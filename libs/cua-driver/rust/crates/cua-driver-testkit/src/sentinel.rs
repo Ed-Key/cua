@@ -45,16 +45,26 @@ impl Drop for BlurRecoveryBudget {
 }
 
 /// Longest blur-to-focus gap, or `None` when some blur never recovered.
+/// For a focus-loss event, the event kind that ends it: a DOM blur recovers
+/// with a DOM focus, a native window blur with a native window focus.
+fn blur_pair(event: &serde_json::Value) -> Option<&'static str> {
+    match event_kind(event)? {
+        "blur" => Some("focus"),
+        "native-window-blur" => Some("native-window-focus"),
+        _ => None,
+    }
+}
+
 fn blur_recovery_ms(events: &[serde_json::Value]) -> Option<u64> {
     let mut worst = 0;
     for (index, event) in events.iter().enumerate() {
-        if event_kind(event) != Some("blur") {
+        let Some(recovery) = blur_pair(event) else {
             continue;
-        }
+        };
         let blurred_at = event["at_ms"].as_u64()?;
         let recovered_at = events[index + 1..]
             .iter()
-            .find(|later| event_kind(later) == Some("focus"))
+            .find(|later| event_kind(later) == Some(recovery))
             .and_then(|later| later["at_ms"].as_u64())?;
         worst = worst.max(recovered_at.saturating_sub(blurred_at));
     }
@@ -260,7 +270,9 @@ impl ForegroundSentinel {
             let hidden = events.iter().any(|event| {
                 event_kind(event) == Some("visibility") && event["state"].as_str() == Some("hidden")
             });
-            let blurred = events.iter().any(|event| event_kind(event) == Some("blur"));
+            // A DOM blur or a native window resign: AppKit can lose key
+            // window status while document.hasFocus stays unchanged.
+            let blurred = events.iter().any(|event| blur_pair(event).is_some());
             let budget = BLUR_RECOVERY_BUDGET_MS.load(std::sync::atomic::Ordering::SeqCst);
             let recovered = blurred
                 && budget > 0
@@ -358,6 +370,13 @@ impl ForegroundSentinel {
         if is_wayland_session() {
             wait_for_native_focus_lost(self.target, background_target)?;
         } else {
+            #[cfg(target_os = "macos")]
+            wait_for_event(
+                &self.journal_path,
+                "native-window-blur",
+                Duration::from_secs(3),
+            )?;
+            #[cfg(not(target_os = "macos"))]
             wait_for_event(&self.journal_path, "blur", Duration::from_secs(3))?;
             let (_, focus_violations) = self.observe();
             if !focus_violations
@@ -531,6 +550,12 @@ fn read_journal_events(path: &std::path::Path) -> Result<Vec<serde_json::Value>,
 
 fn event_kind(event: &serde_json::Value) -> Option<&str> {
     event["kind"].as_str()
+}
+
+#[cfg(test)]
+fn is_focus_loss_event(event: &serde_json::Value) -> bool {
+    blur_pair(event).is_some()
+        || (event_kind(event) == Some("visibility") && event["state"].as_str() == Some("hidden"))
 }
 
 fn wait_for_event(path: &std::path::Path, kind: &str, timeout: Duration) -> Result<(), String> {
@@ -1233,5 +1258,24 @@ fn electron_fixture() -> ElectronFixture {
                 "--force-renderer-accessibility",
             ],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_focus_loss_event;
+
+    #[test]
+    fn native_window_blur_is_a_focus_loss_even_without_dom_blur() {
+        assert!(is_focus_loss_event(
+            &serde_json::json!({"kind": "native-window-blur"})
+        ));
+        assert!(is_focus_loss_event(&serde_json::json!({"kind": "blur"})));
+        assert!(is_focus_loss_event(
+            &serde_json::json!({"kind": "visibility", "state": "hidden"})
+        ));
+        assert!(!is_focus_loss_event(
+            &serde_json::json!({"kind": "native-window-focus"})
+        ));
     }
 }
