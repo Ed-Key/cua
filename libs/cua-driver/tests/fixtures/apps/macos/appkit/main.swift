@@ -101,6 +101,40 @@ final class LaggingTextField: NSTextField {
     }
 }
 
+final class WindowDiscoveryApplication: NSApplication {
+    private var discoveryMode: String? {
+        ProcessInfo.processInfo.environment["CUA_HARNESS_AX_WINDOW_DISCOVERY"]
+    }
+
+    override func accessibilityWindows() -> [Any]? {
+        guard let mode = discoveryMode else { return super.accessibilityWindows() }
+        if mode == "listed-sibling" {
+            return super.accessibilityWindows()?.filter { ($0 as? NSWindow) !== mainWindow }
+        }
+        return []
+    }
+
+    override func accessibilityChildren() -> [Any]? {
+        guard discoveryMode != nil else { return super.accessibilityChildren() }
+        return super.accessibilityChildren()?.filter { !($0 is NSWindow) }
+    }
+
+    override func accessibilityMainWindow() -> Any? {
+        switch discoveryMode {
+        case "focused", "none": return nil
+        case "invalid": return self
+        default: return super.accessibilityMainWindow()
+        }
+    }
+
+    override func accessibilityFocusedWindow() -> Any? {
+        switch discoveryMode {
+        case "main", "none", "invalid": return nil
+        default: return super.accessibilityFocusedWindow()
+        }
+    }
+}
+
 // MARK: - Controller
 
 final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
@@ -751,7 +785,7 @@ final class SingleClickReceiver: NSView {
 @main
 struct CuaAppKitHarness {
     static func main() {
-        let app = NSApplication.shared
+        let app = WindowDiscoveryApplication.shared
         app.setActivationPolicy(.regular)
         let controller = HarnessWindowController()
         installMenuBar(target: controller)
@@ -772,6 +806,8 @@ struct CuaAppKitHarness {
         var matrixWindows: BringToFrontMatrixWindows?
         if let mode = ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] {
             matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: mode)
+        } else if ProcessInfo.processInfo.environment["CUA_HARNESS_AX_WINDOW_DISCOVERY"] == "listed-sibling" {
+            matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: "normal")
         }
         app.activate(ignoringOtherApps: true)
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)

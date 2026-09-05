@@ -12,7 +12,7 @@
 
 use core_foundation::{
     array::CFArrayRef,
-    base::{CFRelease, CFRetain, CFTypeID, CFTypeRef},
+    base::{CFEqual, CFRelease, CFRetain, CFTypeID, CFTypeRef},
     string::CFStringRef,
 };
 use std::os::raw::{c_int, c_void};
@@ -87,6 +87,7 @@ extern "C" {
         timeout_in_seconds: f32,
     ) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
+    pub fn AXUIElementGetPid(element: AXUIElementRef, pid: *mut i32) -> AXError;
     pub fn AXIsProcessTrusted() -> bool;
     /// `AXIsProcessTrustedWithOptions(options)` — when called with
     /// `{kAXTrustedCheckOptionPrompt: true}` raises the system Accessibility
@@ -812,15 +813,67 @@ fn checked_window_id(error: AXError, window_id: u32) -> Result<Option<u32>, AXEr
     Ok((window_id != 0).then_some(window_id))
 }
 
-/// Read the `AXWindows` attribute of an application element.
-/// Unlike `AXChildren`, this returns the window list regardless of whether
-/// the app is frontmost. Returns a Vec of retained AXUIElementRefs.
+/// Copy fresh application windows from `AXWindows`, `AXMainWindow`, and
+/// `AXFocusedWindow`. macOS can omit off-Space windows from the array while
+/// retaining their main/focused references. Additional candidates must be
+/// same-process AXWindows; callers still match their exact CGWindowIDs.
+/// Returns a Vec of retained AXUIElementRefs without duplicate added identities.
 ///
 /// # Safety
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
-    copy_element_array_attr(element, "AXWindows")
+    copy_ax_windows_with_list_count(element).0
+}
+
+pub(crate) unsafe fn copy_ax_windows_with_list_count(
+    element: AXUIElementRef,
+) -> (Vec<AXUIElementRef>, usize) {
+    let mut windows = copy_element_array_attr(element, "AXWindows");
+    let listed_count = windows.len();
+    let mut application_pid = 0;
+    if AXUIElementGetPid(element, &mut application_pid) != kAXErrorSuccess || application_pid <= 0 {
+        return (windows, listed_count);
+    }
+
+    for attribute in ["AXMainWindow", "AXFocusedWindow"] {
+        let Some(candidate) = copy_element_attr(element, attribute) else {
+            continue;
+        };
+        let mut candidate_pid = 0;
+        let candidate_pid = (AXUIElementGetPid(candidate, &mut candidate_pid) == kAXErrorSuccess)
+            .then_some(candidate_pid);
+        let role = if candidate_pid == Some(application_pid) {
+            copy_string_attr(candidate, "AXRole")
+        } else {
+            None
+        };
+        if is_same_application_window(application_pid, candidate_pid, role.as_deref()) {
+            push_unique_ax_element(&mut windows, candidate);
+        } else {
+            CFRelease(candidate as CFTypeRef);
+        }
+    }
+    (windows, listed_count)
+}
+
+fn is_same_application_window(
+    application_pid: i32,
+    candidate_pid: Option<i32>,
+    role: Option<&str>,
+) -> bool {
+    application_pid > 0 && candidate_pid == Some(application_pid) && role == Some("AXWindow")
+}
+
+unsafe fn push_unique_ax_element(elements: &mut Vec<AXUIElementRef>, candidate: AXUIElementRef) {
+    if elements
+        .iter()
+        .any(|&element| CFEqual(element as CFTypeRef, candidate as CFTypeRef) != 0)
+    {
+        CFRelease(candidate as CFTypeRef);
+    } else {
+        elements.push(candidate);
+    }
 }
 
 /// Copy an attribute without conflating an AX failure with an absent value.
@@ -955,6 +1008,47 @@ pub unsafe fn copy_element_array_attr(
 mod tests {
     use super::*;
     use core_foundation::{boolean::CFBoolean, number::CFNumber};
+
+    #[test]
+    fn additional_window_candidates_require_same_process_window_role() {
+        assert!(is_same_application_window(42, Some(42), Some("AXWindow")));
+        for (application_pid, candidate_pid, role) in [
+            (42, Some(7), Some("AXWindow")),
+            (42, None, Some("AXWindow")),
+            (42, Some(42), None),
+            (42, Some(42), Some("AXApplication")),
+            (42, Some(42), Some("AXSheet")),
+            (0, Some(0), Some("AXWindow")),
+            (-1, Some(-1), Some("AXWindow")),
+        ] {
+            assert!(!is_same_application_window(
+                application_pid,
+                candidate_pid,
+                role
+            ));
+        }
+    }
+
+    #[test]
+    fn additional_ax_candidates_deduplicate_by_native_identity() {
+        unsafe {
+            let first = AXUIElementCreateApplication(42);
+            let same_identity = AXUIElementCreateApplication(42);
+            let other_identity = AXUIElementCreateApplication(7);
+            assert!(!first.is_null());
+            assert!(!same_identity.is_null());
+            assert!(!other_identity.is_null());
+
+            let mut elements = vec![first];
+            push_unique_ax_element(&mut elements, same_identity);
+            assert_eq!(elements.len(), 1);
+            push_unique_ax_element(&mut elements, other_identity);
+            assert_eq!(elements.len(), 2);
+            for element in elements {
+                CFRelease(element as CFTypeRef);
+            }
+        }
+    }
 
     #[test]
     fn value_writability_distinguishes_false_from_query_failure() {
