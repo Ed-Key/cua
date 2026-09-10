@@ -36,7 +36,9 @@ use crate::{
     CompiledTheme, CursorAction, CursorConfig, CursorVisualState, DeliveryModifier, MotionConfig,
     OverlayCommand, PathPlanner, PathState, PlannedPath, Spring, TargetModifier,
 };
+use crate::{VisualActionId, VisualEvent, VisualPhase};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 pub const SESSION_BADGE_HOLD_SECS: f64 = 2.0;
 pub const SESSION_BADGE_FADE_SECS: f64 = 0.4;
@@ -66,6 +68,11 @@ pub struct RenderStateCore {
     pub spring_tgt: Option<(f64, f64, f64)>,
     /// Click-pulse phase 0..1; `None` = no pulse in flight.
     pub click_t: Option<f64>,
+    pub contact: Option<ContactPresentation>,
+    visual_owner: Option<(VisualActionId, Instant, VisualPhase)>,
+    visual_travel: Option<(Instant, Duration)>,
+    visual_deadline: Option<Instant>,
+    presentation_now: Option<Instant>,
     /// Whether a button is currently being held for this cursor.
     pub pressed: bool,
     /// Semantic action and animation playback state.
@@ -132,7 +139,183 @@ impl DisplayBounds {
     }
 }
 
+#[derive(Clone, Copy, Debug)]
+pub struct ContactPresentation {
+    pub target: (f64, f64),
+    pub timestamp: Instant,
+    pub progress: f64,
+}
+
 impl RenderStateCore {
+    /// Apply one accepted action using monotonic event time. A missing target
+    /// never creates placement, and first placement requires current display bounds.
+    pub fn apply_visual_event(
+        &mut self,
+        event: VisualEvent,
+        display: Option<DisplayBounds>,
+        now: Instant,
+    ) -> bool {
+        if !event.is_valid() || !self.cfg.enabled || !self.visible {
+            return false;
+        }
+        if let Some((id, timestamp, phase)) = self.visual_owner {
+            if event.id.generation != id.generation
+                || event.id.action < id.action
+                || event.timestamp < timestamp
+                || (event.id == id
+                    && (phase == VisualPhase::End
+                        || (phase == VisualPhase::Contact && event.phase == VisualPhase::Intent)))
+            {
+                return false;
+            }
+        }
+        if event.phase != VisualPhase::End {
+            if let Some(target) = event.target {
+                if display.is_some_and(|bounds| !bounds.contains(target)) {
+                    return false;
+                }
+                if !self.placed {
+                    let Some(bounds) = display else {
+                        return false;
+                    };
+                    if !self.initialize_near_target(target, bounds) {
+                        return false;
+                    }
+                }
+            }
+        }
+        self.visual_owner = Some((event.id, event.timestamp, event.phase));
+        if let Some(window) = event.window {
+            self.pinned_wid = Some(window);
+        }
+        if event.phase == VisualPhase::End {
+            self.pressed = false;
+            self.visual.to_idle();
+            self.visual_deadline = None;
+            self.advance_visual_presentation(now);
+            return true;
+        }
+        let reveal_badge = !self.cursor_is_revealed();
+        self.idle_secs = 0.0;
+        self.idle_alpha = 1.0;
+        if reveal_badge {
+            self.reveal_session_badge();
+        }
+        let mut duration = Duration::from_millis(150);
+        if let Some(target) = event.target {
+            let OverlayCommand::SnapTo {
+                x,
+                y,
+                heading_radians: Some(heading),
+            } = crate::track_pointer_command(target.0, target.1)
+            else {
+                unreachable!()
+            };
+            self.path = None;
+            self.dist = 0.0;
+            self.spring = None;
+            self.spring_tgt = None;
+            self.click_t = None;
+            self.visual_travel = None;
+            if event.phase == VisualPhase::Intent
+                && self.visual.reduced_motion != crate::ReducedMotion::On
+            {
+                let distance = (x - self.pos.0).hypot(y - self.pos.1);
+                duration = Duration::from_secs_f64((distance / 900.0).clamp(0.120, 0.220));
+                self.path = Some(PathPlanner::plan(
+                    self.pos.0,
+                    self.pos.1,
+                    self.heading + std::f64::consts::PI,
+                    x,
+                    y,
+                    heading + std::f64::consts::PI,
+                    heading,
+                    self.motion.turn_radius,
+                ));
+                self.visual_travel = Some((event.timestamp, duration));
+            } else {
+                self.pos = (x, y);
+                self.heading = heading;
+            }
+            if event.phase == VisualPhase::Contact {
+                self.contact = Some(ContactPresentation {
+                    target,
+                    timestamp: event.timestamp,
+                    progress: 0.0,
+                });
+            }
+        }
+        self.visual.begin(event.action, None, None);
+        self.visual_deadline = Some(event.timestamp + duration);
+        self.advance_visual_presentation(now);
+        true
+    }
+
+    /// Advance timed action effects before painting. Both tick paths use this
+    /// clock; accumulated frame deltas never stretch action display durations.
+    pub fn advance_visual_presentation(&mut self, now: Instant) -> bool {
+        let now = self.presentation_now.map_or(now, |last| now.max(last));
+        self.presentation_now = Some(now);
+        let mut arrived = false;
+        if let Some((started, duration)) = self.visual_travel {
+            let fraction = if self.visual.reduced_motion == crate::ReducedMotion::On {
+                1.0
+            } else {
+                (now.saturating_duration_since(started).as_secs_f64() / duration.as_secs_f64())
+                    .clamp(0.0, 1.0)
+            };
+            if let Some(path) = &self.path {
+                // Smooth display interpolation, independent of the user's legacy timing.
+                let eased = fraction * fraction * (3.0 - 2.0 * fraction);
+                self.dist = path.length * eased;
+                let sample = path.sample(self.dist);
+                self.pos = (sample.x, sample.y);
+                self.heading = if fraction >= 1.0 {
+                    path.end_visual_heading
+                } else {
+                    sample.heading + std::f64::consts::PI
+                };
+            }
+            if fraction >= 1.0 {
+                self.path = None;
+                self.visual_travel = None;
+                self.spring = None;
+                self.spring_tgt = None;
+                arrived = true;
+            }
+        }
+        if let Some(contact) = &mut self.contact {
+            contact.progress = now
+                .saturating_duration_since(contact.timestamp)
+                .as_secs_f64()
+                / 0.150;
+            if contact.progress >= 1.0 {
+                self.contact = None;
+            }
+        }
+        if let Some(deadline) = self.visual_deadline {
+            if now >= deadline {
+                self.visual.to_idle();
+                self.visual_deadline = None;
+            } else if let Some((_, timestamp, _)) = self.visual_owner {
+                self.visual.elapsed_secs = now.saturating_duration_since(timestamp).as_secs_f64();
+            }
+        }
+        arrived
+    }
+
+    /// Clear action effects when placement or visibility is invalidated.
+    /// Keep the ownership watermark so late events cannot rewind this instance.
+    pub fn clear_visual_presentation(&mut self) {
+        if self.visual_travel.take().is_some() {
+            self.path = None;
+        }
+        self.contact = None;
+        if self.visual_deadline.take().is_some() {
+            self.visual.to_idle();
+        }
+    }
+
     /// Initialize a first move near its resolved target on the containing display.
     pub fn initialize_near_target(&mut self, target: (f64, f64), display: DisplayBounds) -> bool {
         if self.placed || !self.cfg.enabled || !self.visible || !display.contains(target) {
@@ -191,6 +374,11 @@ impl RenderStateCore {
             spring: None,
             spring_tgt: None,
             click_t: None,
+            contact: None,
+            visual_owner: None,
+            visual_travel: None,
+            visual_deadline: None,
+            presentation_now: None,
             pressed: false,
             visible: true,
             idle_secs: 0.0,
@@ -336,6 +524,16 @@ impl RenderStateCore {
     /// Returns `true` when the planned path just ended (so the caller can
     /// fire an arrival oneshot to unblock `animate_cursor_to`).
     pub fn tick_motion(&mut self, dt: f64) -> bool {
+        self.tick_motion_at(dt, Instant::now())
+    }
+
+    pub fn tick_motion_at(&mut self, dt: f64, now: Instant) -> bool {
+        let timed_travel = self.visual_travel.is_some();
+        let arrived = self.advance_visual_presentation(now);
+        if timed_travel {
+            self.tick_idle(dt);
+            return arrived;
+        }
         let spring_k = self.motion.spring * 400.0;
         let spring_c = self.motion.spring * 20.0;
 
@@ -441,6 +639,16 @@ impl RenderStateCore {
     /// peak at 1.0 at u=0.5.  The original Swift code uses the 30/1.875
     /// form so we preserve it here for parity.
     pub fn tick_swift_constants(&mut self, dt: f64) -> bool {
+        self.tick_swift_constants_at(dt, Instant::now())
+    }
+
+    pub fn tick_swift_constants_at(&mut self, dt: f64, now: Instant) -> bool {
+        let timed_travel = self.visual_travel.is_some();
+        let arrived = self.advance_visual_presentation(now);
+        if timed_travel {
+            self.tick_idle(dt);
+            return arrived;
+        }
         const PEAK_SPEED: f64 = 900.0;
         const MIN_START_SPEED: f64 = 300.0;
         const MIN_END_SPEED: f64 = 200.0;
@@ -545,7 +753,9 @@ impl RenderStateCore {
     /// `motion.idle_hide_ms` has elapsed.  Identical across all platforms.
     fn tick_idle(&mut self, dt: f64) {
         let modifiers_before_tick = (self.visual.delivery, self.visual.target);
-        self.visual.tick(dt);
+        if self.visual_deadline.is_none() {
+            self.visual.tick(dt);
+        }
         let modifiers_after_tick = (self.visual.delivery, self.visual.target);
         if modifiers_after_tick.0.is_some() || modifiers_after_tick.1.is_some() {
             self.badge_modifiers = Some(modifiers_after_tick);
@@ -571,7 +781,10 @@ impl RenderStateCore {
         }
         let idle_hide_ms = self.motion.idle_hide_ms;
         if idle_hide_ms > 0.0 {
-            let moving = self.path.is_some() || self.spring.is_some() || self.click_t.is_some();
+            let moving = self.path.is_some()
+                || self.spring.is_some()
+                || self.click_t.is_some()
+                || self.contact.is_some();
             if moving {
                 self.idle_secs = 0.0;
                 self.idle_alpha = 1.0;
@@ -604,6 +817,15 @@ impl RenderStateCore {
         move_to_places_unplaced: bool,
         click_pulse_unplaced_only: bool,
     ) -> bool {
+        if matches!(
+            &cmd,
+            OverlayCommand::MoveTo { .. }
+                | OverlayCommand::SnapTo { .. }
+                | OverlayCommand::ClickPulse { .. }
+                | OverlayCommand::SetEnabled(false)
+        ) {
+            self.clear_visual_presentation();
+        }
         match cmd {
             OverlayCommand::MoveTo {
                 x,
@@ -969,6 +1191,36 @@ fn paint_cursor_impl(
                     None,
                 );
             }
+        }
+    }
+
+    // Contact is anchored in global target coordinates, independent of artwork.
+    if let Some(contact) = core.contact {
+        let cx = ((contact.target.0 - origin_x) * s) as f32;
+        let cy = ((contact.target.1 - origin_y) * s) as f32;
+        let radius = (12.0 + 20.0 * contact.progress) as f32 * sf;
+        let mut builder = tiny_skia::PathBuilder::new();
+        builder.push_circle(cx, cy, radius);
+        if let Some(path) = builder.finish() {
+            let mut paint = tiny_skia::Paint::default();
+            paint.set_color_rgba8(
+                94,
+                192,
+                232,
+                (220.0 * (1.0 - contact.progress) * core.idle_alpha) as u8,
+            );
+            paint.anti_alias = true;
+            let stroke = tiny_skia::Stroke {
+                width: 2.0 * sf,
+                ..Default::default()
+            };
+            pm.stroke_path(
+                &path,
+                &paint,
+                &stroke,
+                tiny_skia::Transform::identity(),
+                None,
+            );
         }
     }
 
@@ -1463,6 +1715,277 @@ mod backing_scale_tests {
 
 #[cfg(test)]
 mod tests {
+    fn timed_event(
+        action: u64,
+        phase: VisualPhase,
+        timestamp: Instant,
+        target: Option<(f64, f64)>,
+    ) -> VisualEvent {
+        VisualEvent {
+            id: VisualActionId {
+                generation: 1,
+                action,
+            },
+            timestamp,
+            target,
+            window: None,
+            bounds: None,
+            action: CursorAction::Click,
+            scroll_direction: None,
+            phase,
+        }
+    }
+    fn timed_core() -> RenderStateCore {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.placed = true;
+        core.pos = (111.31370849898476, 111.31370849898476);
+        core.motion.idle_hide_ms = 0.0;
+        core
+    }
+    fn tick_at(core: &mut RenderStateCore, swift: bool, dt: f64, now: Instant) -> bool {
+        if swift {
+            core.tick_swift_constants_at(dt, now)
+        } else {
+            core.tick_motion_at(dt, now)
+        }
+    }
+    fn assert_tip(core: &RenderStateCore, target: (f64, f64)) {
+        assert!((core.pos.0 - core.heading.cos() * 16.0 - target.0).abs() < 0.001);
+        assert!((core.pos.1 - core.heading.sin() * 16.0 - target.1).abs() < 0.001);
+    }
+    #[test]
+    fn slice_a_timed_theme_age_and_reduced_motion_use_explicit_now() {
+        let t = Instant::now();
+        for swift in [false, true] {
+            let mut core = timed_core();
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Contact, t, Some((500.0, 300.0))),
+                None,
+                t + Duration::from_millis(80),
+            );
+            assert!((core.visual.elapsed_secs - 0.08).abs() < 0.0001);
+            tick_at(&mut core, swift, 5.0, t + Duration::from_millis(100));
+            assert!((core.visual.elapsed_secs - 0.10).abs() < 0.0001);
+            assert!(core.contact.is_some());
+            core.advance_visual_presentation(t + Duration::from_millis(90));
+            assert!((core.visual.elapsed_secs - 0.10).abs() < 0.0001);
+            let next = t + Duration::from_millis(200);
+            core.apply_visual_event(
+                timed_event(2, VisualPhase::Intent, next, Some((900.0, 600.0))),
+                None,
+                next,
+            );
+            core.visual.reduced_motion = crate::ReducedMotion::On;
+            tick_at(&mut core, swift, 0.0, next + Duration::from_millis(1));
+            assert!(core.path.is_none());
+            assert_tip(&core, (900.0, 600.0));
+        }
+    }
+
+    #[test]
+    fn slice_a_timed_travel_uses_wall_time_policy_on_both_tick_paths_without_config_changes() {
+        let t = Instant::now();
+        for swift in [false, true] {
+            for (distance, duration) in [(1.0, 120.0), (150.0, 166.666667), (2000.0, 220.0)] {
+                let mut core = timed_core();
+                core.motion.glide_duration_ms = 3000.0;
+                let config = core.motion.clone();
+                core.apply_visual_event(
+                    timed_event(1, VisualPhase::Intent, t, Some((100.0 + distance, 100.0))),
+                    None,
+                    t,
+                );
+                tick_at(
+                    &mut core,
+                    swift,
+                    0.0,
+                    t + Duration::from_secs_f64((duration - 1.0) / 1000.0),
+                );
+                assert!(core.path.is_some(), "travel must last its display duration");
+                assert!(tick_at(
+                    &mut core,
+                    swift,
+                    0.0,
+                    t + Duration::from_secs_f64((duration + 1.0) / 1000.0)
+                ));
+                assert!(core.path.is_none() && core.spring.is_none());
+                assert_tip(&core, (100.0 + distance, 100.0));
+                assert_eq!(core.motion, config);
+            }
+        }
+    }
+    #[test]
+    fn slice_a_timed_second_intent_interrupts_from_current_rendered_position() {
+        let mut core = timed_core();
+        let t = Instant::now();
+        core.apply_visual_event(
+            timed_event(1, VisualPhase::Intent, t, Some((500.0, 300.0))),
+            None,
+            t,
+        );
+        core.advance_visual_presentation(t + Duration::from_millis(40));
+        let interrupted = core.pos;
+        let later = t + Duration::from_millis(40);
+        core.apply_visual_event(
+            timed_event(2, VisualPhase::Intent, later, Some((700.0, 100.0))),
+            None,
+            later,
+        );
+        assert_eq!(core.pos, interrupted);
+        core.advance_visual_presentation(later + Duration::from_millis(221));
+        assert_tip(&core, (700.0, 100.0));
+        assert!(!core.apply_visual_event(
+            timed_event(1, VisualPhase::Contact, later, Some((500.0, 300.0))),
+            None,
+            later
+        ));
+        assert_tip(&core, (700.0, 100.0));
+    }
+    #[test]
+    fn slice_a_timed_contact_cancels_travel_and_spring_at_forty_ms_and_expires() {
+        let t = Instant::now();
+        for swift in [false, true] {
+            let mut core = timed_core();
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Intent, t, Some((500.0, 300.0))),
+                None,
+                t,
+            );
+            tick_at(&mut core, swift, 0.04, t + Duration::from_millis(40));
+            core.spring = Some(Spring::default());
+            core.spring_tgt = Some((0.0, 0.0, 0.0));
+            core.apply_visual_event(
+                timed_event(
+                    1,
+                    VisualPhase::Contact,
+                    t + Duration::from_millis(40),
+                    Some((500.0, 300.0)),
+                ),
+                None,
+                t + Duration::from_millis(40),
+            );
+            assert_tip(&core, (500.0, 300.0));
+            assert!(core.path.is_none() && core.spring.is_none() && core.spring_tgt.is_none());
+            assert_eq!(core.contact.unwrap().target, (500.0, 300.0));
+            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(189));
+            assert!(core.contact.is_some());
+            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(191));
+            assert!(core.contact.is_none());
+            assert_eq!(core.visual.resolved_action, CursorAction::Idle);
+            assert!(!core.session_badge_needs_frame_tick());
+        }
+    }
+    #[test]
+    fn slice_a_timed_old_contact_expires_before_first_draw_and_cannot_rewind_newer_tracking() {
+        let mut core = timed_core();
+        let t = Instant::now();
+        core.apply_visual_event(
+            timed_event(1, VisualPhase::Contact, t, Some((500.0, 300.0))),
+            None,
+            t + Duration::from_secs(1),
+        );
+        assert_tip(&core, (500.0, 300.0));
+        assert!(core.contact.is_none());
+        assert_eq!(core.visual.resolved_action, CursorAction::Idle);
+        let later = t + Duration::from_secs(2);
+        core.apply_visual_event(
+            timed_event(1, VisualPhase::Tracking, later, Some((800.0, 400.0))),
+            None,
+            later,
+        );
+        assert!(!core.apply_visual_event(
+            timed_event(1, VisualPhase::Contact, t, Some((500.0, 300.0))),
+            None,
+            later
+        ));
+        assert_tip(&core, (800.0, 400.0));
+    }
+    #[test]
+    fn slice_a_timed_ring_pixels_keep_independent_negative_origin_anchor() {
+        let t = Instant::now();
+        for scale in [1.0, 2.0] {
+            let mut core = timed_core();
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Contact, t, Some((-100.0, -100.0))),
+                None,
+                t,
+            );
+            core.apply_visual_event(
+                timed_event(
+                    1,
+                    VisualPhase::Tracking,
+                    t + Duration::from_millis(10),
+                    Some((500.0, 300.0)),
+                ),
+                None,
+                t + Duration::from_millis(10),
+            );
+            core.advance_visual_presentation(t + Duration::from_millis(50));
+            let mut pm =
+                tiny_skia::Pixmap::new((200.0 * scale) as u32, (200.0 * scale) as u32).unwrap();
+            paint_cursor(&mut pm, &core, -200.0, -200.0, None, scale as f32);
+            let pixels: Vec<_> = pm
+                .pixels()
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.alpha() > 0)
+                .map(|(i, _)| {
+                    (
+                        (i as u32 % pm.width()) as f64 / scale,
+                        (i as u32 / pm.width()) as f64 / scale,
+                    )
+                })
+                .collect();
+            assert!(!pixels.is_empty(), "ring must paint on its own surface");
+            let min_x = pixels.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+            let max_x = pixels.iter().map(|p| p.0).fold(f64::NEG_INFINITY, f64::max);
+            let min_y = pixels.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+            let max_y = pixels.iter().map(|p| p.1).fold(f64::NEG_INFINITY, f64::max);
+            assert!(
+                (min_x - 80.0).abs() <= 1.5 && (min_y - 80.0).abs() <= 1.5,
+                "{min_x}, {min_y}"
+            );
+            assert!(
+                (max_x - 120.0).abs() <= 1.5 && (max_y - 120.0).abs() <= 1.5,
+                "{max_x}, {max_y}"
+            );
+            core.advance_visual_presentation(t + Duration::from_millis(151));
+            pm.fill(tiny_skia::Color::TRANSPARENT);
+            paint_cursor(&mut pm, &core, -200.0, -200.0, None, scale as f32);
+            assert!(pm.pixels().iter().all(|p| p.alpha() == 0));
+        }
+    }
+    #[test]
+    fn slice_a_timed_reduced_motion_and_first_display_seed_and_label_only() {
+        let t = Instant::now();
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        let mut label = timed_event(1, VisualPhase::Intent, t, None);
+        label.action = CursorAction::Text;
+        assert!(core.apply_visual_event(label, None, t));
+        assert!(!core.placed);
+        let display = DisplayBounds {
+            x: -1000.0,
+            y: -800.0,
+            width: 1000.0,
+            height: 800.0,
+        };
+        core.apply_visual_event(
+            timed_event(2, VisualPhase::Intent, t, Some((-500.0, -300.0))),
+            Some(display),
+            t,
+        );
+        assert_eq!(core.pos, (-640.0, -440.0));
+        assert!(core.path.is_some());
+        core.visual.reduced_motion = crate::ReducedMotion::On;
+        core.apply_visual_event(
+            timed_event(3, VisualPhase::Intent, t, Some((-200.0, -100.0))),
+            Some(display),
+            t,
+        );
+        assert_tip(&core, (-200.0, -100.0));
+        assert!(core.path.is_none() && core.spring.is_none());
+    }
+
     use super::*;
 
     fn viewport_pixels(origin: (f64, f64), scale: f32, focus: bool) -> tiny_skia::Pixmap {

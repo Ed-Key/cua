@@ -128,7 +128,7 @@ struct InboxBatch {
 }
 
 impl InboxBatch {
-    fn apply(self, map: &mut RenderMap) -> bool {
+    fn apply(self, map: &mut RenderMap, now: Instant) -> bool {
         enum Item {
             Command(OverlayMsg),
             Visual(CursorKey, cursor_overlay::VisualEvent),
@@ -163,43 +163,57 @@ impl InboxBatch {
                         apply_msg(map, OverlayMsg::Revive(key));
                     }
                 }
-                Item::Visual(key, event) => apply_visual_in_map(map, key, event),
+                Item::Visual(key, event) => apply_visual_in_map(map, key, event, now),
             }
         }
         had_work
     }
 }
 
-fn apply_visual_in_map(map: &mut RenderMap, key: CursorKey, event: cursor_overlay::VisualEvent) {
-    use cursor_overlay::VisualPhase;
-    if map.ended.contains(&key) {
+fn apply_visual_in_map(
+    map: &mut RenderMap,
+    key: CursorKey,
+    event: cursor_overlay::VisualEvent,
+    now: Instant,
+) {
+    if key.is_empty() || map.ended.contains(&key) {
         return;
     }
-    if let Some(window) = event.window {
-        apply_msg(
-            map,
-            OverlayMsg::Cmd(KeyedOverlayCommand {
-                key: key.clone(),
-                cmd: OverlayCommand::PinAbove(window),
-            }),
-        );
+    let target = (event.phase != cursor_overlay::VisualPhase::End)
+        .then_some(event.target)
+        .flatten();
+    let display = target.and_then(|(x, y)| map.layout.display_at(x, y));
+    if target.is_some() && (display.is_none() || !animation_enabled(map, &key)) {
+        let state = map
+            .cursors
+            .entry(key.clone())
+            .or_insert_with(|| render_state_for_key(&map.template, &key));
+        state.target = target;
+        state.invalidate_placement();
+        return;
     }
-    let cmd = match (event.phase, event.target) {
-        (VisualPhase::Intent, Some((x, y))) => OverlayCommand::MoveTo {
-            x,
-            y,
-            end_heading_radians: std::f64::consts::FRAC_PI_4,
-        },
-        (VisualPhase::Tracking, Some((x, y))) => cursor_overlay::track_pointer_command(x, y),
-        (VisualPhase::Contact, Some((x, y))) => OverlayCommand::ClickPulse { x, y },
-        (VisualPhase::End, _) => OverlayCommand::EndAction(event.action),
-        _ => OverlayCommand::BeginAction {
-            action: event.action,
-            delivery: None,
-            target: None,
-        },
-    };
-    apply_msg(map, OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }));
+    let bounds = display.map(|display| cursor_overlay::DisplayBounds {
+        x: display.x,
+        y: display.y,
+        width: display.width,
+        height: display.height,
+    });
+    let state = map
+        .cursors
+        .entry(key.clone())
+        .or_insert_with(|| render_state_for_key(&map.template, &key));
+    let focus = event.bounds;
+    if state.core.apply_visual_event(event, bounds, now) {
+        if target.is_some() {
+            state.target = target;
+        }
+        if let Some(rect) = focus {
+            state.focus_rect = Some(rect);
+            state.focus_rect_t = 0.0;
+        }
+        map.command_order.retain(|candidate| candidate != &key);
+        map.command_order.push(key);
+    }
 }
 
 fn inbox() -> &'static Mutex<OverlayInbox> {
@@ -636,6 +650,7 @@ impl RenderState {
     }
 
     fn invalidate_placement(&mut self) {
+        self.core.clear_visual_presentation();
         self.core.placed = false;
         self.core.path = None;
         self.core.spring = None;
@@ -651,11 +666,16 @@ impl RenderState {
     /// (peakSpeed=900, springK=400, overshoot=0.8) — see
     /// [`RenderStateCore::tick_swift_constants`].  Returns true if an
     /// arrival signal should be fired (the path just ended).
+    #[cfg(test)]
     fn tick(&mut self, dt: f64) -> bool {
+        self.tick_at(dt, Instant::now())
+    }
+
+    fn tick_at(&mut self, dt: f64, now: Instant) -> bool {
         if !self.core.cfg.enabled || !self.core.visible || !self.core.placed {
             return false;
         }
-        let fire_arrival = self.core.tick_swift_constants(dt);
+        let fire_arrival = self.core.tick_swift_constants_at(dt, now);
 
         // Advance focus-rect fade (fades out over ~600ms).  macOS-only —
         // the shared core has no focus_rect concept.
@@ -700,6 +720,7 @@ impl RenderState {
         self.core.path.is_some()
             || self.core.spring.is_some()
             || self.core.click_t.is_some()
+            || self.core.contact.is_some()
             || self.focus_rect.is_some()
             || self.core.session_badge_needs_frame_tick()
             || (self.core.motion.idle_hide_ms > 0.0 && cursor_is_visible(self))
@@ -995,13 +1016,13 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             let Some(map) = guard.as_mut() else {
                 break;
             };
-            let cursor_commanded = batch.apply(map);
+            let cursor_commanded = batch.apply(map, now);
             let had_msg = first_msg.is_some() || cursor_commanded;
 
             let mut arrived = Vec::new();
             if frame_tick_needed || had_msg {
                 for (key, state) in map.cursors.iter_mut() {
-                    if state.tick(dt) {
+                    if state.tick_at(dt, now) {
                         arrived.push(key.clone());
                     }
                 }
@@ -1144,7 +1165,19 @@ fn state_paints_display(state: &RenderState, display: DisplayGeometry) -> bool {
     let focus_intersects = state
         .focus_rect
         .is_some_and(|[x, y, width, height]| rectangles_intersect((x, y, width, height), display));
-    cursor_intersects || focus_intersects
+    let contact_intersects = state.core.contact.is_some_and(|contact| {
+        let radius = 34.0;
+        rectangles_intersect(
+            (
+                contact.target.0 - radius,
+                contact.target.1 - radius,
+                radius * 2.0,
+                radius * 2.0,
+            ),
+            display,
+        )
+    });
+    cursor_intersects || focus_intersects || contact_intersects
 }
 
 fn rectangles_intersect(rect: (f64, f64, f64, f64), display: DisplayGeometry) -> bool {
@@ -1454,6 +1487,80 @@ mod tests {
     }
 
     #[test]
+    fn slice_a_mailbox_equal_timestamps_keep_accepted_order_across_drains() {
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        let t = Instant::now();
+        let one = inbox.visual.begin_action("one").unwrap();
+        let two = inbox.visual.begin_action("two").unwrap();
+        for (key, id, x, window) in [
+            ("one", one, 20.0, 111),
+            ("two", two, 40.0, 222),
+            ("one", one, 60.0, 111),
+        ] {
+            let mut event = mailbox_event(id, x, cursor_overlay::VisualPhase::Tracking);
+            event.timestamp = t;
+            event.window = Some(window);
+            assert!(inbox.visual.publish(key, event));
+            inbox.take().apply(&mut map, t);
+        }
+        assert_eq!(map.cursors["one"].target, Some((60.0, 30.0)));
+        assert_eq!(map.command_order, vec!["two", "one"]);
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111))]);
+    }
+
+    #[test]
+    fn slice_a_mailbox_contact_routes_its_own_surface_and_expires_quiescently() {
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        let left = DisplayGeometry {
+            id: 2,
+            x: -200.0,
+            y: 0.0,
+            width: 200.0,
+            height: 100.0,
+            backing_scale: 2.0,
+            is_primary: false,
+        };
+        map.layout.displays.push(left);
+        map.template.motion.idle_hide_ms = 0.0;
+        let t = Instant::now();
+        let id = inbox.visual.begin_action("one").unwrap();
+        let mut contact = mailbox_event(id, -100.0, cursor_overlay::VisualPhase::Contact);
+        contact.timestamp = t;
+        inbox.visual.publish("one", contact);
+        let mut tracking = mailbox_event(id, 90.0, cursor_overlay::VisualPhase::Tracking);
+        tracking.timestamp = t + Duration::from_millis(10);
+        inbox.visual.publish("one", tracking);
+        inbox.take().apply(&mut map, t + Duration::from_millis(10));
+        let core = &mut map.cursors.get_mut("one").unwrap().core;
+        core.advance_visual_presentation(t + Duration::from_millis(50));
+        assert_eq!(core.contact.unwrap().target, (-100.0, 30.0));
+        assert_eq!(map.cursors["one"].target, Some((90.0, 30.0)));
+        assert_eq!(painted_display_ids(&map), HashSet::from([1, 2]));
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111)), (2, Some(111))]);
+        let pm = render_display(&map, left);
+        let painted: Vec<_> = pm
+            .pixels()
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| p.alpha() > 0)
+            .map(|(i, _)| (i as u32 % pm.width(), i as u32 / pm.width()))
+            .collect();
+        assert!(!painted.is_empty());
+        assert!(painted
+            .iter()
+            .all(|(x, y)| (158..=242).contains(x) && (18..=102).contains(y)));
+        map.cursors
+            .get_mut("one")
+            .unwrap()
+            .core
+            .tick_swift_constants_at(0.0, t + Duration::from_millis(201));
+        assert_eq!(painted_display_ids(&map), HashSet::from([1]));
+        assert!(!render_map_needs_frame_tick(&map));
+    }
+
+    #[test]
     fn slice_a_mailbox_detached_renderer_and_saturated_commands_do_not_block_visuals() {
         use std::sync::{mpsc, Arc};
         let inbox = Arc::new(Mutex::new(OverlayInbox::default()));
@@ -1464,7 +1571,7 @@ mod tests {
             let batch = consumer.lock().unwrap().take();
             ready_tx.send(()).unwrap();
             release_rx.recv().unwrap();
-            batch.apply(&mut empty_map());
+            batch.apply(&mut empty_map(), Instant::now());
         });
         ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let (done_tx, done_rx) = mpsc::channel();
@@ -1493,7 +1600,7 @@ mod tests {
         publisher.join().unwrap();
         assert!(result.unwrap());
         let mut map = empty_map();
-        inbox.lock().unwrap().take().apply(&mut map);
+        inbox.lock().unwrap().take().apply(&mut map, Instant::now());
         assert!(!map.cursors.contains_key("old"));
         assert_eq!(map.cursors["new"].target, Some((70.0, 30.0)));
     }
@@ -1515,17 +1622,18 @@ mod tests {
             "one",
             mailbox_event(one, 60.0, cursor_overlay::VisualPhase::Intent),
         );
-        inbox.take().apply(&mut map);
+        inbox.take().apply(&mut map, Instant::now());
         assert_eq!(map.command_order, vec!["two", "one"]);
         assert_eq!(ordering_pairs(&map), vec![(1, Some(111))]);
         assert_eq!(map.cursors["one"].target, Some((60.0, 30.0)));
         inbox.command(command("two", OverlayCommand::PinAbove(333)));
-        inbox.take().apply(&mut map);
+        inbox.take().apply(&mut map, Instant::now());
         assert_eq!(ordering_pairs(&map), vec![(1, Some(333))]);
     }
 
     #[test]
     fn slice_a_mailbox_remove_late_contact_revive_before_drain_is_fresh() {
+        let now = Instant::now();
         let mut inbox = OverlayInbox::default();
         let mut map = empty_map();
         let old = inbox.visual.begin_action("one").unwrap();
@@ -1533,7 +1641,7 @@ mod tests {
             "one",
             mailbox_event(old, 20.0, cursor_overlay::VisualPhase::Intent),
         );
-        inbox.take().apply(&mut map);
+        inbox.take().apply(&mut map, now);
         assert!(map.cursors.contains_key("one"));
         inbox.command(OverlayMsg::Remove("one".into()));
         assert!(!inbox.visual.publish(
@@ -1551,11 +1659,11 @@ mod tests {
             "one",
             mailbox_event(fresh, 80.0, cursor_overlay::VisualPhase::Intent),
         );
-        inbox.take().apply(&mut map);
+        inbox.take().apply(&mut map, now);
         assert_eq!(map.cursors["one"].target, Some((80.0, 30.0)));
         assert_eq!(map.cursors["one"].core.pos, (2.0, 2.0));
         inbox.command(OverlayMsg::Remove("one".into()));
-        inbox.take().apply(&mut map);
+        inbox.take().apply(&mut map, now);
         assert!(!map.cursors.contains_key("one"));
         assert!(map.command_order.is_empty());
     }
@@ -1574,7 +1682,7 @@ mod tests {
         assert!(inbox.commands.is_empty());
         let batch = inbox.take();
         assert_eq!(batch.pending.len(), 1);
-        batch.apply(&mut map);
+        batch.apply(&mut map, Instant::now());
         assert_eq!(map.cursors["one"].target, Some((9.0, 30.0)));
     }
 

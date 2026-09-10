@@ -223,6 +223,48 @@ mod tests {
         assert!(mailbox.take_pending().is_empty());
     }
     #[test]
+    fn newer_action_discards_undrained_contact_but_tracking_keeps_its_own_contact() {
+        let mut mailbox = VisualMailbox::default();
+        let t = Instant::now();
+        let first = mailbox.begin_action("a").unwrap();
+        mailbox.publish("a", event(first, VisualPhase::Intent, t, 10.0));
+        mailbox.publish("a", event(first, VisualPhase::Contact, t, 10.0));
+        mailbox.publish(
+            "a",
+            event(
+                first,
+                VisualPhase::Tracking,
+                t + Duration::from_millis(1),
+                20.0,
+            ),
+        );
+        assert_eq!(
+            mailbox.pending["a"].contact.as_ref().unwrap().event.target,
+            Some((10.0, 30.0))
+        );
+        assert_eq!(
+            mailbox.pending["a"].latest.as_ref().unwrap().event.target,
+            Some((20.0, 30.0))
+        );
+        let second = mailbox.begin_action("a").unwrap();
+        mailbox.publish(
+            "a",
+            event(
+                second,
+                VisualPhase::Intent,
+                t + Duration::from_millis(2),
+                30.0,
+            ),
+        );
+        let batch = mailbox.take_pending();
+        assert!(batch["a"].contact.is_none());
+        assert_eq!(
+            batch["a"].latest.as_ref().unwrap().event.target,
+            Some((30.0, 30.0))
+        );
+    }
+
+    #[test]
     fn ownership_and_timestamps_survive_draining() {
         let mut m = VisualMailbox::default();
         let t = Instant::now();
