@@ -193,35 +193,50 @@ fn tool_result_text(result: ToolResult) -> String {
 /// hook) we degrade to `GetWindowRect.top-left + (px, py)` — matches
 /// the capture fallback which also keeps the full PrintWindow bitmap
 /// without crop.
-fn bitmap_to_screen(hwnd: u64, px: i32, py: i32) -> (i32, i32) {
+fn bitmap_rects(
+    hwnd: u64,
+) -> (
+    Option<crate::cursor_geometry::Rect>,
+    Option<crate::cursor_geometry::Rect>,
+) {
     use windows::Win32::Foundation::{HWND, RECT};
     use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
     use windows::Win32::UI::WindowsAndMessaging::GetWindowRect;
-
-    // Keep this constant in sync with `capture::DWM_CROP_INSET_PX`.
-    const DWM_CROP_INSET_PX: i32 = 1;
     let h = HWND(hwnd as *mut _);
     unsafe {
         let mut dwm = RECT::default();
-        let hr = DwmGetWindowAttribute(
+        if DwmGetWindowAttribute(
             h,
             DWMWA_EXTENDED_FRAME_BOUNDS,
             &mut dwm as *mut _ as *mut _,
             std::mem::size_of::<RECT>() as u32,
-        );
-        if hr.is_ok() {
-            return (
-                dwm.left + DWM_CROP_INSET_PX + px,
-                dwm.top + DWM_CROP_INSET_PX + py,
-            );
+        )
+        .is_ok()
+        {
+            return (Some((dwm.left, dwm.top, dwm.right, dwm.bottom)), None);
         }
-        // Fallback path — capture also keeps the full bitmap when DWM
-        // bounds aren't available, so the bitmap origin IS GetWindowRect
-        // top-left in that branch.
-        let mut wr = RECT::default();
-        let _ = GetWindowRect(h, &mut wr);
-        (wr.left + px, wr.top + py)
+        let mut rect = RECT::default();
+        let fallback = GetWindowRect(h, &mut rect)
+            .ok()
+            .map(|_| (rect.left, rect.top, rect.right, rect.bottom));
+        (None, fallback)
     }
+}
+
+fn try_bitmap_to_screen(hwnd: u64) -> Result<(f64, f64), ToolResult> {
+    let (dwm, rect) = bitmap_rects(hwnd);
+    crate::cursor_geometry::bitmap_origin(dwm, rect)
+}
+
+fn bitmap_to_screen(hwnd: u64, px: i32, py: i32) -> (i32, i32) {
+    let (dwm, rect) = bitmap_rects(hwnd);
+    // Retain the existing input mapping and fallback for legacy click routes.
+    let (x, y) = match (dwm, rect) {
+        (Some((left, top, _, _)), _) => (left + 1, top + 1),
+        (None, Some((left, top, _, _))) => (left, top),
+        (None, None) => (0, 0),
+    };
+    (x + px, y + py)
 }
 
 fn screen_to_bitmap(hwnd: u64, sx: i32, sy: i32) -> (i32, i32) {
@@ -7882,7 +7897,7 @@ impl Tool for MoveCursorTool {
         MCURSOR_DEF.get_or_init(|| ToolDef {
             name: "move_cursor".into(),
             description:
-                "Move the agent cursor overlay to (x, y). Does NOT move the real mouse cursor."
+                "Move the agent cursor overlay using exact-window get_window_state screenshot pixels. Legacy untargeted moves use screen points. Explicit scope=desktop moves the real OS pointer."
                     .into(),
             input_schema: json!({"type":"object","required":["x","y"],"properties":{
                 "session": cua_driver_core::tool_schema::session_schema(),
@@ -7896,7 +7911,6 @@ impl Tool for MoveCursorTool {
         })
     }
     async fn invoke(&self, args: Value) -> ToolResult {
-        use cua_driver_core::tool_args::ArgsExt;
         if args.get("scope").and_then(Value::as_str) == Some("desktop") {
             let input = match parse_typed_projection::<MoveCursorInput>("move_cursor", &args) {
                 Ok(input) => input,
@@ -7914,28 +7928,18 @@ impl Tool for MoveCursorTool {
                 Err(error) => ToolResult::error(error.to_string()),
             };
         }
-        let x = args.f64_or("x", 0.0);
-        let y = args.f64_or("y", 0.0);
-        // The trusted dispatch boundary always supplies a lifecycle key,
-        // including for an unnamed implicit session.
-        let cursor_key = resolve_cursor_key(&args);
-        if !cursor_key.is_empty() {
-            self.state
-                .cursor_registry
-                .update_position(&cursor_key, x, y);
-        }
-        // End pointing upper-left (45°) — matches Swift's
-        // `AgentCursor.animateAndWait(endAngleDegrees: 45)` convention so
-        // the cursor settles to the natural macOS-style pose.
-        // Use the acknowledged animation path so a first-ever move seeds and
-        // displays the session cursor just as reliably as a coordinate click.
-        crate::overlay::animate_cursor_to(cursor_key.clone(), x, y).await;
-        let shown = if cursor_key.is_empty() {
-            "default"
-        } else {
-            cursor_key.as_str()
-        };
-        ToolResult::text(format!("Agent cursor '{shown}' moved to ({x:.1}, {y:.1})."))
+        crate::cursor_geometry::move_overlay(
+            &args,
+            resolve_cursor_key(&args),
+            &self.state.resize_registry,
+            &self.state.cursor_registry,
+            |pid, hwnd| {
+                exact_window_ownership_result(pid, hwnd, crate::win32::window_owner_pid(hwnd))?;
+                try_bitmap_to_screen(hwnd)
+            },
+            |key, x, y| crate::overlay::animate_cursor_to(key, x, y),
+        )
+        .await
     }
 }
 
@@ -8103,7 +8107,9 @@ impl Tool for SetAgentCursorThemeTool {
     }
 }
 
-pub struct GetAgentCursorStateV2Tool;
+pub struct GetAgentCursorStateV2Tool {
+    cursor_registry: Arc<CursorRegistry>,
+}
 
 static CURSOR_STATE_V2_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
@@ -8115,6 +8121,11 @@ impl Tool for GetAgentCursorStateV2Tool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         let session = resolve_cursor_key(&args);
+        let position = self
+            .cursor_registry
+            .get(&session)
+            .and_then(|state| state.x.zip(state.y))
+            .map(|(x, y)| json!({"x":x,"y":y}));
         if session.is_empty() {
             return ToolResult::error("`session` is required for agent cursor controls.");
         }
@@ -8141,7 +8152,7 @@ impl Tool for GetAgentCursorStateV2Tool {
             json!({
                 "session":session,
                 "enabled":enabled,
-                "position":null,
+                "position":position,
                 "theme":{
                     "id":theme_id,
                     "version":version,
@@ -10063,7 +10074,9 @@ pub fn build_registry_with_provider(
         state: state.clone(),
     }));
     r.register(Box::new(SetAgentCursorMotionV2Tool));
-    r.register(Box::new(GetAgentCursorStateV2Tool));
+    r.register(Box::new(GetAgentCursorStateV2Tool {
+        cursor_registry: state.cursor_registry.clone(),
+    }));
     r.register(Box::new(SetAgentCursorThemeTool {
         state: state.clone(),
     }));

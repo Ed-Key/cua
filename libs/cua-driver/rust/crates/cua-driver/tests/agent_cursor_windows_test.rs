@@ -471,3 +471,78 @@ fn wait_until(timeout: Duration, description: &str, mut predicate: impl FnMut() 
         std::thread::sleep(Duration::from_millis(25));
     }
 }
+
+#[test]
+#[ignore]
+fn slice_a_windows_window_move() {
+    use windows::Win32::Graphics::Dwm::{DwmGetWindowAttribute, DWMWA_EXTENDED_FRAME_BOUNDS};
+    use windows::Win32::UI::HiDpi::GetDpiForWindow;
+    let case = CaseSpec::delivered(
+        "slice-a-windows-window-move",
+        "desktop",
+        "win32",
+        "move_cursor",
+        Targeting::Px,
+        Delivery::NotApplicable,
+        Scope::Window,
+        DriverRoute::WindowsOverlay,
+        vec![OracleKind::Cursor, OracleKind::Focus],
+    );
+    execute_case(case, |evidence| {
+        let mut driver =
+            McpDriver::spawn_named_with_overlay("slice-a-windows-window-move").unwrap();
+        *evidence = recording_evidence(driver.recording_dir());
+        let target = launch_wpf_window(&mut driver);
+        let configured = driver.call(
+            "set_config",
+            serde_json::json!({"key":"max_image_dimension","value":300}),
+        );
+        assert!(!configured.is_error(), "{}", configured.text());
+        let state = window_state(&mut driver, target);
+        let width = state.structured()["screenshot_width"]
+            .as_f64()
+            .expect("capture width");
+        let height = state.structured()["screenshot_height"]
+            .as_f64()
+            .expect("capture height");
+        let hwnd = HWND(target.native_id as *mut _);
+        let mut bounds = RECT::default();
+        unsafe {
+            DwmGetWindowAttribute(
+                hwnd,
+                DWMWA_EXTENDED_FRAME_BOUNDS,
+                &mut bounds as *mut _ as *mut _,
+                std::mem::size_of::<RECT>() as u32,
+            )
+            .expect("independent DWM geometry");
+        }
+        let dpi = unsafe { GetDpiForWindow(hwnd) };
+        assert!(dpi > 0);
+        let ratio = (bounds.right - bounds.left - 2) as f64 / width;
+        assert!(ratio > 1.0, "fixture must exercise resized capture");
+        let expected = (
+            bounds.left as f64 + 1.0 + 30.25 * ratio,
+            bounds.top as f64 + 1.0 + 40.25 * ratio,
+        );
+        let pointer = real_cursor_position();
+        let focus = unsafe { GetForegroundWindow() };
+        let moved = driver.call("move_cursor", serde_json::json!({"pid":target.pid,"window_id":target.native_id,"x":30.25,"y":40.25,"session":"slice-a"}));
+        assert!(!moved.is_error(), "{}", moved.text());
+        let cursor = driver.call(
+            "get_agent_cursor_state",
+            serde_json::json!({"session":"slice-a"}),
+        );
+        assert!(!cursor.is_error(), "{}", cursor.text());
+        let point = &cursor.structured()["position"];
+        let dx = (point["x"].as_f64().expect("registry x") - expected.0).abs();
+        let dy = (point["y"].as_f64().expect("registry y") - expected.1).abs();
+        assert!(dx < 0.000001 && dy < 0.000001, "position error {dx},{dy}");
+        assert_eq!(real_cursor_position(), pointer);
+        assert_eq!(unsafe { GetForegroundWindow() }, focus);
+        eprintln!("HWND={} DPI={dpi} capture={width}x{height} registry_error=({dx},{dy}) pointer/focus unchanged",target.native_id);
+        Observation::delivered(
+            vec![OracleKind::Cursor, OracleKind::Focus],
+            Evidence::default(),
+        )
+    });
+}

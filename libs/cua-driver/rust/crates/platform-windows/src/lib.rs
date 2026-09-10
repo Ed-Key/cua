@@ -102,3 +102,5 @@ pub fn register_tools_with_cursor_and_provider(
 }
 
 pub mod resize_registry;
+
+pub mod cursor_geometry;
