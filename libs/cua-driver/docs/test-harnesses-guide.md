@@ -588,3 +588,276 @@ slice_a_windows_window_move`. It independently reads DWM bounds and window DPI,
 checks the downscaled screenshot target numerically, and checks pointer and
 focus. Windows target compilation and host execution of the pure geometry
 module do not replace this interactive desktop test.
+
+## Focused local macOS Slice A evidence
+
+These ignored AppKit rows support the local quick-approach policy. They are not
+full-matrix or cross-platform certification. With the overlay enabled, native
+Click-family delivery intentionally waits for target-frame acknowledgement,
+with an approximate 80 to 140 ms approach and a bounded 250 ms admission wait.
+The former under-5-percent enabled/disabled latency gate is obsolete. Core
+Animation submission does not guarantee physical scanout or visibility through
+other windows. Earlier debug clips and asynchronous-playback clips remain
+historical milestones, not evidence for a newer candidate.
+
+| Row | Evidence |
+| --- | --- |
+| `harness_appkit_counter_px_background` | Reused AX hit-test row: exactly one counter transition, registry target, foreground, z-order, real cursor and leaked-input oracles. |
+| `slice_a_cursor_window_geometry` | Actual 2x window screenshot on the right half, moved window, explicit 600-pixel resized screenshot, invalid-window refusal, independent native bounds and annotated painted tip. |
+| `slice_a_cursor_first_target` | Fresh named session, near-target first appearance, quick approach, observed arrow arrival versus observed counter change, then target pulse. |
+| `slice_a_cursor_display_geometry` | Reused strict unmirrored 2x plus 1x secondary display with a negative origin. Missing hardware fails its precondition. |
+| `slice_a_cursor_latency` | Descriptive paired timings and native background oracles, separately named `same_point` and `different_target` setup modes. No performance pass threshold. |
+
+One physical display with 1512 by 982 logical points and 3024 by 1964 pixels can
+exercise the local 2x rows. It cannot qualify native 1x, secondary-display or
+negative-origin behavior. Record these as unavailable, not passed. Synthetic
+helper tests cannot replace those native rows. A successful click smoke without
+all desktop oracles is not isolation certification.
+
+### Preparation and candidate identity
+
+Only the controller performs native runs, builds/installs the candidate and
+starts its TCC-authorized CuaDriverLocal daemon. Preserve the actual installer
+invocation and output, with `CUA_DRIVER_SOURCE_SHA` set to the exact clean Git
+SHA during the build. The local installer supports `--release` and
+`--require-stable-signing`. Do not reconstruct a build transcript afterward.
+Use the existing `CUA_LOG=cua_cursor_approach=debug` setting on the candidate
+process and retain its stderr in a regular file for timing runs.
+
+Set the installed candidate executable and dedicated socket explicitly:
+
+```sh
+cd /Users/edkiboma/Projects/cua/libs/cua-driver/rust
+export CUA_TEST_DRIVER_BIN="$HOME/.local/bin/cua-driver-local"
+export CUA_E2E_MACOS_DAEMON_SOCKET="$HOME/Library/Caches/cua-driver-local/cua-driver-local.sock"
+export CUA_TEST_REQUIRE_FIXTURES=1
+export CUA_REQUIRE_GUI=1
+export CUA_SLICE_A_CANDIDATE=/absolute/evidence/candidate.json
+```
+
+`candidate.json` contains these required fields. Artifact paths resolve relative
+to that JSON file; all hashes are SHA-256 of the actual retained bytes:
+
+```json
+{
+  "candidate_sha": "FULL_40_HEX_GIT_SHA",
+  "daemon_pid": 12345,
+  "candidate_binary_sha256": "64_HEX_SHA256_OF_INSTALLED_SIGNED_EXECUTABLE",
+  "build_profile": "release",
+  "build_log": {"path": "build.log", "sha256": "64_HEX_SHA256"},
+  "launch_log": {"path": "launch.log", "sha256": "64_HEX_SHA256"}
+}
+```
+
+The build transcript must contain the actual `CUA_DRIVER_SOURCE_SHA=<sha>`
+invocation and Cargo's `Finished` line for the declared profile. `debug` maps
+to Cargo's `dev` build profile and is accepted only for visual milestones;
+final timing requires `release`. Launch provenance records the actual command,
+PID, socket and environment. Each new row checks a clean tracked checkout,
+current HEAD, socket-owning PID, executable hashes, signature verification and
+production `get_config.source_sha` from a persistent MCP connection. The binary
+path uses testkit `driver_binary()`, including its explicit override. A file
+hash alone cannot identify an already-loaded image. Keep the daemon unchanged
+between capture and verification; a newer process cannot certify old frames.
+
+The controller must have the AppKit fixture and Electron foreground sentinel
+built through `tests/fixtures/build/macos.sh`, and the necessary Accessibility
+and screen-capture grants. The fixed-size AppKit window is positioned through
+native AX fixture setup. Cursor moves and clicks under test always go through
+the candidate's MCP proxy. Native CGWindow and AX readbacks independently check
+the window, control bounds and counter. Returned registry coordinates are not
+painted-arrow evidence.
+
+Every new visual/timing session explicitly sets `cua.default` with
+`reduced_motion: "off"` and a session-only `max_image_dimension: 4096`, then
+checks the effective readback. `reduced_motion` is an enum, not a boolean.
+Screenshots and subsequent actions use the same public session label. The
+baseline must have resize ratio 1 and native pixel dimensions; the resized
+row must have a 600-pixel long edge and ratio greater than 1. Requesting a large
+`max_dimension` without the session override would not bypass the configured
+capture ceiling. No global settings are changed.
+
+### Capture, annotate, then verify without repeating input
+
+Start the controller's external recorder before the capture command. Retain the
+original video, crop and clock provenance. First-target acceptance requires the
+complete selected display, so an earlier arrow at another location cannot be
+hidden by cropping. Cropped pilot clips remain supporting evidence. Window
+geometry stages may use a crop. Capture the visible fixture, counter
+label, full expected seed region and arrow, with no resizing of the video.
+Requested 120 fps is only a request. Use measured decoded PTS values and retain
+all frames in each selected interval. No recorder is started by these rows.
+
+Use a new directory per capture, and different reporter files per phase:
+
+```sh
+export CUA_SLICE_A_RUN_DIR=/absolute/evidence/first-target
+export CUA_SLICE_A_PHASE=capture
+export CUA_E2E_DECLARATIONS_FILE=/absolute/evidence/first-capture-declarations.jsonl
+export CUA_E2E_RESULTS_FILE=/absolute/evidence/first-capture-results.jsonl
+cargo test --offline -p cua-driver --test harness_appkit_test slice_a_cursor_first_target -- --ignored --exact --nocapture --test-threads=1
+```
+
+Capture intentionally reports an error/pending result after saving `ready.json`,
+`trace.json`, window screenshots, raw call results and `disabled.json`. It cannot
+pass before pixel evidence exists. The fixture closes after capture. The
+controller stops the recorder, annotates it, and reruns only verification:
+
+```sh
+export CUA_SLICE_A_PHASE=verify
+export CUA_E2E_DECLARATIONS_FILE=/absolute/evidence/first-verify-declarations.jsonl
+export CUA_E2E_RESULTS_FILE=/absolute/evidence/first-verify-results.jsonl
+cargo test --offline -p cua-driver --test harness_appkit_test slice_a_cursor_first_target -- --ignored --exact --nocapture --test-threads=1
+```
+
+Repeat this procedure for `slice_a_cursor_window_geometry` in a different new
+run directory. That row produces `right-half`, `moved` and `resized` stages.
+Verification does not relaunch the fixture or repeat the cursor actions.
+Keep capture-phase failures separate from final verification results.
+
+For each stage, supply `<stage>-visual.json`, plus `disabled-visual.json`:
+
+```json
+{
+  "trace_sha256": "64_HEX_SHA256_OF_TRACE_JSON",
+  "stage": "first-click",
+  "video": {"path": "original.mov", "sha256": "64_HEX_SHA256"},
+  "capture_log": {"path": "capture.json", "sha256": "64_HEX_SHA256"},
+  "video_started_epoch_ms": 1789075000000.0,
+  "clock_uncertainty_ms": 2.0,
+  "first_frame": 20,
+  "annotation_method": "Manual tip, ring center and counter read on every selected original frame",
+  "crop_bounds": [0.0, 0.0, 1512.0, 982.0],
+  "pixel_size": [3024, 1964],
+  "scale": 2.0,
+  "frames": [
+    {"index": 20, "pts": 0.166667,
+     "image": {"path": "frames/000020.png", "sha256": "64_HEX_SHA256"},
+     "tip": [], "pulse_center": [], "counter": 0}
+  ]
+}
+```
+
+This is a schema illustration, not valid acceptance evidence: provide every
+frame in the selected interval, not the single example frame. `index` is the
+original video's zero-based frame index. `pts` is its decoded timestamp in
+seconds. `tip` and `pulse_center` are independently annotated native-pixel
+`[x,y]` positions relative to the crop. An empty array means inspected and
+absent. `counter` is the visible integer, or explicit `null` when unreadable;
+omitting it is malformed evidence. Do not mark the label, click ring or
+registry target as the arrow tip.
+
+`capture.json` records `candidate_sha`, `daemon_pid`, `session` from `ready.json`,
+`video_sha256`, `video_started_epoch_ms`, `clock_uncertainty_ms`, `crop_bounds`,
+`pixel_size`, `scale`, the exact `capture_command` as a string array, and a
+nonempty `clock_alignment_method`. Derive video epoch alignment from the
+recorder's actual start/sample-clock records, retaining that procedure. Do not
+use a guessed launch delay. Uncertainty over 10 ms fails the clock precondition.
+The crop must be inside the observed physical display.
+
+Extract frames and timings from the original file without changing frame rate:
+
+```sh
+mkdir -p frames
+ffprobe -v error -select_streams v:0 -show_frames -show_entries frame=best_effort_timestamp_time,width,height -of json original.mov > frame-times.json
+ffmpeg -v error -i original.mov -map 0:v:0 -fps_mode passthrough -start_number 0 frames/%06d.png
+```
+
+The verifier re-decodes the selected original range with `ffmpeg`, checks every
+PNG's pixels and hash, and compares timestamps and dimensions with `ffprobe`.
+A stage interval must begin at least 50 ms before its call and continue at least
+100 ms after return, including pulse expiry for first-click. It must include
+all preceding empty frames in that interval. The disabled interval must contain
+at least 300 ms of absent arrow/ring, entirely after its recorded disable plus
+50 ms and before `disabled.json`'s end.
+
+Numeric conversion and registry errors allow at most one screen unit per axis;
+painted tip and ring centers allow two native pixels. First-click verification
+requires a near-target first appearance and samples consistent with approximate
+80 to 140 ms travel and a 150 ms pulse. It reports frame-bounded intervals,
+not exact renderer timestamps. A counter change before arrival fails. A change
+in the same frame as arrival, unreadable counter, insufficient travel samples,
+a gap over 40 ms, or unresolved timing remains **indeterminate**, with the row
+still failing/pending. An earlier captured arrival frame establishes sampled UI
+ordering only. It does not establish a separate earlier physical scanout, the
+native accepted-input timestamp, or causality from a delayed label redraw.
+Production boundary tests supply the dispatch/contact ordering evidence.
+
+For the deferred mixed-display row, `CUA_SLICE_A_DISPLAY_EVIDENCE` contains
+`candidate_sha`, `candidate_binary_sha256`, `daemon_pid`, `build_profile` and
+exactly two `captures`. Each capture has `display_id`, `bounds`, `scale`,
+`screenshot`, `screenshot_sha256`, `target`, separately recorded `registry`,
+`measured_tip_pixels`, and a `capture_log` artifact. That log repeats the four
+candidate fields, screenshot hash and `measurement_method`. Retain native
+full-display screenshots and MCP/capture-session provenance. Do not run this
+row on the single-display setup or substitute synthetic captures.
+
+### Descriptive timing and isolation
+
+Stop external and behavior recordings before timing. The row checks
+`get_recording_state.enabled == false` before and after measured calls, uses an
+unrecorded MCP proxy, and requires an explicit external-recorder-stopped
+attestation. Candidate configuration must report PiP disabled; no PiP is started. The separate first-target artifacts must prove
+actual enabled and disabled pixels. Indeterminate sampled arrival/counter
+ordering may accompany descriptive timings and is retained as such in the
+report; it never becomes first-target acceptance.
+
+```sh
+unset CUA_E2E_RECORDINGS_ROOT
+export CUA_SLICE_A_PHASE=measure
+export CUA_SLICE_A_PREFLIGHT_DIR=/absolute/evidence/first-target
+export CUA_SLICE_A_EXTERNAL_CAPTURE_STOPPED=1
+export CUA_SLICE_A_APPROACH_LOG=/absolute/evidence/candidate-stderr.log
+export CUA_SLICE_A_TIMING_MODE=different_target
+export CUA_SLICE_A_RUN_DIR=/absolute/evidence/timing-different-target
+export CUA_E2E_DECLARATIONS_FILE=/absolute/evidence/timing-declarations.jsonl
+export CUA_E2E_RESULTS_FILE=/absolute/evidence/timing-results.jsonl
+cargo test --offline -p cua-driver --test harness_appkit_test slice_a_cursor_latency -- --ignored --exact --nocapture --test-threads=1
+```
+
+Use `same_point` and a separate new run directory for the other planned mode.
+Each run performs 10 alternating warmup clicks and three blocks of 30 complete
+pairs. Pair order is enabled/disabled, disabled/enabled, enabled/disabled across
+the three blocks. All pairs share a session, candidate and exact fixture
+geometry. Before each sample, same-point setup requests the click target;
+different-target setup requests a point 100 logical units to its right. The
+setup move, overlay toggle, 400 ms pacing, AX readbacks, config reads and file IO
+are outside the measured call. A setup request does not itself prove rendering
+or an already-arrived physical arrow.
+
+`samples.json` has `mode`, ten `warmups` (`enabled`, `ns`) and 90 `pairs`
+(`block`, `pair`, `enabled_first`, `enabled_ns`, `disabled_ns`). Empty,
+nonfinite, incomplete, reordered or malformed samples fail. Block prefixes and
+per-call raw results survive later failures. The report contains per-condition
+median and nearest-rank p95, plus descriptive enabled/disabled ratios for each
+block and the aggregate. There is no bootstrap, seed or ratio verdict for this
+amended policy. Do not repeat runs until a preferred result appears.
+
+Per-sample `*-timing.json` and `*-approach.log` retain byte ranges from the
+candidate's existing private diagnostics. Enabled samples require exactly one
+matching registered/ack_received/released action identity and finite ordered
+first-frame, target-frame, submission and acknowledgement measurements. Disabled
+samples require no approach record. Missing, rotated, mixed or incomplete logs
+fail rather than invent timing. `rpc_outside_registered_approach_ms` subtracts
+the **measured** registration-to-acknowledgement interval from the measured RPC;
+it includes resolution, native delivery, readback, restoration and transport.
+It is not a measurement of pure dispatch overhead. Submission/acknowledgement
+measurements make no physical scanout guarantee. Private debug logging remains
+enabled for both timing conditions and is part of this instrumented observation.
+
+Timing success means complete descriptive data and passing unchanged background
+oracles. Also run the existing `harness_appkit_counter_px_background` row once
+on the same verified final candidate, serially, through the same socket. Its
+prior-candidate success does not certify the current candidate. Do not suppress
+real-pointer changes or any other observer violation. Preserve failures and
+investigate their cause before asserting local isolation.
+
+Helper-only preparation, with no native run:
+
+```sh
+cargo test --offline -p cua-driver --test harness_appkit_test slice_a_latency:: -- --nocapture
+cargo test --offline -p cua-driver --test harness_appkit_test slice_a_identity_tests -- --nocapture
+cargo test --offline -p cua-driver --test harness_appkit_test slice_a_cursor --no-run
+```
+
+These focused commands do not run the complete GUI module or desktop matrix.
