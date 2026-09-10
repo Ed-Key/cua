@@ -66,22 +66,57 @@ struct OverlayInbox {
     commands: Vec<(u64, OverlayMsg)>,
     motion: HashMap<CursorKey, MotionConfig>,
     template_motion: MotionConfig,
+    // Generic admission hands its context to one resolved action. Subsequent
+    // events carry that action's context even after presentation expires.
+    contexts: HashMap<
+        CursorKey,
+        (
+            cursor_overlay::VisualActionId,
+            cua_driver_contract::CursorSemantics,
+            bool,
+        ),
+    >,
 }
 
 impl OverlayInbox {
+    fn begin_action(&mut self, key: &str) -> Option<cursor_overlay::VisualActionId> {
+        let id = self.visual.begin_action(key)?;
+        if let Some((_, semantics, true)) = self.contexts.remove(key) {
+            self.contexts.insert(key.into(), (id, semantics, false));
+        }
+        Some(id)
+    }
+    fn publish(&mut self, key: &str, mut event: cursor_overlay::VisualEvent) -> bool {
+        if let Some((id, semantics, _)) = self.contexts.get(key) {
+            if *id == event.id {
+                event.modifiers = Some((semantics.delivery, semantics.target));
+            }
+        }
+        self.visual.publish(key, event)
+    }
     fn command(&mut self, message: OverlayMsg) {
         match message {
             OverlayMsg::Remove(key) => {
                 self.visual.remove(&key);
                 if key != "default" {
+                    self.contexts.remove(&key);
                     self.motion.remove(&key);
                 }
             }
-            OverlayMsg::Revive(key) => self.visual.revive(&key),
+            OverlayMsg::Revive(key) => {
+                if !key.is_empty() && !self.visual.accepts_key(&key) {
+                    self.motion
+                        .insert(key.clone(), self.template_motion.clone());
+                }
+                self.visual.revive(&key);
+            }
             message => {
                 // Preserve the legacy bounded, drop-newest command behavior.
                 if self.commands.len() < 4096 {
                     if let OverlayMsg::Cmd(ref keyed) = message {
+                        if !self.visual.accepts_key(&keyed.key) {
+                            return;
+                        }
                         let motion = self
                             .motion
                             .entry(keyed.key.clone())
@@ -123,6 +158,7 @@ impl OverlayInbox {
                 // cue at Begin; resolved handles take ownership later. An unscoped
                 // End must never release a newer resolved action of the same kind.
                 if let Some(id) = self.visual.begin_action(&session) {
+                    self.contexts.insert(session.clone(), (id, semantics, true));
                     self.command(OverlayMsg::Cmd(KeyedOverlayCommand {
                         key: session.clone(),
                         cmd: OverlayCommand::BeginAction {
@@ -131,7 +167,7 @@ impl OverlayInbox {
                             target: semantics.target,
                         },
                     }));
-                    self.visual.publish(
+                    self.publish(
                         &session,
                         cursor_overlay::VisualEvent {
                             id,
@@ -141,6 +177,7 @@ impl OverlayInbox {
                             bounds: None,
                             action: semantics.action,
                             scroll_direction: None,
+                            modifiers: None,
                             phase: cursor_overlay::VisualPhase::Intent,
                         },
                     );
@@ -261,14 +298,14 @@ fn wake_renderer() {
 
 /// Allocate an action in the active session without reading renderer state.
 pub fn begin_visual_action(key: &str) -> Option<cursor_overlay::VisualActionId> {
-    inbox().lock().unwrap().visual.begin_action(key)
+    inbox().lock().unwrap().begin_action(key)
 }
 
 /// Publish presentation state without waiting for path planning or a renderer acknowledgement.
 pub fn publish_visual_event(key: &str, event: cursor_overlay::VisualEvent) -> bool {
     let accepted = {
         let mut inbox = inbox().lock().unwrap();
-        let accepted = inbox.visual.publish(key, event);
+        let accepted = inbox.publish(key, event);
         if accepted {
             let template = inbox.template_motion.clone();
             inbox.motion.entry(key.to_owned()).or_insert(template);
@@ -621,6 +658,8 @@ impl RenderState {
 
     fn tick_at(&mut self, dt: f64, now: Instant) -> bool {
         if !self.core.cfg.enabled || !self.core.visible || !self.core.placed {
+            // Semantic-only actions still expire without inventing placement.
+            self.core.advance_visual_presentation(now);
             return false;
         }
         self.core.tick_swift_constants_at(dt, now)
@@ -646,6 +685,9 @@ impl RenderState {
     /// quiescent, so `serve` with no agent activity can block on the command
     /// channel instead of compositing empty display pixmaps at 60fps.
     fn needs_frame_tick(&self) -> bool {
+        if self.core.has_timed_presentation() {
+            return true;
+        }
         if !self.core.cfg.enabled || !self.core.visible || !self.core.placed {
             return false;
         }
@@ -1404,6 +1446,7 @@ mod tests {
             bounds: None,
             action: cursor_overlay::CursorAction::Click,
             scroll_direction: None,
+            modifiers: None,
             phase,
         }
     }
@@ -1419,35 +1462,331 @@ mod tests {
         let mut inbox = OverlayInbox::default();
         let mut map = empty_map();
         let t = Instant::now();
-        let a = inbox.visual.begin_action("one").unwrap();
-        let b = inbox.visual.begin_action("one").unwrap();
+        let a = inbox.begin_action("one").unwrap();
+        let b = inbox.begin_action("one").unwrap();
         // B is captured first, then descheduled while A's contact publishes.
         let mut intent = mailbox_event(b, 80.0, Intent);
         intent.timestamp = t + Duration::from_millis(10);
         let mut contact = mailbox_event(a, 20.0, Contact);
         contact.timestamp = t + Duration::from_millis(20);
-        assert!(inbox.visual.publish("one", contact));
+        assert!(inbox.publish("one", contact));
         if applied {
             assert!(inbox.take().apply(&mut map, t + Duration::from_millis(20)));
             assert_mailbox_tip(&map, (20.0, 30.0));
         }
-        assert!(inbox.visual.publish("one", intent));
+        assert!(inbox.publish("one", intent));
         assert!(inbox.take().apply(&mut map, t + Duration::from_millis(25)));
         assert_eq!(map.cursors["one"].target, Some((80.0, 30.0)));
         assert!(map.cursors["one"].core.path.is_some());
         let mut tracking = mailbox_event(b, 90.0, Tracking);
         tracking.timestamp = t + Duration::from_millis(15);
-        assert!(inbox.visual.publish("one", tracking.clone()));
+        assert!(inbox.publish("one", tracking.clone()));
         tracking.timestamp = t + Duration::from_millis(14);
         tracking.target = Some((50.0, 30.0));
-        assert!(!inbox.visual.publish("one", tracking));
+        assert!(!inbox.publish("one", tracking));
         let mut stale = mailbox_event(a, 20.0, Contact);
         stale.timestamp = t + Duration::from_millis(30);
-        assert!(!inbox.visual.publish("one", stale));
+        assert!(!inbox.publish("one", stale));
         assert!(inbox.take().apply(&mut map, t + Duration::from_millis(30)));
         assert_eq!(map.cursors["one"].target, Some((90.0, 30.0)));
         assert_mailbox_tip(&map, (90.0, 30.0));
         assert!(map.cursors["one"].core.path.is_none());
+    }
+
+    #[test]
+    fn slice_a_fix_late_motion_cannot_survive_removal_and_revival() {
+        for drain in [false, true] {
+            let mut inbox = OverlayInbox::default();
+            let mut map = empty_map();
+            let mut old = MotionConfig::default();
+            old.glide_duration_ms = 850.0;
+            inbox.command(command("default", OverlayCommand::SetMotion(old.clone())));
+            inbox.command(command("one", OverlayCommand::SetMotion(old.clone())));
+            inbox.take().apply(&mut map, Instant::now());
+            inbox.command(OverlayMsg::Remove("one".into()));
+            if drain {
+                inbox.take().apply(&mut map, Instant::now());
+            }
+            inbox.command(command("one", OverlayCommand::SetMotion(old.clone())));
+            inbox.command(command("", OverlayCommand::SetMotion(old)));
+            let late_motion = inbox.motion.get("one").cloned();
+            let empty_motion = inbox.motion.get("").cloned();
+            inbox.command(OverlayMsg::Revive("one".into()));
+            // Use the production snapshot reader and partial-override pattern.
+            let prior = std::mem::replace(&mut *super::inbox().lock().unwrap(), inbox);
+            let revived = current_motion("one");
+            let partial = revived.with_overrides(
+                None,
+                None,
+                None,
+                None,
+                Some(0.5),
+                None,
+                None,
+                None,
+                None,
+                None,
+            );
+            let mut inbox = std::mem::replace(&mut *super::inbox().lock().unwrap(), prior);
+            inbox.command(command("one", OverlayCommand::SetMotion(partial)));
+            inbox.take().apply(&mut map, Instant::now());
+            assert!(
+                late_motion.is_none(),
+                "late motion admitted after Remove, drain={drain}"
+            );
+            assert!(empty_motion.is_none());
+            assert_eq!(revived, map.template.motion);
+            assert_eq!(
+                map.cursors["one"].core.motion.glide_duration_ms,
+                map.template.motion.glide_duration_ms
+            );
+            assert_eq!(map.cursors["one"].core.motion.spring, 0.5);
+        }
+    }
+
+    #[test]
+    fn slice_a_fix_semantics_survive_expiry_before_resolved_delivery() {
+        use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+        for phase in [
+            cursor_overlay::VisualPhase::Intent,
+            cursor_overlay::VisualPhase::Tracking,
+            cursor_overlay::VisualPhase::Contact,
+        ] {
+            let mut inbox = OverlayInbox::default();
+            let mut map = empty_map();
+            let semantics = cua_driver_contract::classify_cursor_semantics(
+                "type_text",
+                &serde_json::json!({"delivery_mode":"background","element_index":1}),
+            )
+            .unwrap();
+            inbox.semantic(CursorEvent::Action {
+                session: "one".into(),
+                phase: CursorEventPhase::Begin,
+                semantics,
+            });
+            let t = Instant::now();
+            inbox.take().apply(&mut map, t);
+            map.cursors
+                .get_mut("one")
+                .unwrap()
+                .tick_at(0.0, t + Duration::from_secs(1));
+            let id = inbox.begin_action("one").unwrap();
+            let mut event = mailbox_event(id, 40.0, phase);
+            event.action = cursor_overlay::CursorAction::Text;
+            event.timestamp = t + Duration::from_secs(2);
+            inbox.publish("one", event.clone());
+            inbox.take().apply(&mut map, event.timestamp);
+            assert_eq!(map.cursors["one"].core.visual.delivery, semantics.delivery);
+            assert_eq!(map.cursors["one"].core.visual.target, semantics.target);
+            assert_eq!(map.cursors["one"].core.session_badge_chip_alpha(), 1.0);
+            if phase == cursor_overlay::VisualPhase::Intent {
+                map.cursors
+                    .get_mut("one")
+                    .unwrap()
+                    .tick_at(0.0, t + Duration::from_secs(3));
+                event.phase = cursor_overlay::VisualPhase::Contact;
+                event.timestamp = t + Duration::from_secs(4);
+                inbox.publish("one", event.clone());
+                inbox.take().apply(&mut map, event.timestamp);
+                assert_eq!(map.cursors["one"].core.visual.delivery, semantics.delivery);
+            }
+        }
+    }
+
+    #[test]
+    fn slice_a_fix_new_owner_does_not_recover_an_unrelated_fading_badge() {
+        use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        let semantics = cua_driver_contract::classify_cursor_semantics(
+            "click",
+            &serde_json::json!({"delivery_mode":"background","x":1,"y":2}),
+        )
+        .unwrap();
+        inbox.semantic(CursorEvent::Action {
+            session: "one".into(),
+            phase: CursorEventPhase::Begin,
+            semantics,
+        });
+        let id = inbox.begin_action("one").unwrap();
+        let first = mailbox_event(id, 40.0, cursor_overlay::VisualPhase::Contact);
+        let t = first.timestamp;
+        inbox.publish("one", first);
+        inbox.take().apply(&mut map, t);
+        map.cursors
+            .get_mut("one")
+            .unwrap()
+            .tick_at(0.0, t + Duration::from_millis(200));
+        let id = inbox.begin_action("one").unwrap();
+        let mut second = mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Contact);
+        second.timestamp = t + Duration::from_millis(210);
+        inbox.publish("one", second.clone());
+        inbox.take().apply(&mut map, second.timestamp);
+        assert_eq!(map.cursors["one"].core.visual.delivery, None);
+        assert_eq!(map.cursors["one"].core.visual.target, None);
+        assert_eq!(map.cursors["one"].core.badge_modifiers, None);
+    }
+
+    #[test]
+    fn slice_a_fix_partial_chip_fade_uses_event_clock_and_invalidation_clears_it() {
+        use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+        for invalidate in [false, true] {
+            let mut inbox = OverlayInbox::default();
+            let mut map = empty_map();
+            let semantics = cua_driver_contract::classify_cursor_semantics(
+                "click",
+                &serde_json::json!({"delivery_mode":"background","x":1,"y":2}),
+            )
+            .unwrap();
+            inbox.semantic(CursorEvent::Action {
+                session: "one".into(),
+                phase: CursorEventPhase::Begin,
+                semantics,
+            });
+            let id = inbox.begin_action("one").unwrap();
+            let event = mailbox_event(id, 40.0, cursor_overlay::VisualPhase::Contact);
+            let t = event.timestamp;
+            inbox.publish("one", event);
+            inbox.take().apply(&mut map, t);
+            if invalidate {
+                apply_msg(&mut map, command("one", OverlayCommand::SetEnabled(false)));
+                apply_msg(&mut map, command("one", OverlayCommand::SetEnabled(true)));
+            } else {
+                map.cursors
+                    .get_mut("one")
+                    .unwrap()
+                    .tick_at(0.0, t + Duration::from_millis(200));
+                assert!(map.cursors["one"].core.session_badge_chip_alpha() > 0.0);
+            }
+            map.cursors
+                .get_mut("one")
+                .unwrap()
+                .tick_at(0.0, t + Duration::from_secs(2));
+            assert_eq!(
+                map.cursors["one"].core.badge_modifiers, None,
+                "invalidate={invalidate}"
+            );
+        }
+    }
+
+    #[test]
+    fn slice_a_fix_unplaced_semantic_cue_requests_ticks_until_expiry() {
+        use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        inbox.semantic(CursorEvent::Action {
+            session: "one".into(),
+            phase: CursorEventPhase::Begin,
+            semantics: cua_driver_contract::CursorSemantics::new(
+                cursor_overlay::CursorAction::Click,
+            ),
+        });
+        let t = Instant::now();
+        inbox.take().apply(&mut map, t);
+        assert!(!map.cursors["one"].core.placed);
+        assert!(map.cursors["one"].needs_frame_tick());
+        map.cursors
+            .get_mut("one")
+            .unwrap()
+            .tick_at(0.0, t + Duration::from_secs(2));
+        assert!(!map.cursors["one"].needs_frame_tick());
+        assert!(!map.cursors["one"].core.placed);
+    }
+
+    #[test]
+    fn slice_a_fix_sparse_drag_stays_active_until_owned_end() {
+        let mut map = empty_map();
+        let mut mailbox = cursor_overlay::VisualMailbox::default();
+        let id = mailbox.begin_action("one").unwrap();
+        let mut event = mailbox_event(id, 40.0, cursor_overlay::VisualPhase::Tracking);
+        event.action = cursor_overlay::CursorAction::Drag;
+        let t = event.timestamp;
+        apply_visual_in_map(&mut map, "one".into(), event.clone(), t);
+        map.cursors.get_mut("one").unwrap().core.motion.idle_hide_ms = 10.0;
+        map.cursors
+            .get_mut("one")
+            .unwrap()
+            .tick_at(1.0, t + Duration::from_secs(1));
+        let core = &map.cursors["one"].core;
+        assert_eq!(
+            core.visual.resolved_action,
+            cursor_overlay::CursorAction::Drag
+        );
+        assert!(core.pressed);
+        assert_eq!(core.idle_alpha, 1.0);
+        assert!(core.path.is_none());
+        event.phase = cursor_overlay::VisualPhase::End;
+        event.timestamp = t + Duration::from_secs(1);
+        apply_visual_in_map(&mut map, "one".into(), event.clone(), event.timestamp);
+        assert!(!map.cursors["one"].core.pressed);
+        assert_eq!(
+            map.cursors["one"].core.visual.resolved_action,
+            cursor_overlay::CursorAction::Idle
+        );
+    }
+
+    #[test]
+    fn slice_a_fix_generic_metadata_survives_resolved_events_and_chips_expire() {
+        use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+        for resolved in [true, false] {
+            for drain in [false, true] {
+                let mut inbox = OverlayInbox::default();
+                let mut map = empty_map();
+                let semantics = cua_driver_contract::classify_cursor_semantics(
+                    "click",
+                    &serde_json::json!({"delivery_mode":"background","x":1,"y":2}),
+                )
+                .unwrap();
+                inbox.semantic(CursorEvent::Action {
+                    session: "one".into(),
+                    phase: CursorEventPhase::Begin,
+                    semantics,
+                });
+                let t = Instant::now();
+                if drain {
+                    inbox.take().apply(&mut map, t);
+                    assert_eq!(map.cursors["one"].core.visual.delivery, semantics.delivery);
+                    assert_eq!(map.cursors["one"].core.visual.target, semantics.target);
+                }
+                if resolved {
+                    let id = inbox.begin_action("one").unwrap();
+                    for phase in [
+                        cursor_overlay::VisualPhase::Intent,
+                        cursor_overlay::VisualPhase::Contact,
+                    ] {
+                        let mut event = mailbox_event(id, 40.0, phase);
+                        event.timestamp = t;
+                        assert!(inbox.publish("one", event));
+                        if drain {
+                            inbox.take().apply(&mut map, t);
+                        }
+                    }
+                }
+                inbox.semantic(CursorEvent::Action {
+                    session: "one".into(),
+                    phase: CursorEventPhase::End,
+                    semantics,
+                });
+                inbox.take().apply(&mut map, t);
+                let core = &map.cursors["one"].core;
+                assert_eq!(core.visual.delivery, semantics.delivery);
+                assert_eq!(core.visual.target, semantics.target);
+                assert_eq!(core.session_badge_chip_alpha(), 1.0);
+                if !resolved {
+                    assert!(!core.placed);
+                    assert!(core.contact.is_none());
+                }
+                map.cursors
+                    .get_mut("one")
+                    .unwrap()
+                    .tick_at(0.0, t + Duration::from_secs(2));
+                let core = &map.cursors["one"].core;
+                assert_eq!(core.visual.delivery, None);
+                assert_eq!(core.visual.target, None);
+                assert_eq!(core.badge_modifiers, None);
+                assert_eq!(core.session_badge_chip_alpha(), 0.0);
+            }
+        }
     }
 
     #[test]
@@ -1471,6 +1810,7 @@ mod tests {
                 action: cursor_overlay::CursorAction::Text,
                 phase: cursor_overlay::VisualPhase::Intent,
                 scroll_direction: None,
+                modifiers: None,
             },
         );
         let actual = current_motion("motion-event-key");
@@ -1541,6 +1881,7 @@ mod tests {
             action: cursor_overlay::CursorAction::Text,
             phase: cursor_overlay::VisualPhase::Tracking,
             scroll_direction: None,
+            modifiers: None,
         };
         apply_visual_in_map(
             &mut map,
@@ -1584,7 +1925,7 @@ mod tests {
             ),
         };
         inbox.semantic(semantic(CursorEventPhase::Begin));
-        let id = inbox.visual.begin_action("one").unwrap();
+        let id = inbox.begin_action("one").unwrap();
         let t = Instant::now();
         let event = cursor_overlay::VisualEvent {
             id,
@@ -1594,9 +1935,10 @@ mod tests {
             bounds: None,
             action: cursor_overlay::CursorAction::Click,
             scroll_direction: None,
+            modifiers: None,
             phase: cursor_overlay::VisualPhase::Contact,
         };
-        inbox.visual.publish("one", event);
+        inbox.publish("one", event);
         inbox.semantic(semantic(CursorEventPhase::End));
         inbox.take().apply(&mut map, t + Duration::from_millis(75));
         assert_eq!(
@@ -1707,11 +2049,11 @@ mod tests {
         let mut inbox = OverlayInbox::default();
         let mut map = empty_map();
         let t = Instant::now();
-        let id = inbox.visual.begin_action("one").unwrap();
+        let id = inbox.begin_action("one").unwrap();
         let publish = |inbox: &mut OverlayInbox, phase, x| {
             let mut event = mailbox_event(id, x, phase);
             event.timestamp = t;
-            inbox.visual.publish("one", event)
+            inbox.publish("one", event)
         };
         assert!(publish(&mut inbox, Contact, 20.0));
         if detach {
@@ -1769,11 +2111,11 @@ mod tests {
     }
 
     fn publish_contact_bounds(inbox: &mut OverlayInbox, t: Instant) {
-        let id = inbox.visual.begin_action("one").unwrap();
+        let id = inbox.begin_action("one").unwrap();
         let mut contact = mailbox_event(id, 90.0, cursor_overlay::VisualPhase::Contact);
         contact.timestamp = t;
         contact.bounds = Some([-150.0, 10.0, 40.0, 40.0]);
-        assert!(inbox.visual.publish("one", contact));
+        assert!(inbox.publish("one", contact));
     }
 
     fn assert_bounds_expired(map: &RenderMap, left: DisplayGeometry) {
@@ -1857,8 +2199,8 @@ mod tests {
         let mut inbox = OverlayInbox::default();
         let mut map = empty_map();
         let t = Instant::now();
-        let one = inbox.visual.begin_action("one").unwrap();
-        let two = inbox.visual.begin_action("two").unwrap();
+        let one = inbox.begin_action("one").unwrap();
+        let two = inbox.begin_action("two").unwrap();
         for (key, id, x, window) in [
             ("one", one, 20.0, 111),
             ("two", two, 40.0, 222),
@@ -1867,7 +2209,7 @@ mod tests {
             let mut event = mailbox_event(id, x, cursor_overlay::VisualPhase::Tracking);
             event.timestamp = t;
             event.window = Some(window);
-            assert!(inbox.visual.publish(key, event));
+            assert!(inbox.publish(key, event));
             inbox.take().apply(&mut map, t);
         }
         assert_eq!(map.cursors["one"].target, Some((60.0, 30.0)));
@@ -1891,13 +2233,13 @@ mod tests {
         map.layout.displays.push(left);
         map.template.motion.idle_hide_ms = 0.0;
         let t = Instant::now();
-        let id = inbox.visual.begin_action("one").unwrap();
+        let id = inbox.begin_action("one").unwrap();
         let mut contact = mailbox_event(id, -100.0, cursor_overlay::VisualPhase::Contact);
         contact.timestamp = t;
-        inbox.visual.publish("one", contact);
+        inbox.publish("one", contact);
         let mut tracking = mailbox_event(id, 90.0, cursor_overlay::VisualPhase::Tracking);
         tracking.timestamp = t + Duration::from_millis(10);
-        inbox.visual.publish("one", tracking);
+        inbox.publish("one", tracking);
         inbox.take().apply(&mut map, t + Duration::from_millis(10));
         let core = &mut map.cursors.get_mut("one").unwrap().core;
         core.advance_visual_presentation(t + Duration::from_millis(50));
@@ -1947,14 +2289,14 @@ mod tests {
             for _ in 0..5000 {
                 inbox.command(command("old", OverlayCommand::PinAbove(7)));
             }
-            let id = inbox.visual.begin_action("old").unwrap();
-            inbox.visual.publish(
+            let id = inbox.begin_action("old").unwrap();
+            inbox.publish(
                 "old",
                 mailbox_event(id, 50.0, cursor_overlay::VisualPhase::Intent),
             );
             inbox.command(OverlayMsg::Remove("old".into()));
-            let fresh = inbox.visual.begin_action("new").unwrap();
-            let accepted = inbox.visual.publish(
+            let fresh = inbox.begin_action("new").unwrap();
+            let accepted = inbox.publish(
                 "new",
                 mailbox_event(fresh, 70.0, cursor_overlay::VisualPhase::Intent),
             );
@@ -1975,16 +2317,16 @@ mod tests {
     fn slice_a_mailbox_two_sessions_follow_accepted_order_after_coalescing() {
         let mut inbox = OverlayInbox::default();
         let mut map = empty_map();
-        let one = inbox.visual.begin_action("one").unwrap();
-        let two = inbox.visual.begin_action("two").unwrap();
-        inbox.visual.publish(
+        let one = inbox.begin_action("one").unwrap();
+        let two = inbox.begin_action("two").unwrap();
+        inbox.publish(
             "one",
             mailbox_event(one, 20.0, cursor_overlay::VisualPhase::Intent),
         );
         let mut e = mailbox_event(two, 40.0, cursor_overlay::VisualPhase::Intent);
         e.window = Some(222);
-        inbox.visual.publish("two", e);
-        inbox.visual.publish(
+        inbox.publish("two", e);
+        inbox.publish(
             "one",
             mailbox_event(one, 60.0, cursor_overlay::VisualPhase::Intent),
         );
@@ -2002,26 +2344,26 @@ mod tests {
         let now = Instant::now();
         let mut inbox = OverlayInbox::default();
         let mut map = empty_map();
-        let old = inbox.visual.begin_action("one").unwrap();
-        inbox.visual.publish(
+        let old = inbox.begin_action("one").unwrap();
+        inbox.publish(
             "one",
             mailbox_event(old, 20.0, cursor_overlay::VisualPhase::Intent),
         );
         inbox.take().apply(&mut map, now);
         assert!(map.cursors.contains_key("one"));
         inbox.command(OverlayMsg::Remove("one".into()));
-        assert!(!inbox.visual.publish(
+        assert!(!inbox.publish(
             "one",
             mailbox_event(old, 20.0, cursor_overlay::VisualPhase::Contact)
         ));
         inbox.command(OverlayMsg::Revive("one".into()));
-        assert!(!inbox.visual.publish(
+        assert!(!inbox.publish(
             "one",
             mailbox_event(old, 20.0, cursor_overlay::VisualPhase::Contact)
         ));
-        let fresh = inbox.visual.begin_action("one").unwrap();
+        let fresh = inbox.begin_action("one").unwrap();
         assert_ne!(fresh.generation, old.generation);
-        inbox.visual.publish(
+        inbox.publish(
             "one",
             mailbox_event(fresh, 80.0, cursor_overlay::VisualPhase::Intent),
         );
@@ -2039,8 +2381,8 @@ mod tests {
         let mut inbox = OverlayInbox::default();
         let mut map = empty_map();
         for n in 0..10_000 {
-            let id = inbox.visual.begin_action("one").unwrap();
-            assert!(inbox.visual.publish(
+            let id = inbox.begin_action("one").unwrap();
+            assert!(inbox.publish(
                 "one",
                 mailbox_event(id, (n % 90) as f64, cursor_overlay::VisualPhase::Intent)
             ));

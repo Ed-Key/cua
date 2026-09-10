@@ -455,6 +455,48 @@ impl Tool for DragTool {
 mod tests {
     use super::*;
     #[test]
+    fn slice_a_fix_sparse_native_callback_keeps_drag_active_until_guard_drops() {
+        use cursor_overlay::{CursorAction, VisualPhase};
+        for fail in [false, true] {
+            let registry = crate::cursor::CursorRegistry::new();
+            let sink = crate::cursor::visual::test_support::RecordingSink::default();
+            let mut core =
+                cursor_overlay::RenderStateCore::new(cursor_overlay::CursorConfig::default());
+            core.motion.idle_hide_ms = 10.0;
+            let display = cursor_overlay::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            };
+            let result = with_drag_visual(&registry, &sink, "sparse-drag", Some(42), |observe| {
+                observe(40.0, 50.0);
+                let event = sink.1.lock().unwrap().last().unwrap().clone();
+                core.apply_visual_event(event.clone(), Some(display), event.timestamp);
+                core.tick_swift_constants_at(
+                    1.0,
+                    event.timestamp + std::time::Duration::from_secs(1),
+                );
+                assert_eq!(core.visual.resolved_action, CursorAction::Drag);
+                assert!(core.pressed);
+                assert_eq!(core.idle_alpha, 1.0);
+                assert!(core.path.is_none());
+                if fail {
+                    Err("native release error")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), fail);
+            let end = sink.1.lock().unwrap().last().unwrap().clone();
+            assert_eq!(end.phase, VisualPhase::End);
+            core.apply_visual_event(end.clone(), Some(display), end.timestamp);
+            assert!(!core.pressed);
+            assert_eq!(core.visual.resolved_action, CursorAction::Idle);
+        }
+    }
+
+    #[test]
     fn slice_a_drag_tracks_only_native_callbacks_and_cleans_early_error() {
         use cursor_overlay::VisualPhase;
         for count in [0, 2, 3] {

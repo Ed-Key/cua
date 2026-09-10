@@ -187,6 +187,28 @@ pub fn move_cursor_desktop(x: f64, y: f64) -> anyhow::Result<()> {
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+pub(crate) struct WheelDelivery {
+    pub x: f64,
+    pub y: f64,
+    pub delta_y: i32,
+    pub delta_x: i32,
+    pub timestamp: std::time::Instant,
+}
+
+pub(crate) fn run_wheel_posts<E>(
+    ticks: usize,
+    mut post: impl FnMut() -> Result<WheelDelivery, E>,
+    observed: &mut dyn FnMut(WheelDelivery),
+    mut settle: impl FnMut(),
+) -> Result<(), E> {
+    for _ in 0..ticks.max(1) {
+        observed(post()?);
+        settle();
+    }
+    Ok(())
+}
+
 /// Scroll the foreground desktop surface at a logical screen point through the
 /// global HID queue. Mirrors computer-server's pynput wheel behavior while
 /// preserving cua-driver's explicit direction/amount contract.
@@ -197,36 +219,59 @@ pub fn scroll_wheel_desktop(
     delta_x_per_tick: i32,
     ticks: usize,
 ) -> anyhow::Result<()> {
+    scroll_wheel_desktop_observed(x, y, delta_y_per_tick, delta_x_per_tick, ticks, &mut |_| {})
+}
+
+pub(crate) fn scroll_wheel_desktop_observed(
+    x: f64,
+    y: f64,
+    delta_y_per_tick: i32,
+    delta_x_per_tick: i32,
+    ticks: usize,
+    observed: &mut dyn FnMut(WheelDelivery),
+) -> anyhow::Result<()> {
     use core_graphics::event::{CGEventTapLocation, ScrollEventUnit};
 
     move_cursor_desktop(x, y)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
-    for _ in 0..ticks.max(1) {
-        // AppKit does not reliably consume synthetic LINE-unit events posted
-        // through the global HID queue. pynput's proven macOS desktop path uses
-        // PIXEL units, a null source, and scales each logical wheel notch to ten
-        // pixels. Keep that exact controller convention instead of attaching
-        // synthetic source state unrelated to the physical pointer we warped.
-        let wheel_y = (delta_y_per_tick / 12).clamp(-100, 100);
-        let wheel_x = (delta_x_per_tick / 12).clamp(-100, 100);
-        let event_ref = unsafe {
-            CGEventCreateScrollWheelEvent2(
-                std::ptr::null_mut(),
-                ScrollEventUnit::PIXEL,
-                2,
-                wheel_y,
-                wheel_x,
-                0,
-            )
-        };
-        if event_ref.is_null() {
-            return Err(anyhow::anyhow!("CGEventCreateScrollWheelEvent2 failed"));
-        }
-        let event = unsafe { CGEvent::from_ptr(event_ref) };
-        event.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(30));
-    }
-    Ok(())
+    run_wheel_posts(
+        ticks,
+        || {
+            // AppKit does not reliably consume synthetic LINE-unit events posted
+            // through the global HID queue. pynput's proven macOS desktop path uses
+            // PIXEL units, a null source, and scales each logical wheel notch to ten
+            // pixels. Keep that exact controller convention instead of attaching
+            // synthetic source state unrelated to the physical pointer we warped.
+            let wheel_y = (delta_y_per_tick / 12).clamp(-100, 100);
+            let wheel_x = (delta_x_per_tick / 12).clamp(-100, 100);
+            let event_ref = unsafe {
+                CGEventCreateScrollWheelEvent2(
+                    std::ptr::null_mut(),
+                    ScrollEventUnit::PIXEL,
+                    2,
+                    wheel_y,
+                    wheel_x,
+                    0,
+                )
+            };
+            if event_ref.is_null() {
+                return Err(anyhow::anyhow!("CGEventCreateScrollWheelEvent2 failed"));
+            }
+            let event = unsafe { CGEvent::from_ptr(event_ref) };
+            event.post(CGEventTapLocation::HID);
+            Ok(WheelDelivery {
+                x,
+                y,
+                delta_y: wheel_y,
+                delta_x: wheel_x,
+                timestamp: std::time::Instant::now(),
+            })
+        },
+        observed,
+        || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        },
+    )
 }
 
 /// Click one exact desktop point, then restore the user's cursor position.
@@ -1233,6 +1278,30 @@ pub fn scroll_wheel_at_xy(
     delta_x_per_tick: i32,
     ticks: usize,
 ) -> anyhow::Result<()> {
+    scroll_wheel_at_xy_observed(
+        pid,
+        screen_x,
+        screen_y,
+        window_local,
+        wid,
+        delta_y_per_tick,
+        delta_x_per_tick,
+        ticks,
+        &mut |_| {},
+    )
+}
+
+pub(crate) fn scroll_wheel_at_xy_observed(
+    pid: i32,
+    screen_x: f64,
+    screen_y: f64,
+    window_local: Option<(f64, f64)>,
+    wid: Option<u32>,
+    delta_y_per_tick: i32,
+    delta_x_per_tick: i32,
+    ticks: usize,
+    observed: &mut dyn FnMut(WheelDelivery),
+) -> anyhow::Result<()> {
     use core_graphics::event::ScrollEventUnit;
 
     // Prime AppKit/WebKit's tracking state at the target before the wheel
@@ -1257,49 +1326,61 @@ pub fn scroll_wheel_at_xy(
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
 
-    for _ in 0..ticks.max(1) {
-        // Fresh source per event, matching the click primitives.
-        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-            .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-        // wheel_count = 2 → both axes carried (vertical = wheel1/axis-1,
-        // horizontal = wheel2/axis-2). Convert the driver's pixel-tuned step
-        // into a bounded line delta for the event API.
-        let wheel_y = (delta_y_per_tick / 120).clamp(-10, 10);
-        let wheel_x = (delta_x_per_tick / 120).clamp(-10, 10);
-        let event =
-            CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, wheel_y, wheel_x, 0)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_scroll_event failed"))?;
+    run_wheel_posts(
+        ticks,
+        || {
+            // Fresh source per event, matching the click primitives.
+            let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+            // wheel_count = 2 → both axes carried (vertical = wheel1/axis-1,
+            // horizontal = wheel2/axis-2). Convert the driver's pixel-tuned step
+            // into a bounded line delta for the event API.
+            let wheel_y = (delta_y_per_tick / 120).clamp(-10, 10);
+            let wheel_x = (delta_x_per_tick / 120).clamp(-10, 10);
+            let event =
+                CGEvent::new_scroll_event(source, ScrollEventUnit::LINE, 2, wheel_y, wheel_x, 0)
+                    .map_err(|_| anyhow::anyhow!("CGEvent::new_scroll_event failed"))?;
 
-        let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
+            let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
 
-        // Anchor the event at the target screen point so the renderer's wheel
-        // hit-test routes the scroll to the element under the cursor.
-        unsafe { CGEventSetLocation(event_ptr, screen_x, screen_y) };
+            // Anchor the event at the target screen point so the renderer's wheel
+            // hit-test routes the scroll to the element under the cursor.
+            unsafe { CGEventSetLocation(event_ptr, screen_x, screen_y) };
 
-        // Background-delivery stamps (mirror post_mouse_event).
-        if let Some((wx, wy)) = window_local {
-            crate::input::skylight::set_window_location(event_ptr, wx, wy);
-        }
-        if let Some(wid) = wid {
-            let window_id = wid as i64;
-            let set = |f: u32, v: i64| {
-                crate::input::skylight::set_integer_field(event_ptr, f, v);
-            };
-            set(51, window_id); // windowNumber
-            set(91, window_id); // kCGMouseEventWindowUnderMousePointer
-            set(92, window_id); // ...ThatCanHandleThisEvent
-        }
-        // f40 = target pid (Chromium synthetic-event filter).
-        crate::input::skylight::set_integer_field(event_ptr, 40, pid as i64);
+            // Background-delivery stamps (mirror post_mouse_event).
+            if let Some((wx, wy)) = window_local {
+                crate::input::skylight::set_window_location(event_ptr, wx, wy);
+            }
+            if let Some(wid) = wid {
+                let window_id = wid as i64;
+                let set = |f: u32, v: i64| {
+                    crate::input::skylight::set_integer_field(event_ptr, f, v);
+                };
+                set(51, window_id); // windowNumber
+                set(91, window_id); // kCGMouseEventWindowUnderMousePointer
+                set(92, window_id); // ...ThatCanHandleThisEvent
+            }
+            // f40 = target pid (Chromium synthetic-event filter).
+            crate::input::skylight::set_integer_field(event_ptr, 40, pid as i64);
 
-        // Belt+suspenders post: SkyLight reaches backgrounded Chromium/Catalyst;
-        // the public path lands on AppKit/WKWebView. Mouse-class → no auth envelope.
-        crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
-        event.post_to_pid(pid as libc::pid_t);
+            // Belt+suspenders post: SkyLight reaches backgrounded Chromium/Catalyst;
+            // the public path lands on AppKit/WKWebView. Mouse-class → no auth envelope.
+            crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
+            event.post_to_pid(pid as libc::pid_t);
 
-        std::thread::sleep(std::time::Duration::from_millis(30));
-    }
-    Ok(())
+            Ok(WheelDelivery {
+                x: screen_x,
+                y: screen_y,
+                delta_y: wheel_y,
+                delta_x: wheel_x,
+                timestamp: std::time::Instant::now(),
+            })
+        },
+        observed,
+        || {
+            std::thread::sleep(std::time::Duration::from_millis(30));
+        },
+    )
 }
 
 extern "C" {

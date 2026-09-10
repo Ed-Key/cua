@@ -435,6 +435,10 @@ pub unsafe fn element_screen_center(element: AXUIElementRef) -> Option<(f64, f64
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn element_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
+    #[cfg(test)]
+    if let Some(result) = test_support::editor_rect(element) {
+        return result;
+    }
     // AXPosition → CGPoint
     let pos_attr = CFStr::new("AXPosition");
     let mut pos_ref: CFTypeRef = std::ptr::null();
@@ -611,6 +615,10 @@ pub unsafe fn perform_action(element: AXUIElementRef, action_name: &str) -> AXEr
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn set_string_attr(element: AXUIElementRef, attr_name: &str, value: &str) -> AXError {
+    #[cfg(test)]
+    if let Some(result) = test_support::editor_write(element, attr_name, value) {
+        return result;
+    }
     let attr = CFStr::new(attr_name);
     let cf_value = CFStr::new(value);
     AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())

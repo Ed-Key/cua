@@ -108,6 +108,7 @@ pub struct RenderStateCore {
     pub badge_modifiers: Option<(Option<DeliveryModifier>, Option<TargetModifier>)>,
     /// Elapsed chip fade time after the active semantic action clears.
     pub badge_modifier_fade_secs: Option<f64>,
+    badge_modifier_fade_started: Option<Instant>,
 }
 
 /// Logical bounds of the display containing a resolved target.
@@ -210,6 +211,7 @@ impl RenderStateCore {
             self.pressed = false;
             self.visual.to_idle();
             if self.badge_modifiers.is_some() {
+                self.badge_modifier_fade_started = Some(event.timestamp);
                 self.badge_modifier_fade_secs =
                     Some(now.saturating_duration_since(event.timestamp).as_secs_f64());
             }
@@ -217,8 +219,8 @@ impl RenderStateCore {
             self.advance_visual_presentation(now);
             return true;
         }
-        self.delivery_active =
-            event.action == CursorAction::Text && event.phase == VisualPhase::Tracking;
+        self.delivery_active = matches!(event.action, CursorAction::Text | CursorAction::Drag)
+            && event.phase == VisualPhase::Tracking;
         if let Some(bounds) = event
             .bounds
             .filter(|rect| rect.iter().all(|v| v.is_finite()) && rect[2] > 0.0 && rect[3] > 0.0)
@@ -226,6 +228,10 @@ impl RenderStateCore {
             self.focus_rect = Some(bounds);
             self.focus_rect_t = 0.0;
             self.focus_rect_timestamp = Some(event.timestamp);
+        } else {
+            self.focus_rect = None;
+            self.focus_rect_timestamp = None;
+            self.focus_rect_t = 1.0;
         }
         self.advance_focus_rect(0.0, now);
         if event.action == CursorAction::Drag && event.phase == VisualPhase::Tracking {
@@ -282,10 +288,13 @@ impl RenderStateCore {
                 });
             }
         }
-        // Generic admission supplies existing delivery/target context; resolved
-        // events replace geometry and ownership without discarding those labels.
-        self.visual
-            .begin(event.action, self.visual.delivery, self.visual.target);
+        let (delivery, target) = event.modifiers.unwrap_or((None, None));
+        self.visual.begin(event.action, delivery, target);
+        self.badge_modifiers = event
+            .modifiers
+            .filter(|(delivery, target)| delivery.is_some() || target.is_some());
+        self.badge_modifier_fade_secs = None;
+        self.badge_modifier_fade_started = None;
         self.visual_deadline = (!self.delivery_active).then_some(event.timestamp + duration);
         self.advance_visual_presentation(now);
         true
@@ -338,6 +347,7 @@ impl RenderStateCore {
             if now >= deadline {
                 self.visual.to_idle();
                 if self.badge_modifiers.is_some() {
+                    self.badge_modifier_fade_started = Some(deadline);
                     self.badge_modifier_fade_secs =
                         Some(now.saturating_duration_since(deadline).as_secs_f64());
                 }
@@ -346,12 +356,31 @@ impl RenderStateCore {
                 self.visual.elapsed_secs = now.saturating_duration_since(timestamp).as_secs_f64();
             }
         }
+        if let Some(started) = self.badge_modifier_fade_started {
+            self.badge_modifier_fade_secs =
+                Some(now.saturating_duration_since(started).as_secs_f64());
+        }
+        if self
+            .badge_modifier_fade_secs
+            .is_some_and(|elapsed| elapsed >= SESSION_BADGE_FADE_SECS)
+        {
+            self.badge_modifiers = None;
+            self.badge_modifier_fade_secs = None;
+            self.badge_modifier_fade_started = None;
+        }
         arrived
+    }
+
+    pub fn has_timed_presentation(&self) -> bool {
+        self.visual_deadline.is_some() || self.badge_modifier_fade_started.is_some()
     }
 
     /// Clear action effects when placement or visibility is invalidated.
     /// Keep the ownership watermark so late events cannot rewind this instance.
     pub fn clear_visual_presentation(&mut self) {
+        self.badge_modifiers = None;
+        self.badge_modifier_fade_secs = None;
+        self.badge_modifier_fade_started = None;
         if self.visual_travel.take().is_some() {
             self.path = None;
         }
@@ -463,6 +492,7 @@ impl RenderStateCore {
             session_badge_hovered: false,
             badge_modifiers: None,
             badge_modifier_fade_secs: None,
+            badge_modifier_fade_started: None,
         }
     }
 
@@ -842,7 +872,11 @@ impl RenderStateCore {
             self.badge_modifier_fade_secs = Some(0.0);
         }
         if let Some(elapsed) = self.badge_modifier_fade_secs {
-            let next = elapsed + dt.max(0.0);
+            let next = if self.badge_modifier_fade_started.is_some() {
+                elapsed
+            } else {
+                elapsed + dt.max(0.0)
+            };
             if next >= SESSION_BADGE_FADE_SECS {
                 self.badge_modifiers = None;
                 self.badge_modifier_fade_secs = None;
@@ -901,6 +935,13 @@ impl RenderStateCore {
                 | OverlayCommand::SetEnabled(false)
         ) {
             self.clear_visual_presentation();
+            // Legacy BeginAction context is still active when replacing legacy
+            // movement. Invalidation must clear chips even in that case.
+            if !matches!(&cmd, OverlayCommand::SetEnabled(false))
+                && (self.visual.delivery.is_some() || self.visual.target.is_some())
+            {
+                self.badge_modifiers = Some((self.visual.delivery, self.visual.target));
+            }
         }
         match cmd {
             OverlayCommand::MoveTo {
@@ -1048,6 +1089,7 @@ impl RenderStateCore {
                     None
                 };
                 self.badge_modifier_fade_secs = None;
+                self.badge_modifier_fade_started = None;
                 true
             }
             OverlayCommand::EndAction(action) => {
@@ -1834,6 +1876,7 @@ mod tests {
             bounds: None,
             action: CursorAction::Click,
             scroll_direction: None,
+            modifiers: None,
             phase,
         }
     }
@@ -1871,6 +1914,7 @@ mod tests {
             bounds: None,
             action: CursorAction::Text,
             scroll_direction: None,
+            modifiers: None,
             phase: VisualPhase::Tracking,
         };
         assert!(core.apply_visual_event(event.clone(), None, t));
@@ -1911,6 +1955,7 @@ mod tests {
                 bounds: None,
                 action: CursorAction::Scroll,
                 scroll_direction: Some(direction),
+                modifiers: None,
                 phase: VisualPhase::Contact,
             };
             let display = DisplayBounds {

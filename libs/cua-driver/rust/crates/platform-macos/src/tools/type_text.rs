@@ -49,8 +49,35 @@ pub(crate) fn with_type_visual<T>(
     target: Option<crate::cursor::visual::ResolvedPointerTarget>,
     native: impl FnOnce() -> T,
 ) -> T {
-    let _delivery = crate::cursor::visual::DeliveryVisualGuard::text(registry, sink, key, target);
-    native()
+    with_type_visual_updates(registry, sink, key, target, |_| native())
+}
+
+fn with_type_visual_updates<T>(
+    registry: &crate::cursor::CursorRegistry,
+    sink: &dyn crate::cursor::visual::PointerVisualSink,
+    key: &str,
+    target: Option<crate::cursor::visual::ResolvedPointerTarget>,
+    native: impl FnOnce(&mut dyn FnMut(Option<crate::cursor::visual::ResolvedPointerTarget>)) -> T,
+) -> T {
+    let mut delivery =
+        crate::cursor::visual::DeliveryVisualGuard::text(registry, sink, key, target);
+    native(&mut |target| delivery.retarget(registry, target))
+}
+
+fn editor_visual_target(
+    element: AXUIElementRef,
+    window: Option<u32>,
+) -> Option<crate::cursor::visual::ResolvedPointerTarget> {
+    let wid = window?;
+    unsafe {
+        matches!(
+            copy_string_attr(element, "AXRole").as_deref(),
+            Some("AXTextField" | "AXTextArea" | "AXSearchField")
+        )
+        .then(|| crate::ax::bindings::element_screen_rect(element))
+        .flatten()
+        .and_then(|rect| crate::cursor::visual::ResolvedPointerTarget::from_bounds(wid, rect))
+    }
 }
 
 pub struct TypeTextTool {
@@ -381,25 +408,14 @@ impl Tool for TypeTextTool {
             || async move {
                 tokio::task::spawn_blocking(move || {
                     let target = element_ptr.and_then(|(ptr, _)| {
-                        window_id.and_then(|wid| unsafe {
-                            let element = ptr as AXUIElementRef;
-                            matches!(
-                                crate::ax::bindings::copy_string_attr(element, "AXRole").as_deref(),
-                                Some("AXTextField" | "AXTextArea" | "AXSearchField")
-                            )
-                            .then(|| crate::ax::bindings::element_screen_rect(element))
-                            .flatten()
-                            .and_then(|rect| {
-                                crate::cursor::visual::ResolvedPointerTarget::from_bounds(wid, rect)
-                            })
-                        })
+                        editor_visual_target(ptr as AXUIElementRef, window_id)
                     });
-                    with_type_visual(
+                    with_type_visual_updates(
                         &visual_registry,
                         &crate::cursor::visual::OverlayVisualSink,
                         &cursor_key,
                         target,
-                        || {
+                        |update| {
                             type_text_blocking(
                                 pid,
                                 &text_clone,
@@ -409,6 +425,9 @@ impl Tool for TypeTextTool {
                                 delivery_mode,
                                 window_id,
                                 blocking_policy,
+                                Some(&mut |element| {
+                                    update(editor_visual_target(element, window_id))
+                                }),
                             )
                         },
                     )
@@ -1135,6 +1154,7 @@ fn type_text_blocking(
     delivery_mode: super::DeliveryMode,
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
+    resolved_editor: Option<&mut dyn FnMut(AXUIElementRef)>,
 ) -> anyhow::Result<TypeTextDelivery> {
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -1296,6 +1316,9 @@ fn type_text_blocking(
     };
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
+        if let Some(observed) = resolved_editor {
+            observed(element);
+        }
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
         let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
@@ -1395,6 +1418,67 @@ fn type_text_blocking(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn slice_a_fix_focused_editor_resolution_updates_delivery_before_ax_write() {
+        use crate::ax::bindings::test_support::EditorScope;
+        for (role, bounds, expected) in [
+            (
+                "AXTextField",
+                Some([10.0, 20.0, 100.0, 40.0]),
+                Some([10.0, 20.0, 100.0, 40.0]),
+            ),
+            ("AXTextArea", None, None),
+            ("AXButton", Some([10.0, 20.0, 100.0, 40.0]), None),
+            ("AXTextField", Some([10.0, 20.0, 0.0, 40.0]), None),
+        ] {
+            let registry = crate::cursor::CursorRegistry::new();
+            let sink = Arc::new(crate::cursor::visual::test_support::RecordingSink::default());
+            let observed = sink.clone();
+            let _fixture = EditorScope::install(role, bounds, move || {
+                let active = observed.1.lock().unwrap().last().unwrap().clone();
+                assert_eq!(active.phase, cursor_overlay::VisualPhase::Tracking);
+                assert_eq!(
+                    active.bounds, expected,
+                    "the actual focused editor must be highlighted before its write"
+                );
+                assert_eq!(active.target, expected.map(|_| (60.0, 40.0)));
+            });
+            let result = with_type_visual_updates(
+                &registry,
+                sink.as_ref(),
+                "focused-type",
+                None,
+                |update| {
+                    type_text_blocking(
+                        -9876,
+                        "hello",
+                        None,
+                        0,
+                        false,
+                        super::super::DeliveryMode::Background,
+                        Some(42),
+                        BackgroundKeyboardPolicy::Allowed,
+                        Some(&mut |element| update(editor_visual_target(element, Some(42)))),
+                    )
+                },
+            )
+            .unwrap();
+            let TypeTextDelivery::Typed(outcome) = result else {
+                panic!("expected unchanged AX delivery result");
+            };
+            assert_eq!(outcome.path, PATH_AX);
+            assert_eq!(outcome.delivered_chars, Some(5));
+            assert!(outcome.verified);
+            assert_eq!(
+                sink.1.lock().unwrap().last().unwrap().phase,
+                cursor_overlay::VisualPhase::End
+            );
+            if expected.is_none() {
+                assert!(registry.get("focused-type").is_none());
+            }
+        }
+    }
+
+    #[test]
     fn slice_a_type_delivery_and_error_drop_end_trusted_editor_highlight() {
         use crate::cursor::visual::{test_support::RecordingSink, ResolvedPointerTarget};
         use cursor_overlay::VisualPhase;
@@ -1480,6 +1564,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+            None,
         );
         // We don't care whether r is Ok or Err — what matters is that
         // calling it with is_terminal_target=true is safe and never
@@ -1506,6 +1591,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             Some(7),
             BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
+            None,
         );
         match r {
             Ok(TypeTextDelivery::Refused(returned)) => assert_eq!(returned, refusal),
@@ -1525,6 +1611,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+            None,
         )
         .expect("preflight refusal must not attempt the invalid pid");
         let TypeTextDelivery::SynthesisRefused {

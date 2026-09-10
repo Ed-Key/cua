@@ -73,6 +73,7 @@ pub(crate) fn emit_action_target(
             bounds: target.and_then(|t| t.element_bounds),
             action,
             scroll_direction: None,
+            modifiers: None,
             phase: VisualPhase::Intent,
         };
         sink.publish(key, event.clone());
@@ -116,9 +117,24 @@ impl PointerVisualHandle {
         next.publish(sink, VisualPhase::Tracking, Instant::now());
     }
     pub(crate) fn scroll_contact(&self, sink: &dyn PointerVisualSink, dy: i32, dx: i32) {
+        let Some((x, y)) = self.event.as_ref().and_then(|event| event.target) else {
+            return;
+        };
+        self.scroll_contact_at(sink, x, y, dy, dx, Instant::now());
+    }
+    pub(crate) fn scroll_contact_at(
+        &self,
+        sink: &dyn PointerVisualSink,
+        x: f64,
+        y: f64,
+        dy: i32,
+        dx: i32,
+        timestamp: Instant,
+    ) {
         use cursor_overlay::ScrollDirection;
         let mut next = self.clone();
         if let Some(event) = next.event.as_mut() {
+            event.target = Some((x, y));
             event.scroll_direction = if dy > 0 {
                 Some(ScrollDirection::Up)
             } else if dy < 0 {
@@ -131,7 +147,7 @@ impl PointerVisualHandle {
                 None
             };
         }
-        next.publish(sink, VisualPhase::Contact, Instant::now());
+        next.publish(sink, VisualPhase::Contact, timestamp);
     }
     pub(crate) fn pin(&mut self, window: Option<u32>) {
         if let Some(event) = self.event.as_mut() {
@@ -163,6 +179,25 @@ pub(crate) struct DeliveryVisualGuard<'a> {
     sink: &'a dyn PointerVisualSink,
 }
 impl<'a> DeliveryVisualGuard<'a> {
+    pub(crate) fn retarget(
+        &mut self,
+        registry: &super::CursorRegistry,
+        target: Option<ResolvedPointerTarget>,
+    ) {
+        if cua_driver_core::session::is_session_ended(&self.handle.key) {
+            return;
+        }
+        if let Some(event) = self.handle.event.as_mut() {
+            event.target = target.map(|target| (target.x, target.y));
+            event.bounds = target.and_then(|target| target.element_bounds);
+            event.window = target.and_then(|target| target.window_id.map(u64::from));
+            if let Some(target) = target {
+                registry.update_position(&self.handle.key, target.x, target.y);
+            }
+        }
+        self.handle
+            .publish(self.sink, VisualPhase::Tracking, Instant::now());
+    }
     pub(crate) fn text(
         registry: &super::CursorRegistry,
         sink: &'a dyn PointerVisualSink,
@@ -214,6 +249,36 @@ impl DeliveryReceipt {
     pub(crate) fn was_accepted(&self) -> bool {
         self.0.lock().unwrap().accepted.is_some()
     }
+    pub(crate) fn dispatch_at<T, E>(
+        &self,
+        registry: &super::CursorRegistry,
+        x: f64,
+        y: f64,
+        window: u32,
+        native: impl FnOnce(f64, f64) -> Result<T, E>,
+    ) -> Result<T, E> {
+        {
+            let mut state = self.0.lock().unwrap();
+            if let Some((sink, handle)) = state.visual.as_mut() {
+                if !cua_driver_core::session::is_session_ended(&handle.key) {
+                    if let (Some(target), Some(event)) =
+                        (point(x, y, Some(window)), handle.event.as_mut())
+                    {
+                        // Keep the native fallback's exact coordinates and action ID.
+                        // Its fresh center does not establish fresh element bounds.
+                        event.target = Some((target.x, target.y));
+                        event.window = Some(u64::from(window));
+                        event.bounds = None;
+                        sink.send(&handle.key, OverlayCommand::PinAbove(u64::from(window)));
+                        registry.update_position(&handle.key, x, y);
+                        handle.publish(sink.as_ref(), VisualPhase::Intent, Instant::now());
+                    }
+                }
+            }
+        }
+        self.dispatch(|| native(x, y))
+    }
+
     pub(crate) fn dispatch<T, E>(&self, native: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
         let result = native();
         if result.is_ok() {

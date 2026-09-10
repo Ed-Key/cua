@@ -35,6 +35,10 @@ pub struct VisualEvent {
     pub bounds: Option<[f64; 4]>,
     pub action: CursorAction,
     pub scroll_direction: Option<ScrollDirection>,
+    pub modifiers: Option<(
+        Option<crate::DeliveryModifier>,
+        Option<crate::TargetModifier>,
+    )>,
     pub phase: VisualPhase,
 }
 
@@ -91,8 +95,12 @@ impl VisualMailbox {
         self.order += 1;
         self.order
     }
+    /// Admission shared by timed events and adapter configuration commands.
+    pub fn accepts_key(&self, key: &str) -> bool {
+        !key.is_empty() && !self.ended.contains(key)
+    }
     pub fn begin_action(&mut self, key: &str) -> Option<VisualActionId> {
-        if key.is_empty() || self.ended.contains(key) {
+        if !self.accepts_key(key) {
             return None;
         }
         let session = self.sessions.entry(key.to_owned()).or_insert_with(|| {
@@ -204,6 +212,7 @@ mod tests {
             bounds: None,
             action: CursorAction::Click,
             scroll_direction: None,
+            modifiers: None,
         }
     }
     #[test]
@@ -397,6 +406,21 @@ mod tests {
     }
     #[test]
     fn semantic_intent_and_text_delivery_never_invent_contact_coordinates() {
+        for action in CursorAction::ALL {
+            let mut mailbox = VisualMailbox::default();
+            let id = mailbox.begin_action("semantic").unwrap();
+            let mut intent = event(id, VisualPhase::Intent, Instant::now(), 1.0);
+            intent.action = action;
+            intent.target = None;
+            assert!(mailbox.publish("semantic", intent));
+            assert!(mailbox.take_pending()["semantic"]
+                .latest
+                .as_ref()
+                .unwrap()
+                .event
+                .target
+                .is_none());
+        }
         let mut m = VisualMailbox::default();
         let id = m.begin_action("a").unwrap();
         let mut e = event(id, VisualPhase::Intent, Instant::now(), 1.0);

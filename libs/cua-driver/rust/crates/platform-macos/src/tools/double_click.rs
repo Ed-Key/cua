@@ -360,7 +360,7 @@ fn ax_double_click(
              screen coordinates as window-local for element [{idx}]."
             )
         })?;
-    visual.dispatch(|| {
+    visual.dispatch_at(registry, cx, cy, wid, |cx, cy| {
         crate::input::mouse::click_at_xy_with_window_local(
             pid,
             cx,
@@ -380,6 +380,96 @@ fn ax_double_click(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slice_a_fix_native_fallback_rebinds_actual_center_and_drops_stale_bounds() {
+        use crate::cursor::visual::{
+            begin_pointer_action, test_support::RecordingSink, ResolvedPointerTarget,
+        };
+        for initial in [
+            ResolvedPointerTarget::from_bounds(42, [10.0, 20.0, 20.0, 20.0]),
+            None,
+        ] {
+            for (accepted, failed) in [(false, true), (true, false), (true, true)] {
+                let registry = crate::cursor::CursorRegistry::new();
+                let sink = Arc::new(RecordingSink::default());
+                let receipt = begin_pointer_action(
+                    &registry,
+                    sink.clone(),
+                    "double_click-fallback",
+                    initial,
+                    cursor_overlay::CursorAction::Click,
+                );
+                // AX bounds were at A (or unreadable). Its failed semantic attempt
+                // leaves the receipt unaccepted. The existing native read found B.
+                let result = receipt.dispatch_at(&registry, 90.0, 80.0, 42, |x, y| {
+                    assert_eq!(
+                        (x, y),
+                        (90.0, 80.0),
+                        "native coordinates must stay unchanged"
+                    );
+                    let pos = registry
+                        .get("double_click-fallback")
+                        .unwrap()
+                        .position
+                        .unwrap();
+                    assert_eq!(
+                        (pos.x, pos.y),
+                        (90.0, 80.0),
+                        "registry must follow the actual fallback"
+                    );
+                    if accepted && failed {
+                        receipt.accepted();
+                    }
+                    if failed {
+                        Err("native outcome error")
+                    } else {
+                        Ok("delivered")
+                    }
+                });
+                assert_eq!(
+                    result,
+                    if failed {
+                        Err("native outcome error")
+                    } else {
+                        Ok("delivered")
+                    }
+                );
+                assert_eq!(receipt.was_accepted(), accepted);
+                let events = sink.1.lock().unwrap();
+                let contacts: Vec<_> = events
+                    .iter()
+                    .filter(|event| event.phase == cursor_overlay::VisualPhase::Contact)
+                    .collect();
+                assert_eq!(contacts.len(), usize::from(accepted));
+                let last = events.last().unwrap();
+                assert_eq!(last.target, Some((90.0, 80.0)));
+                assert_eq!(last.bounds, None);
+                assert_eq!(last.window, Some(42));
+                assert_eq!(last.id, events[0].id, "fallback retains action ownership");
+                let mut core =
+                    cursor_overlay::RenderStateCore::new(cursor_overlay::CursorConfig::default());
+                let display = cursor_overlay::DisplayBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width: 100.0,
+                    height: 100.0,
+                };
+                // Include a drain of the first rectangle, so omitting later bounds
+                // cannot leave an already rendered stale rectangle behind.
+                for event in events.iter() {
+                    core.apply_visual_event(event.clone(), Some(display), event.timestamp);
+                }
+                assert!(
+                    core.focus_rect.is_none(),
+                    "fallback must clear the earlier rendered bounds"
+                );
+                if accepted {
+                    assert_eq!(core.contact.unwrap().target, (90.0, 80.0));
+                }
+            }
+        }
+    }
+
     #[test]
     fn slice_a_pointer_route_dispatch_feedback_preserves_error_and_fallback() {
         use crate::cursor::visual::{begin_pointer_action, point, test_support::RecordingSink};

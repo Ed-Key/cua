@@ -65,6 +65,32 @@ fn dispatch_scroll_visual<T, E>(
     result
 }
 
+fn dispatch_wheel_visual<T, E>(
+    registry: &crate::cursor::CursorRegistry,
+    sink: &dyn crate::cursor::visual::PointerVisualSink,
+    key: &str,
+    target: Option<crate::cursor::visual::ResolvedPointerTarget>,
+    native: impl FnOnce(&mut dyn FnMut(crate::input::mouse::WheelDelivery)) -> Result<T, E>,
+) -> Result<T, E> {
+    let handle = crate::cursor::visual::emit_action_target(
+        registry,
+        sink,
+        key,
+        target,
+        cursor_overlay::CursorAction::Scroll,
+    );
+    native(&mut |delivery| {
+        handle.scroll_contact_at(
+            sink,
+            delivery.x,
+            delivery.y,
+            delivery.delta_y,
+            delivery.delta_x,
+            delivery.timestamp,
+        );
+    })
+}
+
 pub struct ScrollTool {
     state: Arc<ToolState>,
 }
@@ -173,14 +199,16 @@ impl Tool for ScrollTool {
             let key = super::cursor_tools::resolve_cursor_key(&args);
             let registry = self.state.cursor_registry.clone();
             let result = tokio::task::spawn_blocking(move || {
-                dispatch_scroll_visual(
+                dispatch_wheel_visual(
                     &registry,
                     &crate::cursor::visual::OverlayVisualSink,
                     &key,
                     crate::cursor::visual::point(x, y, None),
-                    delta_y,
-                    delta_x,
-                    || crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount),
+                    |observed| {
+                        crate::input::mouse::scroll_wheel_desktop_observed(
+                            x, y, delta_y, delta_x, amount, observed,
+                        )
+                    },
                 )
             })
             .await;
@@ -583,8 +611,11 @@ impl Tool for ScrollTool {
                 "scroll.CGScrollWheel",
                 || async move {
                     tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                        let do_it = move || -> anyhow::Result<()> {
-                            crate::input::mouse::scroll_wheel_at_xy(
+                        let do_it = move |observed: &mut dyn FnMut(
+                            crate::input::mouse::WheelDelivery,
+                        )|
+                              -> anyhow::Result<()> {
+                            crate::input::mouse::scroll_wheel_at_xy_observed(
                                 pid,
                                 screen_x,
                                 screen_y,
@@ -593,16 +624,15 @@ impl Tool for ScrollTool {
                                 delta_y,
                                 delta_x,
                                 amount_ticks,
+                                observed,
                             )
                         };
                         let do_it = || {
-                            dispatch_scroll_visual(
+                            dispatch_wheel_visual(
                                 &visual_registry,
                                 &crate::cursor::visual::OverlayVisualSink,
                                 &cursor_key,
                                 crate::cursor::visual::point(screen_x, screen_y, wid),
-                                delta_y,
-                                delta_x,
                                 do_it,
                             )
                         };
@@ -846,6 +876,94 @@ unsafe fn collect_ax_buttons(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slice_a_fix_wheel_posts_publish_before_settle_and_survive_later_failure() {
+        use crate::input::mouse::{run_wheel_posts, WheelDelivery};
+        use cursor_overlay::VisualPhase;
+        for fail_at in [Some(0), Some(2), None] {
+            let registry = crate::cursor::CursorRegistry::new();
+            let sink = crate::cursor::visual::test_support::RecordingSink::default();
+            let t = std::time::Instant::now();
+            let mut posts = 0;
+            let mut settles = 0;
+            let result = dispatch_wheel_visual(
+                &registry,
+                &sink,
+                "wheel-post",
+                crate::cursor::visual::point(40.0, 50.0, Some(42)),
+                |observed| {
+                    run_wheel_posts(
+                        3,
+                        || {
+                            if fail_at == Some(posts) {
+                                return Err("allocation failed");
+                            }
+                            posts += 1;
+                            Ok(WheelDelivery {
+                                x: 40.0,
+                                y: 50.0,
+                                delta_y: -1,
+                                delta_x: 0,
+                                timestamp: t,
+                            })
+                        },
+                        observed,
+                        || {
+                            settles += 1;
+                            let events = sink.1.lock().unwrap();
+                            let contact = events.last().unwrap();
+                            assert_eq!(
+                                contact.phase,
+                                VisualPhase::Contact,
+                                "post must be observed before the existing settle delay"
+                            );
+                            assert_eq!(contact.timestamp, t);
+                            assert_eq!(contact.target, Some((40.0, 50.0)));
+                            assert_eq!(
+                                contact.scroll_direction,
+                                Some(cursor_overlay::ScrollDirection::Down)
+                            );
+                        },
+                    )
+                },
+            );
+            assert_eq!(
+                result,
+                if fail_at.is_some() {
+                    Err("allocation failed")
+                } else {
+                    Ok(())
+                }
+            );
+            assert_eq!(settles, posts);
+            let events = sink.1.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.phase == VisualPhase::Contact)
+                    .count(),
+                posts
+            );
+            if posts > 0 {
+                let mut core =
+                    cursor_overlay::RenderStateCore::new(cursor_overlay::CursorConfig::default());
+                core.apply_visual_event(
+                    events.last().unwrap().clone(),
+                    Some(cursor_overlay::DisplayBounds {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 100.0,
+                        height: 100.0,
+                    }),
+                    t + std::time::Duration::from_millis(75),
+                );
+                assert!((core.contact.unwrap().progress - 0.5).abs() < 1e-9);
+                core.advance_visual_presentation(t + std::time::Duration::from_secs(2));
+                assert!(core.contact.is_none());
+            }
+        }
+    }
+
     #[test]
     fn slice_a_scroll_contact_matches_delivered_direction_and_point() {
         use cursor_overlay::{ScrollDirection as D, VisualPhase};
