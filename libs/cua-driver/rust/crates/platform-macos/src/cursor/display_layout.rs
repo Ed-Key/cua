@@ -21,7 +21,13 @@ pub(crate) struct DisplayGeometry {
 
 impl DisplayGeometry {
     pub(crate) fn contains(self, x: f64, y: f64) -> bool {
-        x >= self.x && x < self.x + self.width && y >= self.y && y < self.y + self.height
+        cursor_overlay::DisplayBounds {
+            x: self.x,
+            y: self.y,
+            width: self.width,
+            height: self.height,
+        }
+        .contains((x, y))
     }
 
     pub(crate) fn pixel_size(self) -> (u32, u32) {
@@ -55,17 +61,6 @@ impl DisplayLayout {
             .find(|display| display.contains(x, y))
     }
 
-    pub(crate) fn display_for_or_primary(&self, x: f64, y: f64) -> Option<DisplayGeometry> {
-        self.display_at(x, y)
-            .or_else(|| {
-                self.displays
-                    .iter()
-                    .copied()
-                    .find(|display| display.is_primary)
-            })
-            .or_else(|| self.displays.first().copied())
-    }
-
     pub(crate) fn primary_height(&self) -> Option<f64> {
         self.displays
             .iter()
@@ -92,7 +87,14 @@ pub(crate) fn active_layout(generation: u64) -> Result<DisplayLayout, i32> {
             let bounds = display.bounds();
             let width = bounds.size.width;
             let height = bounds.size.height;
-            if !width.is_finite() || !height.is_finite() || width <= 0.0 || height <= 0.0 {
+            if !(cursor_overlay::DisplayBounds {
+                x: bounds.origin.x,
+                y: bounds.origin.y,
+                width,
+                height,
+            })
+            .contains((bounds.origin.x, bounds.origin.y))
+            {
                 return None;
             }
             let scale = crate::tools::get_screen_size::get_backing_scale(id);
@@ -154,6 +156,59 @@ mod tests {
                     is_primary: false,
                 },
             ],
+        }
+    }
+
+    #[test]
+    fn slice_a_invalid_geometry_and_targets_have_no_containing_display() {
+        let valid = layout().displays[0];
+        for display in [
+            DisplayGeometry {
+                width: f64::INFINITY,
+                ..valid
+            },
+            DisplayGeometry {
+                height: 0.0,
+                ..valid
+            },
+            DisplayGeometry {
+                x: f64::NAN,
+                ..valid
+            },
+            DisplayGeometry {
+                y: f64::NEG_INFINITY,
+                height: f64::INFINITY,
+                ..valid
+            },
+        ] {
+            let layout = DisplayLayout {
+                generation: 1,
+                displays: vec![display],
+            };
+            assert!(layout.display_at(50.0, 50.0).is_none());
+        }
+        assert!(layout().display_at(3000.0, 3000.0).is_none());
+        assert!(layout().display_at(f64::INFINITY, 50.0).is_none());
+    }
+
+    #[test]
+    fn slice_a_requested_origins_project_appkit_frames_and_native_sizes() {
+        for (x, y, scale, want_y, want_size) in [
+            (0.0, 0.0, 2.0, 82.0, (2880, 1800)),
+            (-1440.0, 0.0, 1.0, 82.0, (1440, 900)),
+            (0.0, -900.0, 2.0, 982.0, (2880, 1800)),
+        ] {
+            let d = DisplayGeometry {
+                id: 1,
+                x,
+                y,
+                width: 1440.0,
+                height: 900.0,
+                backing_scale: scale,
+                is_primary: false,
+            };
+            assert_eq!(d.appkit_frame(982.0).origin, NSPoint::new(x, want_y));
+            assert_eq!(d.pixel_size(), want_size);
         }
     }
 

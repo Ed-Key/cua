@@ -95,6 +95,8 @@ struct RenderMap {
     layout: DisplayLayout,
     /// Most recently commanded cursor. Its live position determines which
     /// display surface owns target-relative z-order while it animates.
+    /// Sessions on one display share this native order; their stored pin IDs
+    /// remain independent, but one surface cannot stack above two windows separately.
     active_key: Option<CursorKey>,
     /// Frozen launch-time config used as the template for lazily-created cursors.
     template: CursorConfig,
@@ -162,9 +164,12 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
             };
             if let Some((x, y)) = target {
                 if !animation_enabled(map, &key) || map.layout.display_at(x, y).is_none() {
-                    map.cursors
+                    let rs = map
+                        .cursors
                         .entry(key.clone())
                         .or_insert_with(|| render_state_for_key(&map.template, &key));
+                    rs.target = Some((x, y));
+                    rs.invalidate_placement();
                     arrival_fire(&key);
                     return;
                 }
@@ -177,6 +182,9 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
                 .cursors
                 .entry(key.clone())
                 .or_insert_with(|| render_state_for_key(&template, &key));
+            if let Some(target) = target {
+                rs.target = Some(target);
+            }
             let ends_travel = matches!(
                 &cmd,
                 OverlayCommand::SnapTo { .. } | OverlayCommand::SetEnabled(false)
@@ -475,6 +483,8 @@ pub fn run_on_main_thread() {
 
 struct RenderState {
     core: RenderStateCore,
+    /// Last resolved target, independent of the temporary seed or path position.
+    target: Option<(f64, f64)>,
     /// Focus-highlight rectangle `[x, y, w, h]` in screen coords; None = not shown.
     focus_rect: Option<[f64; 4]>,
     /// Fade progress for the focus rect: 0.0 = fully visible, 1.0 = gone.
@@ -485,9 +495,22 @@ impl RenderState {
     fn new(cfg: CursorConfig) -> Self {
         RenderState {
             core: RenderStateCore::new(cfg),
+            target: None,
             focus_rect: None,
             focus_rect_t: 1.0,
         }
+    }
+
+    fn invalidate_placement(&mut self) {
+        self.core.placed = false;
+        self.core.path = None;
+        self.core.spring = None;
+        self.core.spring_tgt = None;
+        self.core.dist = 0.0;
+        self.core.click_t = None;
+        self.core.session_badge_hovered = false;
+        self.focus_rect = None;
+        self.focus_rect_t = 1.0;
     }
 
     /// Advance the animation by `dt`.  Uses the Swift reference constants
@@ -675,32 +698,47 @@ unsafe fn create_native_surface(
     })
 }
 
-unsafe fn rebuild_appkit_host() -> bool {
-    let generation = DISPLAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    let layout = match super::display_layout::active_layout(generation) {
-        Ok(layout) if !layout.displays.is_empty() => layout,
-        Ok(_) => return false,
-        Err(error) => {
-            tracing::warn!(
-                error,
-                "macOS cursor overlay could not enumerate active displays"
-            );
-            return false;
+fn replace_display_layout(map: &mut RenderMap, layout: DisplayLayout) {
+    for (key, state) in &mut map.cursors {
+        if state
+            .target
+            .is_some_and(|(x, y)| layout.display_at(x, y).is_none())
+        {
+            state.invalidate_placement();
+            arrival_fire(key);
         }
-    };
-    let Some(host) = AppKitOverlayHost::create(&layout) else {
-        tracing::warn!("macOS cursor overlay could not create every display surface");
-        return false;
-    };
-
-    if let Some(map) = RENDER.lock().unwrap().as_mut() {
-        map.layout = layout;
     }
-    let previous = HOST.lock().unwrap().replace(host);
+    map.layout = layout;
+}
+
+unsafe fn rebuild_appkit_host() {
+    let generation = DISPLAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
+    let mut layout = super::display_layout::active_layout(generation).unwrap_or_else(|error| {
+        tracing::warn!(
+            error,
+            "macOS cursor overlay could not enumerate active displays"
+        );
+        DisplayLayout {
+            generation,
+            displays: vec![],
+        }
+    });
+    let host = AppKitOverlayHost::create(&layout);
+    if host.is_none() {
+        // A failed or empty rebuild invalidates every old viewport. Publishing
+        // an empty snapshot also rejects placement until a later rebuild succeeds.
+        if !layout.displays.is_empty() {
+            tracing::warn!("macOS cursor overlay could not create every display surface");
+        }
+        layout.displays.clear();
+    }
+    if let Some(map) = RENDER.lock().unwrap().as_mut() {
+        replace_display_layout(map, layout);
+    }
+    let previous = std::mem::replace(&mut *HOST.lock().unwrap(), host);
     if let Some(previous) = previous {
         previous.close();
     }
-    true
 }
 
 unsafe fn run_appkit(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
@@ -714,9 +752,7 @@ unsafe fn run_appkit(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
     let _: bool = msg_send![app, setActivationPolicy: 1i64];
     let _: () = msg_send![app, finishLaunching];
 
-    if !rebuild_appkit_host() {
-        return;
-    }
+    rebuild_appkit_host();
     register_display_reconfiguration_callback();
 
     std::thread::spawn(move || render_loop(rx));
@@ -745,10 +781,9 @@ fn register_display_reconfiguration_callback() {
 
 fn dispatch_rebuild_appkit_host() {
     dispatch_on_main(Box::new(|| unsafe {
-        if rebuild_appkit_host() {
-            if let Some(tx) = CMD_TX.get() {
-                let _ = tx.try_send(MacOverlayMsg::LayoutChanged);
-            }
+        rebuild_appkit_host();
+        if let Some(tx) = CMD_TX.get() {
+            let _ = tx.try_send(MacOverlayMsg::LayoutChanged);
         }
     }));
 }
@@ -1273,6 +1308,157 @@ mod tests {
     }
 
     #[test]
+    fn slice_a_negative_y_surface_paints_pointer_and_focus_at_two_x() {
+        let mut map = empty_map();
+        let above = DisplayGeometry {
+            id: 2,
+            x: 0.0,
+            y: -900.0,
+            width: 1440.0,
+            height: 900.0,
+            backing_scale: 2.0,
+            is_primary: false,
+        };
+        map.layout.displays.push(above);
+        apply_msg(
+            &mut map,
+            command(
+                "above",
+                OverlayCommand::SnapTo {
+                    x: 40.0,
+                    y: -860.0,
+                    heading_radians: Some(0.0),
+                },
+            ),
+        );
+        apply_msg(
+            &mut map,
+            command(
+                "above",
+                OverlayCommand::ShowFocusRect(Some([95.0, -840.0, 40.0, 20.0])),
+            ),
+        );
+        assert_eq!(painted_display_ids(&map), HashSet::from([2]));
+        let pm = render_display(&map, above);
+        assert_eq!((pm.width(), pm.height()), (2880, 1800));
+        assert!(pm.pixel(190, 140).unwrap().alpha() > 100);
+        assert!(pm.data().chunks_exact(4).any(|pixel| pixel[3] > 0));
+        assert!(render_display(&map, map.layout.displays[0])
+            .data()
+            .iter()
+            .all(|v| *v == 0));
+    }
+
+    #[test]
+    fn slice_a_layout_loss_invalidates_pending_target_and_arrival() {
+        let mut map = empty_map();
+        let primary = map.layout.displays[0];
+        let secondary = DisplayGeometry {
+            id: 2,
+            x: -1440.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+            backing_scale: 2.0,
+            is_primary: false,
+        };
+        map.layout.displays.push(secondary);
+        apply_msg(&mut map, command("lost", OverlayCommand::PinAbove(777)));
+        apply_msg(
+            &mut map,
+            command(
+                "lost",
+                OverlayCommand::SnapTo {
+                    x: 50.0,
+                    y: 50.0,
+                    heading_radians: None,
+                },
+            ),
+        );
+        apply_msg(&mut map, move_msg("lost", -1400.0, 300.0));
+        // The rendered anchor is still on primary while the resolved target is on secondary.
+        assert_eq!(map.cursors["lost"].core.pos, (50.0, 50.0));
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        arrival_register("lost".into(), tx);
+        replace_display_layout(
+            &mut map,
+            DisplayLayout {
+                generation: 2,
+                displays: vec![primary],
+            },
+        );
+        assert!(!map.cursors["lost"].core.placed);
+        assert!(rx.try_recv().is_ok());
+        assert!(!map.cursors["lost"].needs_frame_tick());
+        assert!(painted_display_ids(&map).is_empty());
+        assert_eq!(map.cursors["lost"].core.pinned_wid, Some(777));
+        replace_display_layout(
+            &mut map,
+            DisplayLayout {
+                generation: 3,
+                displays: vec![primary, secondary],
+            },
+        );
+        assert!(
+            !map.cursors["lost"].core.placed,
+            "reattaching alone must not resurrect old visuals"
+        );
+        apply_msg(&mut map, move_msg("lost", -1400.0, 300.0));
+        assert_eq!(map.cursors["lost"].core.pos, (-1438.0, 160.0));
+    }
+
+    #[test]
+    fn slice_a_empty_rebuild_clears_all_viewports_and_pending_motion() {
+        let mut map = empty_map();
+        apply_msg(&mut map, move_msg("live", 50.0, 50.0));
+        replace_display_layout(
+            &mut map,
+            DisplayLayout {
+                generation: 2,
+                displays: vec![],
+            },
+        );
+        assert!(map.layout.displays.is_empty());
+        assert!(!map.cursors["live"].core.placed);
+        assert!(!render_map_needs_frame_tick(&map));
+        assert!(z_order_route(&map).is_none());
+    }
+
+    #[test]
+    fn slice_a_out_of_layout_command_clears_prior_presentation() {
+        let mut map = empty_map();
+        apply_msg(&mut map, move_msg("live", 50.0, 50.0));
+        apply_msg(&mut map, move_msg("live", -1400.0, 50.0));
+        assert!(!map.cursors["live"].core.placed);
+        assert!(!render_map_needs_frame_tick(&map));
+    }
+
+    #[test]
+    fn slice_a_sessions_preserve_stored_pins_on_shared_surface() {
+        let mut map = empty_map();
+        for (key, wid) in [("one", 111), ("two", 222)] {
+            apply_msg(&mut map, command(key, OverlayCommand::PinAbove(wid)));
+            apply_msg(
+                &mut map,
+                command(
+                    key,
+                    OverlayCommand::SnapTo {
+                        x: 50.0,
+                        y: 50.0,
+                        heading_radians: None,
+                    },
+                ),
+            );
+        }
+        assert_eq!(map.cursors["one"].core.pinned_wid, Some(111));
+        assert_eq!(map.cursors["two"].core.pinned_wid, Some(222));
+        assert_eq!(z_order_route(&map).unwrap().target_wid, Some(222));
+        apply_msg(&mut map, move_msg("one", 60.0, 60.0));
+        assert_eq!(z_order_route(&map).unwrap().target_wid, Some(111));
+        assert_eq!(map.cursors["two"].core.pinned_wid, Some(222));
+    }
+
+    #[test]
     fn slice_a_action_admission_does_not_place_or_reject_a_fresh_cursor() {
         let mut map = empty_map();
         assert!(animation_enabled(&map, "fresh"));
@@ -1388,15 +1574,44 @@ mod tests {
         }
     }
 
-    #[test]
-    fn slice_a_seed_never_changes_logical_target() {
+    #[tokio::test]
+    async fn slice_a_seed_never_changes_logical_target() {
+        // Replace only the queue and native thread boundary. Both the resolved
+        // visual publisher and renderer command processing remain production code.
+        struct RenderSink(Mutex<RenderMap>);
+        #[async_trait::async_trait]
+        impl super::super::visual::PointerVisualSink for RenderSink {
+            fn send(&self, key: &str, cmd: OverlayCommand) {
+                apply_msg(&mut self.0.lock().unwrap(), command(key, cmd));
+            }
+            async fn travel(&self, key: &str, x: f64, y: f64) {
+                apply_msg(&mut self.0.lock().unwrap(), move_msg(key, x, y));
+            }
+        }
         let registry = super::super::CursorRegistry::new();
-        registry.update_position("intent", 60.0, 60.0);
-        let mut map = empty_map();
-        apply_msg(&mut map, move_msg("intent", 60.0, 60.0));
-        assert_eq!(map.cursors["intent"].core.pos, (2.0, 2.0));
+        let sink = RenderSink(Mutex::new(empty_map()));
+        super::super::visual::emit_pointer_target(
+            &registry,
+            &sink,
+            "intent",
+            Some(super::super::visual::ResolvedPointerTarget {
+                x: 60.0,
+                y: 60.0,
+                window_id: Some(123),
+                element_bounds: None,
+            }),
+        )
+        .await;
+        assert_eq!(
+            sink.0.lock().unwrap().cursors["intent"].core.pos,
+            (2.0, 2.0)
+        );
         let position = registry.get("intent").unwrap().position.unwrap();
         assert_eq!((position.x, position.y), (60.0, 60.0));
+        assert_eq!(
+            sink.0.lock().unwrap().cursors["intent"].core.pinned_wid,
+            Some(123)
+        );
     }
 
     #[test]

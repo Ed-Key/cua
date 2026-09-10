@@ -1394,3 +1394,227 @@ fn harness_appkit_slider_drag_px_background() {
         )
     });
 }
+
+/// Verify controller-captured native display evidence without launching or
+/// replacing a daemon. Requires an unmirrored 2x display plus a 1x secondary
+/// display with a negative x or y origin. A synthetic image is not acceptance.
+///
+/// CUA_SLICE_A_DISPLAY_EVIDENCE points to a JSON manifest containing candidate_sha,
+/// daemon_pid, candidate_binary_sha256, and captures. Each capture has display_id,
+/// bounds [x,y,w,h], scale, screenshot, screenshot_sha256, target [global x,y],
+/// and measured_tip_pixels [local x,y], independently annotated on that capture.
+/// Capture the full display at native scale from the isolated candidate daemon.
+/// The controller must retain the screenshots and measurement method with the report.
+#[test]
+#[ignore = "requires controller candidate daemon and native 1x/2x negative-origin display captures"]
+fn slice_a_cursor_display_geometry() {
+    use std::ffi::{c_void, CStr};
+
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct Point {
+        x: f64,
+        y: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct Size {
+        width: f64,
+        height: f64,
+    }
+    #[repr(C)]
+    #[derive(Clone, Copy, Debug)]
+    struct Rect {
+        origin: Point,
+        size: Size,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGGetActiveDisplayList(max: u32, ids: *mut u32, count: *mut u32) -> i32;
+        fn CGMainDisplayID() -> u32;
+        fn CGDisplayMirrorsDisplay(id: u32) -> u32;
+        fn CGDisplayBounds(id: u32) -> Rect;
+        fn CGDisplayCopyDisplayMode(id: u32) -> *const c_void;
+        fn CGDisplayModeGetWidth(mode: *const c_void) -> usize;
+        fn CGDisplayModeGetHeight(mode: *const c_void) -> usize;
+        fn CGDisplayModeGetPixelWidth(mode: *const c_void) -> usize;
+        fn CGDisplayModeGetPixelHeight(mode: *const c_void) -> usize;
+    }
+    extern "C" {
+        fn proc_pidpath(pid: i32, buffer: *mut c_void, size: u32) -> i32;
+    }
+    fn output(command: &mut Command) -> String {
+        let out = command.output().expect("run acceptance precondition");
+        assert!(
+            out.status.success(),
+            "precondition command failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        String::from_utf8(out.stdout).unwrap().trim().to_owned()
+    }
+    fn sha256(path: &Path) -> String {
+        output(Command::new("shasum").args(["-a", "256"]).arg(path))
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_owned()
+    }
+    let mut ids = [0u32; 32];
+    let mut count = 0;
+    assert_eq!(
+        unsafe { CGGetActiveDisplayList(32, ids.as_mut_ptr(), &mut count) },
+        0
+    );
+    assert!(count < 32, "display inventory exceeded acceptance capacity");
+    let primary = unsafe { CGMainDisplayID() };
+    let displays: Vec<_> = ids[..count as usize]
+        .iter()
+        .copied()
+        .filter_map(|id| unsafe {
+            if CGDisplayMirrorsDisplay(id) != 0 {
+                return None;
+            }
+            let bounds = CGDisplayBounds(id);
+            let mode = CGDisplayCopyDisplayMode(id);
+            assert!(!mode.is_null(), "display {id} has no current mode");
+            let logical = (CGDisplayModeGetWidth(mode), CGDisplayModeGetHeight(mode));
+            let pixels = (
+                CGDisplayModeGetPixelWidth(mode),
+                CGDisplayModeGetPixelHeight(mode),
+            );
+            core_foundation::base::CFRelease(mode);
+            assert!(logical.0 > 0 && logical.1 > 0 && pixels.0 > 0 && pixels.1 > 0);
+            let scale = pixels.0 as f64 / logical.0 as f64;
+            assert!((pixels.1 as f64 / logical.1 as f64 - scale).abs() < 0.01);
+            Some((id, bounds, scale, pixels))
+        })
+        .collect();
+    println!("Slice A attached display inventory: {displays:?}");
+    let retina = displays
+        .iter()
+        .find(|d| (d.2 - 2.0).abs() < 0.01)
+        .expect("strict precondition: attach an unmirrored 2x display");
+    let secondary = displays.iter().find(|d| d.0 != primary && (d.2 - 1.0).abs() < 0.01
+        && (d.1.origin.x < 0.0 || d.1.origin.y < 0.0))
+        .expect("strict precondition: attach an unmirrored 1x secondary display left of or above primary");
+
+    let manifest_path = PathBuf::from(
+        std::env::var("CUA_SLICE_A_DISPLAY_EVIDENCE")
+            .expect("controller must supply native capture and independent tip measurements"),
+    );
+    let evidence: serde_json::Value =
+        serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+    let workspace = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../../..");
+    let head = output(
+        Command::new("git")
+            .arg("-C")
+            .arg(&workspace)
+            .args(["rev-parse", "HEAD"]),
+    );
+    assert_eq!(evidence["candidate_sha"].as_str(), Some(head.as_str()));
+    assert!(
+        output(Command::new("git").arg("-C").arg(&workspace).args([
+            "status",
+            "--porcelain",
+            "--untracked-files=no"
+        ]))
+        .is_empty(),
+        "candidate acceptance requires a clean tracked tree"
+    );
+    let socket = PathBuf::from(
+        std::env::var("CUA_E2E_MACOS_DAEMON_SOCKET")
+            .expect("controller must explicitly select the isolated candidate socket"),
+    );
+    let installed_socket = PathBuf::from(std::env::var("HOME").unwrap())
+        .join("Library/Caches/cua-driver/cua-driver.sock");
+    assert_ne!(
+        socket.canonicalize().unwrap(),
+        installed_socket.canonicalize().unwrap_or(installed_socket),
+        "installed release daemon cannot stand in for the candidate"
+    );
+    let pid = i32::try_from(
+        evidence["daemon_pid"]
+            .as_i64()
+            .expect("candidate daemon pid"),
+    )
+    .unwrap();
+    assert!(pid > 0);
+    let pids = output(Command::new("lsof").args(["-nP", "-t", "--"]).arg(&socket));
+    assert!(
+        pids.lines().any(|line| line.parse::<i32>() == Ok(pid)),
+        "candidate must own the explicit socket"
+    );
+    let mut path = [0u8; 4096];
+    assert!(unsafe { proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) } > 0);
+    let running_binary = PathBuf::from(
+        unsafe { CStr::from_ptr(path.as_ptr().cast()) }
+            .to_str()
+            .unwrap(),
+    );
+    let built_hash = sha256(Path::new(env!("CARGO_BIN_EXE_cua-driver")));
+    assert_eq!(
+        sha256(&running_binary),
+        built_hash,
+        "running daemon must match this candidate build"
+    );
+    assert_eq!(
+        evidence["candidate_binary_sha256"].as_str(),
+        Some(built_hash.as_str())
+    );
+    let captures = evidence["captures"]
+        .as_array()
+        .expect("native capture rows");
+    for display in [retina, secondary] {
+        let (id, bounds, scale, pixels) = display;
+        let matching: Vec<_> = captures
+            .iter()
+            .filter(|c| c["display_id"].as_u64() == Some(*id as u64))
+            .collect();
+        assert_eq!(matching.len(), 1, "one native capture per required display");
+        let capture = matching[0];
+        assert_eq!(
+            capture["bounds"],
+            serde_json::json!([
+                bounds.origin.x,
+                bounds.origin.y,
+                bounds.size.width,
+                bounds.size.height
+            ])
+        );
+        assert!((capture["scale"].as_f64().unwrap() - scale).abs() < 0.01);
+        let image_path = manifest_path
+            .parent()
+            .unwrap()
+            .join(capture["screenshot"].as_str().unwrap());
+        assert_eq!(
+            capture["screenshot_sha256"].as_str(),
+            Some(sha256(&image_path).as_str())
+        );
+        let image = image::open(&image_path).expect("native full-display capture");
+        assert_eq!(
+            (image.width() as usize, image.height() as usize),
+            *pixels,
+            "capture must retain native pixel size"
+        );
+        let target = &capture["target"];
+        let target = (target[0].as_f64().unwrap(), target[1].as_f64().unwrap());
+        assert!(cursor_overlay::DisplayBounds {
+            x: bounds.origin.x,
+            y: bounds.origin.y,
+            width: bounds.size.width,
+            height: bounds.size.height
+        }
+        .contains(target));
+        let tip = &capture["measured_tip_pixels"];
+        let tip = (tip[0].as_f64().unwrap(), tip[1].as_f64().unwrap());
+        assert!(tip.0 >= 0.0 && tip.0 < pixels.0 as f64 && tip.1 >= 0.0 && tip.1 < pixels.1 as f64);
+        let error = (tip.0 - (target.0 - bounds.origin.x) * scale)
+            .hypot(tip.1 - (target.1 - bounds.origin.y) * scale);
+        assert!(
+            error <= 2.0,
+            "native arrow-tip error {error} pixels exceeds 2 pixels"
+        );
+        println!("Slice A native evidence: SHA={head} display={id} bounds={bounds:?} scale={scale} screenshot={}x{} arrow_tip_error_px={error} image={}",
+            pixels.0,pixels.1,image_path.display());
+    }
+}

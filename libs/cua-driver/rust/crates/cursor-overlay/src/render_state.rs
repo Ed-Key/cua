@@ -810,9 +810,8 @@ pub struct FocusRect {
 /// fresh tiny-skia [`tiny_skia::Pixmap`] of `(width, height)`.
 ///
 /// `origin_x`, `origin_y` are subtracted from the cursor `core.pos` before
-/// drawing — Windows passes the virtual-screen `(virt_x, virt_y)` so the
-/// pixmap is laid out in window-local coordinates.  macOS / Linux pass
-/// `(0.0, 0.0)`.
+/// drawing. macOS passes each display's global origin; other adapters choose
+/// their viewport origin.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio
 /// (e.g. 2.0 on a retina display where the pixmap is sized at physical
@@ -1465,6 +1464,101 @@ mod backing_scale_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn viewport_pixels(origin: (f64, f64), scale: f32, focus: bool) -> tiny_skia::Pixmap {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.apply_command_base(
+            OverlayCommand::SnapTo {
+                x: origin.0 + 40.0,
+                y: origin.1 + 40.0,
+                heading_radians: Some(0.0),
+            },
+            true,
+            true,
+        );
+        render_frame(
+            &core,
+            (192.0 * scale) as u32,
+            (128.0 * scale) as u32,
+            origin.0,
+            origin.1,
+            focus.then_some(FocusRect {
+                rect: [origin.0 + 95.0, origin.1 + 60.0, 40.0, 20.0],
+                t: 0.0,
+            }),
+            scale,
+        )
+    }
+
+    #[test]
+    fn slice_a_viewport_pointer_and_focus_share_origin_at_native_scales() {
+        for scale in [1.0, 2.0] {
+            let reference = viewport_pixels((0.0, 0.0), scale, true);
+            let pointer = viewport_pixels((0.0, 0.0), scale, false);
+            assert!(pointer.data().chunks_exact(4).any(|p| p[3] > 0));
+            assert_ne!(
+                reference.data(),
+                pointer.data(),
+                "focus must contribute pixels"
+            );
+            for origin in [(-1440.0, 0.0), (0.0, -900.0), (-1440.0, -900.0)] {
+                let projected = viewport_pixels(origin, scale, true);
+                assert_eq!(
+                    projected.data(),
+                    reference.data(),
+                    "origin={origin:?}, scale={scale}"
+                );
+                assert_eq!(viewport_pixels(origin, scale, false).data(), pointer.data());
+            }
+            // The known focus edge is at local (95, 70), independently of the cursor.
+            let edge = reference
+                .pixel((95.0 * scale) as u32, (70.0 * scale) as u32)
+                .unwrap();
+            assert!(edge.alpha() > 100);
+        }
+    }
+
+    #[test]
+    fn slice_a_viewport_negative_1400_cursor_paints_only_selected_surface() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.apply_command_base(
+            OverlayCommand::SnapTo {
+                x: -1400.0,
+                y: 40.0,
+                heading_radians: None,
+            },
+            true,
+            true,
+        );
+        let selected = render_frame(&core, 192, 128, -1440.0, 0.0, None, 1.0);
+        let primary = render_frame(&core, 192, 128, 0.0, 0.0, None, 1.0);
+        assert!(selected.data().chunks_exact(4).any(|p| p[3] > 0));
+        assert!(primary.data().iter().all(|v| *v == 0));
+    }
+
+    #[test]
+    fn slice_a_viewport_two_x_doubles_focus_pixel_extent() {
+        for scale in [1.0, 2.0] {
+            let pm = viewport_pixels((0.0, -900.0), scale, true);
+            assert_eq!(
+                (pm.width(), pm.height()),
+                ((192.0 * scale) as u32, (128.0 * scale) as u32)
+            );
+            // Interior fill and exterior are separate from pointer artwork.
+            assert!(
+                pm.pixel((110.0 * scale) as u32, (70.0 * scale) as u32)
+                    .unwrap()
+                    .alpha()
+                    > 0
+            );
+            assert_eq!(
+                pm.pixel((145.0 * scale) as u32, (70.0 * scale) as u32)
+                    .unwrap()
+                    .alpha(),
+                0
+            );
+        }
+    }
 
     #[test]
     fn slice_a_seed_primary_negative_axes_edges_and_corners() {
