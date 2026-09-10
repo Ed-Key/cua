@@ -1273,9 +1273,8 @@ fn perform_ax_click(
     if ax_action == "AXPress" && !advertised.iter().any(|action| action == ax_action) {
         if modifiers.is_empty() {
             if let Some(selected_role) =
-                crate::input::ax_actions::select_nearest_container(element_ptr)
+                crate::input::ax_actions::select_nearest_container(element_ptr, delivered)
             {
-                delivered.store(true, Ordering::Relaxed);
                 return Ok((
                     format!(
                         "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\"; \
@@ -1392,9 +1391,8 @@ fn perform_ax_click(
         // before surfacing the dispatch error.
         if ax_action == "AXPress" && modifiers.is_empty() {
             if let Some(selected_role) =
-                crate::input::ax_actions::select_nearest_container(element_ptr)
+                crate::input::ax_actions::select_nearest_container(element_ptr, delivered)
             {
-                delivered.store(true, Ordering::Relaxed);
                 return Ok((
                     format!(
                         "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\" \
@@ -1749,6 +1747,126 @@ mod tests {
             "feedback must not change the tool result"
         );
         slice_a_assert(&tool, &sink, "slice-a-first", true);
+    }
+
+    async fn slice_a_selected_write_receipt(advertised_press: bool, readback: Option<bool>) {
+        use crate::ax::bindings::test_support::SelectionScope;
+
+        let (tool, sink) = slice_a_tool();
+        let receipt = AtomicBool::new(false);
+        let fixture = SelectionScope::install(advertised_press, readback, true);
+        let result = tool
+            .dispatch_resolved(
+                "slice-a-first",
+                slice_a_target(),
+                Some(&receipt),
+                async { None },
+                async {
+                    // Exercise both real click call sites and the real selection
+                    // helper. No test code sets the delivery receipt.
+                    let outcome = perform_ax_click(
+                        fixture.element_ptr(),
+                        0,
+                        1,
+                        42,
+                        "click",
+                        &receipt,
+                        None,
+                        &[],
+                        false,
+                    );
+                    assert_eq!(
+                        outcome.as_ref().unwrap_err().to_string(),
+                        "AXUIElementPerformAction(AXPress) returned -25200"
+                    );
+                    finish_ax_dispatch(Ok(outcome.map(|outcome| (outcome, false))), "").await
+                },
+            )
+            .await;
+        let expected = if advertised_press {
+            vec![
+                "failed press",
+                "read selected",
+                "write selected",
+                "read selected",
+            ]
+        } else {
+            vec![
+                "read selected",
+                "write selected",
+                "read selected",
+                "read selected",
+                "failed press",
+                "read selected",
+            ]
+        };
+        println!(
+            "advertised_press={advertised_press} readback={readback:?} calls={:?}",
+            fixture.calls()
+        );
+        assert_eq!(fixture.calls(), expected, "no later successful delivery");
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            result.structured_content.is_none(),
+            "no confirmed effect or verification claim"
+        );
+        slice_a_assert(&tool, &sink, "slice-a-first", true);
+        assert!(receipt.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn slice_a_selected_write_before_press_false_readback_has_contact() {
+        slice_a_selected_write_receipt(false, Some(false)).await;
+    }
+
+    #[tokio::test]
+    async fn slice_a_selected_write_before_press_failed_readback_has_contact() {
+        slice_a_selected_write_receipt(false, None).await;
+    }
+
+    #[tokio::test]
+    async fn slice_a_selected_write_after_press_false_readback_has_contact() {
+        slice_a_selected_write_receipt(true, Some(false)).await;
+    }
+
+    #[tokio::test]
+    async fn slice_a_selected_write_after_press_failed_readback_has_contact() {
+        slice_a_selected_write_receipt(true, None).await;
+    }
+
+    #[tokio::test]
+    async fn slice_a_selected_write_rejected_has_no_contact() {
+        use crate::ax::bindings::test_support::SelectionScope;
+
+        let (tool, sink) = slice_a_tool();
+        let receipt = AtomicBool::new(false);
+        let fixture = SelectionScope::install(true, None, false);
+        let result = tool
+            .dispatch_resolved(
+                "slice-a-first",
+                slice_a_target(),
+                Some(&receipt),
+                async { None },
+                async {
+                    let outcome = perform_ax_click(
+                        fixture.element_ptr(),
+                        0,
+                        1,
+                        42,
+                        "click",
+                        &receipt,
+                        None,
+                        &[],
+                        false,
+                    );
+                    finish_ax_dispatch(Ok(outcome.map(|outcome| (outcome, false))), "").await
+                },
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(result.structured_content.is_none());
+        assert!(!receipt.load(Ordering::Relaxed));
+        slice_a_assert(&tool, &sink, "slice-a-first", false);
     }
 
     #[tokio::test]

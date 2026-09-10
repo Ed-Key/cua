@@ -2,6 +2,7 @@
 
 use crate::ax::bindings::*;
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_SELECTION_ANCESTORS: usize = 8;
 
@@ -24,7 +25,11 @@ fn is_selectable_container_role(role: &str) -> bool {
 /// row-like containers. The fallback remains bounded and requires a successful
 /// `AXSelected=true` read-back, so an arbitrary failed image/button press cannot
 /// become a claimed success.
-pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
+///
+/// Record each accepted write in `delivered` independently of read-back. This
+/// receipt describes input delivery only; `Some(role)` still requires verified
+/// selection, and an unsuccessful later attempt must not clear the receipt.
+pub fn select_nearest_container(element_ptr: usize, delivered: &AtomicBool) -> Option<String> {
     let mut current = element_ptr as AXUIElementRef;
     let mut owns_current = false;
 
@@ -34,13 +39,14 @@ pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
             && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
         {
             let err = unsafe { set_bool_attr_true(current, "AXSelected") };
-            if err == kAXErrorSuccess
-                && unsafe { copy_bool_attr(current, "AXSelected") } == Some(true)
-            {
-                if owns_current {
-                    unsafe { CFRelease(current as CFTypeRef) };
+            if err == kAXErrorSuccess {
+                delivered.store(true, Ordering::Relaxed);
+                if unsafe { copy_bool_attr(current, "AXSelected") } == Some(true) {
+                    if owns_current {
+                        unsafe { CFRelease(current as CFTypeRef) };
+                    }
+                    return Some(role);
                 }
-                return Some(role);
             }
         }
 
