@@ -100,3 +100,5 @@ pub fn register_tools_with_cursor_and_provider(
     }
     tools::build_registry_with_provider(compat, provider)
 }
+
+pub mod resize_registry;

@@ -447,17 +447,9 @@ impl Tool for GetWindowStateTool {
                     // pid-only key leaked one window's ratio into the other's
                     // pixel clicks.
                     if !observation_only {
-                        if let Some(ow) = orig_w {
-                            if w > 0 {
-                                self.state.resize_registry.set_ratio(
-                                    pid,
-                                    window_id,
-                                    ow as f64 / w as f64,
-                                );
-                            }
-                        } else {
-                            self.state.resize_registry.clear_ratio(pid, window_id);
-                        }
+                        self.state
+                            .resize_registry
+                            .record_capture(pid, window_id, orig_w, w);
                     }
                     Some((b64, file_path, w, h, bounds, scale))
                 }

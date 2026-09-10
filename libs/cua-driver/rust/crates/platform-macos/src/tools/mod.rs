@@ -493,69 +493,7 @@ impl ZoomRegistry {
     }
 }
 
-/// Tracks the per-(pid, window_id) ratio applied by `max_image_dimension`
-/// downscaling.
-///
-/// `ratio = original_dim / resized_dim` — multiply resized image coordinates
-/// by this to recover original (native) window-local pixel coordinates.
-/// Mirrors Swift's `ImageResizeRegistry`.
-///
-/// Keyed per window, matching the element cache and the element-token
-/// registry. A pid-only key leaked the ratio recorded while snapshotting
-/// window A into pixel clicks aimed at window B of the same pid, sending them
-/// off-target (issue #2237).
-pub struct ResizeRegistry {
-    inner: std::sync::Mutex<HashMap<(i32, u32), f64>>,
-}
-
-impl Default for ResizeRegistry {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
-impl ResizeRegistry {
-    pub fn new() -> Self {
-        Self {
-            inner: std::sync::Mutex::new(HashMap::new()),
-        }
-    }
-
-    /// Record that (pid, window_id)'s screenshot was downscaled by `ratio`.
-    pub fn set_ratio(&self, pid: i32, window_id: u32, ratio: f64) {
-        self.inner.lock().unwrap().insert((pid, window_id), ratio);
-    }
-
-    /// Remove the ratio entry for one window (no active downscale).
-    pub fn clear_ratio(&self, pid: i32, window_id: u32) {
-        self.inner.lock().unwrap().remove(&(pid, window_id));
-    }
-
-    /// The ratio for a window, or `None` if no downscale happened.
-    ///
-    /// `window_id: None` is the screen-scope (legacy) path: it returns a ratio
-    /// only when every window recorded for `pid` agrees on one, so a
-    /// window-less caller can never inherit some other window's scale. That
-    /// preserves today's behaviour for the single-window case without guessing
-    /// across windows.
-    pub fn ratio(&self, pid: i32, window_id: Option<u32>) -> Option<f64> {
-        let inner = self.inner.lock().unwrap();
-        match window_id {
-            Some(wid) => inner.get(&(pid, wid)).copied(),
-            None => {
-                let mut agreed: Option<f64> = None;
-                for (_, ratio) in inner.iter().filter(|((p, _), _)| *p == pid) {
-                    match agreed {
-                        None => agreed = Some(*ratio),
-                        Some(seen) if (seen - *ratio).abs() < 1e-9 => {}
-                        Some(_) => return None,
-                    }
-                }
-                agreed
-            }
-        }
-    }
-}
+pub type ResizeRegistry = cua_driver_core::resize_registry::ResizeRegistry<i32, u32>;
 
 /// Runtime-mutable driver configuration persisted across calls within a session.
 pub struct DriverConfig {

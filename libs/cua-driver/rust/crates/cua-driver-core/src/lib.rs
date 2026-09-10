@@ -93,3 +93,5 @@ pub mod window_target;
 
 pub use cua_driver_contract::{CaptureScope, EscalationReason};
 pub use recording::RecordingSession;
+
+pub mod resize_registry;

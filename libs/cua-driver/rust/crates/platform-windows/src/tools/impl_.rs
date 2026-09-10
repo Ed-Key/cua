@@ -548,26 +548,7 @@ pub fn load_driver_config() -> DriverConfig {
     cfg
 }
 
-pub struct ResizeRegistry {
-    ratios: std::sync::Mutex<std::collections::HashMap<u32, f64>>,
-}
-
-impl ResizeRegistry {
-    pub fn new() -> Self {
-        Self {
-            ratios: std::sync::Mutex::new(Default::default()),
-        }
-    }
-    pub fn set_ratio(&self, pid: u32, ratio: f64) {
-        self.ratios.lock().unwrap().insert(pid, ratio);
-    }
-    pub fn clear_ratio(&self, pid: u32) {
-        self.ratios.lock().unwrap().remove(&pid);
-    }
-    pub fn ratio(&self, pid: u32) -> Option<f64> {
-        self.ratios.lock().unwrap().get(&pid).copied()
-    }
-}
+pub use crate::resize_registry::ResizeRegistry;
 
 /// Per-process zoom context — stores padded crop origin and resize scale from
 /// the most recent `zoom` call so `click(from_zoom=true)` can translate
@@ -1568,13 +1549,7 @@ impl Tool for GetWindowStateTool {
 
                 if let Some((b64_opt, file_path, w, h, orig_w)) = screenshot_opt {
                     if !observation_only {
-                        if let Some(ow) = orig_w {
-                            if w > 0 {
-                                state.resize_registry.set_ratio(pid, ow as f64 / w as f64);
-                            }
-                        } else {
-                            state.resize_registry.clear_ratio(pid);
-                        }
+                        state.resize_registry.record_capture(pid, hwnd, orig_w, w);
                     }
                     // base64 is embedded only when no out_file was given (vision
                     // path). With `screenshot_out_file` the bytes went to disk and
@@ -3864,7 +3839,7 @@ impl Tool for ClickTool {
                         ))
                     }
                 }
-            } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+            } else if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(hwnd)) {
                 px *= ratio;
                 py *= ratio;
             }
@@ -5363,7 +5338,7 @@ impl Tool for PressKeyTool {
                 Err(result) => return result,
             };
             let (mut px, mut py) = screen_to_bitmap(hwnd, cx, cy);
-            if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+            if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(hwnd)) {
                 px = (px as f64 / ratio).round() as i32;
                 py = (py as f64 / ratio).round() as i32;
             }
@@ -6875,7 +6850,7 @@ impl Tool for DoubleClickTool {
                         ))
                     }
                 }
-            } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+            } else if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(hwnd)) {
                 px *= ratio;
                 py *= ratio;
             }
@@ -7219,7 +7194,7 @@ impl Tool for RightClickTool {
                         ))
                     }
                 }
-            } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+            } else if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(hwnd)) {
                 px *= ratio;
                 py *= ratio;
             }
@@ -7442,29 +7417,6 @@ impl Tool for DragTool {
         let button = args.str_or("button", "left");
         let from_zoom = args.bool_or("from_zoom", false);
 
-        if from_zoom {
-            match self.state.zoom_registry.get(pid) {
-                Some(ctx) => {
-                    let (wx, wy) = ctx.zoom_to_window(from_x, from_y);
-                    let (wx2, wy2) = ctx.zoom_to_window(to_x, to_y);
-                    from_x = wx;
-                    from_y = wy;
-                    to_x = wx2;
-                    to_y = wy2;
-                }
-                None => {
-                    return ToolResult::error(format!(
-                        "from_zoom=true but no zoom context for pid {pid}. Call zoom first."
-                    ))
-                }
-            }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
-            from_x *= ratio;
-            from_y *= ratio;
-            to_x *= ratio;
-            to_y *= ratio;
-        }
-
         let hwnd = match hwnd_opt {
             Some(h) => h,
             None => {
@@ -7482,6 +7434,29 @@ impl Tool for DragTool {
                 }
             }
         };
+
+        if from_zoom {
+            match self.state.zoom_registry.get(pid) {
+                Some(ctx) => {
+                    let (wx, wy) = ctx.zoom_to_window(from_x, from_y);
+                    let (wx2, wy2) = ctx.zoom_to_window(to_x, to_y);
+                    from_x = wx;
+                    from_y = wy;
+                    to_x = wx2;
+                    to_y = wy2;
+                }
+                None => {
+                    return ToolResult::error(format!(
+                        "from_zoom=true but no zoom context for pid {pid}. Call zoom first."
+                    ))
+                }
+            }
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(hwnd)) {
+            from_x *= ratio;
+            from_y *= ratio;
+            to_x *= ratio;
+            to_y *= ratio;
+        }
 
         // Compute screen-coord endpoints. Same correction as the click
         // tools — bitmap pixels are anchored to the DWM-frame top-left,
@@ -8758,7 +8733,7 @@ impl Tool for ZoomTool {
         let ratio = self
             .state
             .resize_registry
-            .ratio(raw_pid as u32)
+            .ratio(raw_pid as u32, Some(hwnd))
             .unwrap_or(1.0);
         let (nx1, ny1, nx2, ny2) = (x1 * ratio, y1 * ratio, x2 * ratio, y2 * ratio);
 
