@@ -93,11 +93,11 @@ static DISPLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 struct RenderMap {
     cursors: IndexMap<CursorKey, RenderState>,
     layout: DisplayLayout,
-    /// Most recently commanded cursor. Its live position determines which
-    /// display surface owns target-relative z-order while it animates.
+    /// Accepted command order, oldest first, separate from stable paint order.
+    /// Each surface uses the latest commanded visible session painting there.
     /// Sessions on one display share this native order; their stored pin IDs
     /// remain independent, but one surface cannot stack above two windows separately.
-    active_key: Option<CursorKey>,
+    command_order: Vec<CursorKey>,
     /// Frozen launch-time config used as the template for lazily-created cursors.
     template: CursorConfig,
     /// Render-side tombstone of ended session cursor keys. A `Cmd`
@@ -129,9 +129,7 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
             // must survive every session_end + the daemon lifetime.
             if key != "default" {
                 map.cursors.shift_remove(&key);
-                if map.active_key.as_ref() == Some(&key) {
-                    map.active_key = None;
-                }
+                map.command_order.retain(|candidate| candidate != &key);
                 if let Ok(mut guard) = ARRIVAL_TX.lock() {
                     if let Some(m) = guard.as_mut() {
                         m.remove(&key);
@@ -193,7 +191,8 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
             if ends_travel {
                 arrival_fire(&key);
             }
-            map.active_key = Some(key);
+            map.command_order.retain(|candidate| candidate != &key);
+            map.command_order.push(key);
         }
     }
 }
@@ -213,7 +212,7 @@ pub fn init(cfg: CursorConfig) {
         *RENDER.lock().unwrap() = Some(RenderMap {
             cursors,
             layout: DisplayLayout::default(),
-            active_key: None,
+            command_order: Vec::new(),
             template: cfg,
             ended: HashSet::new(),
         });
@@ -579,29 +578,50 @@ fn render_map_needs_frame_tick(map: &RenderMap) -> bool {
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ZOrderRoute {
     generation: u64,
-    display_ids: Vec<DisplayId>,
+    display_id: DisplayId,
     target_wid: Option<u64>,
 }
 
-fn z_order_route(map: &RenderMap) -> Option<ZOrderRoute> {
-    let state = map
-        .active_key
-        .as_ref()
-        .and_then(|key| map.cursors.get(key))
-        .filter(|state| cursor_is_visible(state))?;
-    let display_ids = map
-        .layout
+fn z_order_routes(map: &RenderMap) -> Vec<ZOrderRoute> {
+    map.layout
         .displays
         .iter()
         .copied()
-        .filter(|display| state_paints_display(state, *display))
-        .map(|display| display.id)
-        .collect::<Vec<_>>();
-    (!display_ids.is_empty()).then_some(ZOrderRoute {
-        generation: map.layout.generation,
-        display_ids,
-        target_wid: state.core.pinned_wid,
-    })
+        .filter_map(|display| {
+            let state = map
+                .command_order
+                .iter()
+                .rev()
+                .filter_map(|key| map.cursors.get(key))
+                .find(|state| state_paints_display(state, display))?;
+            Some(ZOrderRoute {
+                generation: map.layout.generation,
+                display_id: display.id,
+                target_wid: state.core.pinned_wid,
+            })
+        })
+        .collect()
+}
+
+/// The same per-surface decisions restore new generations and periodically
+/// repin existing surfaces. An unrelated session cannot suppress either route.
+fn z_order_updates<'a>(
+    routes: &'a [ZOrderRoute],
+    presented: &[ZOrderRoute],
+    repin_due: bool,
+    cursor_commanded: bool,
+) -> Vec<&'a ZOrderRoute> {
+    routes
+        .iter()
+        .filter(|route| {
+            !presented.contains(route)
+                || if route.target_wid.is_some() {
+                    repin_due
+                } else {
+                    cursor_commanded
+                }
+        })
+        .collect()
 }
 
 // ── AppKit / CGImage plumbing ─────────────────────────────────────────────
@@ -690,7 +710,8 @@ unsafe fn create_native_surface(
         stringWithUTF8String: c"topLeft".as_ptr().cast::<u8>()
     ];
     let _: () = msg_send![layer, setContentsGravity: gravity_ns];
-    let _: () = msg_send![win, orderFrontRegardless];
+    // Keep new surfaces hidden until their controlling session's route orders
+    // them. Surface creation alone must never promote a background cursor.
 
     Some(NativeSurface {
         win_ptr: win as usize,
@@ -795,7 +816,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
     let mut frame_tick_needed = false;
     let mut hover_poll_needed = false;
     let mut presented_displays = HashSet::<DisplayId>::new();
-    let mut presented_z_order: Option<ZOrderRoute> = None;
+    let mut presented_z_order = Vec::<ZOrderRoute>::new();
     let mut repin_frames: u32 = 0;
 
     loop {
@@ -885,7 +906,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                 }
             }
 
-            let z_order = z_order_route(map);
+            let z_order = z_order_routes(map);
             let next_frame_tick_needed = render_map_needs_frame_tick(map);
             let next_hover_poll_needed = map
                 .cursors
@@ -909,22 +930,17 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
 
         if frame_tick_needed || had_msg {
             repin_frames += 1;
-            let route_changed = z_order != presented_z_order;
-            if let Some(route) = z_order.as_ref() {
+            for route in z_order_updates(
+                &z_order,
+                &presented_z_order,
+                repin_frames >= 60,
+                cursor_commanded,
+            ) {
                 match route.target_wid {
-                    Some(target_wid) if route_changed || repin_frames >= 60 => {
-                        for display_id in &route.display_ids {
-                            dispatch_pin_above(*display_id, target_wid);
-                        }
-                        repin_frames = 0;
+                    Some(target_wid) => {
+                        dispatch_pin_above(route.generation, route.display_id, target_wid)
                     }
-                    None if route_changed || cursor_commanded => {
-                        for display_id in &route.display_ids {
-                            dispatch_order_front(*display_id);
-                        }
-                        repin_frames = 0;
-                    }
-                    _ => {}
+                    None => dispatch_order_front(route.generation, route.display_id),
                 }
             }
             presented_z_order = z_order;
@@ -1129,11 +1145,12 @@ fn dispatch_present(generation: u64, display_id: DisplayId, pixmap: tiny_skia::P
 /// This is used only for an externally visible cursor with no target window.
 /// Target-bound actions continue to use [`dispatch_pin_above`] so background
 /// delivery remains below unrelated foreground applications.
-fn dispatch_order_front(display_id: DisplayId) {
+fn dispatch_order_front(generation: u64, display_id: DisplayId) {
     dispatch_on_main(Box::new(move || unsafe {
         let host = HOST.lock().unwrap();
         if let Some(surface) = host
             .as_ref()
+            .filter(|host| host.generation == generation)
             .and_then(|host| host.surfaces.get(&display_id))
         {
             let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
@@ -1173,7 +1190,7 @@ fn target_is_frontmost_visible_window(
         .is_some_and(|window| u64::from(window.window_id) == target_wid)
 }
 
-fn dispatch_pin_above(display_id: DisplayId, target_wid: u64) {
+fn dispatch_pin_above(generation: u64, display_id: DisplayId, target_wid: u64) {
     let windows = crate::windows::visible_windows();
     let raise_front =
         target_is_frontmost_visible_window(target_wid, crate::apps::frontmost_pid(), &windows);
@@ -1181,6 +1198,7 @@ fn dispatch_pin_above(display_id: DisplayId, target_wid: u64) {
         let host = HOST.lock().unwrap();
         if let Some(surface) = host
             .as_ref()
+            .filter(|host| host.generation == generation)
             .and_then(|host| host.surfaces.get(&display_id))
         {
             let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
@@ -1421,7 +1439,7 @@ mod tests {
         assert!(map.layout.displays.is_empty());
         assert!(!map.cursors["live"].core.placed);
         assert!(!render_map_needs_frame_tick(&map));
-        assert!(z_order_route(&map).is_none());
+        assert!(z_order_routes(&map).is_empty());
     }
 
     #[test]
@@ -1431,6 +1449,167 @@ mod tests {
         apply_msg(&mut map, move_msg("live", -1400.0, 50.0));
         assert!(!map.cursors["live"].core.placed);
         assert!(!render_map_needs_frame_tick(&map));
+    }
+
+    fn ordering_fixture() -> RenderMap {
+        let mut map = empty_map();
+        map.layout.displays[0].width = 1000.0;
+        map.layout.displays[0].height = 1000.0;
+        map.layout.displays.push(DisplayGeometry {
+            id: 2,
+            x: -1000.0,
+            is_primary: false,
+            ..map.layout.displays[0]
+        });
+        for (key, wid, x) in [("one", 111, 500.0), ("two", 222, -500.0)] {
+            apply_msg(&mut map, command(key, OverlayCommand::PinAbove(wid)));
+            apply_msg(
+                &mut map,
+                command(
+                    key,
+                    OverlayCommand::SnapTo {
+                        x,
+                        y: 500.0,
+                        heading_radians: None,
+                    },
+                ),
+            );
+        }
+        map
+    }
+
+    fn ordering_pairs(map: &RenderMap) -> Vec<(DisplayId, Option<u64>)> {
+        z_order_routes(map)
+            .into_iter()
+            .map(|route| (route.display_id, route.target_wid))
+            .collect()
+    }
+
+    #[test]
+    fn slice_a_ordering_rebuild_restores_both_surviving_display_pins() {
+        let mut map = ordering_fixture();
+        assert_eq!(map.command_order.last().map(String::as_str), Some("two"));
+        let layout = DisplayLayout {
+            generation: 2,
+            ..map.layout.clone()
+        };
+        replace_display_layout(&mut map, layout);
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111)), (2, Some(222))]);
+    }
+
+    #[test]
+    fn slice_a_ordering_initial_routes_include_every_painted_surface() {
+        let map = ordering_fixture();
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111)), (2, Some(222))]);
+    }
+
+    #[test]
+    fn slice_a_ordering_initial_rebuild_and_periodic_updates_cover_both_displays() {
+        let mut map = ordering_fixture();
+        let routes = z_order_routes(&map);
+        let pairs = |updates: Vec<&ZOrderRoute>| {
+            updates
+                .into_iter()
+                .map(|route| (route.display_id, route.target_wid))
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            pairs(z_order_updates(&routes, &[], false, false)),
+            vec![(1, Some(111)), (2, Some(222))]
+        );
+        assert!(z_order_updates(&routes, &routes, false, false).is_empty());
+        assert_eq!(
+            pairs(z_order_updates(&routes, &routes, true, false)),
+            vec![(1, Some(111)), (2, Some(222))]
+        );
+        let layout = DisplayLayout {
+            generation: 2,
+            ..map.layout.clone()
+        };
+        replace_display_layout(&mut map, layout);
+        assert_eq!(
+            pairs(z_order_updates(
+                &z_order_routes(&map),
+                &routes,
+                false,
+                false
+            )),
+            vec![(1, Some(111)), (2, Some(222))]
+        );
+    }
+
+    #[test]
+    fn slice_a_ordering_unpinned_controller_is_explicit_and_missing_keys_are_skipped() {
+        let mut map = ordering_fixture();
+        apply_msg(
+            &mut map,
+            command(
+                "desktop",
+                OverlayCommand::SnapTo {
+                    x: 500.0,
+                    y: 500.0,
+                    heading_radians: None,
+                },
+            ),
+        );
+        assert_eq!(ordering_pairs(&map), vec![(1, None), (2, Some(222))]);
+        let routes = z_order_routes(&map);
+        assert_eq!(
+            z_order_updates(&routes, &routes, false, true),
+            vec![&routes[0]]
+        );
+        assert_eq!(
+            z_order_updates(&routes, &routes, true, false),
+            vec![&routes[1]]
+        );
+        // Missing state must not prevent another visible session controlling
+        // this surface, even if an ordering key remains in a snapshot.
+        map.cursors.shift_remove("desktop");
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111)), (2, Some(222))]);
+        apply_msg(&mut map, command("", OverlayCommand::PinAbove(999)));
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111)), (2, Some(222))]);
+    }
+
+    #[test]
+    fn slice_a_ordering_removal_restores_last_commanded_survivor() {
+        let mut map = ordering_fixture();
+        apply_msg(&mut map, command("three", OverlayCommand::PinAbove(333)));
+        apply_msg(
+            &mut map,
+            command(
+                "three",
+                OverlayCommand::SnapTo {
+                    x: 500.0,
+                    y: 500.0,
+                    heading_radians: None,
+                },
+            ),
+        );
+        // Insertion order is one, two, three. Command order now puts one first.
+        apply_msg(&mut map, command("one", OverlayCommand::PinAbove(111)));
+        apply_msg(&mut map, OverlayMsg::Remove("one".into()));
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(333)), (2, Some(222))]);
+        apply_msg(&mut map, OverlayMsg::Remove("three".into()));
+        assert_eq!(ordering_pairs(&map), vec![(2, Some(222))]);
+    }
+
+    #[test]
+    fn slice_a_ordering_missing_target_and_unplaced_session_do_not_erase_other_routes() {
+        let mut map = ordering_fixture();
+        apply_msg(&mut map, move_msg("two", -2000.0, 500.0));
+        apply_msg(&mut map, command("unplaced", OverlayCommand::PinAbove(333)));
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111))]);
+        apply_msg(&mut map, command("one", OverlayCommand::SetEnabled(false)));
+        assert!(ordering_pairs(&map).is_empty());
+        replace_display_layout(
+            &mut map,
+            DisplayLayout {
+                generation: 2,
+                displays: vec![],
+            },
+        );
+        assert!(ordering_pairs(&map).is_empty());
+        assert!(ordering_pairs(&empty_map()).is_empty());
     }
 
     #[test]
@@ -1452,9 +1631,9 @@ mod tests {
         }
         assert_eq!(map.cursors["one"].core.pinned_wid, Some(111));
         assert_eq!(map.cursors["two"].core.pinned_wid, Some(222));
-        assert_eq!(z_order_route(&map).unwrap().target_wid, Some(222));
+        assert_eq!(z_order_routes(&map)[0].target_wid, Some(222));
         apply_msg(&mut map, move_msg("one", 60.0, 60.0));
-        assert_eq!(z_order_route(&map).unwrap().target_wid, Some(111));
+        assert_eq!(z_order_routes(&map)[0].target_wid, Some(111));
         assert_eq!(map.cursors["two"].core.pinned_wid, Some(222));
     }
 
@@ -1671,7 +1850,7 @@ mod tests {
                     is_primary: true,
                 }],
             },
-            active_key: None,
+            command_order: Vec::new(),
             template: CursorConfig::default(),
             ended: HashSet::new(),
         }
@@ -1826,7 +2005,7 @@ mod tests {
 
         apply_msg(&mut map, move_msg("sessA", 30.0, 30.0));
         assert!(map.cursors.contains_key("sessA"));
-        assert_eq!(map.active_key.as_deref(), Some("sessA"));
+        assert_eq!(map.command_order.last().map(String::as_str), Some("sessA"));
     }
 
     #[test]
@@ -1840,7 +2019,10 @@ mod tests {
 
         apply_msg(&mut map, move_msg("default", 5.0, 5.0));
         assert!(map.cursors.contains_key("default"));
-        assert_eq!(map.active_key.as_deref(), Some("default"));
+        assert_eq!(
+            map.command_order.last().map(String::as_str),
+            Some("default")
+        );
     }
 
     #[test]
@@ -1980,7 +2162,7 @@ mod tests {
     }
 
     #[test]
-    fn z_order_follows_the_active_cursor_and_layout_generation() {
+    fn z_order_follows_painted_surfaces_and_layout_generation() {
         let mut map = empty_map();
         map.layout.displays[0].width = 1440.0;
         map.layout.displays[0].height = 900.0;
@@ -2003,22 +2185,22 @@ mod tests {
         );
 
         assert_eq!(
-            z_order_route(&map),
-            Some(ZOrderRoute {
+            z_order_routes(&map),
+            vec![ZOrderRoute {
                 generation: 1,
-                display_ids: vec![1],
+                display_id: 1,
                 target_wid: Some(77),
-            })
+            }]
         );
 
         map.cursors.get_mut("sessA").unwrap().core.pos = (-1.0, 400.0);
-        assert_eq!(z_order_route(&map).unwrap().display_ids, vec![1, 2]);
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(77)), (2, Some(77))]);
 
         map.cursors.get_mut("sessA").unwrap().core.pos = (-400.0, 400.0);
-        assert_eq!(z_order_route(&map).unwrap().display_ids, vec![2]);
+        assert_eq!(ordering_pairs(&map), vec![(2, Some(77))]);
 
         map.layout.generation = 2;
-        assert_eq!(z_order_route(&map).unwrap().generation, 2);
+        assert_eq!(z_order_routes(&map)[0].generation, 2);
     }
 
     #[test]

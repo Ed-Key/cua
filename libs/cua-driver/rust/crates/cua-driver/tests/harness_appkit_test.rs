@@ -1395,6 +1395,151 @@ fn harness_appkit_slider_drag_px_background() {
     });
 }
 
+// File hashes corroborate the candidate artifact but cannot identify a loaded image.
+fn validate_slice_a_build_identity(
+    candidate_sha: &str,
+    config: &serde_json::Value,
+    executable_file_hash: &str,
+    built_hash: &str,
+    manifest_hash: Option<&str>,
+) -> Result<(), &'static str> {
+    let source_sha = config["source_sha"]
+        .as_str()
+        .ok_or("get_config.source_sha is missing or not a string")?;
+    for sha in [candidate_sha, source_sha] {
+        if sha.len() != 40 || !sha.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+            return Err("candidate and daemon source_sha must be full 40-digit Git SHAs");
+        }
+    }
+    if source_sha != candidate_sha {
+        return Err("running daemon get_config.source_sha does not match the candidate");
+    }
+    if executable_file_hash != built_hash || manifest_hash != Some(built_hash) {
+        return Err("candidate executable file hashes do not match");
+    }
+    Ok(())
+}
+
+fn slice_a_file_sha256(path: &Path) -> String {
+    let out = Command::new("shasum")
+        .args(["-a", "256"])
+        .arg(path)
+        .output()
+        .expect("hash candidate evidence file");
+    assert!(out.status.success(), "file hash failed");
+    String::from_utf8(out.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .unwrap()
+        .to_owned()
+}
+
+#[cfg(test)]
+mod slice_a_identity_tests {
+    use super::*;
+    use serde_json::json;
+
+    const CANDIDATE: &str = "64892c4e0ee152990c4d9f57ba4bc289e953f5ec";
+    const STALE: &str = "8df29cecb3ee299482a85bcb95283f43d901329b";
+    const HASH: &str = "candidate-file-hash";
+
+    #[test]
+    fn stale_reported_sha_is_rejected_with_matching_filepath_and_filehash() {
+        let artifact = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(artifact.path(), b"newly rebuilt candidate artifact").unwrap();
+        // Both path lookups see the replaced candidate file. The daemon still
+        // reports its old embedded identity, which must veto that corroboration.
+        let daemon_path = artifact.path();
+        let candidate_path = artifact.path();
+        assert_eq!(daemon_path, candidate_path);
+        let daemon_file_hash = slice_a_file_sha256(daemon_path);
+        let candidate_file_hash = slice_a_file_sha256(candidate_path);
+        assert_eq!(daemon_file_hash, candidate_file_hash);
+        assert!(validate_slice_a_build_identity(
+            CANDIDATE,
+            &json!({"source_sha": STALE}),
+            &daemon_file_hash,
+            &candidate_file_hash,
+            Some(&candidate_file_hash)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn missing_sha_is_rejected() {
+        for config in [json!({}), json!({"source_sha": null})] {
+            assert!(
+                validate_slice_a_build_identity(CANDIDATE, &config, HASH, HASH, Some(HASH))
+                    .is_err()
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_sha_is_rejected() {
+        for source in [
+            json!(""),
+            json!("64892c4"),
+            json!("g".repeat(40)),
+            json!(format!("{CANDIDATE}\n")),
+            json!(123),
+            json!([]),
+            json!({}),
+        ] {
+            assert!(
+                validate_slice_a_build_identity(
+                    CANDIDATE,
+                    &json!({"source_sha": source}),
+                    HASH,
+                    HASH,
+                    Some(HASH)
+                )
+                .is_err(),
+                "accepted malformed identity: {source}"
+            );
+        }
+        assert!(validate_slice_a_build_identity(
+            "bad",
+            &json!({"source_sha": "bad"}),
+            HASH,
+            HASH,
+            Some(HASH)
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn matching_sha_and_corroborating_hashes_are_accepted() {
+        assert!(validate_slice_a_build_identity(
+            CANDIDATE,
+            &json!({"source_sha": CANDIDATE}),
+            HASH,
+            HASH,
+            Some(HASH)
+        )
+        .is_ok());
+    }
+
+    #[test]
+    fn matching_sha_still_requires_corroborating_hashes() {
+        for (file_hash, manifest_hash) in [
+            ("old-file", Some(HASH)),
+            (HASH, None),
+            (HASH, Some("old-file")),
+        ] {
+            assert!(validate_slice_a_build_identity(
+                CANDIDATE,
+                &json!({"source_sha": CANDIDATE}),
+                file_hash,
+                HASH,
+                manifest_hash
+            )
+            .is_err());
+        }
+    }
+}
+
 /// Verify controller-captured native display evidence without launching or
 /// replacing a daemon. Requires an unmirrored 2x display plus a 1x secondary
 /// display with a negative x or y origin. A synthetic image is not acceptance.
@@ -1404,7 +1549,14 @@ fn harness_appkit_slider_drag_px_background() {
 /// bounds [x,y,w,h], scale, screenshot, screenshot_sha256, target [global x,y],
 /// and measured_tip_pixels [local x,y], independently annotated on that capture.
 /// Capture the full display at native scale from the isolated candidate daemon.
-/// The controller must retain the screenshots and measurement method with the report.
+/// Build the actual daemon with CUA_DRIVER_SOURCE_SHA set to the clean candidate's
+/// full Git SHA. This row queries get_config through a persistent MCP proxy to the
+/// explicit isolated socket and refuses a missing, malformed, or mismatched SHA.
+/// Executable path and file hashes only corroborate artifacts, not the loaded image.
+/// The controller must retain build and launch provenance, its persistent MCP
+/// get_config response from the capture session, screenshots, and measurement method.
+/// That provenance must bind the captures to this candidate daemon; querying a newer
+/// process later cannot certify older captures. No new diagnostic tool is required.
 #[test]
 #[ignore = "requires controller candidate daemon and native 1x/2x negative-origin display captures"]
 fn slice_a_cursor_display_geometry() {
@@ -1451,13 +1603,6 @@ fn slice_a_cursor_display_geometry() {
             String::from_utf8_lossy(&out.stderr)
         );
         String::from_utf8(out.stdout).unwrap().trim().to_owned()
-    }
-    fn sha256(path: &Path) -> String {
-        output(Command::new("shasum").args(["-a", "256"]).arg(path))
-            .split_whitespace()
-            .next()
-            .unwrap()
-            .to_owned()
     }
     let mut ids = [0u32; 32];
     let mut count = 0;
@@ -1546,21 +1691,34 @@ fn slice_a_cursor_display_geometry() {
     );
     let mut path = [0u8; 4096];
     assert!(unsafe { proc_pidpath(pid, path.as_mut_ptr().cast(), path.len() as u32) } > 0);
-    let running_binary = PathBuf::from(
+    let executable_path = PathBuf::from(
         unsafe { CStr::from_ptr(path.as_ptr().cast()) }
             .to_str()
             .unwrap(),
     );
-    let built_hash = sha256(Path::new(env!("CARGO_BIN_EXE_cua-driver")));
-    assert_eq!(
-        sha256(&running_binary),
-        built_hash,
-        "running daemon must match this candidate build"
+    let built_hash = slice_a_file_sha256(Path::new(env!("CARGO_BIN_EXE_cua-driver")));
+    // This proxy connects to the controller's existing daemon only. It neither
+    // launches a daemon nor starts a behavior recording or native fixture.
+    let mut driver = McpDriver::spawn_daemon_proxy_unrecorded(
+        socket.to_str().expect("isolated socket path must be UTF-8"),
+    )
+    .expect("connect persistent MCP to the isolated candidate daemon");
+    let config = driver.call("get_config", serde_json::json!({}));
+    assert!(
+        !config.is_error(),
+        "candidate get_config failed: {}",
+        config.text()
     );
-    assert_eq!(
+    validate_slice_a_build_identity(
+        &head,
+        config.structured(),
+        &slice_a_file_sha256(&executable_path),
+        &built_hash,
         evidence["candidate_binary_sha256"].as_str(),
-        Some(built_hash.as_str())
-    );
+    )
+    .expect("candidate build identity precondition");
+    println!("Slice A daemon identity: pid={pid} source_sha={} executable_path={} corroborating_file_sha256={built_hash}",
+        config.structured()["source_sha"], executable_path.display());
     let captures = evidence["captures"]
         .as_array()
         .expect("native capture rows");
@@ -1588,7 +1746,7 @@ fn slice_a_cursor_display_geometry() {
             .join(capture["screenshot"].as_str().unwrap());
         assert_eq!(
             capture["screenshot_sha256"].as_str(),
-            Some(sha256(&image_path).as_str())
+            Some(slice_a_file_sha256(&image_path).as_str())
         );
         let image = image::open(&image_path).expect("native full-display capture");
         assert_eq!(
