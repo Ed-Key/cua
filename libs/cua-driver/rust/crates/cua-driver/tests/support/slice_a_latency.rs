@@ -1,6 +1,8 @@
 //! Pure, test-local acceptance calculations. No native calls or generated evidence.
 
 use serde::{Deserialize, Serialize};
+#[path = "slice_a_provenance.rs"]
+pub mod provenance;
 
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -441,7 +443,16 @@ pub fn validate_playback(v: &VisualEvidence, target: [f64; 2]) -> Result<Playbac
     ];
     let complete_counter = v.frames.iter().all(|f| f.counter.is_some());
     let ordering = change.is_some_and(|i| i > arrival) && complete_counter;
-    let sampled_motion = arrival >= first + 2 && distance > 2.0 / v.scale && gap <= 0.040;
+    // Each annotation may vary by 2 native pixels. Require separation greater
+    // than the combined endpoint uncertainty at an intermediate captured point.
+    let start_tip = &v.frames[first].tip;
+    let intermediate = v.frames[first..arrival].iter().skip(1).any(|frame| {
+        let tip = &frame.tip;
+        (tip[0] - start_tip[0]).hypot(tip[1] - start_tip[1]) > 4.0
+            && (tip[0] - target[0]).hypot(tip[1] - target[1]) > 4.0
+    });
+    let sampled_motion =
+        arrival >= first + 2 && intermediate && distance > 2.0 / v.scale && gap <= 0.040;
     let timing_consistent = travel[1] >= 80.0
         && travel[0] <= 140.0
         && pulse_interval[0] <= 150.0
@@ -460,6 +471,9 @@ pub fn validate_playback(v: &VisualEvidence, target: [f64; 2]) -> Result<Playbac
 #[derive(Debug, Serialize)]
 pub struct ApproachTiming {
     pub action_id: String,
+    pub record_epoch_ms: [f64; 3],
+    pub rpc_bracket: provenance::RpcBracket,
+    pub clock_tolerance_ms: f64,
     pub first_frame_ms: f64,
     pub target_frame_ms: f64,
     pub submission_ms: f64,
@@ -469,9 +483,10 @@ pub struct ApproachTiming {
 
 pub fn parse_approach_timing(
     log: &str,
-    rpc_ms: f64,
+    bracket: provenance::RpcBracket,
     enabled: bool,
 ) -> Result<Option<ApproachTiming>, String> {
+    let rpc_ms = bracket.elapsed_ms;
     if !positive(rpc_ms) {
         return Err("invalid RPC duration".into());
     }
@@ -505,6 +520,8 @@ pub fn parse_approach_timing(
             .map(|(id, _)| id)
             .ok_or_else(|| "missing private action identity".into())
     }
+    provenance::validate_record_order(log, [registered[0], ack[0], released[0]])?;
+    let epoch_ms = provenance::validate_rpc_records([registered[0], ack[0], released[0]], bracket)?;
     let action_id = id(registered[0])?;
     if id(ack[0])? != action_id || id(released[0])? != action_id {
         return Err("mixed private action identities".into());
@@ -545,6 +562,9 @@ pub fn parse_approach_timing(
     }
     Ok(Some(ApproachTiming {
         action_id: action_id.into(),
+        record_epoch_ms: epoch_ms,
+        rpc_bracket: bracket,
+        clock_tolerance_ms: provenance::RPC_CLOCK_TOLERANCE_MS,
         first_frame_ms,
         target_frame_ms,
         submission_ms,
@@ -556,9 +576,27 @@ pub fn parse_approach_timing(
 #[cfg(test)]
 mod slice_a_approach_log_tests {
     use super::*;
-    const LOG: &str = r#"DEBUG cua_cursor_approach: click approach registered stage="registered" id=VisualActionId { generation: 2, action: 3 }
-DEBUG cua_cursor_approach: click target submission acknowledged stage="ack_received" id=VisualActionId { generation: 2, action: 3 } age_ms=150.2
-DEBUG cua_cursor_approach: click approach frame evidence stage="released" id=VisualActionId { generation: 2, action: 3 } timing=ApproachTiming { first_frame_ms: Some(10.0), target_frame_ms: Some(110.0), submission_ms: Some(130.0), acknowledgement_ms: Some(150.0), geometry_matches: true, route_matches: true, surface_matches: true } elapsed_ms=260.0"#;
+    // Synthetic parser fixtures, never native observations.
+    const LOG: &str = r#"2026-01-01T00:00:00.000Z DEBUG cua_cursor_approach: click approach registered stage="registered" id=VisualActionId { generation: 2, action: 3 }
+2026-01-01T00:00:00.150Z DEBUG cua_cursor_approach: click target submission acknowledged stage="ack_received" id=VisualActionId { generation: 2, action: 3 } age_ms=150.2
+2026-01-01T00:00:00.260Z DEBUG cua_cursor_approach: click approach frame evidence stage="released" id=VisualActionId { generation: 2, action: 3 } timing=ApproachTiming { first_frame_ms: Some(10.0), target_frame_ms: Some(110.0), submission_ms: Some(130.0), acknowledgement_ms: Some(150.0), geometry_matches: true, route_matches: true, surface_matches: true } elapsed_ms=260.0"#;
+
+    fn parse_approach_timing(
+        log: &str,
+        rpc_ms: f64,
+        enabled: bool,
+    ) -> Result<Option<ApproachTiming>, String> {
+        let start = provenance::timestamp_ms("2026-01-01T00:00:00Z").unwrap();
+        super::parse_approach_timing(
+            log,
+            provenance::RpcBracket {
+                started_epoch_ms: start,
+                returned_epoch_ms: start + rpc_ms,
+                elapsed_ms: rpc_ms,
+            },
+            enabled,
+        )
+    }
 
     #[test]
     fn separates_recorded_approach_from_remaining_rpc_without_guessed_duration() {
@@ -566,6 +604,17 @@ DEBUG cua_cursor_approach: click approach frame evidence stage="released" id=Vis
         assert_eq!(t.acknowledgement_ms, 150.0);
         assert_eq!(t.rpc_outside_registered_approach_ms, 130.0);
         assert!(parse_approach_timing("", 100.0, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn correction_reversed_approach_records_are_rejected() {
+        let lines: Vec<_> = LOG.lines().collect();
+        assert!(parse_approach_timing(
+            &lines.into_iter().rev().collect::<Vec<_>>().join("\n"),
+            280.,
+            true
+        )
+        .is_err());
     }
 
     #[test]
@@ -642,6 +691,41 @@ mod slice_a_evidence_tests {
         let result =
             serde_json::to_value(validate_playback(&parsed, [950.0, 220.0]).unwrap()).unwrap();
         assert_eq!(result["ordering"], "arrival_before_counter");
+    }
+
+    #[test]
+    fn correction_stationary_then_jump_is_not_glide() {
+        let mut v = clip();
+        let start = v.frames[2].tip.clone();
+        for frame in &mut v.frames[2..12] {
+            frame.tip = start.clone();
+        }
+        let result = validate_playback(&v, [950.0, 220.0]).unwrap();
+        assert!(matches!(result.ordering, OrderingEvidence::Indeterminate));
+    }
+    #[test]
+    fn correction_disabled_empty_crop_cannot_hide_painted_region() {
+        assert!(provenance::validate_disabled_coverage(
+            [0., 0., 10., 10.],
+            2.,
+            [0., 0., 1200., 800.],
+            2.
+        )
+        .is_err());
+        assert!(provenance::validate_disabled_coverage(
+            [0., 0., 1200., 800.],
+            1.,
+            [0., 0., 1200., 800.],
+            2.
+        )
+        .is_err());
+        assert!(provenance::validate_disabled_coverage(
+            [0., 0., 1200., 800.],
+            2.,
+            [0., 0., 1200., 800.],
+            2.
+        )
+        .is_ok());
     }
 
     #[test]

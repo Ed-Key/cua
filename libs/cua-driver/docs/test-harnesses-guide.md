@@ -645,20 +645,43 @@ to that JSON file; all hashes are SHA-256 of the actual retained bytes:
   "candidate_binary_sha256": "64_HEX_SHA256_OF_INSTALLED_SIGNED_EXECUTABLE",
   "build_profile": "release",
   "build_log": {"path": "build.log", "sha256": "64_HEX_SHA256"},
-  "launch_log": {"path": "launch.log", "sha256": "64_HEX_SHA256"}
+  "launch_log": {"path": "launch.json", "sha256": "64_HEX_SHA256"}
 }
 ```
 
 The build transcript must contain the actual `CUA_DRIVER_SOURCE_SHA=<sha>`
 invocation and Cargo's `Finished` line for the declared profile. `debug` maps
 to Cargo's `dev` build profile and is accepted only for visual milestones;
-final timing requires `release`. Launch provenance records the actual command,
-PID, socket and environment. Each new row checks a clean tracked checkout,
-current HEAD, socket-owning PID, executable hashes, signature verification and
-production `get_config.source_sha` from a persistent MCP connection. The binary
-path uses testkit `driver_binary()`, including its explicit override. A file
-hash alone cannot identify an already-loaded image. Keep the daemon unchanged
-between capture and verification; a newer process cannot certify old frames.
+final timing requires `release`. `launch_log` now references a structured
+`launch.json`, with these required fields:
+
+- `daemon_pid`, canonical absolute `executable`, `executable_sha256`, and
+  canonical absolute `socket`, matching the candidate's actual running process.
+- `command`: the actual launch argument array; `launched_epoch_ms`: the observed
+  launch wall time; `process_started`: the trimmed original output of
+  `LC_ALL=C ps -p <PID> -o lstart=`. Do not synthesize missing observations.
+- `environment`: the recorded launch environment switches. The harness checks
+  `CUA_LOG` and `CUA_PRIVATE_CURSOR_ORDER_TRACE` against the live process without
+  saving its complete environment. Avoid including unrelated secrets.
+- `stderr`: canonical absolute path of the actual regular file attached to
+  descriptor 2; `stderr_identity`: `{ "device": <st_dev>, "inode": <st_ino> }`
+  observed at launch. The harness checks both against the running process.
+- `transcript`: `{ "path": "launch.log", "sha256": "64_HEX_SHA256" }`, retaining
+  the original launch transcript alongside the structured record.
+
+Timing requires exactly `CUA_LOG=cua_cursor_approach=debug`, with
+`CUA_PRIVATE_CURSOR_ORDER_TRACE` unset or disabled. The approach log path must
+match that process's verified stderr. The title-free ordering diagnostic remains
+opt-in and bounded to one probe per display, at most 120 presentation samples
+within two seconds per request. It observes current application eligibility and
+before/after native stacks. Its overhead is not normal latency evidence.
+
+Each new row checks a clean tracked checkout, current HEAD, socket-owning PID,
+process start record, executable hashes, signature verification and production
+`get_config.source_sha` from a persistent MCP connection. The binary path uses
+testkit `driver_binary()`, including its explicit override. A file hash alone
+cannot identify an already-loaded image. Keep the daemon unchanged between
+capture and verification; a newer process cannot certify old frames.
 
 The controller must have the AppKit fixture and Electron foreground sentinel
 built through `tests/fixtures/build/macos.sh`, and the necessary Accessibility
@@ -777,7 +800,8 @@ requires a near-target first appearance and samples consistent with approximate
 80 to 140 ms travel and a 150 ms pulse. It reports frame-bounded intervals,
 not exact renderer timestamps. A counter change before arrival fails. A change
 in the same frame as arrival, unreadable counter, insufficient travel samples,
-a gap over 40 ms, or unresolved timing remains **indeterminate**, with the row
+a gap over 40 ms, no intermediate tip distinct from both endpoints by more than
+4 native pixels (combined annotation tolerance), or unresolved timing remains **indeterminate**, with the row
 still failing/pending. An earlier captured arrival frame establishes sampled UI
 ordering only. It does not establish a separate earlier physical scanout, the
 native accepted-input timestamp, or causality from a delayed label redraw.
@@ -833,9 +857,17 @@ median and nearest-rank p95, plus descriptive enabled/disabled ratios for each
 block and the aggregate. There is no bootstrap, seed or ratio verdict for this
 amended policy. Do not repeat runs until a preferred result appears.
 
-Per-sample `*-timing.json` and `*-approach.log` retain byte ranges from the
-candidate's existing private diagnostics. Enabled samples require exactly one
-matching registered/ack_received/released action identity and finite ordered
+Per-sample `*-timing.json` and `*-approach.log` retain original byte ranges from
+the candidate's verified stderr, its device/inode identity, and the extracted
+bytes' hash. One open descriptor spans RPC and read; changed path identity,
+truncation, short reads or a slice over 1 MiB fail. The raw sample retains both
+actual wall-clock endpoints and the monotonic RPC duration. No timestamps are
+invented when logs or capture clock measurements are missing. Enabled samples require exactly one
+matching registered/ack_received/released action identity, in that line order.
+RFC3339 timestamps must also be ordered and fall inside the actual RPC bracket,
+with a conservative 5 ms admission tolerance. Wall and monotonic RPC durations
+must agree within that tolerance. This tolerance is not measured clock precision.
+The records must contain finite ordered
 first-frame, target-frame, submission and acknowledgement measurements. Disabled
 samples require no approach record. Missing, rotated, mixed or incomplete logs
 fail rather than invent timing. `rpc_outside_registered_approach_ms` subtracts
@@ -851,6 +883,34 @@ on the same verified final candidate, serially, through the same socket. Its
 prior-candidate success does not certify the current candidate. Do not suppress
 real-pointer changes or any other observer violation. Preserve failures and
 investigate their cause before asserting local isolation.
+
+Disabled-overlay annotations must cover the complete selected physical display
+at its recorded native scale, even for the geometry row. An empty unrelated crop
+cannot establish absence of prior cursor or pulse artwork. Preserve every
+original capture, raw transcript and structured provenance file. A later still,
+an overlay-only image and a video frame are separate instants unless their
+observed timing establishes otherwise.
+
+### Deferred Windows/Linux integration limitation
+
+This local Mac work does not establish cross-platform compatibility. The shared
+`RenderStateCore::new` now starts at `(0, 0)` with `placed = false`, but Windows
+`platform-windows/src/overlay.rs::seed_start_in_map` and X11
+`platform-linux/src/overlay.rs::seed_start_if_sentinel` still require `pos.0 < -50`.
+Their first command therefore skips target-adjacent seeding and can plan from the
+origin. The Windows `seed_moves_sentinel_cursor_on_screen_for_first_action` test
+contradicts that retained predicate by source inspection. Assigning `core.pos`
+alone would also fail to establish explicit placement. Retained sign-based paint
+checks hide valid negative-X positions. Wayland's
+`platform-linux/src/wayland/overlay.rs::apply_keyed_command` retains the same
+sentinel seed pattern.
+
+These are concrete adapter integration regressions, separate from unrun native
+qualification. The user deferred their correction; the early parity contribution
+is retained. A future source fix and focused adapter tests are required before
+universal landing. No Windows/Linux quick-approach support or native result is
+claimed here. Physical 1x, secondary display and negative-origin Mac qualification
+also remain pending when that hardware is unavailable.
 
 Helper-only preparation, with no native run:
 

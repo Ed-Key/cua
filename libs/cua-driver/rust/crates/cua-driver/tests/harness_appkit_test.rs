@@ -1775,7 +1775,9 @@ fn slice_a_verify_profile(evidence: &serde_json::Value, root: &Path) {
     );
     let launch: slice_a_latency::Artifact =
         serde_json::from_value(evidence["launch_log"].clone()).expect("launch provenance");
-    slice_a_artifact(root, &launch);
+    let launch_path = slice_a_artifact(root, &launch);
+    slice_a_latency::provenance::parse_launch(&std::fs::read(launch_path).unwrap())
+        .expect("structured launch provenance");
 }
 
 fn slice_a_socket() -> PathBuf {
@@ -1851,6 +1853,74 @@ fn slice_a_candidate(driver: &mut McpDriver) -> serde_json::Value {
     )
     .expect("running embedded SHA must match candidate");
     slice_a_verify_profile(&meta, path.parent().unwrap());
+    let launch_artifact: slice_a_latency::Artifact =
+        serde_json::from_value(meta["launch_log"].clone()).unwrap();
+    let launch = slice_a_latency::provenance::parse_launch(
+        &std::fs::read(slice_a_artifact(path.parent().unwrap(), &launch_artifact)).unwrap(),
+    )
+    .unwrap();
+    slice_a_artifact(path.parent().unwrap(), &launch.transcript);
+    let stderr_output =
+        slice_a_output(Command::new("lsof").args(["-a", "-p", &pid.to_string(), "-d", "2", "-Fn"]));
+    let stderr_paths: Vec<_> = stderr_output
+        .lines()
+        .filter_map(|s| s.strip_prefix('n'))
+        .collect();
+    assert_eq!(
+        stderr_paths.len(),
+        1,
+        "candidate must retain stderr in one regular file"
+    );
+    let stderr = PathBuf::from(stderr_paths[0]).canonicalize().unwrap();
+    let stderr_metadata = std::fs::metadata(&stderr).unwrap();
+    assert!(stderr_metadata.is_file());
+    let stderr_identity = slice_a_latency::provenance::FileIdentity::of(&stderr_metadata);
+    slice_a_latency::provenance::validate_launch(
+        &launch,
+        pid,
+        &executable.canonicalize().unwrap(),
+        &hash,
+        &socket.canonicalize().unwrap(),
+        &stderr,
+        &stderr_identity,
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        launch.process_started,
+        slice_a_output(Command::new("ps").env("LC_ALL", "C").args([
+            "-p",
+            &pid.to_string(),
+            "-o",
+            "lstart="
+        ])),
+        "launch record must identify this process lifetime"
+    );
+    assert!(
+        launch.launched_epoch_ms <= slice_a_epoch_ms(),
+        "launch timestamp is in the future"
+    );
+    // Inspect only the two diagnostic switches; never persist the process's
+    // complete environment, which can contain unrelated credentials.
+    let live_environment =
+        slice_a_output(Command::new("ps").args(["eww", "-p", &pid.to_string(), "-o", "command="]));
+    for name in ["CUA_LOG", "CUA_PRIVATE_CURSOR_ORDER_TRACE"] {
+        let prefix = format!("{name}=");
+        let values: Vec<_> = live_environment
+            .split_whitespace()
+            .filter_map(|v| v.strip_prefix(&prefix))
+            .collect();
+        assert_eq!(
+            values,
+            launch
+                .environment
+                .get(name)
+                .map(|v| vec![v.as_str()])
+                .unwrap_or_default(),
+            "launch diagnostic environment disagrees with running candidate: {name}"
+        );
+    }
+    meta["verified_launch"] = serde_json::to_value(&launch).unwrap();
     assert_eq!(
         config.structured()["experimental_pip"].as_bool(),
         Some(false),
@@ -2648,6 +2718,13 @@ fn slice_a_verify_visual_trace(
     assert_eq!(disabled.stage, "disabled");
     assert_eq!(disabled.trace_sha256, slice_a_file_sha256(&path));
     slice_a_verify_capture_log(dir, &disabled, &trace);
+    slice_a_latency::provenance::validate_disabled_coverage(
+        disabled.crop_bounds,
+        disabled.scale,
+        trace.stages[0].geometry.display_bounds,
+        trace.stages[0].geometry.scale,
+    )
+    .expect("disabled coverage");
     let disabled_interval = slice_a_json(&dir.join("disabled.json"));
     assert_eq!(disabled_interval["session"], trace.session);
     let off_start = disabled_interval["start_epoch_ms"].as_f64().unwrap();
@@ -2697,7 +2774,24 @@ fn slice_a_cursor_latency() {
             std::env::var("CUA_SLICE_A_APPROACH_LOG")
                 .expect("candidate private timing log path required"),
         );
-        assert!(approach_log.is_file(),"controller must launch candidate with CUA_LOG=cua_cursor_approach=debug and retain stderr");
+        let launch: slice_a_latency::provenance::LaunchRecord =
+            serde_json::from_value(candidate["verified_launch"].clone()).unwrap();
+        assert_eq!(
+            approach_log.canonicalize().unwrap(),
+            launch.stderr,
+            "timing must read this candidate's actual stderr"
+        );
+        slice_a_latency::provenance::validate_launch(
+            &launch,
+            launch.daemon_pid,
+            &launch.executable,
+            &launch.executable_sha256,
+            &launch.socket,
+            &launch.stderr,
+            &launch.stderr_identity,
+            true,
+        )
+        .unwrap();
         let visual_dir = PathBuf::from(
             std::env::var("CUA_SLICE_A_PREFLIGHT_DIR")
                 .expect("completed separate first-target visual evidence required"),
@@ -2878,37 +2972,48 @@ fn slice_a_timed_click(
     let before = slice_a_counter(pid, wid);
     let args = serde_json::json!({"session":session,"pid":pid,"window_id":wid,"x":geometry.request[0],"y":geometry.request[1],"delivery_mode":"background"});
     let log_path = PathBuf::from(std::env::var("CUA_SLICE_A_APPROACH_LOG").unwrap());
-    let log_start = std::fs::metadata(&log_path)
-        .expect("private daemon log")
-        .len();
+    let candidate_path = PathBuf::from(std::env::var("CUA_SLICE_A_CANDIDATE").unwrap());
+    let candidate = slice_a_json(&candidate_path);
+    let launch_artifact: slice_a_latency::Artifact =
+        serde_json::from_value(candidate["launch_log"].clone()).unwrap();
+    let launch = slice_a_latency::provenance::parse_launch(
+        &std::fs::read(slice_a_artifact(
+            candidate_path.parent().unwrap(),
+            &launch_artifact,
+        ))
+        .unwrap(),
+    )
+    .unwrap();
+    assert_eq!(log_path.canonicalize().unwrap(), launch.stderr);
+    let log_slice = slice_a_latency::provenance::LogSlice::open(&log_path, &launch.stderr_identity)
+        .expect("same retained daemon stderr");
+    let log_start = log_slice.start;
+    let log_identity = log_slice.identity.clone();
     let epoch = slice_a_epoch_ms();
     let start = std::time::Instant::now();
     let response = driver.call("click", args.clone());
     let ns = start.elapsed().as_nanos() as f64;
-    let log_end = std::fs::metadata(&log_path).unwrap().len();
-    assert!(log_end >= log_start, "daemon log rotated during sample");
-    let log = {
-        use std::io::{Read, Seek, SeekFrom};
-        let mut file = std::fs::File::open(&log_path).unwrap();
-        file.seek(SeekFrom::Start(log_start)).unwrap();
-        let mut text = String::new();
-        file.take(log_end - log_start)
-            .read_to_string(&mut text)
-            .unwrap();
-        text
+    let returned_epoch_ms = slice_a_epoch_ms();
+    let bracket = slice_a_latency::provenance::RpcBracket {
+        started_epoch_ms: epoch,
+        returned_epoch_ms,
+        elapsed_ms: ns / 1_000_000.0,
     };
+    let (log, log_end) = log_slice
+        .finish()
+        .expect("preserved stderr descriptor and path identity across RPC/read");
     let log_artifact = dir.join(format!("{label}-approach.log"));
     std::fs::write(&log_artifact, &log).unwrap();
     slice_a_write(
         &dir.join(format!("{label}.json")),
-        &serde_json::json!({"arguments":args,"response":response.raw,"elapsed_ns":ns,"started_epoch_ms":epoch,"enabled":enabled,"setup_target_pixels":setup,"timing_mode":mode}),
+        &serde_json::json!({"arguments":args,"response":response.raw,"elapsed_ns":ns,"started_epoch_ms":epoch,"returned_epoch_ms":returned_epoch_ms,"enabled":enabled,"setup_target_pixels":setup,"timing_mode":mode}),
     );
     assert!(!response.is_error(), "timed click failed: {}", response.raw);
-    let approach = slice_a_latency::parse_approach_timing(&log, ns / 1_000_000.0, enabled)
+    let approach = slice_a_latency::parse_approach_timing(&log, bracket, enabled)
         .expect("complete per-action private timing evidence");
     slice_a_write(
         &dir.join(format!("{label}-timing.json")),
-        &serde_json::json!({"approach":approach,"log":log_path,"byte_range":[log_start,log_end],"sha256":slice_a_file_sha256(&log_artifact),"rpc_ms":ns/1_000_000.0}),
+        &serde_json::json!({"approach":approach,"rpc_bracket":bracket,"stderr_identity":log_identity,"log":log_path,"byte_range":[log_start,log_end],"sha256":slice_a_file_sha256(&log_artifact),"rpc_ms":ns/1_000_000.0}),
     );
     assert_eq!(response.action_route(), Some("accessibility"));
     assert_eq!(
