@@ -20,6 +20,20 @@ pub struct MacOsPageBackend {
     pub state: Arc<ToolState>,
 }
 
+async fn dispatch_click_visual<T, E>(
+    registry: &crate::cursor::CursorRegistry,
+    sink: &dyn crate::cursor::visual::PointerVisualSink,
+    target: Option<crate::cursor::visual::ResolvedPointerTarget>,
+    native: impl std::future::Future<Output = Result<T, E>>,
+) -> Result<T, E> {
+    let handle = crate::cursor::visual::emit_pointer_target(registry, sink, "default", target);
+    let result = native.await;
+    if result.is_ok() {
+        crate::cursor::visual::emit_pointer_contact(sink, handle);
+    }
+    result
+}
+
 impl MacOsPageBackend {
     pub fn new(state: Arc<ToolState>) -> Self {
         Self { state }
@@ -154,14 +168,6 @@ impl PageBackend for MacOsPageBackend {
 
         let screen_x = sx + vx * dpr;
         let screen_y = sy + vy * dpr;
-        let cursor_key = "default".to_owned();
-        let visual = crate::cursor::visual::begin_pointer_action(
-            &self.state.cursor_registry,
-            &cursor_key,
-            crate::cursor::visual::point(screen_x, screen_y, Some(window_id as u32)),
-            cursor_overlay::CursorAction::Click,
-        );
-
         let click_js = format!(
             r#"(function() {{
   var selector = {selector_js};
@@ -171,8 +177,13 @@ impl PageBackend for MacOsPageBackend {
   return "clicked:" + selector;
 }})();"#
         );
-        let _ = self.execute_javascript(pid, window_id, &click_js).await?;
-        visual.accepted();
+        dispatch_click_visual(
+            &self.state.cursor_registry,
+            &crate::cursor::visual::OverlayVisualSink,
+            crate::cursor::visual::point(screen_x, screen_y, Some(window_id as u32)),
+            self.execute_javascript(pid, window_id, &click_js),
+        )
+        .await?;
 
         Ok(ClickElementResult {
             screen_x,
@@ -388,4 +399,41 @@ fn required_finite(value: &serde_json::Value, key: &str, raw: &str) -> anyhow::R
                 "click_element: probe JSON missing/invalid required field '{key}' (raw: {raw:?})"
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    #[tokio::test]
+    async fn slice_a_page_dispatch_emits_contact_only_after_accepted_javascript() {
+        for failed in [false, true] {
+            let registry = crate::cursor::CursorRegistry::new();
+            let sink = crate::cursor::visual::test_support::RecordingSink::default();
+            let result = super::dispatch_click_visual(
+                &registry,
+                &sink,
+                crate::cursor::visual::point(90.0, 80.0, Some(42)),
+                async {
+                    let events = sink.1.lock().unwrap();
+                    assert_eq!(events.len(), 1);
+                    assert_eq!(events[0].target, Some((90.0, 80.0)));
+                    assert_eq!(events[0].phase, cursor_overlay::VisualPhase::Intent);
+                    if failed {
+                        Err("JS dispatch failed")
+                    } else {
+                        Ok("clicked")
+                    }
+                },
+            )
+            .await;
+            assert_eq!(result.is_err(), failed);
+            let events = sink.1.lock().unwrap();
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.phase == cursor_overlay::VisualPhase::Contact)
+                    .count(),
+                usize::from(!failed)
+            );
+        }
+    }
 }

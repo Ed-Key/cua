@@ -42,6 +42,17 @@ use cua_driver_core::background_input::BackgroundRefusal;
 
 use super::ToolState;
 
+pub(crate) fn with_type_visual<T>(
+    registry: &crate::cursor::CursorRegistry,
+    sink: &dyn crate::cursor::visual::PointerVisualSink,
+    key: &str,
+    target: Option<crate::cursor::visual::ResolvedPointerTarget>,
+    native: impl FnOnce() -> T,
+) -> T {
+    let _delivery = crate::cursor::visual::DeliveryVisualGuard::text(registry, sink, key, target);
+    native()
+}
+
 pub struct TypeTextTool {
     pub state: Arc<ToolState>,
 }
@@ -177,8 +188,16 @@ impl Tool for TypeTextTool {
             ) {
                 return synthesis_refusal_result("hid", &refusal, AxAttempt::NotAttempted);
             }
+            let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+            let registry = self.state.cursor_registry.clone();
             let result = tokio::task::spawn_blocking(move || {
-                crate::input::keyboard::type_text_global(&text, delay_ms)
+                with_type_visual(
+                    &registry,
+                    &crate::cursor::visual::OverlayVisualSink,
+                    &cursor_key,
+                    None,
+                    || crate::input::keyboard::type_text_global(&text, delay_ms),
+                )
             })
             .await;
             return match result {
@@ -330,30 +349,8 @@ impl Tool for TypeTextTool {
             // element_index stays None → the type path below writes to the now-
             // focused element via the CGEvent (key_events) rung.
         }
-        if let (Some((element, _)), Some(wid)) = (element_guard.as_ref(), window_id) {
-            let center_ptr = element.as_ptr() as usize;
-            if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
-                crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
-            })
-            .await
-            {
-                let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-                crate::cursor::overlay::send_command(
-                    cursor_key.clone(),
-                    cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-                );
-                crate::cursor::visual::emit_action_target(
-                    &self.state.cursor_registry,
-                    &crate::cursor::visual::OverlayVisualSink,
-                    &cursor_key,
-                    crate::cursor::visual::point(screen_x, screen_y, window_id),
-                    cursor_overlay::CursorAction::Text,
-                );
-                self.state
-                    .cursor_registry
-                    .update_position(&cursor_key, screen_x, screen_y);
-            }
-        }
+        let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+        let visual_registry = self.state.cursor_registry.clone();
         let element_ptr = element_guard
             .as_ref()
             .map(|(g, idx)| (g.as_ptr(), Some(*idx)));
@@ -383,15 +380,37 @@ impl Tool for TypeTextTool {
             "type_text.AXSelectedText",
             || async move {
                 tokio::task::spawn_blocking(move || {
-                    type_text_blocking(
-                        pid,
-                        &text_clone,
-                        element_ptr,
-                        delay_ms,
-                        is_terminal_target,
-                        delivery_mode,
-                        window_id,
-                        blocking_policy,
+                    let target = element_ptr.and_then(|(ptr, _)| {
+                        window_id.and_then(|wid| unsafe {
+                            let element = ptr as AXUIElementRef;
+                            matches!(
+                                crate::ax::bindings::copy_string_attr(element, "AXRole").as_deref(),
+                                Some("AXTextField" | "AXTextArea" | "AXSearchField")
+                            )
+                            .then(|| crate::ax::bindings::element_screen_rect(element))
+                            .flatten()
+                            .and_then(|rect| {
+                                crate::cursor::visual::ResolvedPointerTarget::from_bounds(wid, rect)
+                            })
+                        })
+                    });
+                    with_type_visual(
+                        &visual_registry,
+                        &crate::cursor::visual::OverlayVisualSink,
+                        &cursor_key,
+                        target,
+                        || {
+                            type_text_blocking(
+                                pid,
+                                &text_clone,
+                                element_ptr,
+                                delay_ms,
+                                is_terminal_target,
+                                delivery_mode,
+                                window_id,
+                                blocking_policy,
+                            )
+                        },
                     )
                 })
                 .await
@@ -1375,6 +1394,63 @@ fn type_text_blocking(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slice_a_type_delivery_and_error_drop_end_trusted_editor_highlight() {
+        use crate::cursor::visual::{test_support::RecordingSink, ResolvedPointerTarget};
+        use cursor_overlay::VisualPhase;
+        for fail in [false, true] {
+            let registry = crate::cursor::CursorRegistry::new();
+            let sink = RecordingSink::default();
+            let result = with_type_visual(
+                &registry,
+                &sink,
+                "type-cue",
+                ResolvedPointerTarget::from_bounds(42, [10.0, 20.0, 100.0, 40.0]),
+                || {
+                    let events = sink.1.lock().unwrap();
+                    let active = events.last().unwrap();
+                    assert_eq!(active.phase, VisualPhase::Tracking);
+                    assert_eq!(active.bounds, Some([10.0, 20.0, 100.0, 40.0]));
+                    assert_eq!(active.target, Some((60.0, 40.0)));
+                    if fail {
+                        Err("native error")
+                    } else {
+                        Ok(())
+                    }
+                },
+            );
+            assert_eq!(result.is_err(), fail);
+            let events = sink.1.lock().unwrap();
+            assert_eq!(events.last().unwrap().phase, VisualPhase::End);
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.phase == VisualPhase::End)
+                    .count(),
+                1
+            );
+        }
+    }
+    #[test]
+    fn slice_a_type_without_bounds_stays_semantic_and_cleans_up_on_unwind() {
+        let registry = crate::cursor::CursorRegistry::new();
+        let sink = crate::cursor::visual::test_support::RecordingSink::default();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            with_type_visual(&registry, &sink, "type-semantic", None, || {
+                panic!("native error")
+            });
+        }));
+        assert!(result.is_err());
+        let events = sink.1.lock().unwrap();
+        assert!(events
+            .iter()
+            .all(|e| e.target.is_none() && e.bounds.is_none()));
+        assert_eq!(
+            events.last().unwrap().phase,
+            cursor_overlay::VisualPhase::End
+        );
+        assert!(registry.get("type-semantic").is_none());
+    }
     use super::*;
 
     /// Sanity-check that the terminal short-circuit can be expressed as a

@@ -42,6 +42,29 @@ fn after_exact_target_gate<T>(
     Ok(action())
 }
 
+fn dispatch_scroll_visual<T, E>(
+    registry: &crate::cursor::CursorRegistry,
+    sink: &dyn crate::cursor::visual::PointerVisualSink,
+    key: &str,
+    target: Option<crate::cursor::visual::ResolvedPointerTarget>,
+    delta_y: i32,
+    delta_x: i32,
+    native: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let handle = crate::cursor::visual::emit_action_target(
+        registry,
+        sink,
+        key,
+        target,
+        cursor_overlay::CursorAction::Scroll,
+    );
+    let result = native();
+    if result.is_ok() {
+        handle.scroll_contact(sink, delta_y, delta_x);
+    }
+    result
+}
+
 pub struct ScrollTool {
     state: Arc<ToolState>,
 }
@@ -147,8 +170,18 @@ impl Tool for ScrollTool {
                 ScrollDirection::Left => (0, step),
             };
             let (x, y) = super::desktop_screenshot_point(x, y).await;
+            let key = super::cursor_tools::resolve_cursor_key(&args);
+            let registry = self.state.cursor_registry.clone();
             let result = tokio::task::spawn_blocking(move || {
-                crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount)
+                dispatch_scroll_visual(
+                    &registry,
+                    &crate::cursor::visual::OverlayVisualSink,
+                    &key,
+                    crate::cursor::visual::point(x, y, None),
+                    delta_y,
+                    delta_x,
+                    || crate::input::mouse::scroll_wheel_desktop(x, y, delta_y, delta_x, amount),
+                )
             })
             .await;
             return match result {
@@ -274,6 +307,8 @@ impl Tool for ScrollTool {
                 let direction_for_ax = direction.clone();
                 let by_for_ax = by.clone();
                 let foreground = delivery_mode.is_foreground();
+                let visual_registry = self.state.cursor_registry.clone();
+                let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
                 let ax_result =
                     tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
                         let Some(element_guard) = native_element_guard else {
@@ -291,6 +326,9 @@ impl Tool for ScrollTool {
                                             &direction_for_ax,
                                             &by_for_ax,
                                             amount,
+                                            &visual_registry,
+                                            &cursor_key,
+                                            wid,
                                         )
                                     };
                                     std::thread::sleep(std::time::Duration::from_millis(100));
@@ -306,6 +344,9 @@ impl Tool for ScrollTool {
                                         &direction_for_ax,
                                         &by_for_ax,
                                         amount,
+                                        &visual_registry,
+                                        &cursor_key,
+                                        wid,
                                     )
                                 },
                                 false,
@@ -523,26 +564,7 @@ impl Tool for ScrollTool {
                 }
             }
             let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-            // Pin + glide the agent-cursor overlay to the target for visibility
-            // (overlay only — does NOT move the hardware cursor). Mirrors click.
-            if let Some(wid) = target.wid {
-                crate::cursor::overlay::send_command(
-                    cursor_key.clone(),
-                    cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-                );
-            }
-            crate::cursor::visual::emit_action_target(
-                &self.state.cursor_registry,
-                &crate::cursor::visual::OverlayVisualSink,
-                &cursor_key,
-                crate::cursor::visual::point(target.screen_x, target.screen_y, target.wid),
-                cursor_overlay::CursorAction::Scroll,
-            );
-            self.state.cursor_registry.update_position(
-                &cursor_key,
-                target.screen_x,
-                target.screen_y,
-            );
+            let visual_registry = self.state.cursor_registry.clone();
 
             let prior_front = apps::frontmost_pid();
             let snapshot = WindowChangeDetector::snapshot(prior_front);
@@ -571,6 +593,17 @@ impl Tool for ScrollTool {
                                 delta_y,
                                 delta_x,
                                 amount_ticks,
+                            )
+                        };
+                        let do_it = || {
+                            dispatch_scroll_visual(
+                                &visual_registry,
+                                &crate::cursor::visual::OverlayVisualSink,
+                                &cursor_key,
+                                crate::cursor::visual::point(screen_x, screen_y, wid),
+                                delta_y,
+                                delta_x,
+                                do_it,
                             )
                         };
                         // Foreground rung: brief front → wheel → restore prior frontmost.
@@ -663,6 +696,8 @@ impl Tool for ScrollTool {
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
 
+        let visual_registry = self.state.cursor_registry.clone();
+        let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
@@ -680,7 +715,21 @@ impl Tool for ScrollTool {
 
                 tokio::task::spawn_blocking(move || {
                     for _ in 0..amount {
-                        crate::input::keyboard::press_key(pid, &key, &[])?;
+                        let (dy, dx) = match key.as_str() {
+                            "up" | "pageup" => (1, 0),
+                            "left" => (0, 1),
+                            "right" => (0, -1),
+                            _ => (-1, 0),
+                        };
+                        dispatch_scroll_visual(
+                            &visual_registry,
+                            &crate::cursor::visual::OverlayVisualSink,
+                            &cursor_key,
+                            None,
+                            dy,
+                            dx,
+                            || crate::input::keyboard::press_key(pid, &key, &[]),
+                        )?;
                         std::thread::sleep(std::time::Duration::from_millis(50));
                     }
                     Ok::<(), anyhow::Error>(())
@@ -710,6 +759,9 @@ unsafe fn scroll_native_text_area(
     direction: &str,
     by: &str,
     amount: usize,
+    registry: &crate::cursor::CursorRegistry,
+    key: &str,
+    window: u32,
 ) -> bool {
     if copy_string_attr(element, "AXRole").as_deref() != Some("AXTextArea") {
         return false;
@@ -738,7 +790,28 @@ unsafe fn scroll_native_text_area(
     let mut delivered = false;
     if let Some(target) = buttons.get(index).copied() {
         for _ in 0..amount.max(1) {
-            if perform_action(target, "AXPress") != kAXErrorSuccess {
+            let bounds = crate::ax::bindings::element_screen_rect(target).and_then(|rect| {
+                crate::cursor::visual::ResolvedPointerTarget::from_bounds(window, rect)
+            });
+            // This AX route selects vertical buttons even for a nonvertical request.
+            // Describe the delivered actuator direction, without changing its behavior.
+            if dispatch_scroll_visual(
+                registry,
+                &crate::cursor::visual::OverlayVisualSink,
+                key,
+                bounds,
+                if reverse { 1 } else { -1 },
+                0,
+                || {
+                    if perform_action(target, "AXPress") == kAXErrorSuccess {
+                        Ok(())
+                    } else {
+                        Err(())
+                    }
+                },
+            )
+            .is_err()
+            {
                 break;
             }
             delivered = true;
@@ -773,6 +846,53 @@ unsafe fn collect_ax_buttons(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slice_a_scroll_contact_matches_delivered_direction_and_point() {
+        use cursor_overlay::{ScrollDirection as D, VisualPhase};
+        for (dy, dx, direction) in [
+            (30, 0, D::Up),
+            (-30, 0, D::Down),
+            (0, 30, D::Left),
+            (0, -30, D::Right),
+        ] {
+            for failed in [false, true] {
+                let registry = crate::cursor::CursorRegistry::new();
+                let sink = crate::cursor::visual::test_support::RecordingSink::default();
+                let result = dispatch_scroll_visual(
+                    &registry,
+                    &sink,
+                    "scroll-cue",
+                    crate::cursor::visual::point(-40.0, 80.0, Some(42)),
+                    dy,
+                    dx,
+                    || {
+                        assert!(!sink
+                            .1
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .any(|e| e.phase == VisualPhase::Contact));
+                        if failed {
+                            Err("refused")
+                        } else {
+                            Ok((dy, dx))
+                        }
+                    },
+                );
+                let events = sink.1.lock().unwrap();
+                let contacts: Vec<_> = events
+                    .iter()
+                    .filter(|e| e.phase == VisualPhase::Contact)
+                    .collect();
+                assert_eq!(contacts.len(), usize::from(!failed));
+                if let Ok(delivered) = result {
+                    assert_eq!(delivered, (dy, dx));
+                    assert_eq!(contacts[0].target, Some((-40.0, 80.0)));
+                    assert_eq!(contacts[0].scroll_direction, Some(direction));
+                }
+            }
+        }
+    }
     use super::*;
     use cua_driver_core::background_input::{
         decide_background_input, BackgroundAction, BackgroundInputDecision, BackgroundTargetFacts,

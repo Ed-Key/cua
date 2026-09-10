@@ -21,7 +21,9 @@ use cua_driver_core::{
     tool_args::parse_legacy_click_input,
 };
 use serde_json::Value;
-use std::sync::{atomic::Ordering, Arc};
+#[cfg(test)]
+use std::sync::atomic::Ordering;
+use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
@@ -34,8 +36,8 @@ use core_foundation::base::{CFRelease, TCFType};
 
 use super::ToolState;
 use crate::cursor::visual::{
-    emit_pointer_contact, emit_pointer_target, DeliveryReceipt, OverlayVisualSink,
-    PointerVisualSink, ResolvedPointerTarget,
+    emit_pointer_target, DeliveryReceipt, OverlayVisualSink, PointerVisualSink,
+    ResolvedPointerTarget,
 };
 
 pub struct ClickTool {
@@ -53,12 +55,12 @@ impl ClickTool {
 
     // Both futures are lazy: a completed semantic route never polls native input.
     // Selection can deliver input and then fail its postcondition readback. Its
-    // optional receipt keeps that delivery fact independent of the tool result.
+    // receipt keeps that delivery fact independent of the tool result.
     async fn dispatch_resolved(
         &self,
         cursor_key: &str,
         target: Option<ResolvedPointerTarget>,
-        delivery_receipt: Option<&DeliveryReceipt>,
+        delivery_receipt: &DeliveryReceipt,
         semantic: impl std::future::Future<Output = Option<ToolResult>>,
         native: impl std::future::Future<Output = ToolResult>,
     ) -> ToolResult {
@@ -68,16 +70,11 @@ impl ClickTool {
             cursor_key,
             target,
         );
-        if let Some(receipt) = delivery_receipt {
-            receipt.attach(self.visual_sink.clone(), visual.clone());
-        }
+        delivery_receipt.attach(self.visual_sink.clone(), visual);
         let result = match semantic.await {
             Some(result) => result,
             None => native.await,
         };
-        if delivery_receipt.is_none() && result.is_error != Some(true) {
-            emit_pointer_contact(self.visual_sink.as_ref(), visual);
-        }
         result
     }
 }
@@ -380,7 +377,7 @@ impl Tool for ClickTool {
                         window_id: None,
                         element_bounds: None,
                     }),
-                    Some(&delivery_receipt),
+                    &delivery_receipt,
                     async { None },
                     dispatch,
                 )
@@ -720,7 +717,7 @@ impl Tool for ClickTool {
                 .dispatch_resolved(
                     &cursor_key,
                     target,
-                    Some(&delivery_receipt),
+                    &delivery_receipt,
                     async { None },
                     dispatch,
                 )
@@ -1123,7 +1120,7 @@ impl Tool for ClickTool {
                     window_id,
                     element_bounds: None,
                 }),
-                Some(&delivery_receipt),
+                &delivery_receipt,
                 semantic,
                 native,
             )
@@ -1540,7 +1537,8 @@ mod tests {
         })
     }
 
-    fn slice_a_delivered(path: &str) -> ToolResult {
+    fn slice_a_delivered(path: &str, receipt: &DeliveryReceipt) -> ToolResult {
+        receipt.accepted();
         ToolResult::text("delivered attempt").with_structured(serde_json::json!({
             "path": path, "verified": false, "effect": "unverifiable"
         }))
@@ -1576,6 +1574,23 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn slice_a_unaccepted_success_result_is_not_input_delivery() {
+        let (tool, sink) = slice_a_tool();
+        let receipt = DeliveryReceipt::default();
+        let result = tool
+            .dispatch_resolved(
+                "slice-a-first",
+                slice_a_target(),
+                &receipt,
+                async { None },
+                async { ToolResult::text("no input was needed") },
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        slice_a_assert(&tool, &sink, "slice-a-first", false);
+    }
+
+    #[tokio::test]
     async fn slice_a_contact_precedes_delayed_failed_readback() {
         let (tool, sink) = slice_a_tool();
         let receipt = DeliveryReceipt::default();
@@ -1583,7 +1598,7 @@ mod tests {
             .dispatch_resolved(
                 "slice-a-first",
                 slice_a_target(),
-                Some(&receipt),
+                &receipt,
                 async { None },
                 async {
                     receipt.accepted();
@@ -1628,13 +1643,15 @@ mod tests {
     #[tokio::test]
     async fn slice_a_pixel_ax_success_skips_native_and_emits_once() {
         let (tool, sink) = slice_a_tool();
+        let receipt = DeliveryReceipt::default();
         let result = tool
             .dispatch_resolved(
                 "slice-a-first",
                 slice_a_target(),
-                None,
+                &receipt,
                 async {
                     slice_a_assert(&tool, &sink, "slice-a-first", false);
+                    receipt.accepted();
                     pixel_ax_dispatch_result(false, Ok(Ok(true)))
                 },
                 async { panic!("native input must not run after AX delivery") },
@@ -1647,13 +1664,14 @@ mod tests {
     #[tokio::test]
     async fn slice_a_ax_miss_then_native_does_not_duplicate_intent() {
         let (tool, sink) = slice_a_tool();
+        let receipt = DeliveryReceipt::default();
         let result = tool
             .dispatch_resolved(
                 "slice-a-first",
                 slice_a_target(),
-                None,
+                &receipt,
                 async { None },
-                async { slice_a_delivered("cgevent") },
+                async { slice_a_delivered("cgevent", &receipt) },
             )
             .await;
         assert_eq!(result.structured_content.unwrap()["path"], "cgevent");
@@ -1668,30 +1686,40 @@ mod tests {
             ("desktop", None),
         ] {
             let (tool, sink) = slice_a_tool();
+            let receipt = DeliveryReceipt::default();
             let deliveries = std::sync::atomic::AtomicUsize::new(0);
             let mut target = slice_a_target().unwrap();
             target.window_id = window_id;
             let result = tool
-                .dispatch_resolved("slice-a-first", Some(target), None, async { None }, async {
-                    let events = sink.0.lock().unwrap();
-                    assert_eq!(
-                        events
+                .dispatch_resolved(
+                    "slice-a-first",
+                    Some(target),
+                    &receipt,
+                    async { None },
+                    async {
+                        let events = sink.0.lock().unwrap();
+                        assert_eq!(
+                            events
+                                .iter()
+                                .filter(|event| matches!(event, Event::Target(..)))
+                                .count(),
+                            1
+                        );
+                        assert!(!events
                             .iter()
-                            .filter(|event| matches!(event, Event::Target(..)))
-                            .count(),
-                        1
-                    );
-                    assert!(!events
-                        .iter()
-                        .any(|event| matches!(event, Event::Contact(..))));
-                    drop(events);
-                    deliveries.fetch_add(1, Ordering::Relaxed);
-                    slice_a_delivered(if route == "desktop" {
-                        "cgevent_hid"
-                    } else {
-                        "cgevent"
-                    })
-                })
+                            .any(|event| matches!(event, Event::Contact(..))));
+                        drop(events);
+                        deliveries.fetch_add(1, Ordering::Relaxed);
+                        slice_a_delivered(
+                            if route == "desktop" {
+                                "cgevent_hid"
+                            } else {
+                                "cgevent"
+                            },
+                            &receipt,
+                        )
+                    },
+                )
                 .await;
             assert_ne!(result.is_error, Some(true));
             assert_eq!(deliveries.load(Ordering::Relaxed), 1);
@@ -1728,19 +1756,24 @@ mod tests {
     async fn slice_a_ax_press_and_selected_early_success_share_feedback() {
         for (selected, pixel) in [(false, false), (true, false), (true, true)] {
             let (tool, sink) = slice_a_tool();
+            let receipt = DeliveryReceipt::default();
             let result = tool
                 .dispatch_resolved(
                     "slice-a-first",
                     slice_a_target(),
-                    None,
+                    &receipt,
                     async { None },
-                    finish_ax_dispatch(
-                        Ok(Ok((
-                            ("AX outcome".into(), false, false, selected, pixel),
-                            false,
-                        ))),
-                        "",
-                    ),
+                    async {
+                        receipt.accepted();
+                        finish_ax_dispatch(
+                            Ok(Ok((
+                                ("AX outcome".into(), false, false, selected, pixel),
+                                false,
+                            ))),
+                            "",
+                        )
+                        .await
+                    },
                 )
                 .await;
             let result = result.structured_content.unwrap();
@@ -1754,11 +1787,12 @@ mod tests {
     async fn slice_a_failed_delivery_and_focus_refusal_have_no_contact() {
         for semantic_refusal in [false, true] {
             let (tool, sink) = slice_a_tool();
+            let receipt = DeliveryReceipt::default();
             let result = tool
                 .dispatch_resolved(
                     "slice-a-first",
                     slice_a_target(),
-                    None,
+                    &receipt,
                     async {
                         if semantic_refusal {
                             pixel_ax_dispatch_result(true, Ok(Ok(false)))
@@ -1788,7 +1822,7 @@ mod tests {
             .dispatch_resolved(
                 "slice-a-first",
                 slice_a_target(),
-                Some(&receipt),
+                &receipt,
                 async { None },
                 async {
                     receipt.accepted();
@@ -1814,11 +1848,20 @@ mod tests {
         let (tool, sink) = slice_a_tool();
         let receipt = DeliveryReceipt::default();
         let fixture = SelectionScope::install(advertised_press, readback, true);
+        let observed_sink = sink.clone();
+        fixture.before_readback(move || {
+            let events = observed_sink.1.lock().unwrap();
+            assert_eq!(
+                events.last().unwrap().phase,
+                cursor_overlay::VisualPhase::Contact,
+                "real accepted AX write must publish before entering readback"
+            );
+        });
         let result = tool
             .dispatch_resolved(
                 "slice-a-first",
                 slice_a_target(),
-                Some(&receipt),
+                &receipt,
                 async { None },
                 async {
                     // Exercise both real click call sites and the real selection
@@ -1904,7 +1947,7 @@ mod tests {
             .dispatch_resolved(
                 "slice-a-first",
                 slice_a_target(),
-                Some(&receipt),
+                &receipt,
                 async { None },
                 async {
                     let outcome = perform_ax_click(
@@ -1949,14 +1992,19 @@ mod tests {
     #[tokio::test]
     async fn slice_a_sessions_keep_target_and_contact_coordinates_separate() {
         let (tool, sink) = slice_a_tool();
+        let receipt = DeliveryReceipt::default();
         tool.dispatch_resolved(
             "slice-a-first",
             slice_a_target(),
-            None,
-            async { pixel_ax_dispatch_result(false, Ok(Ok(true))) },
+            &receipt,
+            async {
+                receipt.accepted();
+                pixel_ax_dispatch_result(false, Ok(Ok(true)))
+            },
             async { unreachable!() },
         )
         .await;
+        let receipt = DeliveryReceipt::default();
         tool.dispatch_resolved(
             "slice-a-second",
             Some(ResolvedPointerTarget {
@@ -1965,9 +2013,9 @@ mod tests {
                 window_id: None,
                 element_bounds: None,
             }),
-            None,
+            &receipt,
             async { None },
-            async { slice_a_delivered("cgevent_hid") },
+            async { slice_a_delivered("cgevent_hid", &receipt) },
         )
         .await;
         let events = sink.0.lock().unwrap();
@@ -2007,19 +2055,18 @@ mod tests {
     #[tokio::test]
     async fn slice_a_semantic_without_bounds_does_not_invent_position() {
         let (tool, sink) = slice_a_tool();
-        tool.dispatch_resolved(
-            "slice-a-first",
-            None,
-            None,
-            async { None },
+        let receipt = DeliveryReceipt::default();
+        tool.dispatch_resolved("slice-a-first", None, &receipt, async { None }, async {
+            receipt.accepted();
             finish_ax_dispatch(
                 Ok(Ok((
                     ("AX selected".into(), false, false, true, false),
                     false,
                 ))),
                 "",
-            ),
-        )
+            )
+            .await
+        })
         .await;
         assert_eq!(
             *sink.0.lock().unwrap(),

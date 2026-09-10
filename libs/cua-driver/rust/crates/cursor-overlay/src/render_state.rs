@@ -17,7 +17,7 @@
 //!   that all three platforms implement identically (MoveTo / ClickPulse /
 //!   SetEnabled / SetMotion / SetTheme / semantic action events / PinAbove).
 //!   Returns `false` for variants the core doesn't handle so platforms can
-//!   layer their own behaviour on top (e.g. macOS ShowFocusRect).
+//!   layer their own native behavior on top.
 //! - [`render_frame`] — the tiny-skia paint of the selected cursor theme,
 //!   parameterized by pixmap dimensions and a global origin offset.
 //!
@@ -28,9 +28,7 @@
 //! - Native surface presentation through Core Animation, `UpdateLayeredWindow`,
 //!   or `XPutImage`.
 //! - Translation from global coordinates into native surfaces.
-//! - Platform-specific extras like macOS's `focus_rect` (post-arrival
-//!   element highlight — drawn inside [`render_frame`] when the caller
-//!   supplies one via the optional argument).
+//! - Projection of the shared focus highlight into each native surface.
 
 use crate::{
     CompiledTheme, CursorAction, CursorConfig, CursorVisualState, DeliveryModifier, MotionConfig,
@@ -69,6 +67,11 @@ pub struct RenderStateCore {
     /// Click-pulse phase 0..1; `None` = no pulse in flight.
     pub click_t: Option<f64>,
     pub contact: Option<ContactPresentation>,
+    /// Ongoing delivery owns its highlight until End, then a separate 600 ms fade.
+    pub focus_rect: Option<[f64; 4]>,
+    pub focus_rect_t: f64,
+    focus_rect_timestamp: Option<Instant>,
+    delivery_active: bool,
     visual_owner: Option<(VisualActionId, Instant, VisualPhase)>,
     visual_travel: Option<(Instant, Duration)>,
     visual_deadline: Option<Instant>,
@@ -144,6 +147,7 @@ pub struct ContactPresentation {
     pub target: (f64, f64),
     pub timestamp: Instant,
     pub progress: f64,
+    pub direction: Option<crate::ScrollDirection>,
 }
 
 impl RenderStateCore {
@@ -187,16 +191,45 @@ impl RenderStateCore {
                 }
             }
         }
+        if self.visual_owner.is_none_or(|(id, _, _)| id != event.id) {
+            self.focus_rect = None;
+            self.delivery_active = false;
+            self.pressed = false;
+        }
         self.visual_owner = Some((event.id, event.timestamp, event.phase));
         if let Some(window) = event.window {
             self.pinned_wid = Some(window);
         }
         if event.phase == VisualPhase::End {
+            if self.delivery_active && self.focus_rect.is_some() {
+                self.focus_rect_timestamp = Some(event.timestamp);
+                self.focus_rect_t = 0.0;
+            }
+            self.delivery_active = false;
+            self.advance_focus_rect(0.0, now);
             self.pressed = false;
             self.visual.to_idle();
+            if self.badge_modifiers.is_some() {
+                self.badge_modifier_fade_secs =
+                    Some(now.saturating_duration_since(event.timestamp).as_secs_f64());
+            }
             self.visual_deadline = None;
             self.advance_visual_presentation(now);
             return true;
+        }
+        self.delivery_active =
+            event.action == CursorAction::Text && event.phase == VisualPhase::Tracking;
+        if let Some(bounds) = event
+            .bounds
+            .filter(|rect| rect.iter().all(|v| v.is_finite()) && rect[2] > 0.0 && rect[3] > 0.0)
+        {
+            self.focus_rect = Some(bounds);
+            self.focus_rect_t = 0.0;
+            self.focus_rect_timestamp = Some(event.timestamp);
+        }
+        self.advance_focus_rect(0.0, now);
+        if event.action == CursorAction::Drag && event.phase == VisualPhase::Tracking {
+            self.pressed = true;
         }
         let reveal_badge = !self.cursor_is_revealed();
         self.idle_secs = 0.0;
@@ -245,11 +278,15 @@ impl RenderStateCore {
                     target,
                     timestamp: event.timestamp,
                     progress: 0.0,
+                    direction: event.scroll_direction,
                 });
             }
         }
-        self.visual.begin(event.action, None, None);
-        self.visual_deadline = Some(event.timestamp + duration);
+        // Generic admission supplies existing delivery/target context; resolved
+        // events replace geometry and ownership without discarding those labels.
+        self.visual
+            .begin(event.action, self.visual.delivery, self.visual.target);
+        self.visual_deadline = (!self.delivery_active).then_some(event.timestamp + duration);
         self.advance_visual_presentation(now);
         true
     }
@@ -259,6 +296,7 @@ impl RenderStateCore {
     pub fn advance_visual_presentation(&mut self, now: Instant) -> bool {
         let now = self.presentation_now.map_or(now, |last| now.max(last));
         self.presentation_now = Some(now);
+        self.advance_focus_rect(0.0, now);
         let mut arrived = false;
         if let Some((started, duration)) = self.visual_travel {
             let fraction = if self.visual.reduced_motion == crate::ReducedMotion::On {
@@ -299,6 +337,10 @@ impl RenderStateCore {
         if let Some(deadline) = self.visual_deadline {
             if now >= deadline {
                 self.visual.to_idle();
+                if self.badge_modifiers.is_some() {
+                    self.badge_modifier_fade_secs =
+                        Some(now.saturating_duration_since(deadline).as_secs_f64());
+                }
                 self.visual_deadline = None;
             } else if let Some((_, timestamp, _)) = self.visual_owner {
                 self.visual.elapsed_secs = now.saturating_duration_since(timestamp).as_secs_f64();
@@ -314,8 +356,33 @@ impl RenderStateCore {
             self.path = None;
         }
         self.contact = None;
-        if self.visual_deadline.take().is_some() {
+        self.focus_rect = None;
+        self.focus_rect_t = 1.0;
+        self.focus_rect_timestamp = None;
+        let was_delivering = std::mem::take(&mut self.delivery_active);
+        self.pressed = false;
+        if self.visual_deadline.take().is_some() || was_delivering {
             self.visual.to_idle();
+        }
+    }
+
+    fn advance_focus_rect(&mut self, dt: f64, now: Instant) {
+        if self.delivery_active {
+            return;
+        }
+        if self.focus_rect.is_some() {
+            let progress = self.focus_rect_timestamp.map_or_else(
+                || self.focus_rect_t + dt / 0.6,
+                |timestamp| {
+                    (now.saturating_duration_since(timestamp).as_secs_f64() / 0.6)
+                        .max(self.focus_rect_t)
+                },
+            );
+            self.focus_rect_t = progress.min(1.0);
+            if self.focus_rect_t >= 1.0 {
+                self.focus_rect = None;
+                self.focus_rect_timestamp = None;
+            }
         }
     }
 
@@ -378,6 +445,10 @@ impl RenderStateCore {
             spring_tgt: None,
             click_t: None,
             contact: None,
+            focus_rect: None,
+            focus_rect_t: 1.0,
+            focus_rect_timestamp: None,
+            delivery_active: false,
             visual_owner: None,
             visual_travel: None,
             visual_deadline: None,
@@ -755,8 +826,9 @@ impl RenderStateCore {
     /// moving, then fade `idle_alpha` from 1→0 over 180ms once
     /// `motion.idle_hide_ms` has elapsed.  Identical across all platforms.
     fn tick_idle(&mut self, dt: f64) {
+        self.advance_focus_rect(dt, self.presentation_now.unwrap_or_else(Instant::now));
         let modifiers_before_tick = (self.visual.delivery, self.visual.target);
-        if self.visual_deadline.is_none() {
+        if self.visual_deadline.is_none() && !self.delivery_active {
             self.visual.tick(dt);
         }
         let modifiers_after_tick = (self.visual.delivery, self.visual.target);
@@ -787,7 +859,8 @@ impl RenderStateCore {
             let moving = self.path.is_some()
                 || self.spring.is_some()
                 || self.click_t.is_some()
-                || self.contact.is_some();
+                || self.contact.is_some()
+                || self.delivery_active;
             if moving {
                 self.idle_secs = 0.0;
                 self.idle_alpha = 1.0;
@@ -1013,7 +1086,13 @@ impl RenderStateCore {
                 }
                 true
             }
-            OverlayCommand::ShowFocusRect(_) => false, // caller-specific
+            OverlayCommand::ShowFocusRect(rect) => {
+                self.focus_rect = rect;
+                self.focus_rect_t = 0.0;
+                self.focus_rect_timestamp = None;
+                self.delivery_active = false;
+                true
+            }
         }
     }
 }
@@ -1204,6 +1283,26 @@ fn paint_cursor_impl(
         let radius = (12.0 + 20.0 * contact.progress) as f32 * sf;
         let mut builder = tiny_skia::PathBuilder::new();
         builder.push_circle(cx, cy, radius);
+        if let Some(direction) = contact.direction {
+            let (dx, dy) = match direction {
+                crate::ScrollDirection::Up => (0.0, -1.0),
+                crate::ScrollDirection::Down => (0.0, 1.0),
+                crate::ScrollDirection::Left => (-1.0, 0.0),
+                crate::ScrollDirection::Right => (1.0, 0.0),
+            };
+            let tip = (cx + dx * 10.0 * sf, cy + dy * 10.0 * sf);
+            builder.move_to(cx - dx * 7.0 * sf, cy - dy * 7.0 * sf);
+            builder.line_to(tip.0, tip.1);
+            builder.move_to(
+                tip.0 - dx * 5.0 * sf - dy * 5.0 * sf,
+                tip.1 - dy * 5.0 * sf + dx * 5.0 * sf,
+            );
+            builder.line_to(tip.0, tip.1);
+            builder.line_to(
+                tip.0 - dx * 5.0 * sf + dy * 5.0 * sf,
+                tip.1 - dy * 5.0 * sf - dx * 5.0 * sf,
+            );
+        }
         if let Some(path) = builder.finish() {
             let mut paint = tiny_skia::Paint::default();
             paint.set_color_rgba8(
@@ -1756,6 +1855,83 @@ mod tests {
         assert!((core.pos.0 - core.heading.cos() * 16.0 - target.0).abs() < 0.001);
         assert!((core.pos.1 - core.heading.sin() * 16.0 - target.1).abs() < 0.001);
     }
+    #[test]
+    fn slice_a_delivery_ownership_cleanup_and_semantic_only() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        let t = Instant::now();
+        let id = VisualActionId {
+            generation: 1,
+            action: 1,
+        };
+        let mut event = VisualEvent {
+            id,
+            timestamp: t,
+            target: None,
+            window: None,
+            bounds: None,
+            action: CursorAction::Text,
+            scroll_direction: None,
+            phase: VisualPhase::Tracking,
+        };
+        assert!(core.apply_visual_event(event.clone(), None, t));
+        core.tick_swift_constants_at(5.0, t + Duration::from_secs(5));
+        assert!(!core.placed);
+        assert_eq!(core.visual.resolved_action, CursorAction::Text);
+        event.id.action = 2;
+        event.timestamp = t + Duration::from_secs(6);
+        core.apply_visual_event(event.clone(), None, event.timestamp);
+        let mut old_end = event.clone();
+        old_end.id.action = 1;
+        old_end.phase = VisualPhase::End;
+        assert!(!core.apply_visual_event(old_end, None, event.timestamp));
+        assert_eq!(core.visual.resolved_action, CursorAction::Text);
+        core.clear_visual_presentation();
+        assert_eq!(core.visual.resolved_action, CursorAction::Idle);
+    }
+
+    #[test]
+    fn slice_a_scroll_contact_retains_direction_and_changes_pixels() {
+        let t = Instant::now();
+        let mut images = Vec::new();
+        for direction in [
+            crate::ScrollDirection::Up,
+            crate::ScrollDirection::Down,
+            crate::ScrollDirection::Left,
+            crate::ScrollDirection::Right,
+        ] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            let event = VisualEvent {
+                id: VisualActionId {
+                    generation: 1,
+                    action: 1,
+                },
+                timestamp: t,
+                target: Some((60.0, 60.0)),
+                window: None,
+                bounds: None,
+                action: CursorAction::Scroll,
+                scroll_direction: Some(direction),
+                phase: VisualPhase::Contact,
+            };
+            let display = DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 120.0,
+                height: 120.0,
+            };
+            assert!(core.apply_visual_event(event, Some(display), t));
+            assert_eq!(core.contact.unwrap().direction, Some(direction));
+            let mut image = tiny_skia::Pixmap::new(120, 120).unwrap();
+            paint_cursor(&mut image, &core, 0.0, 0.0, None, 1.0);
+            images.push(image.data().to_vec());
+        }
+        for i in 0..4 {
+            for j in 0..i {
+                assert_ne!(images[i], images[j]);
+            }
+        }
+    }
+
     #[test]
     fn slice_a_fix_core_newer_action_precedes_timestamp() {
         let t = Instant::now();

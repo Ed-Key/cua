@@ -240,17 +240,9 @@ fn apply_visual_in_map(
         .cursors
         .entry(key.clone())
         .or_insert_with(|| render_state_for_key(&map.template, &key));
-    let focus = event.bounds;
-    let timestamp = event.timestamp;
     if state.core.apply_visual_event(event, bounds, now) {
         if target.is_some() {
             state.target = target;
-        }
-        if let Some(rect) = focus {
-            state.focus_rect = Some(rect);
-            state.focus_rect_t = 0.0;
-            state.focus_rect_timestamp = Some(timestamp);
-            state.advance_focus_rect(0.0, now);
         }
         map.command_order.retain(|candidate| candidate != &key);
         map.command_order.push(key);
@@ -274,7 +266,15 @@ pub fn begin_visual_action(key: &str) -> Option<cursor_overlay::VisualActionId> 
 
 /// Publish presentation state without waiting for path planning or a renderer acknowledgement.
 pub fn publish_visual_event(key: &str, event: cursor_overlay::VisualEvent) -> bool {
-    let accepted = inbox().lock().unwrap().visual.publish(key, event);
+    let accepted = {
+        let mut inbox = inbox().lock().unwrap();
+        let accepted = inbox.visual.publish(key, event);
+        if accepted {
+            let template = inbox.template_motion.clone();
+            inbox.motion.entry(key.to_owned()).or_insert(template);
+        }
+        accepted
+    };
     if accepted {
         wake_renderer();
     }
@@ -458,9 +458,9 @@ pub fn revive_cursor(key: CursorKey) {
     wake_renderer();
 }
 
-/// Return a snapshot of a cursor's current motion config (for use by
-/// set_agent_cursor_motion to apply partial overrides without losing other
-/// knobs). Reads the motion of the cursor `key`, falling back to the
+/// Return the latest admitted motion configuration without a rendering lock.
+/// Partial overrides compose with accepted configuration even before rendering.
+/// Reads the motion of the cursor `key`, falling back to the
 /// `"default"` cursor's motion when that key has no own entry yet (e.g. a
 /// session whose first motion call precedes any move/enable).
 pub fn current_motion(key: &str) -> MotionConfig {
@@ -473,7 +473,8 @@ pub fn current_motion(key: &str) -> MotionConfig {
         .unwrap_or_else(|| inbox.template_motion.clone())
 }
 
-/// Return the render-owned theme and semantic playback state for one cursor.
+/// Read-only diagnostic snapshot of rendered theme/playback. This alone retains
+/// a blocking renderer lock; input admission and session completion never call it.
 pub fn current_theme_state(
     key: &str,
 ) -> Option<(
@@ -597,12 +598,6 @@ struct RenderState {
     core: RenderStateCore,
     /// Last resolved target, independent of the temporary seed or path position.
     target: Option<(f64, f64)>,
-    /// Focus-highlight rectangle `[x, y, w, h]` in screen coords; None = not shown.
-    focus_rect: Option<[f64; 4]>,
-    /// Fade progress for the focus rect: 0.0 = fully visible, 1.0 = gone.
-    focus_rect_t: f64,
-    /// Event-derived bounds use presentation time; legacy ShowFocusRect uses dt.
-    focus_rect_timestamp: Option<Instant>,
 }
 
 impl RenderState {
@@ -610,9 +605,6 @@ impl RenderState {
         RenderState {
             core: RenderStateCore::new(cfg),
             target: None,
-            focus_rect: None,
-            focus_rect_t: 1.0,
-            focus_rect_timestamp: None,
         }
     }
 
@@ -625,59 +617,19 @@ impl RenderState {
         self.core.dist = 0.0;
         self.core.click_t = None;
         self.core.session_badge_hovered = false;
-        self.focus_rect = None;
-        self.focus_rect_t = 1.0;
-        self.focus_rect_timestamp = None;
-    }
-
-    /// Advance the animation by `dt`.  Uses the Swift reference constants
-    /// (peakSpeed=900, springK=400, overshoot=0.8) — see
-    /// [`RenderStateCore::tick_swift_constants`].  Returns true if an
-    /// arrival signal should be fired (the path just ended).
-    #[cfg(test)]
-    fn tick(&mut self, dt: f64) -> bool {
-        self.tick_at(dt, Instant::now())
     }
 
     fn tick_at(&mut self, dt: f64, now: Instant) -> bool {
         if !self.core.cfg.enabled || !self.core.visible || !self.core.placed {
             return false;
         }
-        let fire_arrival = self.core.tick_swift_constants_at(dt, now);
-
-        self.advance_focus_rect(dt, now);
-        fire_arrival
-    }
-
-    fn advance_focus_rect(&mut self, dt: f64, now: Instant) {
-        if self.focus_rect.is_some() {
-            // Event bounds must expire even on an idle wake with zero frame delta.
-            // Keep legacy ShowFocusRect's 600 ms delta-based fade unchanged.
-            let progress = self.focus_rect_timestamp.map_or_else(
-                || self.focus_rect_t + dt / 0.6,
-                |timestamp| {
-                    (now.saturating_duration_since(timestamp).as_secs_f64() / 0.6)
-                        .max(self.focus_rect_t)
-                },
-            );
-            self.focus_rect_t = progress.min(1.0);
-            if self.focus_rect_t >= 1.0 {
-                self.focus_rect = None;
-                self.focus_rect_t = 1.0;
-                self.focus_rect_timestamp = None;
-            }
-        }
+        self.core.tick_swift_constants_at(dt, now)
     }
 
     fn apply_command(&mut self, cmd: OverlayCommand) {
         // First contact places exactly at its resolved target. Subsequent
         // pulses retain the existing glide behavior until the motion task.
         match cmd {
-            OverlayCommand::ShowFocusRect(rect) => {
-                self.focus_rect = rect;
-                self.focus_rect_t = 0.0; // reset fade to fully visible
-                self.focus_rect_timestamp = None;
-            }
             OverlayCommand::ClickPulse { x, y } if !self.core.placed => {
                 let _ =
                     self.core
@@ -701,7 +653,7 @@ impl RenderState {
             || self.core.spring.is_some()
             || self.core.click_t.is_some()
             || self.core.contact.is_some()
-            || self.focus_rect.is_some()
+            || self.core.focus_rect.is_some()
             || self.core.session_badge_needs_frame_tick()
             || (self.core.motion.idle_hide_ms > 0.0 && cursor_is_visible(self))
     }
@@ -1133,6 +1085,7 @@ fn state_paints_display(state: &RenderState, display: DisplayGeometry) -> bool {
         display,
     );
     let focus_intersects = state
+        .core
         .focus_rect
         .is_some_and(|[x, y, width, height]| rectangles_intersect((x, y, width, height), display));
     let contact_intersects = state.core.contact.is_some_and(|contact| {
@@ -1168,9 +1121,9 @@ fn render_display(map: &RenderMap, display: DisplayGeometry) -> tiny_skia::Pixma
         if !state_paints_display(state, display) {
             continue;
         }
-        let focus = state.focus_rect.map(|rect| FocusRect {
+        let focus = state.core.focus_rect.map(|rect| FocusRect {
             rect,
-            t: state.focus_rect_t,
+            t: state.core.focus_rect_t,
         });
         let anchor_display = state
             .core
@@ -1437,7 +1390,6 @@ fn pixmap_to_cgimage(pixmap: &tiny_skia::Pixmap) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     fn mailbox_event(
         id: cursor_overlay::VisualActionId,
@@ -1496,6 +1448,127 @@ mod tests {
         assert_eq!(map.cursors["one"].target, Some((90.0, 30.0)));
         assert_mailbox_tip(&map, (90.0, 30.0));
         assert!(map.cursors["one"].core.path.is_none());
+    }
+
+    #[test]
+    fn slice_a_motion_snapshot_materializes_timed_keys_from_launch_template() {
+        let mut custom = MotionConfig::default();
+        custom.glide_duration_ms = 850.0;
+        let (prior, template) = {
+            let mut inbox = inbox().lock().unwrap();
+            let template = inbox.template_motion.clone();
+            (inbox.motion.insert("default".into(), custom), template)
+        };
+        let id = begin_visual_action("motion-event-key").unwrap();
+        publish_visual_event(
+            "motion-event-key",
+            cursor_overlay::VisualEvent {
+                id,
+                timestamp: Instant::now(),
+                target: None,
+                bounds: None,
+                window: None,
+                action: cursor_overlay::CursorAction::Text,
+                phase: cursor_overlay::VisualPhase::Intent,
+                scroll_direction: None,
+            },
+        );
+        let actual = current_motion("motion-event-key");
+        {
+            let mut inbox = inbox().lock().unwrap();
+            inbox.motion.remove("motion-event-key");
+            if let Some(prior) = prior {
+                inbox.motion.insert("default".into(), prior);
+            } else {
+                inbox.motion.remove("default");
+            }
+        }
+        assert_eq!(
+            actual, template,
+            "a materialized cursor uses the launch template, not a sibling default override"
+        );
+    }
+
+    #[test]
+    fn slice_a_generic_context_preserves_label_theme_and_delivery_modifiers() {
+        use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        inbox.semantic(CursorEvent::SetSessionLabel {
+            session: "context".into(),
+            label: "Research".into(),
+        });
+        inbox.semantic(CursorEvent::SelectTheme {
+            session: "context".into(),
+            selection: cua_driver_contract::CursorThemeSelection {
+                theme_id: cursor_overlay::DEFAULT_THEME_ID.into(),
+                reduced_motion: cursor_overlay::ReducedMotion::On,
+            },
+        });
+        let semantics = cua_driver_contract::classify_cursor_semantics(
+            "click",
+            &serde_json::json!({"delivery_mode":"background","x":1,"y":2}),
+        )
+        .unwrap();
+        inbox.semantic(CursorEvent::Action {
+            session: "context".into(),
+            phase: CursorEventPhase::Begin,
+            semantics,
+        });
+        inbox.take().apply(&mut map, Instant::now());
+        let core = &map.cursors["context"].core;
+        assert_eq!(core.session_label.as_deref(), Some("Research"));
+        assert_eq!(
+            core.visual.reduced_motion,
+            cursor_overlay::ReducedMotion::On
+        );
+        assert_eq!(core.visual.delivery, semantics.delivery);
+        assert_eq!(core.visual.target, semantics.target);
+    }
+
+    #[test]
+    fn slice_a_type_highlight_survives_full_delivery_then_fades_from_end() {
+        let mut map = empty_map();
+        let t = Instant::now();
+        let mut mailbox = cursor_overlay::VisualMailbox::default();
+        let id = mailbox.begin_action("editor").unwrap();
+        let mut event = cursor_overlay::VisualEvent {
+            id,
+            timestamp: t,
+            target: Some((50.0, 60.0)),
+            window: Some(42),
+            bounds: Some([10.0, 40.0, 80.0, 40.0]),
+            action: cursor_overlay::CursorAction::Text,
+            phase: cursor_overlay::VisualPhase::Tracking,
+            scroll_direction: None,
+        };
+        apply_visual_in_map(
+            &mut map,
+            "editor".into(),
+            event.clone(),
+            t + Duration::from_secs(5),
+        );
+        map.cursors
+            .get_mut("editor")
+            .unwrap()
+            .tick_at(5.0, t + Duration::from_secs(5));
+        assert_eq!(map.cursors["editor"].core.focus_rect, event.bounds);
+        assert_eq!(map.cursors["editor"].core.focus_rect_t, 0.0);
+        assert!(cursor_is_visible(&map.cursors["editor"]));
+        event.phase = cursor_overlay::VisualPhase::End;
+        event.timestamp = t + Duration::from_secs(6);
+        apply_visual_in_map(
+            &mut map,
+            "editor".into(),
+            event.clone(),
+            event.timestamp + Duration::from_millis(300),
+        );
+        assert!((map.cursors["editor"].core.focus_rect_t - 0.5).abs() < 1e-9);
+        map.cursors
+            .get_mut("editor")
+            .unwrap()
+            .tick_at(0.0, event.timestamp + Duration::from_secs(1));
+        assert!(map.cursors["editor"].core.focus_rect.is_none());
     }
 
     #[test]
@@ -1704,7 +1777,7 @@ mod tests {
     }
 
     fn assert_bounds_expired(map: &RenderMap, left: DisplayGeometry) {
-        assert!(map.cursors["one"].focus_rect.is_none());
+        assert!(map.cursors["one"].core.focus_rect.is_none());
         assert!(map.cursors["one"].core.contact.is_none());
         assert_eq!(painted_display_ids(map), HashSet::from([1]));
         assert_eq!(ordering_pairs(map), vec![(1, Some(111))]);
@@ -1737,7 +1810,7 @@ mod tests {
         let now = t + Duration::from_millis(300);
         assert!(inbox.take().apply(&mut map, now));
         map.cursors.get_mut("one").unwrap().tick_at(0.0, now);
-        assert!((map.cursors["one"].focus_rect_t - 0.5).abs() < 1e-9);
+        assert!((map.cursors["one"].core.focus_rect_t - 0.5).abs() < 1e-9);
         assert_eq!(painted_display_ids(&map), HashSet::from([1, 2]));
         assert_eq!(ordering_pairs(&map), vec![(1, Some(111)), (2, Some(111))]);
         assert!(render_display(&map, left)
@@ -1765,18 +1838,18 @@ mod tests {
         let now = t + Duration::from_secs(2);
         assert!(inbox.take().apply(&mut map, now));
         map.cursors.get_mut("one").unwrap().tick_at(0.0, now);
-        assert_eq!(map.cursors["one"].focus_rect_t, 0.0);
+        assert_eq!(map.cursors["one"].core.focus_rect_t, 0.0);
         assert!(render_display(&map, left)
             .pixels()
             .iter()
             .any(|p| p.alpha() > 0));
         map.cursors.get_mut("one").unwrap().tick_at(0.3, now);
-        assert!((map.cursors["one"].focus_rect_t - 0.5).abs() < 1e-9);
+        assert!((map.cursors["one"].core.focus_rect_t - 0.5).abs() < 1e-9);
         map.cursors.get_mut("one").unwrap().tick_at(0.3, now);
         assert_bounds_expired(&map, left);
         inbox.command(command("one", OverlayCommand::ShowFocusRect(None)));
         assert!(inbox.take().apply(&mut map, now));
-        assert!(map.cursors["one"].focus_rect.is_none());
+        assert!(map.cursors["one"].core.focus_rect.is_none());
     }
 
     #[test]
@@ -2902,7 +2975,7 @@ mod tests {
         rs.core.path = None;
         rs.core.spring = None;
         rs.core.click_t = None;
-        rs.focus_rect = None;
+        rs.core.focus_rect = None;
         rs.core.idle_alpha = 0.0;
         assert!(
             !render_map_needs_frame_tick(&map),

@@ -175,6 +175,7 @@ impl Tool for RightClickTool {
                 });
                 let visual = crate::cursor::visual::begin_pointer_action(
                     &registry,
+                    Arc::new(crate::cursor::visual::OverlayVisualSink),
                     &cursor_key,
                     target,
                     cursor_overlay::CursorAction::Click,
@@ -247,6 +248,7 @@ impl Tool for RightClickTool {
 
         let visual = crate::cursor::visual::begin_pointer_action(
             &self.state.cursor_registry,
+            Arc::new(crate::cursor::visual::OverlayVisualSink),
             &cursor_key,
             crate::cursor::visual::point(screen_x, screen_y, window_id),
             cursor_overlay::CursorAction::Click,
@@ -359,4 +361,37 @@ fn ax_show_menu(
         "Right-clicked [{idx}] {role} \"{title}\" at element center ({cx:.0}, {cy:.0}) \
          (pixel right-click; element advertises no AXShowMenu)."
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn slice_a_pointer_route_dispatch_feedback_preserves_error_and_fallback() {
+        use crate::cursor::visual::{begin_pointer_action, point, test_support::RecordingSink};
+        let registry = crate::cursor::CursorRegistry::new();
+        let sink = Arc::new(RecordingSink::default());
+        let receipt = begin_pointer_action(
+            &registry,
+            sink.clone(),
+            "right_click",
+            point(90.0, 80.0, Some(42)),
+            cursor_overlay::CursorAction::Click,
+        );
+        let error = receipt.dispatch(|| Err::<(), _>("native refusal"));
+        assert_eq!(error, Err("native refusal"));
+        assert_eq!(sink.1.lock().unwrap().len(), 1);
+        receipt
+            .dispatch(|| {
+                let pos = registry.get("right_click").unwrap().position.unwrap();
+                assert_eq!((pos.x, pos.y), (90.0, 80.0));
+                Ok::<_, ()>(())
+            })
+            .unwrap();
+        receipt.accepted();
+        let events = sink.1.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[1].phase, cursor_overlay::VisualPhase::Contact);
+        assert_eq!(events[1].target, Some((90.0, 80.0)));
+    }
 }

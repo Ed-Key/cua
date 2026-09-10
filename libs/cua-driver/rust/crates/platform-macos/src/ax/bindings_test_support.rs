@@ -13,6 +13,7 @@ pub(crate) struct SelectionFixture {
     pub reads: VecDeque<Option<bool>>,
     pub write_result: AXError,
     pub calls: Vec<&'static str>,
+    pub before_readback: Option<Box<dyn FnOnce()>>,
 }
 
 pub(crate) struct SelectionScope;
@@ -32,9 +33,16 @@ impl SelectionScope {
                     kAXErrorFailure
                 },
                 calls: vec![],
+                before_readback: None,
             });
         });
         Self
+    }
+
+    pub fn before_readback(&self, callback: impl FnOnce() + 'static) {
+        SELECTION.with(|slot| {
+            slot.borrow_mut().as_mut().unwrap().before_readback = Some(Box::new(callback))
+        });
     }
 
     pub fn element_ptr(&self) -> usize {
@@ -79,6 +87,11 @@ pub(super) fn copy_bool_attr(element: AXUIElementRef, attr: &str) -> Option<Opti
     with_fixture(element, |fixture| match attr {
         "AXEnabled" => Some(true),
         "AXSelected" => {
+            if fixture.calls.last() == Some(&"write selected") {
+                if let Some(callback) = fixture.before_readback.take() {
+                    callback();
+                }
+            }
             fixture.calls.push("read selected");
             fixture.reads.pop_front().unwrap_or(None)
         }

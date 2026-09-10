@@ -45,7 +45,10 @@ impl VisualEvent {
                 return false;
             }
         }
-        self.phase == VisualPhase::End || self.target.is_some() || self.phase == VisualPhase::Intent
+        self.phase == VisualPhase::End
+            || self.target.is_some()
+            || self.phase == VisualPhase::Intent
+            || (self.phase == VisualPhase::Tracking && self.action == CursorAction::Text)
     }
 }
 
@@ -393,11 +396,15 @@ mod tests {
         assert_eq!(result.unwrap(), true);
     }
     #[test]
-    fn label_only_events_do_not_invent_coordinates_and_pointer_events_require_them() {
+    fn semantic_intent_and_text_delivery_never_invent_contact_coordinates() {
         let mut m = VisualMailbox::default();
         let id = m.begin_action("a").unwrap();
         let mut e = event(id, VisualPhase::Intent, Instant::now(), 1.0);
         e.target = None;
+        assert!(m.publish("a", e.clone()));
+        e.phase = VisualPhase::Contact;
+        assert!(!m.publish("a", e.clone()));
+        e.phase = VisualPhase::Tracking;
         assert!(!m.publish("a", e.clone()));
         e.action = CursorAction::Text;
         assert!(m.publish("a", e));

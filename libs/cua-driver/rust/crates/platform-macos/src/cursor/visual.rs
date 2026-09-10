@@ -83,11 +83,11 @@ pub(crate) fn emit_action_target(
 
 pub(crate) fn begin_pointer_action(
     registry: &super::CursorRegistry,
+    sink: Arc<dyn PointerVisualSink>,
     key: &str,
     target: Option<ResolvedPointerTarget>,
     action: CursorAction,
 ) -> Arc<DeliveryReceipt> {
-    let sink: Arc<dyn PointerVisualSink> = Arc::new(OverlayVisualSink);
     let handle = emit_action_target(registry, sink.as_ref(), key, target, action);
     let receipt = Arc::new(DeliveryReceipt::default());
     receipt.attach(sink, handle);
@@ -108,7 +108,42 @@ pub(crate) fn emit_pointer_contact(sink: &dyn PointerVisualSink, handle: Pointer
 }
 
 impl PointerVisualHandle {
-    fn publish(&self, sink: &dyn PointerVisualSink, phase: VisualPhase, timestamp: Instant) {
+    pub(crate) fn track(&self, sink: &dyn PointerVisualSink, x: f64, y: f64) {
+        let mut next = self.clone();
+        if let Some(event) = next.event.as_mut() {
+            event.target = Some((x, y));
+        }
+        next.publish(sink, VisualPhase::Tracking, Instant::now());
+    }
+    pub(crate) fn scroll_contact(&self, sink: &dyn PointerVisualSink, dy: i32, dx: i32) {
+        use cursor_overlay::ScrollDirection;
+        let mut next = self.clone();
+        if let Some(event) = next.event.as_mut() {
+            event.scroll_direction = if dy > 0 {
+                Some(ScrollDirection::Up)
+            } else if dy < 0 {
+                Some(ScrollDirection::Down)
+            } else if dx > 0 {
+                Some(ScrollDirection::Left)
+            } else if dx < 0 {
+                Some(ScrollDirection::Right)
+            } else {
+                None
+            };
+        }
+        next.publish(sink, VisualPhase::Contact, Instant::now());
+    }
+    pub(crate) fn pin(&mut self, window: Option<u32>) {
+        if let Some(event) = self.event.as_mut() {
+            event.window = window.map(u64::from);
+        }
+    }
+    pub(crate) fn publish(
+        &self,
+        sink: &dyn PointerVisualSink,
+        phase: VisualPhase,
+        timestamp: Instant,
+    ) {
         if cua_driver_core::session::is_session_ended(&self.key) {
             return;
         }
@@ -120,6 +155,29 @@ impl PointerVisualHandle {
             event.timestamp = timestamp;
             sink.publish(&self.key, event);
         }
+    }
+}
+
+pub(crate) struct DeliveryVisualGuard<'a> {
+    pub(crate) handle: PointerVisualHandle,
+    sink: &'a dyn PointerVisualSink,
+}
+impl<'a> DeliveryVisualGuard<'a> {
+    pub(crate) fn text(
+        registry: &super::CursorRegistry,
+        sink: &'a dyn PointerVisualSink,
+        key: &str,
+        target: Option<ResolvedPointerTarget>,
+    ) -> Self {
+        let handle = emit_action_target(registry, sink, key, target, CursorAction::Text);
+        handle.publish(sink, VisualPhase::Tracking, Instant::now());
+        Self { handle, sink }
+    }
+}
+impl Drop for DeliveryVisualGuard<'_> {
+    fn drop(&mut self) {
+        self.handle
+            .publish(self.sink, VisualPhase::End, Instant::now());
     }
 }
 
@@ -152,6 +210,7 @@ impl DeliveryReceipt {
             handle.publish(sink.as_ref(), VisualPhase::Contact, timestamp);
         }
     }
+    #[cfg(test)]
     pub(crate) fn was_accepted(&self) -> bool {
         self.0.lock().unwrap().accepted.is_some()
     }
@@ -245,6 +304,35 @@ mod tests {
     use super::test_support::{Event, RecordingSink};
     use super::*;
     use crate::cursor::CursorRegistry;
+
+    #[test]
+    fn slice_a_accepted_dispatch_and_fallback_publish_contact_once() {
+        let registry = CursorRegistry::new();
+        let sink = Arc::new(RecordingSink::default());
+        let handle = emit_pointer_target(
+            &registry,
+            sink.as_ref(),
+            "fallback-contact",
+            point(20.0, 30.0, Some(42)),
+        );
+        let receipt = DeliveryReceipt::default();
+        receipt.attach(sink.clone(), handle);
+        assert!(receipt.dispatch(|| Err::<(), _>("refused")).is_err());
+        assert!(!receipt.was_accepted());
+        assert_eq!(sink.1.lock().unwrap().len(), 1);
+        receipt.dispatch(|| Ok::<_, ()>(())).unwrap();
+        let timestamp = sink.1.lock().unwrap().last().unwrap().timestamp;
+        receipt.dispatch(|| Ok::<_, ()>(())).unwrap();
+        let events = sink.1.lock().unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|e| e.phase == VisualPhase::Contact)
+                .count(),
+            1
+        );
+        assert_eq!(events.last().unwrap().timestamp, timestamp);
+    }
 
     #[test]
     fn trusted_bounds_require_finite_positive_rectangle() {

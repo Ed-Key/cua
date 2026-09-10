@@ -845,7 +845,9 @@ pub fn register_all(
         &pid_window_candidates,
     ));
     registry.register(Box::new(set_window_frame::SetWindowFrameTool));
-    registry.register(Box::new(invoke_menu::InvokeMenuTool));
+    registry.register(Box::new(invoke_menu::InvokeMenuTool(
+        state.cursor_registry.clone(),
+    )));
     registry.register(pid_window_guarded(
         click::ClickTool::new(state.clone()),
         &pid_window_candidates,
