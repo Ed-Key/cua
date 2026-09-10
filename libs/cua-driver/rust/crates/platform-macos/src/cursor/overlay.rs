@@ -1913,6 +1913,245 @@ mod tests {
     }
 
     #[test]
+    fn watchable_fast_click_before_first_inbox_drain_glides_from_target_display_seed() {
+        use cursor_overlay::VisualPhase::*;
+        for drain_intent in [false, true] {
+            let mut inbox = OverlayInbox::default();
+            let (mut map, _) = bounds_map();
+            let t = Instant::now();
+            let id = inbox.begin_action("one").unwrap();
+            let mut intent = mailbox_event(id, -100.0, Intent);
+            intent.timestamp = t;
+            inbox.publish("one", intent.clone());
+            if drain_intent {
+                inbox.take().apply(&mut map, t);
+            }
+            let mut contact = intent;
+            contact.phase = Contact;
+            contact.timestamp = t + Duration::from_millis(1);
+            inbox.publish("one", contact.clone());
+            inbox.take().apply(&mut map, t + Duration::from_millis(2));
+            let core = &map.cursors["one"].core;
+            assert!(core.placed && core.pos.0 >= -200.0 && core.pos.0 < 0.0);
+            assert!(
+                core.path.is_some(),
+                "coalesced fast input must leave visible travel"
+            );
+            assert!(core.contact.is_none());
+            let first = core.pos;
+            map.cursors
+                .get_mut("one")
+                .unwrap()
+                .tick_at(0.0, t + Duration::from_millis(60));
+            assert_ne!(map.cursors["one"].core.pos, first);
+            assert!(map.cursors["one"].core.contact.is_none());
+            map.cursors
+                .get_mut("one")
+                .unwrap()
+                .tick_at(0.0, t + Duration::from_millis(221));
+            assert_mailbox_tip(&map, (-100.0, 30.0));
+            assert_eq!(
+                map.cursors["one"].core.contact.unwrap().timestamp,
+                contact.timestamp
+            );
+            assert_eq!(
+                map.cursors["one"].core.contact.unwrap().target,
+                (-100.0, 30.0)
+            );
+            map.cursors
+                .get_mut("one")
+                .unwrap()
+                .tick_at(0.0, t + Duration::from_millis(371));
+            assert!(map.cursors["one"].core.contact.is_none());
+        }
+    }
+
+    #[derive(Default)]
+    struct WatchableInboxSink(Mutex<OverlayInbox>, Mutex<Vec<cursor_overlay::VisualEvent>>);
+    impl super::super::visual::PointerVisualSink for WatchableInboxSink {
+        fn send(&self, key: &str, cmd: OverlayCommand) {
+            self.0.lock().unwrap().command(command(key, cmd));
+        }
+        fn begin(&self, key: &str) -> Option<cursor_overlay::VisualActionId> {
+            self.0.lock().unwrap().begin_action(key)
+        }
+        fn publish(&self, key: &str, event: cursor_overlay::VisualEvent) {
+            self.1.lock().unwrap().push(event.clone());
+            self.0.lock().unwrap().publish(key, event);
+        }
+    }
+
+    #[test]
+    fn watchable_actual_receipt_fallback_glides_to_delivered_point_with_fresh_bounds() {
+        use super::super::visual::{begin_pointer_action, ResolvedPointerTarget};
+        use std::sync::Arc;
+        for route in ["click", "moved", "missing"] {
+            for drain_intent in [false, true] {
+                let registry = super::super::CursorRegistry::new();
+                let sink = Arc::new(WatchableInboxSink::default());
+                let mut map = empty_map();
+                map.layout.displays[0].width = 1000.0;
+                map.layout.displays[0].height = 800.0;
+                let receipt = begin_pointer_action(
+                    &registry,
+                    sink.clone(),
+                    "one",
+                    (route != "missing").then_some(ResolvedPointerTarget {
+                        x: if route == "click" { 700.0 } else { 100.0 },
+                        y: if route == "click" { 500.0 } else { 100.0 },
+                        window_id: Some(42),
+                        element_bounds: (route != "click").then_some([90.0, 90.0, 20.0, 20.0]),
+                    }),
+                    cursor_overlay::CursorAction::Click,
+                );
+                let original = sink.1.lock().unwrap()[0].clone();
+                if drain_intent {
+                    sink.0
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .apply(&mut map, Instant::now());
+                }
+                let result: Result<u32, ()> = if route == "click" {
+                    receipt.dispatch(|| Ok(73))
+                } else {
+                    receipt.dispatch_at(&registry, 700.0, 500.0, 42, |x, y| {
+                        assert_eq!((x, y), (700.0, 500.0));
+                        Ok(73)
+                    })
+                };
+                assert_eq!(result, Ok(73));
+                assert!(receipt.was_accepted());
+                let batch = sink.0.lock().unwrap().take();
+                let intent = batch.pending["one"]
+                    .latest
+                    .as_ref()
+                    .map_or(&original, |published| &published.event);
+                let contact = &batch.pending["one"].contact.as_ref().unwrap().event;
+                let start = intent.timestamp;
+                let accepted = contact.timestamp;
+                assert_eq!(intent.id, contact.id);
+                assert_eq!(contact.target, Some((700.0, 500.0)));
+                assert!(contact.bounds.is_none());
+                assert!(accepted >= start);
+                batch.apply(&mut map, accepted);
+                assert!(map.cursors["one"].core.path.is_some());
+                assert!(map.cursors["one"].core.contact.is_none());
+                assert!(map.cursors["one"].core.focus_rect.is_none());
+                assert_eq!(map.cursors["one"].core.pinned_wid, Some(42));
+                let logical = registry.get("one").unwrap().position.unwrap();
+                assert_eq!((logical.x, logical.y), (700.0, 500.0));
+                map.cursors
+                    .get_mut("one")
+                    .unwrap()
+                    .tick_at(0.0, start + Duration::from_millis(220));
+                assert_mailbox_tip(&map, (700.0, 500.0));
+                let pulse = map.cursors["one"].core.contact.unwrap();
+                assert_eq!(pulse.target, (700.0, 500.0));
+                assert_eq!(pulse.timestamp, accepted);
+                assert!(pulse.progress.abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn watchable_inbox_reduced_motion_and_already_arrived_clicks_pulse_immediately() {
+        use cursor_overlay::VisualPhase::*;
+        for reduced in [false, true] {
+            let mut inbox = OverlayInbox::default();
+            let mut map = empty_map();
+            if reduced {
+                map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
+            }
+            let t = Instant::now();
+            if !reduced {
+                let prior = inbox.begin_action("one").unwrap();
+                let mut event = mailbox_event(prior, 80.0, Contact);
+                event.timestamp = t;
+                inbox.publish("one", event);
+                inbox.take().apply(&mut map, t);
+            }
+            let id = inbox.begin_action("one").unwrap();
+            for phase in [Intent, Contact] {
+                let mut event = mailbox_event(id, 80.0, phase);
+                event.timestamp = t + Duration::from_millis(1);
+                inbox.publish("one", event);
+            }
+            inbox.take().apply(&mut map, t + Duration::from_millis(1));
+            assert_mailbox_tip(&map, (80.0, 30.0));
+            let core = &map.cursors["one"].core;
+            assert!(core.path.is_none());
+            let pulse = core.contact.unwrap();
+            assert_eq!(pulse.timestamp, t + Duration::from_millis(1));
+            assert_eq!(pulse.presentation_timestamp, pulse.timestamp);
+            assert_eq!(pulse.progress, 0.0);
+            map.cursors
+                .get_mut("one")
+                .unwrap()
+                .tick_at(0.0, t + Duration::from_millis(151));
+            assert!(map.cursors["one"].core.contact.is_none());
+        }
+    }
+
+    #[test]
+    fn watchable_inbox_stall_and_lifecycle_never_replay_pending_contact() {
+        use cursor_overlay::VisualPhase::*;
+        for cleanup in ["stall", "disable", "remove", "display", "end", "new_owner"] {
+            let mut inbox = OverlayInbox::default();
+            let mut map = empty_map();
+            let t = Instant::now();
+            let id = inbox.begin_action("one").unwrap();
+            for phase in [Intent, Contact] {
+                let mut event = mailbox_event(id, 80.0, phase);
+                event.timestamp = t;
+                inbox.publish("one", event);
+            }
+            if cleanup == "stall" {
+                inbox.take().apply(&mut map, t + Duration::from_secs(2));
+            } else {
+                inbox.take().apply(&mut map, t);
+                assert!(map.cursors["one"].core.contact.is_none());
+                match cleanup {
+                    "disable" => {
+                        inbox.command(command("one", OverlayCommand::SetEnabled(false)));
+                        inbox.command(command("one", OverlayCommand::SetEnabled(true)));
+                    }
+                    "remove" => {
+                        inbox.command(OverlayMsg::Remove("one".into()));
+                        inbox.command(OverlayMsg::Revive("one".into()));
+                    }
+                    "display" => {
+                        map.layout.displays.clear();
+                        let mut event = mailbox_event(id, 80.0, Contact);
+                        event.timestamp = t + Duration::from_millis(1);
+                        inbox.publish("one", event);
+                    }
+                    "end" => {
+                        let mut event = mailbox_event(id, 80.0, End);
+                        event.timestamp = t + Duration::from_millis(1);
+                        inbox.publish("one", event);
+                    }
+                    "new_owner" => {
+                        let newer = inbox.begin_action("one").unwrap();
+                        let mut event = mailbox_event(newer, 20.0, Intent);
+                        event.timestamp = t + Duration::from_millis(1);
+                        inbox.publish("one", event);
+                    }
+                    _ => unreachable!(),
+                }
+                inbox.take().apply(&mut map, t + Duration::from_millis(1));
+            }
+            if let Some(state) = map.cursors.get_mut("one") {
+                state.tick_at(0.0, t + Duration::from_millis(250));
+                assert!(state.core.contact.is_none(), "cleanup={cleanup}");
+                assert!(state.core.path.is_none(), "cleanup={cleanup}");
+                state.tick_at(0.0, t + Duration::from_secs(3));
+                assert!(state.core.contact.is_none());
+            }
+        }
+    }
+
+    #[test]
     fn slice_a_generic_end_cannot_cancel_resolved_or_restart_expired_cue() {
         use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
         let mut inbox = OverlayInbox::default();

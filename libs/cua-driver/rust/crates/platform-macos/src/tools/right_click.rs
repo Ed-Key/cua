@@ -451,7 +451,29 @@ mod tests {
                     "fallback must clear the earlier rendered bounds"
                 );
                 if accepted {
-                    assert_eq!(core.contact.unwrap().target, (90.0, 80.0));
+                    // The user amendment keeps fallback travel visible. Native
+                    // acceptance is immediate; the pulse follows scheduled arrival.
+                    assert!(core.path.is_some());
+                    assert!(core.contact.is_none());
+                    let intent = events
+                        .iter()
+                        .rev()
+                        .find(|event| event.phase == cursor_overlay::VisualPhase::Intent)
+                        .unwrap();
+                    core.advance_visual_presentation(
+                        intent.timestamp + std::time::Duration::from_millis(220),
+                    );
+                    let pulse = core.contact.unwrap();
+                    assert_eq!(pulse.target, (90.0, 80.0));
+                    assert_eq!(pulse.timestamp, contacts[0].timestamp);
+                    assert!(pulse.presentation_timestamp >= pulse.timestamp);
+                    assert!((core.pos.0 - core.heading.cos() * 16.0 - 90.0).abs() < 0.001);
+                    assert!((core.pos.1 - core.heading.sin() * 16.0 - 80.0).abs() < 0.001);
+                    assert!(core.path.is_none());
+                    core.advance_visual_presentation(
+                        pulse.presentation_timestamp + std::time::Duration::from_millis(150),
+                    );
+                    assert!(core.contact.is_none());
                 }
             }
         }

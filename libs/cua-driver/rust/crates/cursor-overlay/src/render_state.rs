@@ -74,6 +74,10 @@ pub struct RenderStateCore {
     delivery_active: bool,
     visual_owner: Option<(VisualActionId, Instant, VisualPhase)>,
     visual_travel: Option<(Instant, Duration)>,
+    // Retain the planned arrival after travel finishes so a late inbox drain
+    // can age contact against the original schedule, never its drain time.
+    visual_destination: Option<((f64, f64), Instant)>,
+    pending_contact: Option<ContactPresentation>,
     visual_deadline: Option<Instant>,
     presentation_now: Option<Instant>,
     /// Whether a button is currently being held for this cursor.
@@ -146,7 +150,9 @@ impl DisplayBounds {
 #[derive(Clone, Copy, Debug)]
 pub struct ContactPresentation {
     pub target: (f64, f64),
+    /// Actual accepted-input time, independent of presentation.
     pub timestamp: Instant,
+    pub presentation_timestamp: Instant,
     pub progress: f64,
     pub direction: Option<crate::ScrollDirection>,
 }
@@ -193,15 +199,19 @@ impl RenderStateCore {
             }
         }
         if self.visual_owner.is_none_or(|(id, _, _)| id != event.id) {
-            self.focus_rect = None;
-            self.delivery_active = false;
-            self.pressed = false;
+            self.clear_visual_presentation();
         }
         self.visual_owner = Some((event.id, event.timestamp, event.phase));
         if let Some(window) = event.window {
             self.pinned_wid = Some(window);
         }
         if event.phase == VisualPhase::End {
+            if self.visual_travel.take().is_some() {
+                self.path = None;
+            }
+            self.visual_destination = None;
+            self.pending_contact = None;
+            self.contact = None;
             if self.delivery_active && self.focus_rect.is_some() {
                 self.focus_rect_timestamp = Some(event.timestamp);
                 self.focus_rect_t = 0.0;
@@ -243,7 +253,7 @@ impl RenderStateCore {
         if reveal_badge {
             self.reveal_session_badge();
         }
-        let mut duration = Duration::from_millis(150);
+        let mut deadline = event.timestamp + Duration::from_millis(150);
         if let Some(target) = event.target {
             let OverlayCommand::SnapTo {
                 x,
@@ -253,39 +263,62 @@ impl RenderStateCore {
             else {
                 unreachable!()
             };
-            self.path = None;
-            self.dist = 0.0;
+            // Only a click receipt at the same resolved destination follows the
+            // intent's schedule. Wheel receipts and native tracking stay immediate.
+            let arrival = self
+                .visual_destination
+                .filter(|(point, _)| *point == target);
+            let follow_travel = event.phase == VisualPhase::Contact
+                && event.action == CursorAction::Click
+                && arrival.is_some();
             self.spring = None;
             self.spring_tgt = None;
             self.click_t = None;
-            self.visual_travel = None;
-            if event.phase == VisualPhase::Intent
-                && self.visual.reduced_motion != crate::ReducedMotion::On
-            {
-                let distance = (x - self.pos.0).hypot(y - self.pos.1);
-                duration = Duration::from_secs_f64((distance / 900.0).clamp(0.120, 0.220));
-                self.path = Some(PathPlanner::plan(
-                    self.pos.0,
-                    self.pos.1,
-                    self.heading + std::f64::consts::PI,
-                    x,
-                    y,
-                    heading + std::f64::consts::PI,
-                    heading,
-                    self.motion.turn_radius,
-                ));
-                self.visual_travel = Some((event.timestamp, duration));
-            } else {
-                self.pos = (x, y);
-                self.heading = heading;
+            if !follow_travel {
+                self.path = None;
+                self.dist = 0.0;
+                self.visual_travel = None;
+                self.visual_destination = None;
+                self.pending_contact = None;
+                if event.phase == VisualPhase::Intent
+                    && self.visual.reduced_motion != crate::ReducedMotion::On
+                    && (x - self.pos.0).hypot(y - self.pos.1) > 0.001
+                {
+                    let distance = (x - self.pos.0).hypot(y - self.pos.1);
+                    let duration = Duration::from_secs_f64((distance / 900.0).clamp(0.120, 0.220));
+                    self.path = Some(PathPlanner::plan(
+                        self.pos.0,
+                        self.pos.1,
+                        self.heading + std::f64::consts::PI,
+                        x,
+                        y,
+                        heading + std::f64::consts::PI,
+                        heading,
+                        self.motion.turn_radius,
+                    ));
+                    self.visual_travel = Some((event.timestamp, duration));
+                    deadline = event.timestamp + duration;
+                    self.visual_destination = Some((target, deadline));
+                } else {
+                    self.pos = (x, y);
+                    self.heading = heading;
+                }
             }
             if event.phase == VisualPhase::Contact {
-                self.contact = Some(ContactPresentation {
+                let presentation_timestamp = if follow_travel {
+                    arrival.unwrap().1.max(event.timestamp)
+                } else {
+                    event.timestamp
+                };
+                self.contact = None;
+                self.pending_contact = Some(ContactPresentation {
                     target,
                     timestamp: event.timestamp,
+                    presentation_timestamp,
                     progress: 0.0,
                     direction: event.scroll_direction,
                 });
+                deadline = presentation_timestamp + Duration::from_millis(150);
             }
         }
         let (delivery, target) = event.modifiers.unwrap_or((None, None));
@@ -295,7 +328,7 @@ impl RenderStateCore {
             .filter(|(delivery, target)| delivery.is_some() || target.is_some());
         self.badge_modifier_fade_secs = None;
         self.badge_modifier_fade_started = None;
-        self.visual_deadline = (!self.delivery_active).then_some(event.timestamp + duration);
+        self.visual_deadline = (!self.delivery_active).then_some(deadline);
         self.advance_visual_presentation(now);
         true
     }
@@ -307,6 +340,16 @@ impl RenderStateCore {
         self.presentation_now = Some(now);
         self.advance_focus_rect(0.0, now);
         let mut arrived = false;
+        if self.visual.reduced_motion == crate::ReducedMotion::On {
+            if let Some((_, arrival)) = &mut self.visual_destination {
+                *arrival = (*arrival).min(now);
+            }
+            if let Some(contact) = &mut self.pending_contact {
+                contact.presentation_timestamp = contact.presentation_timestamp.min(now);
+                self.visual_deadline =
+                    Some(contact.presentation_timestamp + Duration::from_millis(150));
+            }
+        }
         if let Some((started, duration)) = self.visual_travel {
             let fraction = if self.visual.reduced_motion == crate::ReducedMotion::On {
                 1.0
@@ -334,9 +377,15 @@ impl RenderStateCore {
                 arrived = true;
             }
         }
+        if self
+            .pending_contact
+            .is_some_and(|contact| now >= contact.presentation_timestamp)
+        {
+            self.contact = self.pending_contact.take();
+        }
         if let Some(contact) = &mut self.contact {
             contact.progress = now
-                .saturating_duration_since(contact.timestamp)
+                .saturating_duration_since(contact.presentation_timestamp)
                 .as_secs_f64()
                 / 0.150;
             if contact.progress >= 1.0 {
@@ -385,6 +434,8 @@ impl RenderStateCore {
             self.path = None;
         }
         self.contact = None;
+        self.pending_contact = None;
+        self.visual_destination = None;
         self.focus_rect = None;
         self.focus_rect_t = 1.0;
         self.focus_rect_timestamp = None;
@@ -480,6 +531,8 @@ impl RenderStateCore {
             delivery_active: false,
             visual_owner: None,
             visual_travel: None,
+            visual_destination: None,
+            pending_contact: None,
             visual_deadline: None,
             presentation_now: None,
             pressed: false,
@@ -2160,8 +2213,9 @@ mod tests {
         ));
         assert_tip(&core, (700.0, 100.0));
     }
+    // The explicit watchable-playback amendment replaces early-contact snapping.
     #[test]
-    fn slice_a_timed_contact_cancels_travel_and_spring_at_forty_ms_and_expires() {
+    fn watchable_contact_keeps_original_travel_then_pulses_on_both_tick_paths() {
         let t = Instant::now();
         for swift in [false, true] {
             let mut core = timed_core();
@@ -2170,30 +2224,242 @@ mod tests {
                 None,
                 t,
             );
-            tick_at(&mut core, swift, 0.04, t + Duration::from_millis(40));
-            core.spring = Some(Spring::default());
-            core.spring_tgt = Some((0.0, 0.0, 0.0));
+            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(40));
+            let before_contact = core.pos;
+            let accepted = t + Duration::from_millis(40);
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Contact, accepted, Some((500.0, 300.0))),
+                None,
+                accepted,
+            );
+            assert_eq!(
+                core.pos, before_contact,
+                "same-target contact cannot snap or restart"
+            );
+            assert!(core.path.is_some());
+            assert!(core.contact.is_none(), "contact is hidden during travel");
+            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(100));
+            assert_ne!(core.pos, before_contact, "intermediate frames must travel");
+            assert!(core.contact.is_none());
+            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(219));
+            assert!(core.path.is_some());
+            assert!(core.contact.is_none());
+            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(220));
+            assert_tip(&core, (500.0, 300.0));
+            assert!(core.path.is_none() && core.spring.is_none());
+            let pulse = core.contact.unwrap();
+            assert_eq!(pulse.target, (500.0, 300.0));
+            assert_eq!(pulse.timestamp, accepted, "actual input time is immutable");
+            assert_eq!(pulse.progress, 0.0);
+            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(295));
+            assert!((core.contact.unwrap().progress - 0.5).abs() < 1e-9);
+            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(370));
+            assert!(core.contact.is_none());
+            assert_eq!(core.visual.resolved_action, CursorAction::Idle);
+        }
+    }
+
+    #[test]
+    fn watchable_pulse_pixels_appear_only_at_arrival_and_center_on_target() {
+        let t = Instant::now();
+        for scale in [1.0_f32, 2.0] {
+            let mut core = timed_core();
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Intent, t, Some((500.0, 300.0))),
+                None,
+                t,
+            );
+            let accepted = t + Duration::from_millis(1);
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Contact, accepted, Some((500.0, 300.0))),
+                None,
+                accepted,
+            );
+            let paint = |core: &RenderStateCore| {
+                let mut image =
+                    tiny_skia::Pixmap::new((100.0 * scale) as u32, (100.0 * scale) as u32).unwrap();
+                paint_cursor(&mut image, core, 450.0, 250.0, None, scale);
+                image
+            };
+            core.advance_visual_presentation(t + Duration::from_millis(219));
+            assert!(core.contact.is_none());
+            let before = paint(&core);
+            assert!(before.pixels().iter().any(|p| p.alpha() > 0));
+            core.advance_visual_presentation(t + Duration::from_millis(295));
+            let with_ring = paint(&core);
+            let contact = core.contact.take().unwrap();
+            assert_eq!(contact.timestamp, accepted);
+            assert_eq!(
+                contact.presentation_timestamp,
+                t + Duration::from_millis(220)
+            );
+            let without_ring = paint(&core);
+            let changed: Vec<_> = with_ring
+                .pixels()
+                .iter()
+                .zip(without_ring.pixels())
+                .enumerate()
+                .filter(|(_, (a, b))| a != b)
+                .map(|(i, _)| {
+                    (
+                        (i as u32 % with_ring.width()) as f64 / scale as f64,
+                        (i as u32 / with_ring.width()) as f64 / scale as f64,
+                    )
+                })
+                .collect();
+            assert!(!changed.is_empty());
+            let min_x = changed.iter().map(|p| p.0).fold(f64::INFINITY, f64::min);
+            let max_x = changed
+                .iter()
+                .map(|p| p.0)
+                .fold(f64::NEG_INFINITY, f64::max);
+            let min_y = changed.iter().map(|p| p.1).fold(f64::INFINITY, f64::min);
+            let max_y = changed
+                .iter()
+                .map(|p| p.1)
+                .fold(f64::NEG_INFINITY, f64::max);
+            assert!(((min_x + max_x) / 2.0 - 50.0).abs() <= 1.0);
+            assert!(((min_y + max_y) / 2.0 - 50.0).abs() <= 1.0);
+        }
+    }
+
+    #[test]
+    fn watchable_new_owner_removes_old_pulse_even_without_a_target() {
+        let t = Instant::now();
+        for pending in [false, true] {
+            let mut core = timed_core();
+            if pending {
+                core.apply_visual_event(
+                    timed_event(1, VisualPhase::Intent, t, Some((500.0, 300.0))),
+                    None,
+                    t,
+                );
+            }
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Contact, t, Some((500.0, 300.0))),
+                None,
+                t,
+            );
+            let next = t + Duration::from_millis(10);
+            core.apply_visual_event(timed_event(2, VisualPhase::Intent, next, None), None, next);
+            assert!(
+                core.contact.is_none(),
+                "new owner must replace every old effect"
+            );
+            core.advance_visual_presentation(t + Duration::from_millis(220));
+            assert!(
+                core.contact.is_none(),
+                "old pending pulse must never reappear"
+            );
+            assert!(core.path.is_none());
+        }
+    }
+
+    #[test]
+    fn watchable_already_arrived_intent_and_contact_pulse_immediately() {
+        let t = Instant::now();
+        let mut core = timed_core();
+        core.apply_visual_event(
+            timed_event(1, VisualPhase::Intent, t, Some((100.0, 100.0))),
+            None,
+            t,
+        );
+        core.apply_visual_event(
+            timed_event(1, VisualPhase::Contact, t, Some((100.0, 100.0))),
+            None,
+            t,
+        );
+        assert!(core.path.is_none());
+        assert_tip(&core, (100.0, 100.0));
+        assert_eq!(core.contact.unwrap().timestamp, t);
+        assert_eq!(core.contact.unwrap().progress, 0.0);
+    }
+
+    #[test]
+    fn watchable_stalls_age_original_schedule_without_replay() {
+        let t = Instant::now();
+        for first_drain in [false, true] {
+            let mut core = timed_core();
+            let now = if first_drain {
+                t + Duration::from_millis(300)
+            } else {
+                t
+            };
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Intent, t, Some((500.0, 300.0))),
+                None,
+                now,
+            );
             core.apply_visual_event(
                 timed_event(
                     1,
                     VisualPhase::Contact,
-                    t + Duration::from_millis(40),
+                    t + Duration::from_millis(1),
                     Some((500.0, 300.0)),
                 ),
                 None,
-                t + Duration::from_millis(40),
+                now,
             );
+            core.advance_visual_presentation(t + Duration::from_millis(300));
             assert_tip(&core, (500.0, 300.0));
-            assert!(core.path.is_none() && core.spring.is_none() && core.spring_tgt.is_none());
-            assert_eq!(core.contact.unwrap().target, (500.0, 300.0));
-            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(189));
-            assert!(core.contact.is_some());
-            tick_at(&mut core, swift, 0.0, t + Duration::from_millis(191));
+            assert!(core.path.is_none());
+            assert!((core.contact.unwrap().progress - 80.0 / 150.0).abs() < 1e-9);
+            core.advance_visual_presentation(t + Duration::from_millis(370));
             assert!(core.contact.is_none());
-            assert_eq!(core.visual.resolved_action, CursorAction::Idle);
-            assert!(!core.session_badge_needs_frame_tick());
+            core.advance_visual_presentation(t + Duration::from_millis(310));
+            assert!(core.contact.is_none());
         }
     }
+
+    #[test]
+    fn watchable_reduced_motion_arrives_and_pulses_without_delaying_input_time() {
+        let t = Instant::now();
+        for enable_during_travel in [false, true] {
+            let mut core = timed_core();
+            if !enable_during_travel {
+                core.visual.reduced_motion = crate::ReducedMotion::On;
+            }
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Intent, t, Some((500.0, 300.0))),
+                None,
+                t,
+            );
+            let accepted = t + Duration::from_millis(1);
+            core.apply_visual_event(
+                timed_event(1, VisualPhase::Contact, accepted, Some((500.0, 300.0))),
+                None,
+                accepted,
+            );
+            core.visual.reduced_motion = crate::ReducedMotion::On;
+            core.advance_visual_presentation(t + Duration::from_millis(2));
+            assert_tip(&core, (500.0, 300.0));
+            assert!(core.path.is_none());
+            assert_eq!(core.contact.unwrap().timestamp, accepted);
+            core.advance_visual_presentation(t + Duration::from_millis(152));
+            assert!(core.contact.is_none());
+        }
+    }
+
+    #[test]
+    fn watchable_changed_contact_target_cannot_reuse_wrong_travel_or_bounds() {
+        let t = Instant::now();
+        let mut core = timed_core();
+        let mut intent = timed_event(1, VisualPhase::Intent, t, Some((500.0, 300.0)));
+        intent.bounds = Some([490.0, 290.0, 20.0, 20.0]);
+        core.apply_visual_event(intent, None, t);
+        let accepted = t + Duration::from_millis(1);
+        core.apply_visual_event(
+            timed_event(1, VisualPhase::Contact, accepted, Some((800.0, 400.0))),
+            None,
+            accepted,
+        );
+        assert_tip(&core, (800.0, 400.0));
+        assert!(core.focus_rect.is_none());
+        assert!(core.path.is_none());
+        assert_eq!(core.contact.unwrap().target, (800.0, 400.0));
+        assert_eq!(core.contact.unwrap().timestamp, accepted);
+    }
+
     #[test]
     fn slice_a_timed_old_contact_expires_before_first_draw_and_cannot_rewind_newer_tracking() {
         let mut core = timed_core();
