@@ -45,6 +45,7 @@ use indexmap::IndexMap;
 
 use super::display_layout::{DisplayGeometry, DisplayId, DisplayLayout};
 
+mod frame_transport;
 mod ordering_trace;
 
 // ── Global overlay state ──────────────────────────────────────────────────
@@ -64,6 +65,7 @@ static DISPLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 // Only this small inbox is shared with action publishers.
 #[derive(Default)]
 struct OverlayInbox {
+    revision: u64,
     visual: cursor_overlay::VisualMailbox,
     commands: Vec<(u64, OverlayMsg)>,
     motion: HashMap<CursorKey, MotionConfig>,
@@ -216,6 +218,25 @@ impl OverlayInbox {
         }
     }
 
+    fn repin_target(
+        &mut self,
+        key: &str,
+        event: &cursor_overlay::VisualEvent,
+        generation: u64,
+    ) -> Result<(), String> {
+        self.target_current(key, event, generation)?;
+        if self.commands.len() >= 4096 {
+            return Err("overlay command inbox is saturated".into());
+        }
+        if let Some(window) = event.window {
+            self.command(OverlayMsg::Cmd(KeyedOverlayCommand {
+                key: key.into(),
+                cmd: OverlayCommand::PinAbove(window),
+            }));
+        }
+        Ok(())
+    }
+
     fn invalidate_surface_frame(&mut self, generation: u64, display: DisplayId) {
         for pending in self.approaches.values_mut() {
             if pending.presented == Some((generation, display)) {
@@ -293,6 +314,7 @@ impl OverlayInbox {
 
     fn begin_action(&mut self, key: &str) -> Option<cursor_overlay::VisualActionId> {
         let id = self.visual.begin_action(key)?;
+        self.revision = self.revision.wrapping_add(1);
         self.approaches.remove(key);
         if let Some((_, semantics, true)) = self.contexts.remove(key) {
             self.contexts.insert(key.into(), (id, semantics, false));
@@ -307,6 +329,9 @@ impl OverlayInbox {
             }
         }
         let accepted = self.visual.publish(key, event.clone());
+        if accepted {
+            self.revision = self.revision.wrapping_add(1);
+        }
         if accepted
             && self.approaches.get(key).is_some_and(|pending| {
                 !same_target(&pending.event, &event)
@@ -318,6 +343,7 @@ impl OverlayInbox {
         accepted
     }
     fn command(&mut self, message: OverlayMsg) {
+        self.revision = self.revision.wrapping_add(1);
         match message {
             OverlayMsg::Remove(key) => {
                 self.visual.remove(&key);
@@ -438,6 +464,7 @@ impl OverlayInbox {
     }
     fn take(&mut self) -> InboxBatch {
         InboxBatch {
+            revision: self.revision,
             commands: std::mem::take(&mut self.commands),
             pending: self.visual.take_pending(),
         }
@@ -445,6 +472,7 @@ impl OverlayInbox {
 }
 
 struct InboxBatch {
+    revision: u64,
     commands: Vec<(u64, OverlayMsg)>,
     pending: HashMap<CursorKey, cursor_overlay::PendingVisualState>,
 }
@@ -531,12 +559,14 @@ fn apply_visual_in_map(
             age_ms = event.timestamp.elapsed().as_secs_f64() * 1000.0,
             "click intent reached render worker");
     }
+    let visual_id = event.id;
     let accepted = if quick {
         state.core.apply_click_approach(event, bounds, now)
     } else {
         state.core.apply_visual_event(event, bounds, now)
     };
     if accepted {
+        state.visual_id = Some(visual_id);
         if target.is_some() {
             state.target = target;
         }
@@ -578,6 +608,15 @@ pub(crate) fn target_current(key: &str, event: &cursor_overlay::VisualEvent) -> 
         .unwrap()
         .target_current(key, event, DISPLAY_GENERATION.load(Ordering::Acquire))
 }
+pub(crate) fn repin_target(key: &str, event: &cursor_overlay::VisualEvent) -> Result<(), String> {
+    inbox()
+        .lock()
+        .unwrap()
+        .repin_target(key, event, DISPLAY_GENERATION.load(Ordering::Acquire))?;
+    wake_renderer();
+    Ok(())
+}
+
 pub(crate) fn release_target(key: &str, event: &cursor_overlay::VisualEvent) {
     let released = inbox().lock().unwrap().release_target(key, event);
     if let Some(pending) = released {
@@ -589,7 +628,11 @@ pub(crate) fn release_target(key: &str, event: &cursor_overlay::VisualEvent) {
 
 /// Allocate an action in the active session without reading renderer state.
 pub fn begin_visual_action(key: &str) -> Option<cursor_overlay::VisualActionId> {
-    inbox().lock().unwrap().begin_action(key)
+    let id = inbox().lock().unwrap().begin_action(key);
+    if id.is_some() {
+        wake_renderer();
+    }
+    id
 }
 
 /// Publish presentation state without waiting for path planning or a renderer acknowledgement.
@@ -930,6 +973,7 @@ struct RenderState {
     core: RenderStateCore,
     /// Last resolved target, independent of the temporary seed or path position.
     target: Option<(f64, f64)>,
+    visual_id: Option<cursor_overlay::VisualActionId>,
 }
 
 impl RenderState {
@@ -937,6 +981,7 @@ impl RenderState {
         RenderState {
             core: RenderStateCore::new(cfg),
             target: None,
+            visual_id: None,
         }
     }
 
@@ -1014,12 +1059,98 @@ struct ZOrderRoute {
     target_wid: Option<u64>,
 }
 
+#[derive(Clone)]
+struct OrderRequest {
+    route: ZOrderRoute,
+    controller: CursorKey,
+    revision: u64,
+}
+
+fn order_requests(map: &RenderMap, revision: u64) -> Vec<OrderRequest> {
+    z_order_routes(map)
+        .into_iter()
+        .filter_map(|route| {
+            let display = map
+                .layout
+                .displays
+                .iter()
+                .find(|d| d.id == route.display_id)?;
+            let controller = map
+                .command_order
+                .iter()
+                .rev()
+                .find(|key| {
+                    map.cursors
+                        .get(*key)
+                        .is_some_and(|s| state_paints_display(s, *display))
+                })?
+                .clone();
+            Some(OrderRequest {
+                route,
+                controller,
+                revision,
+            })
+        })
+        .collect()
+}
+
+fn reject_order_request(request: &OrderRequest) {
+    if let Ok(mut state) = inbox().try_lock() {
+        if state.revision == request.revision
+            && state.applied_routes.get(&request.route.display_id) == Some(&request.route)
+        {
+            state.applied_routes.remove(&request.route.display_id);
+            state.invalidate_surface_frame(request.route.generation, request.route.display_id);
+        }
+    }
+    wake_renderer();
+}
+
+fn order_request_current(request: &OrderRequest) -> bool {
+    request.route.generation == DISPLAY_GENERATION.load(Ordering::Acquire)
+        && order_request_matches(request, &RENDER, inbox())
+}
+
+fn order_request_matches(
+    request: &OrderRequest,
+    render: &Mutex<Option<RenderMap>>,
+    admission: &Mutex<OverlayInbox>,
+) -> bool {
+    let Ok(render) = render.try_lock() else {
+        return false;
+    };
+    let Some(map) = render.as_ref() else {
+        return false;
+    };
+    let Ok(admission) = admission.try_lock() else {
+        return false;
+    };
+    request.revision == admission.revision
+        && order_requests(map, admission.revision)
+            .iter()
+            .any(|current| {
+                current.route == request.route && current.controller == request.controller
+            })
+}
+
 /// Invalidate before ordering, then publish the applied route after AppKit returns.
 /// Both admission sections are nonblocking and never enclose native work.
+#[cfg(test)]
 fn apply_surface_route(
     admission: &Mutex<OverlayInbox>,
     route: ZOrderRoute,
     apply: impl FnOnce(),
+) -> bool {
+    apply_surface_route_if(admission, route, || {
+        apply();
+        true
+    })
+}
+
+fn apply_surface_route_if(
+    admission: &Mutex<OverlayInbox>,
+    route: ZOrderRoute,
+    apply: impl FnOnce() -> bool,
 ) -> bool {
     let Ok(mut state) = admission.try_lock() else {
         return false;
@@ -1029,7 +1160,9 @@ fn apply_surface_route(
         state.applied_routes.remove(&route.display_id);
     }
     drop(state);
-    apply();
+    if !apply() {
+        return false;
+    }
     let Ok(mut state) = admission.try_lock() else {
         return false;
     };
@@ -1074,7 +1207,7 @@ fn z_order_updates<'a>(
         .filter(|route| {
             !presented.contains(route)
                 || if route.target_wid.is_some() {
-                    repin_due
+                    repin_due || cursor_commanded
                 } else {
                     cursor_commanded
                 }
@@ -1305,6 +1438,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             received_wake = true;
         }
         let batch = inbox().lock().unwrap().take();
+        let render_revision = batch.revision;
 
         let (
             z_order,
@@ -1319,6 +1453,18 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                 break;
             };
             let cursor_commanded = batch.apply(map, now);
+            {
+                let state = inbox().lock().unwrap();
+                for (key, cursor) in &mut map.cursors {
+                    if cursor
+                        .visual_id
+                        .is_some_and(|id| !state.visual.owns_action(key, id))
+                    {
+                        cursor.core.clear_visual_presentation();
+                        cursor.visual_id = None;
+                    }
+                }
+            }
             let had_msg = received_wake || cursor_commanded;
 
             if frame_tick_needed || had_msg {
@@ -1344,7 +1490,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                 }
             }
 
-            let z_order = z_order_routes(map);
+            let z_order = order_requests(map, render_revision);
             let next_frame_tick_needed = render_frame_tick_needed(map, &inbox().lock().unwrap());
             let next_hover_poll_needed = map
                 .cursors
@@ -1370,13 +1516,18 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                 .values()
                 .cloned()
                 .collect();
+            let routes: Vec<_> = z_order
+                .iter()
+                .map(|request| request.route.clone())
+                .collect();
             let updates = z_order_updates(
-                &z_order,
+                &routes,
                 &applied_routes,
                 repin_frames >= 60,
                 cursor_commanded,
             );
-            for route in &z_order {
+            for request in &z_order {
+                let route = &request.route;
                 let selected = updates.contains(&route);
                 let trace = ordering_trace::decision(
                     route,
@@ -1394,10 +1545,8 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                     continue;
                 }
                 match route.target_wid {
-                    Some(target_wid) => {
-                        dispatch_pin_above(route.generation, route.display_id, target_wid, trace)
-                    }
-                    None => dispatch_order_front(route.generation, route.display_id, trace),
+                    Some(_) => dispatch_pin_above(request.clone(), trace),
+                    None => dispatch_order_front(request.clone(), trace),
                 }
             }
             if repin_frames >= 60 {
@@ -1430,16 +1579,24 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                                     display.id,
                                     render_display(map, display),
                                     target_frames(map, display, &mut inbox().lock().unwrap()),
+                                    frame_transport::Stamp {
+                                        generation: map.layout.generation,
+                                        revision: render_revision,
+                                        painted_at: now,
+                                    },
                                 )
                             })
                     })
                     .collect::<Vec<_>>();
-                presented_displays = painted;
+                // Keep clear obligations until the display is retired. A stale
+                // queued clear may be discarded and must be regenerated on wake.
+                presented_displays.extend(painted);
+                presented_displays.retain(|id| map.layout.displays.iter().any(|d| d.id == *id));
                 frames
             };
 
-            for (generation, display_id, pixmap, targets) in frames {
-                dispatch_present(generation, display_id, pixmap, targets);
+            for (generation, display_id, pixmap, targets, stamp) in frames {
+                dispatch_present(generation, display_id, pixmap, targets, stamp);
             }
         }
 
@@ -1562,6 +1719,22 @@ fn cursor_is_visible(state: &RenderState) -> bool {
 
 type MainWork = Box<dyn FnOnce() + Send>;
 
+/// For short AppKit queries or mandatory cleanup owned by a native worker.
+/// The worker waits for completion even when its async caller was cancelled.
+pub(crate) fn on_appkit_main<T: Send + 'static>(work: impl FnOnce() -> T + Send + 'static) -> T {
+    extern "C" {
+        fn pthread_main_np() -> i32;
+    }
+    if unsafe { pthread_main_np() } != 0 {
+        return work();
+    }
+    let (send, receive) = std::sync::mpsc::sync_channel(1);
+    dispatch_on_main(Box::new(move || {
+        let _ = send.send(work());
+    }));
+    receive.recv().expect("AppKit main-thread work completed")
+}
+
 fn dispatch_on_main(work: MainWork) {
     #[link(name = "dispatch", kind = "dylib")]
     extern "C" {
@@ -1624,6 +1797,7 @@ fn target_frames(
 }
 
 /// Apply pixels without keeping admission locked across native submission.
+#[cfg(test)]
 fn apply_surface_frame(
     admission: &Mutex<OverlayInbox>,
     generation: u64,
@@ -1632,12 +1806,35 @@ fn apply_surface_frame(
     targets: &[TargetFrame],
     apply: impl FnOnce(),
 ) -> bool {
+    apply_surface_frame_if(
+        admission,
+        generation,
+        display,
+        current_generation,
+        targets,
+        |_| true,
+        apply,
+    )
+}
+
+fn apply_surface_frame_if(
+    admission: &Mutex<OverlayInbox>,
+    generation: u64,
+    display: DisplayId,
+    current_generation: impl Fn() -> u64,
+    targets: &[TargetFrame],
+    current: impl Fn(&OverlayInbox) -> bool,
+    apply: impl FnOnce(),
+) -> bool {
     if generation != current_generation() {
         return false;
     }
     let Ok(mut state) = admission.try_lock() else {
         return false;
     };
+    if !current(&state) {
+        return false;
+    }
     state.prepare_surface_frame(generation, display, targets);
     for target in targets {
         if let Some(pending) = state.approaches.get_mut(&target.key) {
@@ -1652,22 +1849,77 @@ fn apply_surface_frame(
     let Ok(mut state) = admission.try_lock() else {
         return false;
     };
+    if !current(&state) {
+        state.invalidate_surface_frame(generation, display);
+        return false;
+    }
     state.acknowledge_targets(generation, display, current_generation(), targets);
     true
 }
 
-/// Present one display-local pixmap. AppKit objects remain main-thread-owned;
-/// stale frames are rejected by display-layout generation.
+struct SurfaceFrame {
+    generation: u64,
+    pixmap: tiny_skia::Pixmap,
+    targets: Vec<TargetFrame>,
+    stamp: frame_transport::Stamp,
+}
+static FRAMES: OnceLock<Mutex<frame_transport::Mailbox<SurfaceFrame>>> = OnceLock::new();
+fn frames() -> &'static Mutex<frame_transport::Mailbox<SurfaceFrame>> {
+    FRAMES.get_or_init(|| Mutex::new(frame_transport::Mailbox::default()))
+}
+
 fn dispatch_present(
     generation: u64,
     display_id: DisplayId,
     pixmap: tiny_skia::Pixmap,
     targets: Vec<TargetFrame>,
+    stamp: frame_transport::Stamp,
 ) {
-    let Some(cg_image_ptr) = pixmap_to_cgimage(&pixmap) else {
+    let schedule = frames().lock().unwrap().push(
+        display_id,
+        SurfaceFrame {
+            generation,
+            pixmap,
+            targets,
+            stamp,
+        },
+    );
+    if schedule {
+        dispatch_on_main(Box::new(drain_frames));
+    }
+}
+
+fn drain_frames() {
+    let pending = frames().lock().unwrap().take();
+    for (display, frame) in pending {
+        present_frame(display, frame);
+    }
+    let reschedule = frames().lock().unwrap().finish();
+    if reschedule {
+        dispatch_on_main(Box::new(drain_frames));
+    }
+}
+
+fn present_frame(display_id: DisplayId, frame: SurfaceFrame) {
+    let SurfaceFrame {
+        generation,
+        pixmap,
+        targets,
+        stamp,
+    } = frame;
+    let current = inbox().lock().unwrap().revision;
+    if !stamp.current(
+        DISPLAY_GENERATION.load(Ordering::Acquire),
+        current,
+        Instant::now(),
+    ) {
+        wake_renderer();
+        return;
+    }
+    let Some(cg_image_ptr) = pixmap_to_cgimage(pixmap) else {
         return;
     };
-    dispatch_on_main(Box::new(move || unsafe {
+    unsafe {
         extern "C" {
             fn CGImageRelease(image: *mut c_void);
         }
@@ -1682,12 +1934,19 @@ fn dispatch_present(
             let image = cg_image_ptr as *mut objc2::runtime::AnyObject;
             // AppKit/Core Animation submission, not physical scanout or occlusion proof.
             // Admission never encloses these calls, including a stalled flush.
-            if !apply_surface_frame(
+            if !apply_surface_frame_if(
                 inbox(),
                 generation,
                 display_id,
                 || DISPLAY_GENERATION.load(Ordering::Acquire),
                 &targets,
+                |state| {
+                    stamp.current(
+                        DISPLAY_GENERATION.load(Ordering::Acquire),
+                        state.revision,
+                        Instant::now(),
+                    )
+                },
                 || {
                     let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
                     let _: () =
@@ -1703,7 +1962,7 @@ fn dispatch_present(
         drop(host);
         ordering_trace::presented(generation, display_id);
         CGImageRelease(cg_image_ptr as *mut c_void);
-    }));
+    }
 }
 
 /// Raise the normal-level overlay without activating the driver application.
@@ -1711,14 +1970,19 @@ fn dispatch_present(
 /// This is used only for an externally visible cursor with no target window.
 /// Target-bound actions continue to use [`dispatch_pin_above`] so background
 /// delivery remains below unrelated foreground applications.
-fn dispatch_order_front(
-    generation: u64,
-    display_id: DisplayId,
-    trace: Option<ordering_trace::Trace>,
-) {
+fn dispatch_order_front(request: OrderRequest, trace: Option<ordering_trace::Trace>) {
+    let ZOrderRoute {
+        generation,
+        display_id,
+        ..
+    } = request.route;
     dispatch_on_main(Box::new(move || unsafe {
         if let Some(trace) = &trace {
             trace.sample("before_apply");
+        }
+        if !order_request_current(&request) {
+            reject_order_request(&request);
+            return;
         }
         let host = HOST.lock().unwrap();
         if let Some(surface) = host
@@ -1728,7 +1992,7 @@ fn dispatch_order_front(
         {
             let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
             let mut command_ran = false;
-            let applied = apply_surface_route(
+            let applied = apply_surface_route_if(
                 inbox(),
                 ZOrderRoute {
                     generation,
@@ -1736,18 +2000,22 @@ fn dispatch_order_front(
                     target_wid: None,
                 },
                 || {
+                    if !order_request_current(&request) {
+                        return false;
+                    }
                     command_ran = true;
                     let _: () = objc2::msg_send![win, orderFrontRegardless];
                     if let Some(trace) = &trace {
                         trace.native_sample("after_order_front", win);
                     }
+                    true
                 },
             );
             if let Some(trace) = &trace {
                 trace.outcome(command_ran, applied);
             }
             if !applied {
-                wake_renderer();
+                reject_order_request(&request);
             }
         } else if let Some(trace) = &trace {
             trace.event(
@@ -1796,21 +2064,42 @@ fn target_is_frontmost_visible_window(
         .is_some_and(|window| u64::from(window.window_id) == target_wid)
 }
 
-fn dispatch_pin_above(
-    generation: u64,
-    display_id: DisplayId,
-    target_wid: u64,
-    trace: Option<ordering_trace::Trace>,
-) {
-    let windows = crate::windows::visible_windows();
-    let foreground = crate::apps::frontmost_pid();
-    let raise_front = target_is_frontmost_visible_window(target_wid, foreground, &windows);
-    if let Some(trace) = &trace {
-        trace.enqueue(foreground, &windows, raise_front);
+fn apply_target_ordering(
+    current: impl Fn() -> bool,
+    observe: impl Fn() -> bool,
+    relative: impl FnOnce(),
+    front: impl FnOnce(),
+) -> bool {
+    if !current() {
+        return false;
     }
+    relative();
+    // Observation runs on AppKit main, after relative ordering and without
+    // render or inbox locks. A native read can outlast controller ownership.
+    let eligible = observe();
+    if !current() {
+        return false;
+    }
+    if eligible {
+        front();
+    }
+    true
+}
+
+fn dispatch_pin_above(request: OrderRequest, trace: Option<ordering_trace::Trace>) {
+    let ZOrderRoute {
+        generation,
+        display_id,
+        target_wid,
+    } = request.route;
+    let target_wid = target_wid.expect("pinned route");
     dispatch_on_main(Box::new(move || unsafe {
         if let Some(trace) = &trace {
             trace.sample("before_apply");
+        }
+        if !order_request_current(&request) {
+            reject_order_request(&request);
+            return;
         }
         let host = HOST.lock().unwrap();
         if let Some(surface) = host
@@ -1820,7 +2109,7 @@ fn dispatch_pin_above(
         {
             let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
             let mut command_ran = false;
-            let applied = apply_surface_route(
+            let applied = apply_surface_route_if(
                 inbox(),
                 ZOrderRoute {
                     generation,
@@ -1828,25 +2117,50 @@ fn dispatch_pin_above(
                     target_wid: Some(target_wid),
                 },
                 || {
-                    command_ran = true;
-                    let _: () =
-                        objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
-                    if let Some(trace) = &trace {
-                        trace.native_sample("after_order_relative", win);
-                    }
-                    if raise_front {
-                        let _: () = objc2::msg_send![win, orderFrontRegardless];
-                        if let Some(trace) = &trace {
-                            trace.native_sample("after_order_front", win);
-                        }
-                    }
+                    apply_target_ordering(
+                        || order_request_current(&request),
+                        || {
+                            let windows = crate::windows::visible_windows();
+                            let foreground = crate::apps::frontmost_pid();
+                            let eligible = target_is_frontmost_visible_window(
+                                target_wid, foreground, &windows,
+                            );
+                            if let Some(trace) = &trace {
+                                trace.application_predicate(foreground, &windows, eligible);
+                            }
+                            // Private logging can block on stderr. Refresh foreground
+                            // after it, immediately before the final ownership gate.
+                            if trace.is_some() {
+                                target_is_frontmost_visible_window(
+                                    target_wid,
+                                    crate::apps::frontmost_pid(),
+                                    &windows,
+                                )
+                            } else {
+                                eligible
+                            }
+                        },
+                        || {
+                            command_ran = true;
+                            let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
+                            if let Some(trace) = &trace {
+                                trace.native_sample("after_order_relative", win);
+                            }
+                        },
+                        || {
+                            let _: () = objc2::msg_send![win, orderFrontRegardless];
+                            if let Some(trace) = &trace {
+                                trace.native_sample("after_order_front", win);
+                            }
+                        },
+                    )
                 },
             );
             if let Some(trace) = &trace {
                 trace.outcome(command_ran, applied);
             }
             if !applied {
-                wake_renderer();
+                reject_order_request(&request);
             }
         } else if let Some(trace) = &trace {
             trace.event(
@@ -1866,14 +2180,13 @@ fn dispatch_pin_above(
 
 /// Create a `CGImage` from a `tiny_skia::Pixmap` (premultiplied RGBA).
 /// Returns a `+1` retained pointer that the caller must release.
-fn pixmap_to_cgimage(pixmap: &tiny_skia::Pixmap) -> Option<usize> {
+fn pixmap_to_cgimage(pixmap: tiny_skia::Pixmap) -> Option<usize> {
     let w = pixmap.width() as usize;
     let h = pixmap.height() as usize;
     if w == 0 || h == 0 {
         return None;
     }
 
-    let data = pixmap.data();
     let bytes_per_row = w * 4;
 
     // tiny-skia produces premultiplied RGBA with bytes in memory order [R, G, B, A].
@@ -1919,9 +2232,8 @@ fn pixmap_to_cgimage(pixmap: &tiny_skia::Pixmap) -> Option<usize> {
             ) -> *mut c_void;
         }
 
-        // Copy the pixel data into a heap Vec; the data provider will own it
-        // and free it via release_pixel_data when the CGImage is released.
-        let copied: Vec<u8> = data.to_vec();
+        // Transfer pixels to the provider without duplicating the full surface.
+        let copied: Vec<u8> = pixmap.take();
         let len = copied.len();
         let ptr = copied.as_ptr();
         // Leak the Vec into a raw Box so we can pass it as the `info` opaque pointer.
@@ -2605,8 +2917,293 @@ mod tests {
                 self.map.lock().unwrap().layout.generation,
             )
         }
+        fn repin_target(
+            &self,
+            key: &str,
+            event: &cursor_overlay::VisualEvent,
+        ) -> Result<(), String> {
+            self.inbox.lock().unwrap().repin_target(
+                key,
+                event,
+                self.map.lock().unwrap().layout.generation,
+            )
+        }
         fn release_target(&self, key: &str, event: &cursor_overlay::VisualEvent) {
             self.inbox.lock().unwrap().release_target(key, event);
+        }
+    }
+
+    #[test]
+    fn correction_post_activation_repin_rejects_obsolete_action_before_queueing() {
+        for change in ["remove", "supersede", "disable", "generation"] {
+            let sink = QuickApproachSink::new(false, true);
+            let id = sink.inbox.lock().unwrap().begin_action("one").unwrap();
+            let event = mailbox_event(id, 80., cursor_overlay::VisualPhase::Intent);
+            sink.inbox.lock().unwrap().publish("one", event.clone());
+            let _receiver = sink
+                .inbox
+                .lock()
+                .unwrap()
+                .register_target("one", &event, 1)
+                .unwrap();
+            let frames = sink.frame(event.timestamp);
+            sink.present(&frames, 1, 1);
+            let mut inbox = sink.inbox.lock().unwrap();
+            assert!(inbox.repin_target("one", &event, 1).is_ok());
+            let generation = match change {
+                "remove" => {
+                    inbox.command(OverlayMsg::Remove("one".into()));
+                    1
+                }
+                "supersede" => {
+                    inbox.begin_action("one");
+                    1
+                }
+                "disable" => {
+                    inbox.command(command("one", OverlayCommand::SetEnabled(false)));
+                    1
+                }
+                _ => 2,
+            };
+            let before = (inbox.revision, inbox.commands.len());
+            assert!(inbox.repin_target("one", &event, generation).is_err());
+            assert_eq!(
+                (inbox.revision, inbox.commands.len()),
+                before,
+                "obsolete worker must not enqueue even a same-window pin"
+            );
+        }
+    }
+
+    #[test]
+    fn correction_order_request_rejects_same_route_new_controller_and_pending_publication() {
+        let mut admission = OverlayInbox::default();
+        let mut map = empty_map();
+        map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
+        let now = Instant::now();
+        let id = admission.begin_action("one").unwrap();
+        admission.publish(
+            "one",
+            mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
+        );
+        admission.take().apply(&mut map, now);
+        let request = order_requests(&map, admission.revision).pop().unwrap();
+        let render = Mutex::new(Some(map));
+        let inbox = Mutex::new(admission);
+        assert!(order_request_matches(&request, &render, &inbox));
+        // A producer invalidates queued authority before the render map catches up.
+        inbox.lock().unwrap().begin_action("one");
+        assert!(!order_request_matches(&request, &render, &inbox));
+        let mut request = request;
+        request.revision = inbox.lock().unwrap().revision;
+        assert!(order_request_matches(&request, &render, &inbox));
+        {
+            let mut inbox = inbox.lock().unwrap();
+            let id = inbox.begin_action("two").unwrap();
+            inbox.publish(
+                "two",
+                mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
+            );
+            inbox
+                .take()
+                .apply(render.lock().unwrap().as_mut().unwrap(), now);
+            request.revision = inbox.revision;
+        }
+        assert_eq!(
+            z_order_routes(render.lock().unwrap().as_ref().unwrap()),
+            vec![request.route.clone()]
+        );
+        assert!(
+            !order_request_matches(&request, &render, &inbox),
+            "same route is not authority for the replaced controller"
+        );
+    }
+
+    #[test]
+    fn correction_actual_surface_submission_rejects_stale_art_and_preserves_fresh_clear() {
+        use std::cell::Cell;
+        for change in [
+            "remove",
+            "disable",
+            "supersede",
+            "route",
+            "generation",
+            "age",
+        ] {
+            let inbox = Mutex::new(OverlayInbox::default());
+            let now = Instant::now();
+            let old = frame_transport::Stamp {
+                generation: 1,
+                revision: 0,
+                painted_at: now,
+            };
+            let mut generation = 1;
+            let mut clock = now;
+            match change {
+                "remove" => inbox
+                    .lock()
+                    .unwrap()
+                    .command(OverlayMsg::Remove("one".into())),
+                "disable" => inbox
+                    .lock()
+                    .unwrap()
+                    .command(command("one", OverlayCommand::SetEnabled(false))),
+                "supersede" => {
+                    inbox.lock().unwrap().begin_action("one");
+                }
+                "route" => inbox
+                    .lock()
+                    .unwrap()
+                    .command(command("one", OverlayCommand::PinAbove(42))),
+                "generation" => generation = 2,
+                "age" => clock += frame_transport::MAX_FRAME_AGE,
+                _ => unreachable!(),
+            }
+            let submissions = Cell::new(0);
+            assert!(!apply_surface_frame_if(
+                &inbox,
+                1,
+                1,
+                || generation,
+                &[],
+                |state| old.current(generation, state.revision, clock),
+                || submissions.set(submissions.get() + 1)
+            ));
+            assert_eq!(
+                submissions.get(),
+                0,
+                "obsolete art must never reach native contents"
+            );
+            let fresh = frame_transport::Stamp {
+                generation,
+                revision: inbox.lock().unwrap().revision,
+                painted_at: clock,
+            };
+            assert!(apply_surface_frame_if(
+                &inbox,
+                generation,
+                1,
+                || generation,
+                &[],
+                |state| fresh.current(generation, state.revision, clock),
+                || submissions.set(submissions.get() + 1)
+            ));
+            assert_eq!(submissions.get(), 1, "latest clear must remain submitable");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn correction_receipt_repin_uses_prepared_action_and_disabled_path_stays_immediate() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        for disabled in [false, true] {
+            let sink = QuickApproachSink::new(disabled, true);
+            let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+                .with_visual_sink(sink.clone());
+            let receipt = DeliveryReceipt::default();
+            let call = tool.dispatch_resolved(
+                "one",
+                point(80., 30., Some(42)),
+                &receipt,
+                async { None },
+                async {
+                    let before = sink.inbox.lock().unwrap().commands.len();
+                    assert!(receipt.repin_current_target().is_ok());
+                    assert_eq!(
+                        sink.inbox.lock().unwrap().commands.len(),
+                        before + usize::from(!disabled)
+                    );
+                    if !disabled {
+                        sink.inbox.lock().unwrap().begin_action("one");
+                        let before = sink.inbox.lock().unwrap().commands.len();
+                        assert!(receipt.repin_current_target().is_err());
+                        assert_eq!(sink.inbox.lock().unwrap().commands.len(), before);
+                    }
+                    cua_driver_core::protocol::ToolResult::text("repin exercised")
+                },
+            );
+            tokio::pin!(call);
+            if disabled {
+                assert!(futures_util::poll!(&mut call).is_ready());
+            } else {
+                assert!(futures_util::poll!(&mut call).is_pending());
+                let frames = sink.frame(sink.start());
+                sink.present(&frames, 1, 1);
+                call.await;
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn correction_actual_ax_click_denies_selection_and_rechecks_ancestor_after_failed_write()
+    {
+        use crate::ax::bindings::test_support::SelectionScope;
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        for advertised in [false, true] {
+            for ancestor in [false, true] {
+                for deny in [false, true] {
+                    let sink = QuickApproachSink::new(false, true);
+                    let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+                        .with_visual_sink(sink.clone());
+                    let receipt = DeliveryReceipt::default();
+                    let mut fixture = SelectionScope::install(advertised, Some(true), true);
+                    if ancestor {
+                        fixture.ancestor_after_failed_write();
+                    }
+                    if deny {
+                        let sink = sink.clone();
+                        fixture.before_selected(usize::from(ancestor), move || {
+                            sink.inbox
+                                .lock()
+                                .unwrap()
+                                .command(OverlayMsg::Remove("one".into()));
+                        });
+                    }
+                    let call = tool.dispatch_resolved(
+                        "one",
+                        point(80.0, 30.0, Some(42)),
+                        &receipt,
+                        async { None },
+                        async {
+                            let result =
+                                ClickTool::exercise_ax_selection(fixture.element_ptr(), &receipt);
+                            if deny {
+                                assert!(result.is_err());
+                                assert!(!receipt.was_accepted());
+                            } else {
+                                assert!(result.is_ok());
+                                assert!(receipt.was_accepted());
+                            }
+                            cua_driver_core::protocol::ToolResult::text("selection exercised")
+                        },
+                    );
+                    tokio::pin!(call);
+                    assert!(futures_util::poll!(&mut call).is_pending());
+                    let frames = sink.frame(sink.start());
+                    sink.present(&frames, 1, 1);
+                    call.await;
+                    let calls = fixture.calls();
+                    assert_eq!(
+                        calls.iter().filter(|c| **c == "write selected").count(),
+                        usize::from(ancestor) + usize::from(!deny)
+                    );
+                    assert_eq!(
+                        calls.iter().filter(|c| **c == "failed press").count(),
+                        usize::from(advertised),
+                        "selection denial cannot resume AXPress fallback"
+                    );
+                    assert_eq!(
+                        sink.events
+                            .lock()
+                            .unwrap()
+                            .iter()
+                            .filter(|e| e.phase == cursor_overlay::VisualPhase::Contact)
+                            .count(),
+                        usize::from(!deny)
+                    );
+                }
+            }
         }
     }
 
@@ -3227,6 +3824,68 @@ mod tests {
             resume.send(()).unwrap();
             assert_eq!(call.await.is_error == Some(true), replacement != "same");
             assert_eq!(receipt.was_accepted(), replacement == "same");
+        }
+    }
+
+    #[tokio::test]
+    async fn correction_detached_activation_worker_rechecks_real_approach_ownership() {
+        use crate::cursor::visual::{point, DeliveryReceipt, PointerVisualSink};
+        use crate::tools::{ClickTool, ToolState};
+        use std::sync::{mpsc, Arc};
+        for kind in ["assist", "hid", "background"] {
+            for change in ["cancel", "end", "supersede"] {
+                let sink = QuickApproachSink::new(false, true);
+                let tool =
+                    ClickTool::new(Arc::new(ToolState::default())).with_visual_sink(sink.clone());
+                let receipt = Arc::new(DeliveryReceipt::default());
+                let worker_receipt = receipt.clone();
+                let (release, paused) = mpsc::channel();
+                let (finished, result) = tokio::sync::oneshot::channel();
+                let mut call = Box::pin(tool.dispatch_resolved(
+                    "one",
+                    point(80.0, 30.0, Some(42)),
+                    &receipt,
+                    async { None },
+                    async move {
+                        tokio::task::spawn_blocking(move || {
+                            paused.recv().unwrap();
+                            let outcome = crate::input::skylight::exercise_activation(
+                                kind,
+                                &|| worker_receipt.ensure_current(),
+                                || {
+                                    worker_receipt.dispatch_checked(|| {
+                                        panic!("cancelled worker posted input")
+                                    })
+                                },
+                            );
+                            let _ = finished.send(outcome);
+                        });
+                        std::future::pending::<cua_driver_core::protocol::ToolResult>().await
+                    },
+                ));
+                assert!(futures_util::poll!(&mut call).is_pending());
+                sink.present(&sink.frame(sink.start()), 1, 1);
+                assert!(futures_util::poll!(&mut call).is_pending());
+                match change {
+                    "end" => sink
+                        .inbox
+                        .lock()
+                        .unwrap()
+                        .command(OverlayMsg::Remove("one".into())),
+                    "supersede" => {
+                        sink.begin("one");
+                    }
+                    _ => (),
+                }
+                if change == "cancel" {
+                    drop(call);
+                }
+                release.send(()).unwrap();
+                let (outcome, effects) = result.await.unwrap();
+                assert!(outcome.is_err(), "{kind}/{change}");
+                assert!(effects.is_empty(), "{kind}/{change}: {effects:?}");
+                assert!(!receipt.was_accepted());
+            }
         }
     }
 
@@ -4920,7 +5579,7 @@ mod tests {
         let routes = z_order_routes(&map);
         assert_eq!(
             z_order_updates(&routes, &routes, false, true),
-            vec![&routes[0]]
+            vec![&routes[0], &routes[1]]
         );
         assert_eq!(
             z_order_updates(&routes, &routes, true, false),
@@ -5210,6 +5869,55 @@ mod tests {
             command_order: Vec::new(),
             template: CursorConfig::default(),
             ended: HashSet::new(),
+        }
+    }
+
+    #[test]
+    fn correction_same_pinned_route_fresh_command_orders_immediately() {
+        let routes = z_order_routes(&ordering_fixture());
+        assert_eq!(
+            z_order_updates(&routes, &routes, false, true).len(),
+            routes.len()
+        );
+        assert!(z_order_updates(&routes, &routes, false, false).is_empty());
+    }
+
+    #[test]
+    fn correction_native_order_revalidates_foreground_and_controller_after_enqueue() {
+        use std::cell::Cell;
+        for change in [
+            "foreground",
+            "controller",
+            "during_readback",
+            "becomes_foreground",
+        ] {
+            let current = Cell::new(change != "controller");
+            let relative = Cell::new(0);
+            let raised = Cell::new(0);
+            let target = vec![window(10, 100, 20)];
+            apply_target_ordering(
+                || current.get(),
+                || {
+                    if change == "during_readback" {
+                        current.set(false);
+                    }
+                    target_is_frontmost_visible_window(
+                        10,
+                        Some(if change == "foreground" { 200 } else { 100 }),
+                        &target,
+                    )
+                },
+                || relative.set(relative.get() + 1),
+                || raised.set(raised.get() + 1),
+            );
+            assert_eq!(
+                raised.get(),
+                u32::from(change == "becomes_foreground"),
+                "{change}"
+            );
+            if change == "controller" {
+                assert_eq!(relative.get(), 0);
+            }
         }
     }
 

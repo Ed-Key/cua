@@ -14,9 +14,13 @@ pub(crate) struct SelectionFixture {
     pub write_result: AXError,
     pub calls: Vec<&'static str>,
     pub before_readback: Option<Box<dyn FnOnce()>>,
+    parent: Option<usize>,
+    before_selected: VecDeque<Option<Box<dyn FnOnce()>>>,
 }
 
-pub(crate) struct SelectionScope;
+pub(crate) struct SelectionScope {
+    parent: Option<core_foundation::string::CFString>,
+}
 
 impl SelectionScope {
     pub fn install(advertised_press: bool, readback: Option<bool>, accepted: bool) -> Self {
@@ -34,9 +38,32 @@ impl SelectionScope {
                 },
                 calls: vec![],
                 before_readback: None,
+                parent: None,
+                before_selected: VecDeque::new(),
             });
         });
-        Self
+        Self { parent: None }
+    }
+
+    pub fn ancestor_after_failed_write(&mut self) {
+        use core_foundation::base::TCFType;
+        let parent = core_foundation::string::CFString::new("Scoped selection parent");
+        SELECTION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let fixture = slot.as_mut().unwrap();
+            fixture.parent = Some(parent.as_concrete_TypeRef() as usize);
+            fixture.write_result = kAXErrorFailure;
+            fixture.reads = [Some(false), Some(false), Some(true)].into();
+        });
+        self.parent = Some(parent);
+    }
+    pub fn before_selected(&self, read: usize, callback: impl FnOnce() + 'static) {
+        SELECTION.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let fixture = slot.as_mut().unwrap();
+            fixture.before_selected.resize_with(read + 1, || None);
+            fixture.before_selected[read] = Some(Box::new(callback));
+        });
     }
 
     pub fn before_readback(&self, callback: impl FnOnce() + 'static) {
@@ -64,14 +91,13 @@ fn with_fixture<T>(
     element: AXUIElementRef,
     f: impl FnOnce(&mut SelectionFixture) -> T,
 ) -> Option<T> {
-    if element as usize != usize::MAX {
-        return None;
-    }
     SELECTION.with(|slot| {
-        Some(f(slot
-            .borrow_mut()
-            .as_mut()
-            .expect("active selection fixture")))
+        let mut slot = slot.borrow_mut();
+        let fixture = slot.as_mut()?;
+        if element as usize != usize::MAX && fixture.parent != Some(element as usize) {
+            return None;
+        }
+        Some(f(fixture))
     })
 }
 
@@ -95,6 +121,9 @@ pub(super) fn copy_bool_attr(element: AXUIElementRef, attr: &str) -> Option<Opti
     with_fixture(element, |fixture| match attr {
         "AXEnabled" => Some(true),
         "AXSelected" => {
+            if let Some(Some(callback)) = fixture.before_selected.pop_front() {
+                callback();
+            }
             if fixture.calls.last() == Some(&"write selected") {
                 if let Some(callback) = fixture.before_readback.take() {
                     callback();
@@ -121,9 +150,15 @@ pub(super) fn copy_element_attr(
     element: AXUIElementRef,
     attr: &str,
 ) -> Option<Option<AXUIElementRef>> {
-    with_fixture(element, |_| {
+    with_fixture(element, |fixture| {
         assert_eq!(attr, "AXParent");
-        None
+        if element as usize == usize::MAX {
+            fixture.parent.map(|ptr| unsafe {
+                core_foundation::base::CFRetain(ptr as CFTypeRef) as AXUIElementRef
+            })
+        } else {
+            None
+        }
     })
 }
 
@@ -139,7 +174,11 @@ pub(super) fn set_bool_attr_true(element: AXUIElementRef, attr: &str) -> Option<
     with_fixture(element, |fixture| {
         assert_eq!(attr, "AXSelected");
         fixture.calls.push("write selected");
-        fixture.write_result
+        if element as usize == usize::MAX {
+            fixture.write_result
+        } else {
+            kAXErrorSuccess
+        }
     })
 }
 

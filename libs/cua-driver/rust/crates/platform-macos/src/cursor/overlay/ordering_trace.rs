@@ -62,7 +62,7 @@ pub(super) fn decision(
             "cursor_commanded": cursor_commanded, "selected": selected,
             "decision": if selected { "enqueue" } else { "cache_skip" },
             "selected_command": if !selected { "none" } else if route.target_wid.is_some() {
-                "order_relative_pending_enqueue_predicate"
+                "order_relative_pending_application_predicate"
             } else { "order_front" },
         }),
     );
@@ -84,8 +84,13 @@ impl Trace {
         let _ = writeln!(std::io::stderr().lock(), "CUA_CURSOR_ORDER_TRACE {record}");
     }
 
-    pub(super) fn enqueue(&self, pid: Option<i32>, windows: &[WindowInfo], raise: bool) {
-        self.event("enqueue_predicate", json!({
+    pub(super) fn application_predicate(
+        &self,
+        pid: Option<i32>,
+        windows: &[WindowInfo],
+        raise: bool,
+    ) {
+        self.event("application_predicate", json!({
             "foreground_pid": pid,
             "eligibility": eligibility(self.route.target_wid, pid, windows),
             "predicate_windows": window_fields(windows),

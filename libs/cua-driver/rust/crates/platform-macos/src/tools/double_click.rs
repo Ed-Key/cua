@@ -289,30 +289,40 @@ impl Tool for DoubleClickTool {
         let native = async {
             let visual = visual.clone();
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let do_click = move || -> anyhow::Result<()> {
-                    if let Some(wid) = window_id {
-                        crate::input::mouse::click_at_xy_with_window_local(
-                            pid,
-                            screen_x,
-                            screen_y,
-                            win_local_x,
-                            win_local_y,
-                            wid,
-                            2,
-                            &[],
-                            crate::input::mouse::WindowClickDelivery::from_foreground(fg),
-                        )
-                    } else {
-                        crate::input::mouse::click_at_xy(pid, screen_x, screen_y, 2, &[])
-                    }
-                };
-                let do_click = || visual.dispatch_checked(do_click);
+                let do_click =
+                    move |observed: &mut dyn FnMut(std::time::Instant)| -> anyhow::Result<()> {
+                        if let Some(wid) = window_id {
+                            crate::input::mouse::click_at_xy_with_window_local_observed(
+                                pid,
+                                screen_x,
+                                screen_y,
+                                win_local_x,
+                                win_local_y,
+                                wid,
+                                2,
+                                &[],
+                                crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                                observed,
+                            )
+                        } else {
+                            crate::input::mouse::click_at_xy_observed(
+                                pid,
+                                screen_x,
+                                screen_y,
+                                2,
+                                &[],
+                                observed,
+                            )
+                        }
+                    };
+                let do_click = || visual.dispatch_mouse(do_click);
                 // Foreground rung: brief front → double-click → restore prior frontmost.
                 match (fg, window_id) {
                     (true, Some(wid)) => {
-                        crate::input::skylight::with_foreground_assist(
+                        crate::input::skylight::with_foreground_assist_checked(
                             pid as libc::pid_t,
                             wid,
+                            &|| visual.ensure_current(),
                             do_click,
                         )?;
                         Ok(())
@@ -396,8 +406,8 @@ fn ax_double_click(
              screen coordinates as window-local for element [{idx}]."
             )
         })?;
-    visual.dispatch_at(registry, cx, cy, wid, |cx, cy| {
-        crate::input::mouse::click_at_xy_with_window_local(
+    visual.dispatch_mouse_at(registry, cx, cy, wid, |cx, cy, observed| {
+        crate::input::mouse::click_at_xy_with_window_local_observed(
             pid,
             cx,
             cy,
@@ -407,6 +417,7 @@ fn ax_double_click(
             2,
             &[],
             crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
+            observed,
         )
     })?;
     Ok(format!(

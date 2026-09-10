@@ -51,7 +51,29 @@ pub fn click_at_xy(
     count: usize,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    click_at_xy_inner(pid, x, y, None, None, count, modifiers, MousePostMode::Both)
+    click_at_xy_observed(pid, x, y, count, modifiers, &mut |_| {})
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn click_at_xy_observed(
+    pid: i32,
+    x: f64,
+    y: f64,
+    count: usize,
+    modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
+) -> anyhow::Result<()> {
+    click_at_xy_inner(
+        pid,
+        x,
+        y,
+        None,
+        None,
+        count,
+        modifiers,
+        MousePostMode::Both,
+        observed,
+    )
 }
 
 /// Screen-absolute click posted to the GLOBAL HID tap (`CGEventTapLocation::HID`),
@@ -65,7 +87,18 @@ pub fn click_at_xy(
 /// (it lands on whatever is visually on top at the point) — exactly the
 /// foreground, vision-driven model that complements the background contract.
 pub fn click_at_xy_desktop(x: f64, y: f64, count: usize, button: &str) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, count, button, &[], false)
+    click_at_xy_desktop_observed(x, y, count, button, &mut |_| {})
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn click_at_xy_desktop_observed(
+    x: f64,
+    y: f64,
+    count: usize,
+    button: &str,
+    observed: &mut dyn FnMut(std::time::Instant),
+) -> anyhow::Result<()> {
+    click_at_xy_desktop_inner(x, y, count, button, &[], false, observed)
 }
 
 /// Global HID click with physical modifier transitions. The caller must guard
@@ -77,7 +110,19 @@ pub fn click_at_xy_desktop_with_modifiers(
     button: &str,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, count, button, modifiers, false)
+    click_at_xy_desktop_with_modifiers_observed(x, y, count, button, modifiers, &mut |_| {})
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn click_at_xy_desktop_with_modifiers_observed(
+    x: f64,
+    y: f64,
+    count: usize,
+    button: &str,
+    modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
+) -> anyhow::Result<()> {
+    click_at_xy_desktop_inner(x, y, count, button, modifiers, false, observed)
 }
 
 /// Global HID modifier click that restores the user's hardware cursor after
@@ -89,7 +134,26 @@ pub fn click_at_xy_desktop_with_modifiers_preserving_cursor(
     button: &str,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, count, button, modifiers, true)
+    click_at_xy_desktop_with_modifiers_preserving_cursor_observed(
+        x,
+        y,
+        count,
+        button,
+        modifiers,
+        &mut |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn click_at_xy_desktop_with_modifiers_preserving_cursor_observed(
+    x: f64,
+    y: f64,
+    count: usize,
+    button: &str,
+    modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
+) -> anyhow::Result<()> {
+    click_at_xy_desktop_inner(x, y, count, button, modifiers, true, observed)
 }
 
 fn click_at_xy_desktop_inner(
@@ -99,6 +163,7 @@ fn click_at_xy_desktop_inner(
     button: &str,
     modifiers: &[&str],
     preserve_cursor: bool,
+    observed: &mut dyn FnMut(std::time::Instant),
 ) -> anyhow::Result<()> {
     use core_graphics::display::CGDisplay;
     use core_graphics::event::CGEventTapLocation;
@@ -142,28 +207,41 @@ fn click_at_xy_desktop_inner(
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     std::thread::sleep(std::time::Duration::from_millis(40));
     let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
-        for pair_index in 0..count.max(1) {
-            let down = CGEvent::new_mouse_event(source.clone(), down_ty, point, btn)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
-            down.set_flags(flags);
-            down.set_integer_value_field(
-                core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
-                (pair_index + 1) as i64,
-            );
-            down.post(CGEventTapLocation::HID);
-            std::thread::sleep(std::time::Duration::from_millis(28));
-            let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
-            up.set_flags(flags);
-            up.set_integer_value_field(
-                core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
-                (pair_index + 1) as i64,
-            );
-            up.post(CGEventTapLocation::HID);
-            if count > 1 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
-            }
-        }
+        run_mouse_pairs(
+            count.max(1),
+            |pair_index| {
+                let down = CGEvent::new_mouse_event(source.clone(), down_ty, point, btn)
+                    .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
+                down.set_flags(flags);
+                down.set_integer_value_field(
+                    core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
+                    (pair_index + 1) as i64,
+                );
+                down.post(CGEventTapLocation::HID);
+                Ok::<_, anyhow::Error>(std::time::Instant::now())
+            },
+            |pair_index| {
+                let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
+                    .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
+                up.set_flags(flags);
+                up.set_integer_value_field(
+                    core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
+                    (pair_index + 1) as i64,
+                );
+                up.post(CGEventTapLocation::HID);
+                Ok::<_, anyhow::Error>(std::time::Instant::now())
+            },
+            observed,
+            |stage, _pair_index| {
+                let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+                if stage == MousePairStage::AfterDown {
+                    sleep(28);
+                } else if count > 1 {
+                    sleep(80);
+                }
+            },
+        )?;
+
         Ok(())
     });
 
@@ -280,7 +358,7 @@ pub(crate) fn scroll_wheel_desktop_observed(
 /// used only by approved, bounded setup flows after an accessibility element
 /// has proven the exact target point and window.
 pub fn click_at_xy_desktop_preserving_cursor(x: f64, y: f64) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, 1, "left", &[], true)
+    click_at_xy_desktop_inner(x, y, 1, "left", &[], true, &mut |_| {})
 }
 
 extern "C" {
@@ -317,9 +395,36 @@ pub fn click_at_xy_with_window_local(
     modifiers: &[&str],
     delivery: WindowClickDelivery,
 ) -> anyhow::Result<()> {
+    click_at_xy_with_window_local_observed(
+        pid,
+        x,
+        y,
+        wx,
+        wy,
+        wid,
+        count,
+        modifiers,
+        delivery,
+        &mut |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn click_at_xy_with_window_local_observed(
+    pid: i32,
+    x: f64,
+    y: f64,
+    wx: f64,
+    wy: f64,
+    wid: u32,
+    count: usize,
+    modifiers: &[&str],
+    delivery: WindowClickDelivery,
+    observed: &mut dyn FnMut(std::time::Instant),
+) -> anyhow::Result<()> {
     match delivery {
         WindowClickDelivery::Background => {
-            click_at_xy_chromium(pid, x, y, wx, wy, wid, count, modifiers)
+            click_at_xy_chromium_observed(pid, x, y, wx, wy, wid, count, modifiers, observed)
         }
         WindowClickDelivery::Foreground => click_at_xy_inner(
             pid,
@@ -330,6 +435,7 @@ pub fn click_at_xy_with_window_local(
             count,
             modifiers,
             MousePostMode::PublicOnly,
+            observed,
         ),
     }
 }
@@ -343,6 +449,7 @@ fn click_at_xy_inner(
     count: usize,
     modifiers: &[&str],
     post_mode: MousePostMode,
+    observed: &mut dyn FnMut(std::time::Instant),
 ) -> anyhow::Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -376,63 +483,71 @@ fn click_at_xy_inner(
         );
         std::thread::sleep(std::time::Duration::from_millis(12));
 
-        for pair_index in 0..count {
-            let click_state = (pair_index + 1) as i64;
+        run_mouse_pairs(
+            count,
+            |pair_index| {
+                let click_state = (pair_index + 1) as i64;
+                let down = CGEvent::new_mouse_event(
+                    source.clone(),
+                    CGEventType::LeftMouseDown,
+                    point,
+                    CGMouseButton::Left,
+                )
+                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
+                if flags != CGEventFlags::CGEventFlagNull {
+                    down.set_flags(flags);
+                }
 
-            let down = CGEvent::new_mouse_event(
-                source.clone(),
-                CGEventType::LeftMouseDown,
-                point,
-                CGMouseButton::Left,
-            )
-            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
-            if flags != CGEventFlags::CGEventFlagNull {
-                down.set_flags(flags);
-            }
+                post_mouse_event_with_mode(
+                    pid,
+                    &down,
+                    window_local,
+                    wid,
+                    click_group_id,
+                    click_state,
+                    0,
+                    3,
+                    post_mode,
+                );
+                Ok::<_, anyhow::Error>(std::time::Instant::now())
+            },
+            |pair_index| {
+                let click_state = (pair_index + 1) as i64;
+                let up = CGEvent::new_mouse_event(
+                    source.clone(),
+                    CGEventType::LeftMouseUp,
+                    point,
+                    CGMouseButton::Left,
+                )
+                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
+                if flags != CGEventFlags::CGEventFlagNull {
+                    up.set_flags(flags);
+                }
 
-            post_mouse_event_with_mode(
-                pid,
-                &down,
-                window_local,
-                wid,
-                click_group_id,
-                click_state,
-                0,
-                3,
-                post_mode,
-            );
-            // 28 ms down→up gap: an NSButton's mouseDown enters a modal
-            // tracking loop that polls for the matching mouseUp; too tight a
-            // gap can race the loop's first poll and the click is dropped.
-            std::thread::sleep(std::time::Duration::from_millis(28));
+                post_mouse_event_with_mode(
+                    pid,
+                    &up,
+                    window_local,
+                    wid,
+                    click_group_id,
+                    click_state,
+                    0,
+                    3,
+                    post_mode,
+                );
+                Ok::<_, anyhow::Error>(std::time::Instant::now())
+            },
+            observed,
+            |stage, _pair_index| {
+                let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+                if stage == MousePairStage::AfterDown {
+                    sleep(28);
+                } else if count > 1 {
+                    sleep(80);
+                }
+            },
+        )?;
 
-            let up = CGEvent::new_mouse_event(
-                source.clone(),
-                CGEventType::LeftMouseUp,
-                point,
-                CGMouseButton::Left,
-            )
-            .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
-            if flags != CGEventFlags::CGEventFlagNull {
-                up.set_flags(flags);
-            }
-
-            post_mouse_event_with_mode(
-                pid,
-                &up,
-                window_local,
-                wid,
-                click_group_id,
-                click_state,
-                0,
-                3,
-                post_mode,
-            );
-
-            if count > 1 {
-                std::thread::sleep(std::time::Duration::from_millis(80));
-            }
-        }
         Ok(())
     })
 }
@@ -448,11 +563,20 @@ fn click_at_xy_inner(
 /// Returns whether the private focus-without-raise recipe succeeded. Event
 /// posting remains best-effort when the private APIs are unavailable.
 pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
-    let activated = crate::input::skylight::activate_without_raise(pid as libc::pid_t, wid);
+    prepare_background_pixel_click_checked(pid, wid, &|| Ok(())).unwrap_or(false)
+}
+
+pub(crate) fn prepare_background_pixel_click_checked(
+    pid: i32,
+    wid: u32,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    let activated =
+        crate::input::skylight::activate_without_raise_checked(pid as libc::pid_t, wid, admission)?;
     // Match Swift's settle interval so AppKit updates its active/key-window
     // routing before the mouseMoved + primer + target stream arrives.
     std::thread::sleep(std::time::Duration::from_millis(50));
-    activated
+    Ok(activated)
 }
 
 /// Post the stamped event half of the Chromium-compatible left-click recipe
@@ -489,6 +613,31 @@ pub fn click_at_xy_chromium(
     wid: u32,
     count: usize,
     modifiers: &[&str],
+) -> anyhow::Result<()> {
+    click_at_xy_chromium_observed(
+        pid,
+        screen_x,
+        screen_y,
+        win_local_x,
+        win_local_y,
+        wid,
+        count,
+        modifiers,
+        &mut |_| {},
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn click_at_xy_chromium_observed(
+    pid: i32,
+    screen_x: f64,
+    screen_y: f64,
+    win_local_x: f64,
+    win_local_y: f64,
+    wid: u32,
+    count: usize,
+    modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
 ) -> anyhow::Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -579,36 +728,44 @@ pub fn click_at_xy_chromium(
 
     // Step 3: target click pair(s) with clickState stepped 1→N for double-click
     // coalescing (Chromium renderer coalesces pairs into dblclick when state=1→2).
-    for pair_index in 1..=click_pairs {
-        let click_state = pair_index as i64;
-
-        let down = CGEvent::new_mouse_event(
-            source.clone(),
-            CGEventType::LeftMouseDown,
-            target,
-            CGMouseButton::Left,
-        )
-        .map_err(|_| anyhow::anyhow!("target down event creation failed"))?;
-        stamp(&down, win_local, click_state, 3);
-        post(&down);
-        std::thread::sleep(std::time::Duration::from_millis(1));
-
-        let up = CGEvent::new_mouse_event(
-            source.clone(),
-            CGEventType::LeftMouseUp,
-            target,
-            CGMouseButton::Left,
-        )
-        .map_err(|_| anyhow::anyhow!("target up event creation failed"))?;
-        stamp(&up, win_local, click_state, 3);
-        post(&up);
-
-        if pair_index < click_pairs {
-            // ~80 ms between pairs — under the system double-click threshold,
-            // clear of coalescing back into pair N.
-            std::thread::sleep(std::time::Duration::from_millis(80));
-        }
-    }
+    run_mouse_pairs(
+        click_pairs,
+        |pair_index| {
+            let click_state = (pair_index + 1) as i64;
+            let down = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::LeftMouseDown,
+                target,
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow::anyhow!("target down event creation failed"))?;
+            stamp(&down, win_local, click_state, 3);
+            post(&down);
+            Ok::<_, anyhow::Error>(std::time::Instant::now())
+        },
+        |pair_index| {
+            let click_state = (pair_index + 1) as i64;
+            let up = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::LeftMouseUp,
+                target,
+                CGMouseButton::Left,
+            )
+            .map_err(|_| anyhow::anyhow!("target up event creation failed"))?;
+            stamp(&up, win_local, click_state, 3);
+            post(&up);
+            Ok::<_, anyhow::Error>(std::time::Instant::now())
+        },
+        observed,
+        |stage, pair_index| {
+            let sleep = |ms| std::thread::sleep(std::time::Duration::from_millis(ms));
+            if stage == MousePairStage::AfterDown {
+                sleep(1);
+            } else if pair_index + 1 < click_pairs {
+                sleep(80);
+            }
+        },
+    )?;
 
     Ok(())
 }
@@ -963,7 +1120,18 @@ pub enum DragButton {
 /// left- and right-click primitives use. Window-local stamping mirrors
 /// `right_click_at_xy_with_window_local`.
 pub fn middle_click_at_xy(pid: i32, x: f64, y: f64, modifiers: &[&str]) -> anyhow::Result<()> {
-    middle_click_at_xy_inner(pid, x, y, None, modifiers)
+    middle_click_at_xy_observed(pid, x, y, modifiers, &mut |_| {})
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn middle_click_at_xy_observed(
+    pid: i32,
+    x: f64,
+    y: f64,
+    modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
+) -> anyhow::Result<()> {
+    middle_click_at_xy_inner(pid, x, y, None, modifiers, observed)
 }
 
 /// Like `middle_click_at_xy` but stamps the window-local `(wx, wy)` point.
@@ -975,7 +1143,20 @@ pub fn middle_click_at_xy_with_window_local(
     wy: f64,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    middle_click_at_xy_inner(pid, x, y, Some((wx, wy)), modifiers)
+    middle_click_at_xy_with_window_local_observed(pid, x, y, wx, wy, modifiers, &mut |_| {})
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn middle_click_at_xy_with_window_local_observed(
+    pid: i32,
+    x: f64,
+    y: f64,
+    wx: f64,
+    wy: f64,
+    modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
+) -> anyhow::Result<()> {
+    middle_click_at_xy_inner(pid, x, y, Some((wx, wy)), modifiers, observed)
 }
 
 fn middle_click_at_xy_inner(
@@ -984,43 +1165,68 @@ fn middle_click_at_xy_inner(
     y: f64,
     window_local: Option<(f64, f64)>,
     modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
 ) -> anyhow::Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let point = CGPoint::new(x, y);
     let flags = parse_modifier_flags(modifiers);
 
-    let down = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::OtherMouseDown,
-        point,
-        CGMouseButton::Center,
-    )
-    .map_err(|_| anyhow::anyhow!("middle mouse down failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        down.set_flags(flags);
-    }
-    post_mouse_event(pid, &down, window_local, None, None, 1, 2, 3);
-    std::thread::sleep(std::time::Duration::from_millis(16));
-
-    let up = CGEvent::new_mouse_event(
-        source,
-        CGEventType::OtherMouseUp,
-        point,
-        CGMouseButton::Center,
-    )
-    .map_err(|_| anyhow::anyhow!("middle mouse up failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        up.set_flags(flags);
-    }
-    post_mouse_event(pid, &up, window_local, None, None, 1, 2, 3);
+    run_mouse_pairs(
+        1,
+        |_| {
+            let down = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::OtherMouseDown,
+                point,
+                CGMouseButton::Center,
+            )
+            .map_err(|_| anyhow::anyhow!("middle mouse down failed"))?;
+            if flags != CGEventFlags::CGEventFlagNull {
+                down.set_flags(flags);
+            }
+            post_mouse_event(pid, &down, window_local, None, None, 1, 2, 3);
+            Ok::<_, anyhow::Error>(std::time::Instant::now())
+        },
+        |_| {
+            let up = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::OtherMouseUp,
+                point,
+                CGMouseButton::Center,
+            )
+            .map_err(|_| anyhow::anyhow!("middle mouse up failed"))?;
+            if flags != CGEventFlags::CGEventFlagNull {
+                up.set_flags(flags);
+            }
+            post_mouse_event(pid, &up, window_local, None, None, 1, 2, 3);
+            Ok::<_, anyhow::Error>(std::time::Instant::now())
+        },
+        observed,
+        |stage, _| {
+            if stage == MousePairStage::AfterDown {
+                std::thread::sleep(std::time::Duration::from_millis(16));
+            }
+        },
+    )?;
 
     Ok(())
 }
 
 /// Right-click at `(x, y)` with optional modifier keys (no window routing).
 pub fn right_click_at_xy(pid: i32, x: f64, y: f64, modifiers: &[&str]) -> anyhow::Result<()> {
-    right_click_at_xy_inner(pid, x, y, None, None, modifiers)
+    right_click_at_xy_observed(pid, x, y, modifiers, &mut |_| {})
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn right_click_at_xy_observed(
+    pid: i32,
+    x: f64,
+    y: f64,
+    modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
+) -> anyhow::Result<()> {
+    right_click_at_xy_inner(pid, x, y, None, None, modifiers, observed)
 }
 
 /// Like `right_click_at_xy` but stamps `CGEventSetWindowLocation` with the
@@ -1041,7 +1247,21 @@ pub fn right_click_at_xy_with_window_local(
     wid: u32,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    right_click_at_xy_inner(pid, x, y, Some((wx, wy)), Some(wid), modifiers)
+    right_click_at_xy_with_window_local_observed(pid, x, y, wx, wy, wid, modifiers, &mut |_| {})
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn right_click_at_xy_with_window_local_observed(
+    pid: i32,
+    x: f64,
+    y: f64,
+    wx: f64,
+    wy: f64,
+    wid: u32,
+    modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
+) -> anyhow::Result<()> {
+    right_click_at_xy_inner(pid, x, y, Some((wx, wy)), Some(wid), modifiers, observed)
 }
 
 fn right_click_at_xy_inner(
@@ -1051,6 +1271,7 @@ fn right_click_at_xy_inner(
     window_local: Option<(f64, f64)>,
     wid: Option<u32>,
     modifiers: &[&str],
+    observed: &mut dyn FnMut(std::time::Instant),
 ) -> anyhow::Result<()> {
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -1079,32 +1300,45 @@ fn right_click_at_xy_inner(
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
 
-    let down = CGEvent::new_mouse_event(
-        source.clone(),
-        CGEventType::RightMouseDown,
-        point,
-        CGMouseButton::Right,
-    )
-    .map_err(|_| anyhow::anyhow!("right mouse down failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        down.set_flags(flags);
-    }
-    // button_number = 1 (right). Stamping 0 here routes the event as a left
-    // button-number on the receiving side even though the type is rightMouseDown.
-    post_mouse_event(pid, &down, window_local, wid, click_group_id, 1, 1, 3);
-    std::thread::sleep(std::time::Duration::from_millis(28));
-
-    let up = CGEvent::new_mouse_event(
-        source,
-        CGEventType::RightMouseUp,
-        point,
-        CGMouseButton::Right,
-    )
-    .map_err(|_| anyhow::anyhow!("right mouse up failed"))?;
-    if flags != CGEventFlags::CGEventFlagNull {
-        up.set_flags(flags);
-    }
-    post_mouse_event(pid, &up, window_local, wid, click_group_id, 1, 1, 3);
+    run_mouse_pairs(
+        1,
+        |_| {
+            let down = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::RightMouseDown,
+                point,
+                CGMouseButton::Right,
+            )
+            .map_err(|_| anyhow::anyhow!("right mouse down failed"))?;
+            if flags != CGEventFlags::CGEventFlagNull {
+                down.set_flags(flags);
+            }
+            // button_number = 1 (right). Stamping 0 here routes the event as a left
+            // button-number on the receiving side even though the type is rightMouseDown.
+            post_mouse_event(pid, &down, window_local, wid, click_group_id, 1, 1, 3);
+            Ok::<_, anyhow::Error>(std::time::Instant::now())
+        },
+        |_| {
+            let up = CGEvent::new_mouse_event(
+                source.clone(),
+                CGEventType::RightMouseUp,
+                point,
+                CGMouseButton::Right,
+            )
+            .map_err(|_| anyhow::anyhow!("right mouse up failed"))?;
+            if flags != CGEventFlags::CGEventFlagNull {
+                up.set_flags(flags);
+            }
+            post_mouse_event(pid, &up, window_local, wid, click_group_id, 1, 1, 3);
+            Ok::<_, anyhow::Error>(std::time::Instant::now())
+        },
+        observed,
+        |stage, _| {
+            if stage == MousePairStage::AfterDown {
+                std::thread::sleep(std::time::Duration::from_millis(28));
+            }
+        },
+    )?;
 
     Ok(())
 }
@@ -1405,4 +1639,82 @@ fn parse_modifier_flags(modifiers: &[&str]) -> CGEventFlags {
         }
     }
     flags
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MousePairStage {
+    AfterDown,
+    AfterUp,
+}
+
+/// Target pair orchestration only. Mouse-move and off-screen primers never enter it.
+pub(crate) fn run_mouse_pairs<E>(
+    count: usize,
+    mut down: impl FnMut(usize) -> Result<std::time::Instant, E>,
+    mut up: impl FnMut(usize) -> Result<std::time::Instant, E>,
+    observed: &mut dyn FnMut(std::time::Instant),
+    mut settle: impl FnMut(MousePairStage, usize),
+) -> Result<(), E> {
+    for pair in 0..count {
+        observed(down(pair)?);
+        settle(MousePairStage::AfterDown, pair);
+        observed(up(pair)?);
+        settle(MousePairStage::AfterUp, pair);
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod click_post_tests {
+    use super::*;
+    use std::cell::RefCell;
+    use std::time::{Duration, Instant};
+    #[test]
+    fn correction_target_post_is_observed_before_settle_and_survives_later_failure() {
+        for fail in ["none", "first_up", "second_down", "second_up"] {
+            let start = Instant::now();
+            let accepted = RefCell::new(Vec::new());
+            let mut observe = |at| accepted.borrow_mut().push(at);
+            let result = run_mouse_pairs(
+                2,
+                |pair| {
+                    if fail == "second_down" && pair == 1 {
+                        Err("allocation")
+                    } else {
+                        Ok(start + Duration::from_millis(pair as u64 * 80))
+                    }
+                },
+                |pair| {
+                    if (fail == "first_up" && pair == 0) || (fail == "second_up" && pair == 1) {
+                        Err("allocation")
+                    } else {
+                        Ok(start + Duration::from_millis(pair as u64 * 80 + 28))
+                    }
+                },
+                &mut observe,
+                |_, _| {
+                    assert_eq!(
+                        accepted.borrow().first(),
+                        Some(&start),
+                        "first target post must precede settling"
+                    );
+                },
+            );
+            assert_eq!(result.is_err(), fail != "none");
+            assert_eq!(accepted.borrow().first(), Some(&start));
+        }
+    }
+    #[test]
+    fn correction_failed_first_target_allocation_has_no_contact() {
+        let mut count = 0;
+        let result = run_mouse_pairs(
+            1,
+            |_| Err("allocation"),
+            |_| Ok(std::time::Instant::now()),
+            &mut |_| count += 1,
+            |_, _| panic!("no posted pair"),
+        );
+        assert!(result.is_err());
+        assert_eq!(count, 0);
+    }
 }

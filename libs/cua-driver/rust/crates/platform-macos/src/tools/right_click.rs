@@ -289,29 +289,34 @@ impl Tool for RightClickTool {
         let native = async {
             let visual = visual.clone();
             let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-                let do_it = move || -> anyhow::Result<()> {
-                    let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                    if let Some(wid) = window_id {
-                        crate::input::mouse::right_click_at_xy_with_window_local(
-                            pid,
-                            screen_x,
-                            screen_y,
-                            win_local_x,
-                            win_local_y,
-                            wid,
-                            &m,
-                        )
-                    } else {
-                        crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
-                    }
-                };
-                let do_it = || visual.dispatch_checked(do_it);
+                let do_it =
+                    move |observed: &mut dyn FnMut(std::time::Instant)| -> anyhow::Result<()> {
+                        let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                        if let Some(wid) = window_id {
+                            crate::input::mouse::right_click_at_xy_with_window_local_observed(
+                                pid,
+                                screen_x,
+                                screen_y,
+                                win_local_x,
+                                win_local_y,
+                                wid,
+                                &m,
+                                observed,
+                            )
+                        } else {
+                            crate::input::mouse::right_click_at_xy_observed(
+                                pid, screen_x, screen_y, &m, observed,
+                            )
+                        }
+                    };
+                let do_it = || visual.dispatch_mouse(do_it);
                 // Foreground rung: brief front → right-click → restore prior frontmost.
                 match (fg, window_id) {
                     (true, Some(wid)) => {
-                        crate::input::skylight::with_foreground_assist(
+                        crate::input::skylight::with_foreground_assist_checked(
                             pid as libc::pid_t,
                             wid,
+                            &|| visual.ensure_current(),
                             do_it,
                         )?;
                         Ok(())
@@ -391,8 +396,17 @@ fn ax_show_menu(
     let (wx, wy) = crate::windows::window_bounds_by_id(wid)
         .map(|b| (cx - b.x, cy - b.y))
         .ok_or_else(|| anyhow::anyhow!("right-click window frame disappeared before fallback"))?;
-    visual.dispatch_at(registry, cx, cy, wid, |cx, cy| {
-        crate::input::mouse::right_click_at_xy_with_window_local(pid, cx, cy, wx, wy, wid, &[])
+    visual.dispatch_mouse_at(registry, cx, cy, wid, |cx, cy, observed| {
+        crate::input::mouse::right_click_at_xy_with_window_local_observed(
+            pid,
+            cx,
+            cy,
+            wx,
+            wy,
+            wid,
+            &[],
+            observed,
+        )
     })?;
     Ok(format!(
         "Right-clicked [{idx}] {role} \"{title}\" at element center ({cx:.0}, {cy:.0}) \

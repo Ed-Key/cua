@@ -371,6 +371,7 @@ impl DeliveryReceipt {
         Ok(())
     }
 
+    #[cfg(test)]
     pub(crate) fn dispatch_checked<T>(
         &self,
         native: impl FnOnce() -> anyhow::Result<T>,
@@ -388,11 +389,13 @@ impl DeliveryReceipt {
         }
     }
     pub(crate) fn accepted(&self) {
+        self.accepted_at(Instant::now());
+    }
+    pub(crate) fn accepted_at(&self, timestamp: Instant) {
         let mut state = self.0.lock().unwrap();
         if state.accepted.is_some() {
             return;
         }
-        let timestamp = Instant::now();
         state.accepted = Some(timestamp);
         if let Some((sink, handle)) = state.visual.take() {
             handle.publish(sink.as_ref(), VisualPhase::Contact, timestamp);
@@ -407,7 +410,65 @@ impl DeliveryReceipt {
         self.0.lock().unwrap().before_fallback_upgrade = Some(Arc::new(hook));
     }
 
+    /// Re-pin only the still-owned action after native activation settles.
+    pub(crate) fn repin_current_target(&self) -> anyhow::Result<()> {
+        self.ensure_current()?;
+        let (guarded, visual) = {
+            let state = self.0.lock().unwrap();
+            (state.approach.is_some(), state.visual.clone())
+        };
+        // Disabled overlays keep immediate input and need no native ordering.
+        if !guarded {
+            return Ok(());
+        }
+        let (sink, handle) = visual.ok_or_else(|| anyhow::anyhow!("missing click visual"))?;
+        sink.repin_target(
+            &handle.key,
+            handle
+                .event
+                .as_ref()
+                .ok_or_else(|| anyhow::anyhow!("missing click action"))?,
+        )
+        .map_err(anyhow::Error::msg)
+    }
+
+    /// Mouse acceptance comes only from the primitive's actual target posts.
+    pub(crate) fn dispatch_mouse<T>(
+        &self,
+        native: impl FnOnce(&mut dyn FnMut(Instant)) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.ensure_current()?;
+        native(&mut |timestamp| self.accepted_at(timestamp))
+    }
+
+    pub(crate) fn dispatch_mouse_at<T>(
+        &self,
+        registry: &super::CursorRegistry,
+        x: f64,
+        y: f64,
+        window: u32,
+        native: impl FnOnce(f64, f64, &mut dyn FnMut(Instant)) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.dispatch_at_admitted(registry, x, y, window, |x, y| {
+            self.dispatch_mouse(|observed| native(x, y, observed))
+        })
+    }
+
+    #[cfg(test)]
     pub(crate) fn dispatch_at<T>(
+        &self,
+        registry: &super::CursorRegistry,
+        x: f64,
+        y: f64,
+        window: u32,
+        native: impl FnOnce(f64, f64) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.dispatch_at_admitted(registry, x, y, window, |x, y| {
+            self.dispatch(|| native(x, y))
+        })
+    }
+
+    fn dispatch_at_admitted<T>(
         &self,
         registry: &super::CursorRegistry,
         x: f64,
@@ -435,7 +496,8 @@ impl DeliveryReceipt {
                 }
                 drop(state);
                 drop(guard);
-                return self.dispatch_checked(|| native(x, y));
+                self.ensure_current()?;
+                return native(x, y);
             }
         }
         {
@@ -457,9 +519,10 @@ impl DeliveryReceipt {
                 }
             }
         }
-        self.dispatch(|| native(x, y))
+        native(x, y)
     }
 
+    #[cfg(test)]
     pub(crate) fn dispatch<T, E>(&self, native: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
         let result = native();
         if result.is_ok() {
@@ -511,6 +574,9 @@ pub(crate) trait PointerVisualSink: Send + Sync {
     fn target_current(&self, _key: &str, _event: &VisualEvent) -> Result<(), String> {
         Err("click target has no current presentation".into())
     }
+    fn repin_target(&self, _key: &str, _event: &VisualEvent) -> Result<(), String> {
+        Err("renderer does not support action-bound re-pin".into())
+    }
     fn release_target(&self, _key: &str, _event: &VisualEvent) {}
     fn send(&self, key: &str, command: OverlayCommand);
     fn begin(&self, key: &str) -> Option<VisualActionId>;
@@ -552,6 +618,9 @@ impl PointerVisualSink for InvocationVisualSink {
     fn target_current(&self, key: &str, event: &VisualEvent) -> Result<(), String> {
         self.inner.target_current(key, event)
     }
+    fn repin_target(&self, key: &str, event: &VisualEvent) -> Result<(), String> {
+        self.inner.repin_target(key, event)
+    }
     fn release_target(&self, key: &str, event: &VisualEvent) {
         self.inner.release_target(key, event);
     }
@@ -585,6 +654,9 @@ impl PointerVisualSink for OverlayVisualSink {
     }
     fn target_current(&self, key: &str, event: &VisualEvent) -> Result<(), String> {
         super::overlay::target_current(key, event)
+    }
+    fn repin_target(&self, key: &str, event: &VisualEvent) -> Result<(), String> {
+        super::overlay::repin_target(key, event)
     }
     fn release_target(&self, key: &str, event: &VisualEvent) {
         super::overlay::release_target(key, event);
@@ -667,6 +739,30 @@ mod tests {
     use super::test_support::{Event, RecordingSink};
     use super::*;
     use crate::cursor::CursorRegistry;
+
+    #[test]
+    fn correction_mouse_receipt_latches_first_post_time_through_partial_failure() {
+        let receipt = DeliveryReceipt::default();
+        let start = Instant::now() - std::time::Duration::from_millis(50);
+        let result = receipt.dispatch_mouse(|observed| {
+            crate::input::mouse::run_mouse_pairs(
+                2,
+                |pair| Ok(start + std::time::Duration::from_millis(pair as u64 * 20)),
+                |_| Err::<Instant, _>(anyhow::anyhow!("up allocation failed")),
+                observed,
+                |_, _| assert_eq!(receipt.0.lock().unwrap().accepted, Some(start)),
+            )
+        });
+        assert!(result.is_err());
+        receipt.accepted_at(Instant::now());
+        assert_eq!(receipt.0.lock().unwrap().accepted, Some(start));
+        let empty = DeliveryReceipt::default();
+        empty.dispatch_mouse(|_| Ok(())).unwrap();
+        assert!(
+            !empty.was_accepted(),
+            "a successful helper with no post is not contact"
+        );
+    }
 
     #[test]
     fn slice_a_accepted_dispatch_and_fallback_publish_contact_once() {

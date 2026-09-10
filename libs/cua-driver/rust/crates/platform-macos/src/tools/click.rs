@@ -35,6 +35,7 @@ use crate::window_change_detector::WindowChangeDetector;
 use core_foundation::base::{CFRelease, TCFType};
 
 use super::ToolState;
+use crate::cursor::overlay;
 use crate::cursor::visual::{
     emit_pointer_target, DeliveryReceipt, OverlayVisualSink, PointerVisualSink,
     ResolvedPointerTarget,
@@ -363,13 +364,14 @@ impl Tool for ClickTool {
                     // turn the foreground contract back into background delivery.
                     let modifier_refs: Vec<&str> =
                         desktop_modifiers.iter().map(String::as_str).collect();
-                    delivered.dispatch_checked(|| {
-                        crate::input::mouse::click_at_xy_desktop_with_modifiers(
+                    delivered.dispatch_mouse(|observed| {
+                        crate::input::mouse::click_at_xy_desktop_with_modifiers_observed(
                             sx,
                             sy,
                             count,
                             &btn,
                             &modifier_refs,
+                            observed,
                         )
                     })
                 })
@@ -574,17 +576,17 @@ impl Tool for ClickTool {
                     let result = tokio::task::spawn_blocking(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     if foreground && !m.is_empty() {
-                        crate::input::skylight::with_foreground_hid_activation(
+                        crate::input::skylight::with_foreground_hid_activation_checked(
                             pid as libc::pid_t,
                             wid,
+                            &|| receipt.ensure_current(),
                             || {
-                                receipt.dispatch_checked(|| crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
-                                    cx, cy, 1, "middle", &m,
-                                ))
+                                receipt.dispatch_mouse(|observed| crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor_observed(
+                                    cx, cy, 1, "middle", &m, observed))
                             },
                         )
                     } else {
-                        receipt.dispatch_checked(|| crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m))
+                        receipt.dispatch_mouse(|observed| crate::input::mouse::middle_click_at_xy_observed(pid, cx, cy, &m, observed))
                     }
                 })
                 .await;
@@ -661,7 +663,7 @@ impl Tool for ClickTool {
                 // itself via FocusGuard. After the action returns, detect any
                 // new-window / foreground side-effects and append a one-liner
                 // suffix matching Swift's wording.
-                let prior_front = apps::frontmost_pid();
+                let prior_front = overlay::on_appkit_main(apps::frontmost_pid);
                 let foreground = delivery_mode.is_foreground();
                 let snapshot = if foreground {
                     WindowChangeDetector::snapshot_without_suppression(prior_front)
@@ -699,16 +701,18 @@ impl Tool for ClickTool {
                                     Ok(())
                                 };
                                 let fronted = if has_modifiers {
-                                    crate::input::skylight::with_foreground_hid_activation(
+                                    crate::input::skylight::with_foreground_hid_activation_checked(
                                         pid as libc::pid_t,
                                         wid,
+                                        &|| delivered.ensure_current(),
                                         action,
                                     )?;
                                     true
                                 } else {
-                                    crate::input::skylight::with_foreground_assist(
+                                    crate::input::skylight::with_foreground_assist_checked(
                                         pid as libc::pid_t,
                                         wid,
+                                        &|| delivered.ensure_current(),
                                         action,
                                     )?
                                 };
@@ -965,7 +969,7 @@ impl Tool for ClickTool {
                 // A pixel click can land on a "Sign In" button that opens a sheet
                 // or a Safari link that activates a new tab — same side-effect
                 // shape as the AX path, so we wrap identically.
-                let prior_front = apps::frontmost_pid();
+                let prior_front = overlay::on_appkit_main(apps::frontmost_pid);
                 let snapshot = match activation_policy {
                     PixelActivationPolicy::SuppressTarget => {
                         WindowChangeDetector::snapshot(prior_front)
@@ -977,37 +981,6 @@ impl Tool for ClickTool {
                         WindowChangeDetector::snapshot_without_suppression(prior_front)
                     }
                 };
-
-                // Restore the Swift background-click prologue that was left
-                // disconnected in the original Rust port. It makes an opaque
-                // target AppKit-active without raising/restacking its window, which
-                // is required by Chromium gates and remote-HID proxies such as
-                // iPhone Mirroring. Re-pin after the focus record because changing
-                // AppKit active state can disturb overlay ordering.
-                let focus_without_raise =
-                    if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
-                        let wid = window_id.expect("activation policy requires window_id");
-                        match tokio::task::spawn_blocking(move || {
-                            crate::input::mouse::prepare_background_pixel_click(pid, wid)
-                        })
-                        .await
-                        {
-                            Ok(activated) => {
-                                self.visual_sink.send(
-                                    &cursor_key,
-                                    cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-                                );
-                                activated
-                            }
-                            Err(error) => {
-                                return ToolResult::error(format!(
-                                    "Background click activation task failed: {error}"
-                                ));
-                            }
-                        }
-                    } else {
-                        false
-                    };
 
                 let mods_owned = modifiers.clone();
                 // Surface 5: route to the right/middle CGEvent primitives when
@@ -1026,33 +999,30 @@ impl Tool for ClickTool {
                 || async move {
                     tokio::task::spawn_blocking(move || {
                         let has_modifiers = !mods_owned.is_empty();
-                        let do_click = move || -> anyhow::Result<()> {
+                        let do_click = move |observed: &mut dyn FnMut(std::time::Instant)| -> anyhow::Result<()> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                             if fg && !m.is_empty() {
-                                return crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+                                return crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor_observed(
                                     screen_x,
                                     screen_y,
                                     count,
                                     &button_kind,
-                                    &m,
-                                );
+                                    &m, observed);
                             }
                             match button_kind.as_str() {
                                 "right" => {
                                     if let Some(wid) = window_id {
-                                        return crate::input::mouse::right_click_at_xy_with_window_local(
-                                            pid, screen_x, screen_y, win_local_x, win_local_y, wid, &m,
-                                        );
+                                        return crate::input::mouse::right_click_at_xy_with_window_local_observed(
+                                            pid, screen_x, screen_y, win_local_x, win_local_y, wid, &m, observed);
                                     }
-                                    crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
+                                    crate::input::mouse::right_click_at_xy_observed(pid, screen_x, screen_y, &m, observed)
                                 }
                                 "middle" => {
                                     if let Some(_wid) = window_id {
-                                        return crate::input::mouse::middle_click_at_xy_with_window_local(
-                                            pid, screen_x, screen_y, win_local_x, win_local_y, &m,
-                                        );
+                                        return crate::input::mouse::middle_click_at_xy_with_window_local_observed(
+                                            pid, screen_x, screen_y, win_local_x, win_local_y, &m, observed);
                                     }
-                                    crate::input::mouse::middle_click_at_xy(pid, screen_x, screen_y, &m)
+                                    crate::input::mouse::middle_click_at_xy_observed(pid, screen_x, screen_y, &m, observed)
                                 }
                                 // "left" (default) or anything else — preserve legacy left-click path.
                                 _ => {
@@ -1061,67 +1031,66 @@ impl Tool for ClickTool {
                                     // and Chromium-specific fields (f40, f51, f58, f91, f92) onto events
                                     // for better backgrounded-target delivery.
                                     if let Some(wid) = window_id {
-                                        return crate::input::mouse::click_at_xy_with_window_local(
+                                        return crate::input::mouse::click_at_xy_with_window_local_observed(
                                             pid, screen_x, screen_y,
                                             win_local_x, win_local_y,
                                             wid, count, &m,
-                                            crate::input::mouse::WindowClickDelivery::from_foreground(fg),
-                                        );
+                                            crate::input::mouse::WindowClickDelivery::from_foreground(fg), observed);
                                     }
-                                    crate::input::mouse::click_at_xy(pid, screen_x, screen_y, count, &m)
+                                    crate::input::mouse::click_at_xy_observed(pid, screen_x, screen_y, count, &m, observed)
                                 }
                             }
                         };
-                        let do_click = || receipt.dispatch_checked(do_click);
+                        let do_click = || receipt.dispatch_mouse(do_click);
                         // Foreground rung: brief front → click → restore.
                         // Returns whether the window was ACTUALLY fronted, so the
                         // reported `path` honestly reflects the rung that ran.
-                        match (fg, window_id, has_modifiers) {
+                        let dispatch = || match (fg, window_id, has_modifiers) {
                             (true, Some(wid), true) => {
-                                crate::input::skylight::with_foreground_hid_activation(
+                                crate::input::skylight::with_foreground_hid_activation_checked(
                                     pid as libc::pid_t,
                                     wid,
+                                    &|| receipt.ensure_current(),
                                     do_click,
                                 )
                                 .map(|_| true)
                             }
                             (true, Some(wid), false) => {
-                                crate::input::skylight::with_foreground_assist(
+                                crate::input::skylight::with_foreground_assist_checked(
                                     pid as libc::pid_t,
                                     wid,
+                                    &|| receipt.ensure_current(),
                                     do_click,
                                 )
                             }
                             _ => do_click().map(|_| false),
+                        };
+                        if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
+                            let wid = window_id.expect("background activation requires a window");
+                            background_pixel_worker(
+                                || crate::input::mouse::prepare_background_pixel_click_checked(pid, wid, &|| receipt.ensure_current()),
+                                |activated| {
+                                    receipt.repin_current_target()?;
+                                    dispatch().map(|fronted| (fronted, activated))
+                                },
+                                || {
+                                    if prior_front == Some(pid) { return; }
+                                    std::thread::sleep(std::time::Duration::from_millis(50));
+                                    overlay::on_appkit_main(move || {
+                                        if let Some(previous) = background_pixel_restore_pid(activation_policy, prior_front, pid, apps::frontmost_pid()) {
+                                            let _ = apps::activate_pid(previous);
+                                        }
+                                    });
+                                },
+                            )
+                        } else {
+                            dispatch().map(|fronted| (fronted, false))
                         }
                     })
                     .await
                 },
             )
             .await;
-
-                // The no-raise record can make NSWorkspace report the target as
-                // active even though its window never moved in z-order. Once the
-                // click has been queued, restore the prior app if the target is
-                // still reported frontmost. Base this on observed state, not
-                // `focus_without_raise`: the private recipe can report failure
-                // after partially activating the target, and the raw click can
-                // self-activate even when that recipe is unavailable. Do not
-                // overwrite a different app here; the wildcard suppression lease
-                // handles genuine side effects.
-                if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
-                    && prior_front != Some(pid)
-                {
-                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                    if let Some(previous_pid) = background_pixel_restore_pid(
-                        activation_policy,
-                        prior_front,
-                        pid,
-                        apps::frontmost_pid(),
-                    ) {
-                        let _ = apps::activate_pid(previous_pid);
-                    }
-                }
 
                 let changes = super::finish_window_observation(snapshot, &args).await;
 
@@ -1131,7 +1100,7 @@ impl Tool for ClickTool {
                     _ => "click",
                 };
                 match result {
-                    Ok(Ok(fronted)) => {
+                    Ok(Ok((fronted, focus_without_raise))) => {
                         // `with_foreground_assist` returns `false` when the fronting SPIs
                         // were unavailable and it clicked WITHOUT activation — report the
                         // background path in that case so `path` reflects the rung that ran.
@@ -1369,16 +1338,16 @@ fn perform_ax_click(
             };
             let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
             delivered.ensure_current()?;
+            delivered.dispatch_mouse(|observed| {
             if foreground && !modifier_refs.is_empty() {
-                crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+                crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor_observed(
                     target.screen_x,
                     target.screen_y,
                     1,
                     "left",
-                    &modifier_refs,
-                )?;
+                    &modifier_refs, observed)?;
             } else {
-                crate::input::mouse::click_at_xy_with_window_local(
+                crate::input::mouse::click_at_xy_with_window_local_observed(
                     pid,
                     target.screen_x,
                     target.screen_y,
@@ -1387,10 +1356,10 @@ fn perform_ax_click(
                     window_id,
                     1,
                     &modifier_refs,
-                    crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
-                )?;
+                    crate::input::mouse::WindowClickDelivery::from_foreground(foreground), observed)?;
             }
-            delivered.accepted();
+                Ok(())
+            })?;
             // AppKit may publish a transient AXSelected transition while the
             // event queue is still resolving the gesture. Let it settle before
             // accepting a candidate, then require the same state to survive a
@@ -1585,6 +1554,34 @@ mod tests {
     use super::*;
 
     use crate::cursor::visual::test_support::{Event, RecordingSink};
+
+    #[tokio::test]
+    async fn correction_background_worker_restores_after_waiter_is_cancelled() {
+        let (entered, waiting) = tokio::sync::oneshot::channel();
+        let (release, pause) = std::sync::mpsc::channel();
+        let (restored, restoration) = tokio::sync::oneshot::channel();
+        let waiter = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                background_pixel_worker::<()>(
+                    || Ok(false), // A partial activation still needs cleanup.
+                    |_| {
+                        entered.send(()).unwrap();
+                        pause.recv().unwrap();
+                        anyhow::bail!("later failure")
+                    },
+                    || {
+                        let _ = restored.send(());
+                    },
+                )
+            })
+            .await
+        });
+        waiting.await.unwrap();
+        waiter.abort();
+        assert!(waiter.await.unwrap_err().is_cancelled());
+        release.send(()).unwrap();
+        restoration.await.unwrap();
+    }
 
     #[tokio::test]
     async fn pixel_ax_only_explicit_miss_allows_ordinary_fallback() {
@@ -2342,5 +2339,25 @@ mod tests {
             None,
             "strict-suppression paths retain their existing ownership"
         );
+    }
+}
+
+/// The native worker owns cleanup; dropping its async waiter cannot skip it.
+fn background_pixel_worker<T>(
+    prepare: impl FnOnce() -> anyhow::Result<bool>,
+    body: impl FnOnce(bool) -> anyhow::Result<T>,
+    restore: impl FnOnce(),
+) -> anyhow::Result<T> {
+    let activated = prepare()?;
+    crate::input::skylight::with_cleanup(restore, || body(activated))
+}
+
+#[cfg(test)]
+impl ClickTool {
+    pub(crate) fn exercise_ax_selection(
+        element: usize,
+        receipt: &DeliveryReceipt,
+    ) -> anyhow::Result<()> {
+        perform_ax_click(element, 0, 1, 42, "click", receipt, None, &[], false).map(|_| ())
     }
 }
