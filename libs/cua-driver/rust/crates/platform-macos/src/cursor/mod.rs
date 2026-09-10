@@ -12,3 +12,5 @@ pub mod state;
 pub use state::{CursorRegistry, CursorState};
 // Note: `state::CursorConfig` (the old runtime config) is intentionally not re-exported
 // at this level to avoid conflicting with `cursor_overlay::CursorConfig` (the CLI/shared config).
+
+pub(crate) mod visual;

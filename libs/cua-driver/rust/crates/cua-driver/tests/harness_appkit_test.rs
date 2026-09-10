@@ -1050,10 +1050,49 @@ fn harness_appkit_counter_px_background() {
         DriverRoute::MacosAxAction,
         |pid, wid, driver| {
             let pre = snapshot_elements(driver, pid, wid);
+            let counter = |snapshot: &ToolResponse| -> u64 {
+                snapshot
+                    .tree_text()
+                    .split("counter=")
+                    .nth(1)
+                    .expect("fixture counter label")
+                    .chars()
+                    .take_while(char::is_ascii_digit)
+                    .collect::<String>()
+                    .parse()
+                    .expect("numeric fixture counter")
+            };
+            assert_eq!(counter(&pre), 0, "fixture must start at zero");
+            let index = element_index_by_id(pre.tree_text(), "btn-increment").unwrap();
+            let element = pre.structured()["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|element| element["element_index"].as_u64() == Some(index))
+                .unwrap();
+            let frame = &element["frame"];
+            let expected_x = frame["x"].as_f64().unwrap() + frame["w"].as_f64().unwrap() / 2.0;
+            let expected_y = frame["y"].as_f64().unwrap() + frame["h"].as_f64().unwrap() / 2.0;
+            let session = "slice-a-task6-counter";
+            let seed = driver.call(
+                "move_cursor",
+                serde_json::json!({
+                    "session": session, "x": 5.0, "y": 5.0
+                }),
+            );
+            assert!(!seed.is_error(), "cursor seed failed: {}", seed.raw);
+            let before = driver.call(
+                "get_agent_cursor_state",
+                serde_json::json!({"session": session}),
+            );
+            assert!(!before.is_error(), "cursor read failed: {}", before.raw);
+            assert_eq!(before.structured()["position"]["x"].as_f64(), Some(5.0));
+            assert_eq!(before.structured()["position"]["y"].as_f64(), Some(5.0));
             let (x, y, width, height) = element_pixel_frame(&pre, "btn-increment");
             let response = driver.call(
                 "click",
                 serde_json::json!({
+                    "session": session,
                     "pid": pid as i64,
                     "window_id": wid,
                     "x": x + width / 2.0,
@@ -1066,13 +1105,29 @@ fn harness_appkit_counter_px_background() {
                 "AppKit PX background click failed: {}",
                 response.text()
             );
-            std::thread::sleep(Duration::from_millis(200));
-            assert!(
-                snapshot_elements(driver, pid, wid)
-                    .tree_text()
-                    .contains("counter=1"),
-                "AppKit PX background click did not advance counter"
+            assert_eq!(
+                response.action_route(),
+                Some("accessibility"),
+                "pixel counter row must actually use AX delivery: {}",
+                response.raw
             );
+            std::thread::sleep(Duration::from_millis(200));
+            assert_eq!(
+                counter(&snapshot_elements(driver, pid, wid)),
+                1,
+                "one pixel click must advance the fixture counter exactly once"
+            );
+            let cursor = driver.call(
+                "get_agent_cursor_state",
+                serde_json::json!({"session": session}),
+            );
+            assert!(!cursor.is_error(), "cursor read failed: {}", cursor.raw);
+            let position = &cursor.structured()["position"];
+            let actual_x = position["x"].as_f64().expect("resolved cursor x");
+            let actual_y = position["y"].as_f64().expect("resolved cursor y");
+            assert!((actual_x - expected_x).abs() < 0.5 && (actual_y - expected_y).abs() < 0.5,
+                "cursor ({actual_x}, {actual_y}) did not reach resolved button center ({expected_x}, {expected_y})");
+            println!("Task 6 native row: route=accessibility counter=0->1 cursor=({actual_x},{actual_y})");
         },
     );
 }
