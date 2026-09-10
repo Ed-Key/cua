@@ -58,6 +58,11 @@ impl ClickTool {
         self
     }
 
+    #[cfg(test)]
+    pub(crate) fn pixel_ax_result_for_test(result: anyhow::Result<bool>) -> Option<ToolResult> {
+        pixel_ax_dispatch_result(false, Ok(result))
+    }
+
     // Both futures are lazy: a completed semantic route never polls native input.
     // Selection can deliver input and then fail its postcondition readback. Its
     // receipt keeps that delivery fact independent of the tool result.
@@ -1218,7 +1223,13 @@ fn pixel_ax_dispatch_result(
                 }),
             ),
         ),
-        _ => None,
+        Ok(Err(error)) => Some(crate::cursor::visual::approach_refusal(error)),
+        Err(error) if !focus_only => Some(ToolResult::error(format!(
+            "PX-to-AX worker failed: {error}"
+        ))),
+        Ok(Ok(false)) => None,
+        // Preserve the existing focus worker-join behavior.
+        Err(_) => None,
     }
 }
 
@@ -1574,6 +1585,19 @@ mod tests {
     use super::*;
 
     use crate::cursor::visual::test_support::{Event, RecordingSink};
+
+    #[tokio::test]
+    async fn pixel_ax_only_explicit_miss_allows_ordinary_fallback() {
+        assert!(pixel_ax_dispatch_result(false, Ok(Ok(false))).is_none());
+        let worker = tokio::spawn(std::future::pending::<anyhow::Result<bool>>());
+        worker.abort();
+        let error = worker.await.unwrap_err();
+        let reason = error.to_string();
+        let result =
+            pixel_ax_dispatch_result(false, Err(error)).expect("worker failure is terminal");
+        assert_eq!(result.is_error, Some(true));
+        assert!(serde_json::to_string(&result).unwrap().contains(&reason));
+    }
 
     #[test]
     fn pixel_ax_focus_requires_actual_write_acceptance() {

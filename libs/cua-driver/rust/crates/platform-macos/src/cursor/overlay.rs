@@ -3242,6 +3242,165 @@ mod tests {
             .contains_key("quick-real-stalled"));
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn quick_approach_pixel_ax_denial_stays_terminal_after_readiness_recovers() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        let sink = QuickApproachSink::new(false, true);
+        let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+            .with_visual_sink(sink.clone());
+        let receipt = DeliveryReceipt::default();
+        let native_calls = std::cell::Cell::new(0);
+        let denial = std::cell::RefCell::new(String::new());
+        let call = tool.dispatch_resolved(
+            "one",
+            point(80.0, 30.0, Some(42)),
+            &receipt,
+            async {
+                assert!(apply_surface_route(
+                    &sink.inbox,
+                    ZOrderRoute {
+                        generation: 1,
+                        display_id: 1,
+                        target_wid: Some(77),
+                    },
+                    || {}
+                ));
+                let error = receipt.ensure_current().unwrap_err();
+                *denial.borrow_mut() = error.to_string();
+                // Restore real frame admission before the pixel adapter consumes denial.
+                sink.present(&sink.frame(sink.start()), 1, 1);
+                assert!(receipt.ensure_current().is_ok());
+                ClickTool::pixel_ax_result_for_test(Err(error))
+            },
+            async {
+                native_calls.set(native_calls.get() + 1);
+                receipt.dispatch_checked(|| Ok(())).unwrap();
+                cua_driver_core::protocol::ToolResult::text("unexpected native fallback")
+            },
+        );
+        tokio::pin!(call);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        sink.present(&sink.frame(sink.start()), 1, 1);
+        let result = call.await;
+        assert_eq!(native_calls.get(), 0);
+        assert!(!receipt.was_accepted());
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            serde_json::to_value(&result).unwrap(),
+            serde_json::to_value(crate::cursor::visual::approach_refusal(&*denial.borrow()))
+                .unwrap()
+        );
+        assert_eq!(
+            sink.events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|event| event.phase == cursor_overlay::VisualPhase::Contact)
+                .count(),
+            0
+        );
+    }
+
+    #[tokio::test]
+    async fn quick_approach_fallback_expired_weak_is_never_ungated() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{DoubleClickTool, RightClickTool, ToolState};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for double in [false, true] {
+            for changed in [false, true] {
+                let sink = QuickApproachSink::new(false, true);
+                let receipt = Arc::new(DeliveryReceipt::default());
+                let (reached_tx, reached_rx) = tokio::sync::oneshot::channel();
+                let (resume_tx, resume_rx) = std::sync::mpsc::channel();
+                let reached_tx = Mutex::new(Some(reached_tx));
+                let resume_rx = Mutex::new(resume_rx);
+                receipt.before_fallback_upgrade_for_test(move || {
+                    // dispatch_at's initial ensure_current has returned success.
+                    // No receipt/inbox lock or approach guard spans this barrier.
+                    reached_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                    resume_rx.lock().unwrap().recv().unwrap();
+                });
+                let calls = Arc::new(AtomicUsize::new(0));
+                let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+                let invocation = {
+                    let receipt = receipt.clone();
+                    let calls = calls.clone();
+                    let sink = sink.clone();
+                    tokio::spawn(async move {
+                        let right = RightClickTool::new(Arc::new(ToolState::default()))
+                            .with_visual_sink(sink.clone());
+                        let double_tool = DoubleClickTool::new(Arc::new(ToolState::default()))
+                            .with_visual_sink(sink);
+                        let worker_receipt = receipt.clone();
+                        let native = async {
+                            tokio::task::spawn_blocking(move || {
+                                let result = worker_receipt.dispatch_at(
+                                    &super::super::CursorRegistry::new(),
+                                    if changed { 81.0 } else { 80.0 },
+                                    30.0,
+                                    42,
+                                    |_, _| {
+                                        calls.fetch_add(1, Ordering::SeqCst);
+                                        Ok(())
+                                    },
+                                );
+                                finished_tx
+                                    .send(result.map_err(|error| error.to_string()))
+                                    .unwrap();
+                            })
+                            .await
+                            .unwrap();
+                            cua_driver_core::protocol::ToolResult::text("finished")
+                        };
+                        if double {
+                            double_tool
+                                .dispatch_resolved(
+                                    "one",
+                                    point(80.0, 30.0, Some(42)),
+                                    &receipt,
+                                    native,
+                                )
+                                .await
+                        } else {
+                            right
+                                .dispatch_resolved(
+                                    "one",
+                                    point(80.0, 30.0, Some(42)),
+                                    &receipt,
+                                    native,
+                                )
+                                .await
+                        }
+                    })
+                };
+                while sink.pending() == 0 {
+                    tokio::task::yield_now().await;
+                }
+                sink.present(&sink.frame(sink.start()), 1, 1);
+                reached_rx.await.unwrap();
+                invocation.abort();
+                assert!(invocation.await.unwrap_err().is_cancelled());
+                assert_eq!(sink.pending(), 0);
+                resume_tx.send(()).unwrap();
+                let result = finished_rx.await.unwrap();
+                assert_eq!(calls.load(Ordering::SeqCst), 0);
+                assert_eq!(result.unwrap_err(), "click approach cancelled");
+                assert!(!receipt.was_accepted());
+                let events = sink.events.lock().unwrap();
+                assert_eq!(
+                    events.len(),
+                    1,
+                    "cancelled fallback must not republish intent or contact"
+                );
+                assert_eq!(events[0].phase, cursor_overlay::VisualPhase::Intent);
+            }
+        }
+    }
+
     #[tokio::test]
     async fn quick_approach_cancelled_call_cannot_keep_registration_alive_during_native_readback() {
         use crate::cursor::visual::{point, DeliveryReceipt};

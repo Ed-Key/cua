@@ -226,6 +226,8 @@ struct ReceiptState {
     accepted: Option<Instant>,
     visual: Option<(Arc<dyn PointerVisualSink>, PointerVisualHandle)>,
     approach: Option<std::sync::Weak<ApproachGuard>>,
+    #[cfg(test)]
+    before_fallback_upgrade: Option<Arc<dyn Fn() + Send + Sync>>,
     revalidate: Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>,
 }
 /// Invocation-owned registration. Dropping a cancelled call removes only its waiter.
@@ -400,6 +402,11 @@ impl DeliveryReceipt {
     pub(crate) fn was_accepted(&self) -> bool {
         self.0.lock().unwrap().accepted.is_some()
     }
+    #[cfg(test)]
+    pub(crate) fn before_fallback_upgrade_for_test(&self, hook: impl Fn() + Send + Sync + 'static) {
+        self.0.lock().unwrap().before_fallback_upgrade = Some(Arc::new(hook));
+    }
+
     pub(crate) fn dispatch_at<T>(
         &self,
         registry: &super::CursorRegistry,
@@ -409,9 +416,19 @@ impl DeliveryReceipt {
         native: impl FnOnce(f64, f64) -> anyhow::Result<T>,
     ) -> anyhow::Result<T> {
         self.ensure_current()?;
+        #[cfg(test)]
+        {
+            let hook = self.0.lock().unwrap().before_fallback_upgrade.clone();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         {
             let state = self.0.lock().unwrap();
-            if let Some(guard) = state.approach.as_ref().and_then(|weak| weak.upgrade()) {
+            if let Some(weak) = state.approach.as_ref() {
+                let guard = weak
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("click approach cancelled"))?;
                 let event = guard.handle.event.as_ref().unwrap();
                 if event.target != Some((x, y)) || event.window != Some(u64::from(window)) {
                     anyhow::bail!("native fallback target changed after click approach; refusing input, take a fresh snapshot");
