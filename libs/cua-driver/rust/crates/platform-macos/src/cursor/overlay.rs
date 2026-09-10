@@ -45,6 +45,8 @@ use indexmap::IndexMap;
 
 use super::display_layout::{DisplayGeometry, DisplayId, DisplayLayout};
 
+mod ordering_trace;
+
 // ── Global overlay state ──────────────────────────────────────────────────
 
 enum MacOverlayMsg {
@@ -1368,17 +1370,34 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                 .values()
                 .cloned()
                 .collect();
-            for route in z_order_updates(
+            let updates = z_order_updates(
                 &z_order,
                 &applied_routes,
                 repin_frames >= 60,
                 cursor_commanded,
-            ) {
+            );
+            for route in &z_order {
+                let selected = updates.contains(&route);
+                let trace = ordering_trace::decision(
+                    route,
+                    applied_routes.contains(route),
+                    repin_frames >= 60,
+                    cursor_commanded,
+                    selected,
+                );
+                if !selected {
+                    if let Some(trace) = trace {
+                        // Observation only. A cached route must not acquire a
+                        // new native ordering command through diagnostics.
+                        dispatch_on_main(Box::new(move || trace.skipped()));
+                    }
+                    continue;
+                }
                 match route.target_wid {
                     Some(target_wid) => {
-                        dispatch_pin_above(route.generation, route.display_id, target_wid)
+                        dispatch_pin_above(route.generation, route.display_id, target_wid, trace)
                     }
-                    None => dispatch_order_front(route.generation, route.display_id),
+                    None => dispatch_order_front(route.generation, route.display_id, trace),
                 }
             }
             if repin_frames >= 60 {
@@ -1681,6 +1700,8 @@ fn dispatch_present(
                 wake_renderer();
             }
         }
+        drop(host);
+        ordering_trace::presented(generation, display_id);
         CGImageRelease(cg_image_ptr as *mut c_void);
     }));
 }
@@ -1690,8 +1711,15 @@ fn dispatch_present(
 /// This is used only for an externally visible cursor with no target window.
 /// Target-bound actions continue to use [`dispatch_pin_above`] so background
 /// delivery remains below unrelated foreground applications.
-fn dispatch_order_front(generation: u64, display_id: DisplayId) {
+fn dispatch_order_front(
+    generation: u64,
+    display_id: DisplayId,
+    trace: Option<ordering_trace::Trace>,
+) {
     dispatch_on_main(Box::new(move || unsafe {
+        if let Some(trace) = &trace {
+            trace.sample("before_apply");
+        }
         let host = HOST.lock().unwrap();
         if let Some(surface) = host
             .as_ref()
@@ -1699,7 +1727,8 @@ fn dispatch_order_front(generation: u64, display_id: DisplayId) {
             .and_then(|host| host.surfaces.get(&display_id))
         {
             let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
-            if !apply_surface_route(
+            let mut command_ran = false;
+            let applied = apply_surface_route(
                 inbox(),
                 ZOrderRoute {
                     generation,
@@ -1707,11 +1736,31 @@ fn dispatch_order_front(generation: u64, display_id: DisplayId) {
                     target_wid: None,
                 },
                 || {
+                    command_ran = true;
                     let _: () = objc2::msg_send![win, orderFrontRegardless];
+                    if let Some(trace) = &trace {
+                        trace.native_sample("after_order_front", win);
+                    }
                 },
-            ) {
+            );
+            if let Some(trace) = &trace {
+                trace.outcome(command_ran, applied);
+            }
+            if !applied {
                 wake_renderer();
             }
+        } else if let Some(trace) = &trace {
+            trace.event(
+                "surface_rejected",
+                serde_json::json!({
+                    "host_generation": host.as_ref().map(|host| host.generation),
+                    "reason": "missing_surface_or_stale_generation",
+                }),
+            );
+        }
+        drop(host);
+        if let Some(trace) = trace {
+            trace.observe_presentations();
         }
     }));
 }
@@ -1747,11 +1796,22 @@ fn target_is_frontmost_visible_window(
         .is_some_and(|window| u64::from(window.window_id) == target_wid)
 }
 
-fn dispatch_pin_above(generation: u64, display_id: DisplayId, target_wid: u64) {
+fn dispatch_pin_above(
+    generation: u64,
+    display_id: DisplayId,
+    target_wid: u64,
+    trace: Option<ordering_trace::Trace>,
+) {
     let windows = crate::windows::visible_windows();
-    let raise_front =
-        target_is_frontmost_visible_window(target_wid, crate::apps::frontmost_pid(), &windows);
+    let foreground = crate::apps::frontmost_pid();
+    let raise_front = target_is_frontmost_visible_window(target_wid, foreground, &windows);
+    if let Some(trace) = &trace {
+        trace.enqueue(foreground, &windows, raise_front);
+    }
     dispatch_on_main(Box::new(move || unsafe {
+        if let Some(trace) = &trace {
+            trace.sample("before_apply");
+        }
         let host = HOST.lock().unwrap();
         if let Some(surface) = host
             .as_ref()
@@ -1759,7 +1819,8 @@ fn dispatch_pin_above(generation: u64, display_id: DisplayId, target_wid: u64) {
             .and_then(|host| host.surfaces.get(&display_id))
         {
             let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
-            if !apply_surface_route(
+            let mut command_ran = false;
+            let applied = apply_surface_route(
                 inbox(),
                 ZOrderRoute {
                     generation,
@@ -1767,15 +1828,38 @@ fn dispatch_pin_above(generation: u64, display_id: DisplayId, target_wid: u64) {
                     target_wid: Some(target_wid),
                 },
                 || {
+                    command_ran = true;
                     let _: () =
                         objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
+                    if let Some(trace) = &trace {
+                        trace.native_sample("after_order_relative", win);
+                    }
                     if raise_front {
                         let _: () = objc2::msg_send![win, orderFrontRegardless];
+                        if let Some(trace) = &trace {
+                            trace.native_sample("after_order_front", win);
+                        }
                     }
                 },
-            ) {
+            );
+            if let Some(trace) = &trace {
+                trace.outcome(command_ran, applied);
+            }
+            if !applied {
                 wake_renderer();
             }
+        } else if let Some(trace) = &trace {
+            trace.event(
+                "surface_rejected",
+                serde_json::json!({
+                    "host_generation": host.as_ref().map(|host| host.generation),
+                    "reason": "missing_surface_or_stale_generation",
+                }),
+            );
+        }
+        drop(host);
+        if let Some(trace) = trace {
+            trace.observe_presentations();
         }
     }));
 }
