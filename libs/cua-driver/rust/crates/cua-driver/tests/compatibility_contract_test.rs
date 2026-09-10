@@ -288,3 +288,84 @@ fn assert_mcp_contract(driver: &mut RawDriver, fixture: &Value) {
         );
     }
 }
+
+#[test]
+fn slice_a_move_inputs_keep_typed_and_legacy_coordinate_contracts() {
+    use cua_driver_contract::{ActionTarget, MoveCursorInput};
+    use cua_driver_core::{
+        action_target::normalize_action_target, tool_args::parse_typed_projection,
+    };
+
+    for (wire, expected_scope) in [
+        (
+            json!({"x":60,"y":80,"target":{"kind":"window","pid":800,"window_id":11}}),
+            Some("window"),
+        ),
+        (
+            json!({"x":60,"y":80,"target":{"kind":"desktop","display_id":"primary"}}),
+            Some("desktop"),
+        ),
+        (json!({"x":60,"y":80,"scope":"desktop"}), Some("desktop")),
+        (json!({"x":60,"y":80}), None),
+    ] {
+        let input: MoveCursorInput = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!((input.x, input.y), (60.0, 80.0));
+        let mut normalized = serde_json::to_value(&input).unwrap();
+        assert_eq!(
+            serde_json::from_value::<MoveCursorInput>(normalized.clone()).unwrap(),
+            input
+        );
+        normalize_action_target("move_cursor", &mut normalized).unwrap();
+        assert_eq!(normalized["scope"].as_str(), expected_scope);
+        assert_eq!(
+            (normalized["x"].as_f64(), normalized["y"].as_f64()),
+            (Some(60.0), Some(80.0))
+        );
+        if matches!(input.target, Some(ActionTarget::Window { .. })) {
+            assert_eq!(
+                (normalized["pid"].as_i64(), normalized["window_id"].as_u64()),
+                (Some(800), Some(11))
+            );
+        } else {
+            let projected =
+                parse_typed_projection::<MoveCursorInput>("move_cursor", &normalized).unwrap();
+            assert_eq!((projected.x, projected.y), (60.0, 80.0));
+        }
+    }
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn slice_a_move_direct_runtime_keeps_result_schema_and_overlay_refusals() {
+    use cua_driver_contract::{ActionResult, ToolOutput};
+    let mut driver = RawDriver::spawn_explicit_direct().expect("built driver");
+    driver.send(&json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}));
+    driver.recv();
+    driver.send(&json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}));
+    let response = driver.recv();
+    let tool = response["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|tool| tool["name"] == "move_cursor")
+        .unwrap();
+    assert_eq!(
+        tool["outputSchema"],
+        cua_driver_contract::advertised_output_schema(ActionResult::output_schema())
+    );
+    for (index, arguments) in [
+        json!({"x":60,"y":80}),
+        json!({"x":60,"y":80,"target":{"kind":"window","pid":800,"window_id":11}}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        driver.send(&json!({"jsonrpc":"2.0","id":index+3,"method":"tools/call","params":{"name":"move_cursor","arguments":arguments}}));
+        let response = driver.recv();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert_eq!(
+            response["result"]["structuredContent"]["refusal"]["code"], "facility_unavailable",
+            "{response}"
+        );
+    }
+}

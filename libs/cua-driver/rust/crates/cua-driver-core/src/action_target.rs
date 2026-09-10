@@ -143,4 +143,59 @@ mod tests {
             assert!(normalize_action_target("click", &mut args).is_err());
         }
     }
+
+    #[test]
+    fn move_cursor_preserves_coordinates_and_session_during_normalization() {
+        for (target, expected) in [
+            (
+                json!({"kind":"window","pid":800,"window_id":11}),
+                json!({"x":60,"y":80,"session":"move","scope":"window","pid":800,"window_id":11}),
+            ),
+            (
+                json!({"kind":"desktop","display_id":"primary"}),
+                json!({"x":60,"y":80,"session":"move","scope":"desktop"}),
+            ),
+        ] {
+            let mut args = json!({"x":60,"y":80,"session":"move","target":target});
+            normalize_action_target("move_cursor", &mut args).unwrap();
+            assert_eq!(args, expected);
+        }
+        for mut args in [
+            json!({"x":60,"y":80}),
+            json!({"x":60,"y":80,"scope":"desktop"}),
+            json!({"x":60,"y":80,"pid":800,"window_id":11}),
+        ] {
+            let original = args.clone();
+            normalize_action_target("move_cursor", &mut args).unwrap();
+            assert_eq!(args, original);
+        }
+    }
+
+    #[test]
+    fn move_cursor_rejects_ambiguous_or_incomplete_typed_targets() {
+        for mut args in [
+            json!({"target":{"kind":"window","pid":800}}),
+            json!({"target":{"kind":"window","window_id":11}}),
+            json!({"target":{"kind":"window","pid":800,"window_id":0}}),
+            json!({"target":{"kind":"window","pid":800,"window_id":11},"pid":800}),
+            json!({"target":{"kind":"desktop","display_id":"primary"},"scope":"desktop"}),
+            json!({"scope":"desktop","window_id":11}),
+        ] {
+            let refusal = normalize_action_target("move_cursor", &mut args).unwrap_err();
+            assert_eq!(refusal.is_error, Some(true));
+            assert_eq!(
+                refusal.structured_content.unwrap()["code"],
+                "invalid_action_target"
+            );
+        }
+    }
+
+    #[test]
+    fn move_cursor_normalization_preserves_wide_ids_for_platform_validation() {
+        let mut args =
+            json!({"target":{"kind":"window","pid":2147483648_u64,"window_id":4294967307_u64}});
+        normalize_action_target("move_cursor", &mut args).unwrap();
+        assert_eq!(args["pid"], 2147483648_u64);
+        assert_eq!(args["window_id"], 4294967307_u64);
+    }
 }
