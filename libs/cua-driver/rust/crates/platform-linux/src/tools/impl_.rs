@@ -90,26 +90,7 @@ pub fn load_driver_config() -> DriverConfig {
     cfg
 }
 
-pub struct ResizeRegistry {
-    ratios: std::sync::Mutex<std::collections::HashMap<u32, f64>>,
-}
-
-impl ResizeRegistry {
-    pub fn new() -> Self {
-        Self {
-            ratios: std::sync::Mutex::new(Default::default()),
-        }
-    }
-    pub fn set_ratio(&self, pid: u32, ratio: f64) {
-        self.ratios.lock().unwrap().insert(pid, ratio);
-    }
-    pub fn clear_ratio(&self, pid: u32) {
-        self.ratios.lock().unwrap().remove(&pid);
-    }
-    pub fn ratio(&self, pid: u32) -> Option<f64> {
-        self.ratios.lock().unwrap().get(&pid).copied()
-    }
-}
+pub type ResizeRegistry = cua_driver_core::resize_registry::ResizeRegistry<u32, u64>;
 
 /// Per-process zoom context — stores padded crop origin and resize scale from
 /// the most recent `zoom` call so `click(from_zoom=true)` can translate
@@ -1002,13 +983,7 @@ impl Tool for GetWindowStateTool {
 
                 if let Some((b64_opt, file_path, w, h, orig_w)) = shot_opt {
                     if !observation_only {
-                        if let Some(ow) = orig_w {
-                            if w > 0 {
-                                state.resize_registry.set_ratio(pid, ow as f64 / w as f64);
-                            }
-                        } else {
-                            state.resize_registry.clear_ratio(pid);
-                        }
+                        state.resize_registry.record_capture(pid, xid, orig_w, w);
                     }
                     // ax mode + screenshot_out_file writes the PNG to disk and
                     // returns b64=None — never embed the image bytes in that case.
@@ -3659,7 +3634,7 @@ impl Tool for ClickTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(xid)) {
             x *= ratio;
             y *= ratio;
         }
@@ -5721,7 +5696,11 @@ impl Tool for ScrollTool {
                 // Pixel targets use the latest screenshot's coordinate frame.
                 // Apply the same buffer-to-window ratio as click/drag before
                 // positioning either the agent cursor or the input device.
-                let ratio = self.state.resize_registry.ratio(pid).unwrap_or(1.0);
+                let ratio = self
+                    .state
+                    .resize_registry
+                    .ratio(pid, Some(xid))
+                    .unwrap_or(1.0);
                 Some((x * ratio, y * ratio))
             }
             (None, None) => None,
@@ -6248,7 +6227,7 @@ impl Tool for DoubleClickTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(xid)) {
             x *= ratio;
             y *= ratio;
         }
@@ -6487,7 +6466,7 @@ impl Tool for RightClickTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(xid)) {
             x *= ratio;
             y *= ratio;
         }
@@ -6736,7 +6715,7 @@ impl Tool for DragTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(xid)) {
             from_x *= ratio;
             from_y *= ratio;
             to_x *= ratio;
@@ -7199,7 +7178,7 @@ impl Tool for MouseButtonDownTool {
                     ))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(pid, Some(xid)) {
             x *= ratio;
             y *= ratio;
         }
@@ -7345,7 +7324,7 @@ impl Tool for MouseDragTool {
                     .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(hold.pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(hold.pid, Some(hold.xid)) {
             to_x *= ratio;
             to_y *= ratio;
         }
@@ -7551,7 +7530,7 @@ impl Tool for MouseButtonUpTool {
                     .with_structured(mouse_hold_json(&cursor_id, Some(&hold)))
                 }
             }
-        } else if let Some(ratio) = self.state.resize_registry.ratio(hold.pid) {
+        } else if let Some(ratio) = self.state.resize_registry.ratio(hold.pid, Some(hold.xid)) {
             x *= ratio;
             y *= ratio;
         }
@@ -8256,6 +8235,132 @@ pub struct MoveCursorTool {
     state: Arc<ToolState>,
 }
 
+impl MoveCursorTool {
+    async fn invoke_overlay<F, P, V>(&self, args: &Value, resolve: F, publish: P) -> ToolResult
+    where
+        F: FnOnce(u32, u64, f64, f64, f64) -> Result<(f64, f64), ToolResult>,
+        P: FnOnce(String, f64, f64) -> V,
+        V: std::future::Future<Output = ()>,
+    {
+        let resolved = (|| {
+            let (x, y) = (args.require_f64("x")?, args.require_f64("y")?);
+            if !x.is_finite() || !y.is_finite() {
+                return Err(ToolResult::error("cursor coordinates must be finite"));
+            }
+            if args.get("pid").is_none() && args.get("window_id").is_none() {
+                return Ok((x, y));
+            }
+            let pid = args
+                .get("pid")
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+                .filter(|v| *v > 0);
+            let wid = args
+                .get("window_id")
+                .and_then(Value::as_u64)
+                .filter(|v| *v > 0);
+            let (Some(pid), Some(wid)) = (pid, wid) else {
+                return Err(ToolResult::error(
+                    "window target requires a positive 32-bit PID and window_id",
+                ));
+            };
+            let ratio = self
+                .state
+                .resize_registry
+                .ratio(pid, Some(wid))
+                .unwrap_or(1.0);
+            if !ratio.is_finite() || ratio <= 0.0 {
+                return Err(ToolResult::error(
+                    "screenshot resize ratio must be finite and positive",
+                ));
+            }
+            let point = resolve(pid, wid, x, y, ratio)?;
+            if !point.0.is_finite() || !point.1.is_finite() {
+                return Err(ToolResult::error("window cursor target is not finite"));
+            }
+            Ok(point)
+        })();
+        let (x, y) = match resolved {
+            Ok(point) => point,
+            Err(error) => return error,
+        };
+        let key = resolve_cursor_key(args);
+        self.state.cursor_registry.set_enabled(&key, true);
+        self.state.cursor_registry.update_position(&key, x, y);
+        publish(key.clone(), x, y).await;
+        ToolResult::text(format!(
+            "Agent cursor '{key}' moved to ({x:.1}, {y:.1}); the user pointer was unchanged."
+        ))
+    }
+}
+
+fn checked_x11_point(
+    point: (f64, f64),
+    ratio: f64,
+    geometry: Option<(i32, i32, u32, u32, bool)>,
+) -> Result<(f64, f64), ToolResult> {
+    let (x, y, width, height, same_screen) = geometry
+        .ok_or_else(|| window_move_refusal("X11 window geometry or translation is unavailable"))?;
+    if width == 0 || height == 0 || !same_screen {
+        return Err(window_move_refusal(
+            "X11 requires positive live geometry and a same-screen translation",
+        ));
+    }
+    let point =
+        cua_driver_core::geometry::screenshot_to_screen(point, ratio, 1.0, (x as f64, y as f64));
+    if !ratio.is_finite() || ratio <= 0.0 || !point.0.is_finite() || !point.1.is_finite() {
+        return Err(window_move_refusal("X11 cursor geometry is not finite"));
+    }
+    Ok(point)
+}
+
+fn window_move_refusal(detail: impl Into<String>) -> ToolResult {
+    let detail = detail.into();
+    ToolResult::error(format!("background_unavailable: {detail}")).with_structured(json!({
+        "code":"background_unavailable","reason":"unsupported_operation","effect":"refused","detail":detail
+    }))
+}
+
+fn require_wayland_overlay(point: (f64, f64), available: bool) -> Result<(f64, f64), ToolResult> {
+    if available {
+        Ok(point)
+    } else {
+        Err(window_move_refusal("native Wayland overlay surface is unavailable: requires layer-shell or the GNOME Shell cursor helper"))
+    }
+}
+
+fn try_window_local_to_screen(
+    pid: u32,
+    xid: u64,
+    x: f64,
+    y: f64,
+    ratio: f64,
+) -> Result<(f64, f64), ToolResult> {
+    use x11rb::{connection::Connection, protocol::xproto::ConnectionExt};
+    if !crate::x11::window_belongs_to_pid(xid, pid) {
+        return Err(window_move_refusal(
+            "X11 window is gone or belongs to another PID",
+        ));
+    }
+    let geometry = (|| -> anyhow::Result<_> {
+        let (conn, screen_num) = x11rb::rust_connection::RustConnection::connect(None)?;
+        let wid = u32::try_from(xid)?;
+        let geometry = conn.get_geometry(wid)?.reply()?;
+        let reply = conn
+            .translate_coordinates(wid, conn.setup().roots[screen_num].root, 0, 0)?
+            .reply()?;
+        Ok((
+            reply.dst_x as i32,
+            reply.dst_y as i32,
+            geometry.width as u32,
+            geometry.height as u32,
+            reply.same_screen,
+        ))
+    })()
+    .map_err(|error| window_move_refusal(format!("X11 live geometry lookup failed: {error}")))?;
+    checked_x11_point((x, y), ratio, Some(geometry))
+}
+
 static MCURSOR_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -8276,7 +8381,7 @@ impl Tool for MoveCursorTool {
     fn def(&self) -> &ToolDef {
         MCURSOR_DEF.get_or_init(|| ToolDef {
             name: "move_cursor".into(),
-            description: "Move the synthetic agent cursor without changing the user's pointer. Only an explicit scope=desktop request moves the real OS pointer in get_desktop_state coordinates.".into(),
+            description: "Move the synthetic agent cursor using exact-window get_window_state screenshot pixels. Legacy untargeted moves use screen points. Native Wayland refuses when exact geometry, capture scale, or an overlay surface is unavailable. Only explicit scope=desktop moves the real OS pointer in get_desktop_state coordinates.".into(),
             input_schema: json!({"type":"object","required":["x","y"],"properties":{
                 "x":{"type":"number"},"y":{"type":"number"},"session": cua_driver_core::tool_schema::session_schema(),"cursor_id":{"type":"string"},"scope":{"type":"string","enum":["window","desktop"],"default":"window"}
             },"additionalProperties":false}),
@@ -8284,7 +8389,6 @@ impl Tool for MoveCursorTool {
         })
     }
     async fn invoke(&self, args: Value) -> ToolResult {
-        use cua_driver_core::tool_args::ArgsExt;
         if cursor_control_scope(&args) == CursorControlScope::Desktop {
             let input = match parse_typed_projection::<MoveCursorInput>("move_cursor", &args) {
                 Ok(input) => input,
@@ -8319,18 +8423,23 @@ impl Tool for MoveCursorTool {
                 Err(error) => ToolResult::error(format!("Task error: {error}")),
             };
         }
-        let x = args.f64_or("x", 0.0);
-        let y = args.f64_or("y", 0.0);
-        let cursor_id = resolve_cursor_key(&args);
-        // End pointing upper-left (45°) — matches Swift's
-        // `AgentCursor.animateAndWait(endAngleDegrees: 45)` convention so the
-        // overlay arrow settles to the natural macOS-style pose.
-        // Use the acknowledged animation path so a first-ever move seeds and
-        // displays the session cursor just as reliably as a coordinate click.
-        reveal_pointer_action_for(&self.state, &cursor_id, x, y, false).await;
-        ToolResult::text(format!(
-            "Agent cursor '{cursor_id}' moved to ({x:.1}, {y:.1}); the user pointer was unchanged."
-        ))
+        self.invoke_overlay(
+            &args,
+            |pid, wid, x, y, ratio| {
+                if crate::wayland::is_wayland() {
+                    let point = crate::wayland::try_window_local_to_output(pid, wid, x, y, ratio)
+                        .map_err(window_move_refusal)?;
+                    require_wayland_overlay(
+                        point,
+                        crate::overlay::native_window_move_overlay_available(),
+                    )
+                } else {
+                    try_window_local_to_screen(pid, wid, x, y, ratio)
+                }
+            },
+            |key, x, y| async move { overlay_glide_to_for(&key, x, y).await },
+        )
+        .await
     }
 }
 
@@ -8489,7 +8598,9 @@ impl Tool for SetAgentCursorThemeTool {
     }
 }
 
-pub struct GetAgentCursorStateV2Tool;
+pub struct GetAgentCursorStateV2Tool {
+    cursor_registry: Arc<CursorRegistry>,
+}
 
 static CURSOR_STATE_V2_DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
@@ -8501,6 +8612,11 @@ impl Tool for GetAgentCursorStateV2Tool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         let session = resolve_cursor_key(&args);
+        let position = self
+            .cursor_registry
+            .get(&session)
+            .and_then(|state| state.x.zip(state.y))
+            .map(|(x, y)| json!({"x":x,"y":y}));
         let enabled = crate::overlay::is_enabled_for(&session);
         let motion = crate::overlay::current_motion_for(&session);
         let (theme_id, version, profile, fallback, visual) =
@@ -8524,7 +8640,7 @@ impl Tool for GetAgentCursorStateV2Tool {
             json!({
                 "session":session,
                 "enabled":enabled,
-                "position":null,
+                "position":position,
                 "theme":{
                     "id":theme_id,
                     "version":version,
@@ -9614,7 +9730,7 @@ pub fn build_registry_with_provider(
                     // translating to the recording's full-output image.
                     if args.bool_or("from_zoom", false) {
                         (x, y) = state.zoom_registry.get(pid)?.zoom_to_window(x, y);
-                    } else if let Some(ratio) = state.resize_registry.ratio(pid) {
+                    } else if let Some(ratio) = state.resize_registry.ratio(pid, window_id) {
                         x *= ratio;
                         y *= ratio;
                     }
@@ -9808,7 +9924,9 @@ pub fn build_registry_with_provider(
         state: state.clone(),
     }));
     r.register(Box::new(SetAgentCursorMotionV2Tool));
-    r.register(Box::new(GetAgentCursorStateV2Tool));
+    r.register(Box::new(GetAgentCursorStateV2Tool {
+        cursor_registry: state.cursor_registry.clone(),
+    }));
     r.register(Box::new(SetAgentCursorThemeTool {
         state: state.clone(),
     }));
@@ -10074,5 +10192,154 @@ mod desktop_capture_frame_tests {
         let error = normalize_desktop_capture_for_action_frame(png(3200, 2000), 1600, 1200)
             .expect_err("nonuniform mapping must fail closed");
         assert!(error.to_string().contains("cannot be mapped uniformly"));
+    }
+}
+
+#[cfg(test)]
+mod resize_registry_tests {
+    use super::*;
+    #[test]
+    fn sibling_capture_does_not_replace_first_window() {
+        let registry = ResizeRegistry::new();
+        registry.record_capture(10, 101, Some(1200), 600);
+        registry.record_capture(10, 102, Some(900), 600);
+        assert_eq!(registry.ratio(10, Some(101)), Some(2.0));
+        assert_eq!(registry.ratio(10, Some(102)), Some(1.5));
+        assert_eq!(registry.ratio(20, Some(101)), None);
+        assert_eq!(registry.ratio(10, Some(103)), None);
+        assert_eq!(registry.ratio(10, None), None);
+        registry.record_capture(10, 102, None, 600);
+        assert_eq!(registry.ratio(10, Some(102)), None);
+        assert_eq!(registry.ratio(10, None), None);
+        registry.record_capture(10, 101, Some(1800), 600);
+        assert_eq!(registry.ratio(10, Some(101)), Some(3.0));
+    }
+}
+
+#[cfg(test)]
+mod move_cursor_geometry_tests {
+    use super::*;
+    use std::cell::Cell;
+    #[tokio::test]
+    async fn x11_move_retains_fractional_coordinates_and_resolves_moved_windows() {
+        let tool = MoveCursorTool {
+            state: ToolState::new(),
+        };
+        tool.state
+            .resize_registry
+            .record_capture(10, 101, Some(1200), 600);
+        tool.state
+            .resize_registry
+            .record_capture(10, 102, Some(900), 600);
+        for (wid, origin, want) in [
+            (101, (100, 200), (160.5, 280.5)),
+            (102, (100, 200), (145.375, 260.375)),
+            (101, (-1000, -500), (-939.5, -419.5)),
+        ] {
+            let visual = Cell::new(None);
+            let result = tool
+                .invoke_overlay(
+                    &json!({"pid":10,"window_id":wid,"x":30.25,"y":40.25,"_session_id":"slice-a"}),
+                    |pid, id, x, y, ratio| {
+                        assert_eq!((pid, id), (10, wid));
+                        checked_x11_point((x, y), ratio, Some((origin.0, origin.1, 600, 400, true)))
+                    },
+                    |_, x, y| {
+                        visual.set(Some((x, y)));
+                        async {}
+                    },
+                )
+                .await;
+            assert_ne!(result.is_error, Some(true));
+            assert_eq!(visual.get(), Some(want));
+            let state = tool.state.cursor_registry.get("slice-a").unwrap();
+            assert_eq!((state.x, state.y), (Some(want.0), Some(want.1)));
+        }
+    }
+
+    #[tokio::test]
+    async fn every_geometry_refusal_preserves_registry_and_visuals() {
+        let tool = MoveCursorTool {
+            state: ToolState::new(),
+        };
+        tool.state
+            .cursor_registry
+            .update_position("existing", 7.0, 9.0);
+        tool.state.cursor_registry.set_enabled("existing", false);
+        for failure in 0..8 {
+            for key in ["existing", "absent"] {
+                let visual = Cell::new(0);
+                let result = tool
+                    .invoke_overlay(
+                        &json!({"pid":10,"window_id":101,"x":30.25,"y":40.25,"_session_id":key}),
+                        |_, _, x, y, ratio| match failure {
+                            0 => checked_x11_point((x, y), ratio, None),
+                            1 => checked_x11_point((x, y), ratio, Some((100, 200, 0, 400, true))),
+                            2 => {
+                                checked_x11_point((x, y), ratio, Some((100, 200, 600, 400, false)))
+                            }
+                            3 => crate::wayland::checked_window_point(
+                                (x, y),
+                                ratio,
+                                None,
+                                true,
+                                Some(1.0),
+                            )
+                            .map_err(window_move_refusal),
+                            4 => crate::wayland::checked_window_point(
+                                (x, y),
+                                ratio,
+                                Some((100, 200, 600, 400)),
+                                true,
+                                None,
+                            )
+                            .map_err(window_move_refusal),
+                            5 => crate::wayland::checked_window_point(
+                                (x, y),
+                                ratio,
+                                Some((100, 200, 600, 400)),
+                                false,
+                                Some(1.0),
+                            )
+                            .map_err(window_move_refusal),
+                            6 => require_wayland_overlay((160.5, 280.5), false),
+                            _ => Err(window_move_refusal("window owner mismatch")),
+                        },
+                        |_, _, _| {
+                            visual.set(visual.get() + 1);
+                            async {}
+                        },
+                    )
+                    .await;
+                assert_eq!(result.is_error, Some(true));
+                assert_eq!(visual.get(), 0);
+                let body = result.structured_content.as_ref().unwrap();
+                assert_eq!(body["code"], "background_unavailable");
+                assert_eq!(body["reason"], "unsupported_operation");
+                assert_eq!(body["effect"], "refused");
+                assert!(tool.state.cursor_registry.get("absent").is_none());
+                let state = tool.state.cursor_registry.get("existing").unwrap();
+                assert_eq!((state.x, state.y), (Some(7.0), Some(9.0)));
+                assert!(!state.config.enabled);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn legacy_untargeted_move_retains_screen_coordinates() {
+        let tool = MoveCursorTool {
+            state: ToolState::new(),
+        };
+        let result = tool
+            .invoke_overlay(
+                &json!({"x":-30.25,"y":40.25}),
+                |_, _, _, _, _| panic!("legacy geometry lookup"),
+                |_, x, y| {
+                    assert_eq!((x, y), (-30.25, 40.25));
+                    async {}
+                },
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true));
     }
 }

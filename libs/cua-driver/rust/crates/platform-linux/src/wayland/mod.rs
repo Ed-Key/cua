@@ -1627,6 +1627,76 @@ pub fn window_local_to_output(window_id: u64, x: i32, y: i32) -> (i32, i32) {
         .unwrap_or((x, y))
 }
 
+pub(crate) fn checked_window_point(
+    point: (f64, f64),
+    ratio: f64,
+    geometry: Option<(i32, i32, u32, u32)>,
+    exact_identity: bool,
+    capture_scale: Option<f64>,
+) -> Result<(f64, f64), &'static str> {
+    if !exact_identity {
+        return Err(
+            "native Wayland exact window identity is unproven; PID/title matching is insufficient",
+        );
+    }
+    let (x, y, width, height) = geometry.ok_or("native Wayland window geometry is missing")?;
+    if width == 0 || height == 0 {
+        return Err("native Wayland window geometry is empty");
+    }
+    let scale = capture_scale
+        .ok_or("native Wayland capture-pixel to compositor-coordinate scale is unproven")?;
+    if !scale.is_finite() || scale <= 0.0 || !ratio.is_finite() || ratio <= 0.0 {
+        return Err("native Wayland capture and resize scales must be finite and positive");
+    }
+    let point =
+        cua_driver_core::geometry::screenshot_to_screen(point, ratio, scale, (x as f64, y as f64));
+    if !point.0.is_finite() || !point.1.is_finite() {
+        return Err("native Wayland cursor target is not finite");
+    }
+    Ok(point)
+}
+
+/// Exact native geometry only. Never use PID/title heuristics or X11 fallback.
+pub fn try_window_local_to_output(
+    pid: u32,
+    window_id: u64,
+    x: f64,
+    y: f64,
+    ratio: f64,
+) -> Result<(f64, f64), &'static str> {
+    if hyprland::is_session() {
+        let window = hyprland::window_for_address(window_id)
+            .ok_or("Hyprland exact window address has no live geometry")?;
+        if window.pid != pid {
+            return Err("Hyprland exact window address belongs to another PID");
+        }
+        // hyprland::capture normalizes every exported buffer to logical window
+        // dimensions before GetWindowState applies max_image_dimension.
+        return checked_window_point(
+            (x, y),
+            ratio,
+            Some((window.x, window.y, window.width, window.height)),
+            true,
+            Some(1.0),
+        );
+    }
+    if let Some(window) = sway_ipc::window_for_id(window_id) {
+        if window.pid != pid {
+            return Err("Sway exact window ID belongs to another PID");
+        }
+        // The output-crop capture path has no attested buffer scale or output
+        // identity. Tree geometry alone cannot prove screenshot pixel units.
+        return checked_window_point(
+            (x, y),
+            ratio,
+            Some((window.x, window.y, window.width, window.height)),
+            true,
+            None,
+        );
+    }
+    Err("native Wayland exact window geometry and capture scale are unavailable; requires an exact Hyprland address or Sway ID")
+}
+
 /// Resolve geometry through stable title/app identity when a foreign-toplevel
 /// object ID came from an earlier Wayland connection. Protocol object IDs are
 /// connection-local, so direct equality is only a fast path.
@@ -3482,6 +3552,53 @@ const _BTN_LEFT_ALIAS: u32 = BTN_LEFT;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slice_a_known_geometry_requires_proven_scale_and_identity() {
+        assert_eq!(
+            checked_window_point(
+                (30.25, 40.25),
+                2.0,
+                Some((-100, 200, 600, 400)),
+                true,
+                Some(1.0)
+            )
+            .unwrap(),
+            (-39.5, 280.5)
+        );
+        assert_eq!(
+            checked_window_point(
+                (30.25, 40.25),
+                2.0,
+                Some((-100, 200, 600, 400)),
+                true,
+                Some(2.0)
+            )
+            .unwrap(),
+            (-69.75, 240.25)
+        );
+    }
+
+    #[test]
+    fn slice_a_missing_geometry_never_returns_the_input_point() {
+        assert!(checked_window_point((30.0, 40.0), 1.0, None, true, Some(1.0)).is_err());
+        assert!(
+            checked_window_point((30.0, 40.0), 1.0, Some((100, 200, 600, 400)), true, None)
+                .is_err()
+        );
+        assert!(checked_window_point(
+            (30.0, 40.0),
+            1.0,
+            Some((100, 200, 600, 400)),
+            false,
+            Some(1.0)
+        )
+        .is_err());
+        assert!(
+            checked_window_point((30.0, 40.0), 1.0, Some((100, 200, 0, 400)), true, Some(1.0))
+                .is_err()
+        );
+    }
 
     fn window(xid: u64, pid: Option<u32>, title: &str) -> WindowInfo {
         WindowInfo {

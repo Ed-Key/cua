@@ -548,3 +548,43 @@ When adding a new scenario:
 
 The goal is one understandable Rust E2E model across platforms, with
 platform-specific harnesses where the OS genuinely differs.
+
+### Focused exact-window cursor geometry (Slice A)
+
+Run `harness_gtk3_test slice_a_linux_window_move` for the focused Linux case.
+On X11 it compares fractional screenshot targets against independent
+`xwininfo` geometry before and after moving the fixture window, reverses the
+capture downscale, and checks the real pointer and focus. The checked move
+requires a live XID owned by the requested PID, positive dimensions, and a
+same-screen XTranslateCoordinates reply. Desktop and legacy untargeted moves
+retain their existing coordinate conventions.
+
+Native Wayland support has separate geometry and overlay requirements:
+
+- Hyprland resolves the exact address and PID. Its toplevel capture already
+  normalizes exported pixels to logical window dimensions, so the move uses
+  capture scale 1 after reversing screenshot downscaling. This does not infer
+  scale from a display mode or from a title match.
+- Sway resolves an exact tree ID, but the current output-crop capture does not
+  attest the buffer scale and output identity. Exact-window cursor moves
+  refuse with a detail naming the unproven capture scale.
+- Other compositor paths, including foreign-toplevel PID/title matching,
+  do not establish this exact window transform. They refuse with a detail
+  naming the missing exact geometry and capture scale. Native Wayland moves
+  never consult X11 geometry as a fallback.
+- Even when geometry is proven, a native overlay requires layer-shell or the
+  GNOME Shell cursor helper. Missing overlay support is reported separately
+  from missing geometry. No real-pointer injection substitutes for an overlay.
+
+These limitations use `code: background_unavailable`,
+`reason: unsupported_operation`, and `effect: refused`, before cursor registry
+or visual updates. Pure tests cover proven 1x and 2x transforms, missing scale,
+missing geometry, heuristic identity, and unchanged state on refusal. Those
+unit results do not certify a native compositor runtime. Run the selected GTK
+case on the actual compositor to collect placement or explicit refusal evidence.
+
+The Windows focused case is `agent_cursor_windows_test
+slice_a_windows_window_move`. It independently reads DWM bounds and window DPI,
+checks the downscaled screenshot target numerically, and checks pointer and
+focus. Windows target compilation and host execution of the pure geometry
+module do not replace this interactive desktop test.
