@@ -594,7 +594,12 @@ module do not replace this interactive desktop test.
 These ignored AppKit rows support the local quick-approach policy. They are not
 full-matrix or cross-platform certification. With the overlay enabled, native
 Click-family delivery intentionally waits for target-frame acknowledgement,
-with an approximate 80 to 140 ms approach and a bounded 250 ms admission wait.
+with a desired 80 to 140 ms glide and up to 1000 ms for genuine presentation
+confirmation. It proceeds immediately when acknowledged, without waiting out
+the budget or waiting for the pulse. Observed travel duration is descriptive,
+not an exact wall-clock acceptance range. The 64 ms stale-frame limit and
+post-apply confirmation remain separate requirements; a larger admission budget
+does not make an old frame fresh.
 The former under-5-percent enabled/disabled latency gate is obsolete. Core
 Animation submission does not guarantee physical scanout or visibility through
 other windows. Earlier debug clips and asynchronous-playback clips remain
@@ -816,8 +821,9 @@ at least 300 ms of absent arrow/ring, entirely after its recorded disable plus
 
 Numeric conversion and registry errors allow at most one screen unit per axis;
 painted tip and ring centers allow two native pixels. First-click verification
-requires a near-target first appearance and samples consistent with approximate
-80 to 140 ms travel and a 150 ms pulse. It reports frame-bounded intervals,
+requires a near-target first appearance, actual intermediate visible travel,
+and samples consistent with the 150 ms pulse. It reports observed travel and
+pulse durations as frame-bounded intervals,
 not exact renderer timestamps. A counter change before arrival fails. A change
 in the same frame as arrival, unreadable counter, insufficient travel samples,
 a gap over 40 ms, no intermediate tip distinct from both endpoints by more than

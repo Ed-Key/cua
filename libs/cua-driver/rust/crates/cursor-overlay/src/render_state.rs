@@ -411,8 +411,9 @@ impl RenderStateCore {
                         heading,
                         self.motion.turn_radius,
                     ));
-                    // A healthy first drain starts visible travel now. The adapter's
-                    // independent 250 ms deadline still bounds admission.
+                    // A promptly drained intent starts visible travel now; an
+                    // older intent ages its original schedule. The adapter owns
+                    // the separate presentation-confirmation deadline.
                     let start = if quick_approach
                         && now.saturating_duration_since(event.timestamp)
                             < Duration::from_millis(250)

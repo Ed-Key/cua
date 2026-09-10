@@ -279,9 +279,14 @@ impl DeliveryReceipt {
             .clone();
         let guard = Arc::new(ApproachGuard { sink, handle });
         let receiver = guard.sink.register_target(&guard.handle.key, &event)?;
-        tokio::time::timeout(std::time::Duration::from_millis(250), receiver)
+        tokio::time::timeout(super::CLICK_PRESENTATION_TIMEOUT, receiver)
             .await
-            .map_err(|_| "renderer did not present the click target within 250 ms")?
+            .map_err(|_| {
+                format!(
+                    "renderer did not present the click target within {} ms",
+                    super::CLICK_PRESENTATION_TIMEOUT.as_millis()
+                )
+            })?
             .map_err(|_| "click approach cancelled, superseded, or surface invalidated")??;
         tracing::debug!(target: "cua_cursor_approach", stage = "ack_received", id = ?event.id,
             age_ms = event.timestamp.elapsed().as_secs_f64() * 1000.0,

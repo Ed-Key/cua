@@ -453,15 +453,15 @@ pub fn validate_playback(v: &VisualEvidence, target: [f64; 2]) -> Result<Playbac
     });
     let sampled_motion =
         arrival >= first + 2 && intermediate && distance > 2.0 / v.scale && gap <= 0.040;
-    let timing_consistent = travel[1] >= 80.0
-        && travel[0] <= 140.0
-        && pulse_interval[0] <= 150.0
-        && pulse_interval[1] >= 150.0;
-    let established = ordering && sampled_motion && timing_consistent;
+    // Desired glide configuration is not a wall-clock acceptance range.
+    // Report the observed travel interval; keep sampled motion/order and the
+    // independent contact-pulse evidence requirements.
+    let pulse_timing_consistent = pulse_interval[0] <= 150.0 && pulse_interval[1] >= 150.0;
+    let established = ordering && sampled_motion && pulse_timing_consistent;
     Ok(PlaybackEvidence {
         ordering: if established { OrderingEvidence::ArrivalBeforeCounter } else { OrderingEvidence::Indeterminate },
         reason: if established { "Arrow at target is visible in an earlier captured frame than the counter change. This is sampled UI ordering, not a physical scanout or native receipt timestamp." }
-            else { "Insufficient sampled ordering or timing: same-frame change, unreadable counter, missing travel samples, or timing intervals outside the approximate policy. Native acceptance remains pending." }.into(),
+            else { "Insufficient sampled ordering or timing: same-frame change, unreadable counter, missing travel samples, or inconsistent pulse timing. Native acceptance remains pending." }.into(),
         first_visible_frame:v.frames[first].index,arrival_frame:v.frames[arrival].index,
         counter_change_frame:change.map(|i| v.frames[i].index),measured_max_frame_gap_ms:gap*1000.0,
         travel_interval_ms:travel,pulse_interval_ms:pulse_interval,
@@ -691,6 +691,29 @@ mod slice_a_evidence_tests {
         let result =
             serde_json::to_value(validate_playback(&parsed, [950.0, 220.0]).unwrap()).unwrap();
         assert_eq!(result["ordering"], "arrival_before_counter");
+    }
+
+    #[test]
+    fn presentation_jitter_travel_duration_is_descriptive_with_visible_ordering() {
+        for frame_seconds in [0.005, 0.030] {
+            let mut v = clip();
+            // Only the approach/counter prefix is retimed. Preserve pulse
+            // samples and all original synthetic geometry and ordering.
+            for f in &mut v.frames {
+                f.pts = if f.index <= 14 {
+                    f.index as f64 * frame_seconds
+                } else {
+                    14.0 * frame_seconds + (f.index - 14) as f64 * 0.01
+                };
+            }
+            let result = validate_playback(&v, [950.0, 220.0]).unwrap();
+            assert!(matches!(
+                result.ordering,
+                OrderingEvidence::ArrivalBeforeCounter
+            ));
+            assert!((result.travel_interval_ms[0] - 9.0 * frame_seconds * 1000.0).abs() < 1e-6);
+            assert!((result.travel_interval_ms[1] - 11.0 * frame_seconds * 1000.0).abs() < 1e-6);
+        }
     }
 
     #[test]

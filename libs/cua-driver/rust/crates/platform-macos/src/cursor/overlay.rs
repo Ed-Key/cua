@@ -169,7 +169,7 @@ impl OverlayInbox {
                 presented: None,
                 timing: ApproachTiming::new(),
                 surface_generation,
-                deadline: tokio::time::Instant::now() + Duration::from_millis(250),
+                deadline: tokio::time::Instant::now() + crate::cursor::CLICK_PRESENTATION_TIMEOUT,
             },
         );
         Ok(receiver)
@@ -3568,6 +3568,113 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn presentation_jitter_fresh_ack_before_one_second_dispatches_immediately() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for (ack_ms, reduced) in [(20, true), (300, false), (999, false)] {
+            let sink = QuickApproachSink::new(false, reduced);
+            let tool =
+                ClickTool::new(Arc::new(ToolState::default())).with_visual_sink(sink.clone());
+            let receipt = DeliveryReceipt::default();
+            let dispatches = AtomicUsize::new(0);
+            let call = tool.dispatch_resolved(
+                "one",
+                point(80.0, 30.0, Some(42)),
+                &receipt,
+                async { None },
+                async {
+                    receipt
+                        .dispatch_checked(|| {
+                            dispatches.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .unwrap();
+                    cua_driver_core::protocol::ToolResult::text("accepted")
+                },
+            );
+            tokio::pin!(call);
+            let start = tokio::time::Instant::now();
+            assert!(futures_util::poll!(&mut call).is_pending());
+            if !reduced {
+                assert!(
+                    sink.frame(sink.start()).is_empty(),
+                    "glide cannot acknowledge at its starting point"
+                );
+            }
+            tokio::time::advance(Duration::from_millis(ack_ms)).await;
+            assert!(
+                futures_util::poll!(&mut call).is_pending(),
+                "expired before fresh ack at {ack_ms} ms"
+            );
+            assert_eq!(dispatches.load(Ordering::SeqCst), 0);
+            // Fresh rendering at this observation time, not an old frame kept
+            // alive by the larger admission budget. Native submission is explicit.
+            let frames = sink.frame(sink.start() + Duration::from_millis(ack_ms));
+            assert_eq!(frames.len(), 1);
+            sink.present(&frames, 1, 1);
+            let std::task::Poll::Ready(result) = futures_util::poll!(&mut call) else {
+                panic!("acknowledged input waited unnecessarily")
+            };
+            assert_ne!(result.is_error, Some(true));
+            assert_eq!(dispatches.load(Ordering::SeqCst), 1);
+            assert!(receipt.was_accepted());
+            assert_eq!(sink.pending(), 0);
+            assert_eq!(start.elapsed(), Duration::from_millis(ack_ms));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn presentation_jitter_stall_and_expired_ack_refuse_at_one_second() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        use std::sync::Arc;
+        for expired_ack in [false, true] {
+            let sink = QuickApproachSink::new(false, true);
+            let tool =
+                ClickTool::new(Arc::new(ToolState::default())).with_visual_sink(sink.clone());
+            let receipt = DeliveryReceipt::default();
+            let call = tool.dispatch_resolved(
+                "one",
+                point(80.0, 30.0, Some(42)),
+                &receipt,
+                async { panic!("unconfirmed or expired target dispatched") },
+                async { unreachable!() },
+            );
+            tokio::pin!(call);
+            let start = tokio::time::Instant::now();
+            assert!(futures_util::poll!(&mut call).is_pending());
+            tokio::time::advance(Duration::from_millis(999)).await;
+            assert!(futures_util::poll!(&mut call).is_pending());
+            assert_eq!(sink.pending(), 1);
+            tokio::time::advance(Duration::from_millis(1)).await;
+            if expired_ack {
+                let frames = sink.frame(sink.start() + Duration::from_millis(1000));
+                sink.present(&frames, 1, 1);
+                assert!(sink.inbox.lock().unwrap().approaches["one"]
+                    .presented
+                    .is_none());
+            }
+            let std::task::Poll::Ready(result) = futures_util::poll!(&mut call) else {
+                panic!("deadline did not refuse")
+            };
+            assert_eq!(result.is_error, Some(true));
+            assert!(!receipt.was_accepted());
+            assert_eq!(sink.pending(), 0);
+            assert_eq!(start.elapsed(), Duration::from_millis(1000));
+            assert!(sink
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|e| e.phase != cursor_overlay::VisualPhase::Contact));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn quick_approach_timeout_cancel_end_supersede_and_surface_loss_never_dispatch() {
         use crate::cursor::visual::{point, DeliveryReceipt, PointerVisualSink};
         use crate::tools::{ClickTool, ToolState};
@@ -3623,7 +3730,7 @@ mod tests {
             if failure != "timeout" {
                 sink.present(&frames, 1, 1);
             }
-            tokio::time::advance(Duration::from_millis(250)).await;
+            tokio::time::advance(crate::cursor::CLICK_PRESENTATION_TIMEOUT).await;
             let result = call.await;
             assert_eq!(result.is_error, Some(true), "{failure}");
             assert!(!receipt.was_accepted());
@@ -3781,7 +3888,7 @@ mod tests {
             assert!(futures_util::poll!(&mut call).is_pending());
             let frame = sink.frame(sink.start());
             if change == "late_ack" {
-                tokio::time::advance(Duration::from_millis(250)).await;
+                tokio::time::advance(crate::cursor::CLICK_PRESENTATION_TIMEOUT).await;
             }
             sink.present(&frame, 1, 1);
             match change {
@@ -3925,7 +4032,7 @@ mod tests {
         assert!(!render_map_needs_frame_tick(&map));
         assert!(render_frame_tick_needed(&map, &sink.inbox.lock().unwrap()));
         drop(map);
-        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::time::advance(crate::cursor::CLICK_PRESENTATION_TIMEOUT).await;
         assert_eq!(call.await.is_error, Some(true));
         assert!(!receipt.was_accepted());
         assert_eq!(sink.pending(), 0);
@@ -4220,7 +4327,7 @@ mod tests {
         );
         tokio::pin!(call);
         assert!(futures_util::poll!(&mut call).is_pending());
-        tokio::time::advance(Duration::from_millis(250)).await;
+        tokio::time::advance(crate::cursor::CLICK_PRESENTATION_TIMEOUT).await;
         assert_eq!(call.await.is_error, Some(true));
         assert!(!receipt.was_accepted());
         assert!(!inbox()
