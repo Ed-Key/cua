@@ -14,11 +14,35 @@ use super::ToolState;
 
 pub struct RightClickTool {
     state: Arc<ToolState>,
+    visual_sink: Arc<dyn crate::cursor::visual::PointerVisualSink>,
 }
 
 impl RightClickTool {
     pub fn new(state: Arc<ToolState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            visual_sink: Arc::new(crate::cursor::visual::OverlayVisualSink),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_visual_sink(
+        mut self,
+        sink: Arc<dyn crate::cursor::visual::PointerVisualSink>,
+    ) -> Self {
+        self.visual_sink = sink;
+        self
+    }
+    pub(crate) async fn dispatch_resolved(
+        &self,
+        key: &str,
+        target: Option<crate::cursor::visual::ResolvedPointerTarget>,
+        receipt: &crate::cursor::visual::DeliveryReceipt,
+        native: impl std::future::Future<Output = ToolResult>,
+    ) -> ToolResult {
+        super::click::ClickTool::new(self.state.clone())
+            .with_visual_sink(self.visual_sink.clone())
+            .dispatch_resolved(key, target, receipt, async { None }, native)
+            .await
     }
 }
 
@@ -151,6 +175,7 @@ impl Tool for RightClickTool {
                     ))
                 }
             };
+            let element_guard = Arc::new(element_guard);
             let element_ptr = element_guard.as_ptr();
 
             let _mutation_lease = match super::gate_background_window_action(
@@ -165,30 +190,32 @@ impl Tool for RightClickTool {
                 Err(refusal_result) => return refusal_result,
             };
 
-            let registry = self.state.cursor_registry.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                let target = unsafe {
-                    crate::ax::bindings::element_screen_rect(element_ptr as AXUIElementRef)
-                }
-                .and_then(|rect| {
-                    crate::cursor::visual::ResolvedPointerTarget::from_bounds(wid, rect)
-                });
-                let visual = crate::cursor::visual::begin_pointer_action(
-                    &registry,
-                    Arc::new(crate::cursor::visual::OverlayVisualSink),
-                    &cursor_key,
-                    target,
-                    cursor_overlay::CursorAction::Click,
-                );
-                ax_show_menu(element_ptr, idx, pid, wid, &visual, &registry)
+            let bounds_guard = element_guard.clone();
+            let target = tokio::task::spawn_blocking(move || unsafe {
+                crate::ax::bindings::element_screen_rect(bounds_guard.as_ptr() as AXUIElementRef)
             })
-            .await;
-
-            return match result {
-                Ok(Ok(msg)) => ToolResult::text(msg),
-                Ok(Err(e)) => ToolResult::error(format!("Right-click failed: {e}")),
-                Err(e) => ToolResult::error(format!("Task error: {e}")),
+            .await
+            .ok()
+            .flatten()
+            .and_then(|rect| crate::cursor::visual::ResolvedPointerTarget::from_bounds(wid, rect));
+            let visual = Arc::new(crate::cursor::visual::DeliveryReceipt::default());
+            visual.validate_ax_target(pid, wid, element_guard, target);
+            let registry = self.state.cursor_registry.clone();
+            let native = async {
+                let visual = visual.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    ax_show_menu(element_ptr, idx, pid, wid, &visual, &registry)
+                })
+                .await;
+                match result {
+                    Ok(Ok(msg)) => ToolResult::text(msg),
+                    Ok(Err(e)) => ToolResult::error(format!("Click failed: {e}")),
+                    Err(e) => ToolResult::error(format!("Task error: {e}")),
+                }
             };
+            return self
+                .dispatch_resolved(&cursor_key, target, &visual, native)
+                .await;
         }
 
         // ── Pixel path ───────────────────────────────────────────────────────
@@ -202,9 +229,11 @@ impl Tool for RightClickTool {
         // Window-local → screen coordinate translation + win-local logical coords
         // for CGEventSetWindowLocation (shared with click.rs via px_frame, which
         // refuses a window with no live frame).
+        let mut approach_frame = None;
         let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
             match super::px_frame::resolve_or_refuse(wid).await {
                 Ok(frame) => {
+                    approach_frame = Some(frame.bounds.clone());
                     let translated = frame.to_screen(cx, cy);
                     if !delivery_mode.is_foreground()
                         && (translated.2 < 0.0
@@ -246,13 +275,9 @@ impl Tool for RightClickTool {
             None
         };
 
-        let visual = crate::cursor::visual::begin_pointer_action(
-            &self.state.cursor_registry,
-            Arc::new(crate::cursor::visual::OverlayVisualSink),
-            &cursor_key,
-            crate::cursor::visual::point(screen_x, screen_y, window_id),
-            cursor_overlay::CursorAction::Click,
-        );
+        let visual = Arc::new(crate::cursor::visual::DeliveryReceipt::default());
+        visual.validate_pixel_frame(pid, window_id, approach_frame);
+        let target = crate::cursor::visual::point(screen_x, screen_y, window_id);
 
         let mod_suffix = if modifiers.is_empty() {
             String::new()
@@ -261,40 +286,46 @@ impl Tool for RightClickTool {
         };
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let do_it = move || -> anyhow::Result<()> {
-                let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                if let Some(wid) = window_id {
-                    crate::input::mouse::right_click_at_xy_with_window_local(
-                        pid,
-                        screen_x,
-                        screen_y,
-                        win_local_x,
-                        win_local_y,
-                        wid,
-                        &m,
-                    )
-                } else {
-                    crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
+        let native = async {
+            let visual = visual.clone();
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let do_it = move || -> anyhow::Result<()> {
+                    let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+                    if let Some(wid) = window_id {
+                        crate::input::mouse::right_click_at_xy_with_window_local(
+                            pid,
+                            screen_x,
+                            screen_y,
+                            win_local_x,
+                            win_local_y,
+                            wid,
+                            &m,
+                        )
+                    } else {
+                        crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
+                    }
+                };
+                let do_it = || visual.dispatch_checked(do_it);
+                // Foreground rung: brief front → right-click → restore prior frontmost.
+                match (fg, window_id) {
+                    (true, Some(wid)) => {
+                        crate::input::skylight::with_foreground_assist(
+                            pid as libc::pid_t,
+                            wid,
+                            do_it,
+                        )?;
+                        Ok(())
+                    }
+                    _ => do_it(),
                 }
+            })
+            .await;
+            let mode_label = if fg {
+                " (delivery_mode:foreground)"
+            } else {
+                ""
             };
-            let do_it = || visual.dispatch(do_it);
-            // Foreground rung: brief front → right-click → restore prior frontmost.
-            match (fg, window_id) {
-                (true, Some(wid)) => {
-                    crate::input::skylight::with_foreground_assist(pid as libc::pid_t, wid, do_it)?;
-                    Ok(())
-                }
-                _ => do_it(),
-            }
-        })
-        .await;
-        let mode_label = if fg {
-            " (delivery_mode:foreground)"
-        } else {
-            ""
-        };
-        match result {
+            match result {
             Ok(Ok(())) => ToolResult::text(format!("Right-clicked{mod_suffix} at ({screen_x:.1}, {screen_y:.1}){mode_label}."))
                 .with_structured(serde_json::json!({
                     "path": if fg { "cgevent_fg" } else { "cgevent" }, "verified": false, "effect": "unverifiable"
@@ -302,6 +333,9 @@ impl Tool for RightClickTool {
             Ok(Err(e)) => ToolResult::error(format!("Right-click failed: {e}")),
             Err(e)     => ToolResult::error(format!("Task error: {e}")),
         }
+        };
+        self.dispatch_resolved(&cursor_key, target, &visual, native)
+            .await
     }
 }
 
@@ -316,6 +350,7 @@ fn ax_show_menu(
     registry: &crate::cursor::CursorRegistry,
 ) -> anyhow::Result<String> {
     let element = element_ptr as AXUIElementRef;
+    visual.ensure_current()?;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
@@ -332,6 +367,7 @@ fn ax_show_menu(
     // primitive. This makes "right-click element N" land on any element, not
     // just ones with a native context-menu AX action.
     if advertised.iter().any(|a| a == "AXShowMenu") {
+        visual.ensure_current()?;
         let err = unsafe { perform_action(element, "AXShowMenu") };
         if err == kAXErrorSuccess {
             visual.accepted();
@@ -354,7 +390,7 @@ fn ax_show_menu(
         })?;
     let (wx, wy) = crate::windows::window_bounds_by_id(wid)
         .map(|b| (cx - b.x, cy - b.y))
-        .unwrap_or((cx, cy));
+        .ok_or_else(|| anyhow::anyhow!("right-click window frame disappeared before fallback"))?;
     visual.dispatch_at(registry, cx, cy, wid, |cx, cy| {
         crate::input::mouse::right_click_at_xy_with_window_local(pid, cx, cy, wx, wy, wid, &[])
     })?;
@@ -367,6 +403,21 @@ fn ax_show_menu(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn quick_approach_route_never_polls_input_without_target_frame() {
+        let tool = RightClickTool::new(Arc::new(ToolState::default()));
+        let receipt = crate::cursor::visual::DeliveryReceipt::default();
+        let call = tool.dispatch_resolved(
+            "quick-right_click",
+            crate::cursor::visual::point(20.0, 30.0, Some(42)),
+            &receipt,
+            async { panic!("input before target frame") },
+        );
+        tokio::pin!(call);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        assert!(!receipt.was_accepted());
+    }
+
     #[test]
     fn slice_a_fix_native_fallback_rebinds_actual_center_and_drops_stale_bounds() {
         use crate::cursor::visual::{
@@ -408,15 +459,15 @@ mod tests {
                         receipt.accepted();
                     }
                     if failed {
-                        Err("native outcome error")
+                        Err(anyhow::anyhow!("native outcome error"))
                     } else {
                         Ok("delivered")
                     }
                 });
                 assert_eq!(
-                    result,
+                    result.map_err(|error| error.to_string()),
                     if failed {
-                        Err("native outcome error")
+                        Err("native outcome error".to_owned())
                     } else {
                         Ok("delivered")
                     }

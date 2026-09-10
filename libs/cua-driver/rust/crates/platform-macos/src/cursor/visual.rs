@@ -1,4 +1,4 @@
-//! Resolved action visuals published without renderer acknowledgements.
+//! Resolved action visuals and bounded macOS click approach admission.
 
 use cursor_overlay::{CursorAction, OverlayCommand, VisualActionId, VisualEvent, VisualPhase};
 use std::sync::{Arc, Mutex};
@@ -82,6 +82,7 @@ pub(crate) fn emit_action_target(
     handle
 }
 
+#[cfg(test)]
 pub(crate) fn begin_pointer_action(
     registry: &super::CursorRegistry,
     sink: Arc<dyn PointerVisualSink>,
@@ -224,8 +225,151 @@ pub(crate) struct DeliveryReceipt(Mutex<ReceiptState>);
 struct ReceiptState {
     accepted: Option<Instant>,
     visual: Option<(Arc<dyn PointerVisualSink>, PointerVisualHandle)>,
+    approach: Option<std::sync::Weak<ApproachGuard>>,
+    revalidate: Option<Arc<dyn Fn() -> anyhow::Result<()> + Send + Sync>>,
 }
+/// Invocation-owned registration. Dropping a cancelled call removes only its waiter.
+pub(crate) struct ApproachGuard {
+    sink: Arc<dyn PointerVisualSink>,
+    handle: PointerVisualHandle,
+}
+impl Drop for ApproachGuard {
+    fn drop(&mut self) {
+        if let Some(event) = &self.handle.event {
+            self.sink.release_target(&self.handle.key, event);
+        }
+    }
+}
+
+pub(crate) fn approach_refusal(
+    error: impl std::fmt::Display,
+) -> cua_driver_core::protocol::ToolResult {
+    cua_driver_core::protocol::ToolResult::error(format!(
+        "Click approach refused before input: {error}"
+    ))
+    .with_structured(
+        serde_json::json!({"code": "cursor_approach_unavailable", "effect": "refused"}),
+    )
+}
+
 impl DeliveryReceipt {
+    pub(crate) async fn prepare_click(&self) -> Result<Option<Arc<ApproachGuard>>, String> {
+        let (sink, handle) = self
+            .0
+            .lock()
+            .unwrap()
+            .visual
+            .clone()
+            .ok_or("missing click visual")?;
+        if !sink.approach_enabled(&handle.key) {
+            return Ok(None);
+        }
+        if handle.key.is_empty() || cua_driver_core::session::is_session_ended(&handle.key) {
+            return Err("click session is ended or missing".into());
+        }
+        let event = handle
+            .event
+            .as_ref()
+            .filter(|e| e.target.is_some() && e.is_valid())
+            .ok_or("enabled overlay has no trustworthy resolved click target")?
+            .clone();
+        let guard = Arc::new(ApproachGuard { sink, handle });
+        let receiver = guard.sink.register_target(&guard.handle.key, &event)?;
+        tokio::time::timeout(std::time::Duration::from_millis(250), receiver)
+            .await
+            .map_err(|_| "renderer did not present the click target within 250 ms")?
+            .map_err(|_| "click approach cancelled, superseded, or surface invalidated")?;
+        guard.sink.target_current(&guard.handle.key, &event)?;
+        self.0.lock().unwrap().approach = Some(Arc::downgrade(&guard));
+        Ok(Some(guard))
+    }
+
+    /// Retaining the AX object here also owns it inside detached blocking input tasks.
+    pub(crate) fn validate_ax_target(
+        &self,
+        pid: i32,
+        window: u32,
+        element: Arc<crate::ax::cache::RetainedElement>,
+        target: Option<ResolvedPointerTarget>,
+    ) {
+        let window_frame = crate::windows::window_bounds_by_id(window);
+        self.set_revalidation(move || {
+            let expected = target.ok_or_else(|| anyhow::anyhow!("missing AX click target"))?;
+            let ptr = element.as_ptr() as crate::ax::bindings::AXUIElementRef;
+            let live = unsafe { crate::ax::bindings::element_screen_rect(ptr) }
+                .and_then(|rect| ResolvedPointerTarget::from_bounds(window, rect));
+            if live != Some(expected)
+                || unsafe { crate::ax::exact_target::element_window_id(ptr) } != Some(window) {
+                anyhow::bail!("AX click target moved or changed ownership during approach; take a fresh snapshot");
+            }
+            let frame = window_frame.as_ref().ok_or_else(|| anyhow::anyhow!("missing AX click window frame"))?;
+            validate_live_window(pid, window, Some(frame))
+        });
+    }
+
+    pub(crate) fn validate_pixel_frame(
+        &self,
+        pid: i32,
+        window: Option<u32>,
+        bounds: Option<crate::windows::WindowBounds>,
+    ) {
+        if let Some(window) = window {
+            self.set_revalidation(move || {
+                let bounds = bounds
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("missing click window frame"))?;
+                validate_live_window(pid, window, Some(bounds))
+            });
+        }
+    }
+
+    pub(crate) fn set_revalidation(
+        &self,
+        check: impl Fn() -> anyhow::Result<()> + Send + Sync + 'static,
+    ) {
+        self.0.lock().unwrap().revalidate = Some(Arc::new(check));
+    }
+
+    pub(crate) fn ensure_current(&self) -> anyhow::Result<()> {
+        let (approach, revalidate) = {
+            let state = self.0.lock().unwrap();
+            (state.approach.clone(), state.revalidate.clone())
+        };
+        if let Some(weak) = approach {
+            let guard = weak
+                .upgrade()
+                .ok_or_else(|| anyhow::anyhow!("click approach cancelled"))?;
+            if cua_driver_core::session::is_session_ended(&guard.handle.key) {
+                anyhow::bail!("click session ended before input");
+            }
+            guard
+                .sink
+                .target_current(&guard.handle.key, guard.handle.event.as_ref().unwrap())
+                .map_err(anyhow::Error::msg)?;
+            if let Some(check) = revalidate {
+                check()?;
+            }
+            // AX/WindowServer readback can cross a concurrent publication. Check
+            // ownership again after those reads, immediately before the actuator.
+            guard
+                .sink
+                .target_current(&guard.handle.key, guard.handle.event.as_ref().unwrap())
+                .map_err(anyhow::Error::msg)?;
+            if cua_driver_core::session::is_session_ended(&guard.handle.key) {
+                anyhow::bail!("click session ended during target revalidation");
+            }
+        }
+        Ok(())
+    }
+
+    pub(crate) fn dispatch_checked<T>(
+        &self,
+        native: impl FnOnce() -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.ensure_current()?;
+        self.dispatch(native)
+    }
+
     pub(crate) fn attach(&self, sink: Arc<dyn PointerVisualSink>, handle: PointerVisualHandle) {
         let mut state = self.0.lock().unwrap();
         if let Some(timestamp) = state.accepted {
@@ -249,14 +393,26 @@ impl DeliveryReceipt {
     pub(crate) fn was_accepted(&self) -> bool {
         self.0.lock().unwrap().accepted.is_some()
     }
-    pub(crate) fn dispatch_at<T, E>(
+    pub(crate) fn dispatch_at<T>(
         &self,
         registry: &super::CursorRegistry,
         x: f64,
         y: f64,
         window: u32,
-        native: impl FnOnce(f64, f64) -> Result<T, E>,
-    ) -> Result<T, E> {
+        native: impl FnOnce(f64, f64) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        self.ensure_current()?;
+        {
+            let state = self.0.lock().unwrap();
+            if let Some(guard) = state.approach.as_ref().and_then(|weak| weak.upgrade()) {
+                let event = guard.handle.event.as_ref().unwrap();
+                if event.target != Some((x, y)) || event.window != Some(u64::from(window)) {
+                    anyhow::bail!("native fallback target changed after click approach; refusing input, take a fresh snapshot");
+                }
+                drop(state);
+                return self.dispatch_checked(|| native(x, y));
+            }
+        }
         {
             let mut state = self.0.lock().unwrap();
             if let Some((sink, handle)) = state.visual.as_mut() {
@@ -288,7 +444,49 @@ impl DeliveryReceipt {
     }
 }
 
+fn validate_live_window(
+    pid: i32,
+    window: u32,
+    expected: Option<&crate::windows::WindowBounds>,
+) -> anyhow::Result<()> {
+    let windows = crate::windows::visible_windows();
+    let live = windows
+        .iter()
+        .find(|w| {
+            w.window_id == window
+                && w.pid == pid
+                && w.is_on_screen
+                && w.on_current_space != Some(false)
+        })
+        .ok_or_else(|| {
+            anyhow::anyhow!("click window is no longer visible or owned by the target process")
+        })?;
+    if let Some(expected) = expected {
+        let a = &live.bounds;
+        if (a.x, a.y, a.width, a.height)
+            != (expected.x, expected.y, expected.width, expected.height)
+        {
+            anyhow::bail!("click window frame changed during approach; take a fresh snapshot");
+        }
+    }
+    Ok(())
+}
+
 pub(crate) trait PointerVisualSink: Send + Sync {
+    fn approach_enabled(&self, _key: &str) -> bool {
+        true
+    }
+    fn register_target(
+        &self,
+        _key: &str,
+        _event: &VisualEvent,
+    ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+        Err("renderer does not support click target acknowledgement".into())
+    }
+    fn target_current(&self, _key: &str, _event: &VisualEvent) -> Result<(), String> {
+        Err("click target has no current presentation".into())
+    }
+    fn release_target(&self, _key: &str, _event: &VisualEvent) {}
     fn send(&self, key: &str, command: OverlayCommand);
     fn begin(&self, key: &str) -> Option<VisualActionId>;
     fn publish(&self, key: &str, event: VisualEvent);
@@ -316,6 +514,22 @@ impl InvocationVisualSink {
     }
 }
 impl PointerVisualSink for InvocationVisualSink {
+    fn approach_enabled(&self, key: &str) -> bool {
+        self.inner.approach_enabled(key)
+    }
+    fn register_target(
+        &self,
+        key: &str,
+        event: &VisualEvent,
+    ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+        self.inner.register_target(key, event)
+    }
+    fn target_current(&self, key: &str, event: &VisualEvent) -> Result<(), String> {
+        self.inner.target_current(key, event)
+    }
+    fn release_target(&self, key: &str, event: &VisualEvent) {
+        self.inner.release_target(key, event);
+    }
     fn send(&self, key: &str, command: OverlayCommand) {
         self.inner.send(key, command);
     }
@@ -334,6 +548,22 @@ impl PointerVisualSink for InvocationVisualSink {
 
 pub(crate) struct OverlayVisualSink;
 impl PointerVisualSink for OverlayVisualSink {
+    fn approach_enabled(&self, key: &str) -> bool {
+        super::overlay::approach_enabled(key)
+    }
+    fn register_target(
+        &self,
+        key: &str,
+        event: &VisualEvent,
+    ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+        super::overlay::register_target(key, event)
+    }
+    fn target_current(&self, key: &str, event: &VisualEvent) -> Result<(), String> {
+        super::overlay::target_current(key, event)
+    }
+    fn release_target(&self, key: &str, event: &VisualEvent) {
+        super::overlay::release_target(key, event);
+    }
     fn send(&self, key: &str, command: OverlayCommand) {
         super::overlay::send_command(key.into(), command);
     }
@@ -363,6 +593,10 @@ pub(crate) mod test_support {
     pub struct RecordingSink(pub Mutex<Vec<Event>>, pub Mutex<Vec<VisualEvent>>);
 
     impl PointerVisualSink for RecordingSink {
+        // Legacy event-only fixtures explicitly model an overlay-disabled caller.
+        fn approach_enabled(&self, _key: &str) -> bool {
+            false
+        }
         fn send(&self, key: &str, command: OverlayCommand) {
             let event = match command {
                 OverlayCommand::PinAbove(wid) => Event::Pin(key.into(), wid),

@@ -14,6 +14,7 @@ use super::ToolState;
 
 pub struct DoubleClickTool {
     state: Arc<ToolState>,
+    visual_sink: Arc<dyn crate::cursor::visual::PointerVisualSink>,
 }
 
 fn background_action_for_element(
@@ -28,7 +29,30 @@ fn background_action_for_element(
 
 impl DoubleClickTool {
     pub fn new(state: Arc<ToolState>) -> Self {
-        Self { state }
+        Self {
+            state,
+            visual_sink: Arc::new(crate::cursor::visual::OverlayVisualSink),
+        }
+    }
+    #[cfg(test)]
+    pub(crate) fn with_visual_sink(
+        mut self,
+        sink: Arc<dyn crate::cursor::visual::PointerVisualSink>,
+    ) -> Self {
+        self.visual_sink = sink;
+        self
+    }
+    pub(crate) async fn dispatch_resolved(
+        &self,
+        key: &str,
+        target: Option<crate::cursor::visual::ResolvedPointerTarget>,
+        receipt: &crate::cursor::visual::DeliveryReceipt,
+        native: impl std::future::Future<Output = ToolResult>,
+    ) -> ToolResult {
+        super::click::ClickTool::new(self.state.clone())
+            .with_visual_sink(self.visual_sink.clone())
+            .dispatch_resolved(key, target, receipt, async { None }, native)
+            .await
     }
 }
 
@@ -121,14 +145,16 @@ impl Tool for DoubleClickTool {
                     ))
                 }
             };
+            let element_guard = Arc::new(element_guard);
             let element_ptr = element_guard.as_ptr();
 
             // Choose one background actuator before dispatch. An element that
             // advertises AXOpen uses the exact semantic route; all other
             // elements require the stricter routed-pointer proof. Do not let a
             // failed AXOpen silently cross into an ungated pointer fallback.
+            let action_guard = element_guard.clone();
             let has_ax_open = tokio::task::spawn_blocking(move || unsafe {
-                copy_action_names(element_ptr as AXUIElementRef)
+                copy_action_names(action_guard.as_ptr() as AXUIElementRef)
                     .iter()
                     .any(|action| action == "AXOpen")
             })
@@ -148,27 +174,41 @@ impl Tool for DoubleClickTool {
 
             // Thread the resolved session cursor key into the blocking AX path
             // so its ClickPulse lands on THIS session's cursor, not "default".
-            let ck = cursor_key.clone();
-            let registry = self.state.cursor_registry.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                ax_double_click(
-                    pid,
-                    wid,
-                    element_ptr,
-                    idx,
-                    &ck,
-                    &registry,
-                    has_ax_open,
-                    delivery_mode.is_foreground(),
-                )
+            let bounds_guard = element_guard.clone();
+            let target = tokio::task::spawn_blocking(move || unsafe {
+                crate::ax::bindings::element_screen_rect(bounds_guard.as_ptr() as AXUIElementRef)
             })
-            .await;
-
-            return match result {
-                Ok(Ok(msg)) => ToolResult::text(msg),
-                Ok(Err(e)) => ToolResult::error(format!("double_click failed: {e}")),
-                Err(e) => ToolResult::error(format!("Task error: {e}")),
+            .await
+            .ok()
+            .flatten()
+            .and_then(|rect| crate::cursor::visual::ResolvedPointerTarget::from_bounds(wid, rect));
+            let visual = Arc::new(crate::cursor::visual::DeliveryReceipt::default());
+            visual.validate_ax_target(pid, wid, element_guard, target);
+            let registry = self.state.cursor_registry.clone();
+            let native = async {
+                let visual = visual.clone();
+                let result = tokio::task::spawn_blocking(move || {
+                    ax_double_click(
+                        pid,
+                        wid,
+                        element_ptr,
+                        idx,
+                        &visual,
+                        &registry,
+                        has_ax_open,
+                        delivery_mode.is_foreground(),
+                    )
+                })
+                .await;
+                match result {
+                    Ok(Ok(msg)) => ToolResult::text(msg),
+                    Ok(Err(e)) => ToolResult::error(format!("Click failed: {e}")),
+                    Err(e) => ToolResult::error(format!("Task error: {e}")),
+                }
             };
+            return self
+                .dispatch_resolved(&cursor_key, target, &visual, native)
+                .await;
         }
 
         // ── Pixel path ───────────────────────────────────────────────────────
@@ -195,9 +235,11 @@ impl Tool for DoubleClickTool {
         // for CGEventSetWindowLocation (shared with click.rs via px_frame, which
         // refuses a window with no live frame instead of silently treating the
         // local point as screen-absolute).
+        let mut approach_frame = None;
         let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
             match super::px_frame::resolve_or_refuse(wid).await {
                 Ok(frame) => {
+                    approach_frame = Some(frame.bounds.clone());
                     let translated = frame.to_screen(cx, cy);
                     if !delivery_mode.is_foreground()
                         && (translated.2 < 0.0
@@ -239,55 +281,53 @@ impl Tool for DoubleClickTool {
             None
         };
 
-        let visual = crate::cursor::visual::begin_pointer_action(
-            &self.state.cursor_registry,
-            Arc::new(crate::cursor::visual::OverlayVisualSink),
-            &cursor_key,
-            crate::cursor::visual::point(screen_x, screen_y, window_id),
-            cursor_overlay::CursorAction::Click,
-        );
+        let visual = Arc::new(crate::cursor::visual::DeliveryReceipt::default());
+        visual.validate_pixel_frame(pid, window_id, approach_frame);
+        let target = crate::cursor::visual::point(screen_x, screen_y, window_id);
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let do_click = move || -> anyhow::Result<()> {
-                if let Some(wid) = window_id {
-                    crate::input::mouse::click_at_xy_with_window_local(
-                        pid,
-                        screen_x,
-                        screen_y,
-                        win_local_x,
-                        win_local_y,
-                        wid,
-                        2,
-                        &[],
-                        crate::input::mouse::WindowClickDelivery::from_foreground(fg),
-                    )
-                } else {
-                    crate::input::mouse::click_at_xy(pid, screen_x, screen_y, 2, &[])
+        let native = async {
+            let visual = visual.clone();
+            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+                let do_click = move || -> anyhow::Result<()> {
+                    if let Some(wid) = window_id {
+                        crate::input::mouse::click_at_xy_with_window_local(
+                            pid,
+                            screen_x,
+                            screen_y,
+                            win_local_x,
+                            win_local_y,
+                            wid,
+                            2,
+                            &[],
+                            crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                        )
+                    } else {
+                        crate::input::mouse::click_at_xy(pid, screen_x, screen_y, 2, &[])
+                    }
+                };
+                let do_click = || visual.dispatch_checked(do_click);
+                // Foreground rung: brief front → double-click → restore prior frontmost.
+                match (fg, window_id) {
+                    (true, Some(wid)) => {
+                        crate::input::skylight::with_foreground_assist(
+                            pid as libc::pid_t,
+                            wid,
+                            do_click,
+                        )?;
+                        Ok(())
+                    }
+                    _ => do_click(),
                 }
-            };
-            let do_click = || visual.dispatch(do_click);
-            // Foreground rung: brief front → double-click → restore prior frontmost.
-            match (fg, window_id) {
-                (true, Some(wid)) => {
-                    crate::input::skylight::with_foreground_assist(
-                        pid as libc::pid_t,
-                        wid,
-                        do_click,
-                    )?;
-                    Ok(())
-                }
-                _ => do_click(),
-            }
-        })
-        .await;
+            })
+            .await;
 
-        let mode_label = if fg {
-            " (delivery_mode:foreground)"
-        } else {
-            ""
-        };
-        match result {
+            let mode_label = if fg {
+                " (delivery_mode:foreground)"
+            } else {
+                ""
+            };
+            match result {
             Ok(Ok(())) => ToolResult::text(format!("✅ Double-clicked at ({screen_x:.1}, {screen_y:.1}){mode_label}."))
                 .with_structured(serde_json::json!({
                     "path": if fg { "cgevent_fg" } else { "cgevent" }, "verified": false, "effect": "unverifiable"
@@ -295,6 +335,9 @@ impl Tool for DoubleClickTool {
             Ok(Err(e)) => ToolResult::error(format!("Double-click failed: {e}")),
             Err(e)     => ToolResult::error(format!("Task error: {e}")),
         }
+        };
+        self.dispatch_resolved(&cursor_key, target, &visual, native)
+            .await
     }
 }
 
@@ -305,24 +348,17 @@ fn ax_double_click(
     wid: u32,
     element_ptr: usize,
     idx: usize,
-    cursor_key: &str,
+    visual: &crate::cursor::visual::DeliveryReceipt,
     registry: &crate::cursor::CursorRegistry,
     has_ax_open: bool,
     foreground: bool,
 ) -> anyhow::Result<String> {
     let element = element_ptr as AXUIElementRef;
-    let target = unsafe { crate::ax::bindings::element_screen_rect(element) }
-        .and_then(|rect| crate::cursor::visual::ResolvedPointerTarget::from_bounds(wid, rect));
-    let visual = crate::cursor::visual::begin_pointer_action(
-        registry,
-        Arc::new(crate::cursor::visual::OverlayVisualSink),
-        cursor_key,
-        target,
-        cursor_overlay::CursorAction::Click,
-    );
+    visual.ensure_current()?;
 
     // Try AXOpen first (Finder items, openable list rows, document cells).
     if has_ax_open {
+        visual.ensure_current()?;
         let err = unsafe { perform_action(element, "AXOpen") };
         if err == kAXErrorSuccess {
             visual.accepted();
@@ -380,6 +416,21 @@ fn ax_double_click(
 
 #[cfg(test)]
 mod tests {
+    #[tokio::test]
+    async fn quick_approach_route_never_polls_input_without_target_frame() {
+        let tool = DoubleClickTool::new(Arc::new(ToolState::default()));
+        let receipt = crate::cursor::visual::DeliveryReceipt::default();
+        let call = tool.dispatch_resolved(
+            "quick-double_click",
+            crate::cursor::visual::point(20.0, 30.0, Some(42)),
+            &receipt,
+            async { panic!("input before target frame") },
+        );
+        tokio::pin!(call);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        assert!(!receipt.was_accepted());
+    }
+
     #[test]
     fn slice_a_fix_native_fallback_rebinds_actual_center_and_drops_stale_bounds() {
         use crate::cursor::visual::{
@@ -421,15 +472,15 @@ mod tests {
                         receipt.accepted();
                     }
                     if failed {
-                        Err("native outcome error")
+                        Err(anyhow::anyhow!("native outcome error"))
                     } else {
                         Ok("delivered")
                     }
                 });
                 assert_eq!(
-                    result,
+                    result.map_err(|error| error.to_string()),
                     if failed {
-                        Err("native outcome error")
+                        Err("native outcome error".to_owned())
                     } else {
                         Ok("delivered")
                     }

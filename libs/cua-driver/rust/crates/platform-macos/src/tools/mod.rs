@@ -1199,6 +1199,7 @@ mod recording_start_guard_tests {
 
 #[cfg(test)]
 pub(crate) use {
-    click::ClickTool, invoke_menu::dispatch_menu_visual, scroll::dispatch_scroll_visual,
+    click::ClickTool, double_click::DoubleClickTool, invoke_menu::dispatch_menu_visual,
+    right_click::RightClickTool, scroll::dispatch_scroll_visual,
     type_text::with_type_visual_updates,
 };

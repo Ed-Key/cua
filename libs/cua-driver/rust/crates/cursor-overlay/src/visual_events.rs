@@ -91,6 +91,16 @@ struct Session {
 }
 
 impl VisualMailbox {
+    /// True only for the latest allocated, published, non-ended action.
+    pub fn owns_action(&self, key: &str, id: VisualActionId) -> bool {
+        self.sessions.get(key).is_some_and(|session| {
+            session.generation == id.generation
+                && session.next_action == id.action
+                && session
+                    .owner
+                    .is_some_and(|(owner, _, phase)| owner == id && phase != VisualPhase::End)
+        })
+    }
     pub fn next_order(&mut self) -> u64 {
         self.order += 1;
         self.order

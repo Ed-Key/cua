@@ -76,9 +76,21 @@ impl ClickTool {
             target,
         );
         delivery_receipt.attach(self.visual_sink.clone(), visual);
+        let _approach = match delivery_receipt.prepare_click().await {
+            Ok(guard) => guard,
+            Err(error) => return crate::cursor::visual::approach_refusal(error),
+        };
+        if let Err(error) = delivery_receipt.ensure_current() {
+            return crate::cursor::visual::approach_refusal(error);
+        }
         let result = match semantic.await {
             Some(result) => result,
-            None => native.await,
+            None => {
+                if let Err(error) = delivery_receipt.ensure_current() {
+                    return crate::cursor::visual::approach_refusal(error);
+                }
+                native.await
+            }
         };
         result
     }
@@ -346,7 +358,7 @@ impl Tool for ClickTool {
                     // turn the foreground contract back into background delivery.
                     let modifier_refs: Vec<&str> =
                         desktop_modifiers.iter().map(String::as_str).collect();
-                    delivered.dispatch(|| {
+                    delivered.dispatch_checked(|| {
                         crate::input::mouse::click_at_xy_desktop_with_modifiers(
                             sx,
                             sy,
@@ -490,6 +502,7 @@ impl Tool for ClickTool {
                     ))
                 }
             };
+            let element_guard = Arc::new(element_guard);
             let element_ptr = element_guard.as_ptr();
 
             // ── Exact-target background gate (macOS background input v1) ──
@@ -523,8 +536,9 @@ impl Tool for ClickTool {
                 action.clone()
             };
 
+            let bounds_guard = element_guard.clone();
             let bounds = tokio::task::spawn_blocking(move || unsafe {
-                element_screen_rect(element_ptr as AXUIElementRef)
+                element_screen_rect(bounds_guard.as_ptr() as AXUIElementRef)
             })
             .await
             .ok()
@@ -539,6 +553,7 @@ impl Tool for ClickTool {
             }
 
             let delivery_receipt = Arc::new(DeliveryReceipt::default());
+            delivery_receipt.validate_ax_target(pid, wid, element_guard.clone(), target);
             let dispatch = async {
                 // Surface 5: button=middle on the AX path has no AX equivalent.
                 // Fall back to a pixel middle-click at the element's screen-space center
@@ -558,13 +573,13 @@ impl Tool for ClickTool {
                             pid as libc::pid_t,
                             wid,
                             || {
-                                receipt.dispatch(|| crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+                                receipt.dispatch_checked(|| crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                                     cx, cy, 1, "middle", &m,
                                 ))
                             },
                         )
                     } else {
-                        receipt.dispatch(|| crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m))
+                        receipt.dispatch_checked(|| crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m))
                     }
                 })
                 .await;
@@ -585,9 +600,12 @@ impl Tool for ClickTool {
                 // elements so perform_ax_click can cross that one failed semantic
                 // rung internally and confirm the result by AX read-back.
                 let selection_candidate = if effective_action == "press" {
+                    let selection_guard = element_guard.clone();
                     tokio::task::spawn_blocking(move || {
-                        crate::input::ax_actions::nearest_container_selection_state(element_ptr)
-                            .is_some()
+                        crate::input::ax_actions::nearest_container_selection_state(
+                            selection_guard.as_ptr(),
+                        )
+                        .is_some()
                     })
                     .await
                     .unwrap_or(false)
@@ -803,9 +821,11 @@ impl Tool for ClickTool {
             //
             // win_local_x/y: window-local logical-pixel coords needed for
             // CGEventSetWindowLocation in the Chromium recipe.
+            let mut approach_frame = None;
             let (screen_x, screen_y, win_local_x, win_local_y) = if let Some(wid) = window_id {
                 match super::px_frame::resolve_or_refuse(wid).await {
                     Ok(frame) => {
+                        approach_frame = Some(frame.bounds.clone());
                         let (sx, sy, lx, ly) = frame.to_screen(cx, cy);
                         // A window-local point outside the live frame would
                         // dispatch onto whatever occupies that screen point —
@@ -866,6 +886,7 @@ impl Tool for ClickTool {
             // Future construction does not dispatch. The boundary emits intent
             // before polling the hit test, then polls native input only on fallback.
             let delivery_receipt = Arc::new(DeliveryReceipt::default());
+            delivery_receipt.validate_pixel_frame(pid, window_id, approach_frame);
             let semantic = async {
                 // A background PX action can still use an accessibility delivery
                 // backend after resolving the requested screen point. This keeps
@@ -881,6 +902,7 @@ impl Tool for ClickTool {
                     let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
                     let receipt = delivery_receipt.clone();
                     let ax_result = tokio::task::spawn_blocking(move || unsafe {
+                        receipt.ensure_current()?;
                         let Some(element) = element_at_screen_position(pid, screen_x, screen_y)
                         else {
                             return Ok::<bool, anyhow::Error>(false);
@@ -894,6 +916,10 @@ impl Tool for ClickTool {
                         {
                             CFRelease(element as _);
                             return Ok(false);
+                        }
+                        if let Err(error) = receipt.ensure_current() {
+                            CFRelease(element as _);
+                            return Err(error);
                         }
                         let delivered = if focus_only {
                             crate::input::ax_actions::focus_element(element as usize).is_ok()
@@ -1033,7 +1059,7 @@ impl Tool for ClickTool {
                                 }
                             }
                         };
-                        let do_click = || receipt.dispatch(do_click);
+                        let do_click = || receipt.dispatch_checked(do_click);
                         // Foreground rung: brief front → click → restore.
                         // Returns whether the window was ACTUALLY fronted, so the
                         // reported `path` honestly reflects the rung that ran.
@@ -1261,6 +1287,7 @@ fn perform_ax_click(
     modifiers: &[String],
     foreground: bool,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
+    delivered.ensure_current()?;
     let ax_action = map_action(action_str);
     let element = element_ptr as AXUIElementRef;
 
@@ -1283,6 +1310,7 @@ fn perform_ax_click(
     // or forcing the caller onto a less stable pixel coordinate.
     if ax_action == "AXPress" && !advertised.iter().any(|action| action == ax_action) {
         if modifiers.is_empty() {
+            delivered.ensure_current()?;
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr, delivered)
             {
@@ -1308,6 +1336,7 @@ fn perform_ax_click(
                 anyhow::bail!("selection target stopped exposing AXSelected before delivery");
             };
             let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
+            delivered.ensure_current()?;
             if foreground && !modifier_refs.is_empty() {
                 crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                     target.screen_x,
@@ -1395,12 +1424,14 @@ fn perform_ax_click(
         }
     }
 
+    delivered.ensure_current()?;
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Some collection rows claim a click-like action but Finder returns
         // kAXErrorCannotComplete. Use the same verified selection fallback
         // before surfacing the dispatch error.
         if ax_action == "AXPress" && modifiers.is_empty() {
+            delivered.ensure_current()?;
             if let Some(selected_role) =
                 crate::input::ax_actions::select_nearest_container(element_ptr, delivered)
             {
@@ -1522,6 +1553,27 @@ mod tests {
     use super::*;
 
     use crate::cursor::visual::test_support::{Event, RecordingSink};
+
+    #[tokio::test]
+    async fn quick_approach_stalled_renderer_does_not_poll_input() {
+        let tool = ClickTool::new(Arc::new(ToolState::default()));
+        let receipt = DeliveryReceipt::default();
+        let dispatched = std::sync::atomic::AtomicBool::new(false);
+        let call = tool.dispatch_resolved(
+            "quick-approach-stalled-renderer",
+            slice_a_target(),
+            &receipt,
+            async {
+                dispatched.store(true, Ordering::SeqCst);
+                Some(ToolResult::text("unexpected input"))
+            },
+            async { panic!("native must remain unpolled") },
+        );
+        tokio::pin!(call);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        assert!(!dispatched.load(Ordering::SeqCst));
+        assert!(!receipt.was_accepted());
+    }
 
     fn slice_a_tool() -> (ClickTool, Arc<RecordingSink>) {
         let sink = Arc::new(RecordingSink::default());

@@ -166,6 +166,50 @@ impl RenderStateCore {
         display: Option<DisplayBounds>,
         now: Instant,
     ) -> bool {
+        self.apply_visual_event_with_approach(event, display, now, false)
+    }
+
+    /// Opt-in click timing for adapters that gate input on target presentation.
+    /// Other adapters and legacy MoveTo retain their existing timing.
+    pub fn apply_click_approach(
+        &mut self,
+        event: VisualEvent,
+        display: Option<DisplayBounds>,
+        now: Instant,
+    ) -> bool {
+        self.apply_visual_event_with_approach(event, display, now, true)
+    }
+
+    /// Concrete arrow-tip geometry for this exact action, never a timer-only ack.
+    pub fn is_target_frame(&self, event: &VisualEvent) -> bool {
+        let Some(target) = event.target else {
+            return false;
+        };
+        let tip = (
+            self.pos.0 - self.heading.cos() * 16.0,
+            self.pos.1 - self.heading.sin() * 16.0,
+        );
+        self.cfg.enabled
+            && self.visible
+            && self.placed
+            && self.idle_alpha > 0.0
+            && self.path.is_none()
+            && self.spring.is_none()
+            && self
+                .visual_owner
+                .is_some_and(|(id, _, phase)| id == event.id && phase == VisualPhase::Intent)
+            && self.pinned_wid == event.window
+            && (tip.0 - target.0).abs() < 0.001
+            && (tip.1 - target.1).abs() < 0.001
+    }
+
+    fn apply_visual_event_with_approach(
+        &mut self,
+        event: VisualEvent,
+        display: Option<DisplayBounds>,
+        now: Instant,
+        quick_approach: bool,
+    ) -> bool {
         if !event.is_valid() || !self.cfg.enabled || !self.visible {
             return false;
         }
@@ -202,7 +246,9 @@ impl RenderStateCore {
             self.clear_visual_presentation();
         }
         self.visual_owner = Some((event.id, event.timestamp, event.phase));
-        if let Some(window) = event.window {
+        if quick_approach {
+            self.pinned_wid = event.window;
+        } else if let Some(window) = event.window {
             self.pinned_wid = Some(window);
         }
         if event.phase == VisualPhase::End {
@@ -280,12 +326,19 @@ impl RenderStateCore {
                 self.visual_travel = None;
                 self.visual_destination = None;
                 self.pending_contact = None;
+                let tip_distance = (self.pos.0 - self.heading.cos() * 16.0 - target.0)
+                    .hypot(self.pos.1 - self.heading.sin() * 16.0 - target.1);
                 if event.phase == VisualPhase::Intent
+                    && !(quick_approach && tip_distance < 0.001)
                     && self.visual.reduced_motion != crate::ReducedMotion::On
                     && (x - self.pos.0).hypot(y - self.pos.1) > 0.001
                 {
                     let distance = (x - self.pos.0).hypot(y - self.pos.1);
-                    let duration = Duration::from_secs_f64((distance / 900.0).clamp(0.120, 0.220));
+                    let duration = Duration::from_secs_f64(if quick_approach {
+                        (distance / 1600.0).clamp(0.080, 0.140)
+                    } else {
+                        (distance / 900.0).clamp(0.120, 0.220)
+                    });
                     self.path = Some(PathPlanner::plan(
                         self.pos.0,
                         self.pos.1,
@@ -296,8 +349,18 @@ impl RenderStateCore {
                         heading,
                         self.motion.turn_radius,
                     ));
-                    self.visual_travel = Some((event.timestamp, duration));
-                    deadline = event.timestamp + duration;
+                    // A healthy first drain starts visible travel now. The adapter's
+                    // independent 250 ms deadline still bounds admission.
+                    let start = if quick_approach
+                        && now.saturating_duration_since(event.timestamp)
+                            < Duration::from_millis(250)
+                    {
+                        now
+                    } else {
+                        event.timestamp
+                    };
+                    self.visual_travel = Some((start, duration));
+                    deadline = start + duration;
                     self.visual_destination = Some((target, deadline));
                 } else {
                     self.pos = (x, y);
@@ -2780,5 +2843,64 @@ mod tests {
         core.cfg.enabled = false;
         paint_cursor(&mut pm, &core, 0.0, 0.0, None, 1.0);
         assert!(pm.data().iter().all(|v| *v == 0));
+    }
+    #[test]
+    fn quick_approach_requires_current_concrete_tip_and_preserves_legacy_policy() {
+        let now = Instant::now();
+        let display = DisplayBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 2000.0,
+            height: 1200.0,
+        };
+        let event = VisualEvent {
+            id: VisualActionId {
+                generation: 1,
+                action: 1,
+            },
+            timestamp: now,
+            target: Some((800.0, 500.0)),
+            window: Some(42),
+            bounds: None,
+            action: CursorAction::Click,
+            scroll_direction: None,
+            modifiers: None,
+            phase: VisualPhase::Intent,
+        };
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        assert!(core.apply_click_approach(event.clone(), Some(display), now));
+        assert!(!core.is_target_frame(&event));
+        core.advance_visual_presentation(now + Duration::from_millis(79));
+        assert!(!core.is_target_frame(&event));
+        core.advance_visual_presentation(now + Duration::from_millis(140));
+        assert!(core.is_target_frame(&event));
+        core.pos.0 += 1.0;
+        assert!(
+            !core.is_target_frame(&event),
+            "elapsed time is not arrival evidence"
+        );
+        core.pos.0 -= 1.0;
+        let mut other = event.clone();
+        other.id.action += 1;
+        assert!(!core.is_target_frame(&other));
+        other = event.clone();
+        other.target = Some((801.0, 500.0));
+        assert!(!core.is_target_frame(&other));
+        core.heading = 1.7;
+        core.pos = (
+            800.0 + 16.0 * core.heading.cos(),
+            500.0 + 16.0 * core.heading.sin(),
+        );
+        let mut next = event.clone();
+        next.id.action += 1;
+        next.timestamp = now + Duration::from_millis(141);
+        assert!(core.apply_click_approach(next.clone(), Some(display), next.timestamp));
+        assert!(
+            core.path.is_none(),
+            "an arrived tip needs no glide even with a different heading"
+        );
+        assert!(core.is_target_frame(&next));
+        core.apply_command_base(OverlayCommand::SetEnabled(false), false, false);
+        assert!(!core.is_target_frame(&next));
     }
 }
