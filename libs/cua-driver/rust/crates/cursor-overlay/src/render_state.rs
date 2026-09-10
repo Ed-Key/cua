@@ -100,7 +100,63 @@ pub struct RenderStateCore {
     pub badge_modifier_fade_secs: Option<f64>,
 }
 
+/// Logical bounds of the display containing a resolved target.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct DisplayBounds {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+}
+
+impl DisplayBounds {
+    pub fn contains(self, target: (f64, f64)) -> bool {
+        [
+            self.x,
+            self.y,
+            self.width,
+            self.height,
+            self.x + self.width,
+            self.y + self.height,
+            target.0,
+            target.1,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+            && self.width > 0.0
+            && self.height > 0.0
+            && target.0 >= self.x
+            && target.0 < self.x + self.width
+            && target.1 >= self.y
+            && target.1 < self.y + self.height
+    }
+}
+
 impl RenderStateCore {
+    /// Initialize a first move near its resolved target on the containing display.
+    pub fn initialize_near_target(&mut self, target: (f64, f64), display: DisplayBounds) -> bool {
+        if self.placed || !self.cfg.enabled || !self.visible || !display.contains(target) {
+            return false;
+        }
+        // Adapted from PR3019: keep the seed within 140 units on each axis.
+        // Cap the inset at a quarter dimension so tiny displays remain valid.
+        let inset_x = 2.0_f64.min(display.width / 4.0);
+        let inset_y = 2.0_f64.min(display.height / 4.0);
+        let clamp = |x: f64, y: f64| {
+            (
+                x.clamp(display.x + inset_x, display.x + display.width - inset_x),
+                y.clamp(display.y + inset_y, display.y + display.height - inset_y),
+            )
+        };
+        let mut seed = clamp(target.0 - 140.0, target.1 - 140.0);
+        if (seed.0 - target.0).abs() < 8.0 && (seed.1 - target.1).abs() < 8.0 {
+            seed = clamp(target.0 + 140.0, target.1 + 140.0);
+        }
+        self.pos = seed;
+        self.placed = true;
+        true
+    }
+
     /// Build the core from a launch-time CursorConfig.
     pub fn new(cfg: CursorConfig) -> Self {
         let motion = cfg.motion.clone();
@@ -154,7 +210,7 @@ impl RenderStateCore {
     }
 
     pub fn cursor_is_revealed(&self) -> bool {
-        self.visible && self.placed && self.idle_alpha >= 0.004
+        self.cfg.enabled && self.visible && self.placed && self.idle_alpha >= 0.004
     }
 
     fn reveal_session_badge(&mut self) {
@@ -785,7 +841,7 @@ pub fn render_frame(
 /// render N owned cursors into one buffer / one NSWindow.
 ///
 /// `origin_x` / `origin_y` are subtracted from `core.pos` before drawing
-/// (Windows passes the virtual-screen origin; macOS / Linux pass `(0.0, 0.0)`).
+/// (macOS passes the per-display origin; other adapters choose their viewport).
 /// Both are in **logical** screen points, just like `core.pos`.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio.
@@ -1403,5 +1459,124 @@ mod backing_scale_tests {
                 "3× visible bounds should triple: {one}, {three}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn slice_a_seed_primary_negative_axes_edges_and_corners() {
+        for origin in [(0.0, 0.0), (-1440.0, 0.0), (0.0, -900.0)] {
+            let display = DisplayBounds {
+                x: origin.0,
+                y: origin.1,
+                width: 1440.0,
+                height: 900.0,
+            };
+            for (local, seed) in [
+                ((400.0, 400.0), (260.0, 260.0)),
+                ((0.0, 0.0), (140.0, 140.0)),
+                ((2.0, 2.0), (142.0, 142.0)),
+                ((1439.0, 899.0), (1299.0, 759.0)),
+                ((0.0, 500.0), (2.0, 360.0)),
+            ] {
+                let target = (origin.0 + local.0, origin.1 + local.1);
+                let mut core = RenderStateCore::new(CursorConfig::default());
+                core.pos = (-1400.0, -1400.0);
+                assert!(core.initialize_near_target(target, display));
+                assert_eq!(core.pos, (origin.0 + seed.0, origin.1 + seed.1));
+                assert!(core.placed);
+                assert!((core.pos.0 - target.0).hypot(core.pos.1 - target.1) <= 200.0);
+                let first = core.pos;
+                assert!(!core.initialize_near_target((origin.0 + 800.0, origin.1 + 700.0), display));
+                assert_eq!(core.pos, first);
+            }
+        }
+    }
+
+    #[test]
+    fn slice_a_tiny_bounds_have_safe_margins() {
+        for (width, height) in [(1.0, 0.5), (0.001, 0.002), (4.0, 4.0)] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            assert!(core.initialize_near_target(
+                (0.0, 0.0),
+                DisplayBounds {
+                    x: 0.0,
+                    y: 0.0,
+                    width,
+                    height
+                }
+            ));
+            assert!(core.pos.0 > 0.0 && core.pos.0 < width);
+            assert!(core.pos.1 > 0.0 && core.pos.1 < height);
+            assert!(core.pos.0.hypot(core.pos.1) <= 200.0);
+        }
+    }
+
+    #[test]
+    fn slice_a_invalid_bounds_and_absent_targets_never_place() {
+        let valid = DisplayBounds {
+            x: 0.0,
+            y: 0.0,
+            width: 100.0,
+            height: 100.0,
+        };
+        for bounds in [
+            DisplayBounds {
+                width: 0.0,
+                ..valid
+            },
+            DisplayBounds {
+                height: -1.0,
+                ..valid
+            },
+            DisplayBounds {
+                x: f64::NAN,
+                ..valid
+            },
+            DisplayBounds {
+                y: f64::INFINITY,
+                ..valid
+            },
+            DisplayBounds {
+                width: f64::INFINITY,
+                ..valid
+            },
+            DisplayBounds {
+                x: f64::MAX,
+                width: f64::MAX,
+                ..valid
+            },
+        ] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            assert!(!core.initialize_near_target((50.0, 50.0), bounds));
+            assert!(!core.placed);
+        }
+        for target in [
+            (100.0, 50.0),
+            (-1.0, 0.0),
+            (50.0, 100.0),
+            (f64::NAN, 1.0),
+            (1.0, f64::INFINITY),
+        ] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            assert!(!core.initialize_near_target(target, valid));
+            assert!(!core.placed);
+        }
+    }
+
+    #[test]
+    fn slice_a_disabled_and_unplaced_states_do_not_paint() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.pos = (40.0, 40.0);
+        let mut pm = tiny_skia::Pixmap::new(100, 100).unwrap();
+        paint_cursor(&mut pm, &core, 0.0, 0.0, None, 1.0);
+        assert!(pm.data().iter().all(|v| *v == 0));
+        core.placed = true;
+        core.cfg.enabled = false;
+        paint_cursor(&mut pm, &core, 0.0, 0.0, None, 1.0);
+        assert!(pm.data().iter().all(|v| *v == 0));
     }
 }

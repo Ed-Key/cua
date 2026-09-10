@@ -150,15 +150,41 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
             // Drop a command for an already-ended session WITHOUT get-or-create
             // — this is the resurrection guard. Without it, a ClickPulse/MoveTo
             // landing after Remove would re-insert (and re-leak) the cursor.
-            if map.ended.contains(&key) {
+            if key.is_empty() || map.ended.contains(&key) {
+                arrival_fire(&key);
                 return;
+            }
+            let target = match &cmd {
+                OverlayCommand::MoveTo { x, y, .. }
+                | OverlayCommand::SnapTo { x, y, .. }
+                | OverlayCommand::ClickPulse { x, y } => Some((*x, *y)),
+                _ => None,
+            };
+            if let Some((x, y)) = target {
+                if !animation_enabled(map, &key) || map.layout.display_at(x, y).is_none() {
+                    map.cursors
+                        .entry(key.clone())
+                        .or_insert_with(|| render_state_for_key(&map.template, &key));
+                    arrival_fire(&key);
+                    return;
+                }
+                if matches!(&cmd, OverlayCommand::MoveTo { .. }) {
+                    seed_start_in_map(map, &key, x, y);
+                }
             }
             let template = map.template.clone();
             let rs = map
                 .cursors
                 .entry(key.clone())
                 .or_insert_with(|| render_state_for_key(&template, &key));
+            let ends_travel = matches!(
+                &cmd,
+                OverlayCommand::SnapTo { .. } | OverlayCommand::SetEnabled(false)
+            );
             rs.apply_command(cmd);
+            if ends_travel {
+                arrival_fire(&key);
+            }
             map.active_key = Some(key);
         }
     }
@@ -229,10 +255,17 @@ pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
     if key.is_empty() {
         return;
     }
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(MacOverlayMsg::Cursor(OverlayMsg::Cmd(
+    let arrival_key = matches!(&cmd, OverlayCommand::MoveTo { .. }).then(|| key.clone());
+    let sent = CMD_TX.get().is_some_and(|tx| {
+        tx.try_send(MacOverlayMsg::Cursor(OverlayMsg::Cmd(
             KeyedOverlayCommand { key, cmd },
-        )));
+        )))
+        .is_ok()
+    });
+    if !sent {
+        if let Some(key) = arrival_key {
+            arrival_fire(&key);
+        }
     }
 }
 
@@ -313,100 +346,50 @@ pub fn current_theme_state(
     Some((id, version, profile, fallback, state.core.visual.clone()))
 }
 
-/// Seed a brand-new cursor at an on-screen start point
-/// offset up-left of `(target_x, target_y)` so the immediately-following
-/// `MoveTo` glides INTO the target instead of silently snapping. Without this,
-/// a cursor's very first action (common on a pure-AX run — launch app, AX-press
-/// a button) produces no visible motion: `animate_cursor_to` early-returned at
-/// no position and only `ClickPulse` placed a static arrow, which is easy to
-/// miss. See the AX-no-glide report.
-///
-/// No-op when the cursor is already placed or absent. The seed is clamped to
-/// the display containing the target so it never starts off-display.
-/// Returns true if a seed was applied (i.e. the cursor was unplaced and
-/// is now primed to glide).
-fn seed_start_if_unplaced(key: &CursorKey, target_x: f64, target_y: f64) -> bool {
-    let mut guard = RENDER.lock().unwrap();
-    let Some(map) = guard.as_mut() else {
-        return false;
-    };
-    seed_start_in_map(map, key, target_x, target_y)
-}
-
-/// Pure seed step operating on a borrowed [`RenderMap`] — factored out of
-/// `seed_start_if_unplaced` so the get-or-create + clamp logic is unit-testable
-/// without the global `RENDER` static or AppKit.
+/// Called only while processing commands on the render worker, after tombstones.
 fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target_y: f64) -> bool {
-    // Offset the start up-left of the target so the Dubins path has room to
-    // curve in; 140pt is enough to read as motion at 900pt/s peak speed.
-    const SEED_OFFSET: f64 = 140.0;
-    let target_display = map.layout.display_for_or_primary(target_x, target_y);
-    // Respect the resurrection guard: never seed (and thus re-create) a cursor
-    // whose session already ended.
     if map.ended.contains(key) {
         return false;
     }
-    // Get-or-create the cursor so the very first AX action seeds + glides even
-    // when the lazy render-thread creation hasn't drained the PinAbove yet
-    // (the render loop's drain would otherwise win the race and the seed read
-    // an absent cursor). Mirrors apply_msg's entry().or_insert_with.
-    let template = map.template.clone();
-    let k = key.clone();
+    let Some(display) = map.layout.display_at(target_x, target_y) else {
+        return false;
+    };
     let rs = map
         .cursors
         .entry(key.clone())
-        .or_insert_with(|| render_state_for_key(&template, &k));
-    if !(rs.core.cfg.enabled && !rs.core.placed) {
-        return false;
-    }
-    let mut sx = target_x - SEED_OFFSET;
-    let mut sy = target_y - SEED_OFFSET;
-    if let Some(display) = target_display {
-        let min_x = display.x + 2.0;
-        let min_y = display.y + 2.0;
-        let max_x = display.x + display.width - 2.0;
-        let max_y = display.y + display.height - 2.0;
-        sx = sx.clamp(min_x, max_x);
-        sy = sy.clamp(min_y, max_y);
-        // If clamping collapsed the seed onto the target (target in a corner),
-        // nudge it the other way so there is still a visible glide distance.
-        if (sx - target_x).abs() < 8.0 && (sy - target_y).abs() < 8.0 {
-            sx = (target_x + SEED_OFFSET).min(max_x);
-            sy = (target_y + SEED_OFFSET).min(max_y);
-        }
-    }
-    rs.core.pos = (sx, sy);
-    rs.core.placed = true;
-    true
+        .or_insert_with(|| render_state_for_key(&map.template, key));
+    rs.core.initialize_near_target(
+        (target_x, target_y),
+        cursor_overlay::DisplayBounds {
+            x: display.x,
+            y: display.y,
+            width: display.width,
+            height: display.height,
+        },
+    )
+}
+
+fn animation_enabled(map: &RenderMap, key: &str) -> bool {
+    !map.ended.contains(key)
+        && map.cursors.get(key).map_or(map.template.enabled, |rs| {
+            rs.core.cfg.enabled && rs.core.visible
+        })
 }
 
 /// Animate the overlay cursor to `(x, y)` and suspend until the Dubins path
 /// completes and the spring overshoot begins.
 ///
-/// Mirrors Swift's `AgentCursor.shared.animateAndWait(to:)`.
-/// Returns immediately (no animation) only when the overlay is disabled for
-/// this cursor. A brand-new cursor is first seeded on-screen via
-/// [`seed_start_if_unplaced`] so its first action glides
-/// in (it previously snapped silently via `ClickPulse`, invisible on a pure-AX
-/// run).
+/// Placement occurs when the renderer consumes the command. This temporary
+/// arrival transport is retained until the later nonblocking motion task.
 pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
-    // An empty key disables cursors for direct platform calls.
     if key.is_empty() {
         return;
     }
-    // Seed an unplaced cursor on-screen so the MoveTo below glides instead of
-    // being short-circuited. After this the cursor has a position, so
-    // the should-animate check passes on the first action just like later ones.
-    seed_start_if_unplaced(&key, x, y);
-
-    // Check whether animation should run for THIS cursor. A disabled cursor
-    // never animates; an absent cursor (seed found nothing to prime) is skipped.
     let should_animate = {
         let guard = RENDER.lock().unwrap();
-        matches!(
-            guard.as_ref().and_then(|m| m.cursors.get(&key)),
-            Some(rs) if rs.core.cfg.enabled && rs.core.placed
-        )
+        guard
+            .as_ref()
+            .is_some_and(|map| animation_enabled(map, &key))
     };
     if !should_animate {
         return;
@@ -512,6 +495,9 @@ impl RenderState {
     /// [`RenderStateCore::tick_swift_constants`].  Returns true if an
     /// arrival signal should be fired (the path just ended).
     fn tick(&mut self, dt: f64) -> bool {
+        if !self.core.cfg.enabled || !self.core.visible || !self.core.placed {
+            return false;
+        }
         let fire_arrival = self.core.tick_swift_constants(dt);
 
         // Advance focus-rect fade (fades out over ~600ms).  macOS-only —
@@ -528,12 +514,17 @@ impl RenderState {
     }
 
     fn apply_command(&mut self, cmd: OverlayCommand) {
-        // A macOS click pulse preserves the position reached by its glide.
-        // The shared core places an unplaced cursor on first use.
+        // First contact places exactly at its resolved target. Subsequent
+        // pulses retain the existing glide behavior until the motion task.
         match cmd {
             OverlayCommand::ShowFocusRect(rect) => {
                 self.focus_rect = rect;
                 self.focus_rect_t = 0.0; // reset fade to fully visible
+            }
+            OverlayCommand::ClickPulse { x, y } if !self.core.placed => {
+                let _ =
+                    self.core
+                        .apply_command_base(OverlayCommand::ClickPulse { x, y }, true, false);
             }
             other => {
                 let _ = self.core.apply_command_base(other, true, true);
@@ -546,6 +537,9 @@ impl RenderState {
     /// quiescent, so `serve` with no agent activity can block on the command
     /// channel instead of compositing empty display pixmaps at 60fps.
     fn needs_frame_tick(&self) -> bool {
+        if !self.core.cfg.enabled || !self.core.visible || !self.core.placed {
+            return false;
+        }
         self.core.path.is_some()
             || self.core.spring.is_some()
             || self.core.click_t.is_some()
@@ -1271,6 +1265,150 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    fn command(key: &str, cmd: OverlayCommand) -> OverlayMsg {
+        OverlayMsg::Cmd(KeyedOverlayCommand {
+            key: key.into(),
+            cmd,
+        })
+    }
+
+    #[test]
+    fn slice_a_action_admission_does_not_place_or_reject_a_fresh_cursor() {
+        let mut map = empty_map();
+        assert!(animation_enabled(&map, "fresh"));
+        assert!(!map.cursors.contains_key("fresh"));
+        map.ended.insert("ended".into());
+        assert!(!animation_enabled(&map, "ended"));
+        apply_msg(
+            &mut map,
+            command("disabled", OverlayCommand::SetEnabled(false)),
+        );
+        assert!(!animation_enabled(&map, "disabled"));
+        assert!(!map.cursors["disabled"].core.placed);
+    }
+
+    #[test]
+    fn slice_a_first_command_seeds_on_each_target_display() {
+        for (x, y) in [(0.0, 0.0), (-1440.0, 0.0), (0.0, -900.0)] {
+            let mut map = empty_map();
+            map.layout.displays[0].x = x;
+            map.layout.displays[0].y = y;
+            map.layout.displays[0].width = 1440.0;
+            map.layout.displays[0].height = 900.0;
+            let target = (x + 400.0, y + 400.0);
+            apply_msg(&mut map, move_msg("first-command", target.0, target.1));
+            let core = &map.cursors["first-command"].core;
+            assert!(core.placed);
+            assert_eq!(core.pos, (x + 260.0, y + 260.0));
+            assert!(core.path.is_some());
+        }
+    }
+
+    #[test]
+    fn slice_a_missing_display_never_places_or_keeps_waiter() {
+        for empty in [false, true] {
+            let mut map = empty_map();
+            if empty {
+                map.layout.displays.clear();
+            }
+            let key = format!("slice-a-missing-{empty}");
+            let (tx, mut rx) = tokio::sync::oneshot::channel();
+            arrival_register(key.clone(), tx);
+            apply_msg(&mut map, move_msg(&key, -1400.0, -700.0));
+            assert!(
+                rx.try_recv().is_ok(),
+                "unavailable display must complete temporary arrival"
+            );
+            let rs = &map.cursors[&key];
+            assert!(!rs.core.placed);
+            assert!(!rs.needs_frame_tick());
+            assert!(!cursor_is_visible(rs));
+        }
+    }
+
+    #[test]
+    fn slice_a_disabled_and_nonpositional_commands_are_quiescent() {
+        let mut map = empty_map();
+        apply_msg(
+            &mut map,
+            command("disabled", OverlayCommand::SetEnabled(false)),
+        );
+        apply_msg(&mut map, move_msg("disabled", 50.0, 50.0));
+        assert!(!map.cursors["disabled"].core.placed);
+        assert!(!map.cursors["disabled"].needs_frame_tick());
+        apply_msg(
+            &mut map,
+            command(
+                "fresh",
+                OverlayCommand::ShowFocusRect(Some([1.0, 2.0, 3.0, 4.0])),
+            ),
+        );
+        assert!(!map.cursors["fresh"].needs_frame_tick());
+        assert!(!cursor_is_visible(&map.cursors["fresh"]));
+        apply_msg(
+            &mut map,
+            command("disabled", OverlayCommand::SetEnabled(true)),
+        );
+        apply_msg(&mut map, move_msg("disabled", 50.0, 50.0));
+        assert_eq!(map.cursors["disabled"].core.pos, (2.0, 2.0));
+    }
+
+    #[test]
+    fn slice_a_remove_before_first_command_and_revive_seed_anew() {
+        let mut map = empty_map();
+        apply_msg(&mut map, OverlayMsg::Remove("late".into()));
+        let (tx, mut rx) = tokio::sync::oneshot::channel();
+        arrival_register("late".into(), tx);
+        apply_msg(&mut map, move_msg("late", 50.0, 50.0));
+        assert!(!map.cursors.contains_key("late"));
+        assert!(rx.try_recv().is_ok());
+        apply_msg(&mut map, OverlayMsg::Revive("late".into()));
+        apply_msg(&mut map, move_msg("late", 50.0, 50.0));
+        assert_eq!(map.cursors["late"].core.pos, (2.0, 2.0));
+        apply_msg(&mut map, move_msg("late", 80.0, 80.0));
+        assert_eq!(map.cursors["late"].core.pos, (2.0, 2.0));
+    }
+
+    #[test]
+    fn slice_a_contact_and_snap_initialize_at_resolved_position() {
+        for cmd in [
+            OverlayCommand::SnapTo {
+                x: 40.0,
+                y: 45.0,
+                heading_radians: None,
+            },
+            OverlayCommand::ClickPulse { x: 40.0, y: 45.0 },
+        ] {
+            let mut map = empty_map();
+            apply_msg(&mut map, command("contact", cmd));
+            let core = &map.cursors["contact"].core;
+            assert!(core.placed);
+            assert_eq!(core.pos, (40.0, 45.0));
+            assert!(core.path.is_none());
+        }
+    }
+
+    #[test]
+    fn slice_a_seed_never_changes_logical_target() {
+        let registry = super::super::CursorRegistry::new();
+        registry.update_position("intent", 60.0, 60.0);
+        let mut map = empty_map();
+        apply_msg(&mut map, move_msg("intent", 60.0, 60.0));
+        assert_eq!(map.cursors["intent"].core.pos, (2.0, 2.0));
+        let position = registry.get("intent").unwrap().position.unwrap();
+        assert_eq!((position.x, position.y), (60.0, 60.0));
+    }
+
+    #[test]
+    fn slice_a_tiny_display_seed_stays_inside() {
+        let mut map = empty_map();
+        map.layout.displays[0].width = 1.0;
+        map.layout.displays[0].height = 0.5;
+        apply_msg(&mut map, move_msg("tiny", 0.1, 0.1));
+        let p = map.cursors["tiny"].core.pos;
+        assert!(p.0 > 0.0 && p.0 < 1.0 && p.1 > 0.0 && p.1 < 0.5, "{p:?}");
+    }
+
     #[test]
     fn keyed_render_state_carries_the_session_color_identity() {
         let state = render_state_for_key(&CursorConfig::default(), "session-blueprint");
@@ -1527,6 +1665,15 @@ mod tests {
     #[test]
     fn negative_display_coordinates_are_visible_and_not_reseeded() {
         let mut map = empty_map();
+        map.layout.displays.push(DisplayGeometry {
+            id: 2,
+            x: -1440.0,
+            y: 0.0,
+            width: 1440.0,
+            height: 900.0,
+            backing_scale: 1.0,
+            is_primary: false,
+        });
         seed_start_in_map(&mut map, &"sessA".to_owned(), 60.0, 60.0);
         map.cursors.get_mut("sessA").unwrap().core.pos = (-867.0, 400.0);
         map.cursors.get_mut("sessA").unwrap().core.placed = true;

@@ -23,7 +23,7 @@ pub use bezier::CubicBezier;
 pub use motion::{MotionConfig, Spring};
 pub use path_planner::{PathPlanner, PathState, PlannedPath};
 pub use render_state::{
-    paint_cursor, paint_cursor_art, render_frame, FocusRect, RenderStateCore,
+    paint_cursor, paint_cursor_art, render_frame, DisplayBounds, FocusRect, RenderStateCore,
     SESSION_BADGE_FADE_SECS, SESSION_BADGE_HOLD_SECS,
 };
 pub use session_badge::{
