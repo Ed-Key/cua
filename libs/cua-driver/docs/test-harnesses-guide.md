@@ -600,6 +600,26 @@ Animation submission does not guarantee physical scanout or visibility through
 other windows. Earlier debug clips and asynchronous-playback clips remain
 historical milestones, not evidence for a newer candidate.
 
+Mac resolved click approaches and explicit-window cursor navigation register the
+embedded default arrow's rounded visible nose. This point is the minimum `x+y`
+on the first cubic of the opaque body in authored coordinates, extended outward
+by half its white outline width along the northwest normal. The current body
+frame transform and shared float/rotation/scale are applied to that point before
+translating the artwork onto the existing logical target. The shape, input
+coordinates, registry target and independent ring center do not change. The
+registration persists through arrival, idle, accepted contact and pulse expiry.
+Annotate the actual opaque rounded outline in original frames, not glow, action
+marks, the metadata hotspot or a copied registry coordinate. The two-native-pixel
+oracle is unchanged. Raster unit evidence does not replace native recording.
+
+Exact visible-tip registration currently supports only the embedded default
+artifact. Enabled-overlay gated clicks with custom themes refuse before input
+with an `unsupported_cursor_registration` explanation. Disabled-overlay clicks
+remain immediate. Custom navigation remains best-effort legacy artwork without
+an exact painted-arrival claim. Untargeted movement, scroll/type/drag and other
+platform adapters retain their existing rendering; this local opt-in does not
+resolve the deferred retained-adapter limitation documented below.
+
 | Row | Evidence |
 | --- | --- |
 | `harness_appkit_counter_px_background` | Reused AX hit-test row: exactly one counter transition, registry target, foreground, z-order, real cursor and leaked-input oracles. |

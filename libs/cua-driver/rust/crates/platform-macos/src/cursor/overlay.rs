@@ -89,7 +89,7 @@ struct OverlayInbox {
 struct ApproachRegistration {
     surface_generation: u64,
     event: cursor_overlay::VisualEvent,
-    sender: Option<tokio::sync::oneshot::Sender<()>>,
+    sender: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     deadline: tokio::time::Instant,
     presented: Option<(u64, DisplayId)>,
     timing: ApproachTiming,
@@ -152,7 +152,7 @@ impl OverlayInbox {
         key: &str,
         event: &cursor_overlay::VisualEvent,
         surface_generation: u64,
-    ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
         if !self.approach_enabled(key)
             || !self.visual.owns_action(key, event.id)
             || !event.is_valid()
@@ -305,7 +305,7 @@ impl OverlayInbox {
                     pending.presented = Some((generation, display));
                     if let Some(sender) = pending.sender.take() {
                         pending.timing.acknowledgement_ms = Some(pending.timing.elapsed_ms());
-                        let _ = sender.send(());
+                        let _ = sender.send(Ok(()));
                     }
                 }
             }
@@ -562,6 +562,8 @@ fn apply_visual_in_map(
     let visual_id = event.id;
     let accepted = if quick {
         state.core.apply_click_approach(event, bounds, now)
+    } else if event.action == cursor_overlay::CursorAction::Navigate && event.window.is_some() {
+        state.core.apply_registered_navigation(event, bounds, now)
     } else {
         state.core.apply_visual_event(event, bounds, now)
     };
@@ -591,7 +593,7 @@ pub(crate) fn approach_enabled(key: &str) -> bool {
 pub(crate) fn register_target(
     key: &str,
     event: &cursor_overlay::VisualEvent,
-) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
     let receiver = inbox().lock().unwrap().register_target(
         key,
         event,
@@ -1804,6 +1806,12 @@ fn target_frames(
         .filter_map(|(key, pending)| {
             let target = pending.event.target?;
             let state = map.cursors.get(key)?;
+            if state.visual_id == Some(pending.event.id) && !state.core.target_registration_supported() {
+                if let Some(sender) = pending.sender.take() {
+                    let _ = sender.send(Err("unsupported_cursor_registration: enabled click approach requires the embedded default arrow; custom theme hotspot metadata does not define its painted tip".into()));
+                }
+                return None;
+            }
             let timing = &mut pending.timing;
             let elapsed = timing.elapsed_ms();
             timing.frames = timing.frames.saturating_add(1);
@@ -2956,7 +2964,7 @@ mod tests {
             &self,
             key: &str,
             event: &cursor_overlay::VisualEvent,
-        ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+        ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
             self.inbox.lock().unwrap().register_target(
                 key,
                 event,
@@ -2987,6 +2995,150 @@ mod tests {
         }
         fn release_target(&self, key: &str, event: &cursor_overlay::VisualEvent) {
             self.inbox.lock().unwrap().release_target(key, event);
+        }
+    }
+
+    #[test]
+    fn registered_mac_explicit_window_navigation_paints_target_but_untargeted_stays_legacy() {
+        for window in [Some(111), None] {
+            for scale in [1.0, 2.0] {
+                let mut map = empty_map();
+                map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
+                let mut event = mailbox_event(
+                    cursor_overlay::VisualActionId {
+                        generation: 1,
+                        action: 1,
+                    },
+                    60.25,
+                    cursor_overlay::VisualPhase::Intent,
+                );
+                event.action = cursor_overlay::CursorAction::Navigate;
+                event.window = window;
+                apply_visual_in_map(&mut map, "one".into(), event.clone(), event.timestamp);
+                map.cursors
+                    .get_mut("one")
+                    .unwrap()
+                    .tick_at(0.0, event.timestamp + Duration::from_millis(221));
+                let mut pm = tiny_skia::Pixmap::new(200, 200).unwrap();
+                cursor_overlay::paint_cursor_art(
+                    &mut pm,
+                    &map.cursors["one"].core,
+                    0.0,
+                    0.0,
+                    None,
+                    scale,
+                );
+                let near = pm.data().chunks_exact(4).enumerate().any(|(i, p)| {
+                    p[3] >= 250
+                        && ((i % 200) as f64 + 0.5 - 60.25 * scale as f64)
+                            .hypot((i / 200) as f64 + 0.5 - 30.0 * scale as f64)
+                            <= 2.0
+                });
+                assert_eq!(
+                    near,
+                    window.is_some(),
+                    "Mac window navigation must opt into actual painted registration only"
+                );
+            }
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registered_custom_theme_refuses_real_click_gate_and_disabled_stays_immediate() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        // A cloned theme even with the same public ID is not the trusted embedded surface.
+        for disabled in [false, true] {
+            let sink = QuickApproachSink::new(disabled, true);
+            let mut custom = (*cursor_overlay::embedded_default_theme()).clone();
+            custom.hotspot = [0, 0];
+            let mut state = RenderState::new(CursorConfig::default());
+            state.core.visual.reduced_motion = cursor_overlay::ReducedMotion::On;
+            state.core.theme = Some(Arc::new(custom));
+            sink.map.lock().unwrap().cursors.insert("one".into(), state);
+            let tool =
+                ClickTool::new(Arc::new(ToolState::default())).with_visual_sink(sink.clone());
+            let receipt = DeliveryReceipt::default();
+            let calls = AtomicUsize::new(0);
+            let call = tool.dispatch_resolved(
+                "one",
+                point(60.25, 30.0, Some(42)),
+                &receipt,
+                async { None },
+                async {
+                    receipt
+                        .dispatch_checked(|| {
+                            calls.fetch_add(1, Ordering::SeqCst);
+                            Ok(())
+                        })
+                        .unwrap();
+                    cua_driver_core::protocol::ToolResult::text("accepted")
+                },
+            );
+            tokio::pin!(call);
+            if !disabled {
+                assert!(futures_util::poll!(&mut call).is_pending());
+                let frames = sink.frame(sink.start());
+                sink.present(&frames, 1, 1);
+            }
+            let result = call.await;
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                usize::from(disabled),
+                "unsupported registration must refuse before actual input"
+            );
+            assert_eq!(result.is_error == Some(true), !disabled);
+            if !disabled {
+                assert!(serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("unsupported_cursor_registration"));
+            }
+            assert_eq!(sink.pending(), 0);
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn registered_theme_change_invalidates_pending_or_presented_click_before_input() {
+        use crate::cursor::visual::{point, DeliveryReceipt, PointerVisualSink};
+        use crate::tools::{ClickTool, ToolState};
+        use std::sync::Arc;
+        for presented in [false, true] {
+            let sink = QuickApproachSink::new(false, true);
+            let receipt = DeliveryReceipt::default();
+            let tool =
+                ClickTool::new(Arc::new(ToolState::default())).with_visual_sink(sink.clone());
+            let call = tool.dispatch_resolved(
+                "one",
+                point(60.25, 30.0, Some(42)),
+                &receipt,
+                async { panic!("theme-invalidated click reached input") },
+                async { unreachable!() },
+            );
+            tokio::pin!(call);
+            assert!(futures_util::poll!(&mut call).is_pending());
+            let frames = sink.frame(sink.start());
+            assert_eq!(frames.len(), 1);
+            if presented {
+                sink.present(&frames, 1, 1);
+            }
+            sink.send(
+                "one",
+                OverlayCommand::SetTheme {
+                    theme_id: cursor_overlay::DEFAULT_THEME_ID.into(),
+                    reduced_motion: cursor_overlay::ReducedMotion::On,
+                },
+            );
+            assert_eq!(call.await.is_error, Some(true));
+            assert!(!receipt.was_accepted());
+            assert_eq!(sink.pending(), 0);
+            sink.frame(sink.start());
+            assert!(!sink.map.lock().unwrap().cursors["one"]
+                .core
+                .is_target_frame(&sink.events.lock().unwrap()[0]));
         }
     }
 
@@ -4357,7 +4509,7 @@ mod tests {
             },
         );
         inbox.acknowledge_targets(2, 1, 2, &[candidate]);
-        assert_eq!(receiver.try_recv(), Ok(()));
+        assert_eq!(receiver.try_recv(), Ok(Ok(())));
         assert!(inbox.target_current("quick", &event, 2).is_ok());
         inbox.begin_action("quick");
         assert!(inbox.target_current("quick", &event, 2).is_err());

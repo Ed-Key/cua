@@ -73,6 +73,9 @@ pub struct RenderStateCore {
     focus_rect_timestamp: Option<Instant>,
     delivery_active: bool,
     visual_owner: Option<(VisualActionId, Instant, VisualPhase)>,
+    // Mac resolved-target opt-in, owned by the accepted visual action. Legacy
+    // commands and other adapters retain their 16-point logical convention.
+    registered_target: bool,
     visual_travel: Option<(Instant, Duration)>,
     // Retain the planned arrival after travel finishes so a late inbox drain
     // can age contact against the original schedule, never its drain time.
@@ -166,7 +169,7 @@ impl RenderStateCore {
         display: Option<DisplayBounds>,
         now: Instant,
     ) -> bool {
-        self.apply_visual_event_with_approach(event, display, now, false)
+        self.apply_visual_event_with_approach(event, display, now, false, false)
     }
 
     /// Opt-in click timing for adapters that gate input on target presentation.
@@ -177,7 +180,60 @@ impl RenderStateCore {
         display: Option<DisplayBounds>,
         now: Instant,
     ) -> bool {
-        self.apply_visual_event_with_approach(event, display, now, true)
+        self.apply_visual_event_with_approach(event, display, now, true, true)
+    }
+
+    /// Mac explicit-window navigation shares registration without click gating
+    /// or changing navigation travel timing. Other adapters keep the legacy path.
+    pub fn apply_registered_navigation(
+        &mut self,
+        event: VisualEvent,
+        display: Option<DisplayBounds>,
+        now: Instant,
+    ) -> bool {
+        let register = event.action == CursorAction::Navigate && event.window.is_some();
+        self.apply_visual_event_with_approach(event, display, now, false, register)
+    }
+
+    /// Current artwork has a defensible visible-tip definition. Custom theme
+    /// metadata cannot promise this, even when its ID resembles the default.
+    pub fn target_registration_supported(&self) -> bool {
+        self.target_painted_offset().is_some()
+    }
+
+    fn target_painted_offset(&self) -> Option<tiny_skia::Point> {
+        if !self
+            .theme
+            .as_ref()
+            .is_some_and(|theme| Arc::ptr_eq(theme, &crate::embedded_default_theme()))
+        {
+            return None;
+        }
+        crate::theme_artifact::default_painted_tip_offset(&self.visual, self.heading as f32)
+    }
+
+    // One calculation drives paint anchor and arrival. The existing logical tip
+    // follows the path; the actual transformed outline is translated onto it.
+    fn registered_geometry(&self) -> Option<((f64, f64), (f64, f64))> {
+        if !self.registered_target {
+            return None;
+        }
+        let offset = self.target_painted_offset()?;
+        let desired = (
+            self.pos.0 - self.heading.cos() * 16.0,
+            self.pos.1 - self.heading.sin() * 16.0,
+        );
+        let anchor = (
+            desired.0 - f64::from(offset.x),
+            desired.1 - f64::from(offset.y),
+        );
+        Some((
+            anchor,
+            (
+                anchor.0 + f64::from(offset.x),
+                anchor.1 + f64::from(offset.y),
+            ),
+        ))
     }
 
     /// Concrete arrow-tip geometry for this exact action, never a timer-only ack.
@@ -185,10 +241,9 @@ impl RenderStateCore {
         let Some(target) = event.target else {
             return false;
         };
-        let tip = (
-            self.pos.0 - self.heading.cos() * 16.0,
-            self.pos.1 - self.heading.sin() * 16.0,
-        );
+        let Some((_, tip)) = self.registered_geometry() else {
+            return false;
+        };
         self.cfg.enabled
             && self.visible
             && self.placed
@@ -209,6 +264,7 @@ impl RenderStateCore {
         display: Option<DisplayBounds>,
         now: Instant,
         quick_approach: bool,
+        register_tip: bool,
     ) -> bool {
         if !event.is_valid() || !self.cfg.enabled || !self.visible {
             return false;
@@ -246,12 +302,18 @@ impl RenderStateCore {
             self.clear_visual_presentation();
         }
         self.visual_owner = Some((event.id, event.timestamp, event.phase));
+        if event.phase == VisualPhase::Intent
+            || !matches!(event.action, CursorAction::Click | CursorAction::Navigate)
+        {
+            self.registered_target = register_tip;
+        }
         if quick_approach {
             self.pinned_wid = event.window;
         } else if let Some(window) = event.window {
             self.pinned_wid = Some(window);
         }
         if event.phase == VisualPhase::End {
+            self.registered_target = false;
             if self.visual_travel.take().is_some() {
                 self.path = None;
             }
@@ -490,6 +552,7 @@ impl RenderStateCore {
     /// Clear action effects when placement or visibility is invalidated.
     /// Keep the ownership watermark so late events cannot rewind this instance.
     pub fn clear_visual_presentation(&mut self) {
+        self.registered_target = false;
         self.badge_modifiers = None;
         self.badge_modifier_fade_secs = None;
         self.badge_modifier_fade_started = None;
@@ -593,6 +656,7 @@ impl RenderStateCore {
             focus_rect_timestamp: None,
             delivery_active: false,
             visual_owner: None,
+            registered_target: false,
             visual_travel: None,
             visual_destination: None,
             pending_contact: None,
@@ -614,7 +678,10 @@ impl RenderStateCore {
 
     pub fn paint_radius(&self) -> f64 {
         // Cover host-owned bloom and click-pulse effects as well as theme art.
-        self.theme_paint_radius.max(64.0)
+        let translation = self.registered_geometry().map_or(0.0, |(anchor, _)| {
+            (anchor.0 - self.pos.0).hypot(anchor.1 - self.pos.1)
+        });
+        self.theme_paint_radius.max(64.0) + translation
     }
 
     pub fn cursor_is_revealed(&self) -> bool {
@@ -1198,6 +1265,7 @@ impl RenderStateCore {
                 delivery,
                 target,
             } => {
+                self.registered_target = false;
                 self.visual.begin(action, delivery, target);
                 self.badge_modifiers = if delivery.is_some() || target.is_some() {
                     Some((delivery, target))
@@ -1218,6 +1286,7 @@ impl RenderStateCore {
             } => {
                 match crate::resolve_theme_selection(&theme_id) {
                     Ok(theme) => {
+                        self.registered_target = false;
                         self.theme_paint_radius =
                             theme.as_deref().map_or(64.0, CompiledTheme::paint_radius);
                         self.theme = theme;
@@ -1485,14 +1554,17 @@ fn paint_cursor_impl(
     }
 
     if let Some(theme) = core.theme.as_deref() {
+        let (art_x, art_y) = core.registered_geometry().map_or((px, py), |(anchor, _)| {
+            ((anchor.0 - origin_x) * s, (anchor.1 - origin_y) * s)
+        });
         let tint = (theme.id == crate::DEFAULT_THEME_ID)
             .then(|| crate::session_fill_rgba(&core.cfg.cursor_id));
         crate::paint_compiled_theme_with_tint(
             pm,
             theme,
             &core.visual,
-            px as f32,
-            py as f32,
+            art_x as f32,
+            art_y as f32,
             heading as f32,
             backing_scale.max(1.0),
             alpha_scale,
@@ -2904,3 +2976,6 @@ mod tests {
         assert!(!core.is_target_frame(&next));
     }
 }
+
+#[cfg(test)]
+mod registration_tests;

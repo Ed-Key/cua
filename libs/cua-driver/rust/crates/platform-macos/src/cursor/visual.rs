@@ -282,7 +282,7 @@ impl DeliveryReceipt {
         tokio::time::timeout(std::time::Duration::from_millis(250), receiver)
             .await
             .map_err(|_| "renderer did not present the click target within 250 ms")?
-            .map_err(|_| "click approach cancelled, superseded, or surface invalidated")?;
+            .map_err(|_| "click approach cancelled, superseded, or surface invalidated")??;
         tracing::debug!(target: "cua_cursor_approach", stage = "ack_received", id = ?event.id,
             age_ms = event.timestamp.elapsed().as_secs_f64() * 1000.0,
             "click target submission acknowledged");
@@ -568,7 +568,7 @@ pub(crate) trait PointerVisualSink: Send + Sync {
         &self,
         _key: &str,
         _event: &VisualEvent,
-    ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
         Err("renderer does not support click target acknowledgement".into())
     }
     fn target_current(&self, _key: &str, _event: &VisualEvent) -> Result<(), String> {
@@ -612,7 +612,7 @@ impl PointerVisualSink for InvocationVisualSink {
         &self,
         key: &str,
         event: &VisualEvent,
-    ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
         self.inner.register_target(key, event)
     }
     fn target_current(&self, key: &str, event: &VisualEvent) -> Result<(), String> {
@@ -649,7 +649,7 @@ impl PointerVisualSink for OverlayVisualSink {
         &self,
         key: &str,
         event: &VisualEvent,
-    ) -> Result<tokio::sync::oneshot::Receiver<()>, String> {
+    ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
         super::overlay::register_target(key, event)
     }
     fn target_current(&self, key: &str, event: &VisualEvent) -> Result<(), String> {
