@@ -31,7 +31,13 @@ impl WindowPxFrame {
     pub fn to_screen(&self, cx: f64, cy: f64) -> (f64, f64, f64, f64) {
         let lx = cx / self.scale;
         let ly = cy / self.scale;
-        (self.bounds.x + lx, self.bounds.y + ly, lx, ly)
+        let (sx, sy) = cua_driver_core::geometry::screenshot_to_screen(
+            (cx, cy),
+            1.0,
+            self.scale,
+            (self.bounds.x, self.bounds.y),
+        );
+        (sx, sy, lx, ly)
     }
 }
 
@@ -309,5 +315,22 @@ mod tests {
                 .contains("list_windows"),
             "the refusal must name the retry path"
         );
+    }
+
+    #[test]
+    fn conversion_preserves_fractional_local_points_at_a_negative_origin() {
+        let mut frame = frame(2.0);
+        frame.bounds.x = -1440.0;
+        frame.bounds.y = -900.0;
+        assert_eq!(frame.to_screen(3.0, 5.0), (-1438.5, -897.5, 1.5, 2.5));
+    }
+
+    #[test]
+    fn conversion_uses_the_current_window_origin_without_resizing_again() {
+        let mut frame = frame(2.0);
+        assert_eq!(frame.to_screen(60.0, 80.0), (130.0, 620.0, 30.0, 40.0));
+        frame.bounds.x = 500.0;
+        frame.bounds.y = 100.0;
+        assert_eq!(frame.to_screen(60.0, 80.0), (530.0, 140.0, 30.0, 40.0));
     }
 }

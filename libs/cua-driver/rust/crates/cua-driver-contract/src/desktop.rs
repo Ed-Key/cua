@@ -200,7 +200,10 @@ fn get_cursor_position() -> ToolContract {
 fn move_cursor() -> ToolContract {
     contract::<MoveCursorInput, ActionResult>(
         "move_cursor",
-        "Move the real OS pointer in get_desktop_state coordinates.",
+        "Move a cursor to (x, y). Exact window targets use get_window_state screenshot \
+            pixels; explicit desktop targets use get_desktop_state screenshot pixels. On macOS, \
+            window moves affect the agent cursor overlay, desktop moves affect the real OS \
+            pointer, and legacy untargeted moves use screen points.",
         &["agent_cursor.move", "input.pointer.move"],
         ToolAnnotations {
             read_only: false,
