@@ -244,6 +244,8 @@ impl Drop for ApproachGuard {
 pub(crate) fn approach_refusal(
     error: impl std::fmt::Display,
 ) -> cua_driver_core::protocol::ToolResult {
+    tracing::debug!(target: "cua_cursor_approach", stage = "refused", reason = %error,
+        "click approach refused");
     cua_driver_core::protocol::ToolResult::error(format!(
         "Click approach refused before input: {error}"
     ))
@@ -279,6 +281,9 @@ impl DeliveryReceipt {
             .await
             .map_err(|_| "renderer did not present the click target within 250 ms")?
             .map_err(|_| "click approach cancelled, superseded, or surface invalidated")?;
+        tracing::debug!(target: "cua_cursor_approach", stage = "ack_received", id = ?event.id,
+            age_ms = event.timestamp.elapsed().as_secs_f64() * 1000.0,
+            "click target submission acknowledged");
         guard.sink.target_current(&guard.handle.key, &event)?;
         self.0.lock().unwrap().approach = Some(Arc::downgrade(&guard));
         Ok(Some(guard))
@@ -336,26 +341,28 @@ impl DeliveryReceipt {
             (state.approach.clone(), state.revalidate.clone())
         };
         if let Some(weak) = approach {
-            let guard = weak
-                .upgrade()
-                .ok_or_else(|| anyhow::anyhow!("click approach cancelled"))?;
-            if cua_driver_core::session::is_session_ended(&guard.handle.key) {
+            let (sink, handle) = {
+                let guard = weak
+                    .upgrade()
+                    .ok_or_else(|| anyhow::anyhow!("click approach cancelled"))?;
+                (guard.sink.clone(), guard.handle.clone())
+            };
+            // Readback must not extend the invocation's registration lifetime.
+            // If the caller aborts while AX blocks, its guard drops immediately
+            // and the final ownership check below refuses the pending mutation.
+            if cua_driver_core::session::is_session_ended(&handle.key) {
                 anyhow::bail!("click session ended before input");
             }
-            guard
-                .sink
-                .target_current(&guard.handle.key, guard.handle.event.as_ref().unwrap())
+            sink.target_current(&handle.key, handle.event.as_ref().unwrap())
                 .map_err(anyhow::Error::msg)?;
             if let Some(check) = revalidate {
                 check()?;
             }
             // AX/WindowServer readback can cross a concurrent publication. Check
             // ownership again after those reads, immediately before the actuator.
-            guard
-                .sink
-                .target_current(&guard.handle.key, guard.handle.event.as_ref().unwrap())
+            sink.target_current(&handle.key, handle.event.as_ref().unwrap())
                 .map_err(anyhow::Error::msg)?;
-            if cua_driver_core::session::is_session_ended(&guard.handle.key) {
+            if cua_driver_core::session::is_session_ended(&handle.key) {
                 anyhow::bail!("click session ended during target revalidation");
             }
         }
@@ -410,6 +417,7 @@ impl DeliveryReceipt {
                     anyhow::bail!("native fallback target changed after click approach; refusing input, take a fresh snapshot");
                 }
                 drop(state);
+                drop(guard);
                 return self.dispatch_checked(|| native(x, y));
             }
         }

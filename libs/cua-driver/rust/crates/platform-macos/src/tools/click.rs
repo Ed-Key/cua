@@ -922,7 +922,15 @@ impl Tool for ClickTool {
                             return Err(error);
                         }
                         let delivered = if focus_only {
-                            crate::input::ax_actions::focus_element(element as usize).is_ok()
+                            match dispatch_pixel_ax_focus(&receipt, || {
+                                crate::ax::bindings::set_bool_attr_true(element, "AXFocused")
+                            }) {
+                                Ok(accepted) => accepted,
+                                Err(error) => {
+                                    CFRelease(element as _);
+                                    return Err(error);
+                                }
+                            }
                         } else {
                             let press = core_foundation::string::CFString::new("AXPress");
                             AXUIElementPerformAction(element, press.as_concrete_TypeRef())
@@ -1164,6 +1172,19 @@ impl Tool for ClickTool {
     }
 }
 
+/// Click focus requires an accepted AX write. Typing keeps its separate best-effort helper.
+fn dispatch_pixel_ax_focus(
+    receipt: &DeliveryReceipt,
+    write: impl FnOnce() -> i32,
+) -> anyhow::Result<bool> {
+    receipt.ensure_current()?;
+    let accepted = write() == kAXErrorSuccess;
+    if accepted {
+        receipt.accepted();
+    }
+    Ok(accepted)
+}
+
 fn pixel_ax_dispatch_result(
     focus_only: bool,
     result: Result<anyhow::Result<bool>, tokio::task::JoinError>,
@@ -1312,7 +1333,7 @@ fn perform_ax_click(
         if modifiers.is_empty() {
             delivered.ensure_current()?;
             if let Some(selected_role) =
-                crate::input::ax_actions::select_nearest_container(element_ptr, delivered)
+                crate::input::ax_actions::select_nearest_container(element_ptr, delivered)?
             {
                 return Ok((
                     format!(
@@ -1433,7 +1454,7 @@ fn perform_ax_click(
         if ax_action == "AXPress" && modifiers.is_empty() {
             delivered.ensure_current()?;
             if let Some(selected_role) =
-                crate::input::ax_actions::select_nearest_container(element_ptr, delivered)
+                crate::input::ax_actions::select_nearest_container(element_ptr, delivered)?
             {
                 return Ok((
                     format!(
@@ -1553,6 +1574,27 @@ mod tests {
     use super::*;
 
     use crate::cursor::visual::test_support::{Event, RecordingSink};
+
+    #[test]
+    fn pixel_ax_focus_requires_actual_write_acceptance() {
+        for accepted in [false, true] {
+            let receipt = DeliveryReceipt::default();
+            let writes = std::cell::Cell::new(0);
+            let result = dispatch_pixel_ax_focus(&receipt, || {
+                writes.set(writes.get() + 1);
+                if accepted {
+                    kAXErrorSuccess
+                } else {
+                    crate::ax::bindings::kAXErrorFailure
+                }
+            });
+            let result = pixel_ax_dispatch_result(true, Ok(result))
+                .expect("focus must never fall through to a click");
+            assert_eq!(result.is_error == Some(true), !accepted);
+            assert_eq!(receipt.was_accepted(), accepted);
+            assert_eq!(writes.get(), 1);
+        }
+    }
 
     #[tokio::test]
     async fn quick_approach_stalled_renderer_does_not_poll_input() {

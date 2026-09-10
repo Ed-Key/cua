@@ -69,6 +69,7 @@ struct OverlayInbox {
     explicitly_disabled: bool,
     enabled_overrides: HashMap<CursorKey, bool>,
     approaches: HashMap<CursorKey, ApproachRegistration>,
+    applied_routes: HashMap<DisplayId, ZOrderRoute>,
     // Generic admission hands its context to one resolved action. Subsequent
     // events carry that action's context even after presentation expires.
     contexts: HashMap<
@@ -87,6 +88,39 @@ struct ApproachRegistration {
     sender: Option<tokio::sync::oneshot::Sender<()>>,
     deadline: tokio::time::Instant,
     presented: Option<(u64, DisplayId)>,
+    timing: ApproachTiming,
+}
+
+/// Fixed-size per-action evidence, emitted once off AppKit main at guard cleanup.
+#[derive(Debug)]
+struct ApproachTiming {
+    started: Instant,
+    first_frame_ms: Option<f64>,
+    target_frame_ms: Option<f64>,
+    submission_ms: Option<f64>,
+    acknowledgement_ms: Option<f64>,
+    frames: u32,
+    geometry_matches: bool,
+    route_matches: bool,
+    surface_matches: bool,
+}
+impl ApproachTiming {
+    fn new() -> Self {
+        Self {
+            started: Instant::now(),
+            first_frame_ms: None,
+            target_frame_ms: None,
+            submission_ms: None,
+            acknowledgement_ms: None,
+            frames: 0,
+            geometry_matches: false,
+            route_matches: false,
+            surface_matches: false,
+        }
+    }
+    fn elapsed_ms(&self) -> f64 {
+        self.started.elapsed().as_secs_f64() * 1000.0
+    }
 }
 
 #[derive(Clone)]
@@ -129,6 +163,7 @@ impl OverlayInbox {
                 event: event.clone(),
                 sender: Some(sender),
                 presented: None,
+                timing: ApproachTiming::new(),
                 surface_generation,
                 deadline: tokio::time::Instant::now() + Duration::from_millis(250),
             },
@@ -136,13 +171,19 @@ impl OverlayInbox {
         Ok(receiver)
     }
 
-    fn release_target(&mut self, key: &str, event: &cursor_overlay::VisualEvent) {
+    fn release_target(
+        &mut self,
+        key: &str,
+        event: &cursor_overlay::VisualEvent,
+    ) -> Option<ApproachRegistration> {
         if self
             .approaches
             .get(key)
             .is_some_and(|pending| same_target(&pending.event, event))
         {
-            self.approaches.remove(key);
+            self.approaches.remove(key)
+        } else {
+            None
         }
     }
 
@@ -158,7 +199,13 @@ impl OverlayInbox {
                 same_target(&pending.event, event)
                     && pending
                         .presented
-                        .is_some_and(|(surface_generation, _)| surface_generation == generation)
+                        .is_some_and(|(surface_generation, display)| {
+                            surface_generation == generation
+                                && self.applied_routes.get(&display).is_some_and(|route| {
+                                    route.generation == generation
+                                        && route.target_wid == event.window
+                                })
+                        })
             })
         {
             Ok(())
@@ -170,6 +217,34 @@ impl OverlayInbox {
     fn invalidate_surface_frame(&mut self, generation: u64, display: DisplayId) {
         for pending in self.approaches.values_mut() {
             if pending.presented == Some((generation, display)) {
+                pending.presented = None;
+            }
+        }
+    }
+
+    /// Replacing a target by the same proven geometry does not withdraw readiness
+    /// during Core Animation submission. Omitted or obsolete targets do.
+    fn prepare_surface_frame(
+        &mut self,
+        generation: u64,
+        display: DisplayId,
+        targets: &[TargetFrame],
+    ) {
+        for (key, pending) in &mut self.approaches {
+            if pending.presented != Some((generation, display)) {
+                continue;
+            }
+            let retained = self.visual.owns_action(key, pending.event.id)
+                && self.applied_routes.get(&display).is_some_and(|route| {
+                    route.generation == generation && route.target_wid == pending.event.window
+                })
+                && targets.iter().any(|target| {
+                    target.generation == generation
+                        && target.display_id == display
+                        && target.key == *key
+                        && same_target(&target.event, &pending.event)
+                });
+            if !retained {
                 pending.presented = None;
             }
         }
@@ -193,7 +268,10 @@ impl OverlayInbox {
             if target.generation != generation || target.display_id != display {
                 continue;
             }
-            if !self.visual.owns_action(&target.key, target.event.id) {
+            if !self.applied_routes.get(&display).is_some_and(|route| {
+                route.generation == generation && route.target_wid == target.event.window
+            }) || !self.visual.owns_action(&target.key, target.event.id)
+            {
                 continue;
             }
             if let Some(pending) = self.approaches.get_mut(&target.key) {
@@ -203,6 +281,7 @@ impl OverlayInbox {
                 {
                     pending.presented = Some((generation, display));
                     if let Some(sender) = pending.sender.take() {
+                        pending.timing.acknowledgement_ms = Some(pending.timing.elapsed_ms());
                         let _ = sender.send(());
                     }
                 }
@@ -443,9 +522,14 @@ fn apply_visual_in_map(
         .cursors
         .entry(key.clone())
         .or_insert_with(|| render_state_for_key(&map.template, &key));
-    let accepted = if event.action == cursor_overlay::CursorAction::Click
-        && event.phase == cursor_overlay::VisualPhase::Intent
-    {
+    let quick = event.action == cursor_overlay::CursorAction::Click
+        && event.phase == cursor_overlay::VisualPhase::Intent;
+    if quick {
+        tracing::debug!(target: "cua_cursor_approach", stage = "intent_drained", id = ?event.id,
+            age_ms = event.timestamp.elapsed().as_secs_f64() * 1000.0,
+            "click intent reached render worker");
+    }
+    let accepted = if quick {
         state.core.apply_click_approach(event, bounds, now)
     } else {
         state.core.apply_visual_event(event, bounds, now)
@@ -481,6 +565,8 @@ pub(crate) fn register_target(
         event,
         DISPLAY_GENERATION.load(Ordering::Acquire),
     )?;
+    tracing::debug!(target: "cua_cursor_approach", stage = "registered", id = ?event.id,
+        "click approach registered");
     wake_renderer();
     Ok(receiver)
 }
@@ -491,7 +577,12 @@ pub(crate) fn target_current(key: &str, event: &cursor_overlay::VisualEvent) -> 
         .target_current(key, event, DISPLAY_GENERATION.load(Ordering::Acquire))
 }
 pub(crate) fn release_target(key: &str, event: &cursor_overlay::VisualEvent) {
-    inbox().lock().unwrap().release_target(key, event);
+    let released = inbox().lock().unwrap().release_target(key, event);
+    if let Some(pending) = released {
+        tracing::debug!(target: "cua_cursor_approach", stage = "released", id = ?event.id,
+            surface_generation = pending.surface_generation, timing = ?pending.timing,
+            elapsed_ms = pending.timing.elapsed_ms(), "click approach frame evidence");
+    }
 }
 
 /// Allocate an action in the active session without reading renderer state.
@@ -907,11 +998,44 @@ fn render_map_needs_frame_tick(map: &RenderMap) -> bool {
     map.cursors.values().any(RenderState::needs_frame_tick)
 }
 
+fn render_frame_tick_needed(map: &RenderMap, inbox: &OverlayInbox) -> bool {
+    render_map_needs_frame_tick(map)
+        || inbox.approaches.values().any(|pending| {
+            pending.sender.is_some() && tokio::time::Instant::now() < pending.deadline
+        })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ZOrderRoute {
     generation: u64,
     display_id: DisplayId,
     target_wid: Option<u64>,
+}
+
+/// Invalidate before ordering, then publish the applied route after AppKit returns.
+/// Both admission sections are nonblocking and never enclose native work.
+fn apply_surface_route(
+    admission: &Mutex<OverlayInbox>,
+    route: ZOrderRoute,
+    apply: impl FnOnce(),
+) -> bool {
+    let Ok(mut state) = admission.try_lock() else {
+        return false;
+    };
+    if state.applied_routes.get(&route.display_id) != Some(&route) {
+        state.invalidate_surface_frame(route.generation, route.display_id);
+        state.applied_routes.remove(&route.display_id);
+    }
+    drop(state);
+    apply();
+    let Ok(mut state) = admission.try_lock() else {
+        return false;
+    };
+    state
+        .applied_routes
+        .retain(|_, old| old.generation == route.generation);
+    state.applied_routes.insert(route.display_id, route);
+    true
 }
 
 fn z_order_routes(map: &RenderMap) -> Vec<ZOrderRoute> {
@@ -1145,7 +1269,6 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
     let mut frame_tick_needed = false;
     let mut hover_poll_needed = false;
     let mut presented_displays = HashSet::<DisplayId>::new();
-    let mut presented_z_order = Vec::<ZOrderRoute>::new();
     let mut repin_frames: u32 = 0;
 
     loop {
@@ -1165,6 +1288,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
         };
 
         let woke_from_idle = first_msg.is_some();
+        let mut received_wake = woke_from_idle;
         let now = Instant::now();
         let dt = if woke_from_idle {
             0.0
@@ -1175,7 +1299,9 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
 
         // The notification carries no command history. Release the producer
         // lock before acquiring renderer state, planning paths or touching AppKit.
-        while rx.try_recv().is_ok() {}
+        while rx.try_recv().is_ok() {
+            received_wake = true;
+        }
         let batch = inbox().lock().unwrap().take();
 
         let (
@@ -1191,7 +1317,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                 break;
             };
             let cursor_commanded = batch.apply(map, now);
-            let had_msg = first_msg.is_some() || cursor_commanded;
+            let had_msg = received_wake || cursor_commanded;
 
             if frame_tick_needed || had_msg {
                 for state in map.cursors.values_mut() {
@@ -1217,7 +1343,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             }
 
             let z_order = z_order_routes(map);
-            let next_frame_tick_needed = render_map_needs_frame_tick(map);
+            let next_frame_tick_needed = render_frame_tick_needed(map, &inbox().lock().unwrap());
             let next_hover_poll_needed = map
                 .cursors
                 .values()
@@ -1235,9 +1361,16 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
 
         if frame_tick_needed || had_msg {
             repin_frames += 1;
+            let applied_routes: Vec<_> = inbox()
+                .lock()
+                .unwrap()
+                .applied_routes
+                .values()
+                .cloned()
+                .collect();
             for route in z_order_updates(
                 &z_order,
-                &presented_z_order,
+                &applied_routes,
                 repin_frames >= 60,
                 cursor_commanded,
             ) {
@@ -1248,7 +1381,6 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                     None => dispatch_order_front(route.generation, route.display_id),
                 }
             }
-            presented_z_order = z_order;
             if repin_frames >= 60 {
                 repin_frames = 0;
             }
@@ -1278,7 +1410,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                                     map.layout.generation,
                                     display.id,
                                     render_display(map, display),
-                                    target_frames(map, display, &inbox().lock().unwrap()),
+                                    target_frames(map, display, &mut inbox().lock().unwrap()),
                                 )
                             })
                     })
@@ -1437,24 +1569,32 @@ fn dispatch_on_main(work: MainWork) {
 fn target_frames(
     map: &RenderMap,
     display: DisplayGeometry,
-    inbox: &OverlayInbox,
+    inbox: &mut OverlayInbox,
 ) -> Vec<TargetFrame> {
     let route = z_order_routes(map)
         .into_iter()
         .find(|route| route.display_id == display.id);
     inbox
         .approaches
-        .iter()
+        .iter_mut()
         .filter_map(|(key, pending)| {
             let target = pending.event.target?;
             let state = map.cursors.get(key)?;
-            (pending.surface_generation == map.layout.generation
-                && display.contains(target.0, target.1)
-                && route
-                    .as_ref()
-                    .is_some_and(|route| route.target_wid == pending.event.window)
-                && state.core.is_target_frame(&pending.event))
-            .then(|| TargetFrame {
+            let timing = &mut pending.timing;
+            let elapsed = timing.elapsed_ms();
+            timing.frames = timing.frames.saturating_add(1);
+            timing.first_frame_ms.get_or_insert(elapsed);
+            timing.surface_matches = pending.surface_generation == map.layout.generation
+                && display.contains(target.0, target.1);
+            timing.route_matches = route
+                .as_ref()
+                .is_some_and(|route| route.target_wid == pending.event.window);
+            timing.geometry_matches = state.core.is_target_frame(&pending.event);
+            let ready = timing.surface_matches && timing.route_matches && timing.geometry_matches;
+            if ready {
+                timing.target_frame_ms.get_or_insert(elapsed);
+            }
+            ready.then(|| TargetFrame {
                 key: key.clone(),
                 event: pending.event.clone(),
                 generation: map.layout.generation,
@@ -1462,6 +1602,39 @@ fn target_frames(
             })
         })
         .collect()
+}
+
+/// Apply pixels without keeping admission locked across native submission.
+fn apply_surface_frame(
+    admission: &Mutex<OverlayInbox>,
+    generation: u64,
+    display: DisplayId,
+    current_generation: impl Fn() -> u64,
+    targets: &[TargetFrame],
+    apply: impl FnOnce(),
+) -> bool {
+    if generation != current_generation() {
+        return false;
+    }
+    let Ok(mut state) = admission.try_lock() else {
+        return false;
+    };
+    state.prepare_surface_frame(generation, display, targets);
+    for target in targets {
+        if let Some(pending) = state.approaches.get_mut(&target.key) {
+            if same_target(&pending.event, &target.event) {
+                let elapsed = pending.timing.elapsed_ms();
+                pending.timing.submission_ms.get_or_insert(elapsed);
+            }
+        }
+    }
+    drop(state);
+    apply();
+    let Ok(mut state) = admission.try_lock() else {
+        return false;
+    };
+    state.acknowledge_targets(generation, display, current_generation(), targets);
+    true
 }
 
 /// Present one display-local pixmap. AppKit objects remain main-thread-owned;
@@ -1488,36 +1661,23 @@ fn dispatch_present(
         {
             let layer = surface.layer_ptr as *mut objc2::runtime::AnyObject;
             let image = cg_image_ptr as *mut objc2::runtime::AnyObject;
-            // Never wait for the producer or render worker on AppKit main.
-            // If admission is busy, skip this frame and wake the renderer. Never
-            // overwrite a ready frame without updating its acknowledgement state.
-            let may_apply = if let Ok(mut admission) = inbox().try_lock() {
-                admission.invalidate_surface_frame(generation, display_id);
-                true
-            } else {
-                false
-            };
-            if may_apply {
-                let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
-                let _: () = objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
-                let _: () = objc2::msg_send![layer, setContents: image];
-                let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
-                let _: () = objc2::msg_send![objc2::class!(CATransaction), flush];
-                // This proves AppKit/Core Animation submission, not physical scanout
-                // or absence of occlusion by another application's window.
-                // Never hold admission across AppKit/Core Animation calls. Even a
-                // stalled compositor cannot prevent the async approach from timing out.
-                if let Ok(mut admission) = inbox().try_lock() {
-                    admission.acknowledge_targets(
-                        generation,
-                        display_id,
-                        DISPLAY_GENERATION.load(Ordering::Acquire),
-                        &targets,
-                    );
-                } else {
-                    wake_renderer();
-                }
-            } else {
+            // AppKit/Core Animation submission, not physical scanout or occlusion proof.
+            // Admission never encloses these calls, including a stalled flush.
+            if !apply_surface_frame(
+                inbox(),
+                generation,
+                display_id,
+                || DISPLAY_GENERATION.load(Ordering::Acquire),
+                &targets,
+                || {
+                    let _: () = objc2::msg_send![objc2::class!(CATransaction), begin];
+                    let _: () =
+                        objc2::msg_send![objc2::class!(CATransaction), setDisableActions: true];
+                    let _: () = objc2::msg_send![layer, setContents: image];
+                    let _: () = objc2::msg_send![objc2::class!(CATransaction), commit];
+                    let _: () = objc2::msg_send![objc2::class!(CATransaction), flush];
+                },
+            ) {
                 wake_renderer();
             }
         }
@@ -1539,7 +1699,19 @@ fn dispatch_order_front(generation: u64, display_id: DisplayId) {
             .and_then(|host| host.surfaces.get(&display_id))
         {
             let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
-            let _: () = objc2::msg_send![win, orderFrontRegardless];
+            if !apply_surface_route(
+                inbox(),
+                ZOrderRoute {
+                    generation,
+                    display_id,
+                    target_wid: None,
+                },
+                || {
+                    let _: () = objc2::msg_send![win, orderFrontRegardless];
+                },
+            ) {
+                wake_renderer();
+            }
         }
     }));
 }
@@ -1587,9 +1759,22 @@ fn dispatch_pin_above(generation: u64, display_id: DisplayId, target_wid: u64) {
             .and_then(|host| host.surfaces.get(&display_id))
         {
             let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
-            let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
-            if raise_front {
-                let _: () = objc2::msg_send![win, orderFrontRegardless];
+            if !apply_surface_route(
+                inbox(),
+                ZOrderRoute {
+                    generation,
+                    display_id,
+                    target_wid: Some(target_wid),
+                },
+                || {
+                    let _: () =
+                        objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
+                    if raise_front {
+                        let _: () = objc2::msg_send![win, orderFrontRegardless];
+                    }
+                },
+            ) {
+                wake_renderer();
             }
         }
     }));
@@ -2268,13 +2453,24 @@ mod tests {
             }
             let display = map.layout.displays[0];
             let pixels = render_display(&map, display);
-            let frames = target_frames(&map, display, &self.inbox.lock().unwrap());
+            let frames = target_frames(&map, display, &mut self.inbox.lock().unwrap());
             if !frames.is_empty() {
                 assert!(pixels.data().chunks_exact(4).any(|pixel| pixel[3] != 0));
             }
             frames
         }
         fn present(&self, frames: &[TargetFrame], generation: u64, display: DisplayId) {
+            if let Some(frame) = frames.first() {
+                assert!(apply_surface_route(
+                    &self.inbox,
+                    ZOrderRoute {
+                        generation,
+                        display_id: display,
+                        target_wid: frame.event.window,
+                    },
+                    || {}
+                ));
+            }
             self.inbox.lock().unwrap().acknowledge_targets(
                 generation,
                 display,
@@ -2780,6 +2976,247 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn quick_approach_waiter_keeps_production_frame_scheduler_awake_until_deadline() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        let sink = QuickApproachSink::new(false, true);
+        sink.map.lock().unwrap().template.motion.idle_hide_ms = 0.0;
+        let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+            .with_visual_sink(sink.clone());
+        let receipt = DeliveryReceipt::default();
+        let call = tool.dispatch_resolved(
+            "one",
+            point(80.0, 30.0, Some(42)),
+            &receipt,
+            async { panic!("no applied target yet") },
+            async { unreachable!() },
+        );
+        tokio::pin!(call);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        // Renderer progressed, but submission did not acknowledge. No timer-only admission.
+        sink.frame(sink.start() + Duration::from_secs(2));
+        let map = sink.map.lock().unwrap();
+        assert!(!render_map_needs_frame_tick(&map));
+        assert!(render_frame_tick_needed(&map, &sink.inbox.lock().unwrap()));
+        drop(map);
+        tokio::time::advance(Duration::from_millis(250)).await;
+        assert_eq!(call.await.is_error, Some(true));
+        assert!(!receipt.was_accepted());
+        assert_eq!(sink.pending(), 0);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quick_approach_selection_read_cannot_outlive_admission() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::input::ax_actions::{select_nearest_container_with, SelectionAccess};
+        use crate::tools::{ClickTool, ToolState};
+        use std::cell::Cell;
+        struct Ax<'a> {
+            sink: &'a QuickApproachSink,
+            writes: Cell<usize>,
+            releases: Cell<usize>,
+            invalidate: bool,
+        }
+        impl SelectionAccess for Ax<'_> {
+            fn role(&self, element: usize) -> String {
+                if element == 1 { "AXTextField" } else { "AXRow" }.into()
+            }
+            fn selected(&self, _: usize) -> Option<bool> {
+                if self.invalidate {
+                    self.sink.inbox.lock().unwrap().begin_action("one");
+                }
+                Some(false) // accepted writes deliberately fail readback as well
+            }
+            fn set_selected(&self, _: usize) -> i32 {
+                self.writes.set(self.writes.get() + 1);
+                0
+            }
+            fn parent(&self, element: usize) -> Option<usize> {
+                (element == 1).then_some(2)
+            }
+            fn release(&self, _: usize) {
+                self.releases.set(self.releases.get() + 1);
+            }
+        }
+        for invalidate in [true, false] {
+            let sink = QuickApproachSink::new(false, true);
+            let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+                .with_visual_sink(sink.clone());
+            let receipt = DeliveryReceipt::default();
+            let ax = Ax {
+                sink: &sink,
+                writes: Cell::new(0),
+                releases: Cell::new(0),
+                invalidate,
+            };
+            let call = tool.dispatch_resolved(
+                "one",
+                point(80.0, 30.0, Some(42)),
+                &receipt,
+                async {
+                    let result = select_nearest_container_with(1, &receipt, &ax);
+                    assert_eq!(result.is_err(), invalidate);
+                    Some(cua_driver_core::protocol::ToolResult::error(
+                        "selection not verified",
+                    ))
+                },
+                async { panic!("selection admission failure reached native fallback") },
+            );
+            tokio::pin!(call);
+            assert!(futures_util::poll!(&mut call).is_pending());
+            let frames = sink.frame(sink.start());
+            sink.present(&frames, 1, 1);
+            assert_eq!(call.await.is_error, Some(true));
+            assert_eq!(ax.writes.get(), usize::from(!invalidate));
+            assert_eq!(ax.releases.get(), 1);
+            assert_eq!(receipt.was_accepted(), !invalidate);
+            let contacts: Vec<_> = sink
+                .events
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|e| e.phase == cursor_overlay::VisualPhase::Contact)
+                .cloned()
+                .collect();
+            assert_eq!(contacts.len(), usize::from(!invalidate));
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quick_approach_matching_frame_keeps_admission_through_submission() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        for replacement in ["same", "omitted", "changed"] {
+            let sink = QuickApproachSink::new(false, true);
+            let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+                .with_visual_sink(sink.clone());
+            let receipt = DeliveryReceipt::default();
+            let (resume, wait) = tokio::sync::oneshot::channel::<()>();
+            let call = tool.dispatch_resolved(
+                "one",
+                point(80.0, 30.0, Some(42)),
+                &receipt,
+                async { None },
+                async {
+                    wait.await.unwrap();
+                    match receipt.dispatch_checked(|| Ok(())) {
+                        Ok(()) => cua_driver_core::protocol::ToolResult::text("accepted"),
+                        Err(e) => cua_driver_core::protocol::ToolResult::error(e.to_string()),
+                    }
+                },
+            );
+            tokio::pin!(call);
+            assert!(futures_util::poll!(&mut call).is_pending());
+            let frames = sink.frame(sink.start());
+            sink.present(&frames, 1, 1);
+            assert!(futures_util::poll!(&mut call).is_pending());
+            assert!(receipt.ensure_current().is_ok());
+            assert!(apply_surface_route(
+                &sink.inbox,
+                ZOrderRoute {
+                    generation: 1,
+                    display_id: 1,
+                    target_wid: Some(42),
+                },
+                || {
+                    assert!(receipt.ensure_current().is_ok());
+                }
+            ));
+            let mut next = frames.clone();
+            if replacement == "omitted" {
+                next.clear();
+            }
+            if replacement == "changed" {
+                next[0].event.target = Some((81.0, 30.0));
+            }
+            assert!(apply_surface_frame(
+                &sink.inbox,
+                1,
+                1,
+                || 1,
+                &next,
+                || {
+                    // A live readback may return during setContents/commit/flush.
+                    assert_eq!(receipt.ensure_current().is_ok(), replacement == "same");
+                }
+            ));
+            resume.send(()).unwrap();
+            assert_eq!(call.await.is_error == Some(true), replacement != "same");
+            assert_eq!(receipt.was_accepted(), replacement == "same");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn quick_approach_route_change_invalidates_before_native_ordering() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        let sink = QuickApproachSink::new(false, true);
+        let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+            .with_visual_sink(sink.clone());
+        let receipt = DeliveryReceipt::default();
+        let call = tool.dispatch_resolved(
+            "one",
+            point(80.0, 30.0, Some(42)),
+            &receipt,
+            async { None },
+            async {
+                receipt
+                    .dispatch_checked(|| -> anyhow::Result<()> {
+                        panic!("obsolete surface dispatched")
+                    })
+                    .unwrap();
+                unreachable!()
+            },
+        );
+        tokio::pin!(call);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        let frames = sink.frame(sink.start());
+        sink.present(&frames, 1, 1);
+        let event = frames[0].event.clone();
+        assert!(sink
+            .inbox
+            .lock()
+            .unwrap()
+            .target_current("one", &event, 1)
+            .is_ok());
+        // Session two has a different window on the same physical surface.
+        let id = sink.inbox.lock().unwrap().begin_action("two").unwrap();
+        let mut other = event.clone();
+        other.id = id;
+        other.window = Some(77);
+        sink.inbox.lock().unwrap().publish("two", other);
+        assert!(apply_surface_route(
+            &sink.inbox,
+            ZOrderRoute {
+                generation: 1,
+                display_id: 1,
+                target_wid: Some(77),
+            },
+            || {
+                assert!(sink
+                    .inbox
+                    .lock()
+                    .unwrap()
+                    .target_current("one", &event, 1)
+                    .is_err());
+            }
+        ));
+        // A queued old frame cannot establish readiness under the new route.
+        sink.inbox
+            .lock()
+            .unwrap()
+            .acknowledge_targets(1, 1, 1, &frames);
+        assert!(sink
+            .inbox
+            .lock()
+            .unwrap()
+            .target_current("one", &event, 1)
+            .is_err());
+        assert_eq!(call.await.is_error, Some(true));
+        assert!(!receipt.was_accepted());
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn quick_approach_deadline_does_not_take_the_stalled_render_lock() {
         use crate::cursor::visual::{point, DeliveryReceipt};
         use crate::tools::{ClickTool, ToolState};
@@ -2803,6 +3240,84 @@ mod tests {
             .unwrap()
             .approaches
             .contains_key("quick-real-stalled"));
+    }
+
+    #[tokio::test]
+    async fn quick_approach_cancelled_call_cannot_keep_registration_alive_during_native_readback() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        use std::sync::{
+            atomic::{AtomicUsize, Ordering},
+            Arc,
+        };
+        for fallback in [false, true] {
+            let sink = QuickApproachSink::new(false, true);
+            let receipt = Arc::new(DeliveryReceipt::default());
+            let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+            let started_tx = Mutex::new(Some(started_tx));
+            let (release_tx, release_rx) = std::sync::mpsc::channel();
+            let release_rx = Mutex::new(release_rx);
+            let reads = AtomicUsize::new(0);
+            receipt.set_revalidation(move || {
+                if reads.fetch_add(1, Ordering::SeqCst) == if fallback { 3 } else { 2 } {
+                    started_tx.lock().unwrap().take().unwrap().send(()).unwrap();
+                    release_rx.lock().unwrap().recv().unwrap();
+                }
+                Ok(())
+            });
+            let tool =
+                ClickTool::new(Arc::new(ToolState::default())).with_visual_sink(sink.clone());
+            let delivered = Arc::new(AtomicUsize::new(0));
+            let observed = delivered.clone();
+            let (finished_tx, finished_rx) = tokio::sync::oneshot::channel();
+            let invocation = tokio::spawn(async move {
+                let worker_receipt = receipt.clone();
+                tool.dispatch_resolved(
+                    "one",
+                    point(80.0, 30.0, Some(42)),
+                    &receipt,
+                    async { None },
+                    async {
+                        tokio::task::spawn_blocking(move || {
+                            let mutate = || {
+                                observed.fetch_add(1, Ordering::SeqCst);
+                                Ok(())
+                            };
+                            let result = if fallback {
+                                worker_receipt.dispatch_at(
+                                    &super::super::CursorRegistry::new(),
+                                    80.0,
+                                    30.0,
+                                    42,
+                                    |_, _| mutate(),
+                                )
+                            } else {
+                                worker_receipt.dispatch_checked(mutate)
+                            };
+                            finished_tx.send(result.is_err()).unwrap();
+                        })
+                        .await
+                        .unwrap();
+                        cua_driver_core::protocol::ToolResult::text("finished")
+                    },
+                )
+                .await
+            });
+            // The publication barrier is a yield, with no real timer or native input.
+            while sink.pending() == 0 {
+                tokio::task::yield_now().await;
+            }
+            sink.present(&sink.frame(sink.start()), 1, 1);
+            started_rx.await.unwrap();
+            invocation.abort();
+            assert!(invocation.await.unwrap_err().is_cancelled());
+            let registrations_after_cancel = sink.pending();
+            release_tx.send(()).unwrap();
+            let refused = finished_rx.await.unwrap();
+            assert_eq!(registrations_after_cancel, 0);
+            assert!(refused);
+            assert_eq!(delivered.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[test]
@@ -2838,6 +3353,14 @@ mod tests {
         changed.event.target = Some((21.0, 30.0));
         inbox.acknowledge_targets(2, 1, 2, &[changed]);
         assert!(receiver.try_recv().is_err());
+        inbox.applied_routes.insert(
+            1,
+            ZOrderRoute {
+                generation: 2,
+                display_id: 1,
+                target_wid: event.window,
+            },
+        );
         inbox.acknowledge_targets(2, 1, 2, &[candidate]);
         assert_eq!(receiver.try_recv(), Ok(()));
         assert!(inbox.target_current("quick", &event, 2).is_ok());

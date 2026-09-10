@@ -32,42 +32,81 @@ fn is_selectable_container_role(role: &str) -> bool {
 pub(crate) fn select_nearest_container(
     element_ptr: usize,
     delivered: &DeliveryReceipt,
-) -> Option<String> {
-    let mut current = element_ptr as AXUIElementRef;
-    let mut owns_current = false;
+) -> anyhow::Result<Option<String>> {
+    select_nearest_container_with(element_ptr, delivered, &NativeSelectionAccess)
+}
 
+/// Private AX boundary: traversal and mutation use the same admission path in tests.
+pub(crate) trait SelectionAccess {
+    fn role(&self, element: usize) -> String;
+    fn selected(&self, element: usize) -> Option<bool>;
+    fn set_selected(&self, element: usize) -> i32;
+    fn parent(&self, element: usize) -> Option<usize>;
+    fn release(&self, element: usize);
+}
+
+struct NativeSelectionAccess;
+impl SelectionAccess for NativeSelectionAccess {
+    fn role(&self, element: usize) -> String {
+        unsafe { copy_string_attr(element as AXUIElementRef, "AXRole") }.unwrap_or_default()
+    }
+    fn selected(&self, element: usize) -> Option<bool> {
+        unsafe { copy_bool_attr(element as AXUIElementRef, "AXSelected") }
+    }
+    fn set_selected(&self, element: usize) -> i32 {
+        unsafe { set_bool_attr_true(element as AXUIElementRef, "AXSelected") }
+    }
+    fn parent(&self, element: usize) -> Option<usize> {
+        unsafe { copy_element_attr(element as AXUIElementRef, "AXParent") }.map(|ptr| ptr as usize)
+    }
+    fn release(&self, element: usize) {
+        unsafe { CFRelease(element as CFTypeRef) };
+    }
+}
+
+pub(crate) fn select_nearest_container_with(
+    element_ptr: usize,
+    delivered: &DeliveryReceipt,
+    ax: &impl SelectionAccess,
+) -> anyhow::Result<Option<String>> {
+    let mut current = element_ptr;
+    let mut owns_current = false;
     for _ in 0..MAX_SELECTION_ANCESTORS {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
-        if is_selectable_container_role(&role)
-            && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
-        {
-            let err = unsafe { set_bool_attr_true(current, "AXSelected") };
+        let role = ax.role(current);
+        if is_selectable_container_role(&role) && ax.selected(current).is_some() {
+            // Traversal/readback can block. Revalidate after those reads and before
+            // each actual write. Refusal must propagate, never become a fallback.
+            if let Err(error) = delivered.ensure_current() {
+                if owns_current {
+                    ax.release(current);
+                }
+                return Err(error);
+            }
+            let err = ax.set_selected(current);
             if err == kAXErrorSuccess {
                 delivered.accepted();
-                if unsafe { copy_bool_attr(current, "AXSelected") } == Some(true) {
+                if ax.selected(current) == Some(true) {
                     if owns_current {
-                        unsafe { CFRelease(current as CFTypeRef) };
+                        ax.release(current);
                     }
-                    return Some(role);
+                    return Ok(Some(role));
                 }
             }
         }
-
-        let parent = unsafe { copy_element_attr(current, "AXParent") };
+        let parent = ax.parent(current);
         if owns_current {
-            unsafe { CFRelease(current as CFTypeRef) };
+            ax.release(current);
         }
         let Some(parent) = parent else {
-            return None;
+            return Ok(None);
         };
         current = parent;
         owns_current = true;
     }
-
     if owns_current {
-        unsafe { CFRelease(current as CFTypeRef) };
+        ax.release(current);
     }
-    None
+    Ok(None)
 }
 
 /// Read the selection state of the nearest collection-like element without
