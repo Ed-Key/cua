@@ -16,7 +16,12 @@ pub mod session_badge;
 pub mod theme;
 pub mod theme_artifact;
 pub mod util;
+pub mod visual_events;
 pub mod z_order;
+pub use visual_events::{
+    PendingVisualState, ScrollDirection, VisualActionId, VisualEvent, VisualLifecycle,
+    VisualMailbox, VisualPhase,
+};
 
 pub use badge_glyphs::{BadgeChip, BadgeGlyph};
 pub use bezier::CubicBezier;

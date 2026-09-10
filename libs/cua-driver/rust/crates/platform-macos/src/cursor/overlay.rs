@@ -4,9 +4,10 @@
 //!
 //! The MCP/tokio server runs on a **background thread** (spawned in
 //! `cua-driver/src/main.rs`).  AppKit MUST run on the **main thread**.
-//! The two sides communicate through a bounded process-global channel:
+//! Producers publish into a small process-global inbox:
 //!
-//! - MCP tool calls → `send_command(OverlayCommand)` → `CMD_TX` (SyncSender)
+//! - Legacy commands retain a bounded queue; action events coalesce per session.
+//! - A capacity-one notification wakes the renderer without carrying visual history.
 //! - render worker → per-display pixmaps → main-thread `AppKitOverlayHost`
 //!
 //! One shared render map owns cursor state. The AppKit host owns one transparent
@@ -75,16 +76,155 @@ fn arrival_fire(key: &CursorKey) {
 // ── Global overlay state ──────────────────────────────────────────────────
 
 enum MacOverlayMsg {
-    Cursor(OverlayMsg),
-    LayoutChanged,
+    Wake,
 }
 
 static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<MacOverlayMsg>> = OnceLock::new();
 // Single-consumer slot; receiver is moved into run_on_main_thread().
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<MacOverlayMsg>>> = Mutex::new(None);
+static INBOX: OnceLock<Mutex<OverlayInbox>> = OnceLock::new();
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 static HOST: Mutex<Option<AppKitOverlayHost>> = Mutex::new(None);
 static DISPLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
+
+// Only this small inbox is shared with action publishers.
+#[derive(Default)]
+struct OverlayInbox {
+    visual: cursor_overlay::VisualMailbox,
+    commands: Vec<(u64, OverlayMsg)>,
+}
+
+impl OverlayInbox {
+    fn command(&mut self, message: OverlayMsg) {
+        match message {
+            OverlayMsg::Remove(key) => self.visual.remove(&key),
+            OverlayMsg::Revive(key) => self.visual.revive(&key),
+            message => {
+                // Preserve the legacy bounded, drop-newest command behavior.
+                if self.commands.len() < 4096 {
+                    let order = self.visual.next_order();
+                    self.commands.push((order, message));
+                } else if let OverlayMsg::Cmd(KeyedOverlayCommand {
+                    key,
+                    cmd: OverlayCommand::MoveTo { .. },
+                }) = message
+                {
+                    arrival_fire(&key);
+                }
+            }
+        }
+    }
+    fn take(&mut self) -> InboxBatch {
+        InboxBatch {
+            commands: std::mem::take(&mut self.commands),
+            pending: self.visual.take_pending(),
+        }
+    }
+}
+
+struct InboxBatch {
+    commands: Vec<(u64, OverlayMsg)>,
+    pending: HashMap<CursorKey, cursor_overlay::PendingVisualState>,
+}
+
+impl InboxBatch {
+    fn apply(self, map: &mut RenderMap) -> bool {
+        enum Item {
+            Command(OverlayMsg),
+            Visual(CursorKey, cursor_overlay::VisualEvent),
+            Lifecycle(CursorKey, cursor_overlay::VisualLifecycle),
+        }
+        let mut items: Vec<_> = self
+            .commands
+            .into_iter()
+            .map(|(order, message)| (order, Item::Command(message)))
+            .collect();
+        for (key, pending) in self.pending {
+            if let Some((order, lifecycle)) = pending.lifecycle {
+                items.push((order, Item::Lifecycle(key.clone(), lifecycle)));
+            }
+            for published in [pending.latest, pending.contact, pending.end]
+                .into_iter()
+                .flatten()
+            {
+                items.push((published.order, Item::Visual(key.clone(), published.event)));
+            }
+        }
+        // Sorting and all renderer work happen on the detached batch.
+        items.sort_by_key(|(order, _)| *order);
+        let had_work = !items.is_empty();
+        for (_, item) in items {
+            match item {
+                Item::Command(message) => apply_msg(map, message),
+                Item::Lifecycle(key, lifecycle) => {
+                    // Revive also removes an old render instance if Remove coalesced away.
+                    apply_msg(map, OverlayMsg::Remove(key.clone()));
+                    if lifecycle == cursor_overlay::VisualLifecycle::Revive {
+                        apply_msg(map, OverlayMsg::Revive(key));
+                    }
+                }
+                Item::Visual(key, event) => apply_visual_in_map(map, key, event),
+            }
+        }
+        had_work
+    }
+}
+
+fn apply_visual_in_map(map: &mut RenderMap, key: CursorKey, event: cursor_overlay::VisualEvent) {
+    use cursor_overlay::VisualPhase;
+    if map.ended.contains(&key) {
+        return;
+    }
+    if let Some(window) = event.window {
+        apply_msg(
+            map,
+            OverlayMsg::Cmd(KeyedOverlayCommand {
+                key: key.clone(),
+                cmd: OverlayCommand::PinAbove(window),
+            }),
+        );
+    }
+    let cmd = match (event.phase, event.target) {
+        (VisualPhase::Intent, Some((x, y))) => OverlayCommand::MoveTo {
+            x,
+            y,
+            end_heading_radians: std::f64::consts::FRAC_PI_4,
+        },
+        (VisualPhase::Tracking, Some((x, y))) => cursor_overlay::track_pointer_command(x, y),
+        (VisualPhase::Contact, Some((x, y))) => OverlayCommand::ClickPulse { x, y },
+        (VisualPhase::End, _) => OverlayCommand::EndAction(event.action),
+        _ => OverlayCommand::BeginAction {
+            action: event.action,
+            delivery: None,
+            target: None,
+        },
+    };
+    apply_msg(map, OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }));
+}
+
+fn inbox() -> &'static Mutex<OverlayInbox> {
+    INBOX.get_or_init(|| Mutex::new(OverlayInbox::default()))
+}
+
+fn wake_renderer() {
+    if let Some(tx) = CMD_TX.get() {
+        let _ = tx.try_send(MacOverlayMsg::Wake);
+    }
+}
+
+/// Allocate an action in the active session without reading renderer state.
+pub fn begin_visual_action(key: &str) -> Option<cursor_overlay::VisualActionId> {
+    inbox().lock().unwrap().visual.begin_action(key)
+}
+
+/// Publish presentation state without waiting for path planning or a renderer acknowledgement.
+pub fn publish_visual_event(key: &str, event: cursor_overlay::VisualEvent) -> bool {
+    let accepted = inbox().lock().unwrap().visual.publish(key, event);
+    if accepted {
+        wake_renderer();
+    }
+    accepted
+}
 
 /// The keyed, insertion-ordered collection of owned cursors that the render
 /// loop composites every frame. Insertion order = stable z-order (later keys
@@ -201,7 +341,7 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
 pub fn init(cfg: CursorConfig) {
     static INITIALIZED: OnceLock<()> = OnceLock::new();
     INITIALIZED.get_or_init(|| {
-        let (tx, rx) = std::sync::mpsc::sync_channel(4096);
+        let (tx, rx) = std::sync::mpsc::sync_channel(1);
         CMD_TX
             .set(tx)
             .expect("cursor overlay sender is initialized exactly once");
@@ -254,26 +394,23 @@ pub fn init(cfg: CursorConfig) {
     ));
 }
 
-/// Send a keyed command from any thread (MCP tool, etc.).  Non-blocking; drops
-/// if the channel is full (old commands are less important than new ones).
+/// Send a legacy keyed command. Configuration retains its bounded drop-newest behavior.
+/// Action visuals use publish_visual_event and never enter this command queue.
 pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
-    // An empty key disables cursors for direct platform calls
-    // that bypass lifecycle dispatch.
     if key.is_empty() {
         return;
     }
-    let arrival_key = matches!(&cmd, OverlayCommand::MoveTo { .. }).then(|| key.clone());
-    let sent = CMD_TX.get().is_some_and(|tx| {
-        tx.try_send(MacOverlayMsg::Cursor(OverlayMsg::Cmd(
-            KeyedOverlayCommand { key, cmd },
-        )))
-        .is_ok()
-    });
-    if !sent {
-        if let Some(key) = arrival_key {
+    if CMD_TX.get().is_none() {
+        if matches!(&cmd, OverlayCommand::MoveTo { .. }) {
             arrival_fire(&key);
         }
+        return;
     }
+    inbox()
+        .lock()
+        .unwrap()
+        .command(OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }));
+    wake_renderer();
 }
 
 /// Truthful render acknowledgement for lifecycle inspection. This never falls
@@ -300,9 +437,8 @@ pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(MacOverlayMsg::Cursor(OverlayMsg::Remove(key)));
-    }
+    inbox().lock().unwrap().command(OverlayMsg::Remove(key));
+    wake_renderer();
 }
 
 /// Clear the render-side tombstone after a successful explicit session
@@ -311,9 +447,8 @@ pub fn revive_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
-    if let Some(tx) = CMD_TX.get() {
-        let _ = tx.try_send(MacOverlayMsg::Cursor(OverlayMsg::Revive(key)));
-    }
+    inbox().lock().unwrap().command(OverlayMsg::Revive(key));
+    wake_renderer();
 }
 
 /// Return a snapshot of a cursor's current motion config (for use by
@@ -803,9 +938,7 @@ fn register_display_reconfiguration_callback() {
 fn dispatch_rebuild_appkit_host() {
     dispatch_on_main(Box::new(|| unsafe {
         rebuild_appkit_host();
-        if let Some(tx) = CMD_TX.get() {
-            let _ = tx.try_send(MacOverlayMsg::LayoutChanged);
-        }
+        wake_renderer();
     }));
 }
 
@@ -844,6 +977,11 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
         };
         last_tick = now;
 
+        // The notification carries no command history. Release the producer
+        // lock before acquiring renderer state, planning paths or touching AppKit.
+        while rx.try_recv().is_ok() {}
+        let batch = inbox().lock().unwrap().take();
+
         let (
             z_order,
             arrived,
@@ -857,28 +995,8 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             let Some(map) = guard.as_mut() else {
                 break;
             };
-            let mut had_msg = false;
-            let mut cursor_commanded = false;
-
-            let mut apply = |message: MacOverlayMsg| {
-                had_msg = true;
-                match message {
-                    MacOverlayMsg::Cursor(message) => {
-                        cursor_commanded |= match &message {
-                            OverlayMsg::Cmd(command) => !map.ended.contains(&command.key),
-                            _ => false,
-                        };
-                        apply_msg(map, message);
-                    }
-                    MacOverlayMsg::LayoutChanged => {}
-                }
-            };
-            if let Some(message) = first_msg {
-                apply(message);
-            }
-            while let Ok(message) = rx.try_recv() {
-                apply(message);
-            }
+            let cursor_commanded = batch.apply(map);
+            let had_msg = first_msg.is_some() || cursor_commanded;
 
             let mut arrived = Vec::new();
             if frame_tick_needed || had_msg {
@@ -1317,6 +1435,148 @@ fn pixmap_to_cgimage(pixmap: &tiny_skia::Pixmap) -> Option<usize> {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+
+    fn mailbox_event(
+        id: cursor_overlay::VisualActionId,
+        x: f64,
+        phase: cursor_overlay::VisualPhase,
+    ) -> cursor_overlay::VisualEvent {
+        cursor_overlay::VisualEvent {
+            id,
+            timestamp: Instant::now(),
+            target: Some((x, 30.0)),
+            window: Some(111),
+            bounds: None,
+            action: cursor_overlay::CursorAction::Click,
+            scroll_direction: None,
+            phase,
+        }
+    }
+
+    #[test]
+    fn slice_a_mailbox_detached_renderer_and_saturated_commands_do_not_block_visuals() {
+        use std::sync::{mpsc, Arc};
+        let inbox = Arc::new(Mutex::new(OverlayInbox::default()));
+        let (ready_tx, ready_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let consumer = inbox.clone();
+        let worker = std::thread::spawn(move || {
+            let batch = consumer.lock().unwrap().take();
+            ready_tx.send(()).unwrap();
+            release_rx.recv().unwrap();
+            batch.apply(&mut empty_map());
+        });
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let producer = inbox.clone();
+        let publisher = std::thread::spawn(move || {
+            let mut inbox = producer.lock().unwrap();
+            for _ in 0..5000 {
+                inbox.command(command("old", OverlayCommand::PinAbove(7)));
+            }
+            let id = inbox.visual.begin_action("old").unwrap();
+            inbox.visual.publish(
+                "old",
+                mailbox_event(id, 50.0, cursor_overlay::VisualPhase::Intent),
+            );
+            inbox.command(OverlayMsg::Remove("old".into()));
+            let fresh = inbox.visual.begin_action("new").unwrap();
+            let accepted = inbox.visual.publish(
+                "new",
+                mailbox_event(fresh, 70.0, cursor_overlay::VisualPhase::Intent),
+            );
+            done_tx.send(accepted).unwrap();
+        });
+        let result = done_rx.recv_timeout(Duration::from_secs(2));
+        release_tx.send(()).unwrap();
+        worker.join().unwrap();
+        publisher.join().unwrap();
+        assert!(result.unwrap());
+        let mut map = empty_map();
+        inbox.lock().unwrap().take().apply(&mut map);
+        assert!(!map.cursors.contains_key("old"));
+        assert_eq!(map.cursors["new"].target, Some((70.0, 30.0)));
+    }
+
+    #[test]
+    fn slice_a_mailbox_two_sessions_follow_accepted_order_after_coalescing() {
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        let one = inbox.visual.begin_action("one").unwrap();
+        let two = inbox.visual.begin_action("two").unwrap();
+        inbox.visual.publish(
+            "one",
+            mailbox_event(one, 20.0, cursor_overlay::VisualPhase::Intent),
+        );
+        let mut e = mailbox_event(two, 40.0, cursor_overlay::VisualPhase::Intent);
+        e.window = Some(222);
+        inbox.visual.publish("two", e);
+        inbox.visual.publish(
+            "one",
+            mailbox_event(one, 60.0, cursor_overlay::VisualPhase::Intent),
+        );
+        inbox.take().apply(&mut map);
+        assert_eq!(map.command_order, vec!["two", "one"]);
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111))]);
+        assert_eq!(map.cursors["one"].target, Some((60.0, 30.0)));
+        inbox.command(command("two", OverlayCommand::PinAbove(333)));
+        inbox.take().apply(&mut map);
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(333))]);
+    }
+
+    #[test]
+    fn slice_a_mailbox_remove_late_contact_revive_before_drain_is_fresh() {
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        let old = inbox.visual.begin_action("one").unwrap();
+        inbox.visual.publish(
+            "one",
+            mailbox_event(old, 20.0, cursor_overlay::VisualPhase::Intent),
+        );
+        inbox.take().apply(&mut map);
+        assert!(map.cursors.contains_key("one"));
+        inbox.command(OverlayMsg::Remove("one".into()));
+        assert!(!inbox.visual.publish(
+            "one",
+            mailbox_event(old, 20.0, cursor_overlay::VisualPhase::Contact)
+        ));
+        inbox.command(OverlayMsg::Revive("one".into()));
+        assert!(!inbox.visual.publish(
+            "one",
+            mailbox_event(old, 20.0, cursor_overlay::VisualPhase::Contact)
+        ));
+        let fresh = inbox.visual.begin_action("one").unwrap();
+        assert_ne!(fresh.generation, old.generation);
+        inbox.visual.publish(
+            "one",
+            mailbox_event(fresh, 80.0, cursor_overlay::VisualPhase::Intent),
+        );
+        inbox.take().apply(&mut map);
+        assert_eq!(map.cursors["one"].target, Some((80.0, 30.0)));
+        assert_eq!(map.cursors["one"].core.pos, (2.0, 2.0));
+        inbox.command(OverlayMsg::Remove("one".into()));
+        inbox.take().apply(&mut map);
+        assert!(!map.cursors.contains_key("one"));
+        assert!(map.command_order.is_empty());
+    }
+
+    #[test]
+    fn slice_a_mailbox_stalled_adapter_retains_newest_without_queued_visual_commands() {
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        for n in 0..10_000 {
+            let id = inbox.visual.begin_action("one").unwrap();
+            assert!(inbox.visual.publish(
+                "one",
+                mailbox_event(id, (n % 90) as f64, cursor_overlay::VisualPhase::Intent)
+            ));
+        }
+        assert!(inbox.commands.is_empty());
+        let batch = inbox.take();
+        assert_eq!(batch.pending.len(), 1);
+        batch.apply(&mut map);
+        assert_eq!(map.cursors["one"].target, Some((9.0, 30.0)));
+    }
 
     fn command(key: &str, cmd: OverlayCommand) -> OverlayMsg {
         OverlayMsg::Cmd(KeyedOverlayCommand {
