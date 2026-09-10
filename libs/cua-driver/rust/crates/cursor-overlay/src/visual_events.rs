@@ -122,12 +122,15 @@ impl VisualMailbox {
         {
             return false;
         }
+        // Action allocation determines ownership across producers. Timestamp and
+        // phase regressions only constrain events belonging to the same action.
         if let Some((id, timestamp, phase)) = session.owner {
             if event.id < id
-                || event.timestamp < timestamp
                 || (event.id == id
-                    && (phase == VisualPhase::End
-                        || (phase == VisualPhase::Contact && event.phase == VisualPhase::Intent)))
+                    && (event.timestamp < timestamp
+                        || phase == VisualPhase::End
+                        || (matches!(phase, VisualPhase::Contact | VisualPhase::Tracking)
+                            && event.phase == VisualPhase::Intent)))
             {
                 return false;
             }
@@ -203,6 +206,57 @@ mod tests {
             scroll_direction: None,
         }
     }
+    #[test]
+    fn slice_a_fix_mailbox_newer_action_precedes_timestamp() {
+        let mut m = VisualMailbox::default();
+        let t = Instant::now();
+        let a = m.begin_action("a").unwrap();
+        let b = m.begin_action("a").unwrap();
+        assert!(m.publish(
+            "a",
+            event(a, VisualPhase::Contact, t + Duration::from_millis(20), 20.0)
+        ));
+        assert!(m.publish(
+            "a",
+            event(b, VisualPhase::Intent, t + Duration::from_millis(10), 80.0)
+        ));
+        let batch = m.take_pending();
+        assert!(batch["a"].contact.is_none());
+        assert_eq!(
+            batch["a"].latest.as_ref().unwrap().event.target,
+            Some((80.0, 30.0))
+        );
+        assert!(!m.publish("a", event(b, VisualPhase::Tracking, t, 10.0)));
+        assert!(!m.publish(
+            "a",
+            event(a, VisualPhase::Contact, t + Duration::from_millis(30), 20.0)
+        ));
+        assert!(m.take_pending().is_empty());
+    }
+
+    #[test]
+    fn slice_a_fix_mailbox_phase_barrier_survives_tracking_and_drain() {
+        for phase in [VisualPhase::Contact, VisualPhase::Tracking] {
+            let mut m = VisualMailbox::default();
+            let t = Instant::now();
+            let id = m.begin_action("a").unwrap();
+            assert!(m.publish("a", event(id, phase, t, 20.0)));
+            assert!(!m.publish("a", event(id, VisualPhase::Intent, t, 10.0)));
+            assert!(m.publish("a", event(id, VisualPhase::Tracking, t, 60.0)));
+            m.take_pending();
+            assert!(!m.publish("a", event(id, VisualPhase::Intent, t, 20.0)));
+            assert!(!m.publish(
+                "a",
+                event(id, VisualPhase::Intent, t + Duration::from_millis(1), 20.0)
+            ));
+            assert!(m.publish("a", event(id, VisualPhase::Tracking, t, 80.0)));
+            assert_eq!(
+                m.take_pending()["a"].latest.as_ref().unwrap().event.target,
+                Some((80.0, 30.0))
+            );
+        }
+    }
+
     #[test]
     fn stalled_consumer_retains_constant_state_and_newest_of_ten_thousand() {
         let mut mailbox = VisualMailbox::default();

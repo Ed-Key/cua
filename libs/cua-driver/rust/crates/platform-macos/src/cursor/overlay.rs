@@ -203,6 +203,7 @@ fn apply_visual_in_map(
         .entry(key.clone())
         .or_insert_with(|| render_state_for_key(&map.template, &key));
     let focus = event.bounds;
+    let timestamp = event.timestamp;
     if state.core.apply_visual_event(event, bounds, now) {
         if target.is_some() {
             state.target = target;
@@ -210,6 +211,8 @@ fn apply_visual_in_map(
         if let Some(rect) = focus {
             state.focus_rect = Some(rect);
             state.focus_rect_t = 0.0;
+            state.focus_rect_timestamp = Some(timestamp);
+            state.advance_focus_rect(0.0, now);
         }
         map.command_order.retain(|candidate| candidate != &key);
         map.command_order.push(key);
@@ -637,6 +640,8 @@ struct RenderState {
     focus_rect: Option<[f64; 4]>,
     /// Fade progress for the focus rect: 0.0 = fully visible, 1.0 = gone.
     focus_rect_t: f64,
+    /// Event-derived bounds use presentation time; legacy ShowFocusRect uses dt.
+    focus_rect_timestamp: Option<Instant>,
 }
 
 impl RenderState {
@@ -646,6 +651,7 @@ impl RenderState {
             target: None,
             focus_rect: None,
             focus_rect_t: 1.0,
+            focus_rect_timestamp: None,
         }
     }
 
@@ -660,6 +666,7 @@ impl RenderState {
         self.core.session_badge_hovered = false;
         self.focus_rect = None;
         self.focus_rect_t = 1.0;
+        self.focus_rect_timestamp = None;
     }
 
     /// Advance the animation by `dt`.  Uses the Swift reference constants
@@ -677,17 +684,28 @@ impl RenderState {
         }
         let fire_arrival = self.core.tick_swift_constants_at(dt, now);
 
-        // Advance focus-rect fade (fades out over ~600ms).  macOS-only —
-        // the shared core has no focus_rect concept.
+        self.advance_focus_rect(dt, now);
+        fire_arrival
+    }
+
+    fn advance_focus_rect(&mut self, dt: f64, now: Instant) {
         if self.focus_rect.is_some() {
-            self.focus_rect_t = (self.focus_rect_t + dt / 0.6).min(1.0);
+            // Event bounds must expire even on an idle wake with zero frame delta.
+            // Keep legacy ShowFocusRect's 600 ms delta-based fade unchanged.
+            let progress = self.focus_rect_timestamp.map_or_else(
+                || self.focus_rect_t + dt / 0.6,
+                |timestamp| {
+                    (now.saturating_duration_since(timestamp).as_secs_f64() / 0.6)
+                        .max(self.focus_rect_t)
+                },
+            );
+            self.focus_rect_t = progress.min(1.0);
             if self.focus_rect_t >= 1.0 {
                 self.focus_rect = None;
                 self.focus_rect_t = 1.0;
+                self.focus_rect_timestamp = None;
             }
         }
-
-        fire_arrival
     }
 
     fn apply_command(&mut self, cmd: OverlayCommand) {
@@ -697,6 +715,7 @@ impl RenderState {
             OverlayCommand::ShowFocusRect(rect) => {
                 self.focus_rect = rect;
                 self.focus_rect_t = 0.0; // reset fade to fully visible
+                self.focus_rect_timestamp = None;
             }
             OverlayCommand::ClickPulse { x, y } if !self.core.placed => {
                 let _ =
@@ -1484,6 +1503,208 @@ mod tests {
             scroll_direction: None,
             phase,
         }
+    }
+
+    fn assert_mailbox_tip(map: &RenderMap, target: (f64, f64)) {
+        let core = &map.cursors["one"].core;
+        assert!((core.pos.0 - core.heading.cos() * 16.0 - target.0).abs() < 0.001);
+        assert!((core.pos.1 - core.heading.sin() * 16.0 - target.1).abs() < 0.001);
+    }
+
+    fn newer_action_before_older_timestamp(applied: bool) {
+        use cursor_overlay::VisualPhase::*;
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        let t = Instant::now();
+        let a = inbox.visual.begin_action("one").unwrap();
+        let b = inbox.visual.begin_action("one").unwrap();
+        // B is captured first, then descheduled while A's contact publishes.
+        let mut intent = mailbox_event(b, 80.0, Intent);
+        intent.timestamp = t + Duration::from_millis(10);
+        let mut contact = mailbox_event(a, 20.0, Contact);
+        contact.timestamp = t + Duration::from_millis(20);
+        assert!(inbox.visual.publish("one", contact));
+        if applied {
+            assert!(inbox.take().apply(&mut map, t + Duration::from_millis(20)));
+            assert_mailbox_tip(&map, (20.0, 30.0));
+        }
+        assert!(inbox.visual.publish("one", intent));
+        assert!(inbox.take().apply(&mut map, t + Duration::from_millis(25)));
+        assert_eq!(map.cursors["one"].target, Some((80.0, 30.0)));
+        assert!(map.cursors["one"].core.path.is_some());
+        let mut tracking = mailbox_event(b, 90.0, Tracking);
+        tracking.timestamp = t + Duration::from_millis(15);
+        assert!(inbox.visual.publish("one", tracking.clone()));
+        tracking.timestamp = t + Duration::from_millis(14);
+        tracking.target = Some((50.0, 30.0));
+        assert!(!inbox.visual.publish("one", tracking));
+        let mut stale = mailbox_event(a, 20.0, Contact);
+        stale.timestamp = t + Duration::from_millis(30);
+        assert!(!inbox.visual.publish("one", stale));
+        assert!(inbox.take().apply(&mut map, t + Duration::from_millis(30)));
+        assert_eq!(map.cursors["one"].target, Some((90.0, 30.0)));
+        assert_mailbox_tip(&map, (90.0, 30.0));
+        assert!(map.cursors["one"].core.path.is_none());
+    }
+
+    #[test]
+    fn slice_a_fix_newer_action_replaces_pending_older_contact() {
+        newer_action_before_older_timestamp(false);
+    }
+
+    #[test]
+    fn slice_a_fix_newer_action_replaces_applied_older_contact() {
+        newer_action_before_older_timestamp(true);
+    }
+
+    fn late_intent_after_tracking(detach: bool) {
+        use cursor_overlay::VisualPhase::*;
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        let t = Instant::now();
+        let id = inbox.visual.begin_action("one").unwrap();
+        let publish = |inbox: &mut OverlayInbox, phase, x| {
+            let mut event = mailbox_event(id, x, phase);
+            event.timestamp = t;
+            inbox.visual.publish("one", event)
+        };
+        assert!(publish(&mut inbox, Contact, 20.0));
+        if detach {
+            assert!(inbox.take().apply(&mut map, t));
+        }
+        assert!(publish(&mut inbox, Tracking, 60.0));
+        let detached = detach.then(|| inbox.take());
+        if let Some(batch) = &detached {
+            assert_eq!(batch.pending.len(), 1);
+            assert_eq!(
+                batch.pending["one"].latest.as_ref().unwrap().event.phase,
+                Tracking
+            );
+        }
+        assert!(!publish(&mut inbox, Intent, 20.0));
+        if let Some(batch) = detached {
+            assert!(batch.apply(&mut map, t));
+            assert!(!inbox.take().apply(&mut map, t));
+        } else {
+            assert!(inbox.take().apply(&mut map, t));
+        }
+        assert_eq!(map.cursors["one"].target, Some((60.0, 30.0)));
+        assert_mailbox_tip(&map, (60.0, 30.0));
+        assert!(map.cursors["one"].core.path.is_none());
+        assert!(publish(&mut inbox, Tracking, 80.0));
+        assert!(inbox.take().apply(&mut map, t));
+        assert_mailbox_tip(&map, (80.0, 30.0));
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111))]);
+    }
+
+    #[test]
+    fn slice_a_fix_undrained_tracking_rejects_late_intent() {
+        late_intent_after_tracking(false);
+    }
+
+    #[test]
+    fn slice_a_fix_nonempty_detached_tracking_rejects_late_intent() {
+        late_intent_after_tracking(true);
+    }
+
+    fn bounds_map() -> (RenderMap, DisplayGeometry) {
+        let mut map = empty_map();
+        map.template.motion.idle_hide_ms = 0.0;
+        let left = DisplayGeometry {
+            id: 2,
+            x: -200.0,
+            y: 0.0,
+            width: 200.0,
+            height: 100.0,
+            backing_scale: 2.0,
+            is_primary: false,
+        };
+        map.layout.displays.push(left);
+        (map, left)
+    }
+
+    fn publish_contact_bounds(inbox: &mut OverlayInbox, t: Instant) {
+        let id = inbox.visual.begin_action("one").unwrap();
+        let mut contact = mailbox_event(id, 90.0, cursor_overlay::VisualPhase::Contact);
+        contact.timestamp = t;
+        contact.bounds = Some([-150.0, 10.0, 40.0, 40.0]);
+        assert!(inbox.visual.publish("one", contact));
+    }
+
+    fn assert_bounds_expired(map: &RenderMap, left: DisplayGeometry) {
+        assert!(map.cursors["one"].focus_rect.is_none());
+        assert!(map.cursors["one"].core.contact.is_none());
+        assert_eq!(painted_display_ids(map), HashSet::from([1]));
+        assert_eq!(ordering_pairs(map), vec![(1, Some(111))]);
+        assert!(render_display(map, left)
+            .pixels()
+            .iter()
+            .all(|p| p.alpha() == 0));
+        assert!(!render_map_needs_frame_tick(map));
+    }
+
+    #[test]
+    fn slice_a_fix_old_contact_bounds_expire_before_first_paint() {
+        let mut inbox = OverlayInbox::default();
+        let (mut map, left) = bounds_map();
+        let t = Instant::now();
+        publish_contact_bounds(&mut inbox, t);
+        let now = t + Duration::from_secs(1);
+        assert!(inbox.take().apply(&mut map, now));
+        assert_bounds_expired(&map, left);
+        map.cursors.get_mut("one").unwrap().tick_at(0.0, now);
+        assert_bounds_expired(&map, left);
+    }
+
+    #[test]
+    fn slice_a_fix_contact_bounds_age_and_expire_on_zero_delta_tick() {
+        let mut inbox = OverlayInbox::default();
+        let (mut map, left) = bounds_map();
+        let t = Instant::now();
+        publish_contact_bounds(&mut inbox, t);
+        let now = t + Duration::from_millis(300);
+        assert!(inbox.take().apply(&mut map, now));
+        map.cursors.get_mut("one").unwrap().tick_at(0.0, now);
+        assert!((map.cursors["one"].focus_rect_t - 0.5).abs() < 1e-9);
+        assert_eq!(painted_display_ids(&map), HashSet::from([1, 2]));
+        assert_eq!(ordering_pairs(&map), vec![(1, Some(111)), (2, Some(111))]);
+        assert!(render_display(&map, left)
+            .pixels()
+            .iter()
+            .any(|p| p.alpha() > 0));
+        map.cursors
+            .get_mut("one")
+            .unwrap()
+            .tick_at(0.0, t + Duration::from_millis(600));
+        assert_bounds_expired(&map, left);
+    }
+
+    #[test]
+    fn slice_a_fix_legacy_focus_rect_keeps_delta_based_fade() {
+        let mut inbox = OverlayInbox::default();
+        let (mut map, left) = bounds_map();
+        let t = Instant::now();
+        publish_contact_bounds(&mut inbox, t);
+        assert!(inbox.take().apply(&mut map, t + Duration::from_millis(300)));
+        inbox.command(command(
+            "one",
+            OverlayCommand::ShowFocusRect(Some([-150.0, 10.0, 40.0, 40.0])),
+        ));
+        let now = t + Duration::from_secs(2);
+        assert!(inbox.take().apply(&mut map, now));
+        map.cursors.get_mut("one").unwrap().tick_at(0.0, now);
+        assert_eq!(map.cursors["one"].focus_rect_t, 0.0);
+        assert!(render_display(&map, left)
+            .pixels()
+            .iter()
+            .any(|p| p.alpha() > 0));
+        map.cursors.get_mut("one").unwrap().tick_at(0.3, now);
+        assert!((map.cursors["one"].focus_rect_t - 0.5).abs() < 1e-9);
+        map.cursors.get_mut("one").unwrap().tick_at(0.3, now);
+        assert_bounds_expired(&map, left);
+        inbox.command(command("one", OverlayCommand::ShowFocusRect(None)));
+        assert!(inbox.take().apply(&mut map, now));
+        assert!(map.cursors["one"].focus_rect.is_none());
     }
 
     #[test]

@@ -158,13 +158,16 @@ impl RenderStateCore {
         if !event.is_valid() || !self.cfg.enabled || !self.visible {
             return false;
         }
+        // Action allocation determines ownership across producers. Timestamp and
+        // phase regressions only constrain events belonging to the same action.
         if let Some((id, timestamp, phase)) = self.visual_owner {
             if event.id.generation != id.generation
                 || event.id.action < id.action
-                || event.timestamp < timestamp
                 || (event.id == id
-                    && (phase == VisualPhase::End
-                        || (phase == VisualPhase::Contact && event.phase == VisualPhase::Intent)))
+                    && (event.timestamp < timestamp
+                        || phase == VisualPhase::End
+                        || (matches!(phase, VisualPhase::Contact | VisualPhase::Tracking)
+                            && event.phase == VisualPhase::Intent)))
             {
                 return false;
             }
@@ -1753,6 +1756,101 @@ mod tests {
         assert!((core.pos.0 - core.heading.cos() * 16.0 - target.0).abs() < 0.001);
         assert!((core.pos.1 - core.heading.sin() * 16.0 - target.1).abs() < 0.001);
     }
+    #[test]
+    fn slice_a_fix_core_newer_action_precedes_timestamp() {
+        let t = Instant::now();
+        let now = t + Duration::from_millis(30);
+        let mut core = timed_core();
+        assert!(core.apply_visual_event(
+            timed_event(
+                1,
+                VisualPhase::Contact,
+                t + Duration::from_millis(20),
+                Some((20.0, 30.0))
+            ),
+            None,
+            now
+        ));
+        assert!(core.apply_visual_event(
+            timed_event(
+                2,
+                VisualPhase::Intent,
+                t + Duration::from_millis(10),
+                Some((80.0, 30.0))
+            ),
+            None,
+            now
+        ));
+        assert!(core.path.is_some());
+        assert!(core.apply_visual_event(
+            timed_event(
+                2,
+                VisualPhase::Tracking,
+                t + Duration::from_millis(15),
+                Some((90.0, 30.0))
+            ),
+            None,
+            now
+        ));
+        assert!(!core.apply_visual_event(
+            timed_event(
+                2,
+                VisualPhase::Tracking,
+                t + Duration::from_millis(14),
+                Some((50.0, 30.0))
+            ),
+            None,
+            now
+        ));
+        assert!(!core.apply_visual_event(
+            timed_event(1, VisualPhase::Contact, now, Some((20.0, 30.0))),
+            None,
+            now
+        ));
+        assert_tip(&core, (90.0, 30.0));
+    }
+
+    #[test]
+    fn slice_a_fix_core_contact_and_tracking_bar_intent_but_allow_tracking_ties() {
+        let t = Instant::now();
+        for phase in [VisualPhase::Contact, VisualPhase::Tracking] {
+            let mut core = timed_core();
+            assert!(core.apply_visual_event(timed_event(1, phase, t, Some((20.0, 30.0))), None, t));
+            assert!(!core.apply_visual_event(
+                timed_event(1, VisualPhase::Intent, t, Some((10.0, 30.0))),
+                None,
+                t
+            ));
+            assert!(core.apply_visual_event(
+                timed_event(1, VisualPhase::Tracking, t, Some((60.0, 30.0))),
+                None,
+                t
+            ));
+            assert!(!core.apply_visual_event(
+                timed_event(1, VisualPhase::Intent, t, Some((20.0, 30.0))),
+                None,
+                t
+            ));
+            assert!(!core.apply_visual_event(
+                timed_event(
+                    1,
+                    VisualPhase::Intent,
+                    t + Duration::from_millis(1),
+                    Some((20.0, 30.0))
+                ),
+                None,
+                t
+            ));
+            assert!(core.apply_visual_event(
+                timed_event(1, VisualPhase::Tracking, t, Some((80.0, 30.0))),
+                None,
+                t
+            ));
+            assert_tip(&core, (80.0, 30.0));
+            assert!(core.path.is_none());
+        }
+    }
+
     #[test]
     fn slice_a_timed_theme_age_and_reduced_motion_use_explicit_now() {
         let t = Instant::now();
