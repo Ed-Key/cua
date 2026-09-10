@@ -52,7 +52,7 @@ pub(crate) fn with_type_visual<T>(
     with_type_visual_updates(registry, sink, key, target, |_| native())
 }
 
-fn with_type_visual_updates<T>(
+pub(crate) fn with_type_visual_updates<T>(
     registry: &crate::cursor::CursorRegistry,
     sink: &dyn crate::cursor::visual::PointerVisualSink,
     key: &str,
@@ -196,6 +196,12 @@ impl Tool for TypeTextTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        let visual_sink = crate::cursor::visual::InvocationVisualSink::bind(
+            self.def().name.as_str(),
+            &args,
+            &super::cursor_tools::resolve_cursor_key(&args),
+            Arc::new(crate::cursor::visual::OverlayVisualSink),
+        );
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
             && args.get("window_id").is_none()
@@ -218,13 +224,9 @@ impl Tool for TypeTextTool {
             let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
             let registry = self.state.cursor_registry.clone();
             let result = tokio::task::spawn_blocking(move || {
-                with_type_visual(
-                    &registry,
-                    &crate::cursor::visual::OverlayVisualSink,
-                    &cursor_key,
-                    None,
-                    || crate::input::keyboard::type_text_global(&text, delay_ms),
-                )
+                with_type_visual(&registry, visual_sink.as_ref(), &cursor_key, None, || {
+                    crate::input::keyboard::type_text_global(&text, delay_ms)
+                })
             })
             .await;
             return match result {
@@ -368,6 +370,7 @@ impl Tool for TypeTextTool {
                 args.opt_str("_session_id"),
                 from_zoom,
                 _mutation_lease.as_ref(),
+                Some(visual_sink.clone()),
             )
             .await
             {
@@ -412,7 +415,7 @@ impl Tool for TypeTextTool {
                     });
                     with_type_visual_updates(
                         &visual_registry,
-                        &crate::cursor::visual::OverlayVisualSink,
+                        visual_sink.as_ref(),
                         &cursor_key,
                         target,
                         |update| {

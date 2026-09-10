@@ -293,6 +293,45 @@ pub(crate) trait PointerVisualSink: Send + Sync {
     fn begin(&self, key: &str) -> Option<VisualActionId>;
     fn publish(&self, key: &str, event: VisualEvent);
 }
+/// A bounded publisher owned by one native tool invocation, including its child stages.
+/// Classification uses the same authorized, normalized arguments as core admission.
+/// No session history is consulted or retained by later invocations.
+pub(crate) struct InvocationVisualSink {
+    inner: Arc<dyn PointerVisualSink>,
+    key: String,
+    semantics: Option<cua_driver_contract::CursorSemantics>,
+}
+impl InvocationVisualSink {
+    pub(crate) fn bind(
+        tool: &str,
+        args: &serde_json::Value,
+        key: &str,
+        inner: Arc<dyn PointerVisualSink>,
+    ) -> Arc<dyn PointerVisualSink> {
+        Arc::new(Self {
+            inner,
+            key: key.into(),
+            semantics: cua_driver_contract::classify_cursor_semantics(tool, args),
+        })
+    }
+}
+impl PointerVisualSink for InvocationVisualSink {
+    fn send(&self, key: &str, command: OverlayCommand) {
+        self.inner.send(key, command);
+    }
+    fn begin(&self, key: &str) -> Option<VisualActionId> {
+        self.inner.begin(key)
+    }
+    fn publish(&self, key: &str, mut event: VisualEvent) {
+        if key == self.key {
+            if let Some(semantics) = self.semantics {
+                event.modifiers = Some((semantics.delivery, semantics.target));
+            }
+        }
+        self.inner.publish(key, event);
+    }
+}
+
 pub(crate) struct OverlayVisualSink;
 impl PointerVisualSink for OverlayVisualSink {
     fn send(&self, key: &str, command: OverlayCommand) {

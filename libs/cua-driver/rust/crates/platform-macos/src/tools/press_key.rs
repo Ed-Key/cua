@@ -392,6 +392,7 @@ impl Tool for PressKeyTool {
                     args.opt_str("_session_id"),
                     from_zoom,
                     _mutation_lease.as_ref(),
+                    None,
                 )
                 .await
                 {

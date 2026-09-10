@@ -18,7 +18,7 @@ use crate::ax::bindings::{
     AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 
-fn dispatch_menu_visual<T, E>(
+pub(crate) fn dispatch_menu_visual<T, E>(
     registry: &crate::cursor::CursorRegistry,
     sink: &dyn crate::cursor::visual::PointerVisualSink,
     key: &str,
@@ -160,6 +160,7 @@ unsafe fn invoke_path(
     pid: i32,
     path: &[String],
     registry: &crate::cursor::CursorRegistry,
+    visual_sink: &dyn crate::cursor::visual::PointerVisualSink,
     key: &str,
     window: u32,
 ) -> Result<(), String> {
@@ -197,21 +198,14 @@ unsafe fn invoke_path(
                 }
             };
             let bounds = crate::ax::bindings::element_screen_rect(target);
-            let error = dispatch_menu_visual(
-                registry,
-                &crate::cursor::visual::OverlayVisualSink,
-                key,
-                bounds,
-                window,
-                || {
-                    let error = perform_action(target, action);
-                    if error == kAXErrorSuccess {
-                        Ok(error)
-                    } else {
-                        Err(error)
-                    }
-                },
-            )
+            let error = dispatch_menu_visual(registry, visual_sink, key, bounds, window, || {
+                let error = perform_action(target, action);
+                if error == kAXErrorSuccess {
+                    Ok(error)
+                } else {
+                    Err(error)
+                }
+            })
             .unwrap_or_else(|error| error);
             CFRelease(target as CFTypeRef);
             if error != kAXErrorSuccess {
@@ -339,6 +333,12 @@ impl Tool for InvokeMenuTool {
     async fn invoke(&self, args: Value) -> ToolResult {
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
         let registry = self.0.clone();
+        let visual_sink = crate::cursor::visual::InvocationVisualSink::bind(
+            self.def().name.as_str(),
+            &args,
+            &cursor_key,
+            std::sync::Arc::new(crate::cursor::visual::OverlayVisualSink),
+        );
         let input: InvokeMenuInput =
             match cua_driver_core::tool_args::parse_typed_input("invoke_menu", args) {
                 Ok(input) => input,
@@ -370,7 +370,14 @@ impl Tool for InvokeMenuTool {
             let needs_activation = prior_frontmost != Some(pid);
 
             let result = focus_exact_window(pid, window_id).and_then(|()| unsafe {
-                invoke_path(pid, &path, &registry, &cursor_key, window_id)
+                invoke_path(
+                    pid,
+                    &path,
+                    &registry,
+                    visual_sink.as_ref(),
+                    &cursor_key,
+                    window_id,
+                )
             });
 
             // Restore the exact prior key window when one was observable,

@@ -42,7 +42,7 @@ fn after_exact_target_gate<T>(
     Ok(action())
 }
 
-fn dispatch_scroll_visual<T, E>(
+pub(crate) fn dispatch_scroll_visual<T, E>(
     registry: &crate::cursor::CursorRegistry,
     sink: &dyn crate::cursor::visual::PointerVisualSink,
     key: &str,
@@ -172,6 +172,12 @@ impl Tool for ScrollTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        let visual_sink = crate::cursor::visual::InvocationVisualSink::bind(
+            self.def().name.as_str(),
+            &args,
+            &super::cursor_tools::resolve_cursor_key(&args),
+            Arc::new(crate::cursor::visual::OverlayVisualSink),
+        );
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
             && args.get("window_id").is_none()
@@ -201,7 +207,7 @@ impl Tool for ScrollTool {
             let result = tokio::task::spawn_blocking(move || {
                 dispatch_wheel_visual(
                     &registry,
-                    &crate::cursor::visual::OverlayVisualSink,
+                    visual_sink.as_ref(),
                     &key,
                     crate::cursor::visual::point(x, y, None),
                     |observed| {
@@ -337,6 +343,7 @@ impl Tool for ScrollTool {
                 let foreground = delivery_mode.is_foreground();
                 let visual_registry = self.state.cursor_registry.clone();
                 let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+                let ax_visual_sink = visual_sink.clone();
                 let ax_result =
                     tokio::task::spawn_blocking(move || -> anyhow::Result<(bool, bool)> {
                         let Some(element_guard) = native_element_guard else {
@@ -355,6 +362,7 @@ impl Tool for ScrollTool {
                                             &by_for_ax,
                                             amount,
                                             &visual_registry,
+                                            ax_visual_sink.as_ref(),
                                             &cursor_key,
                                             wid,
                                         )
@@ -373,6 +381,7 @@ impl Tool for ScrollTool {
                                         &by_for_ax,
                                         amount,
                                         &visual_registry,
+                                        ax_visual_sink.as_ref(),
                                         &cursor_key,
                                         wid,
                                     )
@@ -630,7 +639,7 @@ impl Tool for ScrollTool {
                         let do_it = || {
                             dispatch_wheel_visual(
                                 &visual_registry,
-                                &crate::cursor::visual::OverlayVisualSink,
+                                visual_sink.as_ref(),
                                 &cursor_key,
                                 crate::cursor::visual::point(screen_x, screen_y, wid),
                                 do_it,
@@ -753,7 +762,7 @@ impl Tool for ScrollTool {
                         };
                         dispatch_scroll_visual(
                             &visual_registry,
-                            &crate::cursor::visual::OverlayVisualSink,
+                            visual_sink.as_ref(),
                             &cursor_key,
                             None,
                             dy,
@@ -790,6 +799,7 @@ unsafe fn scroll_native_text_area(
     by: &str,
     amount: usize,
     registry: &crate::cursor::CursorRegistry,
+    visual_sink: &dyn crate::cursor::visual::PointerVisualSink,
     key: &str,
     window: u32,
 ) -> bool {
@@ -827,7 +837,7 @@ unsafe fn scroll_native_text_area(
             // Describe the delivered actuator direction, without changing its behavior.
             if dispatch_scroll_visual(
                 registry,
-                &crate::cursor::visual::OverlayVisualSink,
+                visual_sink,
                 key,
                 bounds,
                 if reverse { 1 } else { -1 },

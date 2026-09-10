@@ -88,7 +88,8 @@ impl OverlayInbox {
     }
     fn publish(&mut self, key: &str, mut event: cursor_overlay::VisualEvent) -> bool {
         if let Some((id, semantics, _)) = self.contexts.get(key) {
-            if *id == event.id {
+            // Explicit native invocation context wins over the one-use fallback.
+            if *id == event.id && event.modifiers.is_none() {
                 event.modifiers = Some((semantics.delivery, semantics.target));
             }
         }
@@ -1967,7 +1968,11 @@ mod tests {
     }
 
     #[derive(Default)]
-    struct WatchableInboxSink(Mutex<OverlayInbox>, Mutex<Vec<cursor_overlay::VisualEvent>>);
+    struct WatchableInboxSink(
+        Mutex<OverlayInbox>,
+        Mutex<Vec<cursor_overlay::VisualEvent>>,
+        Mutex<Duration>,
+    );
     impl super::super::visual::PointerVisualSink for WatchableInboxSink {
         fn send(&self, key: &str, cmd: OverlayCommand) {
             self.0.lock().unwrap().command(command(key, cmd));
@@ -1975,9 +1980,402 @@ mod tests {
         fn begin(&self, key: &str) -> Option<cursor_overlay::VisualActionId> {
             self.0.lock().unwrap().begin_action(key)
         }
-        fn publish(&self, key: &str, event: cursor_overlay::VisualEvent) {
+        fn publish(&self, key: &str, mut event: cursor_overlay::VisualEvent) {
+            // Advance only the test clock; production publishers still stamp real time.
+            event.timestamp += *self.2.lock().unwrap();
             self.1.lock().unwrap().push(event.clone());
             self.0.lock().unwrap().publish(key, event);
+        }
+    }
+
+    fn multi_stage_begin(sink: &WatchableInboxSink, tool: &str, args: &serde_json::Value) {
+        use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+        sink.0.lock().unwrap().semantic(CursorEvent::Action {
+            session: "one".into(),
+            phase: CursorEventPhase::Begin,
+            semantics: cua_driver_contract::classify_cursor_semantics(tool, args).unwrap(),
+        });
+    }
+
+    fn multi_stage_assert(
+        sink: &WatchableInboxSink,
+        map: &mut RenderMap,
+        delivery: cua_driver_contract::CursorDelivery,
+        target: cua_driver_contract::CursorTarget,
+    ) {
+        let now = sink.1.lock().unwrap().last().unwrap().timestamp;
+        sink.0.lock().unwrap().take().apply(map, now);
+        let core = &map.cursors["one"].core;
+        assert_eq!(core.visual.delivery, Some(delivery));
+        assert_eq!(core.visual.target, Some(target));
+        assert_eq!(core.badge_modifiers, Some((Some(delivery), Some(target))));
+        assert_eq!(core.session_badge_chip_alpha(), 1.0);
+    }
+
+    #[test]
+    fn multi_stage_ax_scroll_keeps_invocation_modifiers() {
+        use crate::cursor::visual::ResolvedPointerTarget;
+        use cua_driver_contract::{CursorDelivery::Background, CursorTarget::Ax};
+        for schedule in ["coalesced", "split", "expired"] {
+            let registry = super::super::CursorRegistry::new();
+            let sink = std::sync::Arc::new(WatchableInboxSink::default());
+            let args = serde_json::json!({"pid":7,"window_id":42,"element_index":1,
+                "direction":"down","amount":2,"delivery_mode":"background"});
+            multi_stage_begin(&sink, "scroll", &args);
+            let visual_sink = crate::cursor::visual::InvocationVisualSink::bind(
+                "scroll",
+                &args,
+                "one",
+                sink.clone(),
+            );
+            let mut map = empty_map();
+            if schedule == "expired" {
+                let now = Instant::now();
+                sink.0.lock().unwrap().take().apply(&mut map, now);
+                map.cursors
+                    .get_mut("one")
+                    .unwrap()
+                    .tick_at(0.0, now + Duration::from_secs(2));
+                assert_eq!(map.cursors["one"].core.badge_modifiers, None);
+                *sink.2.lock().unwrap() = Duration::from_secs(3);
+            }
+            for stage in 0..2 {
+                let result = crate::tools::dispatch_scroll_visual(
+                    &registry,
+                    visual_sink.as_ref(),
+                    "one",
+                    ResolvedPointerTarget::from_bounds(42, [10.0, 20.0, 40.0, 40.0]),
+                    -1,
+                    0,
+                    || Ok::<_, ()>(17),
+                );
+                assert_eq!(result, Ok(17));
+                if schedule != "coalesced" || stage == 1 {
+                    multi_stage_assert(&sink, &mut map, Background, Ax);
+                    assert_eq!(
+                        map.cursors["one"].core.contact.unwrap().direction,
+                        Some(cursor_overlay::ScrollDirection::Down)
+                    );
+                }
+                multi_stage_expire_between(&sink, &mut map, schedule);
+            }
+            let events = sink.1.lock().unwrap();
+            assert_ne!(events[0].id, events[2].id);
+            drop(events);
+            multi_stage_cleanup_and_unrelated(&sink, &registry, &mut map);
+        }
+    }
+
+    #[tokio::test]
+    async fn multi_stage_pixel_focus_then_type_keeps_invocation_modifiers() {
+        use crate::cursor::visual::{DeliveryReceipt, ResolvedPointerTarget};
+        use cua_driver_contract::{CursorDelivery::Foreground, CursorTarget::Pixel};
+        use std::sync::Arc;
+        for schedule in ["coalesced", "split", "expired"] {
+            let state = Arc::new(crate::tools::ToolState::default());
+            let sink = Arc::new(WatchableInboxSink::default());
+            let args = serde_json::json!({"pid":7,"window_id":42,"x":20,"y":30,
+                "text":"hello","delivery_mode":"foreground"});
+            multi_stage_begin(&sink, "type_text", &args);
+            let visual_sink = crate::cursor::visual::InvocationVisualSink::bind(
+                "type_text",
+                &args,
+                "one",
+                sink.clone(),
+            );
+            let mut map = empty_map();
+            if schedule == "expired" {
+                let now = Instant::now();
+                sink.0.lock().unwrap().take().apply(&mut map, now);
+                map.cursors
+                    .get_mut("one")
+                    .unwrap()
+                    .tick_at(0.0, now + Duration::from_secs(2));
+                assert_eq!(map.cursors["one"].core.badge_modifiers, None);
+                *sink.2.lock().unwrap() = Duration::from_secs(3);
+            }
+            let click =
+                crate::tools::ClickTool::new(state.clone()).with_visual_sink(visual_sink.clone());
+            let receipt = DeliveryReceipt::default();
+            let result = click
+                .dispatch_resolved(
+                    "one",
+                    crate::cursor::visual::point(20.0, 30.0, Some(42)),
+                    &receipt,
+                    async {
+                        receipt.accepted();
+                        Some(cua_driver_core::protocol::ToolResult::text("focused"))
+                    },
+                    async { panic!("semantic focus accepted; native fallback must stay lazy") },
+                )
+                .await;
+            assert_eq!(result.is_error, None);
+            if schedule != "coalesced" {
+                multi_stage_assert(&sink, &mut map, Foreground, Pixel);
+            }
+            multi_stage_expire_between(&sink, &mut map, schedule);
+            let result = crate::tools::with_type_visual_updates(
+                &state.cursor_registry,
+                visual_sink.as_ref(),
+                "one",
+                None,
+                |update| {
+                    update(ResolvedPointerTarget::from_bounds(
+                        42,
+                        [10.0, 20.0, 80.0, 30.0],
+                    ));
+                    multi_stage_assert(&sink, &mut map, Foreground, Pixel);
+                    assert_eq!(
+                        map.cursors["one"].core.visual.requested_action,
+                        cursor_overlay::CursorAction::Text
+                    );
+                    23
+                },
+            );
+            assert_eq!(result, 23);
+            let events = sink.1.lock().unwrap();
+            assert_ne!(events[0].id, events[2].id);
+            assert_eq!(
+                events.last().unwrap().phase,
+                cursor_overlay::VisualPhase::End
+            );
+            drop(events);
+            multi_stage_cleanup_and_unrelated(&sink, &state.cursor_registry, &mut map);
+        }
+    }
+
+    #[test]
+    fn multi_stage_menu_hops_keep_invocation_modifiers() {
+        use cua_driver_contract::{CursorDelivery::Foreground, CursorTarget::Desktop};
+        for schedule in ["coalesced", "split", "expired"] {
+            let registry = super::super::CursorRegistry::new();
+            let sink = std::sync::Arc::new(WatchableInboxSink::default());
+            let args = serde_json::json!({"pid":7,"window_id":42,
+                "path":["File","Open"],"delivery_mode":"foreground"});
+            multi_stage_begin(&sink, "invoke_menu", &args);
+            let visual_sink = crate::cursor::visual::InvocationVisualSink::bind(
+                "invoke_menu",
+                &args,
+                "one",
+                sink.clone(),
+            );
+            let mut map = empty_map();
+            if schedule == "expired" {
+                let now = Instant::now();
+                sink.0.lock().unwrap().take().apply(&mut map, now);
+                map.cursors
+                    .get_mut("one")
+                    .unwrap()
+                    .tick_at(0.0, now + Duration::from_secs(2));
+                assert_eq!(map.cursors["one"].core.badge_modifiers, None);
+                *sink.2.lock().unwrap() = Duration::from_secs(3);
+            }
+            for (stage, bounds) in [Some([10.0, 20.0, 40.0, 20.0]), None]
+                .into_iter()
+                .enumerate()
+            {
+                let result = crate::tools::dispatch_menu_visual(
+                    &registry,
+                    visual_sink.as_ref(),
+                    "one",
+                    bounds,
+                    42,
+                    || Ok::<_, ()>(19),
+                );
+                assert_eq!(result, Ok(19));
+                if schedule != "coalesced" || stage == 1 {
+                    multi_stage_assert(&sink, &mut map, Foreground, Desktop);
+                }
+                multi_stage_expire_between(&sink, &mut map, schedule);
+            }
+            multi_stage_cleanup_and_unrelated(&sink, &registry, &mut map);
+        }
+    }
+
+    fn multi_stage_expire_between(sink: &WatchableInboxSink, map: &mut RenderMap, schedule: &str) {
+        if schedule == "expired" {
+            let now = sink.1.lock().unwrap().last().unwrap().timestamp;
+            map.cursors
+                .get_mut("one")
+                .unwrap()
+                .tick_at(0.0, now + Duration::from_secs(2));
+            // Text delivery is scoped by End, so it need not expire mid-delivery.
+            *sink.2.lock().unwrap() += Duration::from_secs(3);
+        }
+    }
+
+    fn multi_stage_cleanup_and_unrelated(
+        sink: &WatchableInboxSink,
+        registry: &super::super::CursorRegistry,
+        map: &mut RenderMap,
+    ) {
+        use crate::cursor::visual::{emit_action_target, PointerVisualSink};
+        use cursor_overlay::{CursorAction, VisualPhase};
+        let stale = sink.1.lock().unwrap().first().unwrap().clone();
+        let now = sink.1.lock().unwrap().last().unwrap().timestamp;
+        sink.0.lock().unwrap().take().apply(map, now);
+        map.cursors
+            .get_mut("one")
+            .unwrap()
+            .tick_at(0.0, now + Duration::from_secs(2));
+        assert_eq!(map.cursors["one"].core.badge_modifiers, None);
+        assert!(map.cursors["one"].core.contact.is_none());
+        *sink.2.lock().unwrap() += Duration::from_secs(3);
+        // A raw new owner has no invocation context, even in the same session.
+        let unrelated = emit_action_target(registry, sink, "one", None, CursorAction::Text);
+        unrelated.publish(sink, VisualPhase::Tracking, Instant::now());
+        // Old-stage publications cannot replace this owner or restore its badge.
+        sink.publish("one", stale);
+        let now = Instant::now() + *sink.2.lock().unwrap();
+        sink.0.lock().unwrap().take().apply(map, now);
+        let core = &map.cursors["one"].core;
+        assert_eq!(core.visual.delivery, None);
+        assert_eq!(core.visual.target, None);
+        assert_eq!(core.badge_modifiers, None);
+    }
+
+    #[test]
+    fn multi_stage_explicit_new_invocation_does_not_borrow_unresolved_generic_context() {
+        use crate::cursor::visual::{emit_action_target, InvocationVisualSink};
+        let sink = std::sync::Arc::new(WatchableInboxSink::default());
+        multi_stage_begin(
+            &sink,
+            "scroll",
+            &serde_json::json!({
+                "delivery_mode":"background", "element_index":1
+            }),
+        );
+        let registry = super::super::CursorRegistry::new();
+        let args = serde_json::json!({"x":20,"y":30,"text":"next"});
+        let current = InvocationVisualSink::bind("type_text", &args, "one", sink.clone());
+        emit_action_target(
+            &registry,
+            current.as_ref(),
+            "one",
+            None,
+            cursor_overlay::CursorAction::Text,
+        );
+        let mut map = empty_map();
+        sink.0
+            .lock()
+            .unwrap()
+            .take()
+            .apply(&mut map, Instant::now());
+        let core = &map.cursors["one"].core;
+        assert_eq!(core.visual.delivery, None);
+        assert_eq!(
+            core.visual.target,
+            Some(cua_driver_contract::CursorTarget::Pixel)
+        );
+    }
+
+    #[test]
+    fn multi_stage_context_is_local_and_lifecycle_cleanup_rejects_old_stages() {
+        use crate::cursor::visual::{emit_action_target, InvocationVisualSink, PointerVisualSink};
+        use cursor_overlay::{CursorAction, VisualPhase};
+        for cleanup in ["end", "disable", "remove"] {
+            let sink = std::sync::Arc::new(WatchableInboxSink::default());
+            let args = serde_json::json!({"direction":"down", "amount":2,
+                "element_token":"opaque", "delivery_mode":"background"});
+            multi_stage_begin(&sink, "scroll", &args);
+            let registry = super::super::CursorRegistry::new();
+            let invocation = InvocationVisualSink::bind("scroll", &args, "one", sink.clone());
+            for _ in 0..2 {
+                crate::tools::dispatch_scroll_visual(
+                    &registry,
+                    invocation.as_ref(),
+                    "one",
+                    crate::cursor::visual::point(30.0, 40.0, Some(42)),
+                    -1,
+                    0,
+                    || Ok::<_, ()>(()),
+                )
+                .unwrap();
+            }
+            let mut map = empty_map();
+            multi_stage_assert(
+                &sink,
+                &mut map,
+                cua_driver_contract::CursorDelivery::Background,
+                cua_driver_contract::CursorTarget::Ax,
+            );
+            let last = sink.1.lock().unwrap().last().unwrap().clone();
+            match cleanup {
+                "end" => {
+                    let mut end = last.clone();
+                    end.phase = VisualPhase::End;
+                    end.timestamp = Instant::now();
+                    invocation.publish("one", end);
+                }
+                "disable" => {
+                    sink.send("one", OverlayCommand::SetEnabled(false));
+                    sink.send("one", OverlayCommand::SetEnabled(true));
+                }
+                "remove" => {
+                    sink.0
+                        .lock()
+                        .unwrap()
+                        .command(OverlayMsg::Remove("one".into()));
+                    // Publication after tombstoning is refused even with explicit context.
+                    invocation.publish("one", last.clone());
+                    sink.0
+                        .lock()
+                        .unwrap()
+                        .take()
+                        .apply(&mut map, Instant::now());
+                    assert!(!map.cursors.contains_key("one"));
+                    sink.0
+                        .lock()
+                        .unwrap()
+                        .command(OverlayMsg::Revive("one".into()));
+                }
+                _ => unreachable!(),
+            }
+            sink.0
+                .lock()
+                .unwrap()
+                .take()
+                .apply(&mut map, Instant::now());
+            if let Some(state) = map.cursors.get_mut("one") {
+                state.tick_at(0.0, Instant::now() + Duration::from_secs(2));
+                assert!(state.core.contact.is_none());
+                assert_eq!(state.core.badge_modifiers, None);
+            }
+            // Binding a publisher never lends its context to another session.
+            emit_action_target(
+                &registry,
+                invocation.as_ref(),
+                "two",
+                None,
+                CursorAction::Text,
+            );
+            let now = Instant::now();
+            sink.0.lock().unwrap().take().apply(&mut map, now);
+            assert_eq!(map.cursors["two"].core.badge_modifiers, None);
+            assert_eq!(map.cursors["two"].core.visual.target, None);
+            drop(invocation);
+            *sink.2.lock().unwrap() = Duration::from_secs(3);
+            let next =
+                emit_action_target(&registry, sink.as_ref(), "one", None, CursorAction::Text);
+            next.publish(sink.as_ref(), VisualPhase::Tracking, Instant::now());
+            let new_id = sink.1.lock().unwrap().last().unwrap().id;
+            assert_ne!(last.id, new_id);
+            for phase in [VisualPhase::Intent, VisualPhase::Contact, VisualPhase::End] {
+                let mut stale = last.clone();
+                stale.phase = phase;
+                stale.timestamp = Instant::now();
+                sink.publish("one", stale);
+            }
+            sink.0
+                .lock()
+                .unwrap()
+                .take()
+                .apply(&mut map, Instant::now() + Duration::from_secs(3));
+            let core = &map.cursors["one"].core;
+            assert_eq!(core.visual.requested_action, CursorAction::Text);
+            assert_eq!(core.visual.delivery, None);
+            assert_eq!(core.visual.target, None);
+            assert_eq!(core.badge_modifiers, None);
         }
     }
 

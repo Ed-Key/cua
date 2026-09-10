@@ -335,6 +335,7 @@ pub(crate) async fn focus_by_pixel(
     session_id: Option<String>,
     from_zoom: bool,
     mutation_lease: Option<&BackgroundMutationLease>,
+    visual_sink: Option<Arc<dyn crate::cursor::visual::PointerVisualSink>>,
 ) -> Result<(), cua_driver_core::protocol::ToolResult> {
     use cua_driver_core::tool::Tool;
     let mut click_args = serde_json::json!({
@@ -363,7 +364,10 @@ pub(crate) async fn focus_by_pixel(
     if from_zoom {
         click_args["from_zoom"] = serde_json::json!(true);
     }
-    let click_tool = click::ClickTool::new(state.clone());
+    let mut click_tool = click::ClickTool::new(state.clone());
+    if let Some(sink) = visual_sink {
+        click_tool = click_tool.with_visual_sink(sink);
+    }
     let click = click_tool.invoke(click_args);
     let focus = if let Some(lease) = mutation_lease {
         crate::background_mutation::with_held_lease(lease.pid, click).await
@@ -408,9 +412,7 @@ pub(crate) async fn focus_by_pixel(
     if from_zoom {
         click_args["from_zoom"] = serde_json::json!(true);
     }
-    let focus = click::ClickTool::new(state.clone())
-        .invoke(click_args)
-        .await;
+    let focus = click_tool.invoke(click_args).await;
     if focus.is_error == Some(true) {
         return Err(cua_driver_core::protocol::ToolResult::error(format!(
             "focus pixel-click at ({x:.0},{y:.0}) failed."
@@ -1194,3 +1196,9 @@ mod recording_start_guard_tests {
         let _ = rec.stop_owner(None);
     }
 }
+
+#[cfg(test)]
+pub(crate) use {
+    click::ClickTool, invoke_menu::dispatch_menu_visual, scroll::dispatch_scroll_visual,
+    type_text::with_type_visual_updates,
+};

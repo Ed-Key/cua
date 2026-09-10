@@ -53,10 +53,15 @@ impl ClickTool {
         }
     }
 
+    pub(crate) fn with_visual_sink(mut self, sink: Arc<dyn PointerVisualSink>) -> Self {
+        self.visual_sink = sink;
+        self
+    }
+
     // Both futures are lazy: a completed semantic route never polls native input.
     // Selection can deliver input and then fail its postcondition readback. Its
     // receipt keeps that delivery fact independent of the tool result.
-    async fn dispatch_resolved(
+    pub(crate) async fn dispatch_resolved(
         &self,
         cursor_key: &str,
         target: Option<ResolvedPointerTarget>,
