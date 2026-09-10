@@ -10,11 +10,13 @@ pub(super) struct Stamp {
     pub generation: u64,
     pub revision: u64,
     pub painted_at: Instant,
+    pub expires_at: Option<Instant>,
 }
 impl Stamp {
     pub fn current(self, generation: u64, revision: u64, now: Instant) -> bool {
         self.generation == generation
             && self.revision == revision
+            && self.expires_at.is_none_or(|deadline| now < deadline)
             && now.saturating_duration_since(self.painted_at) < MAX_FRAME_AGE
     }
 }
@@ -105,6 +107,7 @@ mod tests {
             generation: 1,
             revision: 8,
             painted_at: start,
+            expires_at: None,
         };
         assert!(frame.current(1, 8, start));
         assert!(!frame.current(2, 8, start));

@@ -1583,6 +1583,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                                         generation: map.layout.generation,
                                         revision: render_revision,
                                         painted_at: now,
+                                        expires_at: frame_pulse_expiry(map, display),
                                     },
                                 )
                             })
@@ -1664,6 +1665,15 @@ fn rectangles_intersect(rect: (f64, f64, f64, f64), display: DisplayGeometry) ->
         && x + width > display.x
         && y < display.y + display.height
         && y + height > display.y
+}
+
+fn frame_pulse_expiry(map: &RenderMap, display: DisplayGeometry) -> Option<Instant> {
+    map.cursors
+        .values()
+        .filter(|state| state_paints_display(state, display))
+        .filter_map(|state| state.core.contact)
+        .map(|contact| contact.presentation_timestamp + Duration::from_millis(150))
+        .min()
 }
 
 fn render_display(map: &RenderMap, display: DisplayGeometry) -> tiny_skia::Pixmap {
@@ -3020,6 +3030,40 @@ mod tests {
     }
 
     #[test]
+    fn correction_surface_rejects_expired_pulse_even_when_frame_is_young() {
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
+        let start = Instant::now();
+        let id = inbox.begin_action("one").unwrap();
+        let mut event = mailbox_event(id, 80., cursor_overlay::VisualPhase::Contact);
+        event.timestamp = start;
+        inbox.publish("one", event);
+        let paint_time = start + Duration::from_millis(149);
+        inbox.take().apply(&mut map, paint_time);
+        assert!(map.cursors["one"].core.contact.is_some());
+        let expires_at = frame_pulse_expiry(&map, map.layout.displays[0]);
+        assert_eq!(expires_at, Some(start + Duration::from_millis(150)));
+        let stamp = frame_transport::Stamp {
+            generation: 1,
+            revision: inbox.revision,
+            painted_at: paint_time,
+            expires_at,
+        };
+        assert!(stamp.current(1, inbox.revision, paint_time));
+        let inbox = Mutex::new(inbox);
+        assert!(!apply_surface_frame_if(
+            &inbox,
+            1,
+            1,
+            || 1,
+            &[],
+            |state| stamp.current(1, state.revision, start + Duration::from_millis(151)),
+            || panic!("expired pulse reached native contents")
+        ));
+    }
+
+    #[test]
     fn correction_actual_surface_submission_rejects_stale_art_and_preserves_fresh_clear() {
         use std::cell::Cell;
         for change in [
@@ -3036,6 +3080,7 @@ mod tests {
                 generation: 1,
                 revision: 0,
                 painted_at: now,
+                expires_at: None,
             };
             let mut generation = 1;
             let mut clock = now;
@@ -3078,6 +3123,7 @@ mod tests {
                 generation,
                 revision: inbox.lock().unwrap().revision,
                 painted_at: clock,
+                expires_at: None,
             };
             assert!(apply_surface_frame_if(
                 &inbox,
