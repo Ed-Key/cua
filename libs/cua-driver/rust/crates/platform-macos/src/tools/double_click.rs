@@ -149,6 +149,7 @@ impl Tool for DoubleClickTool {
             // Thread the resolved session cursor key into the blocking AX path
             // so its ClickPulse lands on THIS session's cursor, not "default".
             let ck = cursor_key.clone();
+            let registry = self.state.cursor_registry.clone();
             let result = tokio::task::spawn_blocking(move || {
                 ax_double_click(
                     pid,
@@ -156,6 +157,7 @@ impl Tool for DoubleClickTool {
                     element_ptr,
                     idx,
                     &ck,
+                    &registry,
                     has_ax_open,
                     delivery_mode.is_foreground(),
                 )
@@ -237,21 +239,11 @@ impl Tool for DoubleClickTool {
             None
         };
 
-        // Pin overlay above the target window before animating.
-        if let Some(wid) = window_id {
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-            );
-        }
-        // Animate cursor to the click point; wait for arrival before firing.
-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
-        crate::cursor::overlay::send_command(
-            cursor_key.clone(),
-            cursor_overlay::OverlayCommand::ClickPulse {
-                x: screen_x,
-                y: screen_y,
-            },
+        let visual = crate::cursor::visual::begin_pointer_action(
+            &self.state.cursor_registry,
+            &cursor_key,
+            crate::cursor::visual::point(screen_x, screen_y, window_id),
+            cursor_overlay::CursorAction::Click,
         );
 
         let fg = delivery_mode.is_foreground() && window_id.is_some();
@@ -273,6 +265,7 @@ impl Tool for DoubleClickTool {
                     crate::input::mouse::click_at_xy(pid, screen_x, screen_y, 2, &[])
                 }
             };
+            let do_click = || visual.dispatch(do_click);
             // Foreground rung: brief front → double-click → restore prior frontmost.
             match (fg, window_id) {
                 (true, Some(wid)) => {
@@ -312,15 +305,25 @@ fn ax_double_click(
     element_ptr: usize,
     idx: usize,
     cursor_key: &str,
+    registry: &crate::cursor::CursorRegistry,
     has_ax_open: bool,
     foreground: bool,
 ) -> anyhow::Result<String> {
     let element = element_ptr as AXUIElementRef;
+    let target = unsafe { crate::ax::bindings::element_screen_rect(element) }
+        .and_then(|rect| crate::cursor::visual::ResolvedPointerTarget::from_bounds(wid, rect));
+    let visual = crate::cursor::visual::begin_pointer_action(
+        registry,
+        cursor_key,
+        target,
+        cursor_overlay::CursorAction::Click,
+    );
 
     // Try AXOpen first (Finder items, openable list rows, document cells).
     if has_ax_open {
         let err = unsafe { perform_action(element, "AXOpen") };
         if err == kAXErrorSuccess {
+            visual.accepted();
             return Ok(format!("AXOpen performed on element [{idx}]."));
         }
         if !foreground {
@@ -338,11 +341,6 @@ fn ax_double_click(
     let (cx, cy) = unsafe { element_screen_center(element) }
         .ok_or_else(|| anyhow::anyhow!("Cannot resolve screen center for element [{idx}]"))?;
 
-    // Drive THIS session's cursor (threaded in via `cursor_key`), not "default".
-    crate::cursor::overlay::send_command(
-        cursor_key.to_owned(),
-        cursor_overlay::OverlayCommand::ClickPulse { x: cx, y: cy },
-    );
     // Use the window-local primitive (not bare click_at_xy): a plain
     // click_at_xy does NOT reliably reach a backgrounded / non-key window — it
     // no-ops on AppKit controls that hit-test the window-local stamp. Mirror the
@@ -360,17 +358,19 @@ fn ax_double_click(
              screen coordinates as window-local for element [{idx}]."
             )
         })?;
-    crate::input::mouse::click_at_xy_with_window_local(
-        pid,
-        cx,
-        cy,
-        wx,
-        wy,
-        wid,
-        2,
-        &[],
-        crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
-    )?;
+    visual.dispatch(|| {
+        crate::input::mouse::click_at_xy_with_window_local(
+            pid,
+            cx,
+            cy,
+            wx,
+            wy,
+            wid,
+            2,
+            &[],
+            crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
+        )
+    })?;
     Ok(format!(
         "✅ Double-clicked element [{idx}] at ({cx:.1}, {cy:.1})."
     ))

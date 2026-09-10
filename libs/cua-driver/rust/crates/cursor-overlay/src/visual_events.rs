@@ -45,10 +45,7 @@ impl VisualEvent {
                 return false;
             }
         }
-        self.phase == VisualPhase::End
-            || self.target.is_some()
-            || (self.phase == VisualPhase::Intent
-                && matches!(self.action, CursorAction::Text | CursorAction::App))
+        self.phase == VisualPhase::End || self.target.is_some() || self.phase == VisualPhase::Intent
     }
 }
 

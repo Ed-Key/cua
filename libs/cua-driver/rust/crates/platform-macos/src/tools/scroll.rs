@@ -531,12 +531,13 @@ impl Tool for ScrollTool {
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
             }
-            crate::cursor::overlay::animate_cursor_to(
-                cursor_key.clone(),
-                target.screen_x,
-                target.screen_y,
-            )
-            .await;
+            crate::cursor::visual::emit_action_target(
+                &self.state.cursor_registry,
+                &crate::cursor::visual::OverlayVisualSink,
+                &cursor_key,
+                crate::cursor::visual::point(target.screen_x, target.screen_y, target.wid),
+                cursor_overlay::CursorAction::Scroll,
+            );
             self.state.cursor_registry.update_position(
                 &cursor_key,
                 target.screen_x,

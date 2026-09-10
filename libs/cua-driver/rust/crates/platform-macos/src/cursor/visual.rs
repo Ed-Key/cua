@@ -1,7 +1,8 @@
-//! Resolved click visuals. The transport remains replaceable by later Slice A work.
+//! Resolved action visuals published without renderer acknowledgements.
 
-use async_trait::async_trait;
-use cursor_overlay::OverlayCommand;
+use cursor_overlay::{CursorAction, OverlayCommand, VisualActionId, VisualEvent, VisualPhase};
+use std::sync::{Arc, Mutex};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub(crate) struct ResolvedPointerTarget {
@@ -27,81 +28,157 @@ impl ResolvedPointerTarget {
     }
 }
 
-/// One resolved visual action. Consuming it prevents duplicate contact emission.
+/// Captures action ownership and resolved coordinates independently of later registry changes.
+#[derive(Clone)]
 pub(crate) struct PointerVisualHandle {
     key: String,
-    target: Option<ResolvedPointerTarget>,
+    event: Option<VisualEvent>,
 }
 
-/// Publish intent before input. This is not evidence of delivery.
-pub(crate) async fn emit_pointer_target(
+pub(crate) fn emit_pointer_target(
     registry: &super::CursorRegistry,
     sink: &dyn PointerVisualSink,
     key: &str,
     target: Option<ResolvedPointerTarget>,
 ) -> PointerVisualHandle {
-    let handle = PointerVisualHandle {
-        key: key.to_owned(),
-        target,
+    emit_action_target(registry, sink, key, target, CursorAction::Click)
+}
+
+pub(crate) fn emit_action_target(
+    registry: &super::CursorRegistry,
+    sink: &dyn PointerVisualSink,
+    key: &str,
+    target: Option<ResolvedPointerTarget>,
+    action: CursorAction,
+) -> PointerVisualHandle {
+    let mut handle = PointerVisualHandle {
+        key: key.into(),
+        event: None,
     };
     if key.is_empty() || cua_driver_core::session::is_session_ended(key) {
         return handle;
     }
     if let Some(target) = target {
-        if let Some(window_id) = target.window_id {
-            sink.send(key, OverlayCommand::PinAbove(window_id as u64));
+        if let Some(window) = target.window_id {
+            sink.send(key, OverlayCommand::PinAbove(window as u64));
         }
         registry.update_position(key, target.x, target.y);
-        sink.travel(key, target.x, target.y).await;
-    } else {
-        // A semantic action has no screen location without trustworthy bounds.
-        sink.send(
-            key,
-            OverlayCommand::BeginAction {
-                action: cursor_overlay::CursorAction::Click,
-                delivery: None,
-                target: None,
-            },
-        );
+    }
+    if let Some(id) = sink.begin(key) {
+        let event = VisualEvent {
+            id,
+            timestamp: Instant::now(),
+            target: target.map(|t| (t.x, t.y)),
+            window: target.and_then(|t| t.window_id.map(u64::from)),
+            bounds: target.and_then(|t| t.element_bounds),
+            action,
+            scroll_direction: None,
+            phase: VisualPhase::Intent,
+        };
+        sink.publish(key, event.clone());
+        handle.event = Some(event);
     }
     handle
 }
 
-/// Delivery feedback only. A contact cue does not certify an application effect.
+pub(crate) fn begin_pointer_action(
+    registry: &super::CursorRegistry,
+    key: &str,
+    target: Option<ResolvedPointerTarget>,
+    action: CursorAction,
+) -> Arc<DeliveryReceipt> {
+    let sink: Arc<dyn PointerVisualSink> = Arc::new(OverlayVisualSink);
+    let handle = emit_action_target(registry, sink.as_ref(), key, target, action);
+    let receipt = Arc::new(DeliveryReceipt::default());
+    receipt.attach(sink, handle);
+    receipt
+}
+
+pub(crate) fn point(x: f64, y: f64, window_id: Option<u32>) -> Option<ResolvedPointerTarget> {
+    (x.is_finite() && y.is_finite()).then_some(ResolvedPointerTarget {
+        x,
+        y,
+        window_id,
+        element_bounds: None,
+    })
+}
+
 pub(crate) fn emit_pointer_contact(sink: &dyn PointerVisualSink, handle: PointerVisualHandle) {
-    if handle.key.is_empty() || cua_driver_core::session::is_session_ended(&handle.key) {
-        return;
-    }
-    if let Some(target) = handle.target {
-        if let Some(bounds) = target.element_bounds {
-            sink.send(&handle.key, OverlayCommand::ShowFocusRect(Some(bounds)));
+    handle.publish(sink, VisualPhase::Contact, Instant::now());
+}
+
+impl PointerVisualHandle {
+    fn publish(&self, sink: &dyn PointerVisualSink, phase: VisualPhase, timestamp: Instant) {
+        if cua_driver_core::session::is_session_ended(&self.key) {
+            return;
         }
-        sink.send(
-            &handle.key,
-            OverlayCommand::ClickPulse {
-                x: target.x,
-                y: target.y,
-            },
-        );
+        if let Some(mut event) = self.event.clone() {
+            if phase == VisualPhase::Contact && event.target.is_none() {
+                return;
+            }
+            event.phase = phase;
+            event.timestamp = timestamp;
+            sink.publish(&self.key, event);
+        }
     }
 }
 
-#[async_trait]
+/// Accepted input is recorded at the actuator boundary, before effect readback.
+/// One receipt spans semantic and native fallback, so contact is emitted at most once.
+#[derive(Default)]
+pub(crate) struct DeliveryReceipt(Mutex<ReceiptState>);
+#[derive(Default)]
+struct ReceiptState {
+    accepted: Option<Instant>,
+    visual: Option<(Arc<dyn PointerVisualSink>, PointerVisualHandle)>,
+}
+impl DeliveryReceipt {
+    pub(crate) fn attach(&self, sink: Arc<dyn PointerVisualSink>, handle: PointerVisualHandle) {
+        let mut state = self.0.lock().unwrap();
+        if let Some(timestamp) = state.accepted {
+            handle.publish(sink.as_ref(), VisualPhase::Contact, timestamp);
+        } else {
+            state.visual = Some((sink, handle));
+        }
+    }
+    pub(crate) fn accepted(&self) {
+        let mut state = self.0.lock().unwrap();
+        if state.accepted.is_some() {
+            return;
+        }
+        let timestamp = Instant::now();
+        state.accepted = Some(timestamp);
+        if let Some((sink, handle)) = state.visual.take() {
+            handle.publish(sink.as_ref(), VisualPhase::Contact, timestamp);
+        }
+    }
+    pub(crate) fn was_accepted(&self) -> bool {
+        self.0.lock().unwrap().accepted.is_some()
+    }
+    pub(crate) fn dispatch<T, E>(&self, native: impl FnOnce() -> Result<T, E>) -> Result<T, E> {
+        let result = native();
+        if result.is_ok() {
+            self.accepted();
+        }
+        result
+    }
+}
+
 pub(crate) trait PointerVisualSink: Send + Sync {
     fn send(&self, key: &str, command: OverlayCommand);
-    async fn travel(&self, key: &str, x: f64, y: f64);
+    fn begin(&self, key: &str) -> Option<VisualActionId>;
+    fn publish(&self, key: &str, event: VisualEvent);
 }
-
 pub(crate) struct OverlayVisualSink;
-
-#[async_trait]
 impl PointerVisualSink for OverlayVisualSink {
     fn send(&self, key: &str, command: OverlayCommand) {
-        super::overlay::send_command(key.to_owned(), command);
+        super::overlay::send_command(key.into(), command);
     }
-
-    async fn travel(&self, key: &str, x: f64, y: f64) {
-        super::overlay::animate_cursor_to(key.to_owned(), x, y).await;
+    fn begin(&self, key: &str) -> Option<VisualActionId> {
+        super::overlay::begin_visual_action(key)
+    }
+    fn publish(&self, key: &str, event: VisualEvent) {
+        super::overlay::publish_visual_event(key, event);
     }
 }
 
@@ -120,9 +197,8 @@ pub(crate) mod test_support {
     }
 
     #[derive(Default)]
-    pub struct RecordingSink(pub Mutex<Vec<Event>>);
+    pub struct RecordingSink(pub Mutex<Vec<Event>>, pub Mutex<Vec<VisualEvent>>);
 
-    #[async_trait]
     impl PointerVisualSink for RecordingSink {
         fn send(&self, key: &str, command: OverlayCommand) {
             let event = match command {
@@ -134,8 +210,32 @@ pub(crate) mod test_support {
             };
             self.0.lock().unwrap().push(event);
         }
-        async fn travel(&self, key: &str, x: f64, y: f64) {
-            self.0.lock().unwrap().push(Event::Target(key.into(), x, y));
+        fn begin(&self, key: &str) -> Option<VisualActionId> {
+            super::super::overlay::begin_visual_action(key)
+        }
+        fn publish(&self, key: &str, event: VisualEvent) {
+            self.1.lock().unwrap().push(event.clone());
+            match event.phase {
+                VisualPhase::Intent => self.0.lock().unwrap().push(match event.target {
+                    Some((x, y)) => Event::Target(key.into(), x, y),
+                    None => Event::Semantic(key.into()),
+                }),
+                VisualPhase::Contact => {
+                    if let Some(rect) = event.bounds {
+                        self.0
+                            .lock()
+                            .unwrap()
+                            .push(Event::Bounds(key.into(), Some(rect)));
+                    }
+                    if let Some((x, y)) = event.target {
+                        self.0
+                            .lock()
+                            .unwrap()
+                            .push(Event::Contact(key.into(), x, y));
+                    }
+                }
+                _ => {}
+            }
         }
     }
 }
@@ -171,8 +271,7 @@ mod tests {
             &sink,
             "visual-captured",
             ResolvedPointerTarget::from_bounds(42, [-100.0, 200.0, 40.0, 60.0]),
-        )
-        .await;
+        );
         registry.update_position("visual-captured", 900.0, 800.0);
         emit_pointer_contact(&sink, handle);
         assert_eq!(
@@ -199,8 +298,7 @@ mod tests {
                 &sink,
                 key,
                 ResolvedPointerTarget::from_bounds(42, [0.0, 0.0, 40.0, 60.0]),
-            )
-            .await;
+            );
             emit_pointer_contact(&sink, handle);
             assert!(registry.get(key).is_none());
         }
@@ -216,8 +314,7 @@ mod tests {
             &sink,
             "visual-ended-mid-task6",
             ResolvedPointerTarget::from_bounds(42, [0.0, 0.0, 40.0, 60.0]),
-        )
-        .await;
+        );
         cua_driver_core::session::fire_session_end("visual-ended-mid-task6");
         registry.remove("visual-ended-mid-task6");
         emit_pointer_contact(&sink, handle);

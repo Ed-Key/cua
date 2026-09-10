@@ -21,10 +21,7 @@ use cua_driver_core::{
     tool_args::parse_legacy_click_input,
 };
 use serde_json::Value;
-use std::sync::{
-    atomic::{AtomicBool, Ordering},
-    Arc,
-};
+use std::sync::{atomic::Ordering, Arc};
 
 use crate::apps;
 use crate::ax::bindings::{
@@ -37,8 +34,8 @@ use core_foundation::base::{CFRelease, TCFType};
 
 use super::ToolState;
 use crate::cursor::visual::{
-    emit_pointer_contact, emit_pointer_target, OverlayVisualSink, PointerVisualSink,
-    ResolvedPointerTarget,
+    emit_pointer_contact, emit_pointer_target, DeliveryReceipt, OverlayVisualSink,
+    PointerVisualSink, ResolvedPointerTarget,
 };
 
 pub struct ClickTool {
@@ -61,7 +58,7 @@ impl ClickTool {
         &self,
         cursor_key: &str,
         target: Option<ResolvedPointerTarget>,
-        delivery_receipt: Option<&AtomicBool>,
+        delivery_receipt: Option<&DeliveryReceipt>,
         semantic: impl std::future::Future<Output = Option<ToolResult>>,
         native: impl std::future::Future<Output = ToolResult>,
     ) -> ToolResult {
@@ -70,15 +67,15 @@ impl ClickTool {
             self.visual_sink.as_ref(),
             cursor_key,
             target,
-        )
-        .await;
+        );
+        if let Some(receipt) = delivery_receipt {
+            receipt.attach(self.visual_sink.clone(), visual.clone());
+        }
         let result = match semantic.await {
             Some(result) => result,
             None => native.await,
         };
-        if result.is_error != Some(true)
-            || delivery_receipt.is_some_and(|receipt| receipt.load(Ordering::Relaxed))
-        {
+        if delivery_receipt.is_none() && result.is_error != Some(true) {
             emit_pointer_contact(self.visual_sink.as_ref(), visual);
         }
         result
@@ -335,9 +332,11 @@ impl Tool for ClickTool {
                     .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
             }
             let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+            let delivery_receipt = Arc::new(DeliveryReceipt::default());
             let dispatch = async {
                 let btn = button.clone();
                 let desktop_modifiers: Vec<String> = args.str_array("modifier");
+                let delivered = delivery_receipt.clone();
                 let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     // Desktop scope is explicitly foreground and vision-driven: post
                     // at the global HID tap so WindowServer delivers to the window
@@ -345,13 +344,15 @@ impl Tool for ClickTool {
                     // turn the foreground contract back into background delivery.
                     let modifier_refs: Vec<&str> =
                         desktop_modifiers.iter().map(String::as_str).collect();
-                    crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                        sx,
-                        sy,
-                        count,
-                        &btn,
-                        &modifier_refs,
-                    )
+                    delivered.dispatch(|| {
+                        crate::input::mouse::click_at_xy_desktop_with_modifiers(
+                            sx,
+                            sy,
+                            count,
+                            &btn,
+                            &modifier_refs,
+                        )
+                    })
                 })
                 .await;
                 let button_label = match button.as_str() {
@@ -379,7 +380,7 @@ impl Tool for ClickTool {
                         window_id: None,
                         element_bounds: None,
                     }),
-                    None,
+                    Some(&delivery_receipt),
                     async { None },
                     dispatch,
                 )
@@ -535,7 +536,7 @@ impl Tool for ClickTool {
                 );
             }
 
-            let delivery_receipt = Arc::new(AtomicBool::new(false));
+            let delivery_receipt = Arc::new(DeliveryReceipt::default());
             let dispatch = async {
                 // Surface 5: button=middle on the AX path has no AX equivalent.
                 // Fall back to a pixel middle-click at the element's screen-space center
@@ -547,6 +548,7 @@ impl Tool for ClickTool {
 
                     let mods_owned = modifiers.clone();
                     let foreground = delivery_mode.is_foreground();
+                    let receipt = delivery_receipt.clone();
                     let result = tokio::task::spawn_blocking(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     if foreground && !m.is_empty() {
@@ -554,13 +556,13 @@ impl Tool for ClickTool {
                             pid as libc::pid_t,
                             wid,
                             || {
-                                crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
+                                receipt.dispatch(|| crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                                     cx, cy, 1, "middle", &m,
-                                )
+                                ))
                             },
                         )
                     } else {
-                        crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m)
+                        receipt.dispatch(|| crate::input::mouse::middle_click_at_xy(pid, cx, cy, &m))
                     }
                 })
                 .await;
@@ -861,6 +863,7 @@ impl Tool for ClickTool {
 
             // Future construction does not dispatch. The boundary emits intent
             // before polling the hit test, then polls native input only on fallback.
+            let delivery_receipt = Arc::new(DeliveryReceipt::default());
             let semantic = async {
                 // A background PX action can still use an accessibility delivery
                 // backend after resolving the requested screen point. This keeps
@@ -874,6 +877,7 @@ impl Tool for ClickTool {
                 {
                     let focus_only = action == "focus";
                     let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
+                    let receipt = delivery_receipt.clone();
                     let ax_result = tokio::task::spawn_blocking(move || unsafe {
                         let Some(element) = element_at_screen_position(pid, screen_x, screen_y)
                         else {
@@ -896,6 +900,9 @@ impl Tool for ClickTool {
                             AXUIElementPerformAction(element, press.as_concrete_TypeRef())
                                 == kAXErrorSuccess
                         };
+                        if delivered {
+                            receipt.accepted();
+                        }
                         CFRelease(element as _);
                         Ok(delivered)
                     })
@@ -966,6 +973,7 @@ impl Tool for ClickTool {
                 // button != left. Left-button path stays on the existing Chromium-
                 // routed `click_at_xy_with_window_local` for back-compat.
                 let button_kind = button_str.clone();
+                let receipt = delivery_receipt.clone();
                 let result = focus_guard::with_focus_suppressed(
                 if activation_policy == PixelActivationPolicy::SuppressTarget {
                     Some(pid)
@@ -1023,6 +1031,7 @@ impl Tool for ClickTool {
                                 }
                             }
                         };
+                        let do_click = || receipt.dispatch(do_click);
                         // Foreground rung: brief front → click → restore.
                         // Returns whether the window was ACTUALLY fronted, so the
                         // reported `path` honestly reflects the rung that ran.
@@ -1114,7 +1123,7 @@ impl Tool for ClickTool {
                     window_id,
                     element_bounds: None,
                 }),
-                None,
+                Some(&delivery_receipt),
                 semantic,
                 native,
             )
@@ -1245,7 +1254,7 @@ fn perform_ax_click(
     pid: i32,
     window_id: u32,
     action_str: &str,
-    delivered: &AtomicBool,
+    delivered: &DeliveryReceipt,
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
@@ -1318,7 +1327,7 @@ fn perform_ax_click(
                     crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
                 )?;
             }
-            delivered.store(true, Ordering::Relaxed);
+            delivered.accepted();
             // AppKit may publish a transient AXSelected transition while the
             // event queue is still resolving the gesture. Let it settle before
             // accepting a candidate, then require the same state to survive a
@@ -1408,7 +1417,7 @@ fn perform_ax_click(
         anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
     }
 
-    delivered.store(true, Ordering::Relaxed);
+    delivered.accepted();
     let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
 
     // AXPopUpButton: list available options, redirect to set_value.
@@ -1564,6 +1573,56 @@ mod tests {
             .unwrap()
             .position
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn slice_a_contact_precedes_delayed_failed_readback() {
+        let (tool, sink) = slice_a_tool();
+        let receipt = DeliveryReceipt::default();
+        let result = tool
+            .dispatch_resolved(
+                "slice-a-first",
+                slice_a_target(),
+                Some(&receipt),
+                async { None },
+                async {
+                    receipt.accepted();
+                    // Verification has not returned, but accepted input already has feedback.
+                    slice_a_assert(&tool, &sink, "slice-a-first", true);
+                    let events = sink.1.lock().unwrap();
+                    let contact = events
+                        .iter()
+                        .find(|event| event.phase == cursor_overlay::VisualPhase::Contact)
+                        .unwrap()
+                        .clone();
+                    let mut core = cursor_overlay::RenderStateCore::new(
+                        cursor_overlay::CursorConfig::default(),
+                    );
+                    let display = cursor_overlay::DisplayBounds {
+                        x: 0.0,
+                        y: 0.0,
+                        width: 1000.0,
+                        height: 1000.0,
+                    };
+                    core.apply_visual_event(
+                        contact.clone(),
+                        Some(display),
+                        contact.timestamp + std::time::Duration::from_millis(75),
+                    );
+                    assert!((core.contact.unwrap().progress - 0.5).abs() < 1e-9);
+                    core.advance_visual_presentation(
+                        contact.timestamp + std::time::Duration::from_secs(1),
+                    );
+                    assert!(
+                        core.contact.is_none(),
+                        "delayed verification cannot create a fresh click"
+                    );
+                    ToolResult::error("later verification failed")
+                },
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        slice_a_assert(&tool, &sink, "slice-a-first", true);
     }
 
     #[tokio::test]
@@ -1724,7 +1783,7 @@ mod tests {
     #[tokio::test]
     async fn slice_a_delivered_selection_with_failed_readback_still_has_contact() {
         let (tool, sink) = slice_a_tool();
-        let receipt = AtomicBool::new(false);
+        let receipt = DeliveryReceipt::default();
         let result = tool
             .dispatch_resolved(
                 "slice-a-first",
@@ -1732,7 +1791,7 @@ mod tests {
                 Some(&receipt),
                 async { None },
                 async {
-                    receipt.store(true, Ordering::Relaxed);
+                    receipt.accepted();
                     finish_ax_dispatch(
                         Ok(Err(anyhow::anyhow!("selection readback did not stabilize"))),
                         "",
@@ -1753,7 +1812,7 @@ mod tests {
         use crate::ax::bindings::test_support::SelectionScope;
 
         let (tool, sink) = slice_a_tool();
-        let receipt = AtomicBool::new(false);
+        let receipt = DeliveryReceipt::default();
         let fixture = SelectionScope::install(advertised_press, readback, true);
         let result = tool
             .dispatch_resolved(
@@ -1811,7 +1870,7 @@ mod tests {
             "no confirmed effect or verification claim"
         );
         slice_a_assert(&tool, &sink, "slice-a-first", true);
-        assert!(receipt.load(Ordering::Relaxed));
+        assert!(receipt.was_accepted());
     }
 
     #[tokio::test]
@@ -1839,7 +1898,7 @@ mod tests {
         use crate::ax::bindings::test_support::SelectionScope;
 
         let (tool, sink) = slice_a_tool();
-        let receipt = AtomicBool::new(false);
+        let receipt = DeliveryReceipt::default();
         let fixture = SelectionScope::install(true, None, false);
         let result = tool
             .dispatch_resolved(
@@ -1865,7 +1924,7 @@ mod tests {
             .await;
         assert_eq!(result.is_error, Some(true));
         assert!(result.structured_content.is_none());
-        assert!(!receipt.load(Ordering::Relaxed));
+        assert!(!receipt.was_accepted());
         slice_a_assert(&tool, &sink, "slice-a-first", false);
     }
 

@@ -803,30 +803,21 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             return;
         }
 
-        crate::cursor::overlay::send_command(
-            action.session.clone(),
-            cursor_overlay::OverlayCommand::PinAbove(action.window_id),
+        // This callback precedes browser input dispatch. It carries intent only.
+        let kind = match action.kind {
+            BrowserVisualActionKind::Type => cursor_overlay::CursorAction::Text,
+            BrowserVisualActionKind::Scroll => cursor_overlay::CursorAction::Scroll,
+            BrowserVisualActionKind::Drag => cursor_overlay::CursorAction::Drag,
+            BrowserVisualActionKind::Hover => cursor_overlay::CursorAction::Navigate,
+            _ => cursor_overlay::CursorAction::Click,
+        };
+        crate::cursor::visual::emit_action_target(
+            &self.cursor_registry,
+            &crate::cursor::visual::OverlayVisualSink,
+            &action.session,
+            crate::cursor::visual::point(screen_x, screen_y, Some(action.window_id as u32)),
+            kind,
         );
-        crate::cursor::overlay::animate_cursor_to(action.session.clone(), screen_x, screen_y).await;
-        self.cursor_registry
-            .update_position(&action.session, screen_x, screen_y);
-
-        if matches!(
-            action.kind,
-            BrowserVisualActionKind::Click
-                | BrowserVisualActionKind::Type
-                | BrowserVisualActionKind::RightClick
-                | BrowserVisualActionKind::DoubleClick
-                | BrowserVisualActionKind::Drag
-        ) {
-            crate::cursor::overlay::send_command(
-                action.session,
-                cursor_overlay::OverlayCommand::ClickPulse {
-                    x: screen_x,
-                    y: screen_y,
-                },
-            );
-        }
     }
 
     async fn classify_browser(&self, pid: i64) -> Result<BrowserClassification, BrowserRefusal> {

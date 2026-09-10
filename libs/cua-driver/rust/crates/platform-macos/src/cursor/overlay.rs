@@ -45,34 +45,6 @@ use indexmap::IndexMap;
 
 use super::display_layout::{DisplayGeometry, DisplayId, DisplayLayout};
 
-// ── Arrival-signal channels (one waiter slot per cursor key) ──────────────
-//
-// Each session's `animate_cursor_to` registers an arrival oneshot keyed by its
-// own cursor key. A new animation only supersedes the SAME key's prior waiter,
-// so concurrent sessions never cross-cancel each other's arrivals.
-
-static ARRIVAL_TX: Mutex<Option<HashMap<CursorKey, tokio::sync::oneshot::Sender<()>>>> =
-    Mutex::new(None);
-
-fn arrival_register(key: CursorKey, tx: tokio::sync::oneshot::Sender<()>) {
-    let mut guard = ARRIVAL_TX.lock().unwrap();
-    let map = guard.get_or_insert_with(HashMap::new);
-    // Cancel only the same key's previous waiter (superseded by new animation).
-    if let Some(old_tx) = map.insert(key, tx) {
-        let _ = old_tx.send(());
-    }
-}
-
-fn arrival_fire(key: &CursorKey) {
-    if let Ok(mut guard) = ARRIVAL_TX.lock() {
-        if let Some(map) = guard.as_mut() {
-            if let Some(tx) = map.remove(key) {
-                let _ = tx.send(());
-            }
-        }
-    }
-}
-
 // ── Global overlay state ──────────────────────────────────────────────────
 
 enum MacOverlayMsg {
@@ -92,26 +64,92 @@ static DISPLAY_GENERATION: AtomicU64 = AtomicU64::new(0);
 struct OverlayInbox {
     visual: cursor_overlay::VisualMailbox,
     commands: Vec<(u64, OverlayMsg)>,
+    motion: HashMap<CursorKey, MotionConfig>,
+    template_motion: MotionConfig,
 }
 
 impl OverlayInbox {
     fn command(&mut self, message: OverlayMsg) {
         match message {
-            OverlayMsg::Remove(key) => self.visual.remove(&key),
+            OverlayMsg::Remove(key) => {
+                self.visual.remove(&key);
+                if key != "default" {
+                    self.motion.remove(&key);
+                }
+            }
             OverlayMsg::Revive(key) => self.visual.revive(&key),
             message => {
                 // Preserve the legacy bounded, drop-newest command behavior.
                 if self.commands.len() < 4096 {
+                    if let OverlayMsg::Cmd(ref keyed) = message {
+                        let motion = self
+                            .motion
+                            .entry(keyed.key.clone())
+                            .or_insert_with(|| self.template_motion.clone());
+                        if let OverlayCommand::SetMotion(ref update) = keyed.cmd {
+                            *motion = update.clone();
+                        }
+                    }
                     let order = self.visual.next_order();
                     self.commands.push((order, message));
-                } else if let OverlayMsg::Cmd(KeyedOverlayCommand {
-                    key,
-                    cmd: OverlayCommand::MoveTo { .. },
-                }) = message
-                {
-                    arrival_fire(&key);
                 }
             }
+        }
+    }
+    fn semantic(&mut self, event: cua_driver_core::cursor_events::CursorEvent) {
+        use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+        match event {
+            CursorEvent::SetSessionLabel { session, label } => {
+                self.command(OverlayMsg::Cmd(KeyedOverlayCommand {
+                    key: session,
+                    cmd: OverlayCommand::SetSessionLabel(label),
+                }))
+            }
+            CursorEvent::SelectTheme { session, selection } => {
+                self.command(OverlayMsg::Cmd(KeyedOverlayCommand {
+                    key: session,
+                    cmd: OverlayCommand::SetTheme {
+                        theme_id: selection.theme_id,
+                        reduced_motion: selection.reduced_motion,
+                    },
+                }))
+            }
+            CursorEvent::Action {
+                session,
+                phase: CursorEventPhase::Begin,
+                semantics,
+            } => {
+                // The core context has no invocation identity. Use a bounded fallback
+                // cue at Begin; resolved handles take ownership later. An unscoped
+                // End must never release a newer resolved action of the same kind.
+                if let Some(id) = self.visual.begin_action(&session) {
+                    self.command(OverlayMsg::Cmd(KeyedOverlayCommand {
+                        key: session.clone(),
+                        cmd: OverlayCommand::BeginAction {
+                            action: semantics.action,
+                            delivery: semantics.delivery,
+                            target: semantics.target,
+                        },
+                    }));
+                    self.visual.publish(
+                        &session,
+                        cursor_overlay::VisualEvent {
+                            id,
+                            timestamp: Instant::now(),
+                            target: None,
+                            window: None,
+                            bounds: None,
+                            action: semantics.action,
+                            scroll_direction: None,
+                            phase: cursor_overlay::VisualPhase::Intent,
+                        },
+                    );
+                }
+            }
+            CursorEvent::Action {
+                phase: CursorEventPhase::End,
+                ..
+            } => {}
         }
     }
     fn take(&mut self) -> InboxBatch {
@@ -287,11 +325,6 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
             if key != "default" {
                 map.cursors.shift_remove(&key);
                 map.command_order.retain(|candidate| candidate != &key);
-                if let Ok(mut guard) = ARRIVAL_TX.lock() {
-                    if let Some(m) = guard.as_mut() {
-                        m.remove(&key);
-                    }
-                }
                 // Tombstone the key so a late in-flight Cmd from another task
                 // (an animate/click racing the owning session's death) cannot
                 // re-create the just-removed cursor. Never tombstone "default".
@@ -308,7 +341,6 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
             // — this is the resurrection guard. Without it, a ClickPulse/MoveTo
             // landing after Remove would re-insert (and re-leak) the cursor.
             if key.is_empty() || map.ended.contains(&key) {
-                arrival_fire(&key);
                 return;
             }
             let target = match &cmd {
@@ -325,7 +357,6 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
                         .or_insert_with(|| render_state_for_key(&map.template, &key));
                     rs.target = Some((x, y));
                     rs.invalidate_placement();
-                    arrival_fire(&key);
                     return;
                 }
                 if matches!(&cmd, OverlayCommand::MoveTo { .. }) {
@@ -340,14 +371,7 @@ fn apply_msg(map: &mut RenderMap, msg: OverlayMsg) {
             if let Some(target) = target {
                 rs.target = Some(target);
             }
-            let ends_travel = matches!(
-                &cmd,
-                OverlayCommand::SnapTo { .. } | OverlayCommand::SetEnabled(false)
-            );
             rs.apply_command(cmd);
-            if ends_travel {
-                arrival_fire(&key);
-            }
             map.command_order.retain(|candidate| candidate != &key);
             map.command_order.push(key);
         }
@@ -363,7 +387,7 @@ pub fn init(cfg: CursorConfig) {
             .set(tx)
             .expect("cursor overlay sender is initialized exactly once");
         *CMD_RX_CELL.lock().unwrap() = Some(rx);
-        *ARRIVAL_TX.lock().unwrap() = Some(HashMap::new());
+        inbox().lock().unwrap().template_motion = cfg.motion.clone();
         let mut cursors = IndexMap::new();
         cursors.insert("default".to_owned(), RenderState::new(cfg.clone()));
         *RENDER.lock().unwrap() = Some(RenderMap {
@@ -374,41 +398,10 @@ pub fn init(cfg: CursorConfig) {
             ended: HashSet::new(),
         });
     });
-    cua_driver_core::cursor_events::install_cursor_event_sink(std::sync::Arc::new(
-        |event: cua_driver_core::cursor_events::CursorEvent| {
-            use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
-            let (session, cmd) = match event {
-                CursorEvent::SetSessionLabel { session, label } => {
-                    (session, OverlayCommand::SetSessionLabel(label))
-                }
-                CursorEvent::Action {
-                    session,
-                    phase: CursorEventPhase::Begin,
-                    semantics,
-                } => (
-                    session,
-                    OverlayCommand::BeginAction {
-                        action: semantics.action,
-                        delivery: semantics.delivery,
-                        target: semantics.target,
-                    },
-                ),
-                CursorEvent::Action {
-                    session,
-                    phase: CursorEventPhase::End,
-                    semantics,
-                } => (session, OverlayCommand::EndAction(semantics.action)),
-                CursorEvent::SelectTheme { session, selection } => (
-                    session,
-                    OverlayCommand::SetTheme {
-                        theme_id: selection.theme_id,
-                        reduced_motion: selection.reduced_motion,
-                    },
-                ),
-            };
-            send_command(session, cmd);
-        },
-    ));
+    cua_driver_core::cursor_events::install_cursor_event_sink(std::sync::Arc::new(|event| {
+        inbox().lock().unwrap().semantic(event);
+        wake_renderer();
+    }));
 }
 
 /// Send a legacy keyed command. Configuration retains its bounded drop-newest behavior.
@@ -418,9 +411,6 @@ pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
         return;
     }
     if CMD_TX.get().is_none() {
-        if matches!(&cmd, OverlayCommand::MoveTo { .. }) {
-            arrival_fire(&key);
-        }
         return;
     }
     inbox()
@@ -430,12 +420,12 @@ pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
     wake_renderer();
 }
 
-/// Truthful render acknowledgement for lifecycle inspection. This never falls
-/// back to the default cursor: an absent, unplaced, disabled, or idle-faded
-/// session cursor is not reported as visible.
+/// Best-effort render acknowledgement for lifecycle completion. Contention means
+/// no current acknowledgement (false), never a cached claim of visibility.
+/// This reader cannot wait behind painting and never falls back to another key.
 pub fn is_visible_for_session(key: &str) -> bool {
     RENDER
-        .lock()
+        .try_lock()
         .ok()
         .and_then(|guard| {
             guard
@@ -474,15 +464,13 @@ pub fn revive_cursor(key: CursorKey) {
 /// `"default"` cursor's motion when that key has no own entry yet (e.g. a
 /// session whose first motion call precedes any move/enable).
 pub fn current_motion(key: &str) -> MotionConfig {
-    let guard = RENDER.lock().unwrap();
-    let Some(map) = guard.as_ref() else {
-        return MotionConfig::default();
-    };
-    map.cursors
+    let inbox = inbox().lock().unwrap();
+    inbox
+        .motion
         .get(key)
-        .or_else(|| map.cursors.get("default"))
-        .map(|rs| rs.core.motion.clone())
-        .unwrap_or_default()
+        .or_else(|| inbox.motion.get("default"))
+        .cloned()
+        .unwrap_or_else(|| inbox.template_motion.clone())
 }
 
 /// Return the render-owned theme and semantic playback state for one cursor.
@@ -535,44 +523,17 @@ fn animation_enabled(map: &RenderMap, key: &str) -> bool {
         })
 }
 
-/// Animate the overlay cursor to `(x, y)` and suspend until the Dubins path
-/// completes and the spring overshoot begins.
-///
-/// Placement occurs when the renderer consumes the command. This temporary
-/// arrival transport is retained until the later nonblocking motion task.
-pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
-    if key.is_empty() {
-        return;
-    }
-    let should_animate = {
-        let guard = RENDER.lock().unwrap();
-        guard
-            .as_ref()
-            .is_some_and(|map| animation_enabled(map, &key))
-    };
-    if !should_animate {
-        return;
-    }
-
-    // Create a one-shot channel; store the sender (keyed) so the render thread
-    // can fire it when this cursor's path finishes.
-    let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-    arrival_register(key.clone(), tx);
-
-    // Send the MoveTo command (click offset applied inside apply_command).
+/// Legacy overlay placement retains the public configured duration, including zero.
+/// Publication never reads rendering state or waits for placement.
+pub fn publish_legacy_move(key: CursorKey, x: f64, y: f64) {
     send_command(
         key,
         OverlayCommand::MoveTo {
             x,
             y,
-            // Arrive pointing upper-left (45°), matching the macOS system-cursor
-            // convention and Swift reference (`endAngleDegrees: 45`).
             end_heading_radians: std::f64::consts::FRAC_PI_4,
         },
     );
-
-    // Await arrival signal (fired from render thread when Dubins path ends).
-    let _ = rx.await;
 }
 
 /// Block the calling thread (must be the OS main thread) running the AppKit
@@ -895,13 +856,12 @@ unsafe fn create_native_surface(
 }
 
 fn replace_display_layout(map: &mut RenderMap, layout: DisplayLayout) {
-    for (key, state) in &mut map.cursors {
+    for state in map.cursors.values_mut() {
         if state
             .target
             .is_some_and(|(x, y)| layout.display_at(x, y).is_none())
         {
             state.invalidate_placement();
-            arrival_fire(key);
         }
     }
     map.layout = layout;
@@ -1024,7 +984,6 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
 
         let (
             z_order,
-            arrived,
             had_msg,
             cursor_commanded,
             hover_changed,
@@ -1038,12 +997,9 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             let cursor_commanded = batch.apply(map, now);
             let had_msg = first_msg.is_some() || cursor_commanded;
 
-            let mut arrived = Vec::new();
             if frame_tick_needed || had_msg {
-                for (key, state) in map.cursors.iter_mut() {
-                    if state.tick_at(dt, now) {
-                        arrived.push(key.clone());
-                    }
+                for state in map.cursors.values_mut() {
+                    state.tick_at(dt, now);
                 }
             }
 
@@ -1073,7 +1029,6 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
 
             (
                 z_order,
-                arrived,
                 had_msg,
                 cursor_commanded,
                 hover_changed,
@@ -1081,10 +1036,6 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                 next_hover_poll_needed,
             )
         };
-
-        for key in &arrived {
-            arrival_fire(key);
-        }
 
         if frame_tick_needed || had_msg {
             repin_frames += 1;
@@ -1548,6 +1499,127 @@ mod tests {
     }
 
     #[test]
+    fn slice_a_generic_end_cannot_cancel_resolved_or_restart_expired_cue() {
+        use cua_driver_core::cursor_events::{CursorEvent, CursorEventPhase};
+        let mut inbox = OverlayInbox::default();
+        let mut map = empty_map();
+        let semantic = |phase| CursorEvent::Action {
+            session: "one".into(),
+            phase,
+            semantics: cua_driver_contract::CursorSemantics::new(
+                cursor_overlay::CursorAction::Click,
+            ),
+        };
+        inbox.semantic(semantic(CursorEventPhase::Begin));
+        let id = inbox.visual.begin_action("one").unwrap();
+        let t = Instant::now();
+        let event = cursor_overlay::VisualEvent {
+            id,
+            timestamp: t,
+            target: Some((40.0, 50.0)),
+            window: Some(42),
+            bounds: None,
+            action: cursor_overlay::CursorAction::Click,
+            scroll_direction: None,
+            phase: cursor_overlay::VisualPhase::Contact,
+        };
+        inbox.visual.publish("one", event);
+        inbox.semantic(semantic(CursorEventPhase::End));
+        inbox.take().apply(&mut map, t + Duration::from_millis(75));
+        assert_eq!(
+            map.cursors["one"].core.visual.resolved_action,
+            cursor_overlay::CursorAction::Click
+        );
+        assert!((map.cursors["one"].core.contact.unwrap().progress - 0.5).abs() < 1e-9);
+        map.cursors
+            .get_mut("one")
+            .unwrap()
+            .tick_at(0.0, t + Duration::from_secs(2));
+        inbox.semantic(semantic(CursorEventPhase::End));
+        inbox.take().apply(&mut map, t + Duration::from_secs(2));
+        assert!(map.cursors["one"].core.contact.is_none());
+        assert_eq!(
+            map.cursors["one"].core.visual.resolved_action,
+            cursor_overlay::CursorAction::Idle
+        );
+        inbox.semantic(semantic(CursorEventPhase::Begin));
+        inbox
+            .take()
+            .apply(&mut map, Instant::now() + Duration::from_secs(2));
+        assert_eq!(
+            map.cursors["one"].core.visual.resolved_action,
+            cursor_overlay::CursorAction::Idle
+        );
+    }
+
+    #[test]
+    fn slice_a_legacy_move_and_admitted_motion_keep_configured_duration() {
+        for duration in [0.0, 850.0] {
+            let mut inbox = OverlayInbox::default();
+            let mut map = empty_map();
+            let mut motion = MotionConfig::default();
+            motion.glide_duration_ms = duration;
+            inbox.command(command("legacy", OverlayCommand::SetMotion(motion.clone())));
+            inbox.command(move_msg("legacy", 80.0, 90.0));
+            assert_eq!(inbox.motion["legacy"], motion);
+            inbox.take().apply(&mut map, Instant::now());
+            assert_eq!(map.cursors["legacy"].core.motion, motion);
+            assert!(map.cursors["legacy"].core.path.is_some());
+            // Legacy motion is not a timestamped action with a 220 ms deadline.
+            map.cursors
+                .get_mut("legacy")
+                .unwrap()
+                .tick_at(0.0, Instant::now() + Duration::from_secs(1));
+            assert!(map.cursors["legacy"].core.path.is_some());
+        }
+    }
+
+    #[test]
+    fn slice_a_producer_and_completion_do_not_wait_for_render() {
+        let held_render = RENDER.lock().unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let runtime = tokio::runtime::Builder::new_current_thread()
+                .build()
+                .unwrap();
+            runtime.block_on(async {
+                let registry = super::super::CursorRegistry::new();
+                let sink = super::super::visual::OverlayVisualSink;
+                let handle = super::super::visual::emit_pointer_target(
+                    &registry,
+                    &sink,
+                    "stalled-native",
+                    Some(super::super::visual::ResolvedPointerTarget {
+                        x: 80.0,
+                        y: 90.0,
+                        window_id: Some(42),
+                        element_bounds: None,
+                    }),
+                );
+                let native = || {
+                    assert_eq!(
+                        registry.get("stalled-native").unwrap().position.unwrap().x,
+                        80.0
+                    );
+                };
+                native();
+                super::super::visual::emit_pointer_contact(&sink, handle);
+                current_motion("stalled-native");
+                is_visible_for_session("stalled-native");
+                remove_cursor("stalled-native".into());
+                tx.send(()).unwrap();
+            });
+        });
+        let completed = rx.recv_timeout(Duration::from_millis(200));
+        drop(held_render);
+        worker.join().unwrap();
+        assert!(
+            completed.is_ok(),
+            "input and explicit completion must finish with renderer held and zero drains"
+        );
+    }
+
+    #[test]
     fn slice_a_fix_newer_action_replaces_pending_older_contact() {
         newer_action_before_older_timestamp(false);
     }
@@ -1957,7 +2029,7 @@ mod tests {
     }
 
     #[test]
-    fn slice_a_layout_loss_invalidates_pending_target_and_arrival() {
+    fn slice_a_layout_loss_invalidates_pending_target() {
         let mut map = empty_map();
         let primary = map.layout.displays[0];
         let secondary = DisplayGeometry {
@@ -1985,8 +2057,6 @@ mod tests {
         apply_msg(&mut map, move_msg("lost", -1400.0, 300.0));
         // The rendered anchor is still on primary while the resolved target is on secondary.
         assert_eq!(map.cursors["lost"].core.pos, (50.0, 50.0));
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        arrival_register("lost".into(), tx);
         replace_display_layout(
             &mut map,
             DisplayLayout {
@@ -1995,7 +2065,6 @@ mod tests {
             },
         );
         assert!(!map.cursors["lost"].core.placed);
-        assert!(rx.try_recv().is_ok());
         assert!(!map.cursors["lost"].needs_frame_tick());
         assert!(painted_display_ids(&map).is_empty());
         assert_eq!(map.cursors["lost"].core.pinned_wid, Some(777));
@@ -2259,20 +2328,14 @@ mod tests {
     }
 
     #[test]
-    fn slice_a_missing_display_never_places_or_keeps_waiter() {
+    fn slice_a_missing_display_never_places() {
         for empty in [false, true] {
             let mut map = empty_map();
             if empty {
                 map.layout.displays.clear();
             }
             let key = format!("slice-a-missing-{empty}");
-            let (tx, mut rx) = tokio::sync::oneshot::channel();
-            arrival_register(key.clone(), tx);
             apply_msg(&mut map, move_msg(&key, -1400.0, -700.0));
-            assert!(
-                rx.try_recv().is_ok(),
-                "unavailable display must complete temporary arrival"
-            );
             let rs = &map.cursors[&key];
             assert!(!rs.core.placed);
             assert!(!rs.needs_frame_tick());
@@ -2311,11 +2374,8 @@ mod tests {
     fn slice_a_remove_before_first_command_and_revive_seed_anew() {
         let mut map = empty_map();
         apply_msg(&mut map, OverlayMsg::Remove("late".into()));
-        let (tx, mut rx) = tokio::sync::oneshot::channel();
-        arrival_register("late".into(), tx);
         apply_msg(&mut map, move_msg("late", 50.0, 50.0));
         assert!(!map.cursors.contains_key("late"));
-        assert!(rx.try_recv().is_ok());
         apply_msg(&mut map, OverlayMsg::Revive("late".into()));
         apply_msg(&mut map, move_msg("late", 50.0, 50.0));
         assert_eq!(map.cursors["late"].core.pos, (2.0, 2.0));
@@ -2347,13 +2407,16 @@ mod tests {
         // Replace only the queue and native thread boundary. Both the resolved
         // visual publisher and renderer command processing remain production code.
         struct RenderSink(Mutex<RenderMap>);
-        #[async_trait::async_trait]
         impl super::super::visual::PointerVisualSink for RenderSink {
             fn send(&self, key: &str, cmd: OverlayCommand) {
                 apply_msg(&mut self.0.lock().unwrap(), command(key, cmd));
             }
-            async fn travel(&self, key: &str, x: f64, y: f64) {
-                apply_msg(&mut self.0.lock().unwrap(), move_msg(key, x, y));
+            fn begin(&self, key: &str) -> Option<cursor_overlay::VisualActionId> {
+                begin_visual_action(key)
+            }
+            fn publish(&self, key: &str, event: cursor_overlay::VisualEvent) {
+                let now = event.timestamp;
+                apply_visual_in_map(&mut self.0.lock().unwrap(), key.into(), event, now);
             }
         }
         let registry = super::super::CursorRegistry::new();
@@ -2368,8 +2431,7 @@ mod tests {
                 window_id: Some(123),
                 element_bounds: None,
             }),
-        )
-        .await;
+        );
         assert_eq!(
             sink.0.lock().unwrap().cursors["intent"].core.pos,
             (2.0, 2.0)
@@ -2846,27 +2908,5 @@ mod tests {
             !render_map_needs_frame_tick(&map),
             "fully hidden idle cursor should quiesce"
         );
-    }
-
-    #[test]
-    fn per_key_arrival_isolation() {
-        // Two concurrent waiters keyed A and B; firing A must not cancel B.
-        // This mirrors the ARRIVAL_TX HashMap logic in isolation (no statics).
-        let mut waiters: HashMap<CursorKey, tokio::sync::oneshot::Sender<()>> = HashMap::new();
-        let (txa, mut rxa) = tokio::sync::oneshot::channel::<()>();
-        let (txb, mut rxb) = tokio::sync::oneshot::channel::<()>();
-        waiters.insert("A".to_owned(), txa);
-        waiters.insert("B".to_owned(), txb);
-
-        // Fire A's arrival.
-        if let Some(tx) = waiters.remove("A") {
-            let _ = tx.send(());
-        }
-        // A resolved, B still pending.
-        assert!(matches!(rxa.try_recv(), Ok(())));
-        assert!(matches!(
-            rxb.try_recv(),
-            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
-        ));
     }
 }

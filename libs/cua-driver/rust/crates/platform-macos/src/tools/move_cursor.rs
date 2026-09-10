@@ -127,14 +127,17 @@ impl Tool for MoveCursorTool {
                 px_frame::resolve_or_refuse(wid).await
             },
             |cursor_id, window_id, x, y| async move {
-                if let Some(wid) = window_id {
-                    crate::cursor::overlay::send_command(
-                        cursor_id.clone(),
-                        cursor_overlay::OverlayCommand::PinAbove(u64::from(wid)),
+                if window_id.is_some() {
+                    crate::cursor::visual::emit_action_target(
+                        &self.state.cursor_registry,
+                        &crate::cursor::visual::OverlayVisualSink,
+                        &cursor_id,
+                        crate::cursor::visual::point(x, y, window_id),
+                        cursor_overlay::CursorAction::Navigate,
                     );
+                } else {
+                    crate::cursor::overlay::publish_legacy_move(cursor_id, x, y);
                 }
-                // Preserve the first-move seeding and animation used by legacy moves.
-                crate::cursor::overlay::animate_cursor_to(cursor_id, x, y).await;
             },
         )
         .await

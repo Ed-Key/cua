@@ -165,8 +165,23 @@ impl Tool for RightClickTool {
                 Err(refusal_result) => return refusal_result,
             };
 
-            let result =
-                tokio::task::spawn_blocking(move || ax_show_menu(element_ptr, idx, pid, wid)).await;
+            let registry = self.state.cursor_registry.clone();
+            let result = tokio::task::spawn_blocking(move || {
+                let target = unsafe {
+                    crate::ax::bindings::element_screen_rect(element_ptr as AXUIElementRef)
+                }
+                .and_then(|rect| {
+                    crate::cursor::visual::ResolvedPointerTarget::from_bounds(wid, rect)
+                });
+                let visual = crate::cursor::visual::begin_pointer_action(
+                    &registry,
+                    &cursor_key,
+                    target,
+                    cursor_overlay::CursorAction::Click,
+                );
+                ax_show_menu(element_ptr, idx, pid, wid, &visual)
+            })
+            .await;
 
             return match result {
                 Ok(Ok(msg)) => ToolResult::text(msg),
@@ -230,21 +245,11 @@ impl Tool for RightClickTool {
             None
         };
 
-        // Pin overlay above the target window before animating.
-        if let Some(wid) = window_id {
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-            );
-        }
-        // Animate cursor to the click point; wait for arrival before firing.
-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
-        crate::cursor::overlay::send_command(
-            cursor_key.clone(),
-            cursor_overlay::OverlayCommand::ClickPulse {
-                x: screen_x,
-                y: screen_y,
-            },
+        let visual = crate::cursor::visual::begin_pointer_action(
+            &self.state.cursor_registry,
+            &cursor_key,
+            crate::cursor::visual::point(screen_x, screen_y, window_id),
+            cursor_overlay::CursorAction::Click,
         );
 
         let mod_suffix = if modifiers.is_empty() {
@@ -271,6 +276,7 @@ impl Tool for RightClickTool {
                     crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
                 }
             };
+            let do_it = || visual.dispatch(do_it);
             // Foreground rung: brief front → right-click → restore prior frontmost.
             match (fg, window_id) {
                 (true, Some(wid)) => {
@@ -299,7 +305,13 @@ impl Tool for RightClickTool {
 
 // ── Blocking AX path ─────────────────────────────────────────────────────────
 
-fn ax_show_menu(element_ptr: usize, idx: usize, pid: i32, wid: u32) -> anyhow::Result<String> {
+fn ax_show_menu(
+    element_ptr: usize,
+    idx: usize,
+    pid: i32,
+    wid: u32,
+    visual: &crate::cursor::visual::DeliveryReceipt,
+) -> anyhow::Result<String> {
     let element = element_ptr as AXUIElementRef;
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -319,6 +331,7 @@ fn ax_show_menu(element_ptr: usize, idx: usize, pid: i32, wid: u32) -> anyhow::R
     if advertised.iter().any(|a| a == "AXShowMenu") {
         let err = unsafe { perform_action(element, "AXShowMenu") };
         if err == kAXErrorSuccess {
+            visual.accepted();
             return Ok(format!(
                 "Shown menu for [{idx}] {role} \"{title}\" (AXShowMenu)."
             ));
@@ -339,7 +352,9 @@ fn ax_show_menu(element_ptr: usize, idx: usize, pid: i32, wid: u32) -> anyhow::R
     let (wx, wy) = crate::windows::window_bounds_by_id(wid)
         .map(|b| (cx - b.x, cy - b.y))
         .unwrap_or((cx, cy));
-    crate::input::mouse::right_click_at_xy_with_window_local(pid, cx, cy, wx, wy, wid, &[])?;
+    visual.dispatch(|| {
+        crate::input::mouse::right_click_at_xy_with_window_local(pid, cx, cy, wx, wy, wid, &[])
+    })?;
     Ok(format!(
         "Right-clicked [{idx}] {role} \"{title}\" at element center ({cx:.0}, {cy:.0}) \
          (pixel right-click; element advertises no AXShowMenu)."

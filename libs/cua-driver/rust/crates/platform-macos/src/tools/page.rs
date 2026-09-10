@@ -155,20 +155,11 @@ impl PageBackend for MacOsPageBackend {
         let screen_x = sx + vx * dpr;
         let screen_y = sy + vy * dpr;
         let cursor_key = "default".to_owned();
-        crate::cursor::overlay::send_command(
-            cursor_key.clone(),
-            cursor_overlay::OverlayCommand::PinAbove(window_id),
-        );
-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
-        self.state
-            .cursor_registry
-            .update_position(&cursor_key, screen_x, screen_y);
-        crate::cursor::overlay::send_command(
-            cursor_key,
-            cursor_overlay::OverlayCommand::ClickPulse {
-                x: screen_x,
-                y: screen_y,
-            },
+        let visual = crate::cursor::visual::begin_pointer_action(
+            &self.state.cursor_registry,
+            &cursor_key,
+            crate::cursor::visual::point(screen_x, screen_y, Some(window_id as u32)),
+            cursor_overlay::CursorAction::Click,
         );
 
         let click_js = format!(
@@ -181,6 +172,7 @@ impl PageBackend for MacOsPageBackend {
 }})();"#
         );
         let _ = self.execute_javascript(pid, window_id, &click_js).await?;
+        visual.accepted();
 
         Ok(ClickElementResult {
             screen_x,

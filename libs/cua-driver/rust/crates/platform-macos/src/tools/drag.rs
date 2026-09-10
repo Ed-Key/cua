@@ -285,7 +285,13 @@ impl Tool for DragTool {
                 cursor_overlay::OverlayCommand::PinAbove(wid as u64),
             );
         }
-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), from_sx, from_sy).await;
+        crate::cursor::visual::emit_action_target(
+            &self.state.cursor_registry,
+            &crate::cursor::visual::OverlayVisualSink,
+            &cursor_key,
+            crate::cursor::visual::point(from_sx, from_sy, window_id),
+            cursor_overlay::CursorAction::Drag,
+        );
 
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // Drags can trigger drag-and-drop side-effects that spawn helper

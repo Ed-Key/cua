@@ -1,8 +1,8 @@
 //! AX action dispatch — the preferred click/interaction path for indexed elements.
 
 use crate::ax::bindings::*;
+use crate::cursor::visual::DeliveryReceipt;
 use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
-use std::sync::atomic::{AtomicBool, Ordering};
 
 const MAX_SELECTION_ANCESTORS: usize = 8;
 
@@ -29,7 +29,10 @@ fn is_selectable_container_role(role: &str) -> bool {
 /// Record each accepted write in `delivered` independently of read-back. This
 /// receipt describes input delivery only; `Some(role)` still requires verified
 /// selection, and an unsuccessful later attempt must not clear the receipt.
-pub fn select_nearest_container(element_ptr: usize, delivered: &AtomicBool) -> Option<String> {
+pub(crate) fn select_nearest_container(
+    element_ptr: usize,
+    delivered: &DeliveryReceipt,
+) -> Option<String> {
     let mut current = element_ptr as AXUIElementRef;
     let mut owns_current = false;
 
@@ -40,7 +43,7 @@ pub fn select_nearest_container(element_ptr: usize, delivered: &AtomicBool) -> O
         {
             let err = unsafe { set_bool_attr_true(current, "AXSelected") };
             if err == kAXErrorSuccess {
-                delivered.store(true, Ordering::Relaxed);
+                delivered.accepted();
                 if unsafe { copy_bool_attr(current, "AXSelected") } == Some(true) {
                     if owns_current {
                         unsafe { CFRelease(current as CFTypeRef) };
