@@ -10,7 +10,12 @@ pub(super) trait Access {
     fn target(&self, pid: i32, wid: u32) -> Option<Psn>;
     fn front(&self, psn: Psn, wid: u32) -> i32;
     fn record(&self, psn: Psn, bytes: &[u8; 248]) -> bool;
-    fn key(&self, pid: i32, wid: u32);
+    fn key(
+        &self,
+        pid: i32,
+        wid: u32,
+        admission: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()>;
     fn focused(&self, pid: i32) -> Option<u32>;
     fn wait(&self, pid: i32, wid: u32) -> bool;
     fn settle(&self);
@@ -38,8 +43,13 @@ impl Access for Native {
     fn record(&self, psn: Psn, bytes: &[u8; 248]) -> bool {
         unsafe { post_event_record_to_fn().unwrap()(psn.as_ptr().cast(), bytes.as_ptr()) == 0 }
     }
-    fn key(&self, pid: i32, wid: u32) {
-        make_exact_window_key(pid, wid);
+    fn key(
+        &self,
+        pid: i32,
+        wid: u32,
+        admission: &dyn Fn() -> anyhow::Result<()>,
+    ) -> anyhow::Result<()> {
+        make_exact_window_key_checked(pid, wid, admission).map(|_| ())
     }
     fn focused(&self, pid: i32) -> Option<u32> {
         crate::ax::bindings::focused_window_id_of_pid(pid)
@@ -107,7 +117,7 @@ pub(super) fn assist(
         || {
             ax.front(target, wid);
             admission()?;
-            ax.key(pid, wid);
+            ax.key(pid, wid, admission)?;
             ax.wait(pid, wid);
             admission()?;
             body()
@@ -152,7 +162,7 @@ pub(super) fn hid(
                 "WindowServer rejected foreground HID activation"
             );
             admission()?;
-            ax.key(pid, wid);
+            ax.key(pid, wid, admission)?;
             anyhow::ensure!(
                 ax.wait(pid, wid),
                 "exact target window did not become focused for foreground HID delivery"
@@ -172,6 +182,7 @@ pub(crate) mod tests {
         events: RefCell<Vec<&'static str>>,
         current: Cell<bool>,
         invalidate_on_read: bool,
+        invalidate_on_key_lookup: bool,
     }
     impl Access for Fake {
         fn can_front(&self) -> bool {
@@ -199,8 +210,39 @@ pub(crate) mod tests {
             self.events.borrow_mut().push("record");
             true
         }
-        fn key(&self, _: i32, _: u32) {
-            self.events.borrow_mut().push("key");
+        fn key(
+            &self,
+            _: i32,
+            wid: u32,
+            admission: &dyn Fn() -> anyhow::Result<()>,
+        ) -> anyhow::Result<()> {
+            make_exact_window_key_with(
+                wid,
+                || {
+                    self.events.borrow_mut().push("key_lookup");
+                    if self.invalidate_on_key_lookup {
+                        self.current.set(false);
+                    }
+                    Some([2; 8])
+                },
+                |psn, target| {
+                    assert_eq!((psn, target), ([2; 8], 42));
+                    self.events.borrow_mut().push("key");
+                    true
+                },
+                |psn, record| {
+                    assert_eq!(psn, [2; 8]);
+                    assert_eq!(&record[0x3c..0x40], &42u32.to_le_bytes());
+                    self.events.borrow_mut().push(match record[0x08] {
+                        1 => "key_down",
+                        2 => "key_up",
+                        _ => panic!("unexpected make-key record"),
+                    });
+                    true
+                },
+                admission,
+            )
+            .map(|_| ())
         }
         fn focused(&self, _: i32) -> Option<u32> {
             None
@@ -221,6 +263,7 @@ pub(crate) mod tests {
             events: RefCell::default(),
             current: Cell::new(true),
             invalidate_on_read: false,
+            invalidate_on_key_lookup: false,
         };
         let result = match kind {
             "assist" => assist(&ax, 2, 42, admission, body).map(|_| ()),
@@ -228,6 +271,50 @@ pub(crate) mod tests {
             _ => background(&ax, 2, 42, admission).and_then(|_| body()),
         };
         (result, ax.events.into_inner())
+    }
+
+    fn exercise_inner_key_lookup(cancel: bool) {
+        for kind in ["assist", "hid"] {
+            let ax = Fake {
+                events: RefCell::default(),
+                current: Cell::new(true),
+                invalidate_on_read: false,
+                invalidate_on_key_lookup: cancel,
+            };
+            let admit = || {
+                anyhow::ensure!(
+                    ax.current.get(),
+                    "ownership invalidated during inner lookup"
+                );
+                Ok(())
+            };
+            let body = || {
+                ax.events.borrow_mut().push("click");
+                Ok(())
+            };
+            let result = if kind == "assist" {
+                assist(&ax, 2, 42, &admit, body).map(|_| ())
+            } else {
+                hid(&ax, 2, 42, &admit, body)
+            };
+            if cancel {
+                assert!(result.is_err());
+                assert_eq!(
+                    *ax.events.borrow(),
+                    ["front", "key_lookup", "restore"],
+                    "{kind}"
+                );
+            } else {
+                assert!(result.is_ok());
+                let mut expected =
+                    vec!["front", "key_lookup", "key", "key_down", "key_up", "click"];
+                if kind == "hid" {
+                    expected.push("settle");
+                }
+                expected.push("restore");
+                assert_eq!(*ax.events.borrow(), expected, "{kind}");
+            }
+        }
     }
 
     #[test]
@@ -240,6 +327,7 @@ pub(crate) mod tests {
                 events: RefCell::default(),
                 current: Cell::new(true),
                 invalidate_on_read: false,
+                invalidate_on_key_lookup: false,
             };
             let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
                 if kind == "assist" {
@@ -261,6 +349,7 @@ pub(crate) mod tests {
                     events: RefCell::default(),
                     current: Cell::new(during_read),
                     invalidate_on_read: during_read,
+                    invalidate_on_key_lookup: false,
                 };
                 let admit = || {
                     anyhow::ensure!(ax.current.get(), "cancelled");
@@ -283,5 +372,17 @@ pub(crate) mod tests {
                 );
             }
         }
+    }
+
+    // Uses the native make-key orchestration, including its own PSN lookup,
+    // through the same checked key boundary used by both foreground routes.
+    #[test]
+    fn inner_key_lookup_cancellation_blocks_key_pair_and_click_but_restores() {
+        exercise_inner_key_lookup(true);
+    }
+
+    #[test]
+    fn admitted_inner_key_lookup_keeps_exact_native_pair_and_restoration() {
+        exercise_inner_key_lookup(false);
     }
 }

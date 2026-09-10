@@ -608,29 +608,60 @@ fn make_key_window_record(window_id: u32, event_kind: u8) -> [u8; 0xF8] {
 /// make-key records for the requested WindowServer id, then let the caller
 /// raise the matching AX window. No other application window is addressed.
 pub fn make_exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
+    make_exact_window_key_checked(target_pid, target_wid, &|| Ok(())).unwrap_or(false)
+}
+
+fn make_exact_window_key_checked(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
     let Some(set_front) = set_front_process_fn() else {
-        return false;
+        return Ok(false);
     };
     let Some(post) = post_event_record_to_fn() else {
-        return false;
+        return Ok(false);
     };
-    let mut target_psn = [0u8; 8];
-    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
-        return false;
-    }
+    make_exact_window_key_with(
+        target_wid,
+        || {
+            let mut psn = [0; 8];
+            get_process_psn_for_window(target_wid, target_pid, &mut psn).then_some(psn)
+        },
+        |psn, wid| unsafe { set_front(psn.as_ptr().cast(), wid, 0x200) == 0 },
+        |psn, record| unsafe { post(psn.as_ptr().cast(), record.as_ptr()) == 0 },
+        admission,
+    )
+}
+
+// The lookup and native effects are supplied at the boundary so regressions
+// exercise the same post-lookup admission and paired records as Native::key.
+fn make_exact_window_key_with(
+    target_wid: u32,
+    lookup: impl FnOnce() -> Option<[u8; 8]>,
+    set_front: impl FnOnce([u8; 8], u32) -> bool,
+    post: impl Fn([u8; 8], &[u8; 248]) -> bool,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    let Some(target_psn) = lookup() else {
+        return Ok(false);
+    };
+    // The owner/PSN lookup can outlive the action. Recheck before the native
+    // request; once admitted, preserve the existing paired record sequence.
+    admission()?;
 
     // kCPSUserGenerated = 0x200. Unlike kCPSNoWindows, this permits AppKit to
     // establish the requested native key window before it validates NSMenu.
-    if unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x200) } != 0 {
-        return false;
+    if !set_front(target_psn, target_wid) {
+        return Ok(false);
     }
     for event_kind in [0x01, 0x02] {
         let record = make_key_window_record(target_wid, event_kind);
-        if unsafe { post(target_psn.as_ptr() as *const c_void, record.as_ptr()) } != 0 {
-            return false;
+        if !post(target_psn, &record) {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Tool-agnostic foreground-assist: briefly front `window_id`, wait for the

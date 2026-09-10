@@ -1237,6 +1237,28 @@ struct AppKitOverlayHost {
     surfaces: HashMap<DisplayId, NativeSurface>,
 }
 
+fn live_cursor_window_ids(
+    host: Option<&AppKitOverlayHost>,
+    mut window_number: impl FnMut(usize) -> isize,
+) -> Vec<u32> {
+    host.into_iter()
+        .flat_map(|host| host.surfaces.values())
+        .filter_map(|surface| u32::try_from(window_number(surface.win_ptr)).ok())
+        .filter(|id| *id != 0)
+        .collect()
+}
+
+/// Snapshot actual surface identities on their owning thread. These windows
+/// belong to the display host, including when no session currently paints art.
+/// Never retain historical IDs across host replacement or inspect render state.
+pub(crate) fn owned_cursor_window_ids(_main: objc2_foundation::MainThreadMarker) -> Vec<u32> {
+    let host = HOST.lock().unwrap();
+    live_cursor_window_ids(host.as_ref(), |ptr| unsafe {
+        let window = ptr as *mut objc2::runtime::AnyObject;
+        objc2::msg_send![window, windowNumber]
+    })
+}
+
 impl AppKitOverlayHost {
     unsafe fn create(layout: &DisplayLayout) -> Option<Self> {
         let primary_height = layout.primary_height()?;
@@ -2292,6 +2314,31 @@ fn pixmap_to_cgimage(pixmap: tiny_skia::Pixmap) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn owned_cursor_ids_follow_live_host_surfaces_only() {
+        let host = |generation, ptr| AppKitOverlayHost {
+            generation,
+            surfaces: HashMap::from([(
+                1,
+                NativeSurface {
+                    win_ptr: ptr,
+                    layer_ptr: 0,
+                },
+            )]),
+        };
+        let old = host(1, 30953);
+        let rebuilt = host(2, 31000);
+        let read = |ptr| ptr as isize;
+        // Ending a session clears art, not these shared display-host windows.
+        // Recognition therefore has no session/render-state dependency.
+        assert_eq!(live_cursor_window_ids(Some(&old), read), [30953]);
+        assert_eq!(live_cursor_window_ids(Some(&rebuilt), read), [31000]);
+        assert!(live_cursor_window_ids(None, |_| panic!("no live surface")).is_empty());
+        for invalid in [-1, 0, u32::MAX as isize + 1] {
+            assert!(live_cursor_window_ids(Some(&old), |_| invalid).is_empty());
+        }
+    }
 
     fn mailbox_event(
         id: cursor_overlay::VisualActionId,
