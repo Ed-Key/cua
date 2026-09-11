@@ -542,3 +542,26 @@ async fn sequence_nested_dispatch_preserves_transport_owner() {
         assert_eq!(args["_public_session_label"], "wire-sequence");
     }
 }
+
+#[tokio::test]
+async fn sequence_preserves_public_labels_that_resemble_runtime_namespaces() {
+    let _serial = SERIAL.lock().await;
+    let (registry, log) = registry("ok", snapshot(true));
+    let context = context();
+    let label = "__cua_runtime_custom";
+    let mut args = input();
+    args["session"] = json!(label);
+    let result = registry
+        .invoke_with_context("run_sequence", args, context.clone())
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    assert_eq!(result.structured_content.unwrap()["status"], "completed");
+    let log = log.lock().unwrap();
+    for index in [0, 2] {
+        assert_eq!(log[index].1["session"], context.runtime_session_key(label));
+        assert_eq!(
+            log[index].1["_session_id"],
+            context.runtime_session_key(label)
+        );
+    }
+}
