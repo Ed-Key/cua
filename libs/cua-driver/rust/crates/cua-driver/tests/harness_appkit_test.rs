@@ -258,6 +258,12 @@ fn run_sequence_counter_case(action: &str, stop_after_first: bool) {
         );
         assert!(!response.is_error(), "{}", response.raw);
         let output = response.structured();
+        println!("sequence outcome={output}");
+        // Read independently before assertions so failed runs retain the
+        // fixture state as well as the executor's reported evidence.
+        let after = snapshot_elements(driver, pid, wid);
+        let actual_counter = read_counter(&after);
+        println!("independent counter={actual_counter}");
         let steps = output["steps"]
             .as_array()
             .expect("attempted sequence steps");
@@ -292,14 +298,8 @@ fn run_sequence_counter_case(action: &str, stop_after_first: bool) {
             .unwrap()
             .iter()
             .all(|block| block["type"] != "image"));
-        // Read the fixture again, independently of the executor's reported
-        // postcondition, to catch a second mutation after a failed check.
-        let after = snapshot_elements(driver, pid, wid);
-        assert_eq!(read_counter(&after), if stop_after_first { 1 } else { 2 });
-        println!(
-            "sequence outcome={output}; independent counter={}",
-            read_counter(&after)
-        );
+        // The independent count catches a second mutation after a failed check.
+        assert_eq!(actual_counter, if stop_after_first { 1 } else { 2 });
     });
 }
 
