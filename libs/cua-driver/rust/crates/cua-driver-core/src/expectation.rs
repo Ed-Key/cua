@@ -22,10 +22,6 @@ use crate::{
     tool_args::parse_typed_input,
 };
 
-const MAX_TIMEOUT_MS: u64 = 10_000;
-const DEFAULT_STABLE_SAMPLES: u64 = 2;
-const MAX_STABLE_SAMPLES: u64 = 5;
-const MAX_PREDICATES: usize = 8;
 const POLL_INTERVAL_MS: u64 = 100;
 
 #[derive(Debug, Clone, Default)]
@@ -231,35 +227,15 @@ impl Tool for VerifyStateTool {
             Ok(input) => input,
             Err(error) => return error,
         };
-        if input.pid <= 0 {
-            return ToolResult::error("verify_state requires pid > 0");
-        }
-        if input.expect.is_empty() || input.expect.len() > MAX_PREDICATES {
-            return ToolResult::error("verify_state requires between 1 and 8 predicates");
-        }
-        if input.timeout_ms.is_some_and(|value| value > MAX_TIMEOUT_MS) {
-            return ToolResult::error("verify_state timeout_ms must be between 0 and 10000");
-        }
-        if input
-            .stable_samples
-            .is_some_and(|value| !(1..=MAX_STABLE_SAMPLES).contains(&value))
-        {
-            return ToolResult::error("verify_state stable_samples must be between 1 and 5");
+        if let Err(error) = input.validate() {
+            return ToolResult::error(error);
         }
         let timeout_ms = input.timeout_ms.unwrap_or(VERIFY_STATE_DEFAULT_TIMEOUT_MS);
-        if timeout_ms == 0 && input.stable_samples.is_some_and(|samples| samples > 1) {
-            return ToolResult::error(
-                "verify_state timeout_ms=0 requires stable_samples=1 because only one sample is possible",
-            );
-        }
         let stable_samples = if timeout_ms == 0 {
             1
         } else {
-            input.stable_samples.unwrap_or(DEFAULT_STABLE_SAMPLES)
+            input.stable_samples.unwrap_or(2)
         };
-        if let Some(error) = invalid_predicate_message(&input.expect) {
-            return ToolResult::error(error);
-        }
         let include_elements = input
             .expect
             .iter()
@@ -334,29 +310,6 @@ impl Tool for VerifyStateTool {
         }
         result
     }
-}
-
-fn invalid_predicate_message(expect: &[StatePredicate]) -> Option<String> {
-    for (index, predicate) in expect.iter().enumerate() {
-        if let Some(element) = predicate.element.as_ref() {
-            if element.exists == Some(false) {
-                return Some(format!(
-                    "verify_state predicate {index} element.exists=false is unsupported because element snapshots are not exhaustive"
-                ));
-            }
-            for (name, value) in [
-                ("role", element.selector.role.as_deref()),
-                ("label_contains", element.selector.label_contains.as_deref()),
-            ] {
-                if value.is_some_and(|value| value.trim().is_empty()) {
-                    return Some(format!(
-                        "verify_state predicate {index} selector {name} must not be empty"
-                    ));
-                }
-            }
-        }
-    }
-    None
 }
 
 fn status_label(status: VerificationStatus) -> &'static str {

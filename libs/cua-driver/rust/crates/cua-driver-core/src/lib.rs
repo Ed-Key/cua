@@ -80,6 +80,7 @@ pub mod recording_loader;
 pub mod recording_render;
 pub mod recording_tools;
 pub mod recording_zoom;
+pub mod sequence;
 pub mod server;
 pub mod session;
 pub mod session_authorization;
@@ -102,3 +103,6 @@ pub mod window_target;
 
 pub use cua_driver_contract::{CaptureScope, EscalationReason, TOOL_INVOCATION_FAILED_CODE};
 pub use recording::RecordingSession;
+
+#[cfg(test)]
+mod sequence_tests;

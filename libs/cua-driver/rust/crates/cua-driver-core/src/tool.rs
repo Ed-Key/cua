@@ -844,6 +844,13 @@ impl ToolRegistry {
         self.register(Box::new(crate::recording_tools::InstallFfmpegTool));
     }
 
+    /// Register the bounded composite after the action and verification tools.
+    pub fn register_sequence_tools(&mut self) {
+        self.register(Box::new(crate::sequence::RunSequenceTool::new(
+            self.replay_registry.clone(),
+        )));
+    }
+
     /// Install the encrypted history hook and its two permission-gated,
     /// read-only agent tools. Lifecycle mutation remains daemon-private.
     pub fn register_history_tools(&mut self, manager: Arc<crate::history::HistoryManager>) {
@@ -898,7 +905,7 @@ impl ToolRegistry {
         crate::perception_tools::register_perception_tool(self, client, resolve_binding);
     }
 
-    /// Wire up the replay tool's weak self-reference.
+    /// Wire up the replay and sequence tools' weak self-reference.
     /// Call this once, immediately after `Arc::new(registry)`.
     pub fn init_self_weak(self: &Arc<Self>) {
         *self.replay_registry.lock().unwrap() = Arc::downgrade(self);
@@ -1534,7 +1541,11 @@ impl ToolRegistry {
         let should_record = !tool.def().read_only
             && !matches!(
                 resolved_name,
-                "start_recording" | "stop_recording" | "get_recording_state" | "replay_trajectory"
+                "start_recording"
+                    | "stop_recording"
+                    | "get_recording_state"
+                    | "replay_trajectory"
+                    | "run_sequence"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
         let _desktop_action = if requires_desktop_coordination(
@@ -5240,6 +5251,7 @@ mod capability_tests {
         "stop_recording",
         "get_recording_state",
         "replay_trajectory",
+        "run_sequence",
         "install_ffmpeg",
         "install_extension",
         // misc

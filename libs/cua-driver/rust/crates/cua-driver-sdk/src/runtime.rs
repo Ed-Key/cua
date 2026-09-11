@@ -587,6 +587,8 @@ fn build_registry(options: &RuntimeOptions) -> ToolRegistry {
         ToolRegistry::new()
     };
 
+    registry.register_sequence_tools();
+
     if let Some(register_host_tools) = options.register_host_tools {
         register_host_tools(&mut registry);
     }
