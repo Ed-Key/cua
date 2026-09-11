@@ -903,7 +903,14 @@ samples require no approach record. Missing, rotated, mixed or incomplete logs
 fail rather than invent timing. `rpc_outside_registered_approach_ms` subtracts
 the **measured** registration-to-acknowledgement interval from the measured RPC;
 it includes resolution, native delivery, readback, restoration and transport.
-It is not a measurement of pure dispatch overhead. On renderer-ready candidates,
+It is not a measurement of pure dispatch overhead.
+
+On renderer-ready candidates, the retained private `surface_matches` field means current display-generation
+geometry, not native surface creation. `route_matches` describes planned routing
+only; false does not reject an otherwise valid renderer-ready timing record.
+Older logs keep their original candidate semantics. Neither field proves native
+ordering or physical presentation.
+
 `submission_ms` denotes queueing the target frame in the bounded visual mailbox,
 and `acknowledgement_ms` denotes completing the renderer-ready receipt. The
 `ack_received` stage is receipt consumption. These retained field names do not

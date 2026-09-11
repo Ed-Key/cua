@@ -33,7 +33,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::c_void;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -46,6 +46,8 @@ use indexmap::IndexMap;
 use super::display_layout::{DisplayGeometry, DisplayId, DisplayLayout};
 
 mod frame_transport;
+mod handoff;
+use handoff::Latest;
 mod ordering_trace;
 
 // ── Global overlay state ──────────────────────────────────────────────────
@@ -1212,24 +1214,18 @@ fn apply_surface_route(
     ) == OrderAuthority::Current
 }
 
+type OrderWork = (OrderRequest, Option<ordering_trace::Trace>);
+
 #[derive(Default)]
 struct OrderMailbox {
-    pending: HashMap<DisplayId, (OrderRequest, Option<ordering_trace::Trace>)>,
-    scheduled: bool,
+    pending: HashMap<DisplayId, OrderWork>,
 }
 impl OrderMailbox {
     fn push(&mut self, request: OrderRequest, trace: Option<ordering_trace::Trace>) {
         self.pending
             .insert(request.route.display_id, (request, trace));
     }
-    fn schedule(&mut self) -> bool {
-        if self.scheduled || self.pending.is_empty() {
-            return false;
-        }
-        self.scheduled = true;
-        true
-    }
-    fn take(&mut self) -> Vec<(OrderRequest, Option<ordering_trace::Trace>)> {
+    fn take(&mut self) -> Vec<OrderWork> {
         std::mem::take(&mut self.pending).into_values().collect()
     }
     fn defer(&mut self, request: OrderRequest, trace: Option<ordering_trace::Trace>) {
@@ -1237,35 +1233,80 @@ impl OrderMailbox {
             .entry(request.route.display_id)
             .or_insert((request, trace));
     }
-    fn finish(&mut self) -> bool {
-        self.scheduled = false;
-        !self.pending.is_empty()
+}
+
+#[derive(Default)]
+struct OrderDispatch {
+    pending: Mutex<OrderMailbox>,
+    // Main returns a single bounded drain's Busy work without reacquiring pending.
+    retry: Latest<Vec<OrderWork>>,
+    // True from worker scheduling until main publishes retry work and returns ownership.
+    scheduled: AtomicBool,
+}
+impl OrderDispatch {
+    // Render worker only. Never called while RENDER is held.
+    fn push(&self, request: OrderRequest, trace: Option<ordering_trace::Trace>) {
+        self.pending.lock().unwrap().push(request, trace);
+    }
+    fn schedule(&self) -> bool {
+        let mut pending = self.pending.lock().unwrap();
+        if self.scheduled.load(Ordering::Acquire) {
+            return false;
+        }
+        if let Some(retry) = self.retry.take() {
+            for (request, trace) in retry {
+                pending.defer(request, trace);
+            }
+        }
+        if pending.pending.is_empty() {
+            return false;
+        }
+        !self.scheduled.swap(true, Ordering::AcqRel)
+    }
+    // AppKit main only. No blocking acquisition and no recursive callback enqueue.
+    fn drain(
+        &self,
+        mut apply: impl FnMut(&OrderRequest, Option<&ordering_trace::Trace>) -> OrderAuthority,
+        wake: impl FnOnce(),
+    ) {
+        let batch = self
+            .pending
+            .try_lock()
+            .ok()
+            .map(|mut pending| pending.take());
+        if let Some(batch) = batch {
+            let retry: Vec<_> = batch
+                .into_iter()
+                .filter_map(|(request, trace)| {
+                    (apply(&request, trace.as_ref()) == OrderAuthority::Busy)
+                        .then_some((request, trace))
+                })
+                .collect();
+            if !retry.is_empty() {
+                self.retry.publish(retry);
+            }
+        }
+        // A failed take leaves pending untouched. Defer and finish need no mutex.
+        // Publish retry before releasing scheduling ownership so the next worker
+        // turn sees it. One capacity-one wake asks that worker to schedule again.
+        self.scheduled.store(false, Ordering::Release);
+        wake();
     }
 }
-static ORDERS: OnceLock<Mutex<OrderMailbox>> = OnceLock::new();
-fn orders() -> &'static Mutex<OrderMailbox> {
-    ORDERS.get_or_init(|| Mutex::new(OrderMailbox::default()))
+static ORDERS: OnceLock<OrderDispatch> = OnceLock::new();
+fn orders() -> &'static OrderDispatch {
+    ORDERS.get_or_init(OrderDispatch::default)
 }
 fn dispatch_order_request(request: OrderRequest, trace: Option<ordering_trace::Trace>) {
-    orders().lock().unwrap().push(request, trace);
-    schedule_pending_orders();
+    orders().push(request, trace);
 }
 fn schedule_pending_orders() {
-    if orders().lock().unwrap().schedule() {
+    if orders().schedule() {
         dispatch_on_main(Box::new(drain_orders));
     }
 }
 fn drain_orders() {
-    let pending = orders().lock().unwrap().take();
-    for (request, trace) in pending {
-        if apply_native_order(&request, trace.as_ref()) == OrderAuthority::Busy {
-            orders().lock().unwrap().defer(request, trace);
-        }
-    }
-    // Retry on the next renderer turn, never spin or wait on AppKit main.
-    if orders().lock().unwrap().finish() {
-        wake_renderer();
-    }
+    orders().drain(apply_native_order, wake_renderer);
 }
 
 fn z_order_routes(map: &RenderMap) -> Vec<ZOrderRoute> {
@@ -1439,6 +1480,36 @@ fn replace_display_layout(map: &mut RenderMap, layout: DisplayLayout) {
     map.layout = layout;
 }
 
+static LAYOUTS: OnceLock<Latest<DisplayLayout>> = OnceLock::new();
+fn layouts() -> &'static Latest<DisplayLayout> {
+    LAYOUTS.get_or_init(Latest::default)
+}
+
+fn publish_display_layout(
+    handoff: &Latest<DisplayLayout>,
+    generation: &AtomicU64,
+    layout: DisplayLayout,
+    wake: impl FnOnce(),
+) {
+    generation.store(layout.generation, Ordering::Release);
+    handoff.publish(layout);
+    wake();
+}
+
+fn apply_pending_layout(
+    handoff: &Latest<DisplayLayout>,
+    map: &mut RenderMap,
+    admission: &Mutex<OverlayInbox>,
+) {
+    if let Some(layout) = handoff.take() {
+        replace_display_layout(map, layout);
+    }
+    admission
+        .lock()
+        .unwrap()
+        .retain_display_targets(&map.layout);
+}
+
 unsafe fn rebuild_appkit_host() {
     let generation = DISPLAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
     let layout = super::display_layout::active_layout(generation).unwrap_or_else(|error| {
@@ -1451,11 +1522,14 @@ unsafe fn rebuild_appkit_host() {
             displays: vec![],
         }
     });
-    // Publish valid geometry independently of native surface creation.
-    if let Some(map) = RENDER.lock().unwrap().as_mut() {
-        replace_display_layout(map, layout.clone());
-    }
-    inbox().lock().unwrap().retain_display_targets(&layout);
+    // Publish valid geometry independently of native surface creation, including
+    // initial startup. Main never acquires renderer or admission state.
+    publish_display_layout(
+        layouts(),
+        &DISPLAY_GENERATION,
+        layout.clone(),
+        wake_renderer,
+    );
     let host = AppKitOverlayHost::create(&layout);
     if host.is_none() && !layout.displays.is_empty() {
         tracing::warn!("macOS cursor overlay could not create every display surface");
@@ -1566,6 +1640,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             let Some(map) = guard.as_mut() else {
                 break;
             };
+            apply_pending_layout(layouts(), map, inbox());
             let cursor_commanded = batch.apply(map, now);
             {
                 let state = inbox().lock().unwrap();
@@ -1606,8 +1681,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
 
             let z_order = order_requests(map, render_revision);
             let next_frame_tick_needed = {
-                let mut state = inbox().lock().unwrap();
-                state.retain_display_targets(&map.layout);
+                let state = inbox().lock().unwrap();
                 render_frame_tick_needed(map, &state)
             };
             let next_hover_poll_needed = map
@@ -1625,51 +1699,6 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             )
         };
 
-        if frame_tick_needed || had_msg {
-            repin_frames += 1;
-            let applied_routes: Vec<_> = inbox()
-                .lock()
-                .unwrap()
-                .applied_routes
-                .values()
-                .cloned()
-                .collect();
-            let routes: Vec<_> = z_order
-                .iter()
-                .map(|request| request.route.clone())
-                .collect();
-            let updates = z_order_updates(
-                &routes,
-                &applied_routes,
-                repin_frames >= 60,
-                cursor_commanded,
-            );
-            for request in &z_order {
-                let route = &request.route;
-                let selected = updates.contains(&route);
-                let trace = ordering_trace::decision(
-                    route,
-                    applied_routes.contains(route),
-                    repin_frames >= 60,
-                    cursor_commanded,
-                    selected,
-                );
-                if !selected {
-                    if let Some(trace) = trace {
-                        // Observation only. A cached route must not acquire a
-                        // new native ordering command through diagnostics.
-                        dispatch_on_main(Box::new(move || trace.skipped()));
-                    }
-                    continue;
-                }
-                dispatch_order_request(request.clone(), trace);
-            }
-            if repin_frames >= 60 {
-                repin_frames = 0;
-            }
-        }
-
-        schedule_pending_orders();
         if had_msg || hover_changed || frame_tick_needed || next_frame_tick_needed {
             let frames = {
                 let guard = RENDER.lock().unwrap();
@@ -1716,6 +1745,52 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                 dispatch_present(generation, display_id, pixmap, targets, stamp);
             }
         }
+
+        if frame_tick_needed || had_msg {
+            repin_frames += 1;
+            let applied_routes: Vec<_> = inbox()
+                .lock()
+                .unwrap()
+                .applied_routes
+                .values()
+                .cloned()
+                .collect();
+            let routes: Vec<_> = z_order
+                .iter()
+                .map(|request| request.route.clone())
+                .collect();
+            let updates = z_order_updates(
+                &routes,
+                &applied_routes,
+                repin_frames >= 60,
+                cursor_commanded,
+            );
+            for request in &z_order {
+                let route = &request.route;
+                let selected = updates.contains(&route);
+                let trace = ordering_trace::decision(
+                    route,
+                    applied_routes.contains(route),
+                    repin_frames >= 60,
+                    cursor_commanded,
+                    selected,
+                );
+                if !selected {
+                    if let Some(trace) = trace {
+                        // Observation only. A cached route must not acquire a
+                        // new native ordering command through diagnostics.
+                        dispatch_on_main(Box::new(move || trace.skipped()));
+                    }
+                    continue;
+                }
+                dispatch_order_request(request.clone(), trace);
+            }
+            if repin_frames >= 60 {
+                repin_frames = 0;
+            }
+        }
+
+        schedule_pending_orders();
 
         frame_tick_needed = next_frame_tick_needed;
         hover_poll_needed = next_hover_poll_needed;
@@ -1934,28 +2009,16 @@ fn target_frames(
 fn apply_surface_frame(
     admission: &Mutex<OverlayInbox>,
     generation: u64,
-    display: DisplayId,
     current_generation: impl Fn() -> u64,
-    targets: &[TargetFrame],
     apply: impl FnOnce(),
 ) -> bool {
-    apply_surface_frame_if(
-        admission,
-        generation,
-        display,
-        current_generation,
-        targets,
-        |_| true,
-        apply,
-    )
+    apply_surface_frame_if(admission, generation, current_generation, |_| true, apply)
 }
 
 fn apply_surface_frame_if(
     admission: &Mutex<OverlayInbox>,
     generation: u64,
-    _display: DisplayId,
     current_generation: impl Fn() -> u64,
-    _targets: &[TargetFrame],
     current: impl Fn(&OverlayInbox) -> bool,
     apply: impl FnOnce(),
 ) -> bool {
@@ -1982,7 +2045,6 @@ fn apply_surface_frame_if(
 struct SurfaceFrame {
     generation: u64,
     pixmap: tiny_skia::Pixmap,
-    targets: Vec<TargetFrame>,
     stamp: frame_transport::Stamp,
 }
 static FRAMES: OnceLock<Mutex<frame_transport::Mailbox<SurfaceFrame>>> = OnceLock::new();
@@ -1993,20 +2055,20 @@ fn frames() -> &'static Mutex<frame_transport::Mailbox<SurfaceFrame>> {
 /// The immutable target evidence and pixels come from the same locked render map.
 /// Publish to the bounded visual mailbox before completing the owned approach.
 fn queue_surface_frame(
-    queue: &Mutex<frame_transport::Mailbox<SurfaceFrame>>,
     admission: &Mutex<OverlayInbox>,
     display: DisplayId,
     frame: SurfaceFrame,
+    targets: &[TargetFrame],
     current_generation: impl FnOnce() -> u64,
+    push: impl FnOnce(SurfaceFrame) -> bool,
 ) -> bool {
     let generation = frame.generation;
-    let targets = frame.targets.clone();
-    let schedule = queue.lock().unwrap().push(display, frame);
+    let schedule = push(frame);
     admission.lock().unwrap().complete_renderer_targets(
         generation,
         display,
         current_generation(),
-        &targets,
+        targets,
     );
     schedule
 }
@@ -2019,16 +2081,16 @@ fn dispatch_present(
     stamp: frame_transport::Stamp,
 ) {
     let schedule = queue_surface_frame(
-        frames(),
         inbox(),
         display_id,
         SurfaceFrame {
             generation,
             pixmap,
-            targets,
             stamp,
         },
+        &targets,
         || DISPLAY_GENERATION.load(Ordering::Acquire),
+        |frame| frames().lock().unwrap().push(display_id, frame),
     );
     if schedule {
         dispatch_on_main(Box::new(drain_frames));
@@ -2046,20 +2108,36 @@ fn drain_frames() {
     }
 }
 
+fn visual_frame_current(
+    admission: &Mutex<OverlayInbox>,
+    stamp: &frame_transport::Stamp,
+    generation: u64,
+    now: Instant,
+    wake: impl FnOnce(),
+) -> bool {
+    let current = admission
+        .try_lock()
+        .ok()
+        .is_some_and(|state| stamp.current(generation, state.revision, now));
+    if !current {
+        wake();
+    }
+    current
+}
+
 fn present_frame(display_id: DisplayId, frame: SurfaceFrame) {
     let SurfaceFrame {
         generation,
         pixmap,
-        targets,
         stamp,
     } = frame;
-    let current = inbox().lock().unwrap().revision;
-    if !stamp.current(
+    if !visual_frame_current(
+        inbox(),
+        &stamp,
         DISPLAY_GENERATION.load(Ordering::Acquire),
-        current,
         Instant::now(),
+        wake_renderer,
     ) {
-        wake_renderer();
         return;
     }
     let Some(cg_image_ptr) = pixmap_to_cgimage(pixmap) else {
@@ -2083,9 +2161,7 @@ fn present_frame(display_id: DisplayId, frame: SurfaceFrame) {
             if !apply_surface_frame_if(
                 inbox(),
                 generation,
-                display_id,
                 || DISPLAY_GENERATION.load(Ordering::Acquire),
-                &targets,
                 |state| {
                     stamp.current(
                         DISPLAY_GENERATION.load(Ordering::Acquire),
@@ -2178,6 +2254,14 @@ fn surface_order_authority(
     }
 }
 
+fn observe_order_host<T>(
+    host: &Mutex<T>,
+    observe: impl FnOnce(),
+) -> Result<std::sync::MutexGuard<'_, T>, OrderAuthority> {
+    observe();
+    host.try_lock().map_err(|_| OrderAuthority::Busy)
+}
+
 /// AppKit main only. Recheck authority around native observation; busy work is
 /// retained by the bounded mailbox and cannot withdraw an applied route.
 fn apply_native_order(
@@ -2188,7 +2272,11 @@ fn apply_native_order(
     if authority != OrderAuthority::Current {
         return finish_order_request(inbox(), request, authority);
     }
-    let Ok(host) = HOST.try_lock() else {
+    let Ok(host) = observe_order_host(&HOST, || {
+        if let Some(trace) = trace {
+            trace.sample("before_apply");
+        }
+    }) else {
         return OrderAuthority::Busy;
     };
     let authority = surface_order_authority(request, host.as_ref());
@@ -2197,9 +2285,6 @@ fn apply_native_order(
     }
     let surface = &host.as_ref().unwrap().surfaces[&request.route.display_id];
     let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
-    if let Some(trace) = trace {
-        trace.sample("before_apply");
-    }
     let command_ran = std::cell::Cell::new(false);
     let outcome = apply_surface_route_if(
         inbox(),
@@ -2974,13 +3059,11 @@ mod tests {
             let queue = Mutex::new(frame_transport::Mailbox::default());
             let revision = self.inbox.lock().unwrap().revision;
             queue_surface_frame(
-                &queue,
                 &self.inbox,
                 display,
                 SurfaceFrame {
                     generation,
                     pixmap: pixels,
-                    targets: targets.to_vec(),
                     stamp: frame_transport::Stamp {
                         generation,
                         revision,
@@ -2988,7 +3071,9 @@ mod tests {
                         expires_at: None,
                     },
                 },
+                targets,
                 || current_generation,
+                |frame| queue.lock().unwrap().push(display, frame),
             );
         }
         fn start(&self) -> Instant {
@@ -3237,6 +3322,202 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
+    async fn renderer_correction_layout_handoff_coalesces_under_locks_and_cancels() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        for ready in [false, true] {
+            let sink = QuickApproachSink::new(false, true);
+            let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+                .with_visual_sink(sink.clone());
+            let receipt = DeliveryReceipt::default();
+            let call = tool.dispatch_resolved(
+                "one",
+                point(80.0, 30.0, Some(42)),
+                &receipt,
+                async { panic!("retired display dispatched input") },
+                async { unreachable!() },
+            );
+            tokio::pin!(call);
+            assert!(futures_util::poll!(&mut call).is_pending());
+            let targets = sink.frame(sink.start());
+            if ready {
+                sink.queue_frame(&targets, 1, 1);
+            }
+            let handoff = Latest::default();
+            let generation = AtomicU64::new(1);
+            let mut map = sink.map.lock().unwrap();
+            let state = sink.inbox.lock().unwrap();
+            // The actual main-side handoff never consults these held locks or HOST.
+            for next in 2..1002 {
+                let mut layout = map.layout.clone();
+                layout.generation = next;
+                publish_display_layout(&handoff, &generation, layout, || {});
+            }
+            assert_eq!(generation.load(Ordering::Acquire), 1001);
+            assert!(state
+                .target_current("one", &targets[0].event, 1001)
+                .is_err());
+            drop(state);
+            apply_pending_layout(&handoff, &mut map, &sink.inbox);
+            assert_eq!(map.layout.generation, 1001);
+            assert!(
+                !map.layout.displays.is_empty(),
+                "geometry does not require a native host"
+            );
+            assert!(handoff.take().is_none());
+            assert_eq!(sink.pending(), 0);
+            drop(map);
+            assert_eq!(call.await.is_error, Some(true));
+            assert!(!receipt.was_accepted());
+        }
+    }
+
+    #[test]
+    fn renderer_correction_observation_precedes_host_and_busy_is_not_authority() {
+        let host = Mutex::new(());
+        let observations = std::cell::Cell::new(0);
+        let observe = || {
+            observations.set(observations.get() + 1);
+            assert!(ordering_trace::snapshot(&host, |_| ()).is_some());
+        };
+        drop(observe_order_host(&host, observe).unwrap());
+        let held = host.lock().unwrap();
+        let result = observe_order_host(&host, || {
+            assert!(ordering_trace::snapshot(&host, |_| ()).is_none());
+        });
+        assert_eq!(result.unwrap_err(), OrderAuthority::Busy);
+        assert_eq!(observations.get(), 1);
+        drop(held);
+        assert!(observe_order_host(&host, || {}).is_ok());
+    }
+
+    #[test]
+    fn renderer_correction_order_drain_contention_has_one_retry_and_latest_wins() {
+        let queue = OrderDispatch::default();
+        let request = OrderRequest {
+            route: ZOrderRoute {
+                generation: 1,
+                display_id: 1,
+                target_wid: Some(42),
+            },
+            controller: "one".into(),
+            revision: 1,
+        };
+        for _ in 0..1000 {
+            queue.push(request.clone(), None);
+        }
+        assert!(queue.schedule());
+        assert!(!queue.schedule());
+        let wakes = std::cell::Cell::new(0);
+        let wake = || wakes.set(wakes.get() + 1);
+        let held = queue.pending.lock().unwrap();
+        queue.drain(|_, _| panic!("busy mailbox issued native work"), wake);
+        assert_eq!(held.pending.len(), 1);
+        drop(held);
+        assert_eq!(wakes.get(), 1);
+        assert!(queue.schedule());
+        assert!(!queue.schedule());
+        let host = Mutex::new(());
+        let held_host = host.lock().unwrap();
+        let calls = std::cell::Cell::new(0);
+        queue.drain(
+            |_, _| {
+                let Ok(_host) = observe_order_host(&host, || {}) else {
+                    return OrderAuthority::Busy;
+                };
+                calls.set(calls.get() + 1);
+                OrderAuthority::Current
+            },
+            wake,
+        );
+        assert_eq!(calls.get(), 0);
+        drop(held_host);
+        let mut newer = request.clone();
+        newer.revision = 2;
+        queue.push(newer, None);
+        assert!(queue.schedule());
+        assert!(!queue.schedule());
+        queue.drain(
+            |r, _| {
+                assert_eq!(r.revision, 2, "old Busy retry replaced newer request");
+                // Contention during finish must not require defer/finish locking.
+                let _held = queue.pending.lock().unwrap();
+                calls.set(calls.get() + 1);
+                OrderAuthority::Current
+            },
+            wake,
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(!queue.schedule());
+        assert!(!queue.scheduled.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn renderer_correction_busy_defer_survives_mailbox_lock_through_finish() {
+        let queue = OrderDispatch::default();
+        let request = OrderRequest {
+            route: ZOrderRoute {
+                generation: 1,
+                display_id: 1,
+                target_wid: Some(42),
+            },
+            controller: "one".into(),
+            revision: 1,
+        };
+        queue.push(request, None);
+        assert!(queue.schedule());
+        let held = std::cell::RefCell::new(None);
+        queue.drain(
+            |_, _| {
+                *held.borrow_mut() = Some(queue.pending.lock().unwrap());
+                OrderAuthority::Busy
+            },
+            || {},
+        );
+        assert!(!queue.scheduled.load(Ordering::Acquire));
+        held.borrow_mut().take();
+        assert!(queue.schedule());
+        let calls = std::cell::Cell::new(0);
+        queue.drain(
+            |_, _| {
+                calls.set(calls.get() + 1);
+                OrderAuthority::Current
+            },
+            || {},
+        );
+        assert_eq!(calls.get(), 1);
+        assert!(!queue.schedule());
+    }
+
+    #[test]
+    fn renderer_correction_preliminary_visual_busy_discards_and_wakes() {
+        let state = Mutex::new(OverlayInbox::default());
+        let now = Instant::now();
+        let stamp = frame_transport::Stamp {
+            generation: 1,
+            revision: state.lock().unwrap().revision,
+            painted_at: now,
+            expires_at: None,
+        };
+        let wakes = std::cell::Cell::new(0);
+        let held = state.lock().unwrap();
+        assert!(!visual_frame_current(&state, &stamp, 1, now, || wakes.set(wakes.get() + 1)));
+        drop(held);
+        assert_eq!(wakes.get(), 1);
+        assert!(visual_frame_current(&state, &stamp, 1, now, || panic!(
+            "fresh frame woke renderer"
+        )));
+        assert!(!visual_frame_current(
+            &state,
+            &stamp,
+            1,
+            now + Duration::from_millis(64),
+            || wakes.set(wakes.get() + 1)
+        ));
+        assert_eq!(wakes.get(), 2);
+    }
+
+    #[tokio::test(start_paused = true)]
     async fn renderer_ready_queued_target_authorizes_without_native_route_or_callback() {
         use crate::cursor::visual::{point, DeliveryReceipt};
         use crate::tools::{ClickTool, ToolState};
@@ -3276,13 +3557,11 @@ mod tests {
         let queue = Mutex::new(frame_transport::Mailbox::default());
         let revision = sink.inbox.lock().unwrap().revision;
         assert!(queue_surface_frame(
-            &queue,
             &sink.inbox,
             1,
             SurfaceFrame {
                 generation: 1,
                 pixmap: pixels,
-                targets,
                 stamp: frame_transport::Stamp {
                     generation: 1,
                     revision,
@@ -3290,7 +3569,23 @@ mod tests {
                     expires_at: None
                 },
             },
-            || 1
+            &targets,
+            || 1,
+            |frame| {
+                use std::future::Future;
+                let mut cx = std::task::Context::from_waker(futures_util::task::noop_waker_ref());
+                assert!(
+                    call.as_mut().poll(&mut cx).is_pending(),
+                    "receipt completed before push began"
+                );
+                assert_eq!(dispatches.get(), 0);
+                let scheduled = queue.lock().unwrap().push(1, frame);
+                assert!(
+                    call.as_mut().poll(&mut cx).is_pending(),
+                    "receipt completed before push returned"
+                );
+                scheduled
+            }
         ));
         assert!(sink.inbox.lock().unwrap().applied_routes.is_empty());
         assert!(
@@ -3337,9 +3632,7 @@ mod tests {
         assert!(!apply_surface_frame_if(
             &sink.inbox,
             1,
-            1,
             || 1,
-            &[],
             |state| {
                 let age = if calls.get() == 0 {
                     Duration::ZERO
@@ -3412,8 +3705,6 @@ mod tests {
                 queue.push(request.clone(), None);
             }
             assert_eq!(queue.pending.len(), 1);
-            assert!(queue.schedule());
-            assert!(!queue.schedule());
             let (pending, trace) = queue.take().pop().unwrap();
             let paint = busy_render.then(|| render.lock().unwrap());
             let producer = (!busy_render).then(|| inbox.lock().unwrap());
@@ -3437,8 +3728,6 @@ mod tests {
                 Some(&request.route)
             );
             queue.defer(pending, trace);
-            assert!(queue.finish());
-            assert!(queue.schedule());
             let (pending, _) = queue.take().pop().unwrap();
             assert_eq!(
                 apply_surface_route_if(
@@ -3452,7 +3741,6 @@ mod tests {
                 ),
                 OrderAuthority::Current
             );
-            assert!(!queue.finish());
             assert_eq!(calls.get(), 1);
             // A newer queued command wins over a deferred old callback.
             let mut newer = request.clone();
@@ -3737,9 +4025,7 @@ mod tests {
         assert!(!apply_surface_frame_if(
             &inbox,
             1,
-            1,
             || 1,
-            &[],
             |state| stamp.current(1, state.revision, start + Duration::from_millis(151)),
             || panic!("expired pulse reached native contents")
         ));
@@ -3790,9 +4076,7 @@ mod tests {
             assert!(!apply_surface_frame_if(
                 &inbox,
                 1,
-                1,
                 || generation,
-                &[],
                 |state| old.current(generation, state.revision, clock),
                 || submissions.set(submissions.get() + 1)
             ));
@@ -3810,9 +4094,7 @@ mod tests {
             assert!(apply_surface_frame_if(
                 &inbox,
                 generation,
-                1,
                 || generation,
-                &[],
                 |state| fresh.current(generation, state.revision, clock),
                 || submissions.set(submissions.get() + 1)
             ));
@@ -4650,9 +4932,7 @@ mod tests {
             assert!(apply_surface_frame(
                 &sink.inbox,
                 1,
-                1,
                 || 1,
-                &next,
                 || {
                     // A live readback may return during setContents/commit/flush.
                     assert!(receipt.ensure_current().is_ok());

@@ -527,7 +527,9 @@ pub fn parse_approach_timing(
         return Err("mixed private action identities".into());
     }
     let line = released[0];
-    for name in ["geometry_matches", "route_matches", "surface_matches"] {
+    // Legacy surface_matches names current display-generation geometry. Planned
+    // route_matches is descriptive only and is not renderer-ready admission.
+    for name in ["geometry_matches", "surface_matches"] {
         if !line.contains(&format!("{name}: true")) {
             return Err(format!("unconfirmed {name}"));
         }
@@ -604,6 +606,12 @@ mod slice_a_approach_log_tests {
         assert_eq!(t.acknowledgement_ms, 150.0);
         assert_eq!(t.rpc_outside_registered_approach_ms, 130.0);
         assert!(parse_approach_timing("", 100.0, false).unwrap().is_none());
+    }
+
+    #[test]
+    fn renderer_ready_timing_accepts_descriptive_route_mismatch() {
+        let log = LOG.replace("route_matches: true", "route_matches: false");
+        assert!(parse_approach_timing(&log, 280.0, true).unwrap().is_some());
     }
 
     #[test]

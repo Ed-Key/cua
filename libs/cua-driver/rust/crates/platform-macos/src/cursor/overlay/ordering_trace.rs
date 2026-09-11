@@ -8,7 +8,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Write;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 static ENABLED: OnceLock<bool> = OnceLock::new();
@@ -67,6 +67,11 @@ pub(super) fn decision(
         }),
     );
     Some(trace)
+}
+
+// Contention is missing observational data, never authority for native work.
+pub(super) fn snapshot<T, R>(state: &Mutex<T>, read: impl FnOnce(&T) -> R) -> Option<R> {
+    state.try_lock().ok().map(|state| read(&state))
 }
 
 impl Trace {
@@ -140,19 +145,26 @@ impl Trace {
         require_main();
         // Copy route identity while locked. Enumeration and logging follow after
         // releasing both renderer and host locks. No inbox lock is acquired.
-        let current = super::RENDER.lock().unwrap().as_ref().and_then(|map| {
-            super::z_order_routes(map)
-                .into_iter()
-                .find(|r| r.display_id == self.route.display_id)
+        let current = snapshot(&super::RENDER, |state| {
+            state.as_ref().and_then(|map| {
+                super::z_order_routes(map)
+                    .into_iter()
+                    .find(|r| r.display_id == self.route.display_id)
+            })
         });
-        let number = {
-            let host = super::HOST.lock().unwrap();
+        let number = snapshot(&super::HOST, |host| {
             host.as_ref()
                 .filter(|h| h.generation == self.route.generation)
                 .and_then(|h| h.surfaces.get(&self.route.display_id))
                 .map(|s| unsafe { window_number(s.win_ptr as *mut objc2::runtime::AnyObject) })
-        };
+        });
+        let renderer_snapshot_available = current.is_some();
+        let host_snapshot_available = number.is_some();
+        let current = current.flatten();
+        let number = number.flatten();
         self.capture(phase, number, json!({
+            "renderer_snapshot_available": renderer_snapshot_available,
+            "host_snapshot_available": host_snapshot_available,
             "current_generation": super::DISPLAY_GENERATION.load(Ordering::Acquire),
             "current_route_matches": current.as_ref() == Some(&self.route),
             "current_route": current.map(|r| json!({
