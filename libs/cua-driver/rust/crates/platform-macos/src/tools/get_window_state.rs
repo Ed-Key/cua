@@ -559,6 +559,9 @@ impl Tool for GetWindowStateTool {
         // preferred-for-back-compat-only via the `_note` field below.
         let elements_json: Vec<serde_json::Value> = match (snapshot_id, tree_result.as_ref()) {
             (Some(sid), Some(r)) => build_elements_array_with_token(&r.nodes, Some(sid)),
+            (None, Some(r)) if scope_matched && observation_only => {
+                build_observation_elements_array(&r.nodes)
+            }
             (None, Some(r)) if scope_matched => build_elements_array_with_token(&r.nodes, None),
             _ => Vec::new(),
         };
@@ -568,8 +571,9 @@ impl Tool for GetWindowStateTool {
             &tree_md,
         );
         let filtered_element_count = elements_json.len();
-        // The structured array intentionally contains only actionable nodes,
-        // and AX child reads can fail independently of the element/depth caps.
+        // Public snapshots contain only actionable nodes. Observation-only
+        // snapshots also retain display-only state, but AX child reads can
+        // fail independently of the element/depth caps.
         // Until the walker exposes a proof over the projected search domain,
         // absence must remain unknown rather than being claimed complete.
         let elements_complete = false;
@@ -836,10 +840,26 @@ pub(crate) fn build_elements_array_with_token(
     nodes: &[crate::ax::tree::AXNode],
     snapshot_id: Option<u32>,
 ) -> Vec<serde_json::Value> {
+    build_elements_array(nodes, snapshot_id, false)
+}
+
+/// Verification observes display-only state without creating action tokens or
+/// changing the public actionable projection and its existing snapshot cache.
+fn build_observation_elements_array(nodes: &[crate::ax::tree::AXNode]) -> Vec<serde_json::Value> {
+    build_elements_array(nodes, None, true)
+}
+
+fn build_elements_array(
+    nodes: &[crate::ax::tree::AXNode],
+    snapshot_id: Option<u32>,
+    include_display_only: bool,
+) -> Vec<serde_json::Value> {
     nodes
         .iter()
         .filter_map(|node| {
-            let idx = node.element_index?;
+            if node.element_index.is_none() && !include_display_only {
+                return None;
+            }
             // `label` is a best-effort human-readable string: title first,
             // then description, then value, then identifier. Mirrors what
             // a human reading the markdown row would call this element.
@@ -853,7 +873,6 @@ pub(crate) fn build_elements_array_with_token(
                 .frame
                 .map(|[x, y, w, h]| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
             let mut entry = serde_json::json!({
-                "element_index": idx,
                 "role": node.role,
                 "depth": node.depth,
             });
@@ -862,9 +881,12 @@ pub(crate) fn build_elements_array_with_token(
             // (invalidated when the next snapshot supersedes this
             // one in the per-pid LRU). See cua-driver-core's
             // `element_token` module.
-            if let Some(sid) = snapshot_id {
-                entry["element_token"] =
-                    serde_json::json!(cua_driver_core::element_token::token_for(sid, idx));
+            if let Some(idx) = node.element_index {
+                entry["element_index"] = serde_json::json!(idx);
+                if let Some(sid) = snapshot_id {
+                    entry["element_token"] =
+                        serde_json::json!(cua_driver_core::element_token::token_for(sid, idx));
+                }
             }
             if let Some(label) = label {
                 entry["label"] = serde_json::Value::String(label);
@@ -1487,6 +1509,68 @@ mod tests {
     }
 
     #[test]
+    fn observation_projection_keeps_display_only_counter_without_action_identity() {
+        let mut counter = node(
+            None,
+            "AXStaticText",
+            None,
+            1,
+            Some(7),
+            Some([10.0, 20.0, 90.0, 18.0]),
+            vec![],
+        );
+        counter.value = Some("counter=1".into());
+        let button = node(
+            Some(7),
+            "AXButton",
+            Some("Increment"),
+            0,
+            None,
+            None,
+            vec!["AXPress".into()],
+        );
+        let nodes = vec![button, counter];
+        let public = build_elements_array_with_token(&nodes, Some(123));
+        assert_eq!(public.len(), 1, "public snapshots remain actionable-only");
+        assert_eq!(public[0]["element_index"], 7);
+        assert!(public[0].get("element_token").is_some());
+
+        let observed = build_observation_elements_array(&nodes);
+        assert_eq!(
+            observed.len(),
+            2,
+            "verification must retain the display-only counter"
+        );
+        assert_eq!(observed[0]["element_index"], 7);
+        assert_eq!(observed[0]["actions"], json!(["AXPress"]));
+        let counter = &observed[1];
+        assert_eq!(counter["role"], "AXStaticText");
+        assert_eq!(counter["label"], "counter=1");
+        assert_eq!(counter["value"], "counter=1");
+        assert_eq!(
+            counter["frame"],
+            json!({"x":10.0,"y":20.0,"w":90.0,"h":18.0})
+        );
+        assert_eq!(counter["parent_index"], 7);
+        assert!(counter.get("element_index").is_none());
+        assert!(observed
+            .iter()
+            .all(|entry| entry.get("element_token").is_none()));
+    }
+
+    #[test]
+    fn observation_projection_preserves_display_only_web_trust_marker() {
+        let mut counter = node(None, "AXStaticText", None, 0, None, None, vec![]);
+        counter.value = Some("counter=1".into());
+        counter.in_web_content = true;
+        let observed = build_observation_elements_array(&[counter]);
+        assert_eq!(observed.len(), 1);
+        assert_eq!(observed[0]["in_web_content"], true);
+        assert!(observed[0].get("element_index").is_none());
+        assert!(observed[0].get("element_token").is_none());
+    }
+
+    #[test]
     fn build_elements_array_with_token_emits_actions_when_present() {
         let nodes = vec![node(
             Some(0),
@@ -1555,7 +1639,7 @@ mod tests {
             None,
             vec!["AXPress".to_owned(), "AXShowMenu".to_owned()],
         )];
-        let entries = build_elements_array_with_token(&nodes, None);
+        let entries = build_observation_elements_array(&nodes);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["actions"], json!(["AXPress", "AXShowMenu"]));
         assert!(
