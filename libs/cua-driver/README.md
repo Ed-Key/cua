@@ -70,6 +70,53 @@ inspection, deletion, and stable-channel return instructions. The [architecture
 and staged plan](docs/computer-history-architecture.md) defines the format,
 security boundary, release gates, and later NVIDIA OpenShell integration.
 
+## Bounded action sequences
+
+`run_sequence` runs 1 to 8 `click` or `type_text` steps against one exact window.
+After each action, it checks your `verify_state` predicates and continues only
+when they are satisfied and stable. Actions and checks run inside the driver,
+so the agent can describe a short known sequence in one call.
+
+Use current window IDs and a target from a fresh observation. For example,
+given a native Search field at screenshot pixel `(100, 80)`:
+
+```json
+{
+  "pid": 1234,
+  "window_id": 5678,
+  "steps": [
+    {
+      "tool": "click",
+      "arguments": {"x": 100, "y": 80},
+      "expect": [{"element": {
+        "selector": {"role": "AXTextField", "label_contains": "Search"},
+        "enabled": true
+      }}]
+    },
+    {
+      "tool": "type_text",
+      "arguments": {"text": "cua"},
+      "expect": [{"element": {
+        "selector": {"role": "AXTextField", "label_contains": "Search"},
+        "value_equals": "cua"
+      }}]
+    }
+  ]
+}
+```
+
+All children use background delivery and inherit the same session and
+authorization. Each step defaults to a 1000 ms verification timeout and two
+consecutive satisfied samples. `timeout_ms: 0` takes one sample; it cannot be
+combined with `stable_samples` greater than one.
+
+The result is `completed` or `stopped`, with the attempted steps, their action
+receipts, predicate evidence and timings. A failed or unknown check stops the
+sequence; earlier actions remain applied. There are no retries, rollback or
+returned screenshots. An enabled-field check alone does not establish focus,
+and a postcondition does not prove that the preceding action caused it.
+Electron accessibility state can remain unknown, which stops further actions.
+
 ## Permission modes
 
 `standard` is the promptless default for normal automation. `bounded` admits
