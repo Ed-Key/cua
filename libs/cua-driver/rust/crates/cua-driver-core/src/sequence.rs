@@ -5,7 +5,7 @@
 
 use crate::{
     protocol::{Content, ToolResult},
-    tool::{Tool, ToolDef, ToolRegistry},
+    tool::{current_dispatch_runtime_scope, Tool, ToolDef, ToolRegistry},
     tool_args::parse_typed_input,
 };
 use async_trait::async_trait;
@@ -49,17 +49,19 @@ impl Tool for RunSequenceTool {
     async fn invoke(&self, mut args: Value) -> ToolResult {
         // Registry namespace metadata is trusted, but child calls require the public label.
         // An implicit transport session needs no public label: nested dispatch inherits its context.
-        if args
-            .get("session")
+        let public_session = args
+            .get("_public_session_label")
             .and_then(Value::as_str)
-            .is_some_and(|label| label.starts_with("__cua_runtime_"))
-        {
-            let public_label = args.get("_public_session_label").cloned();
-            let arguments = args.as_object_mut().expect("session belongs to an object");
-            arguments.remove("session");
-            if let Some(label) = public_label {
-                arguments.insert("session".into(), label);
-            }
+            .map(str::to_owned)
+            .or_else(|| {
+                let prefix = format!("__cua_runtime_{}:", current_dispatch_runtime_scope()?);
+                args.get("session")?
+                    .as_str()?
+                    .strip_prefix(&prefix)
+                    .map(str::to_owned)
+            });
+        if let Some(session) = public_session {
+            args["session"] = Value::String(session);
         }
         let input: RunSequenceInput = match parse_typed_input("run_sequence", args) {
             Ok(input) => input,
