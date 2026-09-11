@@ -176,8 +176,69 @@ pub struct VerifyStateInput {
     pub include_screenshot: Option<bool>,
 }
 
+const MAX_TIMEOUT_MS: u64 = 10_000;
+const MAX_STABLE_SAMPLES: u64 = 5;
+const MAX_PREDICATES: usize = 8;
+
+impl VerifyStateInput {
+    /// Validate request errors before observation. Evaluator-level unknown predicates remain valid requests.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.pid <= 0 {
+            return Err("verify_state requires pid > 0".into());
+        }
+        if self.expect.is_empty() || self.expect.len() > MAX_PREDICATES {
+            return Err("verify_state requires between 1 and 8 predicates".into());
+        }
+        if self.timeout_ms.is_some_and(|value| value > MAX_TIMEOUT_MS) {
+            return Err("verify_state timeout_ms must be between 0 and 10000".into());
+        }
+        if self
+            .stable_samples
+            .is_some_and(|value| !(1..=MAX_STABLE_SAMPLES).contains(&value))
+        {
+            return Err("verify_state stable_samples must be between 1 and 5".into());
+        }
+        let timeout_ms = self.timeout_ms.unwrap_or(VERIFY_STATE_DEFAULT_TIMEOUT_MS);
+        if timeout_ms == 0 && self.stable_samples.is_some_and(|samples| samples > 1) {
+            return Err(
+                "verify_state timeout_ms=0 requires stable_samples=1 because only one sample is possible".into(),
+            );
+        }
+        if let Some(error) = invalid_predicate_message(&self.expect) {
+            return Err(error);
+        }
+        Ok(())
+    }
+}
+
+fn invalid_predicate_message(expect: &[StatePredicate]) -> Option<String> {
+    for (index, predicate) in expect.iter().enumerate() {
+        if let Some(element) = predicate.element.as_ref() {
+            if element.exists == Some(false) {
+                return Some(format!(
+                    "verify_state predicate {index} element.exists=false is unsupported because element snapshots are not exhaustive"
+                ));
+            }
+            for (name, value) in [
+                ("role", element.selector.role.as_deref()),
+                ("label_contains", element.selector.label_contains.as_deref()),
+            ] {
+                if value.is_some_and(|value| value.trim().is_empty()) {
+                    return Some(format!(
+                        "verify_state predicate {index} selector {name} must not be empty"
+                    ));
+                }
+            }
+        }
+    }
+    None
+}
+
 impl ToolInput for VerifyStateInput {
     const TOOL_NAME: &'static str = "verify_state";
+    fn validate(&self) -> Result<(), String> {
+        VerifyStateInput::validate(self)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
