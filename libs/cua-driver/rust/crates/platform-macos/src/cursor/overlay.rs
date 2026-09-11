@@ -45,9 +45,7 @@ use indexmap::IndexMap;
 
 use super::display_layout::{DisplayGeometry, DisplayId, DisplayLayout};
 
-mod confirmation_trace;
 mod frame_transport;
-use confirmation_trace::{Event as ConfirmationEvent, FrameStage};
 mod ordering_trace;
 
 // ── Global overlay state ──────────────────────────────────────────────────
@@ -76,6 +74,8 @@ struct OverlayInbox {
     enabled_overrides: HashMap<CursorKey, bool>,
     approaches: HashMap<CursorKey, ApproachRegistration>,
     applied_routes: HashMap<DisplayId, ZOrderRoute>,
+    // Protect a newer same-route publication from an obsolete queued callback.
+    applied_route_revisions: HashMap<DisplayId, u64>,
     // Generic admission hands its context to one resolved action. Subsequent
     // events carry that action's context even after presentation expires.
     contexts: HashMap<
@@ -89,23 +89,23 @@ struct OverlayInbox {
 }
 
 struct ApproachRegistration {
-    surface_generation: u64,
+    display_generation: u64,
     event: cursor_overlay::VisualEvent,
     sender: Option<tokio::sync::oneshot::Sender<Result<(), String>>>,
     deadline: tokio::time::Instant,
-    presented: Option<(u64, DisplayId)>,
+    renderer_ready: Option<(u64, DisplayId)>,
     timing: ApproachTiming,
 }
 
 /// Fixed-size per-action evidence, emitted once off AppKit main at guard cleanup.
 #[derive(Debug)]
 struct ApproachTiming {
-    diagnostic: confirmation_trace::Trace,
-    display_id: Option<DisplayId>,
     started: Instant,
     first_frame_ms: Option<f64>,
     target_frame_ms: Option<f64>,
+    // Target frame mailbox submission, not Core Animation submission.
     submission_ms: Option<f64>,
+    // Renderer-ready receipt completion, never native presentation.
     acknowledgement_ms: Option<f64>,
     frames: u32,
     geometry_matches: bool,
@@ -115,8 +115,6 @@ struct ApproachTiming {
 impl ApproachTiming {
     fn new() -> Self {
         Self {
-            diagnostic: confirmation_trace::Trace::configured(),
-            display_id: None,
             started: Instant::now(),
             first_frame_ms: None,
             target_frame_ms: None,
@@ -135,7 +133,6 @@ impl ApproachTiming {
 
 #[derive(Clone)]
 struct TargetFrame {
-    diagnostic: confirmation_trace::Trace,
     generation: u64,
     display_id: DisplayId,
     key: CursorKey,
@@ -158,7 +155,7 @@ impl OverlayInbox {
         &mut self,
         key: &str,
         event: &cursor_overlay::VisualEvent,
-        surface_generation: u64,
+        display_generation: u64,
     ) -> Result<tokio::sync::oneshot::Receiver<Result<(), String>>, String> {
         if !self.approach_enabled(key)
             || !self.visual.owns_action(key, event.id)
@@ -173,9 +170,9 @@ impl OverlayInbox {
             ApproachRegistration {
                 event: event.clone(),
                 sender: Some(sender),
-                presented: None,
+                renderer_ready: None,
                 timing: ApproachTiming::new(),
-                surface_generation,
+                display_generation,
                 deadline: tokio::time::Instant::now() + crate::cursor::CLICK_PRESENTATION_TIMEOUT,
             },
         );
@@ -209,19 +206,17 @@ impl OverlayInbox {
             && self.approaches.get(key).is_some_and(|pending| {
                 same_target(&pending.event, event)
                     && pending
-                        .presented
-                        .is_some_and(|(surface_generation, display)| {
-                            surface_generation == generation
-                                && self.applied_routes.get(&display).is_some_and(|route| {
-                                    route.generation == generation
-                                        && route.target_wid == event.window
-                                })
+                        .renderer_ready
+                        .is_some_and(|(display_generation, _display)| {
+                            display_generation == generation
+                                && pending.display_generation == generation
+                                && pending.event.target.is_some()
                         })
             })
         {
             Ok(())
         } else {
-            Err("click target presentation was invalidated before input".into())
+            Err("click renderer readiness was invalidated before input".into())
         }
     }
 
@@ -233,7 +228,9 @@ impl OverlayInbox {
     ) -> Result<(), String> {
         self.target_current(key, event, generation)?;
         if self.commands.len() >= 4096 {
-            return Err("overlay command inbox is saturated".into());
+            // Re-pin is best-effort visual output. Ownership above is mandatory;
+            // native input does not depend on space in the visual command inbox.
+            return Ok(());
         }
         if let Some(window) = event.window {
             self.command(OverlayMsg::Cmd(KeyedOverlayCommand {
@@ -244,44 +241,9 @@ impl OverlayInbox {
         Ok(())
     }
 
-    fn invalidate_surface_frame(&mut self, generation: u64, display: DisplayId) {
-        for pending in self.approaches.values_mut() {
-            if pending.presented == Some((generation, display)) {
-                pending.presented = None;
-            }
-        }
-    }
-
-    /// Replacing a target by the same proven geometry does not withdraw readiness
-    /// during Core Animation submission. Omitted or obsolete targets do.
-    fn prepare_surface_frame(
-        &mut self,
-        generation: u64,
-        display: DisplayId,
-        targets: &[TargetFrame],
-    ) {
-        for (key, pending) in &mut self.approaches {
-            if pending.presented != Some((generation, display)) {
-                continue;
-            }
-            let retained = self.visual.owns_action(key, pending.event.id)
-                && self.applied_routes.get(&display).is_some_and(|route| {
-                    route.generation == generation && route.target_wid == pending.event.window
-                })
-                && targets.iter().any(|target| {
-                    target.generation == generation
-                        && target.display_id == display
-                        && target.key == *key
-                        && same_target(&target.event, &pending.event)
-                });
-            if !retained {
-                pending.presented = None;
-            }
-        }
-    }
-
-    // Called only after this frame's actual layer contents were applied and submitted.
-    fn acknowledge_targets(
+    /// Called by the render worker only after producing and queueing this frame.
+    /// Native surfaces, ordering and frame freshness cannot authorize input.
+    fn complete_renderer_targets(
         &mut self,
         generation: u64,
         display: DisplayId,
@@ -289,53 +251,40 @@ impl OverlayInbox {
         targets: &[TargetFrame],
     ) {
         if generation != current_generation {
-            record_targets(targets, ConfirmationEvent::AckGeneration);
             return;
         }
-        // Readiness describes the last applied frame on that surface. A later
-        // frame cannot silently leave a previously ready arrow acknowledged.
-        self.invalidate_surface_frame(generation, display);
         for target in targets {
-            if target.generation != generation || target.display_id != display {
-                target.diagnostic.record(ConfirmationEvent::AckSurface);
-                continue;
-            }
-            if !self.applied_routes.get(&display).is_some_and(|route| {
-                route.generation == generation && route.target_wid == target.event.window
-            }) {
-                target.diagnostic.record(ConfirmationEvent::AckRoute);
-                continue;
-            }
-            if !self.visual.owns_action(&target.key, target.event.id) {
-                target.diagnostic.record(ConfirmationEvent::AckOwnership);
+            if target.generation != generation
+                || target.display_id != display
+                || !self.approach_enabled(&target.key)
+                || !self.visual.owns_action(&target.key, target.event.id)
+            {
                 continue;
             }
             if let Some(pending) = self.approaches.get_mut(&target.key) {
-                if pending.surface_generation == generation
+                if pending.display_generation == generation
                     && same_target(&pending.event, &target.event)
                     && (pending.sender.is_none() || tokio::time::Instant::now() < pending.deadline)
                 {
-                    pending.presented = Some((generation, display));
+                    pending.renderer_ready = Some((generation, display));
                     if let Some(sender) = pending.sender.take() {
+                        pending.timing.submission_ms = Some(pending.timing.elapsed_ms());
                         pending.timing.acknowledgement_ms = Some(pending.timing.elapsed_ms());
-                        let sent = sender.send(Ok(()));
-                        target.diagnostic.record(if sent.is_ok() {
-                            ConfirmationEvent::AckSent
-                        } else {
-                            ConfirmationEvent::AckReceiverClosed
-                        });
+                        let _ = sender.send(Ok(()));
                     }
-                } else if pending.surface_generation != generation
-                    || !same_target(&pending.event, &target.event)
-                {
-                    target.diagnostic.record(ConfirmationEvent::AckIdentity);
-                } else {
-                    target.diagnostic.record(ConfirmationEvent::AckExpired);
                 }
-            } else {
-                target.diagnostic.record(ConfirmationEvent::AckRegistration);
             }
         }
+    }
+
+    fn retain_display_targets(&mut self, layout: &DisplayLayout) {
+        self.approaches.retain(|_, pending| {
+            pending.display_generation == layout.generation
+                && pending
+                    .event
+                    .target
+                    .is_some_and(|(x, y)| layout.display_at(x, y).is_some())
+        });
     }
 
     fn begin_action(&mut self, key: &str) -> Option<cursor_overlay::VisualActionId> {
@@ -649,7 +598,7 @@ pub(crate) fn release_target(key: &str, event: &cursor_overlay::VisualEvent) {
     let released = inbox().lock().unwrap().release_target(key, event);
     if let Some(pending) = released {
         tracing::debug!(target: "cua_cursor_approach", stage = "released", id = ?event.id,
-            surface_generation = pending.surface_generation, target_window = ?pending.event.window, timing = ?pending.timing,
+            display_generation = pending.display_generation, timing = ?pending.timing,
             elapsed_ms = pending.timing.elapsed_ms(), "click approach frame evidence");
     }
 }
@@ -1089,7 +1038,6 @@ struct ZOrderRoute {
 
 #[derive(Clone)]
 struct OrderRequest {
-    diagnostic: confirmation_trace::Trace,
     route: ZOrderRoute,
     controller: CursorKey,
     revision: u64,
@@ -1115,7 +1063,6 @@ fn order_requests(map: &RenderMap, revision: u64) -> Vec<OrderRequest> {
                 })?
                 .clone();
             Some(OrderRequest {
-                diagnostic: confirmation_trace::Trace::default(),
                 route,
                 controller,
                 revision,
@@ -1124,32 +1071,16 @@ fn order_requests(map: &RenderMap, revision: u64) -> Vec<OrderRequest> {
         .collect()
 }
 
-fn reject_order_request(request: &OrderRequest) {
-    request.diagnostic.record(ConfirmationEvent::OrderRejected);
-    if let Ok(mut state) = inbox().try_lock() {
-        if state.revision == request.revision
-            && state.applied_routes.get(&request.route.display_id) == Some(&request.route)
-        {
-            request
-                .diagnostic
-                .record(ConfirmationEvent::OrderRouteInvalidated);
-            state.applied_routes.remove(&request.route.display_id);
-            state.invalidate_surface_frame(request.route.generation, request.route.display_id);
-        }
-    } else {
-        request
-            .diagnostic
-            .record(ConfirmationEvent::OrderRejectBusy);
-    }
-    wake_renderer();
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OrderAuthority {
+    Current,
+    Busy,
+    Stale,
 }
 
-fn order_request_current(request: &OrderRequest) -> bool {
+fn order_request_current(request: &OrderRequest) -> OrderAuthority {
     if request.route.generation != DISPLAY_GENERATION.load(Ordering::Acquire) {
-        request
-            .diagnostic
-            .record(ConfirmationEvent::OrderGeneration);
-        return false;
+        return OrderAuthority::Stale;
     }
     order_request_matches(request, &RENDER, inbox())
 }
@@ -1158,86 +1089,183 @@ fn order_request_matches(
     request: &OrderRequest,
     render: &Mutex<Option<RenderMap>>,
     admission: &Mutex<OverlayInbox>,
-) -> bool {
+) -> OrderAuthority {
     let Ok(render) = render.try_lock() else {
-        request
-            .diagnostic
-            .record(ConfirmationEvent::OrderBusyRender);
-        return false;
+        return OrderAuthority::Busy;
     };
     let Some(map) = render.as_ref() else {
-        request
-            .diagnostic
-            .record(ConfirmationEvent::OrderMissingMap);
-        return false;
+        return OrderAuthority::Stale;
     };
     let Ok(admission) = admission.try_lock() else {
-        request.diagnostic.record(ConfirmationEvent::OrderBusyInbox);
-        return false;
+        return OrderAuthority::Busy;
     };
-    if request.revision != admission.revision {
-        request.diagnostic.record(ConfirmationEvent::OrderRevision);
-        return false;
-    }
-    let current = order_requests(map, admission.revision)
-        .iter()
-        .any(|current| current.route == request.route && current.controller == request.controller);
-    request.diagnostic.record(if current {
-        ConfirmationEvent::OrderCurrent
+    if request.revision == admission.revision
+        && order_requests(map, admission.revision)
+            .iter()
+            .any(|current| {
+                current.route == request.route && current.controller == request.controller
+            })
+    {
+        OrderAuthority::Current
     } else {
-        ConfirmationEvent::OrderControllerRoute
-    });
-    current
+        OrderAuthority::Stale
+    }
 }
 
-/// Invalidate before ordering, then publish the applied route after AppKit returns.
-/// Both admission sections are nonblocking and never enclose native work.
+/// Busy is not evidence against a route. A stale callback may withdraw only
+/// its matching route, never a newer controller's publication.
+fn finish_order_request(
+    admission: &Mutex<OverlayInbox>,
+    request: &OrderRequest,
+    outcome: OrderAuthority,
+) -> OrderAuthority {
+    if outcome != OrderAuthority::Stale {
+        return outcome;
+    }
+    let Ok(mut state) = admission.try_lock() else {
+        return OrderAuthority::Busy;
+    };
+    if state.applied_routes.get(&request.route.display_id) == Some(&request.route)
+        && state
+            .applied_route_revisions
+            .get(&request.route.display_id)
+            .is_none_or(|revision| *revision <= request.revision)
+    {
+        state.applied_routes.remove(&request.route.display_id);
+        state
+            .applied_route_revisions
+            .remove(&request.route.display_id);
+    }
+    OrderAuthority::Stale
+}
+
+/// No lock spans native work. Failed publication is retried as visual work,
+/// never as a click-admission dependency.
+fn apply_surface_route_if(
+    admission: &Mutex<OverlayInbox>,
+    request: &OrderRequest,
+    current: impl Fn() -> OrderAuthority,
+    apply: impl FnOnce() -> OrderAuthority,
+) -> OrderAuthority {
+    let authority = current();
+    if authority != OrderAuthority::Current {
+        return finish_order_request(admission, request, authority);
+    }
+    let Ok(state) = admission.try_lock() else {
+        return OrderAuthority::Busy;
+    };
+    if state.revision != request.revision {
+        drop(state);
+        return finish_order_request(admission, request, OrderAuthority::Stale);
+    }
+    drop(state);
+    let outcome = apply();
+    if outcome != OrderAuthority::Current {
+        return finish_order_request(admission, request, outcome);
+    }
+    let authority = current();
+    if authority != OrderAuthority::Current {
+        return finish_order_request(admission, request, authority);
+    }
+    let Ok(mut state) = admission.try_lock() else {
+        return OrderAuthority::Busy;
+    };
+    if state.revision != request.revision {
+        drop(state);
+        return finish_order_request(admission, request, OrderAuthority::Stale);
+    }
+    state
+        .applied_routes
+        .retain(|_, old| old.generation == request.route.generation);
+    let retained: HashSet<_> = state.applied_routes.keys().copied().collect();
+    state
+        .applied_route_revisions
+        .retain(|display, _| retained.contains(display));
+    state
+        .applied_routes
+        .insert(request.route.display_id, request.route.clone());
+    state
+        .applied_route_revisions
+        .insert(request.route.display_id, request.revision);
+    OrderAuthority::Current
+}
+
 #[cfg(test)]
 fn apply_surface_route(
     admission: &Mutex<OverlayInbox>,
     route: ZOrderRoute,
     apply: impl FnOnce(),
 ) -> bool {
+    let request = OrderRequest {
+        route,
+        controller: String::new(),
+        revision: admission.lock().unwrap().revision,
+    };
     apply_surface_route_if(
         admission,
-        route,
-        &confirmation_trace::Trace::default(),
+        &request,
+        || OrderAuthority::Current,
         || {
             apply();
-            true
+            OrderAuthority::Current
         },
-    )
+    ) == OrderAuthority::Current
 }
 
-fn apply_surface_route_if(
-    admission: &Mutex<OverlayInbox>,
-    route: ZOrderRoute,
-    diagnostic: &confirmation_trace::Trace,
-    apply: impl FnOnce() -> bool,
-) -> bool {
-    let Ok(mut state) = admission.try_lock() else {
-        diagnostic.record(ConfirmationEvent::RoutePreBusy);
-        return false;
-    };
-    if state.applied_routes.get(&route.display_id) != Some(&route) {
-        state.invalidate_surface_frame(route.generation, route.display_id);
-        state.applied_routes.remove(&route.display_id);
+#[derive(Default)]
+struct OrderMailbox {
+    pending: HashMap<DisplayId, (OrderRequest, Option<ordering_trace::Trace>)>,
+    scheduled: bool,
+}
+impl OrderMailbox {
+    fn push(&mut self, request: OrderRequest, trace: Option<ordering_trace::Trace>) {
+        self.pending
+            .insert(request.route.display_id, (request, trace));
     }
-    drop(state);
-    if !apply() {
-        diagnostic.record(ConfirmationEvent::RouteApplyRejected);
-        return false;
+    fn schedule(&mut self) -> bool {
+        if self.scheduled || self.pending.is_empty() {
+            return false;
+        }
+        self.scheduled = true;
+        true
     }
-    let Ok(mut state) = admission.try_lock() else {
-        diagnostic.record(ConfirmationEvent::RoutePostBusy);
-        return false;
-    };
-    state
-        .applied_routes
-        .retain(|_, old| old.generation == route.generation);
-    state.applied_routes.insert(route.display_id, route);
-    diagnostic.record(ConfirmationEvent::RoutePublished);
-    true
+    fn take(&mut self) -> Vec<(OrderRequest, Option<ordering_trace::Trace>)> {
+        std::mem::take(&mut self.pending).into_values().collect()
+    }
+    fn defer(&mut self, request: OrderRequest, trace: Option<ordering_trace::Trace>) {
+        self.pending
+            .entry(request.route.display_id)
+            .or_insert((request, trace));
+    }
+    fn finish(&mut self) -> bool {
+        self.scheduled = false;
+        !self.pending.is_empty()
+    }
+}
+static ORDERS: OnceLock<Mutex<OrderMailbox>> = OnceLock::new();
+fn orders() -> &'static Mutex<OrderMailbox> {
+    ORDERS.get_or_init(|| Mutex::new(OrderMailbox::default()))
+}
+fn dispatch_order_request(request: OrderRequest, trace: Option<ordering_trace::Trace>) {
+    orders().lock().unwrap().push(request, trace);
+    schedule_pending_orders();
+}
+fn schedule_pending_orders() {
+    if orders().lock().unwrap().schedule() {
+        dispatch_on_main(Box::new(drain_orders));
+    }
+}
+fn drain_orders() {
+    let pending = orders().lock().unwrap().take();
+    for (request, trace) in pending {
+        if apply_native_order(&request, trace.as_ref()) == OrderAuthority::Busy {
+            orders().lock().unwrap().defer(request, trace);
+        }
+    }
+    // Retry on the next renderer turn, never spin or wait on AppKit main.
+    if orders().lock().unwrap().finish() {
+        wake_renderer();
+    }
 }
 
 fn z_order_routes(map: &RenderMap) -> Vec<ZOrderRoute> {
@@ -1413,7 +1441,7 @@ fn replace_display_layout(map: &mut RenderMap, layout: DisplayLayout) {
 
 unsafe fn rebuild_appkit_host() {
     let generation = DISPLAY_GENERATION.fetch_add(1, Ordering::AcqRel) + 1;
-    let mut layout = super::display_layout::active_layout(generation).unwrap_or_else(|error| {
+    let layout = super::display_layout::active_layout(generation).unwrap_or_else(|error| {
         tracing::warn!(
             error,
             "macOS cursor overlay could not enumerate active displays"
@@ -1423,17 +1451,14 @@ unsafe fn rebuild_appkit_host() {
             displays: vec![],
         }
     });
-    let host = AppKitOverlayHost::create(&layout);
-    if host.is_none() {
-        // A failed or empty rebuild invalidates every old viewport. Publishing
-        // an empty snapshot also rejects placement until a later rebuild succeeds.
-        if !layout.displays.is_empty() {
-            tracing::warn!("macOS cursor overlay could not create every display surface");
-        }
-        layout.displays.clear();
-    }
+    // Publish valid geometry independently of native surface creation.
     if let Some(map) = RENDER.lock().unwrap().as_mut() {
-        replace_display_layout(map, layout);
+        replace_display_layout(map, layout.clone());
+    }
+    inbox().lock().unwrap().retain_display_targets(&layout);
+    let host = AppKitOverlayHost::create(&layout);
+    if host.is_none() && !layout.displays.is_empty() {
+        tracing::warn!("macOS cursor overlay could not create every display surface");
     }
     let previous = std::mem::replace(&mut *HOST.lock().unwrap(), host);
     if let Some(previous) = previous {
@@ -1530,7 +1555,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
         let render_revision = batch.revision;
 
         let (
-            mut z_order,
+            z_order,
             had_msg,
             cursor_commanded,
             hover_changed,
@@ -1580,7 +1605,11 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             }
 
             let z_order = order_requests(map, render_revision);
-            let next_frame_tick_needed = render_frame_tick_needed(map, &inbox().lock().unwrap());
+            let next_frame_tick_needed = {
+                let mut state = inbox().lock().unwrap();
+                state.retain_display_targets(&map.layout);
+                render_frame_tick_needed(map, &state)
+            };
             let next_hover_poll_needed = map
                 .cursors
                 .values()
@@ -1598,20 +1627,13 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
 
         if frame_tick_needed || had_msg {
             repin_frames += 1;
-            let applied_routes: Vec<_> = {
-                let state = inbox().lock().unwrap();
-                for request in &mut z_order {
-                    if let Some(pending) = state.approaches.get(&request.controller) {
-                        if state.revision == request.revision
-                            && pending.surface_generation == request.route.generation
-                            && pending.event.window == request.route.target_wid
-                        {
-                            request.diagnostic = pending.timing.diagnostic.clone();
-                        }
-                    }
-                }
-                state.applied_routes.values().cloned().collect()
-            };
+            let applied_routes: Vec<_> = inbox()
+                .lock()
+                .unwrap()
+                .applied_routes
+                .values()
+                .cloned()
+                .collect();
             let routes: Vec<_> = z_order
                 .iter()
                 .map(|request| request.route.clone())
@@ -1625,11 +1647,6 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             for request in &z_order {
                 let route = &request.route;
                 let selected = updates.contains(&route);
-                request.diagnostic.record(if selected {
-                    ConfirmationEvent::OrderSelected
-                } else {
-                    ConfirmationEvent::OrderCached
-                });
                 let trace = ordering_trace::decision(
                     route,
                     applied_routes.contains(route),
@@ -1645,16 +1662,14 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
                     }
                     continue;
                 }
-                match route.target_wid {
-                    Some(_) => dispatch_pin_above(request.clone(), trace),
-                    None => dispatch_order_front(request.clone(), trace),
-                }
+                dispatch_order_request(request.clone(), trace);
             }
             if repin_frames >= 60 {
                 repin_frames = 0;
             }
         }
 
+        schedule_pending_orders();
         if had_msg || hover_changed || frame_tick_needed || next_frame_tick_needed {
             let frames = {
                 let guard = RENDER.lock().unwrap();
@@ -1893,19 +1908,18 @@ fn target_frames(
             let elapsed = timing.elapsed_ms();
             timing.frames = timing.frames.saturating_add(1);
             timing.first_frame_ms.get_or_insert(elapsed);
-            timing.surface_matches = pending.surface_generation == map.layout.generation
+            timing.surface_matches = pending.display_generation == map.layout.generation
                 && display.contains(target.0, target.1);
             timing.route_matches = route
                 .as_ref()
                 .is_some_and(|route| route.target_wid == pending.event.window);
             timing.geometry_matches = state.core.is_target_frame(&pending.event);
-            let ready = timing.surface_matches && timing.route_matches && timing.geometry_matches;
+            let ready = timing.surface_matches && timing.geometry_matches
+                && inbox.visual.owns_action(key, pending.event.id);
             if ready {
                 timing.target_frame_ms.get_or_insert(elapsed);
             }
-            if ready { pending.timing.display_id = Some(display.id); }
             ready.then(|| TargetFrame {
-                diagnostic: pending.timing.diagnostic.clone(),
                 key: key.clone(),
                 event: pending.event.clone(),
                 generation: map.layout.generation,
@@ -1931,7 +1945,7 @@ fn apply_surface_frame(
         display,
         current_generation,
         targets,
-        |_, _| true,
+        |_| true,
         apply,
     )
 }
@@ -1939,76 +1953,30 @@ fn apply_surface_frame(
 fn apply_surface_frame_if(
     admission: &Mutex<OverlayInbox>,
     generation: u64,
-    display: DisplayId,
+    _display: DisplayId,
     current_generation: impl Fn() -> u64,
-    targets: &[TargetFrame],
-    current: impl Fn(&OverlayInbox, FrameStage) -> bool,
+    _targets: &[TargetFrame],
+    current: impl Fn(&OverlayInbox) -> bool,
     apply: impl FnOnce(),
 ) -> bool {
     if generation != current_generation() {
-        record_targets(targets, ConfirmationEvent::FramePreGeneration);
         return false;
     }
-    let Ok(mut state) = admission.try_lock() else {
-        record_targets(targets, ConfirmationEvent::FramePreBusy);
+    let Ok(state) = admission.try_lock() else {
         return false;
     };
-    if !current(&state, FrameStage::Pre) {
-        record_targets(targets, ConfirmationEvent::FramePreRejected);
+    if !current(&state) {
         return false;
-    }
-    state.prepare_surface_frame(generation, display, targets);
-    for target in targets {
-        if let Some(pending) = state.approaches.get_mut(&target.key) {
-            if same_target(&pending.event, &target.event) {
-                let elapsed = pending.timing.elapsed_ms();
-                pending.timing.submission_ms.get_or_insert(elapsed);
-            }
-        }
     }
     drop(state);
-    record_targets(targets, ConfirmationEvent::FrameNativeStarted);
     apply();
-    record_targets(targets, ConfirmationEvent::FrameNativeReturned);
-    let Ok(mut state) = admission.try_lock() else {
-        record_targets(targets, ConfirmationEvent::FramePostBusy);
+    let Ok(state) = admission.try_lock() else {
         return false;
     };
-    if !current(&state, FrameStage::Post) {
-        record_targets(targets, ConfirmationEvent::FramePostRejected);
-        state.invalidate_surface_frame(generation, display);
+    if !current(&state) {
         return false;
     }
-    state.acknowledge_targets(generation, display, current_generation(), targets);
-    record_targets(targets, ConfirmationEvent::FrameAckChecked);
     true
-}
-
-fn record_targets(targets: &[TargetFrame], event: ConfirmationEvent) {
-    for target in targets {
-        target.diagnostic.record(event);
-    }
-}
-
-fn frame_stamp_current(
-    stamp: frame_transport::Stamp,
-    generation: u64,
-    revision: u64,
-    now: Instant,
-    targets: &[TargetFrame],
-    stage: FrameStage,
-) -> bool {
-    let current = stamp.current(generation, revision, now);
-    if !current {
-        // Report the first failed condition in the existing predicate's order.
-        let reason = stage.rejection(
-            stamp.generation != generation,
-            stamp.revision != revision,
-            stamp.expires_at.is_some_and(|deadline| now >= deadline),
-        );
-        record_targets(targets, reason);
-    }
-    current
 }
 
 struct SurfaceFrame {
@@ -2022,6 +1990,27 @@ fn frames() -> &'static Mutex<frame_transport::Mailbox<SurfaceFrame>> {
     FRAMES.get_or_init(|| Mutex::new(frame_transport::Mailbox::default()))
 }
 
+/// The immutable target evidence and pixels come from the same locked render map.
+/// Publish to the bounded visual mailbox before completing the owned approach.
+fn queue_surface_frame(
+    queue: &Mutex<frame_transport::Mailbox<SurfaceFrame>>,
+    admission: &Mutex<OverlayInbox>,
+    display: DisplayId,
+    frame: SurfaceFrame,
+    current_generation: impl FnOnce() -> u64,
+) -> bool {
+    let generation = frame.generation;
+    let targets = frame.targets.clone();
+    let schedule = queue.lock().unwrap().push(display, frame);
+    admission.lock().unwrap().complete_renderer_targets(
+        generation,
+        display,
+        current_generation(),
+        &targets,
+    );
+    schedule
+}
+
 fn dispatch_present(
     generation: u64,
     display_id: DisplayId,
@@ -2029,8 +2018,9 @@ fn dispatch_present(
     targets: Vec<TargetFrame>,
     stamp: frame_transport::Stamp,
 ) {
-    record_targets(&targets, ConfirmationEvent::FrameQueued);
-    let schedule = frames().lock().unwrap().push(
+    let schedule = queue_surface_frame(
+        frames(),
+        inbox(),
         display_id,
         SurfaceFrame {
             generation,
@@ -2038,6 +2028,7 @@ fn dispatch_present(
             targets,
             stamp,
         },
+        || DISPLAY_GENERATION.load(Ordering::Acquire),
     );
     if schedule {
         dispatch_on_main(Box::new(drain_frames));
@@ -2062,21 +2053,16 @@ fn present_frame(display_id: DisplayId, frame: SurfaceFrame) {
         targets,
         stamp,
     } = frame;
-    record_targets(&targets, ConfirmationEvent::FrameDrained);
     let current = inbox().lock().unwrap().revision;
-    if !frame_stamp_current(
-        stamp,
+    if !stamp.current(
         DISPLAY_GENERATION.load(Ordering::Acquire),
         current,
         Instant::now(),
-        &targets,
-        FrameStage::Queued,
     ) {
         wake_renderer();
         return;
     }
     let Some(cg_image_ptr) = pixmap_to_cgimage(pixmap) else {
-        record_targets(&targets, ConfirmationEvent::ImageUnavailable);
         return;
     };
     unsafe {
@@ -2100,14 +2086,11 @@ fn present_frame(display_id: DisplayId, frame: SurfaceFrame) {
                 display_id,
                 || DISPLAY_GENERATION.load(Ordering::Acquire),
                 &targets,
-                |state, stage| {
-                    frame_stamp_current(
-                        stamp,
+                |state| {
+                    stamp.current(
                         DISPLAY_GENERATION.load(Ordering::Acquire),
                         state.revision,
                         Instant::now(),
-                        &targets,
-                        stage,
                     )
                 },
                 || {
@@ -2121,85 +2104,11 @@ fn present_frame(display_id: DisplayId, frame: SurfaceFrame) {
             ) {
                 wake_renderer();
             }
-        } else {
-            record_targets(&targets, ConfirmationEvent::SurfaceMissing);
         }
         drop(host);
         ordering_trace::presented(generation, display_id);
         CGImageRelease(cg_image_ptr as *mut c_void);
     }
-}
-
-/// Raise the normal-level overlay without activating the driver application.
-///
-/// This is used only for an externally visible cursor with no target window.
-/// Target-bound actions continue to use [`dispatch_pin_above`] so background
-/// delivery remains below unrelated foreground applications.
-fn dispatch_order_front(request: OrderRequest, trace: Option<ordering_trace::Trace>) {
-    let ZOrderRoute {
-        generation,
-        display_id,
-        ..
-    } = request.route;
-    dispatch_on_main(Box::new(move || unsafe {
-        if let Some(trace) = &trace {
-            trace.sample("before_apply");
-        }
-        if !order_request_current(&request) {
-            reject_order_request(&request);
-            return;
-        }
-        let host = HOST.lock().unwrap();
-        if let Some(surface) = host
-            .as_ref()
-            .filter(|host| host.generation == generation)
-            .and_then(|host| host.surfaces.get(&display_id))
-        {
-            let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
-            let mut command_ran = false;
-            let applied = apply_surface_route_if(
-                inbox(),
-                ZOrderRoute {
-                    generation,
-                    display_id,
-                    target_wid: None,
-                },
-                &request.diagnostic,
-                || {
-                    if !order_request_current(&request) {
-                        return false;
-                    }
-                    command_ran = true;
-                    let _: () = objc2::msg_send![win, orderFrontRegardless];
-                    if let Some(trace) = &trace {
-                        trace.native_sample("after_order_front", win);
-                    }
-                    true
-                },
-            );
-            if let Some(trace) = &trace {
-                trace.outcome(command_ran, applied);
-            }
-            if !applied {
-                reject_order_request(&request);
-            }
-        } else {
-            request.diagnostic.record(ConfirmationEvent::SurfaceMissing);
-            if let Some(trace) = &trace {
-                trace.event(
-                    "surface_rejected",
-                    serde_json::json!({
-                        "host_generation": host.as_ref().map(|host| host.generation),
-                        "reason": "missing_surface_or_stale_generation",
-                    }),
-                );
-            }
-        }
-        drop(host);
-        if let Some(trace) = trace {
-            trace.observe_presentations();
-        }
-    }));
 }
 
 /// Apply the existing best-effort target-relative order to one display
@@ -2234,121 +2143,125 @@ fn target_is_frontmost_visible_window(
 }
 
 fn apply_target_ordering(
-    current: impl Fn() -> bool,
+    current: impl Fn() -> OrderAuthority,
     observe: impl Fn() -> bool,
     relative: impl FnOnce(),
     front: impl FnOnce(),
-) -> bool {
-    if !current() {
-        return false;
+) -> OrderAuthority {
+    let authority = current();
+    if authority != OrderAuthority::Current {
+        return authority;
     }
     relative();
-    // Observation runs on AppKit main, after relative ordering and without
-    // render or inbox locks. A native read can outlast controller ownership.
     let eligible = observe();
-    if !current() {
-        return false;
+    let authority = current();
+    if authority != OrderAuthority::Current {
+        return authority;
     }
     if eligible {
         front();
     }
-    true
+    OrderAuthority::Current
 }
 
-fn dispatch_pin_above(request: OrderRequest, trace: Option<ordering_trace::Trace>) {
-    let ZOrderRoute {
-        generation,
-        display_id,
-        target_wid,
-    } = request.route;
-    let target_wid = target_wid.expect("pinned route");
-    dispatch_on_main(Box::new(move || unsafe {
-        if let Some(trace) = &trace {
-            trace.sample("before_apply");
-        }
-        if !order_request_current(&request) {
-            reject_order_request(&request);
-            return;
-        }
-        let host = HOST.lock().unwrap();
-        if let Some(surface) = host
-            .as_ref()
-            .filter(|host| host.generation == generation)
-            .and_then(|host| host.surfaces.get(&display_id))
-        {
-            let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
-            let mut command_ran = false;
-            let applied = apply_surface_route_if(
-                inbox(),
-                ZOrderRoute {
-                    generation,
-                    display_id,
-                    target_wid: Some(target_wid),
-                },
-                &request.diagnostic,
-                || {
-                    apply_target_ordering(
-                        || order_request_current(&request),
-                        || {
-                            let windows = crate::windows::visible_windows();
-                            let foreground = crate::apps::frontmost_pid();
-                            let eligible = target_is_frontmost_visible_window(
-                                target_wid, foreground, &windows,
-                            );
-                            if let Some(trace) = &trace {
-                                trace.application_predicate(foreground, &windows, eligible);
-                            }
-                            // Private logging can block on stderr. Refresh foreground
-                            // after it, immediately before the final ownership gate.
-                            if trace.is_some() {
-                                target_is_frontmost_visible_window(
-                                    target_wid,
-                                    crate::apps::frontmost_pid(),
-                                    &windows,
-                                )
-                            } else {
-                                eligible
-                            }
-                        },
-                        || {
-                            command_ran = true;
-                            let _: () = objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
-                            if let Some(trace) = &trace {
-                                trace.native_sample("after_order_relative", win);
-                            }
-                        },
-                        || {
-                            let _: () = objc2::msg_send![win, orderFrontRegardless];
-                            if let Some(trace) = &trace {
-                                trace.native_sample("after_order_front", win);
-                            }
-                        },
-                    )
-                },
-            );
-            if let Some(trace) = &trace {
-                trace.outcome(command_ran, applied);
+fn surface_order_authority(
+    request: &OrderRequest,
+    host: Option<&AppKitOverlayHost>,
+) -> OrderAuthority {
+    if host.is_some_and(|host| {
+        host.generation == request.route.generation
+            && host.surfaces.contains_key(&request.route.display_id)
+    }) {
+        OrderAuthority::Current
+    } else {
+        OrderAuthority::Stale
+    }
+}
+
+/// AppKit main only. Recheck authority around native observation; busy work is
+/// retained by the bounded mailbox and cannot withdraw an applied route.
+fn apply_native_order(
+    request: &OrderRequest,
+    trace: Option<&ordering_trace::Trace>,
+) -> OrderAuthority {
+    let authority = order_request_current(request);
+    if authority != OrderAuthority::Current {
+        return finish_order_request(inbox(), request, authority);
+    }
+    let Ok(host) = HOST.try_lock() else {
+        return OrderAuthority::Busy;
+    };
+    let authority = surface_order_authority(request, host.as_ref());
+    if authority != OrderAuthority::Current {
+        return finish_order_request(inbox(), request, authority);
+    }
+    let surface = &host.as_ref().unwrap().surfaces[&request.route.display_id];
+    let win = surface.win_ptr as *mut objc2::runtime::AnyObject;
+    if let Some(trace) = trace {
+        trace.sample("before_apply");
+    }
+    let command_ran = std::cell::Cell::new(false);
+    let outcome = apply_surface_route_if(
+        inbox(),
+        request,
+        || order_request_current(request),
+        || unsafe {
+            if let Some(target_wid) = request.route.target_wid {
+                apply_target_ordering(
+                    || order_request_current(request),
+                    || {
+                        let windows = crate::windows::visible_windows();
+                        let foreground = crate::apps::frontmost_pid();
+                        let eligible =
+                            target_is_frontmost_visible_window(target_wid, foreground, &windows);
+                        if let Some(trace) = trace {
+                            trace.application_predicate(foreground, &windows, eligible);
+                        }
+                        if trace.is_some() {
+                            target_is_frontmost_visible_window(
+                                target_wid,
+                                crate::apps::frontmost_pid(),
+                                &windows,
+                            )
+                        } else {
+                            eligible
+                        }
+                    },
+                    || {
+                        command_ran.set(true);
+                        let _: () =
+                            objc2::msg_send![win, orderWindow: 1i64 relativeTo: target_wid as i64];
+                        if let Some(trace) = trace {
+                            trace.native_sample("after_order_relative", win);
+                        }
+                    },
+                    || {
+                        let _: () = objc2::msg_send![win, orderFrontRegardless];
+                        if let Some(trace) = trace {
+                            trace.native_sample("after_order_front", win);
+                        }
+                    },
+                )
+            } else {
+                let authority = order_request_current(request);
+                if authority != OrderAuthority::Current {
+                    return authority;
+                }
+                command_ran.set(true);
+                let _: () = objc2::msg_send![win, orderFrontRegardless];
+                if let Some(trace) = trace {
+                    trace.native_sample("after_order_front", win);
+                }
+                OrderAuthority::Current
             }
-            if !applied {
-                reject_order_request(&request);
-            }
-        } else {
-            request.diagnostic.record(ConfirmationEvent::SurfaceMissing);
-            if let Some(trace) = &trace {
-                trace.event(
-                    "surface_rejected",
-                    serde_json::json!({
-                        "host_generation": host.as_ref().map(|host| host.generation),
-                        "reason": "missing_surface_or_stale_generation",
-                    }),
-                );
-            }
-        }
-        drop(host);
-        if let Some(trace) = trace {
-            trace.observe_presentations();
-        }
-    }));
+        },
+    );
+    drop(host);
+    if let Some(trace) = trace {
+        trace.outcome(command_ran.get(), outcome == OrderAuthority::Current);
+        trace.clone().observe_presentations();
+    }
+    outcome
 }
 
 /// Create a `CGImage` from a `tiny_skia::Pixmap` (premultiplied RGBA).
@@ -3053,23 +2966,29 @@ mod tests {
             }
             frames
         }
-        fn present(&self, frames: &[TargetFrame], generation: u64, display: DisplayId) {
-            if let Some(frame) = frames.first() {
-                assert!(apply_surface_route(
-                    &self.inbox,
-                    ZOrderRoute {
-                        generation,
-                        display_id: display,
-                        target_wid: frame.event.window,
-                    },
-                    || {}
-                ));
-            }
-            self.inbox.lock().unwrap().acknowledge_targets(
-                generation,
+        fn queue_frame(&self, targets: &[TargetFrame], generation: u64, display: DisplayId) {
+            let map = self.map.lock().unwrap();
+            let pixels = render_display(&map, map.layout.displays[0]);
+            let current_generation = map.layout.generation;
+            drop(map);
+            let queue = Mutex::new(frame_transport::Mailbox::default());
+            let revision = self.inbox.lock().unwrap().revision;
+            queue_surface_frame(
+                &queue,
+                &self.inbox,
                 display,
-                self.map.lock().unwrap().layout.generation,
-                frames,
+                SurfaceFrame {
+                    generation,
+                    pixmap: pixels,
+                    targets: targets.to_vec(),
+                    stamp: frame_transport::Stamp {
+                        generation,
+                        revision,
+                        painted_at: Instant::now(),
+                        expires_at: None,
+                    },
+                },
+                || current_generation,
             );
         }
         fn start(&self) -> Instant {
@@ -3216,7 +3135,7 @@ mod tests {
             if !disabled {
                 assert!(futures_util::poll!(&mut call).is_pending());
                 let frames = sink.frame(sink.start());
-                sink.present(&frames, 1, 1);
+                sink.queue_frame(&frames, 1, 1);
             }
             let result = call.await;
             assert_eq!(
@@ -3235,7 +3154,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn registered_theme_change_invalidates_pending_or_presented_click_before_input() {
+    async fn registered_theme_change_invalidates_pending_or_ready_click_before_input() {
         use crate::cursor::visual::{point, DeliveryReceipt, PointerVisualSink};
         use crate::tools::{ClickTool, ToolState};
         use std::sync::Arc;
@@ -3256,7 +3175,7 @@ mod tests {
             let frames = sink.frame(sink.start());
             assert_eq!(frames.len(), 1);
             if presented {
-                sink.present(&frames, 1, 1);
+                sink.queue_frame(&frames, 1, 1);
             }
             sink.send(
                 "one",
@@ -3289,7 +3208,7 @@ mod tests {
                 .register_target("one", &event, 1)
                 .unwrap();
             let frames = sink.frame(event.timestamp);
-            sink.present(&frames, 1, 1);
+            sink.queue_frame(&frames, 1, 1);
             let mut inbox = sink.inbox.lock().unwrap();
             assert!(inbox.repin_target("one", &event, 1).is_ok());
             let generation = match change {
@@ -3317,341 +3236,426 @@ mod tests {
         }
     }
 
-    #[test]
-    fn confirmation_trace_distinguishes_order_contention_from_obsolete_authority() {
-        use confirmation_trace::Event as E;
-        let mut admission = OverlayInbox::default();
-        let mut map = empty_map();
-        map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
-        let id = admission.begin_action("one").unwrap();
-        admission.publish(
+    #[tokio::test(start_paused = true)]
+    async fn renderer_ready_queued_target_authorizes_without_native_route_or_callback() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        let sink = QuickApproachSink::new(false, false);
+        let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+            .with_visual_sink(sink.clone());
+        let receipt = DeliveryReceipt::default();
+        let dispatches = std::cell::Cell::new(0);
+        let call = tool.dispatch_resolved(
             "one",
-            mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
+            point(80.0, 30.0, Some(42)),
+            &receipt,
+            async { None },
+            async {
+                receipt
+                    .dispatch_checked(|| {
+                        dispatches.set(dispatches.get() + 1);
+                        Ok(())
+                    })
+                    .unwrap();
+                cua_driver_core::protocol::ToolResult::text("accepted")
+            },
         );
-        admission.take().apply(&mut map, Instant::now());
-        let mut request = order_requests(&map, admission.revision).pop().unwrap();
-        request.diagnostic = confirmation_trace::Trace::new(true);
-        let render = Mutex::new(Some(map));
-        let inbox = Mutex::new(admission);
-        {
-            let _paint = render.lock().unwrap();
-            assert!(!order_request_matches(&request, &render, &inbox));
-        }
-        {
-            let _producer = inbox.lock().unwrap();
-            assert!(!order_request_matches(&request, &render, &inbox));
-        }
-        assert!(order_request_matches(&request, &render, &inbox));
-        inbox.lock().unwrap().begin_action("one");
-        assert!(!order_request_matches(&request, &render, &inbox));
-        request.revision = inbox.lock().unwrap().revision;
-        request.controller = "unrelated".into();
-        assert!(!order_request_matches(&request, &render, &inbox));
-        assert_eq!(request.diagnostic.count(E::OrderBusyRender), 1);
-        assert_eq!(request.diagnostic.count(E::OrderBusyInbox), 1);
-        assert_eq!(request.diagnostic.count(E::OrderRevision), 1);
-        assert_eq!(request.diagnostic.count(E::OrderControllerRoute), 1);
-        assert_eq!(request.diagnostic.count(E::OrderCurrent), 1);
+        tokio::pin!(call);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        assert!(sink.frame(sink.start()).is_empty());
+        assert_eq!(dispatches.get(), 0);
+        let targets = sink.frame(sink.start() + Duration::from_millis(140));
+        assert_eq!(targets.len(), 1);
+        assert!(
+            futures_util::poll!(&mut call).is_pending(),
+            "geometry alone is insufficient before queueing"
+        );
+        let map = sink.map.lock().unwrap();
+        let pixels = render_display(&map, map.layout.displays[0]);
+        drop(map);
+        let queue = Mutex::new(frame_transport::Mailbox::default());
+        let revision = sink.inbox.lock().unwrap().revision;
+        assert!(queue_surface_frame(
+            &queue,
+            &sink.inbox,
+            1,
+            SurfaceFrame {
+                generation: 1,
+                pixmap: pixels,
+                targets,
+                stamp: frame_transport::Stamp {
+                    generation: 1,
+                    revision,
+                    painted_at: Instant::now(),
+                    expires_at: None
+                },
+            },
+            || 1
+        ));
+        assert!(sink.inbox.lock().unwrap().applied_routes.is_empty());
+        assert!(
+            futures_util::poll!(&mut call).is_ready(),
+            "queued exact renderer target must complete without an AppKit callback"
+        );
+        assert_eq!(dispatches.get(), 1);
+        assert_eq!(queue.lock().unwrap().take().len(), 1);
+        assert_eq!(sink.pending(), 0);
     }
 
     #[tokio::test(start_paused = true)]
-    async fn confirmation_trace_separates_submission_route_and_ack_refusals() {
-        use confirmation_trace::Event as E;
-        let mut state = OverlayInbox::default();
-        let id = state
-            .begin_action("private-session-must-not-be-logged")
-            .unwrap();
-        let event = mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent);
-        let key = "private-session-must-not-be-logged";
-        state.publish(key, event.clone());
-        let mut receiver = state.register_target(key, &event, 1).unwrap();
-        let diagnostic = confirmation_trace::Trace::new(true);
-        state.approaches.get_mut(key).unwrap().timing.diagnostic = diagnostic.clone();
-        let targets = [TargetFrame {
+    async fn renderer_ready_visual_submission_cannot_withdraw_click_admission() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        let sink = QuickApproachSink::new(false, true);
+        let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+            .with_visual_sink(sink.clone());
+        let receipt = DeliveryReceipt::default();
+        let (resume, wait) = tokio::sync::oneshot::channel::<()>();
+        let call = tool.dispatch_resolved(
+            "one",
+            point(80.0, 30.0, Some(42)),
+            &receipt,
+            async { None },
+            async {
+                wait.await.unwrap();
+                receipt.dispatch_checked(|| Ok(())).unwrap();
+                cua_driver_core::protocol::ToolResult::text("accepted")
+            },
+        );
+        tokio::pin!(call);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        sink.queue_frame(&sink.frame(sink.start()), 1, 1);
+        assert!(futures_util::poll!(&mut call).is_pending());
+        assert!(receipt.ensure_current().is_ok());
+        let stamp = frame_transport::Stamp {
             generation: 1,
-            display_id: 1,
-            key: key.into(),
-            event: event.clone(),
-            diagnostic: diagnostic.clone(),
-        }];
-        let inbox = Mutex::new(state);
-        {
-            let _producer = inbox.lock().unwrap();
-            assert!(!apply_surface_frame_if(
-                &inbox,
-                1,
-                1,
-                || 1,
-                &targets,
-                |_, _| true,
-                || panic!("pre-admission refusal must not submit")
-            ));
-        }
-        let held = std::cell::RefCell::new(None);
+            revision: sink.inbox.lock().unwrap().revision,
+            painted_at: Instant::now(),
+            expires_at: None,
+        };
+        let calls = std::cell::Cell::new(0);
         assert!(!apply_surface_frame_if(
-            &inbox,
+            &sink.inbox,
             1,
             1,
             || 1,
-            &targets,
-            |_, _| true,
-            || {
-                *held.borrow_mut() = Some(inbox.lock().unwrap());
-            }
-        ));
-        held.borrow_mut().take();
-        let checks = std::cell::Cell::new(0);
-        assert!(!apply_surface_frame_if(
-            &inbox,
-            1,
-            1,
-            || 1,
-            &targets,
-            |_, _| {
-                let n = checks.get();
-                checks.set(n + 1);
-                n == 0
+            &[],
+            |state| {
+                let age = if calls.get() == 0 {
+                    Duration::ZERO
+                } else {
+                    frame_transport::MAX_FRAME_AGE
+                };
+                calls.set(calls.get() + 1);
+                stamp.current(1, state.revision, stamp.painted_at + age)
             },
             || {}
         ));
-        assert!(apply_surface_frame_if(
-            &inbox,
-            1,
-            1,
-            || 1,
-            &targets,
-            |_, _| true,
-            || {}
-        ));
         assert!(
-            receiver.try_recv().is_err(),
-            "native submission without an applied route is not acknowledgement"
+            receipt.ensure_current().is_ok(),
+            "expired visual submission must not revoke renderer-ready input"
         );
-        assert_eq!(diagnostic.count(E::FramePreBusy), 1);
-        assert_eq!(diagnostic.count(E::FramePostBusy), 1);
-        assert_eq!(diagnostic.count(E::FramePostRejected), 1);
-        assert_eq!(diagnostic.count(E::FrameNativeReturned), 3);
-        assert_eq!(diagnostic.count(E::AckRoute), 1);
-        let route = ZOrderRoute {
-            generation: 1,
-            display_id: 1,
-            target_wid: event.window,
-        };
-        assert!(apply_surface_route_if(&inbox, route, &diagnostic, || true));
-        tokio::time::advance(crate::cursor::CLICK_PRESENTATION_TIMEOUT).await;
-        assert!(apply_surface_frame_if(
-            &inbox,
-            1,
-            1,
-            || 1,
-            &targets,
-            |_, _| true,
-            || {}
-        ));
-        assert!(receiver.try_recv().is_err());
-        assert_eq!(diagnostic.count(E::AckExpired), 1);
-        inbox.lock().unwrap().begin_action(key);
-        assert!(apply_surface_frame_if(
-            &inbox,
-            1,
-            1,
-            || 1,
-            &targets,
-            |_, _| true,
-            || {}
-        ));
-        assert_eq!(diagnostic.count(E::AckOwnership), 1);
-        assert_eq!(diagnostic.count(E::AckSent), 0);
-        assert!(!format!("{diagnostic:?}").contains(key));
+        resume.send(()).unwrap();
+        assert_ne!(call.await.is_error, Some(true));
     }
 
     #[test]
-    fn confirmation_trace_separates_route_publication_contention() {
-        use confirmation_trace::Event as E;
-        let diagnostic = confirmation_trace::Trace::new(true);
-        let inbox = Mutex::new(OverlayInbox::default());
-        let route = ZOrderRoute {
-            generation: 1,
-            display_id: 1,
-            target_wid: Some(42),
+    fn renderer_ready_order_authority_distinguishes_busy_from_stale() {
+        let mut state = OverlayInbox::default();
+        let mut map = empty_map();
+        map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
+        let id = state.begin_action("one").unwrap();
+        state.publish(
+            "one",
+            mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
+        );
+        state.take().apply(&mut map, Instant::now());
+        let request = order_requests(&map, state.revision).pop().unwrap();
+        let render = Mutex::new(Some(map));
+        let inbox = Mutex::new(state);
+        let busy = {
+            let _paint = render.lock().unwrap();
+            order_request_matches(&request, &render, &inbox)
         };
-        {
-            let _producer = inbox.lock().unwrap();
-            assert!(!apply_surface_route_if(
-                &inbox,
-                route.clone(),
-                &diagnostic,
-                || panic!("busy admission must not order")
-            ));
-        }
-        let held = std::cell::RefCell::new(None);
-        assert!(!apply_surface_route_if(
-            &inbox,
-            route.clone(),
-            &diagnostic,
-            || {
-                *held.borrow_mut() = Some(inbox.lock().unwrap());
-                true
-            }
-        ));
-        held.borrow_mut().take();
-        assert!(inbox.lock().unwrap().applied_routes.is_empty());
-        assert!(!apply_surface_route_if(
-            &inbox,
-            route.clone(),
-            &diagnostic,
-            || false
-        ));
-        assert!(apply_surface_route_if(&inbox, route, &diagnostic, || true));
-        assert_eq!(diagnostic.count(E::RoutePreBusy), 1);
-        assert_eq!(diagnostic.count(E::RoutePostBusy), 1);
-        assert_eq!(diagnostic.count(E::RouteApplyRejected), 1);
-        assert_eq!(diagnostic.count(E::RoutePublished), 1);
+        let inbox_busy = {
+            let _publish = inbox.lock().unwrap();
+            order_request_matches(&request, &render, &inbox)
+        };
+        assert_eq!(busy, inbox_busy);
+        inbox.lock().unwrap().begin_action("one");
+        let stale = order_request_matches(&request, &render, &inbox);
+        assert_ne!(
+            busy, stale,
+            "temporary contention must not be reported as proven obsolete authority"
+        );
     }
 
     #[test]
-    fn confirmation_trace_preserves_real_ack_and_isolates_replaced_actions() {
-        use confirmation_trace::Event as E;
-        for enabled in [false, true] {
+    fn renderer_ready_order_busy_defers_bounded_work_without_withdrawing_route() {
+        for busy_render in [true, false] {
             let mut state = OverlayInbox::default();
             let mut map = empty_map();
             map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
             let id = state.begin_action("one").unwrap();
-            let event = mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent);
-            state.publish("one", event.clone());
-            let mut receiver = state.register_target("one", &event, 1).unwrap();
-            let diagnostic = confirmation_trace::Trace::new(enabled);
-            state.approaches.get_mut("one").unwrap().timing.diagnostic = diagnostic.clone();
-            state.take().apply(&mut map, event.timestamp);
-            let targets = target_frames(&map, map.layout.displays[0], &mut state);
-            assert_eq!(targets.len(), 1);
-            let inbox = Mutex::new(state);
-            assert!(apply_surface_route_if(
-                &inbox,
-                z_order_routes(&map).pop().unwrap(),
-                &diagnostic,
-                || true
-            ));
-            assert!(apply_surface_frame_if(
-                &inbox,
-                1,
-                1,
-                || 1,
-                &targets,
-                |_, _| true,
-                || {}
-            ));
-            assert_eq!(receiver.try_recv(), Ok(Ok(())));
-            assert!(inbox
-                .lock()
-                .unwrap()
-                .target_current("one", &event, 1)
-                .is_ok());
-            assert_eq!(diagnostic.count(E::AckSent), u64::from(enabled));
-            let next = {
-                let mut state = inbox.lock().unwrap();
-                let id = state.begin_action("one").unwrap();
-                let next = mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent);
-                state.publish("one", next.clone());
-                next
-            };
-            let mut next_receiver = inbox
-                .lock()
-                .unwrap()
-                .register_target("one", &next, 1)
-                .unwrap();
-            assert!(apply_surface_frame_if(
-                &inbox,
-                1,
-                1,
-                || 1,
-                &targets,
-                |_, _| true,
-                || {}
-            ));
-            assert!(
-                next_receiver.try_recv().is_err(),
-                "old frame cannot acknowledge the replacement action"
+            state.publish(
+                "one",
+                mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
             );
-            assert_eq!(diagnostic.count(E::AckOwnership), u64::from(enabled));
-            inbox.lock().unwrap().release_target("one", &next);
-            assert!(inbox.lock().unwrap().approaches.is_empty());
+            state.take().apply(&mut map, Instant::now());
+            let request = order_requests(&map, state.revision).pop().unwrap();
+            state.applied_routes.insert(1, request.route.clone());
+            let render = Mutex::new(Some(map));
+            let inbox = Mutex::new(state);
+            let calls = std::cell::Cell::new(0);
+            let mut queue = OrderMailbox::default();
+            for _ in 0..1000 {
+                queue.push(request.clone(), None);
+            }
+            assert_eq!(queue.pending.len(), 1);
+            assert!(queue.schedule());
+            assert!(!queue.schedule());
+            let (pending, trace) = queue.take().pop().unwrap();
+            let paint = busy_render.then(|| render.lock().unwrap());
+            let producer = (!busy_render).then(|| inbox.lock().unwrap());
+            assert_eq!(
+                apply_surface_route_if(
+                    &inbox,
+                    &pending,
+                    || order_request_matches(&pending, &render, &inbox),
+                    || {
+                        calls.set(calls.get() + 1);
+                        OrderAuthority::Current
+                    }
+                ),
+                OrderAuthority::Busy
+            );
+            drop(paint);
+            drop(producer);
+            assert_eq!(calls.get(), 0);
+            assert_eq!(
+                inbox.lock().unwrap().applied_routes.get(&1),
+                Some(&request.route)
+            );
+            queue.defer(pending, trace);
+            assert!(queue.finish());
+            assert!(queue.schedule());
+            let (pending, _) = queue.take().pop().unwrap();
+            assert_eq!(
+                apply_surface_route_if(
+                    &inbox,
+                    &pending,
+                    || order_request_matches(&pending, &render, &inbox),
+                    || {
+                        calls.set(calls.get() + 1);
+                        OrderAuthority::Current
+                    }
+                ),
+                OrderAuthority::Current
+            );
+            assert!(!queue.finish());
+            assert_eq!(calls.get(), 1);
+            // A newer queued command wins over a deferred old callback.
+            let mut newer = request.clone();
+            newer.revision += 1;
+            queue.push(newer.clone(), None);
+            queue.defer(request, None);
+            assert_eq!(queue.take().pop().unwrap().0.revision, newer.revision);
         }
     }
 
     #[test]
-    fn confirmation_trace_stamp_reasons_preserve_exact_freshness_policy() {
-        use confirmation_trace::Event as E;
-        let diagnostic = confirmation_trace::Trace::new(true);
-        let start = Instant::now();
+    fn renderer_ready_order_proven_staleness_refuses_native_and_invalidates_old_route() {
+        for reason in ["generation", "revision", "controller", "target", "surface"] {
+            let mut state = OverlayInbox::default();
+            let mut map = empty_map();
+            map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
+            let id = state.begin_action("one").unwrap();
+            state.publish(
+                "one",
+                mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
+            );
+            state.take().apply(&mut map, Instant::now());
+            let mut request = order_requests(&map, state.revision).pop().unwrap();
+            state.applied_routes.insert(1, request.route.clone());
+            match reason {
+                "generation" => map.layout.generation += 1,
+                "revision" => {
+                    state.begin_action("one");
+                }
+                "controller" => request.controller = "ended".into(),
+                "target" => map.cursors.get_mut("one").unwrap().core.pinned_wid = Some(77),
+                _ => (),
+            }
+            let render = Mutex::new(Some(map));
+            let inbox = Mutex::new(state);
+            let outcome = apply_surface_route_if(
+                &inbox,
+                &request,
+                || {
+                    if reason == "surface" {
+                        surface_order_authority(&request, None)
+                    } else {
+                        order_request_matches(&request, &render, &inbox)
+                    }
+                },
+                || panic!("stale native order for {reason}"),
+            );
+            assert_eq!(outcome, OrderAuthority::Stale, "{reason}");
+            assert!(inbox.lock().unwrap().applied_routes.is_empty(), "{reason}");
+        }
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn renderer_ready_invalid_display_removes_exact_waiter_without_input() {
+        use crate::cursor::visual::{point, DeliveryReceipt};
+        use crate::tools::{ClickTool, ToolState};
+        for invalid in ["generation", "removed", "outside"] {
+            let sink = QuickApproachSink::new(false, true);
+            let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
+                .with_visual_sink(sink.clone());
+            let receipt = DeliveryReceipt::default();
+            let call = tool.dispatch_resolved(
+                "one",
+                point(80.0, 30.0, Some(42)),
+                &receipt,
+                async { panic!("invalid display dispatched input") },
+                async { unreachable!() },
+            );
+            tokio::pin!(call);
+            assert!(futures_util::poll!(&mut call).is_pending());
+            let targets = sink.frame(sink.start());
+            assert_eq!(targets.len(), 1);
+            let mut layout = sink.map.lock().unwrap().layout.clone();
+            match invalid {
+                "generation" => layout.generation += 1,
+                "removed" => layout.displays.clear(),
+                _ => layout.displays[0].x = 500.0,
+            }
+            replace_display_layout(&mut sink.map.lock().unwrap(), layout.clone());
+            let mut inbox = sink.inbox.lock().unwrap();
+            inbox.retain_display_targets(&layout);
+            inbox.complete_renderer_targets(1, 1, layout.generation, &targets);
+            assert!(inbox.approaches.is_empty());
+            drop(inbox);
+            assert_eq!(call.await.is_error, Some(true));
+            assert!(!receipt.was_accepted());
+        }
+    }
+
+    #[test]
+    fn renderer_ready_order_post_native_busy_keeps_route_and_retries_without_locks() {
+        let mut state = OverlayInbox::default();
+        let mut map = empty_map();
+        map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
+        let id = state.begin_action("one").unwrap();
+        state.publish(
+            "one",
+            mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
+        );
+        state.take().apply(&mut map, Instant::now());
+        let request = order_requests(&map, state.revision).pop().unwrap();
+        state.applied_routes.insert(1, request.route.clone());
+        let render = Mutex::new(Some(map));
+        let inbox = Mutex::new(state);
+        let held = std::cell::RefCell::new(None);
+        let result = apply_surface_route_if(
+            &inbox,
+            &request,
+            || order_request_matches(&request, &render, &inbox),
+            || {
+                assert!(
+                    render.try_lock().is_ok(),
+                    "native ordering must not hold the paint lock"
+                );
+                *held.borrow_mut() = Some(inbox.lock().unwrap());
+                OrderAuthority::Current
+            },
+        );
+        assert_eq!(result, OrderAuthority::Busy);
+        held.borrow_mut().take();
+        assert_eq!(
+            inbox.lock().unwrap().applied_routes.get(&1),
+            Some(&request.route)
+        );
+        assert_eq!(
+            apply_surface_route_if(
+                &inbox,
+                &request,
+                || order_request_matches(&request, &render, &inbox),
+                || OrderAuthority::Current
+            ),
+            OrderAuthority::Current
+        );
+    }
+
+    #[test]
+    fn renderer_ready_repin_saturation_cannot_refuse_an_owned_ready_action() {
         let mut state = OverlayInbox::default();
         let id = state.begin_action("one").unwrap();
-        let targets = [TargetFrame {
-            generation: 1,
-            display_id: 1,
-            key: "one".into(),
-            event: mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
-            diagnostic: diagnostic.clone(),
-        }];
-        let stamp = frame_transport::Stamp {
-            generation: 1,
-            revision: 2,
-            painted_at: start,
-            expires_at: None,
-        };
-        for (stage, reasons) in [
-            (
-                FrameStage::Queued,
-                [
-                    E::StampQueuedGeneration,
-                    E::StampQueuedRevision,
-                    E::StampQueuedAge,
-                    E::StampQueuedPulse,
-                ],
-            ),
-            (
-                FrameStage::Pre,
-                [
-                    E::StampPreGeneration,
-                    E::StampPreRevision,
-                    E::StampPreAge,
-                    E::StampPrePulse,
-                ],
-            ),
-            (
-                FrameStage::Post,
-                [
-                    E::StampPostGeneration,
-                    E::StampPostRevision,
-                    E::StampPostAge,
-                    E::StampPostPulse,
-                ],
-            ),
-        ] {
-            assert!(frame_stamp_current(stamp, 1, 2, start, &targets, stage));
-            assert!(!frame_stamp_current(stamp, 2, 2, start, &targets, stage));
-            assert!(!frame_stamp_current(stamp, 1, 3, start, &targets, stage));
-            assert!(!frame_stamp_current(
-                stamp,
-                1,
-                2,
-                start + frame_transport::MAX_FRAME_AGE,
-                &targets,
-                stage
-            ));
-            let expired = frame_transport::Stamp {
-                expires_at: Some(start),
-                ..stamp
-            };
-            assert!(!frame_stamp_current(expired, 1, 2, start, &targets, stage));
-            for reason in reasons {
-                assert_eq!(diagnostic.count(reason), 1);
-            }
+        let event = mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent);
+        state.publish("one", event.clone());
+        let _receiver = state.register_target("one", &event, 1).unwrap();
+        state.complete_renderer_targets(
+            1,
+            1,
+            1,
+            &[TargetFrame {
+                generation: 1,
+                display_id: 1,
+                key: "one".into(),
+                event: event.clone(),
+            }],
+        );
+        for n in 0..4096 {
+            state
+                .commands
+                .push((n, command("one", OverlayCommand::PinAbove(42))));
         }
-        let disabled = confirmation_trace::Trace::new(false);
-        disabled.record(E::AckSent);
-        assert_eq!(disabled.count(E::AckSent), 0);
-        assert_eq!(format!("{disabled:?}"), "disabled");
+        assert!(
+            state.repin_target("one", &event, 1).is_ok(),
+            "best-effort ordering saturation cannot veto renderer readiness"
+        );
+        assert_eq!(state.commands.len(), 4096);
+        state.begin_action("one");
+        assert!(
+            state.repin_target("one", &event, 1).is_err(),
+            "saturation must not bypass action ownership"
+        );
+    }
+
+    #[test]
+    fn renderer_ready_late_stale_callback_cannot_withdraw_newer_same_route() {
+        let inbox = Mutex::new(OverlayInbox::default());
+        let old = OrderRequest {
+            route: ZOrderRoute {
+                generation: 1,
+                display_id: 1,
+                target_wid: Some(42),
+            },
+            controller: "one".into(),
+            revision: 0,
+        };
+        let mut newer = old.clone();
+        newer.revision = 1;
+        inbox.lock().unwrap().revision = 1;
+        assert_eq!(
+            apply_surface_route_if(
+                &inbox,
+                &newer,
+                || OrderAuthority::Current,
+                || OrderAuthority::Current
+            ),
+            OrderAuthority::Current
+        );
+        assert_eq!(
+            finish_order_request(&inbox, &old, OrderAuthority::Stale),
+            OrderAuthority::Stale
+        );
+        assert_eq!(
+            inbox.lock().unwrap().applied_routes.get(&1),
+            Some(&newer.route),
+            "stale callback must not erase a newer same-route publication"
+        );
     }
 
     #[test]
@@ -3669,13 +3673,22 @@ mod tests {
         let request = order_requests(&map, admission.revision).pop().unwrap();
         let render = Mutex::new(Some(map));
         let inbox = Mutex::new(admission);
-        assert!(order_request_matches(&request, &render, &inbox));
+        assert_eq!(
+            order_request_matches(&request, &render, &inbox),
+            OrderAuthority::Current
+        );
         // A producer invalidates queued authority before the render map catches up.
         inbox.lock().unwrap().begin_action("one");
-        assert!(!order_request_matches(&request, &render, &inbox));
+        assert_eq!(
+            order_request_matches(&request, &render, &inbox),
+            OrderAuthority::Stale
+        );
         let mut request = request;
         request.revision = inbox.lock().unwrap().revision;
-        assert!(order_request_matches(&request, &render, &inbox));
+        assert_eq!(
+            order_request_matches(&request, &render, &inbox),
+            OrderAuthority::Current
+        );
         {
             let mut inbox = inbox.lock().unwrap();
             let id = inbox.begin_action("two").unwrap();
@@ -3693,7 +3706,7 @@ mod tests {
             vec![request.route.clone()]
         );
         assert!(
-            !order_request_matches(&request, &render, &inbox),
+            order_request_matches(&request, &render, &inbox) == OrderAuthority::Stale,
             "same route is not authority for the replaced controller"
         );
     }
@@ -3727,7 +3740,7 @@ mod tests {
             1,
             || 1,
             &[],
-            |state, _| stamp.current(1, state.revision, start + Duration::from_millis(151)),
+            |state| stamp.current(1, state.revision, start + Duration::from_millis(151)),
             || panic!("expired pulse reached native contents")
         ));
     }
@@ -3780,7 +3793,7 @@ mod tests {
                 1,
                 || generation,
                 &[],
-                |state, _| old.current(generation, state.revision, clock),
+                |state| old.current(generation, state.revision, clock),
                 || submissions.set(submissions.get() + 1)
             ));
             assert_eq!(
@@ -3800,7 +3813,7 @@ mod tests {
                 1,
                 || generation,
                 &[],
-                |state, _| fresh.current(generation, state.revision, clock),
+                |state| fresh.current(generation, state.revision, clock),
                 || submissions.set(submissions.get() + 1)
             ));
             assert_eq!(submissions.get(), 1, "latest clear must remain submitable");
@@ -3843,7 +3856,7 @@ mod tests {
             } else {
                 assert!(futures_util::poll!(&mut call).is_pending());
                 let frames = sink.frame(sink.start());
-                sink.present(&frames, 1, 1);
+                sink.queue_frame(&frames, 1, 1);
                 call.await;
             }
         }
@@ -3896,7 +3909,7 @@ mod tests {
                     tokio::pin!(call);
                     assert!(futures_util::poll!(&mut call).is_pending());
                     let frames = sink.frame(sink.start());
-                    sink.present(&frames, 1, 1);
+                    sink.queue_frame(&frames, 1, 1);
                     call.await;
                     let calls = fixture.calls();
                     assert_eq!(
@@ -3923,7 +3936,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn quick_approach_all_routes_wait_for_applied_frame_then_contact_before_readback() {
+    async fn quick_approach_all_routes_wait_for_queued_frame_then_contact_before_readback() {
         use crate::cursor::visual::{point, DeliveryReceipt, InvocationVisualSink};
         use crate::tools::{ClickTool, DoubleClickTool, RightClickTool, ToolState};
         use std::sync::{
@@ -4012,18 +4025,18 @@ mod tests {
                 }
                 assert!(
                     futures_util::poll!(&mut call).is_pending(),
-                    "rendering without submission is insufficient"
+                    "rendering without queueing is insufficient"
                 );
                 if !reduced {
-                    sink.present(&sink.frame(start + Duration::from_millis(79)), 1, 1);
+                    sink.queue_frame(&sink.frame(start + Duration::from_millis(79)), 1, 1);
                     assert!(futures_util::poll!(&mut call).is_pending());
                 }
                 let frames = sink.frame(start + Duration::from_millis(140));
                 assert_eq!(frames.len(), 1, "{route}");
                 assert_eq!(dispatches.load(Ordering::SeqCst), 0);
-                sink.present(&frames, 0, 1);
+                sink.queue_frame(&frames, 0, 1);
                 assert!(futures_util::poll!(&mut call).is_pending());
-                sink.present(&frames, 1, 1);
+                sink.queue_frame(&frames, 1, 1);
                 let result = call.await;
                 assert_eq!(result.is_error, Some(true));
                 assert_eq!(
@@ -4085,7 +4098,7 @@ mod tests {
             // alive by the larger admission budget. Native submission is explicit.
             let frames = sink.frame(sink.start() + Duration::from_millis(ack_ms));
             assert_eq!(frames.len(), 1);
-            sink.present(&frames, 1, 1);
+            sink.queue_frame(&frames, 1, 1);
             let std::task::Poll::Ready(result) = futures_util::poll!(&mut call) else {
                 panic!("acknowledged input waited unnecessarily")
             };
@@ -4123,9 +4136,9 @@ mod tests {
             tokio::time::advance(Duration::from_millis(1)).await;
             if expired_ack {
                 let frames = sink.frame(sink.start() + Duration::from_millis(1000));
-                sink.present(&frames, 1, 1);
+                sink.queue_frame(&frames, 1, 1);
                 assert!(sink.inbox.lock().unwrap().approaches["one"]
-                    .presented
+                    .renderer_ready
                     .is_none());
             }
             let std::task::Poll::Ready(result) = futures_util::poll!(&mut call) else {
@@ -4198,7 +4211,7 @@ mod tests {
                 _ => {}
             }
             if failure != "timeout" {
-                sink.present(&frames, 1, 1);
+                sink.queue_frame(&frames, 1, 1);
             }
             tokio::time::advance(crate::cursor::CLICK_PRESENTATION_TIMEOUT).await;
             let result = call.await;
@@ -4252,7 +4265,7 @@ mod tests {
             if !disabled && target.is_some() {
                 assert!(futures_util::poll!(&mut call).is_pending());
                 let frames = sink.frame(sink.start());
-                sink.present(&frames, 1, 1);
+                sink.queue_frame(&frames, 1, 1);
             }
             let result = call.await;
             assert_eq!(
@@ -4300,14 +4313,14 @@ mod tests {
         assert!(sink.map.lock().unwrap().cursors["one"].core.path.is_none());
         let mut unrelated = frame[0].clone();
         unrelated.key = "two".into();
-        sink.present(&[unrelated], 1, 1);
+        sink.queue_frame(&[unrelated], 1, 1);
         assert!(futures_util::poll!(&mut call).is_pending());
-        sink.present(&frame, 1, 2);
+        sink.queue_frame(&frame, 1, 2);
         assert!(
             futures_util::poll!(&mut call).is_pending(),
             "wrong surface cannot acknowledge"
         );
-        sink.present(&frame, 1, 1);
+        sink.queue_frame(&frame, 1, 1);
         assert_ne!(call.await.is_error, Some(true));
         assert_eq!(sink.pending(), 0);
         for _ in 0..1000 {
@@ -4334,7 +4347,7 @@ mod tests {
             atomic::{AtomicBool, Ordering},
             Arc,
         };
-        for change in ["live_target", "new_frame", "late_ack", "new_surface"] {
+        for change in ["live_target", "new_action", "late_ack", "new_surface"] {
             let sink = QuickApproachSink::new(false, true);
             let live = Arc::new(AtomicBool::new(true));
             let receipt = DeliveryReceipt::default();
@@ -4360,14 +4373,16 @@ mod tests {
             if change == "late_ack" {
                 tokio::time::advance(crate::cursor::CLICK_PRESENTATION_TIMEOUT).await;
             }
-            sink.present(&frame, 1, 1);
+            sink.queue_frame(&frame, 1, 1);
             match change {
                 "live_target" => live.store(false, Ordering::SeqCst),
-                "new_frame" => sink.present(&[], 1, 1),
+                "new_action" => {
+                    sink.inbox.lock().unwrap().begin_action("one");
+                }
                 "new_surface" => {
                     sink.map.lock().unwrap().layout.generation = 2;
                     let fresh = sink.frame(Instant::now());
-                    sink.present(&fresh, 2, 1);
+                    sink.queue_frame(&fresh, 2, 1);
                 }
                 _ => {}
             }
@@ -4399,7 +4414,7 @@ mod tests {
         );
         tokio::pin!(call);
         assert!(futures_util::poll!(&mut call).is_pending());
-        sink.present(&sink.frame(sink.start()), 1, 1);
+        sink.queue_frame(&sink.frame(sink.start()), 1, 1);
         assert_eq!(call.await.is_error, Some(true));
         assert!(!receipt.was_accepted());
     }
@@ -4461,18 +4476,18 @@ mod tests {
             2,
             "old guard cleanup cannot remove the revived waiter"
         );
-        sink.present(&obsolete, 1, 1);
+        sink.queue_frame(&obsolete, 1, 1);
         assert!(futures_util::poll!(&mut a).is_pending());
         assert!(futures_util::poll!(&mut b).is_pending());
         let frames = sink.frame(Instant::now());
         assert_eq!(frames.len(), 2);
         let one: Vec<_> = frames.iter().filter(|f| f.key == "one").cloned().collect();
-        sink.present(&one, 1, 1);
+        sink.queue_frame(&one, 1, 1);
         assert_ne!(a.await.is_error, Some(true));
         assert!(futures_util::poll!(&mut b).is_pending());
         assert_eq!(sink.pending(), 1);
         let two: Vec<_> = frames.iter().filter(|f| f.key == "two").cloned().collect();
-        sink.present(&two, 1, 1);
+        sink.queue_frame(&two, 1, 1);
         assert_ne!(b.await.is_error, Some(true));
         assert_eq!(sink.pending(), 0);
         assert!(!old.was_accepted());
@@ -4568,7 +4583,7 @@ mod tests {
             tokio::pin!(call);
             assert!(futures_util::poll!(&mut call).is_pending());
             let frames = sink.frame(sink.start());
-            sink.present(&frames, 1, 1);
+            sink.queue_frame(&frames, 1, 1);
             assert_eq!(call.await.is_error, Some(true));
             assert_eq!(ax.writes.get(), usize::from(!invalidate));
             assert_eq!(ax.releases.get(), 1);
@@ -4586,7 +4601,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn quick_approach_matching_frame_keeps_admission_through_submission() {
+    async fn quick_approach_visual_frames_do_not_control_ready_admission() {
         use crate::cursor::visual::{point, DeliveryReceipt};
         use crate::tools::{ClickTool, ToolState};
         for replacement in ["same", "omitted", "changed"] {
@@ -4611,7 +4626,7 @@ mod tests {
             tokio::pin!(call);
             assert!(futures_util::poll!(&mut call).is_pending());
             let frames = sink.frame(sink.start());
-            sink.present(&frames, 1, 1);
+            sink.queue_frame(&frames, 1, 1);
             assert!(futures_util::poll!(&mut call).is_pending());
             assert!(receipt.ensure_current().is_ok());
             assert!(apply_surface_route(
@@ -4640,12 +4655,12 @@ mod tests {
                 &next,
                 || {
                     // A live readback may return during setContents/commit/flush.
-                    assert_eq!(receipt.ensure_current().is_ok(), replacement == "same");
+                    assert!(receipt.ensure_current().is_ok());
                 }
             ));
             resume.send(()).unwrap();
-            assert_eq!(call.await.is_error == Some(true), replacement != "same");
-            assert_eq!(receipt.was_accepted(), replacement == "same");
+            assert_ne!(call.await.is_error, Some(true));
+            assert!(receipt.was_accepted());
         }
     }
 
@@ -4686,7 +4701,7 @@ mod tests {
                     },
                 ));
                 assert!(futures_util::poll!(&mut call).is_pending());
-                sink.present(&sink.frame(sink.start()), 1, 1);
+                sink.queue_frame(&sink.frame(sink.start()), 1, 1);
                 assert!(futures_util::poll!(&mut call).is_pending());
                 match change {
                     "end" => sink
@@ -4712,7 +4727,7 @@ mod tests {
     }
 
     #[tokio::test(start_paused = true)]
-    async fn quick_approach_route_change_invalidates_before_native_ordering() {
+    async fn quick_approach_other_session_route_does_not_invalidate_ready_action() {
         use crate::cursor::visual::{point, DeliveryReceipt};
         use crate::tools::{ClickTool, ToolState};
         let sink = QuickApproachSink::new(false, true);
@@ -4725,18 +4740,14 @@ mod tests {
             &receipt,
             async { None },
             async {
-                receipt
-                    .dispatch_checked(|| -> anyhow::Result<()> {
-                        panic!("obsolete surface dispatched")
-                    })
-                    .unwrap();
-                unreachable!()
+                receipt.dispatch_checked(|| Ok(())).unwrap();
+                cua_driver_core::protocol::ToolResult::text("accepted")
             },
         );
         tokio::pin!(call);
         assert!(futures_util::poll!(&mut call).is_pending());
         let frames = sink.frame(sink.start());
-        sink.present(&frames, 1, 1);
+        sink.queue_frame(&frames, 1, 1);
         let event = frames[0].event.clone();
         assert!(sink
             .inbox
@@ -4763,22 +4774,22 @@ mod tests {
                     .lock()
                     .unwrap()
                     .target_current("one", &event, 1)
-                    .is_err());
+                    .is_ok());
             }
         ));
-        // A queued old frame cannot establish readiness under the new route.
+        // Another session's visual ordering cannot withdraw this action's readiness.
         sink.inbox
             .lock()
             .unwrap()
-            .acknowledge_targets(1, 1, 1, &frames);
+            .complete_renderer_targets(1, 1, 1, &frames);
         assert!(sink
             .inbox
             .lock()
             .unwrap()
             .target_current("one", &event, 1)
-            .is_err());
-        assert_eq!(call.await.is_error, Some(true));
-        assert!(!receipt.was_accepted());
+            .is_ok());
+        assert_ne!(call.await.is_error, Some(true));
+        assert!(receipt.was_accepted());
     }
 
     #[tokio::test(start_paused = true)]
@@ -4815,6 +4826,15 @@ mod tests {
         let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()))
             .with_visual_sink(sink.clone());
         let receipt = DeliveryReceipt::default();
+        let live = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let validate = live.clone();
+        receipt.set_revalidation(move || {
+            if validate.load(Ordering::SeqCst) {
+                Ok(())
+            } else {
+                anyhow::bail!("live target changed")
+            }
+        });
         let native_calls = std::cell::Cell::new(0);
         let denial = std::cell::RefCell::new(String::new());
         let call = tool.dispatch_resolved(
@@ -4822,19 +4842,12 @@ mod tests {
             point(80.0, 30.0, Some(42)),
             &receipt,
             async {
-                assert!(apply_surface_route(
-                    &sink.inbox,
-                    ZOrderRoute {
-                        generation: 1,
-                        display_id: 1,
-                        target_wid: Some(77),
-                    },
-                    || {}
-                ));
+                live.store(false, Ordering::SeqCst);
                 let error = receipt.ensure_current().unwrap_err();
                 *denial.borrow_mut() = error.to_string();
-                // Restore real frame admission before the pixel adapter consumes denial.
-                sink.present(&sink.frame(sink.start()), 1, 1);
+                // Recovery cannot turn a prior native revalidation denial into fallback permission.
+                live.store(true, Ordering::SeqCst);
+                sink.queue_frame(&sink.frame(sink.start()), 1, 1);
                 assert!(receipt.ensure_current().is_ok());
                 ClickTool::pixel_ax_result_for_test(Err(error))
             },
@@ -4846,7 +4859,7 @@ mod tests {
         );
         tokio::pin!(call);
         assert!(futures_util::poll!(&mut call).is_pending());
-        sink.present(&sink.frame(sink.start()), 1, 1);
+        sink.queue_frame(&sink.frame(sink.start()), 1, 1);
         let result = call.await;
         assert_eq!(native_calls.get(), 0);
         assert!(!receipt.was_accepted());
@@ -4945,7 +4958,7 @@ mod tests {
                 while sink.pending() == 0 {
                     tokio::task::yield_now().await;
                 }
-                sink.present(&sink.frame(sink.start()), 1, 1);
+                sink.queue_frame(&sink.frame(sink.start()), 1, 1);
                 reached_rx.await.unwrap();
                 invocation.abort();
                 assert!(invocation.await.unwrap_err().is_cancelled());
@@ -5031,7 +5044,7 @@ mod tests {
             while sink.pending() == 0 {
                 tokio::task::yield_now().await;
             }
-            sink.present(&sink.frame(sink.start()), 1, 1);
+            sink.queue_frame(&sink.frame(sink.start()), 1, 1);
             started_rx.await.unwrap();
             invocation.abort();
             assert!(invocation.await.unwrap_err().is_cancelled());
@@ -5063,20 +5076,19 @@ mod tests {
         let mut receiver = inbox.register_target("quick", &event, 2).unwrap();
         assert!(receiver.try_recv().is_err());
         let candidate = TargetFrame {
-            diagnostic: confirmation_trace::Trace::default(),
             key: "quick".into(),
             event: event.clone(),
             generation: 2,
             display_id: 1,
         };
-        inbox.acknowledge_targets(1, 1, 2, &[candidate.clone()]);
+        inbox.complete_renderer_targets(1, 1, 2, &[candidate.clone()]);
         assert!(
             receiver.try_recv().is_err(),
             "obsolete surface must not acknowledge"
         );
         let mut changed = candidate.clone();
         changed.event.target = Some((21.0, 30.0));
-        inbox.acknowledge_targets(2, 1, 2, &[changed]);
+        inbox.complete_renderer_targets(2, 1, 2, &[changed]);
         assert!(receiver.try_recv().is_err());
         inbox.applied_routes.insert(
             1,
@@ -5086,7 +5098,7 @@ mod tests {
                 target_wid: event.window,
             },
         );
-        inbox.acknowledge_targets(2, 1, 2, &[candidate]);
+        inbox.complete_renderer_targets(2, 1, 2, &[candidate]);
         assert_eq!(receiver.try_recv(), Ok(Ok(())));
         assert!(inbox.target_current("quick", &event, 2).is_ok());
         inbox.begin_action("quick");
@@ -6719,7 +6731,13 @@ mod tests {
             let raised = Cell::new(0);
             let target = vec![window(10, 100, 20)];
             apply_target_ordering(
-                || current.get(),
+                || {
+                    if current.get() {
+                        OrderAuthority::Current
+                    } else {
+                        OrderAuthority::Stale
+                    }
+                },
                 || {
                     if change == "during_readback" {
                         current.set(false);

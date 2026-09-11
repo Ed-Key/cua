@@ -283,14 +283,14 @@ impl DeliveryReceipt {
             .await
             .map_err(|_| {
                 format!(
-                    "renderer did not present the click target within {} ms",
+                    "renderer did not complete the click approach within {} ms",
                     super::CLICK_PRESENTATION_TIMEOUT.as_millis()
                 )
             })?
-            .map_err(|_| "click approach cancelled, superseded, or surface invalidated")??;
+            .map_err(|_| "click approach cancelled, superseded, or display invalidated")??;
         tracing::debug!(target: "cua_cursor_approach", stage = "ack_received", id = ?event.id,
             age_ms = event.timestamp.elapsed().as_secs_f64() * 1000.0,
-            "click target submission acknowledged");
+            "renderer approach complete after target frame queued");
         guard.sink.target_current(&guard.handle.key, &event)?;
         self.0.lock().unwrap().approach = Some(Arc::downgrade(&guard));
         Ok(Some(guard))
@@ -577,7 +577,7 @@ pub(crate) trait PointerVisualSink: Send + Sync {
         Err("renderer does not support click target acknowledgement".into())
     }
     fn target_current(&self, _key: &str, _event: &VisualEvent) -> Result<(), String> {
-        Err("click target has no current presentation".into())
+        Err("click target is not renderer ready".into())
     }
     fn repin_target(&self, _key: &str, _event: &VisualEvent) -> Result<(), String> {
         Err("renderer does not support action-bound re-pin".into())

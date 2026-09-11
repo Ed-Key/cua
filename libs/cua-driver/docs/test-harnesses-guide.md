@@ -594,12 +594,16 @@ module do not replace this interactive desktop test.
 These ignored AppKit rows support the local quick-approach policy. They are not
 full-matrix or cross-platform certification. With the overlay enabled, native
 Click-family delivery intentionally waits for target-frame acknowledgement,
-with a desired 80 to 140 ms glide and up to 1000 ms for genuine presentation
-confirmation. It proceeds immediately when acknowledged, without waiting out
+with a desired 80 to 140 ms glide and a 1000 ms renderer-ready watchdog.
+The render worker must reach the exact current action target and produce and
+queue its frame before completing the receipt. It proceeds immediately when
+acknowledged, without waiting out
 the budget or waiting for the pulse. Observed travel duration is descriptive,
-not an exact wall-clock acceptance range. The 64 ms stale-frame limit and
-post-apply confirmation remain separate requirements; a larger admission budget
-does not make an old frame fresh.
+not an exact wall-clock acceptance range. The 64 ms stale-frame limit protects
+native visual delivery only.
+Applied routes, AppKit callbacks and Core Animation submission do not authorize
+input or withdraw renderer readiness. The native actuator still revalidates the
+exact live target and action ownership immediately before mutation.
 The former under-5-percent enabled/disabled latency gate is obsolete. Core
 Animation submission does not guarantee physical scanout or visibility through
 other windows. Earlier debug clips and asynchronous-playback clips remain
@@ -648,22 +652,6 @@ SHA during the build. The local installer supports `--release` and
 `--require-stable-signing`. Do not reconstruct a build transcript afterward.
 Use the existing `CUA_LOG=cua_cursor_approach=debug` setting on the candidate
 process and retain its stderr in a regular file for timing runs.
-
-For a private confirmation-failure diagnostic only, also launch with
-`CUA_PRIVATE_CONFIRMATION_TRACE=1`. The setting is read once at the first
-approach registration. Fixed-size per-action counters appear in the existing
-`released` timing record, correlated by action/session generation, surface
-generation, numeric target window and target display. They distinguish ordering
-lock contention, obsolete authority, route publication, frame submission,
-queue/pre-apply/post-apply freshness rejection, and acknowledgement refusal.
-There are no extra native reads or main-thread log writes. `FrameNativeReturned`
-means the existing contents/commit/flush calls returned, not physical scanout.
-`AckRoute` means the actual applied route did not match, even when the planned
-`route_matches` flag was true. Counts are a cleanup-time snapshot, not a complete
-ordered transcript; cancelled/replaced registrations may have no release record.
-Keep the original RPC and stderr files. This instrumentation is diagnostic,
-not a fix or normal-latency evidence. Leave it unset for timing qualification,
-and do not enable the more expensive cursor ordering trace for this probe.
 
 Set the installed candidate executable and dedicated socket explicitly:
 
@@ -915,8 +903,13 @@ samples require no approach record. Missing, rotated, mixed or incomplete logs
 fail rather than invent timing. `rpc_outside_registered_approach_ms` subtracts
 the **measured** registration-to-acknowledgement interval from the measured RPC;
 it includes resolution, native delivery, readback, restoration and transport.
-It is not a measurement of pure dispatch overhead. Submission/acknowledgement
-measurements make no physical scanout guarantee. Private debug logging remains
+It is not a measurement of pure dispatch overhead. On renderer-ready candidates,
+`submission_ms` denotes queueing the target frame in the bounded visual mailbox,
+and `acknowledgement_ms` denotes completing the renderer-ready receipt. The
+`ack_received` stage is receipt consumption. These retained field names do not
+mean native surface presentation. Earlier candidate logs retain their original
+submission semantics and must stay bound to their recorded source SHA. Neither
+measurement guarantees physical scanout. Private debug logging remains
 enabled for both timing conditions and is part of this instrumented observation.
 
 Timing success means complete descriptive data and passing unchanged background
