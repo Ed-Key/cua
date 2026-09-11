@@ -49,8 +49,8 @@ use super::reconnect::ReconnectGates;
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::semantic::{
     build_dom_index, build_layout_index, compose_accessibility_tree, parse_viewport,
-    OmissionCounts, SemanticDocument, SemanticNode, DEFAULT_SEMANTIC_NODE_BUDGET,
-    SEMANTIC_COMPUTED_STYLES,
+    snapshot_document_title, OmissionCounts, SemanticDocument, SemanticNode,
+    DEFAULT_SEMANTIC_NODE_BUDGET, SEMANTIC_COMPUTED_STYLES,
 };
 use super::store::{
     format_ref, BrowserStore, FrameIdentity, FrameKind, FrameRef, RefEntry, SemanticContinuation,
@@ -2265,6 +2265,7 @@ impl BrowserEngine {
         )
         .map_err(|error| route_err("semantic layout collection failed", error))?;
         let dom = build_dom_index(&root);
+        let title = snapshot_document_title(&layout, &root);
         let layout = build_layout_index(&layout);
         let viewport = parse_viewport(&metrics);
 
@@ -2316,6 +2317,7 @@ impl BrowserEngine {
                 result.extend(frame_document);
             }
         }
+        result.title = title;
         Ok(result)
     }
 
@@ -2558,7 +2560,7 @@ impl BrowserEngine {
             let (outcome, new_refs) = self.semantic_outcome(
                 snapshot.id,
                 snapshot.url.clone(),
-                tab.title,
+                document.title.clone().unwrap_or_default(),
                 page,
                 document.complete,
                 "continuation",
@@ -2705,6 +2707,7 @@ impl BrowserEngine {
             OopifStatus::Unsupported
         };
 
+        semantic.complete &= semantic.title.is_some();
         let page = semantic.page(
             0,
             DEFAULT_SEMANTIC_NODE_BUDGET,
