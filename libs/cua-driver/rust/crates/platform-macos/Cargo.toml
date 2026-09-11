@@ -73,5 +73,6 @@ tokio-tungstenite = { version = "0.24", features = ["native-tls"] }
 futures-util = "0.3"
 
 [dev-dependencies]
+static_assertions = "1.1"
 tokio = { workspace = true, features = ["test-util"] }
 tempfile = "3"

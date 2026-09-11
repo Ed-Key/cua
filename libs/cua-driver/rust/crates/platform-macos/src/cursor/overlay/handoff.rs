@@ -4,8 +4,9 @@ use std::sync::atomic::{AtomicPtr, Ordering};
 
 pub(super) struct Latest<T> {
     value: AtomicPtr<T>,
-    // Preserve T's Send/Sync requirements despite AtomicPtr's unconditional ones.
-    owns: PhantomData<T>,
+    // Shared access transfers ownership, so both Send and Sync require T: Send.
+    // Like Mutex, no shared reference to T is exposed, so T need not be Sync.
+    owns: PhantomData<std::sync::Mutex<T>>,
 }
 impl<T> Default for Latest<T> {
     fn default() -> Self {
@@ -49,6 +50,21 @@ impl<T> Drop for Latest<T> {
 mod tests {
     use super::*;
     use std::sync::{atomic::AtomicUsize, Arc};
+    #[test]
+    fn renderer_correction_latest_auto_traits_require_send_not_sync() {
+        use static_assertions::{assert_impl_all, assert_not_impl_any};
+        use std::cell::Cell;
+        use std::sync::MutexGuard;
+
+        assert_impl_all!(Cell<()>: Send);
+        assert_not_impl_any!(Cell<()>: Sync);
+        assert_impl_all!(Latest<Cell<()>>: Send, Sync);
+
+        assert_impl_all!(MutexGuard<'static, ()>: Sync);
+        assert_not_impl_any!(MutexGuard<'static, ()>: Send);
+        assert_not_impl_any!(Latest<MutexGuard<'static, ()>>: Send, Sync);
+    }
+
     struct Counted(usize, Arc<AtomicUsize>);
     impl Drop for Counted {
         fn drop(&mut self) {

@@ -3290,6 +3290,7 @@ dependencies = [
  "security-framework",
  "serde",
  "serde_json",
+ "static_assertions",
  "tempfile",
  "thiserror 1.0.69",
  "time",
