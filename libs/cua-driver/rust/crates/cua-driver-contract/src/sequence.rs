@@ -128,7 +128,8 @@ pub struct RunSequenceInput {
     pub pid: i64,
     #[schemars(schema_with = "positive_integer_schema")]
     pub window_id: u64,
-    /// Public lifecycle session label, shared by all child calls.
+    /// For multi-call work, prefer a short public session label and repeat it on every call that
+    /// accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

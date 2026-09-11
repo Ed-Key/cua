@@ -431,6 +431,7 @@ mod tests {
             "invoke_menu",
             "move_cursor",
             "press_key",
+            "run_sequence",
             "scroll",
             "set_window_frame",
             "type_text",
