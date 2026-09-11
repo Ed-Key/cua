@@ -4,6 +4,46 @@ This contributor guide explains where the CUA Driver tests live, how to run
 them, and where to add a new case. For current coverage and platform gaps, use
 `test-matrix.md` and `action-support.md`.
 
+## Focused sequence executor checks
+
+From `libs/cua-driver/rust`, build the driver and run the bounded executor's
+unit and protocol checks:
+
+```sh
+cargo test -p cua-driver-contract sequence --lib
+cargo test -p cua-driver-core sequence --lib
+cargo test -p cua-driver-core expectation --lib
+cargo build -p cua-driver
+CUA_TEST_DRIVER_BIN="$PWD/target/debug/cua-driver" cargo test -p cua-driver --test protocol_sequence_test
+CUA_TEST_DRIVER_BIN="$PWD/target/debug/cua-driver" cargo test -p cua-driver --test schema_consistency_test
+```
+
+If using a shared `CARGO_TARGET_DIR`, point `CUA_TEST_DRIVER_BIN` at that
+directory's built binary. The protocol rows use a temporary daemon without an
+overlay and send only invalid sequence requests. They require the driver to
+be available; a skipped startup is not passing evidence.
+
+With the AppKit fixture built and a signed, TCC-authorized candidate installed
+on macOS, run only the two sequence rows during implementation:
+
+```sh
+CUA_TEST_DRIVER_BIN=/Applications/CuaDriverLocal.app/Contents/MacOS/cua-driver-local \
+CUA_E2E_MACOS_DAEMON_SOCKET="$HOME/Library/Caches/cua-driver-local/cua-driver-local.sock" \
+CUA_TEST_REQUIRE_FIXTURES=1 CUA_REQUIRE_GUI=1 \
+cargo test -p cua-driver --test harness_appkit_test harness_appkit_sequence_counter_ -- --ignored --nocapture --test-threads=1
+```
+
+The completed row increments twice and checks the counter between actions.
+It reuses the same action token after verification to detect snapshot-cache
+invalidation. The stopped row requests an incorrect counter value after its
+first click and independently checks that the second click never happened.
+Both use the existing background focus, window-order and real-pointer oracles.
+Neither sequence returns image blocks. Retain the candidate SHA, installed
+binary identity, test output and harness results with native evidence.
+
+These are focused implementation checks. Windows/Linux native qualification
+and the complete desktop matrix retain the separate gates described below.
+
 ## The Short Version
 
 There are two main test layers:
