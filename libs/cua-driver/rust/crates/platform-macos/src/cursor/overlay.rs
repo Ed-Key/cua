@@ -45,7 +45,9 @@ use indexmap::IndexMap;
 
 use super::display_layout::{DisplayGeometry, DisplayId, DisplayLayout};
 
+mod confirmation_trace;
 mod frame_transport;
+use confirmation_trace::{Event as ConfirmationEvent, FrameStage};
 mod ordering_trace;
 
 // ── Global overlay state ──────────────────────────────────────────────────
@@ -98,6 +100,8 @@ struct ApproachRegistration {
 /// Fixed-size per-action evidence, emitted once off AppKit main at guard cleanup.
 #[derive(Debug)]
 struct ApproachTiming {
+    diagnostic: confirmation_trace::Trace,
+    display_id: Option<DisplayId>,
     started: Instant,
     first_frame_ms: Option<f64>,
     target_frame_ms: Option<f64>,
@@ -111,6 +115,8 @@ struct ApproachTiming {
 impl ApproachTiming {
     fn new() -> Self {
         Self {
+            diagnostic: confirmation_trace::Trace::configured(),
+            display_id: None,
             started: Instant::now(),
             first_frame_ms: None,
             target_frame_ms: None,
@@ -129,6 +135,7 @@ impl ApproachTiming {
 
 #[derive(Clone)]
 struct TargetFrame {
+    diagnostic: confirmation_trace::Trace,
     generation: u64,
     display_id: DisplayId,
     key: CursorKey,
@@ -282,6 +289,7 @@ impl OverlayInbox {
         targets: &[TargetFrame],
     ) {
         if generation != current_generation {
+            record_targets(targets, ConfirmationEvent::AckGeneration);
             return;
         }
         // Readiness describes the last applied frame on that surface. A later
@@ -289,12 +297,17 @@ impl OverlayInbox {
         self.invalidate_surface_frame(generation, display);
         for target in targets {
             if target.generation != generation || target.display_id != display {
+                target.diagnostic.record(ConfirmationEvent::AckSurface);
                 continue;
             }
             if !self.applied_routes.get(&display).is_some_and(|route| {
                 route.generation == generation && route.target_wid == target.event.window
-            }) || !self.visual.owns_action(&target.key, target.event.id)
-            {
+            }) {
+                target.diagnostic.record(ConfirmationEvent::AckRoute);
+                continue;
+            }
+            if !self.visual.owns_action(&target.key, target.event.id) {
+                target.diagnostic.record(ConfirmationEvent::AckOwnership);
                 continue;
             }
             if let Some(pending) = self.approaches.get_mut(&target.key) {
@@ -305,9 +318,22 @@ impl OverlayInbox {
                     pending.presented = Some((generation, display));
                     if let Some(sender) = pending.sender.take() {
                         pending.timing.acknowledgement_ms = Some(pending.timing.elapsed_ms());
-                        let _ = sender.send(Ok(()));
+                        let sent = sender.send(Ok(()));
+                        target.diagnostic.record(if sent.is_ok() {
+                            ConfirmationEvent::AckSent
+                        } else {
+                            ConfirmationEvent::AckReceiverClosed
+                        });
                     }
+                } else if pending.surface_generation != generation
+                    || !same_target(&pending.event, &target.event)
+                {
+                    target.diagnostic.record(ConfirmationEvent::AckIdentity);
+                } else {
+                    target.diagnostic.record(ConfirmationEvent::AckExpired);
                 }
+            } else {
+                target.diagnostic.record(ConfirmationEvent::AckRegistration);
             }
         }
     }
@@ -623,7 +649,7 @@ pub(crate) fn release_target(key: &str, event: &cursor_overlay::VisualEvent) {
     let released = inbox().lock().unwrap().release_target(key, event);
     if let Some(pending) = released {
         tracing::debug!(target: "cua_cursor_approach", stage = "released", id = ?event.id,
-            surface_generation = pending.surface_generation, timing = ?pending.timing,
+            surface_generation = pending.surface_generation, target_window = ?pending.event.window, timing = ?pending.timing,
             elapsed_ms = pending.timing.elapsed_ms(), "click approach frame evidence");
     }
 }
@@ -1063,6 +1089,7 @@ struct ZOrderRoute {
 
 #[derive(Clone)]
 struct OrderRequest {
+    diagnostic: confirmation_trace::Trace,
     route: ZOrderRoute,
     controller: CursorKey,
     revision: u64,
@@ -1088,6 +1115,7 @@ fn order_requests(map: &RenderMap, revision: u64) -> Vec<OrderRequest> {
                 })?
                 .clone();
             Some(OrderRequest {
+                diagnostic: confirmation_trace::Trace::default(),
                 route,
                 controller,
                 revision,
@@ -1097,20 +1125,33 @@ fn order_requests(map: &RenderMap, revision: u64) -> Vec<OrderRequest> {
 }
 
 fn reject_order_request(request: &OrderRequest) {
+    request.diagnostic.record(ConfirmationEvent::OrderRejected);
     if let Ok(mut state) = inbox().try_lock() {
         if state.revision == request.revision
             && state.applied_routes.get(&request.route.display_id) == Some(&request.route)
         {
+            request
+                .diagnostic
+                .record(ConfirmationEvent::OrderRouteInvalidated);
             state.applied_routes.remove(&request.route.display_id);
             state.invalidate_surface_frame(request.route.generation, request.route.display_id);
         }
+    } else {
+        request
+            .diagnostic
+            .record(ConfirmationEvent::OrderRejectBusy);
     }
     wake_renderer();
 }
 
 fn order_request_current(request: &OrderRequest) -> bool {
-    request.route.generation == DISPLAY_GENERATION.load(Ordering::Acquire)
-        && order_request_matches(request, &RENDER, inbox())
+    if request.route.generation != DISPLAY_GENERATION.load(Ordering::Acquire) {
+        request
+            .diagnostic
+            .record(ConfirmationEvent::OrderGeneration);
+        return false;
+    }
+    order_request_matches(request, &RENDER, inbox())
 }
 
 fn order_request_matches(
@@ -1119,20 +1160,34 @@ fn order_request_matches(
     admission: &Mutex<OverlayInbox>,
 ) -> bool {
     let Ok(render) = render.try_lock() else {
+        request
+            .diagnostic
+            .record(ConfirmationEvent::OrderBusyRender);
         return false;
     };
     let Some(map) = render.as_ref() else {
+        request
+            .diagnostic
+            .record(ConfirmationEvent::OrderMissingMap);
         return false;
     };
     let Ok(admission) = admission.try_lock() else {
+        request.diagnostic.record(ConfirmationEvent::OrderBusyInbox);
         return false;
     };
-    request.revision == admission.revision
-        && order_requests(map, admission.revision)
-            .iter()
-            .any(|current| {
-                current.route == request.route && current.controller == request.controller
-            })
+    if request.revision != admission.revision {
+        request.diagnostic.record(ConfirmationEvent::OrderRevision);
+        return false;
+    }
+    let current = order_requests(map, admission.revision)
+        .iter()
+        .any(|current| current.route == request.route && current.controller == request.controller);
+    request.diagnostic.record(if current {
+        ConfirmationEvent::OrderCurrent
+    } else {
+        ConfirmationEvent::OrderControllerRoute
+    });
+    current
 }
 
 /// Invalidate before ordering, then publish the applied route after AppKit returns.
@@ -1143,18 +1198,25 @@ fn apply_surface_route(
     route: ZOrderRoute,
     apply: impl FnOnce(),
 ) -> bool {
-    apply_surface_route_if(admission, route, || {
-        apply();
-        true
-    })
+    apply_surface_route_if(
+        admission,
+        route,
+        &confirmation_trace::Trace::default(),
+        || {
+            apply();
+            true
+        },
+    )
 }
 
 fn apply_surface_route_if(
     admission: &Mutex<OverlayInbox>,
     route: ZOrderRoute,
+    diagnostic: &confirmation_trace::Trace,
     apply: impl FnOnce() -> bool,
 ) -> bool {
     let Ok(mut state) = admission.try_lock() else {
+        diagnostic.record(ConfirmationEvent::RoutePreBusy);
         return false;
     };
     if state.applied_routes.get(&route.display_id) != Some(&route) {
@@ -1163,15 +1225,18 @@ fn apply_surface_route_if(
     }
     drop(state);
     if !apply() {
+        diagnostic.record(ConfirmationEvent::RouteApplyRejected);
         return false;
     }
     let Ok(mut state) = admission.try_lock() else {
+        diagnostic.record(ConfirmationEvent::RoutePostBusy);
         return false;
     };
     state
         .applied_routes
         .retain(|_, old| old.generation == route.generation);
     state.applied_routes.insert(route.display_id, route);
+    diagnostic.record(ConfirmationEvent::RoutePublished);
     true
 }
 
@@ -1465,7 +1530,7 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
         let render_revision = batch.revision;
 
         let (
-            z_order,
+            mut z_order,
             had_msg,
             cursor_commanded,
             hover_changed,
@@ -1533,13 +1598,20 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
 
         if frame_tick_needed || had_msg {
             repin_frames += 1;
-            let applied_routes: Vec<_> = inbox()
-                .lock()
-                .unwrap()
-                .applied_routes
-                .values()
-                .cloned()
-                .collect();
+            let applied_routes: Vec<_> = {
+                let state = inbox().lock().unwrap();
+                for request in &mut z_order {
+                    if let Some(pending) = state.approaches.get(&request.controller) {
+                        if state.revision == request.revision
+                            && pending.surface_generation == request.route.generation
+                            && pending.event.window == request.route.target_wid
+                        {
+                            request.diagnostic = pending.timing.diagnostic.clone();
+                        }
+                    }
+                }
+                state.applied_routes.values().cloned().collect()
+            };
             let routes: Vec<_> = z_order
                 .iter()
                 .map(|request| request.route.clone())
@@ -1553,6 +1625,11 @@ fn render_loop(rx: std::sync::mpsc::Receiver<MacOverlayMsg>) {
             for request in &z_order {
                 let route = &request.route;
                 let selected = updates.contains(&route);
+                request.diagnostic.record(if selected {
+                    ConfirmationEvent::OrderSelected
+                } else {
+                    ConfirmationEvent::OrderCached
+                });
                 let trace = ordering_trace::decision(
                     route,
                     applied_routes.contains(route),
@@ -1826,7 +1903,9 @@ fn target_frames(
             if ready {
                 timing.target_frame_ms.get_or_insert(elapsed);
             }
+            if ready { pending.timing.display_id = Some(display.id); }
             ready.then(|| TargetFrame {
+                diagnostic: pending.timing.diagnostic.clone(),
                 key: key.clone(),
                 event: pending.event.clone(),
                 generation: map.layout.generation,
@@ -1852,7 +1931,7 @@ fn apply_surface_frame(
         display,
         current_generation,
         targets,
-        |_| true,
+        |_, _| true,
         apply,
     )
 }
@@ -1863,16 +1942,19 @@ fn apply_surface_frame_if(
     display: DisplayId,
     current_generation: impl Fn() -> u64,
     targets: &[TargetFrame],
-    current: impl Fn(&OverlayInbox) -> bool,
+    current: impl Fn(&OverlayInbox, FrameStage) -> bool,
     apply: impl FnOnce(),
 ) -> bool {
     if generation != current_generation() {
+        record_targets(targets, ConfirmationEvent::FramePreGeneration);
         return false;
     }
     let Ok(mut state) = admission.try_lock() else {
+        record_targets(targets, ConfirmationEvent::FramePreBusy);
         return false;
     };
-    if !current(&state) {
+    if !current(&state, FrameStage::Pre) {
+        record_targets(targets, ConfirmationEvent::FramePreRejected);
         return false;
     }
     state.prepare_surface_frame(generation, display, targets);
@@ -1885,16 +1967,48 @@ fn apply_surface_frame_if(
         }
     }
     drop(state);
+    record_targets(targets, ConfirmationEvent::FrameNativeStarted);
     apply();
+    record_targets(targets, ConfirmationEvent::FrameNativeReturned);
     let Ok(mut state) = admission.try_lock() else {
+        record_targets(targets, ConfirmationEvent::FramePostBusy);
         return false;
     };
-    if !current(&state) {
+    if !current(&state, FrameStage::Post) {
+        record_targets(targets, ConfirmationEvent::FramePostRejected);
         state.invalidate_surface_frame(generation, display);
         return false;
     }
     state.acknowledge_targets(generation, display, current_generation(), targets);
+    record_targets(targets, ConfirmationEvent::FrameAckChecked);
     true
+}
+
+fn record_targets(targets: &[TargetFrame], event: ConfirmationEvent) {
+    for target in targets {
+        target.diagnostic.record(event);
+    }
+}
+
+fn frame_stamp_current(
+    stamp: frame_transport::Stamp,
+    generation: u64,
+    revision: u64,
+    now: Instant,
+    targets: &[TargetFrame],
+    stage: FrameStage,
+) -> bool {
+    let current = stamp.current(generation, revision, now);
+    if !current {
+        // Report the first failed condition in the existing predicate's order.
+        let reason = stage.rejection(
+            stamp.generation != generation,
+            stamp.revision != revision,
+            stamp.expires_at.is_some_and(|deadline| now >= deadline),
+        );
+        record_targets(targets, reason);
+    }
+    current
 }
 
 struct SurfaceFrame {
@@ -1915,6 +2029,7 @@ fn dispatch_present(
     targets: Vec<TargetFrame>,
     stamp: frame_transport::Stamp,
 ) {
+    record_targets(&targets, ConfirmationEvent::FrameQueued);
     let schedule = frames().lock().unwrap().push(
         display_id,
         SurfaceFrame {
@@ -1947,16 +2062,21 @@ fn present_frame(display_id: DisplayId, frame: SurfaceFrame) {
         targets,
         stamp,
     } = frame;
+    record_targets(&targets, ConfirmationEvent::FrameDrained);
     let current = inbox().lock().unwrap().revision;
-    if !stamp.current(
+    if !frame_stamp_current(
+        stamp,
         DISPLAY_GENERATION.load(Ordering::Acquire),
         current,
         Instant::now(),
+        &targets,
+        FrameStage::Queued,
     ) {
         wake_renderer();
         return;
     }
     let Some(cg_image_ptr) = pixmap_to_cgimage(pixmap) else {
+        record_targets(&targets, ConfirmationEvent::ImageUnavailable);
         return;
     };
     unsafe {
@@ -1980,11 +2100,14 @@ fn present_frame(display_id: DisplayId, frame: SurfaceFrame) {
                 display_id,
                 || DISPLAY_GENERATION.load(Ordering::Acquire),
                 &targets,
-                |state| {
-                    stamp.current(
+                |state, stage| {
+                    frame_stamp_current(
+                        stamp,
                         DISPLAY_GENERATION.load(Ordering::Acquire),
                         state.revision,
                         Instant::now(),
+                        &targets,
+                        stage,
                     )
                 },
                 || {
@@ -1998,6 +2121,8 @@ fn present_frame(display_id: DisplayId, frame: SurfaceFrame) {
             ) {
                 wake_renderer();
             }
+        } else {
+            record_targets(&targets, ConfirmationEvent::SurfaceMissing);
         }
         drop(host);
         ordering_trace::presented(generation, display_id);
@@ -2039,6 +2164,7 @@ fn dispatch_order_front(request: OrderRequest, trace: Option<ordering_trace::Tra
                     display_id,
                     target_wid: None,
                 },
+                &request.diagnostic,
                 || {
                     if !order_request_current(&request) {
                         return false;
@@ -2057,14 +2183,17 @@ fn dispatch_order_front(request: OrderRequest, trace: Option<ordering_trace::Tra
             if !applied {
                 reject_order_request(&request);
             }
-        } else if let Some(trace) = &trace {
-            trace.event(
-                "surface_rejected",
-                serde_json::json!({
-                    "host_generation": host.as_ref().map(|host| host.generation),
-                    "reason": "missing_surface_or_stale_generation",
-                }),
-            );
+        } else {
+            request.diagnostic.record(ConfirmationEvent::SurfaceMissing);
+            if let Some(trace) = &trace {
+                trace.event(
+                    "surface_rejected",
+                    serde_json::json!({
+                        "host_generation": host.as_ref().map(|host| host.generation),
+                        "reason": "missing_surface_or_stale_generation",
+                    }),
+                );
+            }
         }
         drop(host);
         if let Some(trace) = trace {
@@ -2156,6 +2285,7 @@ fn dispatch_pin_above(request: OrderRequest, trace: Option<ordering_trace::Trace
                     display_id,
                     target_wid: Some(target_wid),
                 },
+                &request.diagnostic,
                 || {
                     apply_target_ordering(
                         || order_request_current(&request),
@@ -2202,14 +2332,17 @@ fn dispatch_pin_above(request: OrderRequest, trace: Option<ordering_trace::Trace
             if !applied {
                 reject_order_request(&request);
             }
-        } else if let Some(trace) = &trace {
-            trace.event(
-                "surface_rejected",
-                serde_json::json!({
-                    "host_generation": host.as_ref().map(|host| host.generation),
-                    "reason": "missing_surface_or_stale_generation",
-                }),
-            );
+        } else {
+            request.diagnostic.record(ConfirmationEvent::SurfaceMissing);
+            if let Some(trace) = &trace {
+                trace.event(
+                    "surface_rejected",
+                    serde_json::json!({
+                        "host_generation": host.as_ref().map(|host| host.generation),
+                        "reason": "missing_surface_or_stale_generation",
+                    }),
+                );
+            }
         }
         drop(host);
         if let Some(trace) = trace {
@@ -3185,6 +3318,343 @@ mod tests {
     }
 
     #[test]
+    fn confirmation_trace_distinguishes_order_contention_from_obsolete_authority() {
+        use confirmation_trace::Event as E;
+        let mut admission = OverlayInbox::default();
+        let mut map = empty_map();
+        map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
+        let id = admission.begin_action("one").unwrap();
+        admission.publish(
+            "one",
+            mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
+        );
+        admission.take().apply(&mut map, Instant::now());
+        let mut request = order_requests(&map, admission.revision).pop().unwrap();
+        request.diagnostic = confirmation_trace::Trace::new(true);
+        let render = Mutex::new(Some(map));
+        let inbox = Mutex::new(admission);
+        {
+            let _paint = render.lock().unwrap();
+            assert!(!order_request_matches(&request, &render, &inbox));
+        }
+        {
+            let _producer = inbox.lock().unwrap();
+            assert!(!order_request_matches(&request, &render, &inbox));
+        }
+        assert!(order_request_matches(&request, &render, &inbox));
+        inbox.lock().unwrap().begin_action("one");
+        assert!(!order_request_matches(&request, &render, &inbox));
+        request.revision = inbox.lock().unwrap().revision;
+        request.controller = "unrelated".into();
+        assert!(!order_request_matches(&request, &render, &inbox));
+        assert_eq!(request.diagnostic.count(E::OrderBusyRender), 1);
+        assert_eq!(request.diagnostic.count(E::OrderBusyInbox), 1);
+        assert_eq!(request.diagnostic.count(E::OrderRevision), 1);
+        assert_eq!(request.diagnostic.count(E::OrderControllerRoute), 1);
+        assert_eq!(request.diagnostic.count(E::OrderCurrent), 1);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn confirmation_trace_separates_submission_route_and_ack_refusals() {
+        use confirmation_trace::Event as E;
+        let mut state = OverlayInbox::default();
+        let id = state
+            .begin_action("private-session-must-not-be-logged")
+            .unwrap();
+        let event = mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent);
+        let key = "private-session-must-not-be-logged";
+        state.publish(key, event.clone());
+        let mut receiver = state.register_target(key, &event, 1).unwrap();
+        let diagnostic = confirmation_trace::Trace::new(true);
+        state.approaches.get_mut(key).unwrap().timing.diagnostic = diagnostic.clone();
+        let targets = [TargetFrame {
+            generation: 1,
+            display_id: 1,
+            key: key.into(),
+            event: event.clone(),
+            diagnostic: diagnostic.clone(),
+        }];
+        let inbox = Mutex::new(state);
+        {
+            let _producer = inbox.lock().unwrap();
+            assert!(!apply_surface_frame_if(
+                &inbox,
+                1,
+                1,
+                || 1,
+                &targets,
+                |_, _| true,
+                || panic!("pre-admission refusal must not submit")
+            ));
+        }
+        let held = std::cell::RefCell::new(None);
+        assert!(!apply_surface_frame_if(
+            &inbox,
+            1,
+            1,
+            || 1,
+            &targets,
+            |_, _| true,
+            || {
+                *held.borrow_mut() = Some(inbox.lock().unwrap());
+            }
+        ));
+        held.borrow_mut().take();
+        let checks = std::cell::Cell::new(0);
+        assert!(!apply_surface_frame_if(
+            &inbox,
+            1,
+            1,
+            || 1,
+            &targets,
+            |_, _| {
+                let n = checks.get();
+                checks.set(n + 1);
+                n == 0
+            },
+            || {}
+        ));
+        assert!(apply_surface_frame_if(
+            &inbox,
+            1,
+            1,
+            || 1,
+            &targets,
+            |_, _| true,
+            || {}
+        ));
+        assert!(
+            receiver.try_recv().is_err(),
+            "native submission without an applied route is not acknowledgement"
+        );
+        assert_eq!(diagnostic.count(E::FramePreBusy), 1);
+        assert_eq!(diagnostic.count(E::FramePostBusy), 1);
+        assert_eq!(diagnostic.count(E::FramePostRejected), 1);
+        assert_eq!(diagnostic.count(E::FrameNativeReturned), 3);
+        assert_eq!(diagnostic.count(E::AckRoute), 1);
+        let route = ZOrderRoute {
+            generation: 1,
+            display_id: 1,
+            target_wid: event.window,
+        };
+        assert!(apply_surface_route_if(&inbox, route, &diagnostic, || true));
+        tokio::time::advance(crate::cursor::CLICK_PRESENTATION_TIMEOUT).await;
+        assert!(apply_surface_frame_if(
+            &inbox,
+            1,
+            1,
+            || 1,
+            &targets,
+            |_, _| true,
+            || {}
+        ));
+        assert!(receiver.try_recv().is_err());
+        assert_eq!(diagnostic.count(E::AckExpired), 1);
+        inbox.lock().unwrap().begin_action(key);
+        assert!(apply_surface_frame_if(
+            &inbox,
+            1,
+            1,
+            || 1,
+            &targets,
+            |_, _| true,
+            || {}
+        ));
+        assert_eq!(diagnostic.count(E::AckOwnership), 1);
+        assert_eq!(diagnostic.count(E::AckSent), 0);
+        assert!(!format!("{diagnostic:?}").contains(key));
+    }
+
+    #[test]
+    fn confirmation_trace_separates_route_publication_contention() {
+        use confirmation_trace::Event as E;
+        let diagnostic = confirmation_trace::Trace::new(true);
+        let inbox = Mutex::new(OverlayInbox::default());
+        let route = ZOrderRoute {
+            generation: 1,
+            display_id: 1,
+            target_wid: Some(42),
+        };
+        {
+            let _producer = inbox.lock().unwrap();
+            assert!(!apply_surface_route_if(
+                &inbox,
+                route.clone(),
+                &diagnostic,
+                || panic!("busy admission must not order")
+            ));
+        }
+        let held = std::cell::RefCell::new(None);
+        assert!(!apply_surface_route_if(
+            &inbox,
+            route.clone(),
+            &diagnostic,
+            || {
+                *held.borrow_mut() = Some(inbox.lock().unwrap());
+                true
+            }
+        ));
+        held.borrow_mut().take();
+        assert!(inbox.lock().unwrap().applied_routes.is_empty());
+        assert!(!apply_surface_route_if(
+            &inbox,
+            route.clone(),
+            &diagnostic,
+            || false
+        ));
+        assert!(apply_surface_route_if(&inbox, route, &diagnostic, || true));
+        assert_eq!(diagnostic.count(E::RoutePreBusy), 1);
+        assert_eq!(diagnostic.count(E::RoutePostBusy), 1);
+        assert_eq!(diagnostic.count(E::RouteApplyRejected), 1);
+        assert_eq!(diagnostic.count(E::RoutePublished), 1);
+    }
+
+    #[test]
+    fn confirmation_trace_preserves_real_ack_and_isolates_replaced_actions() {
+        use confirmation_trace::Event as E;
+        for enabled in [false, true] {
+            let mut state = OverlayInbox::default();
+            let mut map = empty_map();
+            map.template.reduced_motion = cursor_overlay::ReducedMotion::On;
+            let id = state.begin_action("one").unwrap();
+            let event = mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent);
+            state.publish("one", event.clone());
+            let mut receiver = state.register_target("one", &event, 1).unwrap();
+            let diagnostic = confirmation_trace::Trace::new(enabled);
+            state.approaches.get_mut("one").unwrap().timing.diagnostic = diagnostic.clone();
+            state.take().apply(&mut map, event.timestamp);
+            let targets = target_frames(&map, map.layout.displays[0], &mut state);
+            assert_eq!(targets.len(), 1);
+            let inbox = Mutex::new(state);
+            assert!(apply_surface_route_if(
+                &inbox,
+                z_order_routes(&map).pop().unwrap(),
+                &diagnostic,
+                || true
+            ));
+            assert!(apply_surface_frame_if(
+                &inbox,
+                1,
+                1,
+                || 1,
+                &targets,
+                |_, _| true,
+                || {}
+            ));
+            assert_eq!(receiver.try_recv(), Ok(Ok(())));
+            assert!(inbox
+                .lock()
+                .unwrap()
+                .target_current("one", &event, 1)
+                .is_ok());
+            assert_eq!(diagnostic.count(E::AckSent), u64::from(enabled));
+            let next = {
+                let mut state = inbox.lock().unwrap();
+                let id = state.begin_action("one").unwrap();
+                let next = mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent);
+                state.publish("one", next.clone());
+                next
+            };
+            let mut next_receiver = inbox
+                .lock()
+                .unwrap()
+                .register_target("one", &next, 1)
+                .unwrap();
+            assert!(apply_surface_frame_if(
+                &inbox,
+                1,
+                1,
+                || 1,
+                &targets,
+                |_, _| true,
+                || {}
+            ));
+            assert!(
+                next_receiver.try_recv().is_err(),
+                "old frame cannot acknowledge the replacement action"
+            );
+            assert_eq!(diagnostic.count(E::AckOwnership), u64::from(enabled));
+            inbox.lock().unwrap().release_target("one", &next);
+            assert!(inbox.lock().unwrap().approaches.is_empty());
+        }
+    }
+
+    #[test]
+    fn confirmation_trace_stamp_reasons_preserve_exact_freshness_policy() {
+        use confirmation_trace::Event as E;
+        let diagnostic = confirmation_trace::Trace::new(true);
+        let start = Instant::now();
+        let mut state = OverlayInbox::default();
+        let id = state.begin_action("one").unwrap();
+        let targets = [TargetFrame {
+            generation: 1,
+            display_id: 1,
+            key: "one".into(),
+            event: mailbox_event(id, 80.0, cursor_overlay::VisualPhase::Intent),
+            diagnostic: diagnostic.clone(),
+        }];
+        let stamp = frame_transport::Stamp {
+            generation: 1,
+            revision: 2,
+            painted_at: start,
+            expires_at: None,
+        };
+        for (stage, reasons) in [
+            (
+                FrameStage::Queued,
+                [
+                    E::StampQueuedGeneration,
+                    E::StampQueuedRevision,
+                    E::StampQueuedAge,
+                    E::StampQueuedPulse,
+                ],
+            ),
+            (
+                FrameStage::Pre,
+                [
+                    E::StampPreGeneration,
+                    E::StampPreRevision,
+                    E::StampPreAge,
+                    E::StampPrePulse,
+                ],
+            ),
+            (
+                FrameStage::Post,
+                [
+                    E::StampPostGeneration,
+                    E::StampPostRevision,
+                    E::StampPostAge,
+                    E::StampPostPulse,
+                ],
+            ),
+        ] {
+            assert!(frame_stamp_current(stamp, 1, 2, start, &targets, stage));
+            assert!(!frame_stamp_current(stamp, 2, 2, start, &targets, stage));
+            assert!(!frame_stamp_current(stamp, 1, 3, start, &targets, stage));
+            assert!(!frame_stamp_current(
+                stamp,
+                1,
+                2,
+                start + frame_transport::MAX_FRAME_AGE,
+                &targets,
+                stage
+            ));
+            let expired = frame_transport::Stamp {
+                expires_at: Some(start),
+                ..stamp
+            };
+            assert!(!frame_stamp_current(expired, 1, 2, start, &targets, stage));
+            for reason in reasons {
+                assert_eq!(diagnostic.count(reason), 1);
+            }
+        }
+        let disabled = confirmation_trace::Trace::new(false);
+        disabled.record(E::AckSent);
+        assert_eq!(disabled.count(E::AckSent), 0);
+        assert_eq!(format!("{disabled:?}"), "disabled");
+    }
+
+    #[test]
     fn correction_order_request_rejects_same_route_new_controller_and_pending_publication() {
         let mut admission = OverlayInbox::default();
         let mut map = empty_map();
@@ -3257,7 +3727,7 @@ mod tests {
             1,
             || 1,
             &[],
-            |state| stamp.current(1, state.revision, start + Duration::from_millis(151)),
+            |state, _| stamp.current(1, state.revision, start + Duration::from_millis(151)),
             || panic!("expired pulse reached native contents")
         ));
     }
@@ -3310,7 +3780,7 @@ mod tests {
                 1,
                 || generation,
                 &[],
-                |state| old.current(generation, state.revision, clock),
+                |state, _| old.current(generation, state.revision, clock),
                 || submissions.set(submissions.get() + 1)
             ));
             assert_eq!(
@@ -3330,7 +3800,7 @@ mod tests {
                 1,
                 || generation,
                 &[],
-                |state| fresh.current(generation, state.revision, clock),
+                |state, _| fresh.current(generation, state.revision, clock),
                 || submissions.set(submissions.get() + 1)
             ));
             assert_eq!(submissions.get(), 1, "latest clear must remain submitable");
@@ -4593,6 +5063,7 @@ mod tests {
         let mut receiver = inbox.register_target("quick", &event, 2).unwrap();
         assert!(receiver.try_recv().is_err());
         let candidate = TargetFrame {
+            diagnostic: confirmation_trace::Trace::default(),
             key: "quick".into(),
             event: event.clone(),
             generation: 2,

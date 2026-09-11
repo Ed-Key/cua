@@ -649,6 +649,22 @@ SHA during the build. The local installer supports `--release` and
 Use the existing `CUA_LOG=cua_cursor_approach=debug` setting on the candidate
 process and retain its stderr in a regular file for timing runs.
 
+For a private confirmation-failure diagnostic only, also launch with
+`CUA_PRIVATE_CONFIRMATION_TRACE=1`. The setting is read once at the first
+approach registration. Fixed-size per-action counters appear in the existing
+`released` timing record, correlated by action/session generation, surface
+generation, numeric target window and target display. They distinguish ordering
+lock contention, obsolete authority, route publication, frame submission,
+queue/pre-apply/post-apply freshness rejection, and acknowledgement refusal.
+There are no extra native reads or main-thread log writes. `FrameNativeReturned`
+means the existing contents/commit/flush calls returned, not physical scanout.
+`AckRoute` means the actual applied route did not match, even when the planned
+`route_matches` flag was true. Counts are a cleanup-time snapshot, not a complete
+ordered transcript; cancelled/replaced registrations may have no release record.
+Keep the original RPC and stderr files. This instrumentation is diagnostic,
+not a fix or normal-latency evidence. Leave it unset for timing qualification,
+and do not enable the more expensive cursor ordering trace for this probe.
+
 Set the installed candidate executable and dedicated socket explicitly:
 
 ```sh
