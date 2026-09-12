@@ -300,6 +300,21 @@ surface that only accepts events while frontmost (the canvas/viewport/game
 case below). Unmodified element-indexed (AX) actions remain background-capable
 and hold the no-foreground contract without the flag.
 
+For Electron message lists, background `scroll` can use the existing native
+wheel route when addressed with pixels. AX-addressed and untargeted Electron
+background scroll remain refused. Choose a point inside the message pane from a fresh window
+screenshot and pass `window_id`, `x`, and `y` in that screenshot's pixels. A
+missing or 1-by-1 accessibility frame is not a usable wheel target. Do not click
+the composer merely to prepare a scroll.
+
+An accepted wheel request returns `effect:"unverifiable"`. Read fresh message
+identities or visible text to confirm progress, preferably with a bounded
+`get_window_state` query. Some Electron renderers pause scrolling while covered;
+unchanged history is not success. After a bounded verification attempt, report
+that limit or use an already prepared exact browser connection when its DOM
+scroll route is appropriate. Do not silently activate the app, restart it with
+debugging enabled, or repeat the same ineffective scroll indefinitely.
+
 Modified clicks are the deliberate exception: pass
 `delivery_mode:"foreground"` and a concrete `window_id`. macOS applications
 can discard PID-routed modifier state after initially publishing a transient

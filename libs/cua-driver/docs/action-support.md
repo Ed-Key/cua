@@ -61,6 +61,18 @@ integrity-level harness can exercise it.
 
 ## Native macOS
 
+Local macOS scroll correction: Electron pixel-targeted scrolling is no longer
+rejected solely by runtime identity. The existing guarded native wheel route
+can be attempted and returns `effect:"unverifiable"`; it does not promise a renderer update. The
+focused `macos_electron_scroll` tests prove visible/unfocused virtualized-list
+movement and covered-window dispatch isolation separately. Covered Electron
+renderers can still stall. This does not certify full-occlusion scroll delivery.
+The historical shared-matrix table above predates this correction. Its
+Electron background PX-scroll refusal row needs recertification before release;
+the old exact-refusal expectation is not evidence for the new behavior.
+AX-addressed and untargeted Electron background scroll remain explicitly refused.
+Windows and Linux behavior is unchanged.
+
 | Harness | Proven contracts | Refusals and gaps |
 | --- | --- | --- |
 | AppKit | AX tree/capture; AX background left click, set value, and type text; PX background left/right/double click; PX foreground right/double click and slider drag; AX foreground/background scroll; desktop PX foreground left click | PX background slider drag returns exact `background_unavailable`. Native press key, hotkey, AX-addressed right/double click, and broader control combinations remain unproven. |

@@ -1017,6 +1017,11 @@ fn command_for_browser(
     _force_high_device_scale: bool,
 ) -> Command {
     let mut command = Command::new(&spec.executable);
+    if spec.name == "electron" {
+        command
+            .env("CUA_ELECTRON_CDP_PORT", cdp_port.to_string())
+            .env("CUA_E2E_USER_DATA_DIR", profile);
+    }
     let output = browser_stderr();
     #[cfg(any(target_os = "windows", target_os = "linux"))]
     let window_size = if _force_high_device_scale {
@@ -1194,9 +1199,10 @@ fn wait_for_fixture_window(
                     window["window_id"]
                         .as_u64()
                         .is_some_and(|id| !before.contains(&id))
-                        && window["title"]
-                            .as_str()
-                            .is_some_and(|title| title.contains("cua-driver Web Harness"))
+                        && window["title"].as_str().is_some_and(|title| {
+                            title.contains("cua-driver Web Harness")
+                                || title.starts_with("CuaTestHarness Electron [cdp=")
+                        })
                 })
             })
         {
@@ -5416,3 +5422,7 @@ fn standalone_browser_first_native_snapshot_contains_page() {
         });
     });
 }
+
+#[cfg(target_os = "macos")]
+#[path = "support/macos_electron_scroll.rs"]
+mod macos_electron_scroll;
