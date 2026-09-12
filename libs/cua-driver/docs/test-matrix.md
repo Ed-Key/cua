@@ -221,3 +221,35 @@ When a new action or modality is added, update this document, the shared fixture
 oracle, the Rust test, and the OS-specific runner selection together. This is
 the cross-OS checklist that prevents a Windows-only test from being mistaken
 for cross-platform coverage.
+
+## macOS named accessibility groups
+
+`standalone_browser_behavior_test::standalone_browser_native_named_groups` is
+an optional macOS Chromium regression. It verifies that a `Save` query retains
+named `AXGroup` ancestors, that each duplicate Save has the correct structured
+`parent_index`, and that anonymous wrappers do not add depth. Both section
+orders are exercised. Only Billing is clicked, once, and the fixture journal
+must report Billing = 1 and Profile = 0. This row explicitly brings the isolated
+fixture forward and uses foreground accessibility delivery. It certifies target
+selection and receiver state, not background delivery.
+
+A separate local diagnostic with the existing foreground sentinel preserved
+these group relationships but an accepted AXPress did not advance either
+counter while the Chrome fixture was covered. That background-delivery gap is
+unresolved; the grouping change must not be represented as fixing it.
+
+The macOS walker preserves groups and scroll areas with a nonblank AXTitle or
+AXDescription. Empty wrappers still collapse. Existing addressability rules
+remain in force: display-only groups appear in markdown; only addressable
+nodes appear in `elements`, whose `parent_index` names the nearest addressable
+ancestor. This change does not invent clickable targets for display-only groups.
+Windows and Linux adapters are unchanged and are not certified by this row.
+
+Focused run from `libs/cua-driver/rust`, with the authorized daemon and staged
+browser environment configured as described in the test harness guide:
+
+```sh
+CUA_E2E_BROWSER_PRODUCTS=chrome CUA_TEST_REQUIRE_EXTERNAL_BROWSERS=1 cargo test -p cua-driver --test standalone_browser_behavior_test standalone_browser_native_named_groups -- --ignored --nocapture
+```
+
+This focused regression does not replace the full candidate desktop certification.
