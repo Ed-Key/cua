@@ -150,6 +150,7 @@ mod tests {
     // so CFGetRetainCount is reliable.
     fn node_with_ptr(ptr: usize) -> AXNode {
         AXNode {
+            url: None,
             element_index: Some(0),
             role: String::new(),
             title: None,

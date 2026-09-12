@@ -158,6 +158,35 @@ pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) ->
         && settable != 0
 }
 
+/// Convert a borrowed URL attribute without changing control-value coercion.
+unsafe fn coerce_url_value(value: CFTypeRef) -> Option<String> {
+    use core_foundation::url::CFURL;
+    if value.is_null() || core_foundation::base::CFGetTypeID(value) != CFURL::type_id() {
+        return None;
+    }
+    let url = CFURL::wrap_under_get_rule(value as _)
+        .absolute()
+        .get_string()
+        .to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+/// Read the dedicated AXURL attribute, whose documented type is CFURLRef.
+///
+/// # Safety
+/// `element` must be a valid, live AXUIElementRef for the duration of the call.
+pub unsafe fn copy_url_attr(element: AXUIElementRef) -> Option<String> {
+    let attr = CFStr::new("AXURL");
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    let url = coerce_url_value(value);
+    CFRelease(value);
+    url
+}
+
 /// Copy a string attribute from an AX element. Returns `None` on any error.
 ///
 /// # Safety
@@ -843,6 +872,27 @@ mod tests {
                 "unexpected binary state for {value:?}"
             );
         }
+    }
+
+    #[test]
+    fn link_url_attribute_decodes_cfurl_without_changing_values() {
+        use core_foundation::url::{CFURLCreateWithString, CFURL};
+        let text = CFStr::new("https://example.test/book?q=a%20b#slot");
+        let raw = unsafe {
+            CFURLCreateWithString(
+                std::ptr::null(),
+                text.as_concrete_TypeRef(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!raw.is_null());
+        let url = unsafe { CFURL::wrap_under_create_rule(raw) };
+        assert_eq!(
+            unsafe { coerce_url_value(url.as_CFTypeRef()) }.as_deref(),
+            Some("https://example.test/book?q=a%20b#slot")
+        );
+        assert!(unsafe { coerce_stringish_value(url.as_CFTypeRef()) }.is_none());
+        assert!(unsafe { coerce_url_value(CFNumber::from(8).as_CFTypeRef()) }.is_none());
     }
 
     #[test]

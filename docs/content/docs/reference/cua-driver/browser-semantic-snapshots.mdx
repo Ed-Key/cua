@@ -85,6 +85,32 @@ root. It is an empty string when that title is empty or unavailable, rather
 than a cached title from an earlier page or the title of an embedded frame.
 Continuations retain the title captured for their snapshot.
 
+## Link destinations
+
+Semantic `refs` and `content_refs` include an optional `url` when the browser
+exposes a link destination. The semantic outline includes the same destination
+as `[url="..."]`. The link's `name` and `value` keep their existing meanings.
+For example:
+
+```json
+{"role":"link","name":"Book a court","value":null,"url":"https://example.test/book"}
+```
+
+The driver prefers the browser's resolved accessibility URL and falls back to
+an anchor's DOM `href`, resolving relative references against that containing
+document's reported base URL. A frame without a known base cannot borrow the
+parent frame's URL. Missing or unresolvable destinations omit `url`; they do
+not become invented URLs. Destinations are preserved separately from display
+text normalization and truncation. Reading a URL does not authorize visiting it.
+
+This browser behavior lives in the shared core used by desktop adapters.
+Separately, macOS `get_window_state` exposes `url` on structured `AXLink`
+elements using the app's `AXURL` attribute. Its legacy `tree_markdown` stays
+unchanged. Native Windows and Linux accessibility URL collection is not
+implemented by this change; do not assume an omitted native URL means the
+link has no destination. The browser semantic path remains available on
+supported Chromium endpoints on those platforms.
+
 ## Action refs
 
 Entries in `refs` declare their supported action kinds:

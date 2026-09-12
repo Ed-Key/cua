@@ -866,6 +866,9 @@ pub(crate) fn build_elements_array_with_token(
                 entry["element_token"] =
                     serde_json::json!(cua_driver_core::element_token::token_for(sid, idx));
             }
+            if let Some(url) = &node.url {
+                entry["url"] = serde_json::json!(url);
+            }
             if let Some(label) = label {
                 entry["label"] = serde_json::Value::String(label);
             }
@@ -1127,6 +1130,7 @@ mod tests {
         actions: Vec<String>,
     ) -> AXNode {
         AXNode {
+            url: None,
             element_index: idx,
             role: role.into(),
             title: title.map(|s| s.to_string()),
@@ -1147,6 +1151,37 @@ mod tests {
             selected: None,
             in_web_content: false,
         }
+    }
+
+    #[test]
+    fn link_url_is_serialized_without_replacing_label_or_value() {
+        let mut link = node(
+            Some(0),
+            "AXLink",
+            Some("Book"),
+            0,
+            None,
+            None,
+            vec!["AXPress".into()],
+        );
+        link.url = Some("https://example.test/book".into());
+        let entry = &build_elements_array_with_token(&[link], None)[0];
+        assert_eq!(entry["url"], "https://example.test/book");
+        assert_eq!(entry["label"], "Book");
+        assert!(entry.get("value").is_none());
+        let mut field = node(
+            Some(1),
+            "AXTextField",
+            Some("Search"),
+            0,
+            None,
+            None,
+            vec![],
+        );
+        field.value = Some("pickleball".into());
+        let entry = &build_elements_array_with_token(&[field], None)[0];
+        assert_eq!(entry["value"], "pickleball");
+        assert!(entry.get("url").is_none());
     }
 
     #[test]

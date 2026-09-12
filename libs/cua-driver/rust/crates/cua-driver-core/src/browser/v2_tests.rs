@@ -57,6 +57,7 @@ struct FixtureState {
     completed_key_pairs: usize,
     semantic_large_page: bool,
     semantic_title: Option<String>,
+    semantic_link_urls: bool,
     semantic_main_root_present: bool,
     semantic_full_dom_fails: bool,
     semantic_full_dom_times_out: bool,
@@ -85,6 +86,7 @@ impl Default for FixtureState {
             completed_key_pairs: 0,
             semantic_large_page: false,
             semantic_title: Some("Fixture inbox".into()),
+            semantic_link_urls: false,
             semantic_main_root_present: true,
             semantic_full_dom_fails: false,
             semantic_full_dom_times_out: false,
@@ -507,6 +509,16 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                             nodes[0]["name"] = json!({"value": title});
                         } else {
                             nodes[0].as_object_mut().unwrap().remove("name");
+                        }
+                    }
+                    if st.semantic_link_urls {
+                        for node in tree["nodes"].as_array_mut().unwrap() {
+                            if node["name"]["value"] == "Reply"
+                                || node["name"]["value"] == "Archive item 304"
+                            {
+                                node["role"] = json!({"value":"link"});
+                                node["properties"] = json!([{"name":"url","value":{"type":"string","value":"https://example.test/book?slot=1#court"}}]);
+                            }
                         }
                     }
                     MockReply::ok(tree)
@@ -2498,4 +2510,40 @@ async fn keystrokes_use_char_events_for_text_delivery() {
     }));
     assert!(recorded_calls(&f, "Page.bringToFront").is_empty());
     assert!(recorded_calls(&f, "Target.activateTarget").is_empty());
+}
+
+#[tokio::test]
+async fn semantic_link_urls_reach_query_and_continuation_outputs() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.semantic_link_urls = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = first["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Reply")
+        .unwrap();
+    assert_eq!(reply["url"], "https://example.test/book?slot=1#court");
+    assert!(reply["value"].is_null());
+    let token = first["snapshot"]["continuation"].as_str().unwrap();
+    let continued = semantic_snapshot_with(&f, &target, &tab, json!({"continuation":token})).await;
+    let archive = continued["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Archive item 304")
+        .unwrap();
+    assert_eq!(archive["url"], "https://example.test/book?slot=1#court");
+    let queried = semantic_snapshot_with(&f, &target, &tab, json!({"query":"Reply"})).await;
+    let reply = queried["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Reply")
+        .unwrap();
+    assert_eq!(reply["url"], "https://example.test/book?slot=1#court");
 }
