@@ -240,9 +240,22 @@ impl Tool for ScrollTool {
         // background CGEvents). Only the pixel-wheel path honors it; the
         // keystroke path is background-by-design and untouched.
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
-        if !delivery_mode.is_foreground() && crate::browser::ElectronJs::is_electron(pid) {
+        // Covered Electron renderers vary: some process wheel input, while
+        // others defer it. Admit only the exact pixel route demonstrated to
+        // work, retaining the existing refusal for AX and untargeted keys.
+        // Element addressing takes precedence over x/y later in this method.
+        let explicit_pixel_target = args.opt_u64("window_id").is_some()
+            && args.opt_f64("x").is_some()
+            && args.opt_f64("y").is_some()
+            && args.opt_u64("element_index").is_none()
+            && args.opt_str("element_token").is_none();
+        if !delivery_mode.is_foreground()
+            && !explicit_pixel_target
+            && crate::browser::ElectronJs::is_electron(pid)
+        {
             return ToolResult::error(
-                "Background scroll is unavailable for Electron/Chromium windows on macOS."
+                "Background Electron scroll requires window_id and window-local screenshot \
+                 x,y without an element target. AX and untargeted scrolling remain unavailable."
                     .to_owned(),
             )
             .with_structured(serde_json::json!({ "code": "background_unavailable" }));
@@ -673,7 +686,7 @@ impl Tool for ScrollTool {
                 Ok(Ok(())) => ToolResult::text(format!(
                     "✅ Sent {direction} scroll by {by} × {amount} via pixel wheel at \
                      ({screen_x:.0}, {screen_y:.0}){mode_label} (background CGEvent; not \
-                     driver-verified — confirm via screenshot).{}",
+                     driver-verified; confirm via fresh state or screenshot).{}",
                     changes.result_suffix()
                 ))
                 .with_structured(serde_json::json!({
@@ -783,7 +796,7 @@ impl Tool for ScrollTool {
         match result {
             Ok(Ok(())) => ToolResult::text(format!(
                 "✅ Sent {direction} scroll by {by} × {amount} via keystroke \
-                 (background; not driver-verified — confirm via screenshot).{}",
+                 (background; not driver-verified; confirm via fresh state or screenshot).{}",
                 changes.result_suffix()
             ))
             .with_structured(serde_json::json!({ "path": "key_events", "verified": false })),
