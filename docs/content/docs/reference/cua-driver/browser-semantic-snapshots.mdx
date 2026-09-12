@@ -80,6 +80,11 @@ behind the output budget. A non-null continuation identifies that remaining
 state. Known oversized-DOM fallback produces a partial snapshot with
 `complete: false`; unrelated transport failures remain errors.
 
+`page.title` comes from the freshly collected main document accessibility
+root. It is an empty string when that title is empty or unavailable, rather
+than a cached title from an earlier page or the title of an embedded frame.
+Continuations retain the title captured for their snapshot.
+
 ## Action refs
 
 Entries in `refs` declare their supported action kinds:

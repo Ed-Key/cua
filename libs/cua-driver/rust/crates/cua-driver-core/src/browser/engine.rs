@@ -2629,7 +2629,8 @@ impl BrowserEngine {
             .collect_semantic_session(&conn, &cdp_session, &document, local_tree.as_ref(), None)
             .await?;
         semantic.complete &= document_complete;
-        let title = semantic.document_title().unwrap_or(&tab.title).to_owned();
+        // A missing current title must not revive an earlier document's title.
+        let title = semantic.document_title().unwrap_or_default().to_owned();
 
         let oopif = if local_tree.is_some() {
             match self.attached_iframe_children(&conn, &cdp_session).await {
