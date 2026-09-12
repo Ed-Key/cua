@@ -48,6 +48,8 @@ unsafe fn set_messaging_timeout(element: AXUIElementRef) {
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
+    /// Link destination, separate from AXValue.
+    pub url: Option<String>,
     /// 0-based index (Some = actionable, None = non-actionable display-only node)
     pub element_index: Option<usize>,
     pub role: String,
@@ -584,6 +586,11 @@ unsafe fn walk_element(
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
         AXNode {
+            url: if role == "AXLink" {
+                copy_url_attr(element)
+            } else {
+                None
+            },
             element_index: Some(idx),
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -619,6 +626,11 @@ unsafe fn walk_element(
         }
     } else {
         AXNode {
+            url: if role == "AXLink" {
+                copy_url_attr(element)
+            } else {
+                None
+            },
             element_index: None,
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -900,6 +912,7 @@ mod tests {
             depth: 0,
             parent_element_index: None,
             parent_position: None,
+            url: None,
             frame: None,
             value_state: None,
             value_description: None,
@@ -955,6 +968,7 @@ mod tests {
             depth,
             parent_element_index: None,
             parent_position: parent,
+            url: None,
             frame: None,
             value_state: None,
             value_description: None,

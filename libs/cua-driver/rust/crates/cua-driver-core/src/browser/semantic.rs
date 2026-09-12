@@ -76,6 +76,7 @@ impl Rect {
 
 #[derive(Debug, Clone, Default)]
 struct DomMeta {
+    base_url: Option<String>,
     tag: String,
     attrs: HashMap<String, String>,
     order: usize,
@@ -118,6 +119,7 @@ pub(crate) struct SemanticNode {
     pub(crate) role: String,
     pub(crate) name: Option<String>,
     pub(crate) value: Option<String>,
+    pub(crate) url: Option<String>,
     pub(crate) states: BTreeMap<String, Value>,
     pub(crate) frame: FrameRef,
     pub(crate) visibility: BrowserVisibility,
@@ -292,10 +294,19 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
         inherited_hidden: bool,
         parent_backend_node_id: Option<i64>,
         inherited_frame_id: Option<&str>,
+        inherited_base_url: Option<&str>,
         order: &mut usize,
         index: &mut DomIndex,
     ) {
         let node_type = node.get("nodeType").and_then(Value::as_i64).unwrap_or(0);
+        let base_url = if node_type == 9 {
+            node.get("baseURL")
+                .or_else(|| node.get("documentURL"))
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+        } else {
+            inherited_base_url
+        };
         let attrs = attributes(node);
         let hidden = inherited_hidden || statically_hidden(&attrs);
         let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64);
@@ -316,6 +327,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
             index.nodes.insert(
                 backend,
                 DomMeta {
+                    base_url: base_url.map(str::to_owned),
                     tag,
                     attrs,
                     order: *order,
@@ -333,6 +345,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
                     hidden,
                     backend_node_id.or(parent_backend_node_id),
                     frame_id,
+                    base_url,
                     order,
                     index,
                 );
@@ -348,6 +361,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
                     hidden,
                     backend_node_id.or(parent_backend_node_id),
                     frame_id,
+                    base_url,
                     order,
                     index,
                 );
@@ -359,6 +373,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
                 hidden,
                 backend_node_id.or(parent_backend_node_id),
                 content_document.get("frameId").and_then(Value::as_str),
+                None,
                 order,
                 index,
             );
@@ -372,6 +387,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
         false,
         None,
         root.get("frameId").and_then(Value::as_str),
+        None,
         &mut order,
         &mut index,
     );
@@ -584,6 +600,7 @@ pub(crate) fn compose_accessibility_tree(
                 })
                 .unwrap_or_default(),
             backend_node_id,
+            url: link_destination(&role, Some(ax), dom_meta),
             role,
             name,
             value,
@@ -723,6 +740,7 @@ fn supplement_dom_actions(
                 .and_then(|parent| by_backend.get(&parent).cloned()),
             child_ax_ids: Vec::new(),
             backend_node_id: Some(backend_node_id),
+            url: link_destination(&role, None, Some(meta)),
             role,
             name,
             value: meta
@@ -737,6 +755,37 @@ fn supplement_dom_actions(
             document_order: meta.order,
         });
     }
+}
+
+// Keep destination data separate from display text: text cleanup can truncate
+// or rewrite a URL. CDP's accessibility URL is already resolved by the browser.
+fn link_destination(role: &str, ax: Option<&Value>, dom: Option<&DomMeta>) -> Option<String> {
+    if role != "link" && !dom.is_some_and(|meta| matches!(meta.tag.as_str(), "a" | "area")) {
+        return None;
+    }
+    if let Some(url) = ax
+        .and_then(|node| node.get("properties"))
+        .and_then(Value::as_array)
+        .and_then(|properties| properties.iter().find(|p| p["name"] == "url"))
+        .and_then(|property| property.pointer("/value/value"))
+        .and_then(Value::as_str)
+        .filter(|value| url::Url::parse(value).is_ok())
+    {
+        return Some(url.to_owned());
+    }
+    let dom = dom?;
+    if !matches!(dom.tag.as_str(), "a" | "area") {
+        return None;
+    }
+    let href = dom.attrs.get("href")?;
+    if url::Url::parse(href).is_ok() {
+        return Some(href.clone());
+    }
+    url::Url::parse(dom.base_url.as_deref()?)
+        .ok()?
+        .join(href)
+        .ok()
+        .map(Into::into)
 }
 
 fn attributes(node: &Value) -> HashMap<String, String> {
@@ -1181,6 +1230,11 @@ fn render_outline(nodes: &[SemanticNode], selected: &HashSet<usize>) -> String {
                 line.push_str(value);
             }
         }
+        if let Some(url) = &node.url {
+            line.push_str(" [url=");
+            line.push_str(&serde_json::to_string(url).expect("URL string serialization"));
+            line.push(']');
+        }
         if !node.states.is_empty() {
             let states = node
                 .states
@@ -1258,8 +1312,81 @@ mod tests {
     }
 
     #[test]
+    fn link_destination_uses_frame_base_and_preserves_exact_ax_url() {
+        let root = json!({"nodeType":9,"baseURL":"https://outer.test/base/", "children":[
+            {"nodeType":1,"nodeName":"A","backendNodeId":1,"attributes":["href","../book?q=a%20b#slot"]},
+            {"nodeType":1,"nodeName":"IFRAME","contentDocument":{"nodeType":9,"baseURL":"https://inner.test/custom/",
+                "children":[{"nodeType":1,"nodeName":"A","backendNodeId":2,"attributes":["href","book"]}]}},
+            {"nodeType":1,"nodeName":"IFRAME","contentDocument":{"nodeType":9,
+                "children":[{"nodeType":1,"nodeName":"A","backendNodeId":3,"attributes":["href","book"]}]}}
+        ]});
+        let dom = build_dom_index(&root);
+        assert_eq!(
+            link_destination("link", None, dom.nodes.get(&1)).as_deref(),
+            Some("https://outer.test/book?q=a%20b#slot")
+        );
+        assert_eq!(
+            link_destination("link", None, dom.nodes.get(&2)).as_deref(),
+            Some("https://inner.test/custom/book")
+        );
+        assert!(link_destination("link", None, dom.nodes.get(&3)).is_none());
+        let long_url = format!("https://resolved.test/?q={}%2F#slot", "x".repeat(1200));
+        let ax = json!({"properties":[{"name":"url","value":{"type":"string","value":long_url}}]});
+        assert_eq!(
+            link_destination("link", Some(&ax), dom.nodes.get(&1)),
+            Some(long_url)
+        );
+        assert!(link_destination("textbox", Some(&ax), None).is_none());
+        assert!(link_destination("link", None, None).is_none());
+    }
+
+    #[test]
+    fn link_destination_resolves_empty_fragment_and_protocol_relative_hrefs() {
+        for (href, expected) in [
+            ("", "https://example.test/base/page"),
+            ("#court", "https://example.test/base/page#court"),
+            ("?q=a%2Fb", "https://example.test/base/page?q=a%2Fb"),
+            ("//other.test/book", "https://other.test/book"),
+        ] {
+            let dom = build_dom_index(
+                &json!({"nodeType":9,"baseURL":"https://example.test/base/page",
+                "children":[{"nodeType":1,"nodeName":"A","backendNodeId":1,"attributes":["href",href]}]}),
+            );
+            assert_eq!(
+                link_destination("link", None, dom.nodes.get(&1)).as_deref(),
+                Some(expected)
+            );
+        }
+    }
+
+    #[test]
+    fn link_destination_survives_semantic_composition_and_outline() {
+        let dom = build_dom_index(&json!({"nodeType":9,"baseURL":"https://example.test/base/",
+            "children":[{"nodeType":1,"nodeName":"A","backendNodeId":1,
+                "attributes":["href","../book?q=a%20b#time"]}]}));
+        let ax = json!({"nodes":[{"nodeId":"link","backendDOMNodeId":1,
+            "role":{"value":"link"},"name":{"value":"Book a court"}}]});
+        let doc = compose_accessibility_tree(
+            &ax,
+            &dom,
+            &LayoutIndex::default(),
+            &Viewport::default(),
+            frame(),
+        );
+        let page = doc.page(0, 300, None, None);
+        assert!(
+            page.outline
+                .contains("https://example.test/book?q=a%20b#time"),
+            "{}",
+            page.outline
+        );
+        assert!(page.outline.contains("Book a court"));
+    }
+
+    #[test]
     fn file_inputs_expose_upload_instead_of_text_typing() {
         let dom = DomMeta {
+            base_url: None,
             tag: "input".into(),
             attrs: HashMap::from([("type".into(), "file".into())]),
             order: 0,

@@ -6534,6 +6534,10 @@ export type WindowElement = {
      */
     placeholder?: string,
     /**
+     * A link's destination (macOS AXURL), kept apart from its label and value.
+     */
+    url?: string,
+    /**
      * Whether the value can be written; absent when unknown.
      */
     valueSettable?: boolean,
@@ -6556,6 +6560,7 @@ export const WindowElement = (() => {
         focused: undefined,
         textSelection: undefined,
         placeholder: undefined,
+        url: undefined,
         valueSettable: undefined,
     });
     const create = (() => {
@@ -6582,6 +6587,7 @@ const FfiConverterTypeWindowElement = (() => {
                 focused: FfiConverterOptionalBoolean.read(from),
                 textSelection: FfiConverterOptionalTypeTextSelection.read(from),
                 placeholder: FfiConverterOptionalString.read(from),
+                url: FfiConverterOptionalString.read(from),
                 valueSettable: FfiConverterOptionalBoolean.read(from),
                 valueDescription: FfiConverterOptionalString.read(from),
                 enabled: FfiConverterOptionalBoolean.read(from),
@@ -6604,6 +6610,7 @@ const FfiConverterTypeWindowElement = (() => {
             FfiConverterOptionalBoolean.write(value.focused, into);
             FfiConverterOptionalTypeTextSelection.write(value.textSelection, into);
             FfiConverterOptionalString.write(value.placeholder, into);
+            FfiConverterOptionalString.write(value.url, into);
             FfiConverterOptionalBoolean.write(value.valueSettable, into);
             FfiConverterOptionalString.write(value.valueDescription, into);
             FfiConverterOptionalBoolean.write(value.enabled, into);
@@ -6625,6 +6632,7 @@ const FfiConverterTypeWindowElement = (() => {
              FfiConverterOptionalBoolean.allocationSize(value.focused) +
              FfiConverterOptionalTypeTextSelection.allocationSize(value.textSelection) +
              FfiConverterOptionalString.allocationSize(value.placeholder) +
+             FfiConverterOptionalString.allocationSize(value.url) +
              FfiConverterOptionalBoolean.allocationSize(value.valueSettable) +
              FfiConverterOptionalString.allocationSize(value.valueDescription) +
              FfiConverterOptionalBoolean.allocationSize(value.enabled) +

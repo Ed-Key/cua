@@ -276,6 +276,10 @@ pub struct WindowElement {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[uniffi(default = None)]
     pub placeholder: Option<String>,
+    /// A link's destination (macOS AXURL), kept apart from its label and value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
+    pub url: Option<String>,
     /// Whether the value can be written; absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[uniffi(default = None)]
