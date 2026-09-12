@@ -5020,3 +5020,192 @@ standalone_browser_test!(
     standalone_browser_window_collision,
     run_two_window_collision
 );
+
+#[cfg(target_os = "macos")]
+fn run_native_background_first_click(spec: &BrowserSpec) {
+    for (pixel, cursor_enabled) in [(false, true), (true, true), (false, false), (true, false)] {
+        let scenario = format!(
+            "macos-{}-native-background-first-click-pixel-{pixel}-cursor-{cursor_enabled}",
+            spec.name
+        );
+        let case = CaseSpec::delivered(
+            scenario.clone(),
+            spec.name.clone(),
+            "standalone-chromium-native-content",
+            "native_background_first_click",
+            if pixel { Targeting::Px } else { Targeting::Ax },
+            Delivery::Background,
+            Scope::Window,
+            DriverRoute::MacosAxAction,
+            vec![OracleKind::FixtureState],
+        );
+        execute_case(case, |evidence| {
+            // Fresh process per route. No launch flags, preliminary actions, or
+            // out-of-band accessibility enablement may warm up the target.
+            let html = standalone_named_groups_html(false).replace(
+                "</body>",
+                r#"<script>
+window.backgroundClickEvents = [];
+document.addEventListener('click', e => backgroundClickEvents.push({
+  trusted:e.isTrusted, focused:document.hasFocus(), visibility:document.visibilityState
+}), true);
+</script></body>"#,
+            );
+            let mut fixture = launch_browser_with_html(spec, &scenario, html);
+            *evidence = recording_evidence(fixture.driver.recording_dir());
+            let cursor = fixture.driver.call(
+                "set_agent_cursor_enabled",
+                serde_json::json!({"enabled":cursor_enabled}),
+            );
+            assert!(!cursor.is_error(), "{}", cursor.raw);
+            let sentinel = ForegroundSentinel::launch(&mut fixture.driver);
+            let front = fixture.driver.call(
+                "bring_to_front",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id
+                }),
+            );
+            assert!(!front.is_error(), "{}", front.raw);
+            let target = TargetWindow {
+                pid: fixture.pid,
+                native_id: fixture.window_id,
+            };
+            sentinel
+                .prepare_background_observation(&mut fixture.driver, target)
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let snapshot = loop {
+                let snapshot = fixture.driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":fixture.pid,"window_id":fixture.window_id,"query":"Save",
+                        "include_screenshot":pixel
+                    }),
+                );
+                assert!(!snapshot.is_error(), "{}", snapshot.raw);
+                if snapshot.structured()["elements"]
+                    .as_array()
+                    .is_some_and(|nodes| {
+                        nodes
+                            .iter()
+                            .any(|n| n["role"] == "AXGroup" && n["label"] == "Billing")
+                    })
+                {
+                    break snapshot;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "Billing absent: {}",
+                    snapshot.structured()["tree_markdown"]
+                );
+                thread::sleep(Duration::from_millis(100));
+            };
+            let data = snapshot.structured();
+            let nodes = data["elements"].as_array().expect("native elements");
+            let group = nodes
+                .iter()
+                .find(|n| n["role"] == "AXGroup" && n["label"] == "Billing")
+                .unwrap();
+            let button = nodes
+                .iter()
+                .find(|n| {
+                    n["role"] == "AXButton"
+                        && n["label"] == "Save"
+                        && n["parent_index"] == group["element_index"]
+                })
+                .unwrap();
+            let mut args = serde_json::json!({
+                "pid":fixture.pid,"window_id":fixture.window_id,"delivery_mode":"background"
+            });
+            if pixel {
+                let window = nodes.iter().find(|n| n["role"] == "AXWindow").unwrap();
+                let scale = data["screenshot_width"].as_f64().unwrap()
+                    / window["frame"]["w"].as_f64().unwrap();
+                args["x"] = ((button["frame"]["x"].as_f64().unwrap()
+                    - window["frame"]["x"].as_f64().unwrap()
+                    + button["frame"]["w"].as_f64().unwrap() / 2.0)
+                    * scale)
+                    .into();
+                args["y"] = ((button["frame"]["y"].as_f64().unwrap()
+                    - window["frame"]["y"].as_f64().unwrap()
+                    + button["frame"]["h"].as_f64().unwrap() / 2.0)
+                    * scale)
+                    .into();
+            } else {
+                args["element_index"] = button["element_index"].clone();
+                args["snapshot_id"] = snapshot.snapshot_id().into();
+            }
+            let ws = cdp_page_websocket_for_url(fixture.cdp_port, &fixture.server.page_url());
+            let read = || {
+                let result = harness_cdp_call_at_url(
+                    &ws,
+                    "Runtime.evaluate",
+                    serde_json::json!({
+                        "expression":"({billing:document.getElementById('saved-Billing').textContent,profile:document.getElementById('saved-Profile').textContent,events:window.backgroundClickEvents})",
+                        "returnByValue":true
+                    }),
+                );
+                result["result"]["value"].clone()
+            };
+            let read_window_focus = || unsafe {
+                use platform_macos::ax::bindings::*;
+                let app = AXUIElementCreateApplication(fixture.pid.try_into().unwrap());
+                let windows = copy_ax_windows(app);
+                core_foundation::base::CFRelease(app as _);
+                let mut focused = None;
+                for window in windows {
+                    if ax_get_window_id(window) == Some(fixture.window_id.try_into().unwrap()) {
+                        focused = copy_bool_attr(window, "AXFocused");
+                    }
+                    core_foundation::base::CFRelease(window as _);
+                }
+                focused
+            };
+            assert_eq!(
+                read_window_focus(),
+                Some(false),
+                "target starts internally unfocused"
+            );
+            assert_eq!(read()["billing"], "0");
+            let (received, oracles) = sentinel.observe_background(target,|| {
+                let start = Instant::now();
+                let response = fixture.driver.call("click",args);
+                assert!(!response.is_error(),"{}",response.raw);
+                assert_eq!(response.structured()["route"],"accessibility");
+                let action_ms = start.elapsed().as_millis();
+                let deadline = Instant::now()+Duration::from_secs(3);
+                let state = loop {
+                    let state = read();
+                    if state["billing"]=="1" || Instant::now()>=deadline { break state; }
+                    thread::sleep(Duration::from_millis(100));
+                };
+                eprintln!("[native-first-click] pixel={pixel} cursor={cursor_enabled} action_ms={action_ms} response={} receiver={state}",response.raw);
+                state
+            }).expect("background focus, z-order, cursor, and leaked input checks");
+            assert_eq!(
+                read_window_focus(),
+                Some(false),
+                "click must preserve the target window's focus state"
+            );
+            assert_eq!(
+                received["billing"], "1",
+                "one accepted AXPress must reach Billing on its first attempt: {received}"
+            );
+            assert_eq!(received["profile"], "0");
+            let events = received["events"].as_array().unwrap();
+            assert_eq!(events.len(), 1, "exactly one received click: {received}");
+            assert_eq!(events[0]["trusted"], true);
+            // Page focus is internal browser state, distinct from the native
+            // foreground/keyboard focus verified by the sentinel above.
+            assert_eq!(events[0]["visibility"], "hidden");
+            let mut all_oracles = oracles;
+            all_oracles.push(OracleKind::FixtureState);
+            Observation::delivered(all_oracles, Evidence::default())
+        });
+    }
+}
+#[cfg(target_os = "macos")]
+standalone_browser_test!(
+    standalone_browser_native_background_first_click,
+    run_native_background_first_click
+);

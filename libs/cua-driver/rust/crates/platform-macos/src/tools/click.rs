@@ -102,6 +102,50 @@ impl ClickTool {
     }
 }
 
+/// Chromium's first native hit test initiates an asynchronous renderer lookup.
+/// Issue that read during target preparation, before dispatch, so background AX
+/// delivery does not rely solely on the initial cached accessibility tree.
+/// Discard the lookup result: it must never replace an indexed target or bypass
+/// the pixel route's exact-window ancestry check. This does not send input.
+async fn prepare_background_chromium_target(
+    pid: i32,
+    target: Option<ResolvedPointerTarget>,
+    receipt: Arc<DeliveryReceipt>,
+) -> anyhow::Result<()> {
+    let Some(target) = target else {
+        return Ok(());
+    };
+    let prepared = tokio::task::spawn_blocking(move || {
+        let name = apps::get_app_name_for_pid(pid).unwrap_or_default();
+        let bundle = apps::bundle_id_for_pid(pid).unwrap_or_default();
+        if crate::browser::platform::is_chromium(&name, &bundle) {
+            receipt.ensure_current()?;
+            let prepared = if let Some(element) =
+                unsafe { element_at_screen_position(pid, target.x, target.y) }
+            {
+                unsafe {
+                    CFRelease(element as _);
+                }
+                true
+            } else {
+                false
+            };
+            receipt.ensure_current()?;
+            return Ok::<bool, anyhow::Error>(prepared);
+        }
+        Ok(false)
+    })
+    .await??;
+    if prepared {
+        // The native AX API returns a cached hit while Chromium updates its
+        // renderer asynchronously. macOS exposes no completion notification
+        // for that hit test. Give it a short scheduling interval independently
+        // of cursor animation; the action boundary revalidates before input.
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+    Ok(())
+}
+
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 /// Focus posture for the raw pixel transport after AX hit-testing has failed.
@@ -561,6 +605,14 @@ impl Tool for ClickTool {
 
             let delivery_receipt = Arc::new(DeliveryReceipt::default());
             delivery_receipt.validate_ax_target(pid, wid, element_guard.clone(), target);
+            if !delivery_mode.is_foreground() && effective_action == "press" && button_str == "left"
+            {
+                if let Err(error) =
+                    prepare_background_chromium_target(pid, target, delivery_receipt.clone()).await
+                {
+                    return ToolResult::error(error.to_string());
+                }
+            }
             let dispatch = async {
                 // Surface 5: button=middle on the AX path has no AX equivalent.
                 // Fall back to a pixel middle-click at the element's screen-space center
@@ -896,6 +948,25 @@ impl Tool for ClickTool {
             // before polling the hit test, then polls native input only on fallback.
             let delivery_receipt = Arc::new(DeliveryReceipt::default());
             delivery_receipt.validate_pixel_frame(pid, window_id, approach_frame);
+            let target = Some(ResolvedPointerTarget {
+                x: screen_x,
+                y: screen_y,
+                window_id,
+                element_bounds: None,
+            });
+            if !delivery_mode.is_foreground()
+                && window_id.is_some()
+                && button_str == "left"
+                && count == 1
+                && modifiers.is_empty()
+                && action != "focus"
+            {
+                if let Err(error) =
+                    prepare_background_chromium_target(pid, target, delivery_receipt.clone()).await
+                {
+                    return ToolResult::error(error.to_string());
+                }
+            }
             let semantic = async {
                 // A background PX action can still use an accessibility delivery
                 // backend after resolving the requested screen point. This keeps
@@ -1125,19 +1196,8 @@ impl Tool for ClickTool {
                     Err(e) => ToolResult::error(format!("Task error: {e}")),
                 }
             };
-            self.dispatch_resolved(
-                &cursor_key,
-                Some(ResolvedPointerTarget {
-                    x: screen_x,
-                    y: screen_y,
-                    window_id,
-                    element_bounds: None,
-                }),
-                &delivery_receipt,
-                semantic,
-                native,
-            )
-            .await
+            self.dispatch_resolved(&cursor_key, target, &delivery_receipt, semantic, native)
+                .await
         } else {
             ToolResult::error(
                 "Provide either (element_index + window_id) or (x + y). pid is always required.",
