@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
-use super::store::{BrowserActionKind, BrowserVisibility, FrameRef, RefEntry};
+use super::store::{BrowserActionKind, BrowserVisibility, FrameKind, FrameRef, RefEntry};
 
 pub(crate) const SEMANTIC_COMPUTED_STYLES: &[&str] = &[
     "display",
@@ -173,7 +173,11 @@ impl SemanticDocument {
     pub(crate) fn document_title(&self) -> Option<&str> {
         self.nodes
             .iter()
-            .find(|node| matches!(node.role.as_str(), "rootwebarea" | "webarea"))
+            .find(|node| {
+                node.frame.kind == FrameKind::Main
+                    && node.parent_ax_id.is_none()
+                    && matches!(node.role.as_str(), "rootwebarea" | "webarea")
+            })
             .and_then(|node| node.name.as_deref())
     }
 
