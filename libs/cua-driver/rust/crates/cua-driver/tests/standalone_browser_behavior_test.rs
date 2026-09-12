@@ -84,6 +84,146 @@ fn standalone_generic_type_text_html() -> String {
     )
 }
 
+/// Named sections with duplicate controls must survive the native AX projection.
+#[cfg(target_os = "macos")]
+fn standalone_named_groups_html(billing_first: bool) -> String {
+    let section = |name: &str| {
+        format!(
+            r#"<section aria-labelledby="heading-{name}"><h2 id="heading-{name}">{name}</h2>
+<div><div><button onclick="document.getElementById('saved-{name}').textContent = Number(document.getElementById('saved-{name}').textContent) + 1">Save</button></div></div>
+<span id="saved-{name}" data-cua-id="saved-{name}">0</span></section>"#
+        )
+    };
+    let names = if billing_first {
+        ["Billing", "Profile"]
+    } else {
+        ["Profile", "Billing"]
+    };
+    standalone_fixture_html().replace(
+        r#"<main class="harness-grid">"#,
+        &format!(
+            r#"<div style="display:flex;gap:40px">{}{}</div><main class="harness-grid">"#,
+            section(names[0]),
+            section(names[1])
+        ),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn run_native_named_groups(spec: &BrowserSpec) {
+    for billing_first in [false, true] {
+        let scenario = format!("macos-{}-native-named-groups-{billing_first}", spec.name);
+        let case = CaseSpec::delivered(
+            scenario.clone(),
+            spec.name.clone(),
+            "standalone-chromium-native-content",
+            "named_group_click",
+            Targeting::Ax,
+            Delivery::Foreground,
+            Scope::Window,
+            DriverRoute::MacosAxAction,
+            vec![OracleKind::FixtureState],
+        );
+        execute_case(case, |evidence| {
+            let mut fixture = launch_browser_with_html(
+                spec,
+                &scenario,
+                standalone_named_groups_html(billing_first),
+            );
+            *evidence = recording_evidence(fixture.driver.recording_dir());
+            let front = fixture.driver.call(
+                "bring_to_front",
+                serde_json::json!({"pid":fixture.pid,"window_id":fixture.window_id}),
+            );
+            assert!(!front.is_error(), "{}", front.raw);
+            // Poll observation only until web content is exposed; never retry a click.
+            let deadline = Instant::now() + Duration::from_secs(10);
+            let snapshot = loop {
+                let snapshot = fixture.driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid": fixture.pid, "window_id": fixture.window_id,
+                        "capture_mode": "ax", "query": "Save",
+                    }),
+                );
+                assert!(!snapshot.is_error(), "native observation: {}", snapshot.raw);
+                if snapshot.structured()["elements"]
+                    .as_array()
+                    .is_some_and(|nodes| {
+                        nodes
+                            .iter()
+                            .filter(|n| n["role"] == "AXButton" && n["label"] == "Save")
+                            .count()
+                            == 2
+                    })
+                {
+                    break snapshot;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "duplicate Save controls absent: {}",
+                    snapshot.raw
+                );
+                thread::sleep(Duration::from_millis(100));
+            };
+            let data = snapshot.structured();
+            let elements = data["elements"].as_array().expect("native elements");
+            let mut targets = Vec::new();
+            for name in ["Billing", "Profile"] {
+                let groups = elements
+                    .iter()
+                    .filter(|n| n["role"] == "AXGroup" && n["label"] == name)
+                    .collect::<Vec<_>>();
+                assert_eq!(groups.len(), 1, "missing unique {name} group: {data}");
+                let group = groups[0];
+                let buttons = elements
+                    .iter()
+                    .filter(|n| {
+                        n["role"] == "AXButton"
+                            && n["label"] == "Save"
+                            && n["parent_index"] == group["element_index"]
+                    })
+                    .collect::<Vec<_>>();
+                assert_eq!(
+                    buttons.len(),
+                    1,
+                    "Save must belong to {name}, across unnamed wrappers: {data}"
+                );
+                assert_eq!(
+                    buttons[0]["depth"].as_u64(),
+                    group["depth"].as_u64().map(|d| d + 1)
+                );
+                targets.push(buttons[0]["element_index"].as_u64().unwrap());
+            }
+            eprintln!(
+                "[native-named-groups] billing_first={billing_first} tree={} targets={targets:?}",
+                data["tree_markdown"]
+            );
+            assert_ne!(targets[0], targets[1]);
+            let clicked = fixture.driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": fixture.pid,
+                    "window_id": fixture.window_id,
+                    "element_index": targets[0],
+                    "snapshot_id": snapshot.snapshot_id(),
+                    "delivery_mode": "foreground",
+                }),
+            );
+            assert!(!clicked.is_error(), "Billing Save: {}", clicked.raw);
+            eprintln!("[native-named-groups] click response={}", clicked.raw);
+            wait_for_text(&fixture.server, "saved-Billing", "1");
+            assert_eq!(fixture.server.text("saved-Profile").as_deref(), Some("0"));
+            eprintln!(
+                "[native-named-groups] receiver={} route={:?}",
+                serde_json::json!({"Billing": fixture.server.text("saved-Billing"), "Profile": fixture.server.text("saved-Profile")}),
+                clicked.action_route()
+            );
+            Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
+        });
+    }
+}
+
 fn standalone_browser_completeness_html() -> String {
     standalone_fixture_html().replace(
         "</body>",
@@ -4808,6 +4948,11 @@ macro_rules! standalone_browser_test {
     };
 }
 
+#[cfg(target_os = "macos")]
+standalone_browser_test!(
+    standalone_browser_native_named_groups,
+    run_native_named_groups
+);
 standalone_browser_test!(standalone_browser_roundtrip, run_roundtrip);
 standalone_browser_test!(
     standalone_browser_trust_gated_dom_click,
