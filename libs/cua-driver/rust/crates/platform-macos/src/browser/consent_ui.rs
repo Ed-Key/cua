@@ -391,6 +391,7 @@ mod tests {
             role: role.to_owned(),
             title: title.map(str::to_owned),
             value: None,
+            placeholder: None,
             description: None,
             identifier: None,
             help: None,

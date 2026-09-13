@@ -155,6 +155,7 @@ mod tests {
             role: String::new(),
             title: None,
             value: None,
+            placeholder: None,
             description: None,
             identifier: None,
             help: None,
