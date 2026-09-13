@@ -56,6 +56,7 @@
 //! queue's own thread regardless of run-loop state.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -83,6 +84,8 @@ pub struct SuppressionHandle(Uuid);
 /// Dispatcher-internal entry shape.
 #[derive(Debug)]
 struct Entry {
+    /// Registration order, used to choose one restore destination on overlap.
+    sequence: u64,
     /// `Some(pid)` matches only that pid's activations. `None` is a
     /// wildcard — matches any activation whose pid != `restore_to`.
     /// The wildcard variant is used while a launch is in flight and the
@@ -241,6 +244,8 @@ impl Drop for SuppressionLease {
 /// scan is fine.
 pub(crate) struct Dispatcher {
     entries: Mutex<HashMap<Uuid, Entry>>,
+    /// Incremented under the entries lock so registration and order agree.
+    sequence: AtomicU64,
     /// `true` while the janitor task should keep running. The janitor
     /// loop watches for transitions to detect when to start/stop.
     janitor_active: tokio::sync::watch::Sender<bool>,
@@ -252,6 +257,7 @@ impl Dispatcher {
         let (tx, _rx) = tokio::sync::watch::channel(false);
         Self {
             entries: Mutex::new(HashMap::new()),
+            sequence: AtomicU64::new(0),
             janitor_active: tx,
             janitor_started: Mutex::new(false),
         }
@@ -264,7 +270,7 @@ impl Dispatcher {
     /// (as we used to) lost the janitor permanently in that case:
     /// subsequent adds would skip the kick and the janitor never
     /// started, leaving deadline-reaping entirely up to the
-    /// `snapshot_matches` reap fallback (only fires on an activation).
+    /// `winner_for_activation` reap fallback (only fires on an activation).
     fn add(
         self: &Arc<Self>,
         target_pid: Option<i32>,
@@ -292,15 +298,16 @@ impl Dispatcher {
         origin: &'static str,
     ) -> SuppressionHandle {
         let id = Uuid::new_v4();
-        let entry = Entry {
-            target_pid,
-            allowed_pid,
-            restore_to,
-            deadline: Instant::now() + ENTRY_DEADLINE,
-            origin,
-        };
         {
             let mut guard = self.entries.lock().unwrap();
+            let entry = Entry {
+                sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+                target_pid,
+                allowed_pid,
+                restore_to,
+                deadline: Instant::now() + ENTRY_DEADLINE,
+                origin,
+            };
             guard.insert(id, entry);
         }
         // Always kick — idempotent if the task is already running.
@@ -324,18 +331,18 @@ impl Dispatcher {
         }
     }
 
-    /// Snapshot the entries (cloned to a small Vec) — used by tests
-    /// and the activation handler to evaluate matches without holding
-    /// the lock across the restore call.
-    fn snapshot_matches(&self, activated_pid: i32) -> Vec<i32> {
+    /// Select the newest matching registration, following the Swift ordering
+    /// policy in upstream PR #1539. Return its identity as well as destination
+    /// so a later check cannot confuse a replacement with the original lease.
+    fn winner_for_activation(&self, activated_pid: i32) -> Option<(SuppressionHandle, i32)> {
         let mut guard = self.entries.lock().unwrap();
         // Reap expired entries first — keeps the dispatcher honest even
         // if the janitor hasn't ticked yet.
         let now = Instant::now();
         guard.retain(|_, e| e.deadline > now);
         guard
-            .values()
-            .filter(|e| {
+            .iter()
+            .filter(|(_, e)| {
                 if e.allowed_pid == Some(activated_pid) {
                     return false;
                 }
@@ -347,12 +354,13 @@ impl Dispatcher {
                     None => activated_pid != e.restore_to,
                 }
             })
-            .map(|e| e.restore_to)
-            .collect()
+            .max_by_key(|(_, e)| e.sequence)
+            .map(|(id, e)| (SuppressionHandle(*id), e.restore_to))
     }
 
     /// Notifications can wait on the observer queue while foreground state
-    /// changes. Only restore while the notified app is still foreground.
+    /// changes. Only restore while the notified app is still foreground and
+    /// the chosen lease remains the current winner after the native read.
     /// This is a best-effort freshness check, not proof of user intent or an
     /// atomic compare-and-activate operation. Never hold the entries lock
     /// across the native foreground read or activation.
@@ -362,11 +370,17 @@ impl Dispatcher {
         mut frontmost_pid: impl FnMut() -> Option<i32>,
         mut restore: impl FnMut(i32),
     ) {
-        for pid in self.snapshot_matches(activated_pid) {
-            if frontmost_pid() != Some(activated_pid) {
-                return;
-            }
-            restore(pid);
+        let Some(winner) = self.winner_for_activation(activated_pid) else {
+            return;
+        };
+        if frontmost_pid() != Some(activated_pid) {
+            return;
+        }
+        // The foreground read can overlap cancellation, expiry, or another
+        // registration. Drop this dispatch if the choice changed; do not
+        // reinterpret an in-flight notification using a fallback lease.
+        if self.winner_for_activation(activated_pid) == Some(winner) {
+            restore(winner.1);
         }
     }
 
@@ -398,7 +412,7 @@ impl Dispatcher {
     /// `false` so the next add from a tokio-aware caller retries.
     /// Without that retry path the janitor could go permanently
     /// un-spawned and deadline-reaping would degrade to the
-    /// `snapshot_matches` reap fallback (only runs on an activation).
+    /// `winner_for_activation` reap fallback (only runs on an activation).
     fn kick_janitor(self: &Arc<Self>) {
         let mut started = self.janitor_started.lock().unwrap();
         if *started {
@@ -510,7 +524,7 @@ fn install_observer(dispatcher: &Arc<Dispatcher>) {
 }
 
 /// Match a single activation notification against the dispatcher and,
-/// re-activate matching entries only while the notified app remains foreground.
+/// restore its newest matching registration while the app remains foreground.
 ///
 /// Runs on the observer queue's background thread — safe to call
 /// blocking system APIs.
@@ -558,6 +572,10 @@ mod tests {
     use super::*;
     use std::sync::Arc;
 
+    fn winner_pid(d: &Dispatcher, activated_pid: i32) -> Option<i32> {
+        d.winner_for_activation(activated_pid).map(|(_, pid)| pid)
+    }
+
     #[test]
     fn delayed_activation_does_not_restore_over_a_newer_foreground_app() {
         let d = Arc::new(Dispatcher::new());
@@ -592,27 +610,124 @@ mod tests {
     }
 
     #[test]
-    fn dispatch_rechecks_foreground_before_each_restore() {
-        use std::cell::Cell;
+    fn overlapping_entries_dispatch_only_the_latest_matching_restore() {
         let d = Arc::new(Dispatcher::new());
         let _a = d.add(Some(42), 7, "test.first");
         let _b = d.add(Some(42), 8, "test.second");
-        let foreground = Cell::new(Some(42));
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
+        assert_eq!(
+            restored,
+            vec![8],
+            "one notification must not activate competing destinations"
+        );
+    }
+
+    #[test]
+    fn wildcard_and_target_overlap_use_registration_order() {
+        for (older, newer) in [(None, Some(42)), (Some(42), None), (None, None)] {
+            let d = Arc::new(Dispatcher::new());
+            let _a = d.add(older, 7, "test.older");
+            let b = d.add(newer, 8, "test.newer");
+            let mut restored = Vec::new();
+            d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
+            assert_eq!(restored, vec![8]);
+            d.remove(b);
+            restored.clear();
+            d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
+            assert_eq!(
+                restored,
+                vec![7],
+                "a later notification can use the remaining entry"
+            );
+        }
+    }
+
+    #[test]
+    fn released_lease_cannot_restore_after_foreground_read() {
+        let d = Arc::new(Dispatcher::new());
+        let _older = d.add(Some(42), 6, "test.older");
+        let handle = d.add(Some(42), 7, "test.released");
+        let mut lease = Some(SuppressionLease {
+            handle,
+            dispatcher: Arc::clone(&d),
+            released: false,
+        });
         let mut restored = Vec::new();
         d.dispatch_activation(
             42,
-            || foreground.get(),
-            |pid| {
-                restored.push(pid);
-                // The foreground changes before another candidate is dispatched.
-                foreground.set(Some(99));
+            || {
+                drop(lease.take());
+                Some(42)
             },
+            |pid| restored.push(pid),
         );
-        assert_eq!(
-            restored.len(),
-            1,
-            "remaining candidates must not undo the newer switch"
+        assert!(
+            restored.is_empty(),
+            "do not restore from a released snapshot or fall back mid-dispatch"
         );
+    }
+
+    #[test]
+    fn expired_lease_cannot_restore_after_foreground_read() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.expired");
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || {
+                d.entries
+                    .lock()
+                    .unwrap()
+                    .get_mut(&handle.0)
+                    .unwrap()
+                    .deadline = Instant::now() - Duration::from_secs(1);
+                Some(42)
+            },
+            |pid| restored.push(pid),
+        );
+        assert!(
+            restored.is_empty(),
+            "expiry during the native read must invalidate restoration"
+        );
+    }
+
+    #[test]
+    fn newer_matching_entry_invalidates_the_in_flight_restore() {
+        // Equal destinations still belong to different action lifetimes.
+        for destination in [7, 8] {
+            let d = Arc::new(Dispatcher::new());
+            let _h = d.add(Some(42), 7, "test.old");
+            let mut restored = Vec::new();
+            d.dispatch_activation(
+                42,
+                || {
+                    d.add(Some(42), destination, "test.new");
+                    Some(42)
+                },
+                |pid| restored.push(pid),
+            );
+            assert!(
+                restored.is_empty(),
+                "an in-flight notification must not apply a superseded choice"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_registration_during_read_does_not_block_current_restore() {
+        let d = Arc::new(Dispatcher::new());
+        let _h = d.add(Some(42), 7, "test.current");
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || {
+                d.add(Some(99), 8, "test.unrelated");
+                Some(42)
+            },
+            |pid| restored.push(pid),
+        );
+        assert_eq!(restored, vec![7]);
     }
 
     #[test]
@@ -643,10 +758,10 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.add");
         assert_eq!(d.len(), 1);
-        let matches = d.snapshot_matches(42);
-        assert_eq!(matches, vec![7]);
+        let matches = winner_pid(&d, 42);
+        assert_eq!(matches, Some(7));
         // Non-matching pid: no restore candidates.
-        assert!(d.snapshot_matches(99).is_empty());
+        assert!(winner_pid(&d, 99).is_none());
         d.remove(h);
         assert_eq!(d.len(), 0);
     }
@@ -658,9 +773,9 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(None, 7, "test.wild");
         // pid 99 != restore_to 7 → should match.
-        assert_eq!(d.snapshot_matches(99), vec![7]);
+        assert_eq!(winner_pid(&d, 99), Some(7));
         // pid 7 == restore_to → must NOT match (don't fight ourselves).
-        assert!(d.snapshot_matches(7).is_empty());
+        assert!(winner_pid(&d, 7).is_none());
     }
 
     /// A background pixel click intentionally makes its target AppKit-active
@@ -672,16 +787,16 @@ mod tests {
         let _h = d.add_allowing(42, 7, "test.allow");
 
         assert!(
-            d.snapshot_matches(42).is_empty(),
+            winner_pid(&d, 42).is_none(),
             "intentional target activation must not be restored before the click"
         );
         assert_eq!(
-            d.snapshot_matches(99),
-            vec![7],
+            winner_pid(&d, 99),
+            Some(7),
             "unrelated activations must remain suppressed"
         );
         assert!(
-            d.snapshot_matches(7).is_empty(),
+            winner_pid(&d, 7).is_none(),
             "restoring the original foreground must never recurse"
         );
     }
@@ -717,7 +832,7 @@ mod tests {
     }
 
     /// Force a leaked entry whose deadline is already past, then call
-    /// reap_expired and snapshot_matches — both must purge it.
+    /// reap_expired and winner_for_activation — both must purge it.
     #[test]
     fn deadline_reaps_leaked_entry() {
         let d = Arc::new(Dispatcher::new());
@@ -728,6 +843,7 @@ mod tests {
             guard.insert(
                 id,
                 Entry {
+                    sequence: 0,
                     target_pid: Some(42),
                     allowed_pid: None,
                     restore_to: 7,
@@ -737,10 +853,10 @@ mod tests {
             );
         }
         assert_eq!(d.len(), 1);
-        // snapshot_matches reaps expired entries before matching.
-        let matches = d.snapshot_matches(42);
-        assert!(matches.is_empty(), "expired entry should not fire");
-        assert_eq!(d.len(), 0, "snapshot_matches should purge expired");
+        // winner_for_activation reaps expired entries before matching.
+        let matches = winner_pid(&d, 42);
+        assert!(matches.is_none(), "expired entry should not fire");
+        assert_eq!(d.len(), 0, "winner_for_activation should purge expired");
     }
 
     /// Janitor lifecycle: starts on first add, stops when empty,
@@ -815,18 +931,13 @@ mod tests {
         d.remove(h1);
     }
 
-    /// Snapshot ordering doesn't matter, but the restore pid set
-    /// must contain every match. Multiple concurrent suppressions
-    /// targeting the same pid should both fire.
+    /// A newer unrelated registration does not supersede a matching lease.
     #[test]
-    fn multiple_entries_match_independently() {
+    fn latest_nonmatching_registration_does_not_change_the_winner() {
         let d = Arc::new(Dispatcher::new());
         let _a = d.add(Some(42), 1, "test.m1");
-        let _b = d.add(Some(42), 2, "test.m2");
-        let matches = d.snapshot_matches(42);
-        assert_eq!(matches.len(), 2);
-        // Set equality — order is HashMap-dependent.
-        assert!(matches.contains(&1));
-        assert!(matches.contains(&2));
+        let _b = d.add(Some(99), 2, "test.m2");
+        assert_eq!(winner_pid(&d, 42), Some(1));
+        assert_eq!(winner_pid(&d, 99), Some(2));
     }
 }
