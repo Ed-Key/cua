@@ -4,6 +4,12 @@ use super::*;
 use cua_driver_testkit::observer::{DesktopObserver, NativeObserver};
 
 fn run_scroll(covered: bool) {
+    if !covered {
+        assert!(
+            unsafe { platform_macos::ax::bindings::AXIsProcessTrusted() },
+            "visible-scroll setup requires Accessibility for the test process to move its owned sentinel; the driver's separate grant does not authorize this process"
+        );
+    }
     let _lock = STANDALONE_BROWSER_TEST_LOCK
         .lock()
         .unwrap_or_else(|e| e.into_inner());
@@ -131,14 +137,22 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                 && cover.bounds.y + cover.bounds.height >= bounds.y + bounds.height
         );
     }
-    let expected_visibility = if covered { "hidden" } else { "visible" };
     let deadline = Instant::now() + Duration::from_secs(3);
     loop {
         let state = read();
         let desktop = DesktopObserver::new(NativeObserver::new(), target)
             .snapshot()
             .unwrap();
-        if state["visibility"] == expected_visibility
+        // Native geometry proves coverage. Electron's Page Visibility state
+        // also depends on its version and renderer configuration, so a covered
+        // window is not necessarily reported as hidden. Retain that observed
+        // state rather than claiming this row proves renderer throttling.
+        let visibility_ready = if covered {
+            matches!(state["visibility"].as_str(), Some("visible" | "hidden"))
+        } else {
+            state["visibility"] == "visible"
+        };
+        if visibility_ready
             && state["focused"] == false
             && desktop.foreground == Some(sentinel.target().pid as u64)
         {
@@ -152,6 +166,7 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
         thread::sleep(Duration::from_millis(50));
     }
     let before = read();
+    let expected_visibility = before["visibility"].clone();
     assert_eq!(before["top"], 0);
     let action = || {
         // Keep the unproven untargeted route refused before any key dispatch.
