@@ -2137,34 +2137,50 @@ fn harness_appkit_double_click_px_foreground() {
 #[test]
 #[ignore]
 fn harness_appkit_double_click_px_background() {
+    background_double_click("double_click", "double_click");
+}
+
+/// `click` with count two bypasses its single-click AX hit-test shortcut and
+/// reaches the target-only synthetic-focus path. The standalone double_click
+/// tool has a separate native dispatcher and does not exercise that scope.
+#[test]
+#[ignore]
+fn harness_appkit_raw_double_click_px_background() {
+    background_double_click("click", "raw_double_click");
+}
+
+fn background_double_click(tool: &str, action: &str) {
     run_background_case_targeting(
-        "double_click",
+        action,
         Targeting::Px,
         DriverRoute::MacosCgEventPid,
         |pid, wid, driver| {
             let pre = snapshot_elements(driver, pid, wid);
             let (x, y, width, height) = element_pixel_frame(&pre, "btn-clicktarget");
-            let response = driver.call(
-                "double_click",
-                serde_json::json!({
-                    "pid": pid as i64,
-                    "window_id": wid,
-                    "x": x + width / 2.0,
-                    "y": y + height / 2.0,
-                    "delivery_mode": "background"
-                }),
-            );
+            let mut args = serde_json::json!({
+                "pid": pid as i64,
+                "window_id": wid,
+                "x": x + width / 2.0,
+                "y": y + height / 2.0,
+                "delivery_mode": "background"
+            });
+            if tool == "click" {
+                args["button"] = serde_json::json!("left");
+                args["count"] = serde_json::json!(2);
+            }
+            let response = driver.call(tool, args);
             assert!(
                 !response.is_error(),
                 "AppKit double click failed: {}",
                 response.text()
             );
-            assert_eq!(
-                response.structured()["synthetic_target_focus"],
-                true,
-                "background double click must exercise target-only synthetic focus: {}",
-                response.raw
-            );
+            // MCP publishes ActionResult, which deliberately excludes private
+            // producer diagnostics such as synthetic_target_focus. Verify its
+            // public delivery facts and the independent receiver/sentinel below.
+            assert_eq!(response.action_route(), Some("synthetic_events"));
+            assert_eq!(response.action_delivery_mode(), Some("background"));
+            assert_eq!(response.action_effect(), Some("unverifiable"));
+            println!("{tool} response: {}", response.raw);
             std::thread::sleep(Duration::from_millis(250));
             let receiver_snapshot = snapshot_elements(driver, pid, wid);
             let receiver = receiver_snapshot.tree_text();
