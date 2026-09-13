@@ -351,6 +351,25 @@ impl Dispatcher {
             .collect()
     }
 
+    /// Notifications can wait on the observer queue while foreground state
+    /// changes. Only restore while the notified app is still foreground.
+    /// This is a best-effort freshness check, not proof of user intent or an
+    /// atomic compare-and-activate operation. Never hold the entries lock
+    /// across the native foreground read or activation.
+    fn dispatch_activation(
+        &self,
+        activated_pid: i32,
+        mut frontmost_pid: impl FnMut() -> Option<i32>,
+        mut restore: impl FnMut(i32),
+    ) {
+        for pid in self.snapshot_matches(activated_pid) {
+            if frontmost_pid() != Some(activated_pid) {
+                return;
+            }
+            restore(pid);
+        }
+    }
+
     /// Number of entries (for tests).
     fn len(&self) -> usize {
         self.entries.lock().unwrap().len()
@@ -491,7 +510,7 @@ fn install_observer(dispatcher: &Arc<Dispatcher>) {
 }
 
 /// Match a single activation notification against the dispatcher and,
-/// for each matching entry, re-activate the entry's `restore_to` pid.
+/// re-activate matching entries only while the notified app remains foreground.
 ///
 /// Runs on the observer queue's background thread — safe to call
 /// blocking system APIs.
@@ -515,10 +534,7 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
         pid as i32
     };
 
-    let restore_pids = dispatcher.snapshot_matches(activated_pid);
-    for pid in restore_pids {
-        restore_focus(pid);
-    }
+    dispatcher.dispatch_activation(activated_pid, crate::apps::frontmost_pid, restore_focus);
 }
 
 /// Re-activate `pid` if it's still running. Safe to call from any
@@ -541,6 +557,84 @@ fn restore_focus(pid: i32) {
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn delayed_activation_does_not_restore_over_a_newer_foreground_app() {
+        let d = Arc::new(Dispatcher::new());
+        let _h = d.add(Some(42), 7, "test.delayed");
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || Some(99), |pid| restored.push(pid));
+        assert!(
+            restored.is_empty(),
+            "a queued notification must not undo a newer app switch"
+        );
+    }
+
+    #[test]
+    fn unknown_foreground_does_not_authorize_restoration() {
+        let d = Arc::new(Dispatcher::new());
+        let _h = d.add(Some(42), 7, "test.unknown");
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || None, |pid| restored.push(pid));
+        assert!(
+            restored.is_empty(),
+            "missing current state cannot authorize activation"
+        );
+    }
+
+    #[test]
+    fn current_matching_activation_still_restores_the_prior_app() {
+        let d = Arc::new(Dispatcher::new());
+        let _h = d.add(Some(42), 7, "test.current");
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
+        assert_eq!(restored, vec![7]);
+    }
+
+    #[test]
+    fn dispatch_rechecks_foreground_before_each_restore() {
+        use std::cell::Cell;
+        let d = Arc::new(Dispatcher::new());
+        let _a = d.add(Some(42), 7, "test.first");
+        let _b = d.add(Some(42), 8, "test.second");
+        let foreground = Cell::new(Some(42));
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || foreground.get(),
+            |pid| {
+                restored.push(pid);
+                // The foreground changes before another candidate is dispatched.
+                foreground.set(Some(99));
+            },
+        );
+        assert_eq!(
+            restored.len(),
+            1,
+            "remaining candidates must not undo the newer switch"
+        );
+    }
+
+    #[test]
+    fn dispatch_preserves_target_and_wildcard_matching_policy() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.target");
+        let mut restored = Vec::new();
+        d.dispatch_activation(99, || Some(99), |pid| restored.push(pid));
+        assert!(restored.is_empty());
+        d.remove(h);
+
+        let _h = d.add_allowing(42, 7, "test.wildcard");
+        d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
+        d.dispatch_activation(7, || Some(7), |pid| restored.push(pid));
+        assert!(restored.is_empty());
+        d.dispatch_activation(99, || Some(99), |pid| restored.push(pid));
+        assert_eq!(
+            restored,
+            vec![7],
+            "this fix does not redefine wildcard user-intent policy"
+        );
+    }
 
     /// Dispatcher::add returns a handle, the entry is reachable by
     /// match, and remove() drops it.
