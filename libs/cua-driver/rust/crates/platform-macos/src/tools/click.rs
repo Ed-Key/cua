@@ -153,9 +153,9 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 enum PixelActivationPolicy {
     /// Standard background delivery: suppress activation of the target.
     SuppressTarget,
-    /// Left-click with a concrete window: intentionally make the target
-    /// AppKit-active without raising it, while suppressing every other app.
-    AllowTargetWithoutRaise,
+    /// Left-click with a concrete window: install target-only synthetic routing
+    /// focus. The surrounding guards still suppress activation side effects.
+    SyntheticTargetFocus,
     /// Explicit foreground rung owns its brief activation and restoration.
     ForegroundAssist,
 }
@@ -194,32 +194,9 @@ fn pixel_activation_policy(
     if effective_foreground {
         PixelActivationPolicy::ForegroundAssist
     } else if button == "left" && has_window {
-        PixelActivationPolicy::AllowTargetWithoutRaise
+        PixelActivationPolicy::SyntheticTargetFocus
     } else {
         PixelActivationPolicy::SuppressTarget
-    }
-}
-
-/// Return the prior foreground pid that should be restored after a raw
-/// background pixel click.
-///
-/// This decision deliberately depends on observed application state rather
-/// than the private focus recipe's return value. The recipe can be unavailable
-/// or partially fail while the raw click still makes the target AppKit-active;
-/// in that case the allow-target suppression lease will not restore it for us.
-fn background_pixel_restore_pid(
-    activation_policy: PixelActivationPolicy,
-    prior_front: Option<i32>,
-    target_pid: i32,
-    observed_front: Option<i32>,
-) -> Option<i32> {
-    if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
-        && prior_front != Some(target_pid)
-        && observed_front == Some(target_pid)
-    {
-        prior_front
-    } else {
-        None
     }
 }
 
@@ -1042,11 +1019,9 @@ impl Tool for ClickTool {
                 // shape as the AX path, so we wrap identically.
                 let prior_front = overlay::on_appkit_main(apps::frontmost_pid);
                 let snapshot = match activation_policy {
-                    PixelActivationPolicy::SuppressTarget => {
+                    PixelActivationPolicy::SuppressTarget
+                    | PixelActivationPolicy::SyntheticTargetFocus => {
                         WindowChangeDetector::snapshot(prior_front)
-                    }
-                    PixelActivationPolicy::AllowTargetWithoutRaise => {
-                        WindowChangeDetector::snapshot_allowing_activation(prior_front, pid)
                     }
                     PixelActivationPolicy::ForegroundAssist => {
                         WindowChangeDetector::snapshot_without_suppression(prior_front)
@@ -1060,7 +1035,7 @@ impl Tool for ClickTool {
                 let button_kind = button_str.clone();
                 let receipt = delivery_receipt.clone();
                 let result = focus_guard::with_focus_suppressed(
-                if activation_policy == PixelActivationPolicy::SuppressTarget {
+                if matches!(activation_policy, PixelActivationPolicy::SuppressTarget | PixelActivationPolicy::SyntheticTargetFocus) {
                     Some(pid)
                 } else {
                     None
@@ -1136,22 +1111,13 @@ impl Tool for ClickTool {
                             }
                             _ => do_click().map(|_| false),
                         };
-                        if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
+                        if activation_policy == PixelActivationPolicy::SyntheticTargetFocus {
                             let wid = window_id.expect("background activation requires a window");
-                            background_pixel_worker(
-                                || crate::input::mouse::prepare_background_pixel_click_checked(pid, wid, &|| receipt.ensure_current()),
-                                |activated| {
+                            crate::input::mouse::with_background_pixel_focus_checked(
+                                pid, wid, &|| receipt.ensure_current(),
+                                |used| {
                                     receipt.repin_current_target()?;
-                                    dispatch().map(|fronted| (fronted, activated))
-                                },
-                                || {
-                                    if prior_front == Some(pid) { return; }
-                                    std::thread::sleep(std::time::Duration::from_millis(50));
-                                    overlay::on_appkit_main(move || {
-                                        if let Some(previous) = background_pixel_restore_pid(activation_policy, prior_front, pid, apps::frontmost_pid()) {
-                                            let _ = apps::activate_pid(previous);
-                                        }
-                                    });
+                                    dispatch().map(|fronted| (fronted, used))
                                 },
                             )
                         } else {
@@ -1189,11 +1155,18 @@ impl Tool for ClickTool {
                             "path": path,
                             "verified": false,
                             "effect": "unverifiable",
-                            "focus_without_raise": focus_without_raise
+                            "focus_without_raise": focus_without_raise,
+                            "synthetic_target_focus": focus_without_raise
                         }))
                     }
-                    Ok(Err(e)) => ToolResult::error(format!("{button_label} failed: {e}")),
-                    Err(e) => ToolResult::error(format!("Task error: {e}")),
+                    Ok(Err(e)) => pixel_input_error(
+                        format!("{button_label} failed: {e:#}"),
+                        delivery_receipt.was_accepted(),
+                    ),
+                    Err(e) => pixel_input_error(
+                        format!("Task error: {e}"),
+                        delivery_receipt.was_accepted(),
+                    ),
                 }
             };
             self.dispatch_resolved(&cursor_key, target, &delivery_receipt, semantic, native)
@@ -1204,6 +1177,16 @@ impl Tool for ClickTool {
             )
         }
     }
+}
+
+/// Keep posted-input evidence even when later cleanup or readback fails.
+fn pixel_input_error(message: String, input_posted: bool) -> ToolResult {
+    ToolResult::error(message).with_structured(serde_json::json!({
+        "code": "pixel_input_failed",
+        "input_posted": input_posted,
+        "verified": false,
+        "effect": "unverifiable",
+    }))
 }
 
 /// Click focus requires an accepted AX write. Typing keeps its separate best-effort helper.
@@ -1616,34 +1599,6 @@ mod tests {
     use crate::cursor::visual::test_support::{Event, RecordingSink};
 
     #[tokio::test]
-    async fn correction_background_worker_restores_after_waiter_is_cancelled() {
-        let (entered, waiting) = tokio::sync::oneshot::channel();
-        let (release, pause) = std::sync::mpsc::channel();
-        let (restored, restoration) = tokio::sync::oneshot::channel();
-        let waiter = tokio::spawn(async move {
-            tokio::task::spawn_blocking(move || {
-                background_pixel_worker::<()>(
-                    || Ok(false), // A partial activation still needs cleanup.
-                    |_| {
-                        entered.send(()).unwrap();
-                        pause.recv().unwrap();
-                        anyhow::bail!("later failure")
-                    },
-                    || {
-                        let _ = restored.send(());
-                    },
-                )
-            })
-            .await
-        });
-        waiting.await.unwrap();
-        waiter.abort();
-        assert!(waiter.await.unwrap_err().is_cancelled());
-        release.send(()).unwrap();
-        restoration.await.unwrap();
-    }
-
-    #[tokio::test]
     async fn pixel_ax_only_explicit_miss_allows_ordinary_fallback() {
         assert!(pixel_ax_dispatch_result(false, Ok(Ok(false))).is_none());
         let worker = tokio::spawn(std::future::pending::<anyhow::Result<bool>>());
@@ -1654,6 +1609,17 @@ mod tests {
             pixel_ax_dispatch_result(false, Err(error)).expect("worker failure is terminal");
         assert_eq!(result.is_error, Some(true));
         assert!(serde_json::to_string(&result).unwrap().contains(&reason));
+    }
+
+    #[test]
+    fn pixel_failure_retains_whether_mouse_input_was_posted() {
+        for posted in [false, true] {
+            let result = pixel_input_error("cleanup failed".into(), posted);
+            assert_eq!(result.is_error, Some(true));
+            let value = serde_json::to_value(result).unwrap();
+            assert_eq!(value["structuredContent"]["input_posted"], posted);
+            assert_eq!(value["structuredContent"]["verified"], false);
+        }
     }
 
     #[test]
@@ -2335,15 +2301,14 @@ mod tests {
         }
     }
 
-    /// Regression for the Swift→Rust port gap: only a raw background left
-    /// click with an exact window may intentionally activate the target
-    /// without raising it. Other background buttons retain strict suppression,
-    /// and the explicit foreground rung owns its separate activation.
+    /// Only raw background left clicks with an exact window use target-only
+    /// synthetic focus. Other buttons keep ordinary suppression; foreground
+    /// delivery retains its separately requested activation.
     #[test]
-    fn raw_background_left_click_restores_focus_without_raise_policy() {
+    fn raw_background_left_click_uses_target_only_synthetic_focus() {
         assert_eq!(
             pixel_activation_policy("left", false, true),
-            PixelActivationPolicy::AllowTargetWithoutRaise
+            PixelActivationPolicy::SyntheticTargetFocus
         );
         assert_eq!(
             pixel_activation_policy("left", false, false),
@@ -2362,54 +2327,6 @@ mod tests {
             PixelActivationPolicy::ForegroundAssist
         );
     }
-
-    /// The no-foreground contract must not depend on the private activation
-    /// recipe reporting full success. If that recipe is unavailable or only
-    /// partially succeeds but the target is nevertheless observed frontmost,
-    /// restore the user's prior app.
-    #[test]
-    fn failed_private_activation_still_restores_observed_target_focus() {
-        assert_eq!(
-            background_pixel_restore_pid(
-                PixelActivationPolicy::AllowTargetWithoutRaise,
-                Some(7),
-                42,
-                Some(42),
-            ),
-            Some(7)
-        );
-
-        assert_eq!(
-            background_pixel_restore_pid(
-                PixelActivationPolicy::AllowTargetWithoutRaise,
-                Some(7),
-                42,
-                Some(99),
-            ),
-            None,
-            "do not overwrite an unrelated app that became frontmost"
-        );
-        assert_eq!(
-            background_pixel_restore_pid(
-                PixelActivationPolicy::SuppressTarget,
-                Some(7),
-                42,
-                Some(42),
-            ),
-            None,
-            "strict-suppression paths retain their existing ownership"
-        );
-    }
-}
-
-/// The native worker owns cleanup; dropping its async waiter cannot skip it.
-fn background_pixel_worker<T>(
-    prepare: impl FnOnce() -> anyhow::Result<bool>,
-    body: impl FnOnce(bool) -> anyhow::Result<T>,
-    restore: impl FnOnce(),
-) -> anyhow::Result<T> {
-    let activated = prepare()?;
-    crate::input::skylight::with_cleanup(restore, || body(activated))
 }
 
 #[cfg(test)]

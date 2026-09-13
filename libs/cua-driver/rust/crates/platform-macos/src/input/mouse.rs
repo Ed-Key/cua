@@ -552,38 +552,35 @@ fn click_at_xy_inner(
     })
 }
 
-/// Prepare a raw background pixel click by making the target AppKit-active
-/// without raising or restacking its window.
-///
-/// The Swift implementation ran this immediately before the stamped event
-/// stream. The original Rust port retained the SkyLight primitive but omitted
-/// this call while cursor-overlay repinning was incomplete. Callers should
-/// re-pin their overlay after this returns, then post the click sequence.
-///
-/// Returns whether the private focus-without-raise recipe succeeded. Event
-/// posting remains best-effort when the private APIs are unavailable.
-pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
-    prepare_background_pixel_click_checked(pid, wid, &|| Ok(())).unwrap_or(false)
-}
-
-pub(crate) fn prepare_background_pixel_click_checked(
+/// Keep target-only synthetic focus around the complete background mouse worker.
+/// The foreground process is never sent focus or defocus records by this scope.
+pub(crate) fn with_background_pixel_focus_checked<T>(
     pid: i32,
     wid: u32,
     admission: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<bool> {
-    let activated =
-        crate::input::skylight::activate_without_raise_checked(pid as libc::pid_t, wid, admission)?;
-    // Match Swift's settle interval so AppKit updates its active/key-window
-    // routing before the mouseMoved + primer + target stream arrives.
-    std::thread::sleep(std::time::Duration::from_millis(50));
-    Ok(activated)
+    body: impl FnOnce(bool) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    crate::input::skylight::with_target_only_focus_checked(pid, wid, admission, |used| {
+        if used {
+            // Together with the focus helper's 40 ms, retain the 50 ms prologue.
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        admission()?;
+        let result = body(used);
+        if used {
+            // SkyLight delivery crosses a renderer hop. Match PR 3530's bounded
+            // mouse-up consumption interval before removing synthetic focus.
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        }
+        result
+    })
 }
 
 /// Post the stamped event half of the Chromium-compatible left-click recipe
 /// matching Swift's `clickViaAuthSignedPost`.
 ///
 /// The sequence stays PID/window-routed throughout. The caller must first run
-/// [`prepare_background_pixel_click`] for background delivery, then re-pin any
+/// [`with_background_pixel_focus_checked`] for background delivery, then re-pin any
 /// cursor overlay before entering this event stream.
 ///  1. Stamped `mouseMoved` at target coords (f0=2, cursor-state primer).
 ///  2. Off-screen primer down/up at (-1, -1) (f0=1/2) — satisfies Chromium's

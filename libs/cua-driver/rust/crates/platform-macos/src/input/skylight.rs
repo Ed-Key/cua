@@ -492,33 +492,21 @@ impl SpaceQuery {
 
 // ── Focus-without-raise ───────────────────────────────────────────────────────
 
-/// Activate `target_pid`'s window `target_wid` without raising any windows
-/// or triggering Space-follow. Ported from yabai's
-/// `window_manager_focus_window_without_raise`.
-///
-/// Recipe:
-/// 1. `_SLPSGetFrontProcess` → capture current front PSN.
-/// 2. `SLSGetWindowOwner + SLSGetConnectionPSN` → target PSN, with
-///    `GetProcessForPID(target_pid)` as an older-system fallback.
-/// 3. Post 248-byte defocus record to front PSN (`bytes[0x8a] = 0x02`).
-/// 4. Post 248-byte focus record to target PSN (`bytes[0x8a] = 0x01`,
-///    `bytes[0x3c..0x3f]` = `target_wid` little-endian).
-///
-/// Deliberately skips `SLPSSetFrontProcessWithOptions` — see the Swift
-/// reference `FocusWithoutRaise.swift` for why omitting it keeps
-/// Chromium's user-activation gate open.
-///
-/// Returns `true` when all SPIs resolved and both posts succeeded.
-pub fn activate_without_raise(target_pid: pid_t, target_wid: u32) -> bool {
-    activate_without_raise_checked(target_pid, target_wid, &|| Ok(())).unwrap_or(false)
-}
-
-pub(crate) fn activate_without_raise_checked(
+/// Run background input with target-only synthetic focus. Admission is checked
+/// after native lookup and settling; cleanup remains inside the native worker.
+pub(crate) fn with_target_only_focus_checked<T>(
     target_pid: pid_t,
     target_wid: u32,
     admission: &dyn Fn() -> anyhow::Result<()>,
-) -> anyhow::Result<bool> {
-    focus_activation::background(&focus_activation::Native, target_pid, target_wid, admission)
+    body: impl FnOnce(bool) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    focus_activation::with_background(
+        &focus_activation::Native,
+        target_pid,
+        target_wid,
+        admission,
+        body,
+    )
 }
 
 // ── NSMenu shortcut activation ────────────────────────────────────────────────

@@ -406,7 +406,6 @@ impl DeliveryReceipt {
             handle.publish(sink.as_ref(), VisualPhase::Contact, timestamp);
         }
     }
-    #[cfg(test)]
     pub(crate) fn was_accepted(&self) -> bool {
         self.0.lock().unwrap().accepted.is_some()
     }
