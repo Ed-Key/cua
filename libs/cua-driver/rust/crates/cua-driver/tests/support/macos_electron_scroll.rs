@@ -54,7 +54,7 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
     let ws = cdp_page_websocket_for_url(fixture.cdp_port, &fixture.server.page_url());
     let read = || {
         harness_cdp_call_at_url(&ws, "Runtime.evaluate", serde_json::json!({
-        "expression":"({...window.scrollProbe,top:document.getElementById('history').scrollTop,outer:window.scrollY,focused:document.hasFocus(),visibility:document.visibilityState})",
+        "expression":r#"(()=>{const pane=document.getElementById('history');const bounds=pane.getBoundingClientRect();return {...window.scrollProbe,top:pane.scrollTop,outer:window.scrollY,focused:document.hasFocus(),visibility:document.visibilityState,visible_rows:[...pane.children].filter(row=>{const r=row.getBoundingClientRect();return row.textContent.startsWith('Message ')&&r.top>=bounds.top&&r.bottom<=bounds.bottom}).map(row=>row.textContent)}})()"#,
         "returnByValue":true
     }))["result"]["value"].clone()
     };
@@ -202,6 +202,7 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
         );
         assert!(outside.is_error(), "{}", outside.raw);
         assert_eq!(read()["top"], 0);
+        let scroll_started = Instant::now();
         let response = fixture.driver.call(
             "scroll",
             serde_json::json!({
@@ -209,6 +210,7 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                 "direction":"down","by":"page","amount":1,"delivery_mode":"background"
             }),
         );
+        let scroll_elapsed = scroll_started.elapsed();
         assert!(!response.is_error(), "{}", response.raw);
         assert_eq!(response.action_effect(), Some("unverifiable"));
         assert_eq!(response.action_route(), Some("synthetic_events"));
@@ -232,6 +234,46 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
             let events = after["events"].as_array().unwrap();
             assert!(!events.is_empty());
             assert!(events.iter().all(|e| e["trusted"] == true));
+            // Pick an actually visible row that was absent from the initial
+            // virtualized DOM, then require one fresh agent-facing AX read to
+            // expose it. Wheel receipts and DOM growth alone do not prove this.
+            let new_row = after["visible_rows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter_map(|row| row.as_str())
+                .find(|row| {
+                    row.strip_prefix("Message ")
+                        .and_then(|index| index.parse::<u64>().ok())
+                        .is_some_and(|index| index > before["last"].as_u64().unwrap())
+                })
+                .expect("scroll must reveal a newly rendered message inside the viewport");
+            let read_started = Instant::now();
+            let snapshot = fixture.driver.call(
+                "get_window_state",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id,"capture_mode":"ax"
+                }),
+            );
+            let read_elapsed = read_started.elapsed();
+            assert!(!snapshot.is_error(), "{}", snapshot.raw);
+            assert!(
+                snapshot.structured()["elements"]
+                    .as_array()
+                    .expect("structured accessibility elements")
+                    .iter()
+                    .any(|element| element["label"] == new_row || element["value"] == new_row),
+                "fresh AX read omitted newly visible {new_row}: {}",
+                snapshot.text()
+            );
+            eprintln!(
+                "[electron-scroll-timing] {}",
+                serde_json::json!({
+                    "scroll_call_ms":scroll_elapsed.as_secs_f64()*1000.0,
+                    "following_ax_read_ms":read_elapsed.as_secs_f64()*1000.0,
+                    "new_row":new_row
+                })
+            );
         }
         // Covered renderers may stall. This row proves honest dispatch status
         // and isolation only, never certifies scrolling from a tool response.
