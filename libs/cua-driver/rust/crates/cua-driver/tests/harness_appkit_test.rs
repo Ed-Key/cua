@@ -219,6 +219,33 @@ fn run_background_case_targeting(
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
+/// Diagnostic negative control for focused background runs that do not enable
+/// the full preflight's video capture. This deliberately changes foreground
+/// focus and injects a key into the sentinel, so run only on a test desktop.
+#[test]
+#[ignore]
+fn harness_appkit_background_guard_canary() {
+    let mut driver = McpDriver::spawn_macos_daemon_proxy_named("appkit-background-guard-canary")
+        .expect("start installed macOS daemon proxy");
+    let harness = Harness::launch();
+    let (wid, _) = driver
+        .find_window(harness.pid as i64, "CuaTestHarness AppKit")
+        .expect("find canary target window");
+    let sentinel = cua_driver_testkit::sentinel::ForegroundSentinel::launch(&mut driver);
+    sentinel
+        .assert_guard_canaries(
+            &mut driver,
+            TargetWindow {
+                pid: harness.pid,
+                native_id: wid,
+            },
+        )
+        .expect("observer must detect deliberate leaked input and native focus loss");
+    println!(
+        "Detected deliberate leaked input and native window blur; restored background posture."
+    );
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_foreground_single_click_has_one_ordered_native_pair() {
