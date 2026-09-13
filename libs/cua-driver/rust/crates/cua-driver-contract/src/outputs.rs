@@ -446,6 +446,9 @@ pub struct ActionDelivery {
 #[serde(rename_all = "snake_case")]
 pub enum ActionEvidenceKind {
     ValueReadback,
+    // Retained for existing wire/SDK consumers. New topology observations use
+    // `ActionResult::window_change`; this variant never confirms an action.
+    WindowChange,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
@@ -687,6 +690,27 @@ mod tests {
     }
 
     #[test]
+    fn action_result_preserves_legacy_window_change_evidence_without_confirming() {
+        let wire = json!({
+            "effect": "unverifiable",
+            "route": "accessibility",
+            "evidence": [{"kind": "window_change"}]
+        });
+        let mut result: ActionResult = serde_json::from_value(wire.clone())
+            .expect("previous SDK window_change evidence remains readable");
+        assert_eq!(serde_json::to_value(&result).unwrap(), wire);
+        assert_eq!(result.validate_invariants(), Ok(()));
+
+        // Keeping the wire enum must not make topology alone a successful
+        // postcondition or undo the observer's value-readback requirement.
+        result.effect = ActionEffect::Confirmed;
+        assert_eq!(
+            result.validate_invariants(),
+            Err(ActionResultValidationError::ConfirmedRequiresEvidence)
+        );
+    }
+
+    #[test]
     fn action_result_schema_is_exact_and_closed() {
         let schema = ActionResult::output_schema();
         assert_eq!(schema["additionalProperties"], false);
@@ -750,7 +774,7 @@ mod tests {
         assert_eq!(evidence["required"], json!(["kind"]));
         assert_eq!(
             evidence["properties"]["kind"]["enum"],
-            json!(["value_readback"])
+            json!(["value_readback", "window_change"])
         );
 
         let escalation = object_variant(&properties["escalation"]);

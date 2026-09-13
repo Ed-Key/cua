@@ -25,6 +25,15 @@ LIBRARY = Path(__file__).parents[1] / "src" / "cua_driver" / _library_name()
 
 @unittest.skipUnless(LIBRARY.exists(), "host-native UniFFI library is not staged")
 class GeneratedOptionsTests(unittest.TestCase):
+    def test_legacy_window_change_evidence_keeps_ffi_ordinal(self) -> None:
+        from cua_driver import _native_contract as contract
+
+        converter = contract._UniffiFfiConverterTypeActionEvidenceKind
+        value = contract.ActionEvidenceKind.WINDOW_CHANGE
+        buffer = converter.lower(value)
+        self.assertEqual(bytes(buffer.data[: buffer.len]), b"\x00\x00\x00\x02")
+        self.assertEqual(converter.lift(buffer), value)
+
     def test_embedded_overlay_option_defaults_false_and_accepts_true(self) -> None:
         from cua_driver import EmbeddedDriverHostOptions
 

@@ -30,7 +30,7 @@ Every successful action returns a closed `structuredContent` object:
 | `effect` | `confirmed`, `partial`, `unverifiable`, `suspected_noop`, `refused` |
 | `route` | `accessibility`, `synthetic_events`, `global_input`, `dom`, `trusted_input` |
 | `delivery.mode` | `background`, `foreground`, `not_applicable`, `unknown` |
-| `evidence[].kind` | `value_readback` |
+| `evidence[].kind` | `value_readback`; legacy `window_change` remains readable |
 | `window_change.new_windows[]` | target-scoped, owner-verified `pid`, `window_id`, application, and title |
 | `escalation.target` | `pixel`, `foreground`, `page`, `session`, `rebind` |
 | `escalation.reason` | `route_unavailable`, `delivery_failed`, `effect_unconfirmed`, `suspected_noop`, `permission_required`, `surface_changed` |
@@ -55,6 +55,11 @@ The invariants are:
 - `confirmed` has publishable value readback; topology alone cannot confirm an action;
 - `partial` has `delivery.delivered_count`;
 - `refused` has neither delivery nor evidence.
+
+The public `ActionEvidenceKind::WindowChange` variant and its `window_change`
+wire spelling remain available to existing SDK consumers. New topology reports
+use the separate `window_change` field. Legacy topology evidence alone does not
+satisfy the value-readback requirement for `confirmed`.
 
 ## Window target resolution
 

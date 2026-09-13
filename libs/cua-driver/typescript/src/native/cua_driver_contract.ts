@@ -299,7 +299,8 @@ const FfiConverterTypeActionEscalation = (() => {
 })();
 
 export enum ActionEvidenceKind {
-    ValueReadback
+    ValueReadback,
+    WindowChange
 }
 
 const FfiConverterTypeActionEvidenceKind = (() => {
@@ -309,12 +310,14 @@ const FfiConverterTypeActionEvidenceKind = (() => {
         read(from: RustBuffer): TypeName {
             switch (ordinalConverter.read(from)) {
                 case 1: return ActionEvidenceKind.ValueReadback;
+                case 2: return ActionEvidenceKind.WindowChange;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
         write(value: TypeName, into: RustBuffer): void {
             switch (value) {
                 case ActionEvidenceKind.ValueReadback: return ordinalConverter.write(1, into);
+                case ActionEvidenceKind.WindowChange: return ordinalConverter.write(2, into);
             }
         }
         allocationSize(value: TypeName): number {

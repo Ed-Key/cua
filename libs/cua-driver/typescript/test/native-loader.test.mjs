@@ -31,6 +31,27 @@ if (process.env.CUA_DRIVER_REQUIRE_UNIFFI === "1" && !existsSync(library)) {
 }
 
 test(
+  "legacy window-change evidence keeps its FFI ordinal",
+  { skip: !existsSync(library) },
+  async () => {
+    const { default: contract, ActionEvidenceKind } = await import(
+      "../dist/native/cua_driver_contract.js"
+    )
+    const { default: nativeModule } = await import(
+      "../dist/native/cua_driver_contract-ffi.js"
+    )
+    contract.initialize()
+    const converter = contract.converters.FfiConverterTypeActionEvidenceKind
+    const bytes = converter.lower(
+      ActionEvidenceKind.WindowChange,
+      nativeModule().rustbuffer_alloc,
+    )
+    assert.deepEqual(Array.from(bytes), [0, 0, 0, 2])
+    assert.equal(converter.lift(bytes), ActionEvidenceKind.WindowChange)
+  },
+)
+
+test(
   "embedded host supplies the private socket to the Rust SDK",
   { skip: process.platform === "win32" || !existsSync(library), timeout: 10_000 },
   async () => {

@@ -1205,6 +1205,8 @@ class ActionEvidenceKind(enum.Enum):
 
     VALUE_READBACK = 0
 
+    WINDOW_CHANGE = 1
+
 
 
 class _UniffiFfiConverterTypeActionEvidenceKind(_UniffiConverterRustBuffer):
@@ -1213,11 +1215,15 @@ class _UniffiFfiConverterTypeActionEvidenceKind(_UniffiConverterRustBuffer):
         variant = buf.read_i32()
         if variant == 1:
             return ActionEvidenceKind.VALUE_READBACK
+        if variant == 2:
+            return ActionEvidenceKind.WINDOW_CHANGE
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
     def check_lower(value):
         if value == ActionEvidenceKind.VALUE_READBACK:
+            return
+        if value == ActionEvidenceKind.WINDOW_CHANGE:
             return
         raise ValueError(value)
 
@@ -1225,6 +1231,8 @@ class _UniffiFfiConverterTypeActionEvidenceKind(_UniffiConverterRustBuffer):
     def write(value, buf):
         if value == ActionEvidenceKind.VALUE_READBACK:
             buf.write_i32(1)
+        if value == ActionEvidenceKind.WINDOW_CHANGE:
+            buf.write_i32(2)
 
 
 
