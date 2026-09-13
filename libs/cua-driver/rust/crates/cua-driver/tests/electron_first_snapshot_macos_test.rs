@@ -4,17 +4,32 @@
 //! snapshot after the fixture-owned journal reports that the page is ready.
 //! Run in a logged-in, TCC-authorized macOS session:
 //! cargo test -p cua-driver --test electron_first_snapshot_macos_test -- --ignored --nocapture --test-threads=1
+//! For a controlled local latency regression, set CUA_E2E_FIRST_AX_BUDGET_MS=2000.
+//! This optional budget distinguishes the cold screen-reader debounce from a
+//! ready native-API tree. It is not a universal desktop timing requirement.
 
 #![cfg(target_os = "macos")]
 
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
+use cua_driver_testkit::observer::TargetWindow;
+use cua_driver_testkit::sentinel::ForegroundSentinel;
 use cua_driver_testkit::{harness_app, spawn_in_job, Driver, FixtureJournal, McpDriver};
 
 #[test]
 #[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
 fn first_electron_snapshot_contains_ready_web_controls() {
+    check_first_snapshot(false);
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn first_background_electron_snapshot_contains_ready_web_controls() {
+    check_first_snapshot(true);
+}
+
+fn check_first_snapshot(background: bool) {
     let executable = harness_app(
         "harness-electron",
         "CuaTestHarness.Electron.app/Contents/MacOS/Electron",
@@ -27,6 +42,7 @@ fn first_electron_snapshot_contains_ready_web_controls() {
     let journal = FixtureJournal::start();
     let mut driver = McpDriver::spawn_macos_daemon_proxy_named("electron-first-ax-snapshot")
         .expect("authorized macOS daemon proxy");
+    let sentinel = background.then(|| ForegroundSentinel::launch(&mut driver));
     let port = std::net::TcpListener::bind(("127.0.0.1", 0))
         .expect("allocate fixture port")
         .local_addr()
@@ -76,14 +92,35 @@ fn first_electron_snapshot_contains_ready_web_controls() {
         std::thread::sleep(Duration::from_millis(25));
     };
 
-    let start = Instant::now();
-    let state = driver.call(
-        "get_window_state",
-        serde_json::json!({
-            "pid": pid, "window_id": wid, "include_screenshot": false,
-        }),
-    );
-    eprintln!("first Electron AX snapshot: {:?}", start.elapsed());
+    let target = TargetWindow {
+        pid,
+        native_id: wid,
+    };
+    if let Some(sentinel) = &sentinel {
+        sentinel
+            .prepare_background_observation(&mut driver, target)
+            .expect("owned sentinel covers the fresh Electron target");
+    }
+    let mut read = || {
+        let start = Instant::now();
+        let state = driver.call(
+            "get_window_state",
+            serde_json::json!({
+                "pid": pid, "window_id": wid, "include_screenshot": false,
+            }),
+        );
+        (state, start.elapsed())
+    };
+    let (state, elapsed) = if let Some(sentinel) = &sentinel {
+        let (result, oracles) = sentinel
+            .observe_background(target, read)
+            .expect("first read preserves foreground, cursor, z-order and input isolation");
+        eprintln!("first background snapshot oracles: {oracles:?}");
+        result
+    } else {
+        read()
+    };
+    eprintln!("first Electron AX snapshot: {elapsed:?}");
     assert!(!state.is_error(), "first snapshot failed: {}", state.text());
     let data = state.structured();
     let elements = data["elements"].as_array().expect("structured AX elements");
@@ -101,4 +138,12 @@ fn first_electron_snapshot_contains_ready_web_controls() {
         "first snapshot omitted the known Increment control: {}",
         state.text()
     );
+    if let Ok(budget) = std::env::var("CUA_E2E_FIRST_AX_BUDGET_MS") {
+        let budget = Duration::from_millis(budget.parse().expect("positive millisecond budget"));
+        assert!(!budget.is_zero(), "latency budget must be positive");
+        assert!(
+            elapsed <= budget,
+            "first useful snapshot exceeded the local latency budget: {elapsed:?} > {budget:?}"
+        );
+    }
 }

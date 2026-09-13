@@ -224,6 +224,12 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
         Attempt::Skip => return,
         Attempt::Run { prior_timeouts } => prior_timeouts,
     };
+    // Electron's application-role getter enables native accessibility APIs
+    // immediately, while AXManualAccessibility can debounce screen-reader mode
+    // for two seconds. Prime that read once per attempt, then keep the normal
+    // opt-in and readiness probe: a role value alone never proves web readiness.
+    // An unsupported or failed read falls through to the existing bounded wait.
+    let _ = copy_string_attr(app_element, "AXRole");
     let outcome = wait_outcome(
         enable_chromium_accessibility(app_element),
         prior_timeouts,
