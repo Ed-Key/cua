@@ -946,6 +946,12 @@ fn build_element_record(
     if let Some(settable) = node.value_settable {
         entry["value_settable"] = serde_json::Value::Bool(settable);
     }
+    if let Some(focused) = node.focused {
+        entry["focused"] = serde_json::json!(focused);
+    }
+    if let Some(selection) = &node.text_selection {
+        entry["text_selection"] = serde_json::json!(selection);
+    }
     if let Some(placeholder) = &node.placeholder {
         entry["placeholder"] = serde_json::Value::String(placeholder.clone());
     }
@@ -1184,6 +1190,8 @@ mod tests {
     ) -> AXNode {
         AXNode {
             value_settable: None,
+            focused: None,
+            text_selection: None,
             url: None,
             element_index: idx,
             role: role.into(),
@@ -1206,6 +1214,34 @@ mod tests {
             selected: None,
             in_web_content: false,
         }
+    }
+
+    #[test]
+    fn focused_selection_keeps_utf16_range_and_web_trust_marker() {
+        let mut field = node(Some(3), "AXTextField", Some("Draft"), 1, None, None, vec![]);
+        let absent = build_element_record(&field, None);
+        assert!(absent.get("focused").is_none());
+        assert!(absent.get("text_selection").is_none());
+        field.focused = Some(true);
+        field.in_web_content = true;
+        field.text_selection = Some(cua_driver_contract::TextSelection {
+            text: Some("".into()),
+            range: Some(cua_driver_contract::TextSelectionRange {
+                location: 5,
+                length: 0,
+            }),
+        });
+        let entry = build_element_record(&field, None);
+        assert_eq!(entry["focused"], true);
+        assert_eq!(
+            entry["text_selection"],
+            json!({"text":"","range":{"location":5,"length":0}})
+        );
+        assert_eq!(entry["in_web_content"], true);
+        assert!(
+            entry.get("effect").is_none(),
+            "observed selection is not an action confirmation"
+        );
     }
 
     #[test]
