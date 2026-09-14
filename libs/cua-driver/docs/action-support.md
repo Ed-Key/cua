@@ -61,6 +61,16 @@ integrity-level harness can exercise it.
 
 ## Native macOS
 
+Local macOS observation correction: `get_window_state` keeps an available
+`AXValue` exactly, including empty strings, spaces, tabs and newlines. It
+reports `AXPlaceholderValue` separately as optional `placeholder` metadata.
+Private verification consumes the same records. This does not make web value
+readback trusted. Windows and Linux adapters do not supply this placeholder
+field; their existing value handling is unchanged and has not been certified
+as lossless by the macOS tests. The shared JSON contract accepts an omitted
+placeholder. Native SDK libraries and generated bindings must be rebuilt
+together for the added record field.
+
 Local macOS typing correction: background web-editor keystrokes select the
 exact native keyboard window inside the existing target-only focus scope.
 An AX-focused editor alone does not prove that its window can receive keys.
