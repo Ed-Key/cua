@@ -380,10 +380,38 @@ fn background_open_panel_returns_a_typed_rebind() {
             "owned document before close: {}",
             document_state.text()
         );
+        // The public snapshot does not label native traffic-light buttons.
+        // Read AXCloseButton only as a fixture oracle, then deliver the cleanup
+        // click through Cua using its fresh token. No fixed screen coordinates.
+        let close_frame = textedit_close_button_frame(pid as i32, window_id)
+            .expect("owned document AXCloseButton frame");
+        let close_buttons: Vec<_> = document_state.structured()["elements"]
+            .as_array()
+            .expect("document cleanup elements")
+            .iter()
+            .filter(|element| {
+                element["role"] == "AXButton"
+                    && element["enabled"] == true
+                    && ["x", "y", "w", "h"]
+                        .iter()
+                        .zip(close_frame)
+                        .all(|(axis, want)| {
+                            element["frame"][axis]
+                                .as_f64()
+                                .is_some_and(|got| (got - want).abs() < 0.5)
+                        })
+            })
+            .collect();
+        assert_eq!(
+            close_buttons.len(),
+            1,
+            "unique owned document close control"
+        );
         let closed = driver.call(
-            "hotkey",
+            "click",
             serde_json::json!({
-                "pid": pid, "window_id": window_id, "keys": ["cmd", "w"],
+                "pid": pid, "window_id": window_id,
+                "element_token": close_buttons[0]["element_token"].as_str().expect("close token"),
                 "delivery_mode": "background"
             }),
         );
@@ -423,4 +451,33 @@ fn background_open_panel_returns_a_typed_rebind() {
         fixture.close().expect("remove TextEdit fixture directory");
         Observation::delivered(passed, Default::default())
     });
+}
+
+// Native metadata is fixture setup/cleanup only. The measured hotkey and both
+// cleanup clicks still use the public daemon transport.
+fn textedit_close_button_frame(pid: i32, window_id: u64) -> Option<[f64; 4]> {
+    use core_foundation::base::{CFRelease, CFTypeRef};
+    use platform_macos::ax::bindings::*;
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, 1.0);
+        let windows = copy_ax_windows(app);
+        let mut frame = None;
+        for window in windows {
+            AXUIElementSetMessagingTimeout(window, 1.0);
+            if ax_get_window_id(window).map(u64::from) == Some(window_id) {
+                if let Some(close) = copy_element_attr(window, "AXCloseButton") {
+                    AXUIElementSetMessagingTimeout(close, 1.0);
+                    frame = element_screen_rect(close);
+                    CFRelease(close as CFTypeRef);
+                }
+            }
+            CFRelease(window as CFTypeRef);
+        }
+        CFRelease(app as CFTypeRef);
+        frame
+    }
 }
