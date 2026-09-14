@@ -99,6 +99,19 @@ After an action, use `verify_state` for a bounded structured postcondition.
 retry or another ladder route. `unknown` means the available observation could
 not prove either answer and must never be promoted to success.
 
+On macOS, verification also observes display-only text from the existing AX
+walk. For example, a native `AXStaticText` counter can satisfy an exact
+`value_equals` predicate even though it has no click index. This uses the
+private observation path; public `get_window_state.elements` remains indexed,
+and verification does not replace the current action snapshot or mint tokens.
+Missing elements, ambiguous matches, unavailable control state, and untrusted
+web content retain their existing `unknown` behavior. The observation is still
+incomplete, so absence is not proof that an element does not exist.
+
+This display-text inclusion is currently implemented and tested on macOS only.
+Windows and Linux adapters have not been changed or certified for the same
+display-only predicate coverage; do not assume that coverage from this change.
+
 When `include_screenshot` is enabled, the screenshot is uninterpreted evidence.
 A multimodal harness reads it and decides whether to stop, retry, or advance.
 

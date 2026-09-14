@@ -1014,7 +1014,6 @@ fn harness_appkit_scroll_background() {
     });
 }
 
-/// counter: click the increment button via element_index, verify the
 /// Verification can read a display-only label without publishing a click target
 /// or replacing the action snapshot retained by this session.
 #[test]
@@ -1107,7 +1106,7 @@ fn harness_appkit_verify_display_text_preserves_action_snapshot() {
     );
 }
 
-/// counter label flips from 0 to 1.
+/// Click the increment button via element_index and verify the counter flips from 0 to 1.
 #[test]
 #[ignore]
 fn harness_appkit_counter() {
