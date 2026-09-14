@@ -3,7 +3,7 @@
 use super::*;
 use cua_driver_testkit::observer::{DesktopObserver, NativeObserver};
 
-fn run_scroll(covered: bool) {
+fn run_scroll(covered: bool, element_target: bool) {
     if !covered {
         assert!(
             unsafe { platform_macos::ax::bindings::AXIsProcessTrusted() },
@@ -202,14 +202,36 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
         );
         assert!(outside.is_error(), "{}", outside.raw);
         assert_eq!(read()["top"], 0);
+        let mut arguments = serde_json::json!({
+            "pid":fixture.pid,"window_id":fixture.window_id,"x":x,"y":y,
+            "direction":"down","by":"page","amount":1,"delivery_mode":"background"
+        });
+        if element_target {
+            // Resolve through the agent-facing AX response. CDP geometry above
+            // remains only the pixel control's input and independent oracle.
+            let snapshot = fixture.driver.call(
+                "get_window_state",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id,
+                    "include_screenshot":false
+                }),
+            );
+            assert!(!snapshot.is_error(), "{}", snapshot.raw);
+            let matches: Vec<_> = snapshot.structured()["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|entry| entry["label"] == "Message history")
+                .cloned()
+                .collect();
+            assert_eq!(matches.len(), 1, "one AX message pane: {}", snapshot.text());
+            let token = matches[0]["element_token"].as_str().unwrap();
+            arguments.as_object_mut().unwrap().remove("x");
+            arguments.as_object_mut().unwrap().remove("y");
+            arguments["element_token"] = serde_json::json!(token);
+        }
         let scroll_started = Instant::now();
-        let response = fixture.driver.call(
-            "scroll",
-            serde_json::json!({
-                "pid":fixture.pid,"window_id":fixture.window_id,"x":x,"y":y,
-                "direction":"down","by":"page","amount":1,"delivery_mode":"background"
-            }),
-        );
+        let response = fixture.driver.call("scroll", arguments);
         let scroll_elapsed = scroll_started.elapsed();
         assert!(!response.is_error(), "{}", response.raw);
         assert_eq!(response.action_effect(), Some("unverifiable"));
@@ -305,11 +327,23 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
 #[test]
 #[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
 fn visible_background_scroll_loads_rows() {
-    run_scroll(false);
+    run_scroll(false, false);
 }
 
 #[test]
 #[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
 fn covered_background_dispatch_stays_unverified() {
-    run_scroll(true);
+    run_scroll(true, false);
+}
+
+#[test]
+#[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
+fn visible_background_element_scroll_loads_rows() {
+    run_scroll(false, true);
+}
+
+#[test]
+#[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
+fn covered_background_element_dispatch_stays_unverified() {
+    run_scroll(true, true);
 }
