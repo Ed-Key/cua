@@ -88,24 +88,81 @@ fn consistent_selection(
 /// Read only the matched focused text node. Other nodes do not pay per-node AX
 /// focus queries. If focus moves during the read, discard the whole focus view.
 pub(crate) unsafe fn enrich_focused_state(pid: i32, nodes: &mut [AXNode]) {
-    let Some(before) = focused(pid) else { return };
+    let Some(before) = focused(pid) else {
+        enrich_web_reported_focus(nodes);
+        return;
+    };
     for node in nodes.iter_mut().filter(|node| node.element_index.is_some()) {
         let same = CFEqual(before.as_CFTypeRef(), node.element_ptr as CFTypeRef) != 0;
         node.focused = (same || is_text_role(&node.role)).then_some(same);
         node.text_selection = read_selection_if_focused(&node.role, same, || {
-            let element = node.element_ptr as AXUIElementRef;
-            if copy_string_attr(element, "AXSubrole").as_deref() == Some("AXSecureTextField") {
-                return None;
-            }
-            consistent_selection(
-                || read_range(element),
-                || copy_string_attr(element, "AXSelectedText"),
-            )
+            read_selection(node.element_ptr as AXUIElementRef)
         });
     }
     let unchanged =
         focused(pid).is_some_and(|after| CFEqual(before.as_CFTypeRef(), after.as_CFTypeRef()) != 0);
     retain_stable_focus(nodes, unchanged);
+    if !unchanged {
+        enrich_web_reported_focus(nodes);
+    }
+}
+
+unsafe fn read_selection(element: AXUIElementRef) -> Option<TextSelection> {
+    if copy_string_attr(element, "AXSubrole").as_deref() == Some("AXSecureTextField") {
+        return None;
+    }
+    consistent_selection(
+        || read_range(element),
+        || copy_string_attr(element, "AXSelectedText"),
+    )
+}
+
+fn unique_reported_focus(reported: &[Option<bool>]) -> Option<usize> {
+    let mut matches = reported
+        .iter()
+        .enumerate()
+        .filter(|(_, value)| **value == Some(true));
+    let (index, _) = matches.next()?;
+    matches.next().is_none().then_some(index)
+}
+
+fn stable_reported_selection(
+    selection: Option<TextSelection>,
+    after: Option<bool>,
+) -> Option<TextSelection> {
+    (after == Some(true)).then_some(selection).flatten()
+}
+
+/// Background Electron can expose AXFocused on its editor while the app-level
+/// focused-element lookup is unavailable. This is reported web AX state only;
+/// native key confirmation must never use this fallback.
+unsafe fn enrich_web_reported_focus(nodes: &mut [AXNode]) {
+    let indices: Vec<_> = nodes
+        .iter()
+        .enumerate()
+        .filter(|(_, node)| {
+            node.element_index.is_some() && node.in_web_content && is_text_role(&node.role)
+        })
+        .map(|(index, _)| index)
+        .collect();
+    let reported: Vec<_> = indices
+        .iter()
+        .map(|&index| copy_bool_attr(nodes[index].element_ptr as AXUIElementRef, "AXFocused"))
+        .collect();
+    for (&index, value) in indices.iter().zip(&reported) {
+        // Multiple claimed focuses remain unknown, not multiple active editors.
+        nodes[index].focused = (*value == Some(false)).then_some(false);
+        nodes[index].text_selection = None;
+    }
+    let Some(position) = unique_reported_focus(&reported) else {
+        return;
+    };
+    let node = &mut nodes[indices[position]];
+    let element = node.element_ptr as AXUIElementRef;
+    let selection = read_selection(element);
+    let after = copy_bool_attr(element, "AXFocused");
+    node.focused = (after == Some(true)).then_some(true);
+    node.text_selection = stable_reported_selection(selection, after);
 }
 
 pub(super) fn retain_stable_focus(nodes: &mut [AXNode], unchanged: bool) {
@@ -135,6 +192,34 @@ pub(crate) unsafe fn focused_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn web_fallback_requires_one_stable_reported_text_focus() {
+        assert_eq!(
+            unique_reported_focus(&[Some(false), Some(true), None]),
+            Some(1)
+        );
+        assert_eq!(unique_reported_focus(&[Some(true), Some(true)]), None);
+        assert_eq!(unique_reported_focus(&[Some(false), None]), None);
+        let selection = TextSelection {
+            text: Some("A".into()),
+            range: checked_range(0, 1),
+        };
+        assert_eq!(
+            stable_reported_selection(Some(selection.clone()), Some(true)),
+            Some(selection)
+        );
+        assert_eq!(
+            stable_reported_selection(
+                Some(TextSelection {
+                    text: None,
+                    range: checked_range(0, 1)
+                }),
+                None
+            ),
+            None
+        );
+    }
+
     #[test]
     fn changing_selection_discards_mixed_text_and_range() {
         let mut ranges = [checked_range(0, 1), checked_range(0, 3)].into_iter();

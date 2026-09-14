@@ -17,10 +17,15 @@ window snapshot or on a node omitted by truncation or filtering.
 
 On macOS, the reader matches `AXFocusedUIElement` against retained snapshot
 nodes, reads selection only for the matched text control, and rechecks focus.
-If focus changes while reading, it drops the focus/selection observation. Secure
+If focus changes while reading, it drops that app-level focus observation. Recognized secure
 text controls do not publish selected text through this addition. Native
 `press_key` verification also compares readable selection ranges on the same
 focused control. Unchanged or unavailable ranges do not confirm a key action.
+
+For background web content whose app-level focused-element lookup is unavailable,
+the reader accepts a single text control reporting `AXFocused=true` and rechecks
+that attribute after reading its selection. Multiple claimed focused editors
+remain unknown. This fallback is restricted to web text observations.
 
 For web content, these fields report the accessibility provider's state only.
 `in_web_content:true` remains the trust marker. The key verifier continues to

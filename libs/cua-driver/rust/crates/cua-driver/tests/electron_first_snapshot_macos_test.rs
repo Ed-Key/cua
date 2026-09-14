@@ -454,6 +454,12 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                         "web selection observation: {field}; renderer: {}",
                         journal.snapshot()["txt-input"]
                     );
+                    let _ = log_editor_focus(
+                        pid as i32,
+                        x / scale + bounds.x,
+                        y / scale + bounds.y,
+                        "selection observation",
+                    );
                     assert_eq!(field["in_web_content"], true);
                     assert_eq!(field["focused"], true);
                     assert_eq!(
