@@ -44,3 +44,36 @@ exclude the focused control, and each new snapshot retains the existing token
 lifecycle. This work is related to issue #2243, not a claim that all of that
 issue's native, Chromium, Electron, and lightweight-observation requirements
 have been certified.
+
+## Verifying a selection or caret
+
+The existing `verify_state` tool accepts an exact UTF-16 range with optional
+selected text. For example, verify the word `this` in `Keep this note.`:
+
+```json
+{"pid":42,"window_id":7,"expect":[{"element":{
+  "selector":{"role":"AXTextField","label_contains":"Draft message"},
+  "text_selection":{"location":5,"length":4,"text":"this"}
+}}],"include_screenshot":false}
+```
+
+Use `{"location":9,"length":0}` to check a caret. The predicate's location
+and length are required; `text` is optional. When supplied, its UTF-16 length
+must equal `length`. Overflowing range ends and inconsistent requests are
+rejected before observation, including when the predicate is in a later
+`run_sequence` step.
+
+The predicate requires one trusted matching control and readable focus and
+range metadata. Matching range and requested text on a focused native control
+is satisfied. A different range, different requested text, or explicitly false
+focus is unsatisfied. Missing or inconsistent metadata is unknown with reason
+`unsupported_predicate`; multiple matching native controls are `multi_match`.
+Web targets remain `untrusted_source` even when their AX selection matches.
+Windows, X11, and Wayland snapshots currently omit this metadata and therefore
+cannot satisfy the new predicate; this does not claim an OS limitation.
+
+The result uses the same polling, stability, and bounded evidence as other
+predicates. Evidence includes focus and text-selection metadata. It reuses
+the existing snapshot reads and does not introduce a new observer or retry
+input. This verifies observed state, not which prior action caused it. The
+existing `selected` predicate checks element selection, not selected text.

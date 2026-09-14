@@ -91,6 +91,9 @@ fn malformed_later_steps_are_protocol_errors_before_native_dispatch() {
             "expect":[{"window":{"exists":true}}], "timeout_ms":0,"stable_samples":2}),
         json!({"tool":"click", "arguments":{"x":10},
             "expect":[{"window":{"exists":true}}]}),
+        json!({"tool":"type_text", "arguments":{"text":"unused"},
+            "expect":[{"element":{"selector":{"role":"AXTextField"},
+                "text_selection":{"location":0,"length":1,"text":"😀"}}}]}),
     ];
     for (index, later) in cases.into_iter().enumerate() {
         driver.send(

@@ -53,8 +53,8 @@ pub use outputs::{
 };
 pub use verification::{
     BoundsExpectation, ElementPredicate, ElementSelector, PredicateOutcome, StatePredicate,
-    UnknownReason, VerificationStatus, VerifyStateInput, VerifyStateOutput, WindowPredicate,
-    VERIFY_STATE_DEFAULT_TIMEOUT_MS,
+    TextSelectionPredicate, UnknownReason, VerificationStatus, VerifyStateInput, VerifyStateOutput,
+    WindowPredicate, VERIFY_STATE_DEFAULT_TIMEOUT_MS,
 };
 
 /// Shape version for the MCP `tools/list` result emitted by cua-driver.
