@@ -84,9 +84,19 @@ impl ObservedActionTool {
         End: std::future::Future<Output = ToolResult>,
     {
         crate::background_mutation::with_observation_lease(pid, async {
+            let started = Instant::now();
             let before = start.await;
+            tracing::debug!(pid, tool = %self.inner.def().name, phase = "before_complete",
+                elapsed_ms = started.elapsed().as_millis() as u64, "post-action observer lifecycle");
+            let action_started = Instant::now();
             let result = self.inner.invoke(args).await;
-            finish(before, result).await
+            tracing::debug!(pid, tool = %self.inner.def().name, phase = "actuator_complete",
+                elapsed_ms = action_started.elapsed().as_millis() as u64, "post-action observer lifecycle");
+            let result = finish(before, result).await;
+            tracing::debug!(pid, tool = %self.inner.def().name, phase = "complete",
+                elapsed_ms = started.elapsed().as_millis() as u64,
+                has_delta = result.surface_delta.is_some(), "post-action observer lifecycle");
+            result
         })
         .await
     }
@@ -188,7 +198,15 @@ fn observe_delta(
     before: RootObservation,
 ) -> Option<ActionSurfaceDelta> {
     // Without a complete baseline, an existing root cannot be called new.
-    before.roots.as_ref()?;
+    let started = Instant::now();
+    if before.roots.is_none() {
+        tracing::debug!(
+            pid,
+            reason = "before_unavailable",
+            "surface observation stopped"
+        );
+        return None;
+    }
     let deadline = Instant::now() + OBSERVATION_TIMEOUT;
     let signaled = loop {
         if foreground_changed(prior_front)
@@ -202,20 +220,50 @@ fn observe_delta(
         std::thread::sleep(POLL_INTERVAL);
     };
 
+    tracing::debug!(
+        pid,
+        signaled,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "surface observation signal wait complete"
+    );
     let mut after = snapshot_roots(pid);
-    after.as_ref()?;
+    if after.is_none() {
+        tracing::debug!(
+            pid,
+            reason = "after_unavailable",
+            attempt = 0,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "surface observation stopped"
+        );
+        return None;
+    }
     let mut appeared = appeared_roots(&before.roots, &after);
     if appeared.is_empty() && signaled {
-        for _ in 0..CATCH_UP_ATTEMPTS {
+        for attempt in 1..=CATCH_UP_ATTEMPTS {
             std::thread::sleep(CATCH_UP_INTERVAL);
             after = snapshot_roots(pid);
-            after.as_ref()?;
+            if after.is_none() {
+                tracing::debug!(
+                    pid,
+                    reason = "after_unavailable",
+                    attempt,
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    "surface observation stopped"
+                );
+                return None;
+            }
             appeared = appeared_roots(&before.roots, &after);
             if !appeared.is_empty() {
                 break;
             }
         }
     }
+    tracing::debug!(
+        pid,
+        appeared_count = appeared.len(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "surface observation AX diff complete"
+    );
     resolve_appeared_roots(pid, &appeared, foreground_changed(prior_front))
 }
 
@@ -257,6 +305,13 @@ fn resolve_appeared_roots(
         resolved = resolve_candidates(pid, &app_name, roots, &crate::windows::all_windows());
     }
     let incomplete = resolved.len() != roots.len();
+    tracing::debug!(
+        pid,
+        candidate_count = roots.len(),
+        resolved_count = resolved.len(),
+        incomplete,
+        "surface observation ownership complete"
+    );
     let mut delta = resolve_surface_delta(resolved, foreground_changed)?;
     if incomplete {
         delta.rebind = None;
@@ -416,6 +471,7 @@ impl SnapshotReader {
 }
 
 fn snapshot_roots(pid: i32) -> Option<RootSnapshot> {
+    let started = Instant::now();
     let result = (|| unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
@@ -449,6 +505,11 @@ fn snapshot_roots(pid: i32) -> Option<RootSnapshot> {
             "AX root snapshot unavailable; no surface delta will be inferred"
         );
     }
+    tracing::debug!(pid, complete = result.is_ok(),
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        window_ids = ?result.as_ref().ok().map(|roots| roots.values()
+            .filter_map(|root| root.window_id).collect::<Vec<_>>()),
+        "surface observation AX snapshot complete");
     result.ok()
 }
 
