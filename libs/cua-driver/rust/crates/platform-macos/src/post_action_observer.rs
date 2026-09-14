@@ -512,7 +512,7 @@ fn snapshot_roots(pid: i32) -> Option<RootSnapshot> {
         tracing::debug!(
             pid,
             ?error,
-            "AX root snapshot unavailable; no surface delta will be inferred"
+            "AX root snapshot unavailable for this attempt"
         );
     }
     tracing::debug!(pid, complete = result.is_ok(),
