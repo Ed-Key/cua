@@ -61,3 +61,83 @@ mod tests {
         );
     }
 }
+
+/// Select trusted preorder row positions, without interpreting display text.
+pub fn select_preorder_rows(
+    rows: impl IntoIterator<Item = (usize, bool)>,
+    include_descendants: bool,
+) -> Vec<usize> {
+    let mut parents: Vec<Option<usize>> = Vec::new();
+    let mut under_match: Vec<bool> = Vec::new();
+    let mut selected: Vec<bool> = Vec::new();
+    let mut stack: Vec<(usize, usize)> = Vec::new();
+    for (depth, matches) in rows {
+        while stack
+            .last()
+            .is_some_and(|(parent_depth, _)| *parent_depth >= depth)
+        {
+            stack.pop();
+        }
+        let parent = stack.last().map(|(_, position)| *position);
+        let ancestor_matches = parent.is_some_and(|position| under_match[position]);
+        parents.push(parent);
+        under_match.push(matches || ancestor_matches);
+        selected.push(matches || (include_descendants && ancestor_matches));
+        stack.push((depth, selected.len() - 1));
+    }
+    // Propagate selection upward only after descendant selection is finished,
+    // so a retained ancestor cannot accidentally pull in a sibling branch.
+    for position in (0..selected.len()).rev() {
+        if selected[position] {
+            if let Some(parent) = parents[position] {
+                selected[parent] = true;
+            }
+        }
+    }
+    selected
+        .into_iter()
+        .enumerate()
+        .filter_map(|(i, keep)| keep.then_some(i))
+        .collect()
+}
+
+#[cfg(test)]
+mod preorder_tests {
+    use super::select_preorder_rows;
+
+    #[test]
+    fn query_matches_keep_only_their_actual_ancestors() {
+        let rows = [
+            (0, false),
+            (1, true),
+            (2, false),
+            (1, false),
+            (2, true),
+            (0, false),
+        ];
+        assert_eq!(select_preorder_rows(rows, false), vec![0, 1, 3, 4]);
+    }
+
+    #[test]
+    fn context_includes_descendants_without_leaking_to_siblings_or_other_roots() {
+        let rows = [
+            (0, false),
+            (1, true),
+            (2, false),
+            (1, false),
+            (2, true),
+            (0, false),
+        ];
+        assert_eq!(select_preorder_rows(rows, true), vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn skipped_depths_still_use_the_nearest_actual_ancestor() {
+        assert_eq!(
+            select_preorder_rows([(0, false), (4, false), (5, false), (4, true)], false),
+            vec![0, 3]
+        );
+        assert!(select_preorder_rows([(0, false), (1, false)], true).is_empty());
+        assert!(select_preorder_rows([], true).is_empty());
+    }
+}

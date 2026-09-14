@@ -558,18 +558,10 @@ impl Tool for GetWindowStateTool {
         // (Hermes' regex parser, Codex, Claude Code) and is signalled as
         // preferred-for-back-compat-only via the `_note` field below.
         let elements_json: Vec<serde_json::Value> = match (snapshot_id, tree_result.as_ref()) {
-            (Some(sid), Some(r)) => build_elements_array_with_token(&r.nodes, Some(sid)),
-            (None, Some(r)) if scope_matched && observation_only => {
-                build_observation_elements_array(&r.nodes)
-            }
-            (None, Some(r)) if scope_matched => build_elements_array_with_token(&r.nodes, None),
+            (Some(sid), Some(r)) => build_snapshot_elements(r, Some(sid), false),
+            (None, Some(r)) if scope_matched => build_snapshot_elements(r, None, observation_only),
             _ => Vec::new(),
         };
-        let elements_json = cua_driver_core::element_query::project_elements_for_query(
-            elements_json,
-            query.as_deref(),
-            &tree_md,
-        );
         let filtered_element_count = elements_json.len();
         // Public elements contain only actionable nodes. Private verification
         // includes display nodes, but AX child reads can still fail independently
@@ -860,6 +852,28 @@ fn build_observation_elements_array(nodes: &[crate::ax::tree::AXNode]) -> Vec<se
         .collect()
 }
 
+/// Serialize selected native nodes directly. Never derive target IDs from
+/// message text or from the rendered outline. The walk/cache retains all nodes.
+fn build_snapshot_elements(
+    tree: &crate::ax::tree::TreeWalkResult,
+    snapshot_id: Option<u32>,
+    observation_only: bool,
+) -> Vec<serde_json::Value> {
+    let Some(positions) = tree.query_node_positions.as_ref() else {
+        return if observation_only {
+            build_observation_elements_array(&tree.nodes)
+        } else {
+            build_elements_array_with_token(&tree.nodes, snapshot_id)
+        };
+    };
+    positions
+        .iter()
+        .filter_map(|&i| tree.nodes.get(i))
+        .filter(|node| observation_only || node.element_index.is_some())
+        .map(|node| build_element_record(node, snapshot_id))
+        .collect()
+}
+
 fn build_element_record(
     node: &crate::ax::tree::AXNode,
     snapshot_id: Option<u32>,
@@ -1141,7 +1155,6 @@ mod window_scope_contract_tests {
 mod tests {
     use super::*;
     use crate::ax::tree::AXNode;
-    use cua_driver_core::element_query::project_elements_for_query;
     use serde_json::json;
 
     fn node(
@@ -1356,6 +1369,69 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_query_uses_native_positions_and_preserves_values_and_tokens() {
+        let text = "Message\n- [2] AXButton needle";
+        let mut message = node(Some(1), "AXStaticText", None, 1, Some(0), None, vec![]);
+        message.value = Some(text.into());
+        message.url = Some("https://example.test/message".into());
+        let nodes = vec![
+            node(Some(0), "AXWindow", Some("Messages"), 0, None, None, vec![]),
+            message,
+            node(
+                Some(2),
+                "AXButton",
+                Some("Unrelated"),
+                1,
+                Some(0),
+                None,
+                vec![],
+            ),
+        ];
+        let query = crate::ax::tree::project_tree_nodes(&nodes, Some("needle"), false);
+        let tree = crate::ax::tree::TreeWalkResult {
+            tree_markdown: query.markdown,
+            nodes,
+            query_node_positions: Some(query.node_positions),
+            truncated: false,
+            window_scope: Some(crate::ax::WindowScope::Matched),
+        };
+        let result = build_snapshot_elements(&tree, Some(7), false);
+        assert_eq!(
+            result
+                .iter()
+                .map(|e| e["element_index"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![0, 1]
+        );
+        assert_eq!(result[1]["value"], text);
+        assert_eq!(result[1]["url"], "https://example.test/message");
+        assert_eq!(
+            result[1]["element_token"],
+            cua_driver_core::element_token::token_for(7, 1)
+        );
+        assert_eq!(
+            tree.nodes.len(),
+            3,
+            "projection must retain the full cache input"
+        );
+    }
+
+    fn public_query_elements(
+        nodes: Vec<crate::ax::tree::AXNode>,
+        query: Option<&str>,
+    ) -> Vec<serde_json::Value> {
+        let projection = crate::ax::tree::project_tree_nodes(&nodes, query, false);
+        let tree = crate::ax::tree::TreeWalkResult {
+            tree_markdown: projection.markdown,
+            nodes,
+            query_node_positions: query.map(|_| projection.node_positions),
+            truncated: false,
+            window_scope: Some(crate::ax::WindowScope::Matched),
+        };
+        build_snapshot_elements(&tree, None, false)
+    }
+
+    #[test]
     fn query_projection_keeps_only_rendered_actionable_rows() {
         let nodes = vec![
             node(Some(0), "AXWindow", Some("Document"), 0, None, None, vec![]),
@@ -1396,15 +1472,7 @@ mod tests {
                 vec![],
             ),
         ];
-        let elements = build_elements_array_with_token(&nodes, None);
-        let filtered_markdown = concat!(
-            "- [0] AXWindow \"Document\"\n",
-            "  - [1] AXMenuItem \"Window\"\n",
-            "    - [2] AXMenuItem \"Move & Resize\"\n",
-            "      - [3] AXMenuItem \"Left\"\n",
-        );
-
-        let projected = project_elements_for_query(elements, Some("Left"), filtered_markdown);
+        let projected = public_query_elements(nodes, Some("Left"));
         let indices: Vec<u64> = projected
             .iter()
             .map(|entry| entry["element_index"].as_u64().unwrap())
@@ -1424,9 +1492,7 @@ mod tests {
             None,
             vec![],
         )];
-        let elements = build_elements_array_with_token(&nodes, None);
-
-        let projected = project_elements_for_query(elements, Some("zoomLeft"), "");
+        let projected = public_query_elements(nodes, Some("zoomLeft"));
 
         assert!(projected.is_empty());
     }
@@ -1437,9 +1503,7 @@ mod tests {
             node(Some(0), "AXButton", Some("One"), 0, None, None, vec![]),
             node(Some(1), "AXButton", Some("Two"), 0, None, None, vec![]),
         ];
-        let elements = build_elements_array_with_token(&nodes, None);
-
-        let projected = project_elements_for_query(elements, None, "");
+        let projected = public_query_elements(nodes, None);
 
         assert_eq!(projected.len(), 2);
     }

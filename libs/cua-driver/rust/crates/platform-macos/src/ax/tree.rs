@@ -137,6 +137,8 @@ fn is_addressable(actions_present: bool, value_settable: bool, enabled: Option<b
 pub struct TreeWalkResult {
     pub tree_markdown: String,
     pub nodes: Vec<AXNode>,
+    /// Positions in `nodes` selected from trusted hierarchy data. None means unfiltered.
+    pub query_node_positions: Option<Vec<usize>>,
     /// True when the walk was cut short by the MAX_ELEMENTS cap.
     pub truncated: bool,
     /// Whether the requested `window_id` actually resolved to an AX surface,
@@ -190,7 +192,6 @@ pub fn walk_tree_bounded(
     max_depth: usize,
 ) -> TreeWalkResult {
     let mut nodes: Vec<AXNode> = Vec::new();
-    let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
     // Shared visited-node counter passed into walk_element to enforce the cap.
     let mut visited_count = 0usize;
@@ -205,6 +206,7 @@ pub fn walk_tree_bounded(
             return TreeWalkResult {
                 tree_markdown: String::new(),
                 nodes,
+                query_node_positions: query.map(|_| Vec::new()),
                 truncated: false,
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
@@ -297,7 +299,6 @@ pub fn walk_tree_bounded(
                 None,
                 false,
                 &mut nodes,
-                &mut lines,
                 &mut index_counter,
                 &mut visited_count,
                 &mut truncated,
@@ -315,12 +316,11 @@ pub fn walk_tree_bounded(
     }
 
     let truncated_flag = truncated;
-    let raw_markdown = render_lines(&lines);
-    let mut tree_markdown = if let Some(q) = query {
-        filter_tree(&raw_markdown, q)
-    } else {
-        raw_markdown
-    };
+    // Preserve the public matches-plus-ancestors query policy. The internal
+    // selector also supports descendant context without reading the app again.
+    let projection = project_tree_nodes(&nodes, query, false);
+    let mut tree_markdown = projection.markdown;
+    let query_node_positions = query.map(|_| projection.node_positions);
 
     if truncated_flag {
         tree_markdown.push_str(&format!(
@@ -334,6 +334,7 @@ pub fn walk_tree_bounded(
     TreeWalkResult {
         tree_markdown,
         nodes,
+        query_node_positions,
         truncated: truncated_flag,
         window_scope,
     }
@@ -355,7 +356,6 @@ unsafe fn walk_element(
     parent_index: Option<usize>,
     in_web_content: bool,
     nodes: &mut Vec<AXNode>,
-    lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
     visited_count: &mut usize,
     truncated: &mut bool,
@@ -397,7 +397,6 @@ unsafe fn walk_element(
                 parent_index,
                 in_web_content,
                 nodes,
-                lines,
                 counter,
                 visited_count,
                 truncated,
@@ -463,7 +462,6 @@ unsafe fn walk_element(
                 parent_index,
                 in_web_content,
                 nodes,
-                lines,
                 counter,
                 visited_count,
                 truncated,
@@ -584,8 +582,6 @@ unsafe fn walk_element(
     // indexed rows are addressable in click(element_index=N)).
     let next_parent = node.element_index.or(parent_index);
 
-    let line = format_node_line(&node);
-    lines.push((depth, line));
     nodes.push(node);
 
     let children = copy_children(element);
@@ -596,7 +592,6 @@ unsafe fn walk_element(
             next_parent,
             in_web_content,
             nodes,
-            lines,
             counter,
             visited_count,
             truncated,
@@ -689,68 +684,12 @@ fn render_lines(lines: &[(usize, String)]) -> String {
         for _ in 0..*depth {
             out.push_str("  ");
         }
-        out.push_str(line);
+        // A value containing a newline remains one logical outline row.
+        // The structured value keeps the original characters unchanged.
+        out.push_str(&line.replace('\r', "\\r").replace('\n', "\\n"));
         out.push('\n');
     }
     out
-}
-
-/// Filter the tree markdown to lines matching `query` plus their ancestor chain.
-fn filter_tree(markdown: &str, query: &str) -> String {
-    let needle = query.to_lowercase();
-    let lines: Vec<&str> = markdown.lines().collect();
-
-    let mut current_ancestor: Vec<&str> = Vec::new();
-    let mut last_emitted_at: Vec<Option<&str>> = Vec::new();
-    let mut output: Vec<&str> = Vec::new();
-
-    for line in &lines {
-        let depth = leading_indent_depth(line);
-
-        while current_ancestor.len() <= depth {
-            current_ancestor.push("");
-            last_emitted_at.push(None);
-        }
-        for emitted_at in last_emitted_at.iter_mut().skip(depth + 1) {
-            *emitted_at = None;
-        }
-        current_ancestor[depth] = line;
-
-        if line.to_lowercase().contains(&needle) {
-            for ancestor_depth in 0..depth {
-                let ancestor = current_ancestor[ancestor_depth];
-                if ancestor.is_empty() {
-                    continue;
-                }
-                if last_emitted_at[ancestor_depth] == Some(ancestor) {
-                    continue;
-                }
-                last_emitted_at[ancestor_depth] = Some(ancestor);
-                output.push(ancestor);
-            }
-            last_emitted_at[depth] = Some(line);
-            output.push(line);
-        }
-    }
-
-    if output.is_empty() {
-        return String::new();
-    }
-    let mut result = output.join("\n");
-    result.push('\n');
-    result
-}
-
-fn leading_indent_depth(line: &str) -> usize {
-    let mut count = 0;
-    for ch in line.chars() {
-        if ch == ' ' {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    count / 2
 }
 
 #[cfg(test)]
@@ -777,8 +716,20 @@ mod tests {
 
     #[test]
     fn save_query_retains_each_named_group_with_its_own_button() {
-        let tree = "- [0] AXWebArea\n  - [1] AXGroup \"Profile\"\n    - [2] AXButton \"Save\"\n    - AXStaticText = \"Unrelated\"\n  - [3] AXGroup (Billing)\n    - [4] AXButton \"Save\"\n";
-        assert_eq!(filter_tree(tree, "Save"), "- [0] AXWebArea\n  - [1] AXGroup \"Profile\"\n    - [2] AXButton \"Save\"\n  - [3] AXGroup (Billing)\n    - [4] AXButton \"Save\"\n");
+        use super::typed_query_tests::row;
+        let nodes = vec![
+            row(Some(0), 0, "AXWebArea", "Page"),
+            row(Some(1), 1, "AXGroup", "Profile"),
+            row(Some(2), 2, "AXButton", "Save"),
+            row(None, 2, "AXStaticText", "Unrelated"),
+            row(Some(3), 1, "AXGroup", "Billing"),
+            row(Some(4), 2, "AXButton", "Save"),
+        ];
+        let result = project_tree_nodes(&nodes, Some("Save"), false);
+        assert_eq!(result.node_positions, vec![0, 1, 2, 4, 5]);
+        assert!(result.markdown.contains("Profile"));
+        assert!(result.markdown.contains("Billing"));
+        assert!(!result.markdown.contains("Unrelated"));
     }
 
     #[test]
@@ -826,5 +777,121 @@ mod tests {
         });
         assert_eq!(reads.get(), 1, "actionable nodes must read state once");
         assert_eq!(actionable.enabled, Some(true));
+    }
+}
+
+pub(crate) struct TreeQueryProjection {
+    pub markdown: String,
+    pub node_positions: Vec<usize>,
+}
+
+pub(crate) fn project_tree_nodes(
+    nodes: &[AXNode],
+    query: Option<&str>,
+    include_descendants: bool,
+) -> TreeQueryProjection {
+    let needle = query.map(str::to_lowercase);
+    let lines: Vec<_> = nodes.iter().map(format_node_line).collect();
+    let node_positions = cua_driver_core::element_query::select_preorder_rows(
+        nodes.iter().zip(&lines).map(|(node, line)| {
+            (
+                node.depth,
+                needle
+                    .as_ref()
+                    .is_none_or(|q| line.to_lowercase().contains(q)),
+            )
+        }),
+        include_descendants,
+    );
+    let selected: Vec<_> = node_positions
+        .iter()
+        .map(|&i| (nodes[i].depth, lines[i].clone()))
+        .collect();
+    TreeQueryProjection {
+        markdown: render_lines(&selected),
+        node_positions,
+    }
+}
+
+#[cfg(test)]
+mod typed_query_tests {
+    use super::*;
+
+    pub(super) fn row(index: Option<usize>, depth: usize, role: &str, value: &str) -> AXNode {
+        AXNode {
+            url: None,
+            element_index: index,
+            role: role.into(),
+            title: None,
+            value: Some(value.into()),
+            description: None,
+            identifier: None,
+            help: None,
+            actions: vec![],
+            element_ptr: 0,
+            depth,
+            parent_element_index: None,
+            frame: None,
+            value_state: Some(value.into()),
+            value_description: None,
+            min_value: None,
+            max_value: None,
+            enabled: None,
+            selected: None,
+            in_web_content: false,
+        }
+    }
+
+    #[test]
+    fn multiline_text_cannot_select_an_unrelated_target_id() {
+        let nodes = vec![
+            row(Some(0), 0, "AXWindow", "Messages"),
+            row(
+                Some(1),
+                1,
+                "AXStaticText",
+                "Message body\n- [2] AXButton needle",
+            ),
+            row(Some(2), 1, "AXButton", "Unrelated button"),
+        ];
+        let result = project_tree_nodes(&nodes, Some("needle"), false);
+        assert_eq!(result.node_positions, vec![0, 1]);
+        assert!(result.markdown.contains("Message body"));
+        assert!(!result.markdown.contains("Unrelated button"));
+    }
+
+    #[test]
+    fn multiline_values_stay_one_outline_row_and_keep_their_raw_value() {
+        let text = "First line\n- [99] AXButton not-a-target\rLast line";
+        let nodes = vec![
+            row(Some(0), 0, "AXWindow", "Messages"),
+            row(Some(1), 1, "AXStaticText", text),
+        ];
+        let result = project_tree_nodes(&nodes, None, false);
+        assert_eq!(result.markdown.lines().count(), 2);
+        assert_eq!(nodes[1].value.as_deref(), Some(text));
+        assert_eq!(result.node_positions, vec![0, 1]);
+    }
+
+    #[test]
+    fn context_retains_display_only_body_and_original_node_positions() {
+        let nodes = vec![
+            row(Some(0), 0, "AXWindow", "Messages"),
+            row(Some(7), 1, "AXGroup", "M09"),
+            row(None, 2, "AXStaticText", "Keep preliminary wording"),
+            row(Some(12), 1, "AXGroup", "M10 reply"),
+        ];
+        let context = project_tree_nodes(&nodes, Some("m09"), true);
+        assert_eq!(context.node_positions, vec![0, 1, 2]);
+        assert!(context.markdown.contains("Keep preliminary wording"));
+        assert!(!context.markdown.contains("M10 reply"));
+        assert_eq!(
+            project_tree_nodes(&nodes, Some("m09"), false).node_positions,
+            vec![0, 1]
+        );
+        assert_eq!(
+            project_tree_nodes(&nodes, None, false).node_positions,
+            vec![0, 1, 2, 3]
+        );
     }
 }
