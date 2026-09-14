@@ -279,6 +279,28 @@ fn background_open_panel_returns_a_typed_rebind() {
                 "delivery_mode": "background"
             }),
         );
+        let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let windows = driver.call("list_windows", serde_json::json!({"pid": panel_pid}));
+            assert!(!windows.is_error(), "panel cleanup read: {}", windows.text());
+            let still_visible = windows.structured()["windows"]
+                .as_array()
+                .expect("panel cleanup windows")
+                .iter()
+                .any(|window| {
+                    window["window_id"].as_u64() == Some(panel_window_id)
+                        && window["is_on_screen"] == true
+                });
+            if !still_visible {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < cleanup_deadline,
+                "Open panel remained visible after cleanup: {}",
+                windows.text()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
         Observation::delivered(passed, Default::default())
     });
 }
