@@ -433,8 +433,11 @@ fn background_open_panel_returns_a_typed_rebind() {
                 .as_array()
                 .expect("document cleanup windows")
                 .iter()
-                .any(|window| window["window_id"].as_u64() == Some(window_id));
-            if !present {
+                .any(|window| {
+                    window["window_id"].as_u64() == Some(window_id)
+                        && window["is_on_screen"] == true
+                });
+            if !present && !textedit_has_ax_window(pid as i32, window_id) {
                 break;
             }
             assert!(
@@ -480,5 +483,53 @@ fn textedit_close_button_frame(pid: i32, window_id: u64) -> Option<[f64; 4]> {
         }
         CFRelease(app as CFTypeRef);
         frame
+    }
+}
+
+// WindowServer can retain a closed NSWindow's record. Require a successful AX
+// window-list read as well as disappearance from the screen before cleanup passes.
+fn textedit_has_ax_window(pid: i32, window_id: u64) -> bool {
+    use core_foundation::array::{CFArray, CFArrayRef};
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use core_foundation::string::CFString;
+    use platform_macos::ax::bindings::*;
+    unsafe {
+        let app_ref = AXUIElementCreateApplication(pid);
+        assert!(!app_ref.is_null(), "cleanup application AX object");
+        let _app = CFType::wrap_under_create_rule(app_ref as CFTypeRef);
+        assert_eq!(
+            AXUIElementSetMessagingTimeout(app_ref, 1.0),
+            kAXErrorSuccess
+        );
+        let attribute = CFString::new("AXWindows");
+        let mut raw = std::ptr::null();
+        let status =
+            AXUIElementCopyAttributeValue(app_ref, attribute.as_concrete_TypeRef(), &mut raw);
+        // Own even an unexpected non-null result before an assertion can unwind.
+        let value = (!raw.is_null()).then(|| CFType::wrap_under_create_rule(raw));
+        assert_eq!(status, kAXErrorSuccess, "cleanup AXWindows read failed");
+        let value = value.expect("cleanup AXWindows value");
+        assert_eq!(
+            value.type_of(),
+            CFArray::<CFType>::type_id(),
+            "cleanup AXWindows type"
+        );
+        let windows = CFArray::<CFType>::wrap_under_get_rule(value.as_CFTypeRef() as CFArrayRef);
+        windows.iter().any(|window| {
+            assert_eq!(
+                window.type_of(),
+                AXUIElementGetTypeID(),
+                "cleanup AXWindow type"
+            );
+            let window = window.as_CFTypeRef() as AXUIElementRef;
+            assert_eq!(AXUIElementSetMessagingTimeout(window, 1.0), kAXErrorSuccess);
+            let mut id = 0;
+            assert_eq!(
+                _AXUIElementGetWindow(window, &mut id),
+                kAXErrorSuccess,
+                "cleanup window identity read failed"
+            );
+            u64::from(id) == window_id
+        })
     }
 }
