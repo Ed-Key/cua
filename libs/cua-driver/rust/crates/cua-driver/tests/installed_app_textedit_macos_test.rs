@@ -7,6 +7,155 @@
 
 #![cfg(target_os = "macos")]
 
+// Failure diagnostics are observations made after the action returned. They must
+// never replace its result or turn a missing rebind into a passing assertion.
+fn missing_panel_evidence(
+    action: &serde_json::Value,
+    pid: i64,
+    mut read: impl FnMut(&str, serde_json::Value) -> serde_json::Value,
+) -> Option<serde_json::Value> {
+    use serde_json::json;
+    let candidates = action["window_change"]["new_windows"].as_array();
+    if candidates.is_some_and(|candidates| {
+        candidates.len() == 1
+            && action["escalation"]["target"] == "rebind"
+            && action["escalation"]["window"] == candidates[0]
+    }) {
+        return None;
+    }
+    let started = std::time::Instant::now();
+    let windows = read("list_windows", json!({"pid": pid}));
+    let mut reads = vec![json!({
+        "tool": "list_windows", "started_ms": 0,
+        "finished_ms": started.elapsed().as_millis(), "response": windows
+    })];
+    let mut ids = Vec::new();
+    if windows.get("error").is_none() && windows["result"]["isError"] != true {
+        if let Some(windows) = windows["result"]["structuredContent"]["windows"].as_array() {
+            for window in windows {
+                if window["pid"].as_i64() != Some(pid) {
+                    continue;
+                }
+                if let Some(id) = window["window_id"].as_u64().filter(|id| *id > 0) {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                if ids.len() == 4 {
+                    break;
+                }
+            }
+        }
+    }
+    for id in ids {
+        // Do not start another read after two seconds. The test transport's
+        // existing per-call timeout still bounds a read already in flight.
+        if started.elapsed() >= std::time::Duration::from_secs(2) {
+            break;
+        }
+        let read_started = started.elapsed().as_millis();
+        let state = read(
+            "get_window_state",
+            json!({
+                "pid": pid, "window_id": id, "include_screenshot": false
+            }),
+        );
+        reads.push(json!({
+            "tool": "get_window_state", "window_id": id,
+            "started_ms": read_started, "finished_ms": started.elapsed().as_millis(),
+            "response": state
+        }));
+    }
+    Some(json!({"action": action, "pid": pid, "reads": reads}))
+}
+
+#[cfg(test)]
+mod failure_evidence_tests {
+    use super::missing_panel_evidence;
+    use serde_json::json;
+
+    #[test]
+    fn later_panel_read_preserves_the_missing_action_result() {
+        let action = json!({"effect": "unverifiable"});
+        let evidence = missing_panel_evidence(&action, 42, |tool, args| match tool {
+            "list_windows" => {
+                assert_eq!(args, json!({"pid": 42}));
+                json!({"result": {"structuredContent": {"windows": [
+                    {"pid": 42, "window_id": 9, "title": "Open"}
+                ]}}})
+            }
+            "get_window_state" => {
+                assert_eq!(
+                    args,
+                    json!({"pid": 42, "window_id": 9, "include_screenshot": false})
+                );
+                json!({"result": {"structuredContent": {"elements": [{"label": "Cancel"}]}}})
+            }
+            _ => panic!("diagnostics must only read state"),
+        })
+        .expect("a missing rebind must retain follow-up evidence");
+        assert_eq!(action, json!({"effect": "unverifiable"}));
+        assert_eq!(evidence["action"], action);
+        assert_eq!(evidence["reads"].as_array().unwrap().len(), 2);
+        assert_eq!(
+            evidence["reads"][1]["response"]["result"]["structuredContent"]["elements"][0]["label"],
+            "Cancel"
+        );
+    }
+
+    #[test]
+    fn valid_rebind_adds_no_diagnostic_reads() {
+        let candidate = json!({"pid": 42, "window_id": 9});
+        let action = json!({
+            "window_change": {"new_windows": [candidate]},
+            "escalation": {"target": "rebind", "window": candidate}
+        });
+        assert!(missing_panel_evidence(&action, 42, |_, _| panic!(
+            "passing path must stay unchanged"
+        ))
+        .is_none());
+    }
+
+    #[test]
+    fn inventory_error_is_evidence_and_does_not_trigger_guessed_reads() {
+        let evidence = missing_panel_evidence(&json!({}), 42, |tool, _| {
+            assert_eq!(tool, "list_windows");
+            json!({"error": {"message": "unavailable"}})
+        })
+        .expect("retain unavailable evidence");
+        assert_eq!(evidence["reads"].as_array().unwrap().len(), 1);
+        assert_eq!(
+            evidence["reads"][0]["response"]["error"]["message"],
+            "unavailable"
+        );
+    }
+
+    #[test]
+    fn reads_are_limited_to_distinct_windows_owned_by_the_fixture() {
+        let evidence = missing_panel_evidence(&json!({}), 42, |tool, args| {
+            if tool == "list_windows" {
+                json!({"result": {"structuredContent": {"windows": [
+                    {"pid": 99, "window_id": 100},
+                    {"pid": 42, "window_id": 1}, {"pid": 42, "window_id": 1},
+                    {"pid": 42, "window_id": 2}, {"pid": 42, "window_id": 3},
+                    {"pid": 42, "window_id": 4}, {"pid": 42, "window_id": 5}
+                ]}}})
+            } else {
+                json!({"result": {"structuredContent": {"observed_window": args["window_id"]}}})
+            }
+        })
+        .unwrap();
+        let ids: Vec<_> = evidence["reads"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .skip(1)
+            .map(|r| r["response"]["result"]["structuredContent"]["observed_window"].clone())
+            .collect();
+        assert_eq!(ids, vec![json!(1), json!(2), json!(3), json!(4)]);
+    }
+}
+
 // ── End-to-end ladder behavior (interactive; needs a GUI session) ────────────
 
 /// On a NATIVE Cocoa field (TextEdit), `delivery_mode:"background"` lands via the
@@ -272,7 +421,7 @@ fn background_open_panel_returns_a_typed_rebind() {
                 native_id: window_id,
             },
             |driver| {
-                driver.call(
+                let opened = driver.call(
                     "hotkey",
                     serde_json::json!({
                         "pid": pid,
@@ -280,11 +429,22 @@ fn background_open_panel_returns_a_typed_rebind() {
                         "keys": ["cmd", "o"],
                         "delivery_mode": "background"
                     }),
-                )
+                );
+                // Capture before the sentinel's post-action reads or fixture
+                // reaping can obscure a missing or delayed panel. Keep the
+                // original response and assertions unchanged.
+                eprintln!("[textedit-open-panel] {}", opened.raw);
+                if let Some(diagnostic) =
+                    missing_panel_evidence(opened.structured(), pid, |tool, args| {
+                        driver.call(tool, args).raw
+                    })
+                {
+                    eprintln!("[textedit-missing-panel-evidence] {diagnostic}");
+                }
+                opened
             },
         )
         .unwrap_or_else(|error| panic!("background Open-panel contract failed: {error}"));
-        eprintln!("[textedit-open-panel] {}", opened.raw);
         assert!(!opened.is_error(), "hotkey errored: {}", opened.text());
         assert_eq!(
             opened.action_effect(),
