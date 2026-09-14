@@ -254,16 +254,20 @@ pub struct WindowElement {
     pub value: Option<String>,
     /// Reported keyboard focus. Currently populated on macOS; absent is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub focused: Option<bool>,
     /// Only read for the focused text control. Unsupported attributes stay absent.
     /// Web accessibility state is observational, not renderer verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub text_selection: Option<TextSelection>,
     /// The hint an empty field shows (`AXPlaceholderValue`); never content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub placeholder: Option<String>,
     /// Whether the value can be written; absent when unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub value_settable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_description: Option<String>,
@@ -380,6 +384,7 @@ pub struct WindowStateOutput {
     /// Windows the target app opened since the last action on it that has
     /// not been reported yet. Present only when something new appeared.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub window_change: Option<WindowChange>,
     /// Image content belongs to the MCP envelope, never structuredContent.
     #[serde(skip)]

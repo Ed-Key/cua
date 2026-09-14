@@ -3197,10 +3197,13 @@ class TextSelectionPredicate:
     """
     Exact selection on the currently focused native text control, in UTF-16 units.
 """
-    def __init__(self, *, location:int, length:int, text:typing.Optional[str]):
+    def __init__(self, *, location:int, length:int, text:typing.Optional[str] = _DEFAULT):
         self.location = location
         self.length = length
-        self.text = text
+        if text is _DEFAULT:
+            self.text = None
+        else:
+            self.text = text
 
 
 
@@ -3264,13 +3267,16 @@ class _UniffiFfiConverterOptionalTypeTextSelectionPredicate(_UniffiConverterRust
 
 @dataclass
 class ElementPredicate:
-    def __init__(self, *, selector:ElementSelector, exists:typing.Optional[bool], value_equals:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], text_selection:typing.Optional[TextSelectionPredicate]):
+    def __init__(self, *, selector:ElementSelector, exists:typing.Optional[bool], value_equals:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], text_selection:typing.Optional[TextSelectionPredicate] = _DEFAULT):
         self.selector = selector
         self.exists = exists
         self.value_equals = value_equals
         self.enabled = enabled
         self.selected = selected
-        self.text_selection = text_selection
+        if text_selection is _DEFAULT:
+            self.text_selection = None
+        else:
+            self.text_selection = text_selection
 
 
 
@@ -8433,17 +8439,29 @@ class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowElement:
-    def __init__(self, *, element_index:int, role:str, depth:int, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], focused:typing.Optional[bool], text_selection:typing.Optional[TextSelection], placeholder:typing.Optional[str], value_settable:typing.Optional[bool], value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
+    def __init__(self, *, element_index:int, role:str, depth:int, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], focused:typing.Optional[bool] = _DEFAULT, text_selection:typing.Optional[TextSelection] = _DEFAULT, placeholder:typing.Optional[str] = _DEFAULT, value_settable:typing.Optional[bool] = _DEFAULT, value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
         self.element_index = element_index
         self.role = role
         self.depth = depth
         self.element_token = element_token
         self.label = label
         self.value = value
-        self.focused = focused
-        self.text_selection = text_selection
-        self.placeholder = placeholder
-        self.value_settable = value_settable
+        if focused is _DEFAULT:
+            self.focused = None
+        else:
+            self.focused = focused
+        if text_selection is _DEFAULT:
+            self.text_selection = None
+        else:
+            self.text_selection = text_selection
+        if placeholder is _DEFAULT:
+            self.placeholder = None
+        else:
+            self.placeholder = placeholder
+        if value_settable is _DEFAULT:
+            self.value_settable = None
+        else:
+            self.value_settable = value_settable
         self.value_description = value_description
         self.enabled = enabled
         self.selected = selected
@@ -8692,7 +8710,7 @@ class _UniffiFfiConverterSequenceTypeSnapshotImage(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowStateOutput:
-    def __init__(self, *, pid:int, window_id:int, snapshot_id:typing.Optional[str], app_name:typing.Optional[str], window_title:typing.Optional[str], tree_markdown:typing.Optional[str], elements:typing.Optional[typing.List[WindowElement]], element_count:typing.Optional[int], total_element_count:typing.Optional[int], returned_element_count:typing.Optional[int], filtered_element_count:typing.Optional[int], elements_complete:typing.Optional[bool], degraded:typing.Optional[bool], degraded_reason:typing.Optional[str], truncated:typing.Optional[bool], truncation_reason:typing.Optional[str], screenshot_width:typing.Optional[int], screenshot_height:typing.Optional[int], screenshot_scale:typing.Optional[float], screenshot_mime_type:typing.Optional[str], screenshot_file_path:typing.Optional[str], screenshot_frame_valid:typing.Optional[bool], window_bounds:typing.Optional[WindowBounds], window_change:typing.Optional[WindowChange], images:typing.List[SnapshotImage]):
+    def __init__(self, *, pid:int, window_id:int, snapshot_id:typing.Optional[str], app_name:typing.Optional[str], window_title:typing.Optional[str], tree_markdown:typing.Optional[str], elements:typing.Optional[typing.List[WindowElement]], element_count:typing.Optional[int], total_element_count:typing.Optional[int], returned_element_count:typing.Optional[int], filtered_element_count:typing.Optional[int], elements_complete:typing.Optional[bool], degraded:typing.Optional[bool], degraded_reason:typing.Optional[str], truncated:typing.Optional[bool], truncation_reason:typing.Optional[str], screenshot_width:typing.Optional[int], screenshot_height:typing.Optional[int], screenshot_scale:typing.Optional[float], screenshot_mime_type:typing.Optional[str], screenshot_file_path:typing.Optional[str], screenshot_frame_valid:typing.Optional[bool], window_bounds:typing.Optional[WindowBounds], window_change:typing.Optional[WindowChange] = _DEFAULT, images:typing.List[SnapshotImage]):
         self.pid = pid
         self.window_id = window_id
         self.snapshot_id = snapshot_id
@@ -8716,7 +8734,10 @@ class WindowStateOutput:
         self.screenshot_file_path = screenshot_file_path
         self.screenshot_frame_valid = screenshot_frame_valid
         self.window_bounds = window_bounds
-        self.window_change = window_change
+        if window_change is _DEFAULT:
+            self.window_change = None
+        else:
+            self.window_change = window_change
         self.images = images
 
 
