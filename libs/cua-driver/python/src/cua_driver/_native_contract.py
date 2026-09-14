@@ -6896,13 +6896,14 @@ class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowElement:
-    def __init__(self, *, element_index:int, role:str, depth:int, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], placeholder:typing.Optional[str], value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
+    def __init__(self, *, element_index:int, role:str, depth:int, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], value_settable:typing.Optional[bool], placeholder:typing.Optional[str], value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
         self.element_index = element_index
         self.role = role
         self.depth = depth
         self.element_token = element_token
         self.label = label
         self.value = value
+        self.value_settable = value_settable
         self.placeholder = placeholder
         self.value_description = value_description
         self.enabled = enabled
@@ -6918,7 +6919,7 @@ class WindowElement:
 
 
     def __str__(self):
-        return "WindowElement(element_index={}, role={}, depth={}, element_token={}, label={}, value={}, placeholder={}, value_description={}, enabled={}, selected={}, in_web_content={}, actions={}, parent_index={}, frame={}, min={}, max={})".format(self.element_index, self.role, self.depth, self.element_token, self.label, self.value, self.placeholder, self.value_description, self.enabled, self.selected, self.in_web_content, self.actions, self.parent_index, self.frame, self.min, self.max)
+        return "WindowElement(element_index={}, role={}, depth={}, element_token={}, label={}, value={}, value_settable={}, placeholder={}, value_description={}, enabled={}, selected={}, in_web_content={}, actions={}, parent_index={}, frame={}, min={}, max={})".format(self.element_index, self.role, self.depth, self.element_token, self.label, self.value, self.value_settable, self.placeholder, self.value_description, self.enabled, self.selected, self.in_web_content, self.actions, self.parent_index, self.frame, self.min, self.max)
     def __eq__(self, other):
         if self.element_index != other.element_index:
             return False
@@ -6931,6 +6932,8 @@ class WindowElement:
         if self.label != other.label:
             return False
         if self.value != other.value:
+            return False
+        if self.value_settable != other.value_settable:
             return False
         if self.placeholder != other.placeholder:
             return False
@@ -6964,6 +6967,7 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
             element_token=_UniffiFfiConverterOptionalString.read(buf),
             label=_UniffiFfiConverterOptionalString.read(buf),
             value=_UniffiFfiConverterOptionalString.read(buf),
+            value_settable=_UniffiFfiConverterOptionalBoolean.read(buf),
             placeholder=_UniffiFfiConverterOptionalString.read(buf),
             value_description=_UniffiFfiConverterOptionalString.read(buf),
             enabled=_UniffiFfiConverterOptionalBoolean.read(buf),
@@ -6984,6 +6988,7 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.element_token)
         _UniffiFfiConverterOptionalString.check_lower(value.label)
         _UniffiFfiConverterOptionalString.check_lower(value.value)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.value_settable)
         _UniffiFfiConverterOptionalString.check_lower(value.placeholder)
         _UniffiFfiConverterOptionalString.check_lower(value.value_description)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.enabled)
@@ -7003,6 +7008,7 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.element_token, buf)
         _UniffiFfiConverterOptionalString.write(value.label, buf)
         _UniffiFfiConverterOptionalString.write(value.value, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.value_settable, buf)
         _UniffiFfiConverterOptionalString.write(value.placeholder, buf)
         _UniffiFfiConverterOptionalString.write(value.value_description, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.enabled, buf)

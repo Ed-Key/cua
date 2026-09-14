@@ -209,6 +209,11 @@ pub struct WindowElement {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Whether the platform reports that AXValue can be set. This is capability
+    /// metadata, not confirmation that a write commits to the application.
+    /// Currently populated on macOS; absent means unknown or not queried.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_settable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -322,6 +327,19 @@ impl ToolOutput for WindowStateOutput {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn window_element_preserves_value_writability_without_inventing_it() {
+        for writable in [true, false] {
+            let input = json!({"element_index":13,"role":"AXTextArea","depth":3,
+                "value":"", "value_settable":writable});
+            let element: WindowElement = serde_json::from_value(input.clone()).unwrap();
+            assert_eq!(serde_json::to_value(element).unwrap(), input);
+        }
+        let input = json!({"element_index":13,"role":"AXTextArea","depth":3});
+        let element: WindowElement = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(serde_json::to_value(element).unwrap(), input);
+    }
 
     #[test]
     fn native_app_success_shapes_allow_unavailable_metadata() {

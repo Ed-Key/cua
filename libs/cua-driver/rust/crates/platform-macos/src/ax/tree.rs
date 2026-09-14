@@ -56,6 +56,8 @@ pub struct AXNode {
     pub title: Option<String>,
     /// Raw string AXValue, including empty strings and whitespace.
     pub value: Option<String>,
+    /// Reported AXValue writability, independent of whether an edit commits.
+    pub value_settable: Option<bool>,
     pub placeholder: Option<String>,
     /// AXDescription — shown as `(description)` in the tree line.
     /// Kept separate from `title` so `_find_calc_button("2")` can find
@@ -129,6 +131,14 @@ fn role_supports_value_addressing(role: &str) -> bool {
             | "AXCheckBox"
             | "AXRadioButton"
     )
+}
+
+fn read_value_writability(role: &str, read: impl FnOnce() -> Option<bool>) -> Option<bool> {
+    if role_supports_value_addressing(role) {
+        read()
+    } else {
+        None
+    }
 }
 
 fn is_addressable(actions_present: bool, value_settable: bool, enabled: Option<bool>) -> bool {
@@ -436,24 +446,23 @@ unsafe fn walk_element(
             .as_deref()
             .is_some_and(|hint| !hint.trim().is_empty());
     // Some native controls expose no AX action names but do expose a writable
-    // AXValue. Finder's transient inline-rename field is the important case:
+    // AXValue. Finder's transient inline-rename field is an important case:
     // rendering it without an element_index leaves an agent able to see the
-    // field but unable to call set_value on it. Probe writability only for the
-    // small family of value controls so arbitrary display nodes do not pay an
-    // extra AX round trip.
-    let value_settable = actions.is_empty()
-        && role_supports_value_addressing(&role)
-        && is_attribute_settable(element, "AXValue");
+    // field but unable to call set_value on it. Also retain writability for
+    // controls that expose actions: editable and read-only Electron fields
+    // can have identical action lists. Query only value-control roles so
+    // display nodes do not pay another AX round trip. Failure stays unknown.
+    let value_settable = read_value_writability(&role, || attribute_settable(element, "AXValue"));
     // A closed submenu can keep its descendants in AXChildren while reporting
     // those controls disabled. Never assign such a row a live element index:
     // the same native state also causes dispatch to refuse it, and exposing an
     // index for it invites agents to retain an unusable menu target.
-    let enabled = if !actions.is_empty() || value_settable {
+    let enabled = if !actions.is_empty() || value_settable == Some(true) {
         copy_bool_attr(element, "AXEnabled")
     } else {
         None
     };
-    let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
+    let is_actionable = is_addressable(!actions.is_empty(), value_settable == Some(true), enabled);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
         let children = copy_children(element);
@@ -496,6 +505,7 @@ unsafe fn walk_element(
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
         AXNode {
+            value_settable,
             url: if role == "AXLink" {
                 copy_url_attr(element)
             } else {
@@ -532,6 +542,7 @@ unsafe fn walk_element(
         }
     } else {
         AXNode {
+            value_settable,
             url: if role == "AXLink" {
                 copy_url_attr(element)
             } else {
@@ -692,6 +703,19 @@ fn render_lines(lines: &[(usize, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn value_writability_probes_only_value_controls_and_preserves_unknown() {
+        for state in [Some(true), Some(false), None] {
+            assert_eq!(read_value_writability("AXTextArea", || state), state);
+        }
+        for role in ["AXGroup", "AXStaticText", "AXButton", "AXLink", "AXWindow"] {
+            assert_eq!(
+                read_value_writability(role, || panic!("unexpected AX request")),
+                None
+            );
+        }
+    }
     use std::cell::Cell;
 
     #[test]
@@ -732,6 +756,7 @@ mod tests {
     #[test]
     fn rendered_raw_values_cannot_add_tree_rows_or_become_placeholders() {
         let mut node = AXNode {
+            value_settable: None,
             url: None,
             element_index: Some(0),
             role: "AXTextArea".into(),
@@ -852,6 +877,7 @@ mod typed_query_tests {
 
     pub(super) fn row(index: Option<usize>, depth: usize, role: &str, value: &str) -> AXNode {
         AXNode {
+            value_settable: None,
             url: None,
             element_index: index,
             role: role.into(),

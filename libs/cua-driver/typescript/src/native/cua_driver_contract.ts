@@ -4968,6 +4968,12 @@ export type WindowElement = {
     elementToken?: string,
     label?: string,
     value?: string,
+    /**
+     * Whether the platform reports that AXValue can be set. This is capability
+     * metadata, not confirmation that a write commits to the application.
+     * Currently populated on macOS; absent means unknown or not queried.
+     */
+    valueSettable?: boolean,
     placeholder?: string,
     valueDescription?: string,
     enabled?: boolean,
@@ -5007,6 +5013,7 @@ const FfiConverterTypeWindowElement = (() => {
                 elementToken: FfiConverterOptionalString.read(from),
                 label: FfiConverterOptionalString.read(from),
                 value: FfiConverterOptionalString.read(from),
+                valueSettable: FfiConverterOptionalBoolean.read(from),
                 placeholder: FfiConverterOptionalString.read(from),
                 valueDescription: FfiConverterOptionalString.read(from),
                 enabled: FfiConverterOptionalBoolean.read(from),
@@ -5026,6 +5033,7 @@ const FfiConverterTypeWindowElement = (() => {
             FfiConverterOptionalString.write(value.elementToken, into);
             FfiConverterOptionalString.write(value.label, into);
             FfiConverterOptionalString.write(value.value, into);
+            FfiConverterOptionalBoolean.write(value.valueSettable, into);
             FfiConverterOptionalString.write(value.placeholder, into);
             FfiConverterOptionalString.write(value.valueDescription, into);
             FfiConverterOptionalBoolean.write(value.enabled, into);
@@ -5044,6 +5052,7 @@ const FfiConverterTypeWindowElement = (() => {
              FfiConverterOptionalString.allocationSize(value.elementToken) +
              FfiConverterOptionalString.allocationSize(value.label) +
              FfiConverterOptionalString.allocationSize(value.value) +
+             FfiConverterOptionalBoolean.allocationSize(value.valueSettable) +
              FfiConverterOptionalString.allocationSize(value.placeholder) +
              FfiConverterOptionalString.allocationSize(value.valueDescription) +
              FfiConverterOptionalBoolean.allocationSize(value.enabled) +

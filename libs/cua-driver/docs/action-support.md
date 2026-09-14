@@ -71,6 +71,20 @@ as lossless by the macOS tests. The shared JSON contract accepts an omitted
 placeholder. Native SDK libraries and generated bindings must be rebuilt
 together for the added record field.
 
+The macOS adapter also reports optional `value_settable` on structured value
+controls. `true` and `false` mean that `AXUIElementIsAttributeSettable` succeeded
+and reported AXValue writable or read-only. An absent field means unknown or
+not queried. The probe covers text fields, text areas, combo boxes, sliders,
+steppers, checkboxes and radio buttons, including controls that already expose
+AX actions. Display-only roles do not incur another AX request. Disabled
+controls remain excluded from actionable records. This is capability metadata:
+it does not confirm application commit, change input routing, or make Electron
+value readback trusted. Windows, X11 and Wayland currently omit this metadata;
+their omission must not be interpreted as read-only. Native SDK libraries and
+bindings need to be rebuilt together for the added optional record field.
+Python callers constructing `WindowElement` directly must also supply
+`value_settable=None` when the capability is unknown.
+
 Local macOS typing correction: background web-editor keystrokes select the
 exact native keyboard window inside the existing target-only focus scope.
 An AX-focused editor alone does not prove that its window can receive keys.

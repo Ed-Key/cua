@@ -34,7 +34,10 @@ fn def() -> &'static ToolDef {
             indexed row with `element_index`, `role`, `label`, `value` (the \
             element's text/AXValue when present — use it to verify what a field \
             holds, preserving empty strings and whitespace), optional `placeholder` \
-            (a separate hint, never the value), `actions` (names of AX actions \
+            (a separate hint, never the value), optional `value_settable` \
+            (macOS reports AXValue writable or read-only; absent means unknown \
+            or not queried, and true does not prove an edit committed), \
+            `actions` (names of AX actions \
             exposed by the element, omitted when empty), `frame: {x,y,w,h}`, \
             `parent_index`, `depth`). The markdown \
             `tree_markdown` stays available for text consumers, with raw string \
@@ -940,6 +943,9 @@ fn build_element_record(
     if let Some(value) = node.value_state.clone().or_else(|| node.value.clone()) {
         entry["value"] = serde_json::Value::String(value);
     }
+    if let Some(settable) = node.value_settable {
+        entry["value_settable"] = serde_json::Value::Bool(settable);
+    }
     if let Some(placeholder) = &node.placeholder {
         entry["placeholder"] = serde_json::Value::String(placeholder.clone());
     }
@@ -1177,6 +1183,7 @@ mod tests {
         actions: Vec<String>,
     ) -> AXNode {
         AXNode {
+            value_settable: None,
             url: None,
             element_index: idx,
             role: role.into(),
@@ -1230,6 +1237,34 @@ mod tests {
         let entry = &build_elements_array_with_token(&[field], None)[0];
         assert_eq!(entry["value"], "pickleball");
         assert!(entry.get("url").is_none());
+    }
+
+    #[test]
+    fn value_writability_survives_public_and_verification_records() {
+        for writable in [Some(true), Some(false), None] {
+            let mut field = node(
+                Some(13),
+                "AXTextArea",
+                Some("Draft message"),
+                3,
+                None,
+                None,
+                vec!["AXPress".into()],
+            );
+            field.value = Some(String::new());
+            field.value_settable = writable;
+            for entry in [
+                build_element_record(&field, Some(1)),
+                build_element_record(&field, None),
+            ] {
+                assert_eq!(entry["label"], "Draft message");
+                assert_eq!(entry["value"], "");
+                match writable {
+                    Some(value) => assert_eq!(entry["value_settable"], value),
+                    None => assert!(entry.get("value_settable").is_none()),
+                }
+            }
+        }
     }
 
     #[test]

@@ -1831,6 +1831,12 @@
                     "string",
                     "null"
                   ]
+                },
+                "value_settable": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
                 }
               },
               "required": [

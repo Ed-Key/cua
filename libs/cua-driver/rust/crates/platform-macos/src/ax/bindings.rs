@@ -152,11 +152,22 @@ use core_foundation::{array::CFArray, base::TCFType, string::CFString as CFStr};
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) -> bool {
+    attribute_settable(element, attr_name) == Some(true)
+}
+
+fn checked_attribute_settable(error: AXError, settable: u8) -> Option<bool> {
+    (error == kAXErrorSuccess).then_some(settable != 0)
+}
+
+/// Read capability metadata without treating a failed query as read-only.
+///
+/// # Safety
+/// `element` must be a valid, live AXUIElementRef for the duration of the call.
+pub unsafe fn attribute_settable(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
     let attr = CFStr::new(attr_name);
     let mut settable = 0_u8;
-    AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable)
-        == kAXErrorSuccess
-        && settable != 0
+    let error = AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable);
+    checked_attribute_settable(error, settable)
 }
 
 /// Convert a borrowed URL attribute without changing control-value coercion.
@@ -937,6 +948,14 @@ pub unsafe fn copy_element_array_attr(
 mod tests {
     use super::*;
     use core_foundation::{boolean::CFBoolean, number::CFNumber};
+
+    #[test]
+    fn value_writability_distinguishes_false_from_query_failure() {
+        assert_eq!(checked_attribute_settable(kAXErrorSuccess, 1), Some(true));
+        assert_eq!(checked_attribute_settable(kAXErrorSuccess, 0), Some(false));
+        assert_eq!(checked_attribute_settable(kAXErrorFailure, 0), None);
+        assert_eq!(checked_attribute_settable(kAXErrorFailure, 1), None);
+    }
 
     #[test]
     fn checked_window_id_does_not_turn_a_transport_error_into_a_transient_root() {
