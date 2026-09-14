@@ -71,17 +71,23 @@ final class LaggingTextField: NSTextField {
     override func accessibilityValue() -> String? {
         let actual = stringValue
         let lag = HarnessWindowController.envSeconds("CUA_APPKIT_AX_VALUE_LAG_MS")
-        guard lag > 0 else { return actual }
+        let unreadable = ProcessInfo.processInfo.environment["CUA_APPKIT_AX_VALUE_UNREADABLE"] == "1"
+        guard lag > 0 || unreadable else { return actual }
         if actual != reported {
             reported = actual
             changedAt = Date()
         }
         guard let changedAt, !actual.isEmpty else { return actual }
         let elapsed = Date().timeIntervalSince(changedAt)
-        let visible = max(1, Int(Double(actual.count) * elapsed / lag))
-        let value = elapsed >= lag ? actual : String(actual.prefix(visible))
+        let value: String?
+        if unreadable {
+            value = nil
+        } else {
+            let visible = max(1, Int(Double(actual.count) * elapsed / lag))
+            value = elapsed >= lag ? actual : String(actual.prefix(visible))
+        }
         if let path = ProcessInfo.processInfo.environment["CUA_APPKIT_AX_VALUE_TRACE"],
-           let data = try? JSONSerialization.data(withJSONObject: ["actual": actual, "reported": value, "elapsed": elapsed]) {
+           let data = try? JSONSerialization.data(withJSONObject: ["actual": actual, "reported": value.map { $0 as Any } ?? NSNull(), "elapsed": elapsed]) {
             let line = data + Data([10])
             if let handle = FileHandle(forWritingAtPath: path) {
                 handle.seekToEndOfFile()

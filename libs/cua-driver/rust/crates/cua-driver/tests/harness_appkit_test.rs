@@ -1176,6 +1176,92 @@ fn harness_appkit_type_text_waits_for_a_lagging_value_readback() {
 
 #[test]
 #[ignore]
+fn harness_appkit_type_text_does_not_replay_an_unreadable_ax_write() {
+    let trace_dir = tempfile::tempdir().expect("create readback trace directory");
+    let trace_path = trace_dir.path().join("unreadable-readback.jsonl");
+    run_background_case_with_env(
+        "type_text_unreadable_readback",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[
+            ("CUA_APPKIT_AX_VALUE_UNREADABLE", "1"),
+            ("CUA_APPKIT_AX_VALUE_TRACE", trace_path.to_str().unwrap()),
+        ],
+        |pid, wid, driver| {
+            let pre = snapshot_elements(driver, pid, wid);
+            let (x, y, w, h) = element_pixel_frame(&pre, "txt-input");
+            eprintln!(
+                "unreadable-focus {}",
+                serde_json::json!({
+                    "phase": "before-click", "x": x + w / 2.0, "y": y + h / 2.0,
+                    "at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                })
+            );
+            let focused = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid,
+                    "x": x + w / 2.0, "y": y + h / 2.0,
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(
+                !focused.is_error(),
+                "focus field editor: {}",
+                focused.text()
+            );
+            let pre = snapshot_elements(driver, pid, wid);
+            let index = element_index_by_id(pre.tree_text(), "txt-input").unwrap();
+            let text = "one-insertion-cua";
+            let response = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid,
+                    "element_index": index, "snapshot_id": pre.snapshot_id(),
+                    "text": text, "delivery_mode": "background"
+                }),
+            );
+            let _post = snapshot_elements(driver, pid, wid);
+            let trace = std::fs::read_to_string(&trace_path).expect("fixture readback trace");
+            eprintln!(
+                "unreadable probe response: {}; getter trace: {trace}",
+                response.raw
+            );
+            let rows: Vec<serde_json::Value> = trace
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("parse fixture trace"))
+                .collect();
+            assert!(
+                rows.iter()
+                    .any(|row| row["actual"] == text && row["reported"].is_null()),
+                "fixture must accept the complete text while its AX value is unreadable"
+            );
+            assert!(rows.iter().all(|row| row["actual"] == text),
+                "one type_text request inserted additional text after an accepted AX write: {trace}");
+            assert_eq!(
+                response.structured()["route"],
+                "accessibility",
+                "{}",
+                response.raw
+            );
+            assert_eq!(
+                response.structured()["effect"],
+                "unverifiable",
+                "{}",
+                response.raw
+            );
+            assert!(
+                response.structured()["delivery"]
+                    .get("delivered_count")
+                    .is_none(),
+                "unreadable state cannot prove a delivered count"
+            );
+        },
+    );
+}
+
+#[test]
+#[ignore]
 fn harness_appkit_scroll_foreground() {
     run_case(
         native_foreground_case(

@@ -105,6 +105,7 @@ pub(super) fn copy_string_attr(element: AXUIElementRef, attr: &str) -> Option<Op
     if let Some(value) = with_editor(element, |fixture| match attr {
         "AXRole" => Some(fixture.role.clone()),
         "AXTitle" => Some("Editor".into()),
+        "AXValue" if fixture.hide_value_after_write && !fixture.value.is_empty() => None,
         "AXValue" => Some(fixture.value.clone()),
         _ => panic!("unexpected editor attribute: {attr}"),
     }) {
@@ -190,6 +191,7 @@ struct EditorFixture {
     role: String,
     bounds: Option<[f64; 4]>,
     value: String,
+    hide_value_after_write: bool,
     before_write: Option<Box<dyn FnOnce()>>,
 }
 pub(crate) struct EditorScope {
@@ -210,10 +212,15 @@ impl EditorScope {
                 role: role.into(),
                 bounds,
                 value: String::new(),
+                hide_value_after_write: false,
                 before_write: Some(Box::new(before_write)),
             });
         });
         Self { _element: element }
+    }
+
+    pub fn hide_value_after_write(&self) {
+        EDITOR.with(|slot| slot.borrow_mut().as_mut().unwrap().hide_value_after_write = true);
     }
 }
 impl Drop for EditorScope {
