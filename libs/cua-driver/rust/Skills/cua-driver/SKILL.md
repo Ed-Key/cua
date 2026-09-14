@@ -373,7 +373,8 @@ successful.
 
 - `confirmed` means the driver has publishable value readback for that action.
 - `partial` means only `delivery.delivered_count` was delivered.
-- `unverifiable` means the driver cannot prove the effect.
+- `unverifiable` means the driver cannot prove the effect. Observe the current
+  state before another mutation; the previous edit may already have landed.
 - `suspected_noop` means available evidence suggests no useful change.
 - `refused` means the selected route deliberately did not deliver.
 
@@ -543,19 +544,25 @@ coordinate translation + `delivery_mode`). That gives e.g.
 for Chromium/Electron inputs the AX path can't reach, and
 `hotkey({pid, x, y, keys:["cmd","v"]})` to paste into a specific field.
 
-**Typing default (the ladder).** Call `type_text` directly with
-`element_token` (ax) — it targets the field, no pre-click. On
-Electron/Catalyst the AX layer echoes the write without rendering it,
-so the driver returns `effect:"unverifiable"` with
-`escalation.target:"pixel"` there (never a false `effect:"confirmed"`) —
-follow it, and cross-check the
-screenshot in the response (the only ground truth). Escalate to the px
-form — `type_text({pid, window_id, x, y, text})` — which pixel-clicks
-to focus, then types. **If the target control is closed** (a search
-button, a collapsed field), AX-press to open it first (AX actions work
-in the background): a px focus-click won't reliably open _and_ focus a
-closed control, so the text leaks into whatever's already focused.
-Escalate to `delivery_mode:"foreground"` only if it still drops.
+**Typing and recovery.** Call `type_text` directly with an
+`element_token` to address the field without a separate pre-click. Some web
+controls can echo an AX write without applying the rendered edit, so an
+`unverifiable` result establishes neither success nor failure.
+
+Read the current target state before typing again. `type_text` returns no
+screenshot; request one with `get_window_state` when accessibility cannot
+establish the rendered result. Check the intended field and the complete text,
+including existing text and selection. If the edit already landed, continue
+without repeating it. If the outcome remains ambiguous, gather more evidence
+instead of replaying the text. A proven partial delivery has separate count
+and suffix guidance; do not invent a missing suffix from an unknown result.
+
+Only after observing what remains to do, choose an appropriate route. For an
+unfocused web editor, the coordinate form
+`type_text({pid, window_id, x, y, text})` prepares renderer focus and types in
+one call. Open a closed search or editor control first and verify its state.
+Foreground recovery requires explicit authorization under the no-foreground
+principle. An uncertain outcome alone is not a reason to take over focus.
 
 **`set_value` stays AX-only by design** — use it when the intent is to
 replace a control's whole value: dropdowns, checkboxes, sliders, steppers,

@@ -385,55 +385,39 @@ There is no backgrounded path that reaches these apps today.
   AX-addressable elements (links, buttons, toolbar items), use
   `right_click({pid, element_index})` instead.
 
-### Known text-input limits (Catalyst + Electron)
+### Text input and uncertain outcomes (Catalyst + Electron)
 
-On **Catalyst** apps (WhatsApp, Reminders, Notes-via-Catalyst,
-anything in `/Applications` that's actually `iOSAppOnMac.app`) and
-**Electron** apps (VS Code's Monaco editor, Slack composer, Discord,
-Linear), an AX `type_text` can't reach the rendered text view: the
-`AXSetAttribute(kAXSelectedText)` write succeeds on the AX shim, but
-the UIKit/Chromium view that owns the input never observes it — and on
-Electron the shim _echoes the value straight back through `AXValue`_,
-so a naive read-back "confirms" a value that isn't really there.
+Some web editors accept an AX write or echo AXValue without applying the
+rendered edit. Other controls expose no readable value. Neither case proves
+that text failed to arrive. The driver keeps web AX-only readback unverified;
+this does not mean that every Electron control rejects accessibility input.
 
-The driver **detects Electron and refuses to trust that echo**: an
-AX-path `type_text` on an Electron app returns `effect:"unverifiable"` +
-`escalation:{target:"pixel",reason:"effect_unconfirmed"}`, **never** a
-false `effect:"confirmed"`.
-(On Catalyst the AX value reads back unreadable, so it reports
-unverified too.) Bottom line: on these surfaces **do not trust the AX
-confirm — the screenshot in the same response is the only truth.**
+After `type_text` returns `effect:"unverifiable"`, read the current target
+state before another edit. The typing response contains no screenshot. Request
+one with `get_window_state` when accessibility cannot establish the rendered
+result. Check the intended field and complete text. If it is already correct,
+continue without repeating it. If the outcome remains ambiguous, observe more
+rather than retrying. An unknown result does not prescribe a pixel, page, or
+foreground retry.
 
-Fix — **one call**: `type_text({pid, window_id, x, y, text})`. Passing
-`x,y` (no `element_index`) is the **element px action** form of
-`type_text` — the tool pixel-clicks at `(x,y)` to give the Chromium /
-UIKit renderer the real keyboard focus the AX layer can't, then types
-into the now-focused field. Read `x,y` straight off the screenshot in
-the `get_window_state` response (same convention as `click`). This is
-the one-call replacement for the old two-step "pixel-click then
-`type_text`". Prefer this direct route. If an application only accepts paste,
-call `clipboard_write`, then `clipboard_read` and verify the returned types
-(and text when applicable) **before** selecting or replacing existing editor
-content. Send Cmd+V only after that read-back succeeds.
+For a web editor that needs renderer focus, the coordinate form
+`type_text({pid, window_id, x, y, text})` prepares focus and types in one call.
+Read window-local screenshot coordinates from the latest window state. Open
+closed controls first and verify the exposed editor before targeting it. An
+already-focused editor should retain its current selection. This route is not
+a guarantee that every Catalyst or Electron editor accepts background input.
 
-0. **If the control is CLOSED, open it first.** A px focus-click won't
-   reliably _open and focus_ a closed control (a search button, a
-   collapsed field) — it lands on whatever is already focused (e.g.
-   the message composer), so your text leaks there. **AX-press to
-   open/activate the control first** (AX actions work in the
-   background), then px-type into the now-open field.
-1. **`type_text({pid, window_id, x, y, text})`** — focus + type in a
-   single call. Re-snapshot and read the text off the screenshot to
-   confirm; the AX value can still lag on Catalyst/Electron.
-2. Only if the keystrokes _still_ drop (a focus-polling app), escalate
-   that one `type_text` with `delivery_mode:"foreground"`.
+Only after observing the outcome, choose any remaining edit and its delivery
+route. Foreground delivery requires explicit authorization under the
+no-foreground contract. Do not replay the whole request when text is already
+partially present; establish the actual remaining change first. Proven partial
+results have their own delivered-count guidance.
 
-The `x,y` (px) form is **mutually exclusive** with `element_index`
-(ax) — pass one or the other, not both. Why not `Cmd+V` / `hotkey`: a
-keyboard combo does **not** focus a text field, and `hotkey` /
-`press_key` no longer raise the window on their own (raising is gated
-on `delivery_mode:"foreground"`, like every other tool). The reliable
-move is the px form of `type_text` — focus and type in one call.
+Coordinates are mutually exclusive with element addressing. A keyboard combo
+does not itself focus a text field. If an application needs paste, verify the
+clipboard contents before selecting or replacing editor text, then invoke the
+paste shortcut through an authorized route. Typing, focus, selection, clipboard
+preparation, and verification are separate facts to establish.
 
 ## Navigating native menu bars (AXMenuBar)
 
