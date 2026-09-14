@@ -226,38 +226,24 @@ fn observe_delta(
         elapsed_ms = started.elapsed().as_millis() as u64,
         "surface observation signal wait complete"
     );
-    let mut after = snapshot_roots(pid);
-    if after.is_none() {
-        tracing::debug!(
-            pid,
-            reason = "after_unavailable",
-            attempt = 0,
-            elapsed_ms = started.elapsed().as_millis() as u64,
-            "surface observation stopped"
-        );
-        return None;
-    }
-    let mut appeared = appeared_roots(&before.roots, &after);
-    if appeared.is_empty() && signaled {
-        for attempt in 1..=CATCH_UP_ATTEMPTS {
-            std::thread::sleep(CATCH_UP_INTERVAL);
-            after = snapshot_roots(pid);
+    let appeared = poll_appeared_roots(
+        &before.roots,
+        signaled,
+        |attempt| {
+            let after = snapshot_roots(pid);
             if after.is_none() {
                 tracing::debug!(
                     pid,
                     reason = "after_unavailable",
                     attempt,
                     elapsed_ms = started.elapsed().as_millis() as u64,
-                    "surface observation stopped"
+                    "surface observation AX attempt unavailable"
                 );
-                return None;
             }
-            appeared = appeared_roots(&before.roots, &after);
-            if !appeared.is_empty() {
-                break;
-            }
-        }
-    }
+            after
+        },
+        || std::thread::sleep(CATCH_UP_INTERVAL),
+    )?;
     tracing::debug!(
         pid,
         appeared_count = appeared.len(),
@@ -265,6 +251,30 @@ fn observe_delta(
         "surface observation AX diff complete"
     );
     resolve_appeared_roots(pid, &appeared, foreground_changed(prior_front))
+}
+
+// Keep native reads and waiting at the boundary so transient publication and
+// transport failures can be exercised without timing a live desktop.
+fn poll_appeared_roots(
+    before: &Option<RootSnapshot>,
+    signaled: bool,
+    mut read: impl FnMut(usize) -> Option<RootSnapshot>,
+    mut pause: impl FnMut(),
+) -> Option<Vec<Root>> {
+    before.as_ref()?;
+    let mut after = read(0);
+    for attempt in 1..=CATCH_UP_ATTEMPTS {
+        let appeared = appeared_roots(before, &after);
+        if !signaled || !appeared.is_empty() {
+            return after.map(|_| appeared);
+        }
+        // A transient AX failure during publication is unknown, not an empty
+        // tree. Use the same bounded catch-up as a complete but early snapshot.
+        pause();
+        after = read(attempt);
+    }
+    after.as_ref()?;
+    Some(appeared_roots(before, &after))
 }
 
 fn foreground_changed(prior_front: Option<i32>) -> bool {
@@ -570,6 +580,104 @@ fn surface_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn panel_snapshot() -> RootSnapshot {
+        RootSnapshot::from([(
+            RootKey::Native {
+                window_id: 7,
+                role: "AXWindow".into(),
+                subrole: String::new(),
+            },
+            root(7, "Open"),
+        )])
+    }
+
+    #[test]
+    fn signaled_surface_recovers_after_initial_ax_unavailability() {
+        let mut reads = vec![None, Some(panel_snapshot())].into_iter();
+        assert_eq!(
+            poll_appeared_roots(
+                &Some(RootSnapshot::new()),
+                true,
+                |_| reads.next().unwrap(),
+                || {}
+            ),
+            Some(vec![root(7, "Open")])
+        );
+    }
+
+    #[test]
+    fn signaled_surface_recovers_after_unavailable_catch_up_read() {
+        let mut reads = vec![Some(RootSnapshot::new()), None, Some(panel_snapshot())].into_iter();
+        assert_eq!(
+            poll_appeared_roots(
+                &Some(RootSnapshot::new()),
+                true,
+                |_| reads.next().unwrap(),
+                || {}
+            ),
+            Some(vec![root(7, "Open")])
+        );
+    }
+
+    #[test]
+    fn persistent_ax_unavailability_stays_unknown_after_bounded_retries() {
+        let mut attempts = Vec::new();
+        let mut pauses = 0;
+        let result = poll_appeared_roots(
+            &Some(RootSnapshot::new()),
+            true,
+            |attempt| {
+                attempts.push(attempt);
+                None
+            },
+            || pauses += 1,
+        );
+        assert_eq!(result, None);
+        assert_eq!(attempts, vec![0, 1, 2, 3]);
+        assert_eq!(pauses, 3);
+    }
+
+    #[test]
+    fn unavailable_baseline_does_not_retry_into_a_false_new_window() {
+        assert_eq!(
+            poll_appeared_roots(
+                &None,
+                true,
+                |_| panic!("no valid baseline"),
+                || panic!("no valid baseline")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn unsignaled_complete_read_does_not_add_catch_up_latency() {
+        let mut reads = vec![Some(RootSnapshot::new())].into_iter();
+        assert_eq!(
+            poll_appeared_roots(
+                &Some(RootSnapshot::new()),
+                false,
+                |_| reads.next().unwrap(),
+                || panic!("no catch-up signal")
+            ),
+            Some(Vec::new())
+        );
+    }
+
+    #[test]
+    fn immediately_available_surface_needs_no_catch_up() {
+        let mut reads = vec![Some(panel_snapshot())].into_iter();
+        assert_eq!(
+            poll_appeared_roots(
+                &Some(RootSnapshot::new()),
+                true,
+                |_| reads.next().unwrap(),
+                || panic!("surface already found")
+            ),
+            Some(vec![root(7, "Open")])
+        );
+    }
 
     #[test]
     fn exhausted_snapshot_budget_starts_no_more_ax_messages() {
