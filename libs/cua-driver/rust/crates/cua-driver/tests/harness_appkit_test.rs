@@ -1463,6 +1463,98 @@ fn harness_appkit_scroll_background() {
 }
 
 /// counter: click the increment button via element_index, verify the
+/// Verification can read a display-only label without publishing a click target
+/// or replacing the action snapshot retained by this session.
+#[test]
+#[ignore]
+fn harness_appkit_verify_display_text_preserves_action_snapshot() {
+    run_background_case(
+        "verify_display_text",
+        DriverRoute::MacosAxAction,
+        |pid, wid, driver| {
+            let snapshot = driver.call(
+                "get_window_state",
+                serde_json::json!({
+                    "pid": pid, "window_id": wid, "include_screenshot": false,
+                    // Public ingress must strip this private provider flag.
+                    "_observation_only": true
+                }),
+            );
+            assert!(!snapshot.is_error(), "{}", snapshot.text());
+            assert!(snapshot.tree_text().contains("counter=0"));
+            assert!(snapshot.structured()["snapshot_id"].is_string());
+            let public_elements = snapshot.structured()["elements"].as_array().unwrap();
+            assert!(public_elements
+                .iter()
+                .all(|row| row["element_index"].is_u64()));
+            assert!(!public_elements
+                .iter()
+                .any(|row| row["value"] == "counter=0"));
+            let token = element_token_by_id(&snapshot, "btn-increment");
+
+            for counter in 0..=2 {
+                if counter > 0 {
+                    let clicked = driver.call(
+                        "click",
+                        serde_json::json!({
+                            "pid": pid, "window_id": wid, "element_token": token,
+                            "delivery_mode": "background"
+                        }),
+                    );
+                    assert!(
+                        !clicked.is_error(),
+                        "original token failed: {}",
+                        clicked.text()
+                    );
+                }
+                let verified = driver.call(
+                    "verify_state",
+                    serde_json::json!({
+                        "pid": pid, "window_id": wid,
+                        "expect": [{"element": {
+                            "selector": {"role": "AXStaticText", "label_contains": "counter="},
+                            "value_equals": format!("counter={counter}")
+                        }}],
+                        "timeout_ms": 1500, "stable_samples": 2, "include_screenshot": false
+                    }),
+                );
+                println!("display verification {counter}: {}", verified.structured());
+                assert!(!verified.is_error(), "{}", verified.text());
+                assert_eq!(verified.structured()["status"], "satisfied");
+                assert_eq!(verified.structured()["stable"], true);
+                let observed: serde_json::Value = serde_json::from_str(
+                    verified.structured()["predicates"][0]["observed_json"]
+                        .as_str()
+                        .unwrap(),
+                )
+                .unwrap();
+                assert_eq!(observed["value"], format!("counter={counter}"));
+                assert!(observed.get("element_index").is_none());
+                assert!(observed.get("element_token").is_none());
+            }
+            let wrong = driver.call(
+                "verify_state",
+                serde_json::json!({
+                    "pid": pid, "window_id": wid,
+                    "expect": [{"element": {
+                        "selector": {"role": "AXStaticText", "label_contains": "counter="},
+                        "value_equals": "counter=99"
+                    }}], "timeout_ms": 0, "stable_samples": 1
+                }),
+            );
+            assert_eq!(wrong.structured()["status"], "unsatisfied");
+            let missing = driver.call("verify_state", serde_json::json!({
+                "pid": pid, "window_id": wid,
+                "expect": [{"element": {
+                    "selector": {"role": "AXStaticText", "label_contains": "missing-test-label"},
+                    "exists": true
+                }}], "timeout_ms": 0, "stable_samples": 1
+            }));
+            assert_eq!(missing.structured()["status"], "unknown");
+        },
+    );
+}
+
 /// counter label flips from 0 to 1.
 #[test]
 #[ignore]
