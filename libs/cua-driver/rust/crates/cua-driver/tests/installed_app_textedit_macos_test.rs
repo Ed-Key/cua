@@ -181,12 +181,26 @@ fn background_open_panel_returns_a_typed_rebind() {
         let document = fixture.path().join(&document_name);
         let marker = "Cua observer document readiness marker";
         std::fs::write(&document, marker).expect("write TextEdit fixture");
+        let before_apps = driver.call("list_apps", serde_json::json!({}));
+        assert!(
+            !before_apps.is_error(),
+            "pre-launch application inventory: {}",
+            before_apps.text()
+        );
+        let existing_pids: Vec<_> = before_apps.structured()["apps"]
+            .as_array()
+            .expect("pre-launch applications")
+            .iter()
+            .filter_map(|app| app["pid"].as_i64())
+            .collect();
+        let mut reaper = cua_driver_testkit::ChildReaper::new();
         let launch = driver.call(
             "launch_app",
             serde_json::json!({
                 "bundle_id": "com.apple.TextEdit",
                 "urls": [document.to_str().expect("fixture path")],
-                "creates_new_application_instance": true
+                "creates_new_application_instance": true,
+                "additional_arguments": ["-ApplePersistenceIgnoreState", "YES"]
             }),
         );
         assert!(
@@ -195,6 +209,15 @@ fn background_open_panel_returns_a_typed_rebind() {
             launch.text()
         );
         let pid = launch.structured()["pid"].as_i64().expect("TextEdit pid");
+        assert!(
+            pid > 1 && !existing_pids.contains(&pid),
+            "fixture must own a fresh process"
+        );
+        reaper.track_pid(pid.try_into().expect("owned TextEdit pid"));
+        eprintln!(
+            "[textedit-fixture] pid={pid} document={}",
+            document.display()
+        );
         let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         let window_id = loop {
             let windows = driver.call("list_windows", serde_json::json!({"pid": pid}));
