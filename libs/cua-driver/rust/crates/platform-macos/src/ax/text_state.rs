@@ -85,8 +85,9 @@ fn consistent_selection(
     (range.is_some() || text.is_some()).then_some(TextSelection { text, range })
 }
 
-/// Read only the matched focused text node. Other nodes do not pay per-node AX
-/// focus queries. If focus moves during the read, discard the whole focus view.
+/// Prefer app-level focus identity and read selection only on its matched node.
+/// Discard that view if focus changes. Missing or unstable app identity can use
+/// the separate best-effort web focus observation below.
 pub(crate) unsafe fn enrich_focused_state(pid: i32, nodes: &mut [AXNode]) {
     let Some(before) = focused(pid) else {
         enrich_web_reported_focus(nodes);
