@@ -80,6 +80,10 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
 ///
 /// Caller must `CFRelease` the returned element.
 pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUIElementRef> {
+    #[cfg(test)]
+    if let Some(result) = super::bindings::test_support::focused_editor(pid, window_id) {
+        return result;
+    }
     let element = focused_element_of_pid(pid)?;
     if element_window_id(element) == Some(window_id) {
         Some(element)

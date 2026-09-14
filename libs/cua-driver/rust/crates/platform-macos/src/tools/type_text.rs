@@ -1154,8 +1154,9 @@ fn await_typed_delivery(
 
 /// Best-effort-background ladder for `type_text`.
 ///
-/// - `delivery_mode == Background` (default): AX insert → read-back; on a
-///   silent/unreadable accept, CGEvent keystrokes → read-back. Never fronts.
+/// - `delivery_mode == Background` (default): AX insert then read-back. A
+///   rejected write or readable unchanged native value can fall back to keys.
+///   An accepted write with uncertain read-back stops for observation. Never fronts.
 /// - `delivery_mode == Foreground`: the agent's explicit last resort — briefly
 ///   front `window_id`, insert at the current cursor, restore, then read-back.
 ///
@@ -1381,6 +1382,17 @@ fn type_text_blocking(
             None => AxAttempt::Rejected,
             Some(TypedProgress::Complete | TypedProgress::Partial(_)) => unreachable!(),
         };
+        if ax_attempt == AxAttempt::Unverifiable {
+            // The write was accepted. Unreadable or untrusted unchanged state
+            // cannot establish that nothing landed, so another input route
+            // could insert the same text twice within this single request.
+            return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
+                detail: format!(" via accepted AX write into {role} \"{title}\""),
+                path: PATH_AX,
+                verified: false,
+                delivered_chars: None,
+            }));
+        }
         tracing::debug!(
             "AX write did not land for {role} \"{title}\" (err={err}); \
              falling back to CGEvent keystrokes"
@@ -1530,6 +1542,33 @@ mod tests {
             Ok(TypeTextDelivery::Refused(returned)) => assert_eq!(returned, refusal),
             other => panic!("expected a structured refusal, got {:?}", other.is_ok()),
         }
+    }
+
+    #[test]
+    fn accepted_unreadable_ax_write_returns_before_keyboard_fallback() {
+        let fixture =
+            crate::ax::bindings::test_support::EditorScope::install("AXTextField", None, || {});
+        fixture.hide_value_after_write();
+        // A large payload guarantees the old fallback stops at its synthesis
+        // budget without posting real key events from this unit test.
+        let text = "x".repeat(6_500);
+        let result = type_text_blocking(
+            -9876,
+            &text,
+            None,
+            0,
+            false,
+            super::super::DeliveryMode::Background,
+            Some(42),
+            BackgroundKeyboardPolicy::Allowed,
+        )
+        .expect("accepted AX write must retain an uncertain outcome");
+        let TypeTextDelivery::Typed(outcome) = result else {
+            panic!("an accepted unreadable AX write must not enter keyboard fallback");
+        };
+        assert_eq!(outcome.path, PATH_AX);
+        assert!(!outcome.verified);
+        assert_eq!(outcome.delivered_chars, None);
     }
 
     #[test]

@@ -148,6 +148,10 @@ struct CGSizeValue {
 
 use core_foundation::{array::CFArray, base::TCFType, string::CFString as CFStr};
 
+#[cfg(test)]
+#[path = "bindings_test_support.rs"]
+pub(crate) mod test_support;
+
 /// Whether an AX attribute is currently writable on this element.
 ///
 /// # Safety
@@ -167,6 +171,10 @@ pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) ->
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(result) = test_support::copy_string_attr(element, attr_name) {
+        return result;
+    }
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
@@ -216,6 +224,10 @@ pub unsafe fn copy_number_attr(element: AXUIElementRef, attr_name: &str) -> Opti
 /// `element` must be a valid Accessibility object reference for the duration
 /// of this call.
 pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
+    #[cfg(test)]
+    if let Some(result) = test_support::copy_bool_attr(element, attr_name) {
+        return result;
+    }
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
     let attr = CFStr::new(attr_name);
@@ -347,6 +359,10 @@ pub unsafe fn copy_stringish_attr(
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn copy_action_names(element: AXUIElementRef) -> Vec<String> {
+    #[cfg(test)]
+    if let Some(result) = test_support::copy_action_names(element) {
+        return result;
+    }
     let mut names: CFArrayRef = std::ptr::null_mut();
     let err = AXUIElementCopyActionNames(element, &mut names);
     if err != kAXErrorSuccess || names.is_null() {
@@ -426,6 +442,10 @@ pub unsafe fn element_screen_center(element: AXUIElementRef) -> Option<(f64, f64
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn element_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
+    #[cfg(test)]
+    if let Some(result) = test_support::editor_rect(element) {
+        return result;
+    }
     // AXPosition → CGPoint
     let pos_attr = CFStr::new("AXPosition");
     let mut pos_ref: CFTypeRef = std::ptr::null();
@@ -565,6 +585,10 @@ pub unsafe fn copy_element_attr(
     element: AXUIElementRef,
     attr_name: &str,
 ) -> Option<AXUIElementRef> {
+    #[cfg(test)]
+    if let Some(result) = test_support::copy_element_attr(element, attr_name) {
+        return result;
+    }
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
@@ -584,6 +608,10 @@ pub unsafe fn copy_element_attr(
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn perform_action(element: AXUIElementRef, action_name: &str) -> AXError {
+    #[cfg(test)]
+    if let Some(result) = test_support::perform_action(element, action_name) {
+        return result;
+    }
     let action = CFStr::new(action_name);
     AXUIElementPerformAction(element, action.as_concrete_TypeRef())
 }
@@ -594,6 +622,10 @@ pub unsafe fn perform_action(element: AXUIElementRef, action_name: &str) -> AXEr
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn set_string_attr(element: AXUIElementRef, attr_name: &str, value: &str) -> AXError {
+    #[cfg(test)]
+    if let Some(result) = test_support::editor_write(element, attr_name, value) {
+        return result;
+    }
     let attr = CFStr::new(attr_name);
     let cf_value = CFStr::new(value);
     AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())
@@ -668,6 +700,10 @@ pub unsafe fn set_size_attr(
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn set_bool_attr_true(element: AXUIElementRef, attr_name: &str) -> AXError {
+    #[cfg(test)]
+    if let Some(result) = test_support::set_bool_attr_true(element, attr_name) {
+        return result;
+    }
     use core_foundation::boolean::CFBoolean;
     let attr = CFStr::new(attr_name);
     let cf_true = CFBoolean::true_value();
