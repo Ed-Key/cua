@@ -483,7 +483,6 @@ pub mod macos {
     use core_foundation::dictionary::CFDictionary;
     use core_foundation::number::CFNumber;
     use core_foundation::string::CFString;
-    use objc2_app_kit::NSWorkspace;
 
     use super::{
         DesktopJournal, DesktopSnapshot, FocusEvent, ObserverBackend, ObserverCapabilities,
@@ -505,6 +504,21 @@ pub mod macos {
     #[link(name = "CoreFoundation", kind = "framework")]
     unsafe extern "C" {
         fn CFRelease(value: *const c_void);
+    }
+
+    // Public Process Manager reads remain available on macOS. Unlike the
+    // NSWorkspace cache, they update in a headless Rust test process without
+    // an AppKit main run loop. Keep this observer independent of driver SPI.
+    #[repr(C)]
+    struct ProcessSerialNumber {
+        high: u32,
+        low: u32,
+    }
+
+    #[link(name = "ApplicationServices", kind = "framework")]
+    unsafe extern "C" {
+        fn GetFrontProcess(psn: *mut ProcessSerialNumber) -> i16;
+        fn GetProcessPID(psn: *const ProcessSerialNumber, pid: *mut i32) -> i32;
     }
 
     #[repr(C)]
@@ -604,7 +618,9 @@ pub mod macos {
         fn snapshot(&self, target: TargetWindow) -> Result<DesktopSnapshot, ObserverError> {
             let rows = window_rows();
             let target_index = rows.iter().position(|row| row.id == target.native_id);
-            let foreground = frontmost_pid();
+            let foreground = Some(frontmost_pid().ok_or_else(|| {
+                ObserverError::new("macOS observer could not read the current foreground process")
+            })?);
             let target_z = match target_index {
                 None => TargetZ::NotFound,
                 Some(index) if !rows[index].on_screen => TargetZ::Minimized,
@@ -686,13 +702,14 @@ pub mod macos {
     }
 
     fn frontmost_pid() -> Option<u64> {
+        let mut psn = ProcessSerialNumber { high: 0, low: 0 };
+        let mut pid = 0;
         unsafe {
-            Some(
-                NSWorkspace::sharedWorkspace()
-                    .frontmostApplication()?
-                    .processIdentifier() as u64,
-            )
+            if GetFrontProcess(&mut psn) != 0 || GetProcessPID(&psn, &mut pid) != 0 || pid <= 0 {
+                return None;
+            }
         }
+        Some(pid as u64)
     }
 
     fn main_display_bounds() -> Bounds {

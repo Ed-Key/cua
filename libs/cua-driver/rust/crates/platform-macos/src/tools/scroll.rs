@@ -120,7 +120,14 @@ fn def() -> &'static ToolDef {
             (by='line'); horizontal uses Left/Right arrows. Drives the focused / page \
             scroller only.\n\n\
             Mapping: by='page' → larger step; by='line' → smaller step; amount = number of \
-            wheel notches (targeted path) or keystroke repetitions (keystroke path).".into(),
+            wheel notches (targeted path) or keystroke repetitions (keystroke path).\n\n\
+            On macOS Electron, background element scrolling reads the current element \
+            rectangle and sends wheel events without AXScrollToVisible or keyboard focus. \
+            The rectangle must be usable and contained in the exact window; clipped, \
+            offscreen or placeholder targets are refused. Use fresh screenshot coordinates \
+            when the element cannot provide that geometry. Untargeted background keyboard \
+            scrolling remains unavailable. Delivery does not prove that content moved; \
+            verify the resulting state.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             // `pid` conditionally required (validated in code), not pinned in the
@@ -239,22 +246,21 @@ impl Tool for ScrollTool {
         // background CGEvents). Only the pixel-wheel path honors it; the
         // keystroke path is background-by-design and untouched.
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
-        // Covered Electron renderers vary: some process wheel input, while
-        // others defer it. Admit only the exact pixel route demonstrated to
-        // work, retaining the existing refusal for AX and untargeted keys.
-        // Element addressing takes precedence over x/y later in this method.
+        // Electron element targets use a read-only rectangle lookup and the
+        // same guarded wheel dispatcher as pixel targets. Do not admit the
+        // untargeted keyboard route or implicitly reveal an offscreen element.
+        let background_electron =
+            !delivery_mode.is_foreground() && crate::browser::ElectronJs::is_electron(pid);
         let explicit_pixel_target = args.opt_u64("window_id").is_some()
             && args.opt_f64("x").is_some()
-            && args.opt_f64("y").is_some()
-            && args.opt_u64("element_index").is_none()
-            && args.opt_str("element_token").is_none();
-        if !delivery_mode.is_foreground()
-            && !explicit_pixel_target
-            && crate::browser::ElectronJs::is_electron(pid)
-        {
+            && args.opt_f64("y").is_some();
+        let explicit_element_target =
+            args.opt_u64("element_index").is_some() || args.opt_str("element_token").is_some();
+        if background_electron && !explicit_pixel_target && !explicit_element_target {
             return ToolResult::error(
-                "Background Electron scroll requires window_id and window-local screenshot \
-                 x,y without an element target. AX and untargeted scrolling remain unavailable."
+                "Background Electron scroll requires a fresh element target with a usable \
+                 rectangle inside its window, or window_id and window-local screenshot x,y. \
+                 Untargeted keyboard scrolling remains unavailable."
                     .to_owned(),
             )
             .with_structured(serde_json::json!({ "code": "background_unavailable" }));
@@ -318,7 +324,7 @@ impl Tool for ScrollTool {
         // AppKit exposes vertical scroll-bar buttons beneath the text area's
         // AXScrollArea parent. Pressing those controls is a true
         // background-safe scroll: no activation, z-order change, or cursor move.
-        if matches!(direction.as_str(), "up" | "down") {
+        if !background_electron && matches!(direction.as_str(), "up" | "down") {
             if let (Some(index), Some(wid)) = (element_index, window_id) {
                 if !delivery_mode.is_foreground() {
                     if let Some(lease) = _mutation_lease.as_ref() {
@@ -456,7 +462,48 @@ impl Tool for ScrollTool {
         };
 
         // Resolve a screen-space wheel target, if a target was supplied.
-        let wheel_target: Option<WheelTarget> = if let Some(element_ptr) = pre_focus_ptr {
+        let wheel_target: Option<WheelTarget> = if background_electron && pre_focus_ptr.is_some() {
+            let element_ptr = pre_focus_ptr.unwrap();
+            let Some(wid) = window_id else {
+                return ToolResult::error(
+                    "Electron element scroll requires an exact window target.",
+                );
+            };
+            let target = tokio::task::spawn_blocking(move || {
+                let rect = unsafe {
+                    crate::ax::bindings::element_screen_rect(element_ptr as AXUIElementRef)
+                }?;
+                // Chromium virtualized rows can expose 1-point placeholder
+                // frames. These do not ground a useful wheel target.
+                if rect[2] <= 1.0 || rect[3] <= 1.0 {
+                    return None;
+                }
+                let bounds = crate::windows::window_bounds_by_id(wid)?;
+                let (screen_x, screen_y, lx, ly) =
+                    cua_driver_core::geometry::contained_element_center(
+                        rect,
+                        [bounds.x, bounds.y, bounds.width, bounds.height],
+                    )?;
+                Some(WheelTarget {
+                    screen_x,
+                    screen_y,
+                    win_local: Some((lx, ly)),
+                    wid: Some(wid),
+                })
+            })
+            .await;
+            match target {
+                Ok(Some(target)) => Some(target),
+                _ => {
+                    return ToolResult::error(
+                        "Electron element scroll has no usable rectangle contained in the current \
+                     window. No reveal or keyboard input was sent. Refresh state and use a \
+                     visible scroll region or screenshot coordinates.",
+                    )
+                    .with_structured(serde_json::json!({ "code": "background_unavailable" }))
+                }
+            }
+        } else if let Some(element_ptr) = pre_focus_ptr {
             // Revealing an element is itself an AX mutation. Prove that the
             // cached element still belongs to the exact requested window before
             // AXScrollToVisible for every direction, then keep the lease for the
