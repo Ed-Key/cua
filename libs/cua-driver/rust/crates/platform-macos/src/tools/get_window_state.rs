@@ -1563,6 +1563,35 @@ mod tests {
     }
 
     #[test]
+    fn empty_value_survives_public_and_private_observations() {
+        for index in [None, Some(0)] {
+            let mut field = node(index, "AXTextField", Some("Draft"), 0, None, None, vec![]);
+            field.value = Some(String::new());
+            let nodes = [field];
+            let observed = build_observation_elements_array(&nodes);
+            assert_eq!(observed[0]["value"], "");
+            let public = build_elements_array_with_token(&nodes, Some(12));
+            if index.is_some() {
+                assert_eq!(public[0]["value"], "");
+                assert_eq!(public[0]["element_token"], "s0000000c:0");
+            } else {
+                assert!(public.is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn verification_recognizes_an_empty_native_field_value() {
+        let mut field = node(Some(0), "AXTextField", Some("Draft"), 0, None, None, vec![]);
+        field.value_state = Some(String::new());
+        let result = verify_observed_nodes(
+            &[field],
+            json!({"selector": {"role": "AXTextField", "label_contains": "Draft"}, "value_equals": ""}),
+        );
+        assert_eq!(result[0]["status"], "satisfied");
+    }
+
+    #[test]
     fn elements_omit_empty_value() {
         // An empty AXValue must not emit a `value` field (matches the other
         // optional fields' omit-when-absent contract).
