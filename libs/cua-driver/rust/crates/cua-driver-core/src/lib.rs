@@ -47,6 +47,7 @@ mod action_read_tests;
 pub mod action_record;
 pub mod action_target;
 pub mod authorization;
+pub mod geometry;
 pub mod background_input;
 pub mod browser;
 pub mod capture_mode;

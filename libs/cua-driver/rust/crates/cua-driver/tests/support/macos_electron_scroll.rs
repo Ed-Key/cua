@@ -45,7 +45,11 @@ function renderRows() {
 }
 historyPane.addEventListener('scroll',renderRows);renderRows();
 historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:e.isTrusted,dy:e.deltaY}));
-</script><main class="harness-grid">"#,
+</script>
+<div role="region" aria-label="Offscreen history"
+ style="position:absolute;top:3000px;width:400px;height:200px;overflow:auto">
+ <div style="height:1000px">Offscreen rows must not be revealed by scrolling.</div>
+</div><main class="harness-grid">"#,
     );
     let mut fixture = launch_browser_with_html(&spec, "electron-native-scroll", html);
     assert!(platform_macos::browser::ElectronJs::is_electron(
@@ -130,11 +134,17 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
             .find(|w| w.window_id == fixture.window_id as u32)
             .unwrap();
         assert!(cover.z_index > target.z_index);
+        // Match NativeObserver's two-point WindowServer rounding allowance.
+        // The VM can report a 685-point cover over a 686-point target frame.
+        let tolerance = 2.0;
         assert!(
-            cover.bounds.x <= bounds.x
-                && cover.bounds.y <= bounds.y
-                && cover.bounds.x + cover.bounds.width >= bounds.x + bounds.width
-                && cover.bounds.y + cover.bounds.height >= bounds.y + bounds.height
+            cover.bounds.x <= bounds.x + tolerance
+                && cover.bounds.y <= bounds.y + tolerance
+                && cover.bounds.x + cover.bounds.width + tolerance >= bounds.x + bounds.width
+                && cover.bounds.y + cover.bounds.height + tolerance >= bounds.y + bounds.height,
+            "cover={:?}, current_target={:?}, initial_target={bounds:?}",
+            cover.bounds,
+            target.bounds
         );
     }
     let deadline = Instant::now() + Duration::from_secs(3);
@@ -225,7 +235,71 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                 .cloned()
                 .collect();
             assert_eq!(matches.len(), 1, "one AX message pane: {}", snapshot.text());
-            let token = matches[0]["element_token"].as_str().unwrap();
+            let old_token = matches[0]["element_token"].as_str().unwrap();
+            let refreshed = fixture.driver.call(
+                "get_window_state",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id,
+                    "include_screenshot":false
+                }),
+            );
+            assert!(!refreshed.is_error(), "{}", refreshed.raw);
+            let stale = fixture.driver.call(
+                "scroll",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id,
+                    "element_token":old_token,"x":x,"y":y,"direction":"down",
+                    "delivery_mode":"background"
+                }),
+            );
+            assert!(
+                stale.is_error(),
+                "stale element must not fall back to pixels: {}",
+                stale.raw
+            );
+            let current = refreshed.structured();
+            let find = |label: &str| {
+                current["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|entry| entry["label"] == label)
+                    .unwrap_or_else(|| panic!("missing {label}: {}", refreshed.text()))
+                    ["element_token"]
+                    .as_str()
+                    .unwrap()
+                    .to_owned()
+            };
+            let token = find("Message history");
+            let wrong_window = fixture.driver.call(
+                "scroll",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":sentinel.target().native_id,
+                    "element_token":token,"direction":"down","delivery_mode":"background"
+                }),
+            );
+            assert!(
+                wrong_window.is_error(),
+                "wrong window must refuse: {}",
+                wrong_window.raw
+            );
+            let offscreen = fixture.driver.call(
+                "scroll",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id,
+                    "element_token":find("Offscreen history"),"direction":"down",
+                    "delivery_mode":"background"
+                }),
+            );
+            assert!(
+                offscreen.is_error(),
+                "offscreen target must not be revealed: {}",
+                offscreen.raw
+            );
+            let unchanged = read();
+            assert_eq!(unchanged["top"], 0);
+            assert_eq!(unchanged["outer"], 0);
+            assert_eq!(unchanged["events"].as_array().unwrap().len(), 0);
             arguments.as_object_mut().unwrap().remove("x");
             arguments.as_object_mut().unwrap().remove("y");
             arguments["element_token"] = serde_json::json!(token);
@@ -346,4 +420,89 @@ fn visible_background_element_scroll_loads_rows() {
 #[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
 fn covered_background_element_dispatch_stays_unverified() {
     run_scroll(true, true);
+}
+
+#[test]
+#[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
+fn native_foreground_observer_detects_a_real_transition() {
+    let _lock = STANDALONE_BROWSER_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let spec = BrowserSpec {
+        name: "electron".into(),
+        executable: cua_driver_testkit::harness_app(
+            "harness-electron",
+            "CuaTestHarness.Electron.app/Contents/MacOS/Electron",
+        ),
+    };
+    let html = standalone_fixture_html().replace(
+        r#"<main class="harness-grid">"#,
+        r#"<script>
+fetch(window.__CUA_E2E_FIXTURE_JOURNAL_URL,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({ready:'WEB_HARNESS_MARKER_v1'})});
+</script><main class="harness-grid">"#,
+    );
+    let mut fixture = launch_browser_with_html(&spec, "foreground-observer-canary", html);
+    let sentinel = ForegroundSentinel::launch(&mut fixture.driver);
+    let target = TargetWindow {
+        pid: fixture.pid,
+        native_id: fixture.window_id,
+    };
+    sentinel
+        .prepare_background_observation(&mut fixture.driver, target)
+        .unwrap();
+    let mut observer = DesktopObserver::new(NativeObserver::new(), target);
+    assert_eq!(
+        observer.snapshot().unwrap().foreground,
+        Some(sentinel.target().pid as u64)
+    );
+    let fresh_foreground = || {
+        let output = std::process::Command::new("/usr/bin/osascript")
+            .args(["-l", "JavaScript", "-e", "ObjC.import('AppKit'); $.NSWorkspace.sharedWorkspace.frontmostApplication.processIdentifier"])
+            .output().unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap()
+    };
+    // A new process supplies independent current foreground evidence. No GUI
+    // input goes through that process; activation stays in the fixture setup.
+    assert_eq!(fresh_foreground(), sentinel.target().pid as u64);
+    let (_, delta) = observer
+        .observe(&[OracleKind::Focus], || {
+            let front = fixture.driver.call(
+                "bring_to_front",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id
+                }),
+            );
+            assert!(!front.is_error(), "{}", front.raw);
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let fresh = fresh_foreground();
+                if fresh == fixture.pid as u64 {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture activation did not land: {fresh}"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+        })
+        .unwrap();
+    eprintln!(
+        "[native-focus-canary] fresh_pid={} delta={delta:?}",
+        fresh_foreground()
+    );
+    assert_eq!(
+        delta.after.foreground,
+        Some(fixture.pid as u64),
+        "{delta:?}"
+    );
+    assert!(
+        !delta.violations().is_empty(),
+        "the intentional focus change must fail the focus oracle"
+    );
 }

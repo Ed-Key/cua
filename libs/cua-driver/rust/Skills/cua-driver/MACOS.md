@@ -300,12 +300,16 @@ surface that only accepts events while frontmost (the canvas/viewport/game
 case below). Unmodified element-indexed (AX) actions remain background-capable
 and hold the no-foreground contract without the flag.
 
-For Electron message lists, background `scroll` can use the existing native
-wheel route when addressed with pixels. AX-addressed and untargeted Electron
-background scroll remain refused. Choose a point inside the message pane from a fresh window
-screenshot and pass `window_id`, `x`, and `y` in that screenshot's pixels. A
-missing or 1-by-1 accessibility frame is not a usable wheel target. Do not click
-the composer merely to prepare a scroll.
+For Electron message lists on macOS, background `scroll` uses the existing
+native wheel route with either a fresh element target or screenshot pixels.
+An element target must have a usable current rectangle fully inside the exact
+window. The driver reads that rectangle without revealing the element or
+changing keyboard focus. Missing, clipped, offscreen, and 1-point placeholder
+frames are refused. In that case, choose a point inside the message pane from
+a fresh screenshot and pass `window_id`, `x`, and `y` in screenshot pixels.
+Untargeted background keyboard scrolling remains unavailable. Do not click
+the composer merely to prepare a scroll. This element-to-wheel admission is a
+macOS implementation; it does not change Windows or Linux route support.
 
 An accepted wheel request returns `effect:"unverifiable"`. Read fresh message
 identities or visible text to confirm progress, preferably with a bounded
