@@ -253,6 +253,46 @@ fn run_background_case_with_env(
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
+/// A heartbeat is not the receipt for a setup click. Delayed setup input must
+/// be consumed before a background read enters its observation boundary.
+#[test]
+#[ignore]
+fn harness_appkit_background_setup_waits_for_click_receipt() {
+    run_case(
+        native_background_case(
+            "appkit",
+            "setup_click_receipt",
+            Targeting::Ax,
+            DriverRoute::AxRead,
+        ),
+        |pid, wid, driver| {
+            let target = TargetWindow {
+                pid,
+                native_id: wid,
+            };
+            let sentinel = cua_driver_testkit::sentinel::ForegroundSentinel::launch_with_env(
+                driver,
+                &[("CUA_E2E_SENTINEL_CLICK_RECEIPT_DELAY_MS", "600")],
+            );
+            sentinel
+                .assert_background_posture(target)
+                .expect("occluded target");
+            driver.start_behavior_recording();
+            sentinel
+                .prepare_background_observation(driver, target)
+                .expect("ready observation boundary");
+            let (_, passed) = sentinel
+                .observe_background(target, || {
+                    let state = snapshot_elements(driver, pid, wid);
+                    assert!(state.tree_text().contains("HARNESS_TEXT_MARKER_v1"));
+                    assert!(state.tree_text().contains("counter=0"));
+                })
+                .expect("a read must not inherit the sentinel's setup click");
+            Observation::delivered_with_fixture_state(passed)
+        },
+    );
+}
+
 /// Diagnostic negative control for focused background runs that do not enable
 /// the full preflight's video capture. This deliberately changes foreground
 /// focus and injects a key into the sentinel, so run only on a test desktop.

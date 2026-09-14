@@ -58,7 +58,14 @@ function appendSentinelEvent(entry) {
 }
 
 ipcMain.on('cua-e2e-sentinel-event', (_event, entry) => {
-  appendSentinelEvent(entry);
+  // Fault injection for the setup-boundary regression. Keep heartbeats live
+  // while the completion receipt for a physical setup click is delayed.
+  const delay = Number(process.env.CUA_E2E_SENTINEL_CLICK_RECEIPT_DELAY_MS || 0);
+  if (delay > 0 && (entry.kind === 'pointerup' || entry.kind === 'click')) {
+    setTimeout(() => appendSentinelEvent({ ...entry, journaled_at_ms: Date.now() }), delay);
+  } else {
+    appendSentinelEvent(entry);
+  }
 });
 
 let mainWindow;

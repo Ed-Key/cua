@@ -25,9 +25,13 @@ pub struct ForegroundSentinel {
 
 impl ForegroundSentinel {
     pub fn launch(driver: &mut impl Driver) -> Self {
+        Self::launch_with_env(driver, &[])
+    }
+
+    pub fn launch_with_env(driver: &mut impl Driver, env: &[(&str, &str)]) -> Self {
         let mut last_error = None;
         for attempt in 1..=2 {
-            match Self::try_launch(driver) {
+            match Self::try_launch(driver, env) {
                 Ok(sentinel) => return sentinel,
                 Err(error) => {
                     eprintln!(
@@ -46,7 +50,7 @@ impl ForegroundSentinel {
         );
     }
 
-    fn try_launch(driver: &mut impl Driver) -> Result<Self, String> {
+    fn try_launch(driver: &mut impl Driver, env: &[(&str, &str)]) -> Result<Self, String> {
         let electron = electron_fixture();
         if !electron.path.exists() {
             return Err(format!(
@@ -66,6 +70,7 @@ impl ForegroundSentinel {
             .map_err(|error| format!("allocate sentinel CDP port: {error}"))?
             .port();
         let mut command = Command::new(&electron.path);
+        command.envs(env.iter().copied());
         command
             .args(&electron.args)
             .env("CUA_E2E_SENTINEL", "1")
@@ -175,6 +180,7 @@ impl ForegroundSentinel {
         };
         let mut passed = Vec::new();
         let mut violations = Vec::new();
+        self.trace_journal("observed");
         if !events
             .iter()
             .any(|event| event_kind(event) == Some("heartbeat"))
@@ -337,9 +343,17 @@ impl ForegroundSentinel {
         driver: &mut impl Driver,
         target: TargetWindow,
     ) -> Result<(), String> {
+        // macOS explicitly clicks the foreground renderer during activation.
+        // Start a fresh receipt window so an earlier setup click cannot satisfy
+        // this wait. Heartbeats can overtake asynchronous input delivery.
+        #[cfg(target_os = "macos")]
+        reset_journal(&self.journal_path)?;
         activate_native_foreground(driver, self.target);
+        #[cfg(target_os = "macos")]
+        wait_for_event(&self.journal_path, "click", Duration::from_secs(2))?;
         wait_for_native_focus_stable(self.target);
         std::thread::sleep(Duration::from_millis(100));
+        self.trace_journal("setup-before-reset");
         reset_journal(&self.journal_path)?;
         // Windows establishes focus with a physical click. Its DOM `click`
         // can arrive after the native focus transition and the first journal
@@ -347,8 +361,23 @@ impl ForegroundSentinel {
         // A later heartbeat is an event-loop barrier: once observed, clear the
         // journal again so the action boundary starts from a quiet sentinel.
         wait_for_event(&self.journal_path, "heartbeat", Duration::from_secs(2))?;
+        self.trace_journal("setup-before-final-reset");
         reset_journal(&self.journal_path)?;
         self.assert_background_posture(target)
+    }
+
+    fn trace_journal(&self, phase: &str) {
+        if std::env::var_os("CUA_E2E_SENTINEL_TRACE").is_some() {
+            eprintln!(
+                "sentinel-trace {}",
+                serde_json::json!({
+                    "phase": phase,
+                    "at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                    "pid": self.target.pid,
+                    "events": read_journal_events(&self.journal_path).unwrap_or_default(),
+                })
+            );
+        }
     }
 
     /// Run one background action while checking the native desktop and the
