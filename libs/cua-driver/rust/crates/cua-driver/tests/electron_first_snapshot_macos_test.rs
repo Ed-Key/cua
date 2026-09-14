@@ -4,9 +4,9 @@
 //! snapshot after the fixture-owned journal reports that the page is ready.
 //! Run in a logged-in, TCC-authorized macOS session:
 //! cargo test -p cua-driver --test electron_first_snapshot_macos_test -- --ignored --nocapture --test-threads=1
-//! For a controlled local latency regression, set CUA_E2E_FIRST_AX_BUDGET_MS=2000.
-//! This optional budget distinguishes the cold screen-reader debounce from a
-//! ready native-API tree. It is not a universal desktop timing requirement.
+//! CUA_E2E_FIRST_AX_BUDGET_MS optionally bounds a controlled local measurement.
+//! A fast readable tree is insufficient: its first control must also accept
+//! input. Do not trade first-action correctness for a shorter snapshot time.
 
 #![cfg(target_os = "macos")]
 
@@ -20,16 +20,22 @@ use cua_driver_testkit::{harness_app, spawn_in_job, Driver, FixtureJournal, McpD
 #[test]
 #[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
 fn first_electron_snapshot_contains_ready_web_controls() {
-    check_first_snapshot(false);
+    check_first_snapshot(false, false);
 }
 
 #[test]
 #[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
 fn first_background_electron_snapshot_contains_ready_web_controls() {
-    check_first_snapshot(true);
+    check_first_snapshot(true, false);
 }
 
-fn check_first_snapshot(background: bool) {
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn first_background_electron_snapshot_control_accepts_first_click() {
+    check_first_snapshot(true, true);
+}
+
+fn check_first_snapshot(background: bool, click_first: bool) {
     let executable = harness_app(
         "harness-electron",
         "CuaTestHarness.Electron.app/Contents/MacOS/Electron",
@@ -102,6 +108,9 @@ fn check_first_snapshot(background: bool) {
             .expect("owned sentinel covers the fresh Electron target");
     }
     let mut read = || {
+        if click_first {
+            assert_eq!(journal.text("lbl-counter").as_deref(), Some("counter=0"));
+        }
         let start = Instant::now();
         let state = driver.call(
             "get_window_state",
@@ -109,7 +118,44 @@ fn check_first_snapshot(background: bool) {
                 "pid": pid, "window_id": wid, "include_screenshot": false,
             }),
         );
-        (state, start.elapsed())
+        let elapsed = start.elapsed();
+        if click_first {
+            assert!(!state.is_error(), "first snapshot failed: {}", state.text());
+            let data = state.structured();
+            let targets: Vec<_> = data["elements"]
+                .as_array()
+                .expect("structured AX elements")
+                .iter()
+                .filter(|element| {
+                    element["role"] == "AXButton"
+                        && element["label"] == "Increment"
+                        && element["enabled"] == true
+                })
+                .collect();
+            assert_eq!(targets.len(), 1, "one enabled Increment control");
+            let token = targets[0]["element_token"].as_str().expect("fresh token");
+            // No second snapshot, readiness sleep, or retry. An AXPress
+            // acknowledgement does not prove the renderer accepted the action.
+            let click = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid, "window_id": wid, "element_token": token,
+                    "delivery_mode": "background",
+                }),
+            );
+            assert!(!click.is_error(), "first click failed: {}", click.text());
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while journal.text("lbl-counter").as_deref() != Some("counter=1") {
+                assert!(
+                    Instant::now() < deadline,
+                    "first AX click did not reach the renderer: {}; journal: {}",
+                    click.text(),
+                    journal.snapshot()
+                );
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        (state, elapsed)
     };
     let (state, elapsed) = if let Some(sentinel) = &sentinel {
         let (result, oracles) = sentinel
