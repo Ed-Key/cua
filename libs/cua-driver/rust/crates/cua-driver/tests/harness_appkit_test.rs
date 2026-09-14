@@ -1205,8 +1205,9 @@ fn harness_appkit_verify_display_text_preserves_action_snapshot() {
 /// Manual agent boundary reuses the fixture and background oracles. The agent
 /// receives only fixture identity and task text; an independent raw AX reader
 /// checks the counter before and after the completed answer is published.
+#[cfg(feature = "manual-agent-trials")]
 #[test]
-#[ignore]
+#[ignore = "external agent coordinator and raw AX observer required"]
 fn harness_appkit_agent_counter_trial() {
     let artifacts = PathBuf::from(std::env::var("CUA_AGENT_TRIAL_DIR").expect("trial directory"));
     assert!(artifacts.is_absolute());

@@ -64,6 +64,8 @@ platform-linux = { path = "../platform-linux" }
 
 [features]
 default = []
+# Opt-in agent handoff diagnostics are excluded from ordinary desktop E2E.
+manual-agent-trials = []
 # GNOME/KDE portal input ships in ordinary Linux releases; PipeWire capture
 # remains a separate modern-desktop feature. The combined name stays as a
 # compatibility alias for Nix and downstream builds.
