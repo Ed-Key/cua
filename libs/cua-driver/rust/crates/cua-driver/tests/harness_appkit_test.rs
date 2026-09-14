@@ -816,6 +816,7 @@ fn harness_appkit_click_on_a_text_role_focuses_it() {
                 }),
             );
             assert!(!clicked.is_error(), "click failed: {}", clicked.text());
+            println!("text-field click: {}", clicked.text());
             assert!(
                 !clicked.text().contains("does not advertise"),
                 "a text role still had an AXPress dispatched at it: {}",
@@ -837,13 +838,28 @@ fn harness_appkit_click_on_a_text_role_focuses_it() {
                 }),
             );
             assert!(!typed.is_error(), "type_text failed: {}", typed.text());
+            println!("text-field typing: {}", typed.text());
             std::thread::sleep(Duration::from_millis(250));
             let after = snapshot_elements(driver, pid, wid);
-            assert!(
-                after.tree_text().contains("focus-cua"),
-                "the click did not leave the field focused:\n{}",
-                after.tree_text()
-            );
+            // Check the addressed field rather than accepting a match anywhere
+            // in the tree. Edit-notification/commit behavior is a separate check.
+            for identifier in ["txt-input"] {
+                let index = element_index_by_id(after.tree_text(), identifier)
+                    .unwrap_or_else(|| panic!("{identifier} remains addressable"));
+                let element = after.structured()["elements"]
+                    .as_array()
+                    .and_then(|elements| {
+                        elements
+                            .iter()
+                            .find(|element| element["element_index"].as_u64() == Some(index))
+                    })
+                    .unwrap_or_else(|| panic!("{identifier} structured state"));
+                println!("text-field evidence {identifier}: {element}");
+                assert_eq!(
+                    element["value"], "focus-cua",
+                    "{identifier} must reflect one exact edit"
+                );
+            }
         },
     );
 }
