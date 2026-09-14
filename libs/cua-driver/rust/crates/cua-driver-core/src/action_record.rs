@@ -456,7 +456,14 @@ impl ActionExecutionRecord {
                             EscalationKind::ActivateTarget
                             | EscalationKind::RetryWithForegroundDelivery => (
                                 ActionEscalationTarget::Foreground,
-                                ActionEscalationReason::DeliveryFailed,
+                                // A suggested next route does not establish
+                                // that the previous delivery failed. Preserve
+                                // unknown effects without inventing failure.
+                                if projection.effect == ActionEffect::Unverifiable {
+                                    ActionEscalationReason::EffectUnconfirmed
+                                } else {
+                                    ActionEscalationReason::DeliveryFailed
+                                },
                             ),
                             EscalationKind::RetryWithPixelTarget => (
                                 ActionEscalationTarget::Pixel,
@@ -1501,7 +1508,7 @@ mod tests {
             (
                 EscalationKind::RetryWithForegroundDelivery,
                 ActionEscalationTarget::Foreground,
-                ActionEscalationReason::DeliveryFailed,
+                ActionEscalationReason::EffectUnconfirmed,
             ),
             (
                 EscalationKind::RequestPermission,
@@ -1558,6 +1565,113 @@ mod tests {
             permission.escalation.unwrap().reason,
             ActionEscalationReason::PermissionRequired,
             "suspected-noop classification must not hide a permission blocker"
+        );
+    }
+
+    #[test]
+    fn foreground_recommendation_does_not_turn_unknown_delivery_into_failure() {
+        for transport in [
+            ActionTransport::MacosCgEventPid,
+            ActionTransport::WindowsPostMessage,
+            ActionTransport::LinuxXSendEvent,
+            ActionTransport::LinuxLibei,
+        ] {
+            for kind in [
+                EscalationKind::ActivateTarget,
+                EscalationKind::RetryWithForegroundDelivery,
+            ] {
+                let record = ActionExecutionRecord::builder(
+                    ActionEffect::Unverifiable,
+                    transport,
+                    RequestedDelivery::Background,
+                )
+                .actual_delivery(ActualDelivery::Background)
+                .escalation(ActionEscalation { kind, detail: None })
+                .build()
+                .unwrap();
+                let result = record.public_result().unwrap();
+                assert_eq!(
+                    result.effect,
+                    cua_driver_contract::ActionEffect::Unverifiable
+                );
+                assert_eq!(
+                    result.escalation.unwrap().reason,
+                    cua_driver_contract::ActionEscalationReason::EffectUnconfirmed
+                );
+                assert!(result.evidence.is_none());
+                assert_eq!(result.delivery.unwrap().delivered_count, None);
+            }
+        }
+    }
+
+    #[test]
+    fn foreground_recommendation_preserves_refusal_partial_and_noop_outcomes() {
+        use cua_driver_contract::ActionEscalationReason;
+        for (effect, count, reason) in [
+            (
+                ActionEffect::Refused,
+                None,
+                ActionEscalationReason::DeliveryFailed,
+            ),
+            (
+                ActionEffect::Partial,
+                Some(2),
+                ActionEscalationReason::DeliveryFailed,
+            ),
+            (
+                ActionEffect::SuspectedNoop,
+                None,
+                ActionEscalationReason::SuspectedNoop,
+            ),
+        ] {
+            let mut record = ActionExecutionRecord::new(
+                effect,
+                ActionTransport::MacosCgEventPid,
+                RequestedDelivery::Background,
+            );
+            record.delivered_count = count;
+            if effect != ActionEffect::Refused {
+                record.actual_delivery = Some(ActualDelivery::Background);
+            }
+            record.escalation = Some(ActionEscalation {
+                kind: EscalationKind::RetryWithForegroundDelivery,
+                detail: None,
+            });
+            let result = record.public_result().unwrap();
+            assert_eq!(result.escalation.unwrap().reason, reason);
+            assert_eq!(result.delivery.and_then(|d| d.delivered_count), count);
+            assert!(result.evidence.is_none());
+            assert_eq!(
+                result.effect,
+                match effect {
+                    ActionEffect::Refused => cua_driver_contract::ActionEffect::Refused,
+                    ActionEffect::Partial => cua_driver_contract::ActionEffect::Partial,
+                    ActionEffect::SuspectedNoop => cua_driver_contract::ActionEffect::SuspectedNoop,
+                    _ => unreachable!(),
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_unverified_typing_retains_uncertainty_in_public_result() {
+        let record = ActionExecutionRecord::from_legacy(
+            "type_text",
+            &serde_json::json!({"delivery_mode":"background"}),
+            &serde_json::json!({
+                "path":"key_events", "characters":16, "requested_chars":16,
+                "verified":false, "effect":"unverifiable",
+                "escalation":{"recommended":"foreground", "reason":"background insert could not be confirmed"}
+            }),
+        ).unwrap();
+        let public = serde_json::to_value(record.public_result().unwrap()).unwrap();
+        assert_eq!(
+            public,
+            serde_json::json!({
+                "effect":"unverifiable", "route":"synthetic_events",
+                "delivery":{"mode":"background"},
+                "escalation":{"target":"foreground", "reason":"effect_unconfirmed"}
+            })
         );
     }
 
