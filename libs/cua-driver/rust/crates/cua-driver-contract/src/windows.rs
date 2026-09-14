@@ -233,10 +233,12 @@ pub struct WindowElement {
     pub value_settable: Option<bool>,
     /// Reported keyboard focus. Currently populated on macOS; absent is unknown.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub focused: Option<bool>,
     /// Only read for the focused text control. Unsupported attributes stay absent.
     /// Web accessibility state is observational, not renderer verification.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub text_selection: Option<TextSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
