@@ -30,3 +30,21 @@ cargo test -p cua-driver-core action_record::tests --lib
 Related reports include trycua/cua issue 3389. Pull request 3811 addresses a
 different stale-element readback issue; this formatter correction does not
 replace that contribution or claim to solve its Contacts reproduction.
+
+## macOS typing recovery
+
+After an unverified completed typing attempt, the macOS adapter now returns
+observation guidance without a pixel, page, or foreground escalation. This
+applies both to already-unverified outcomes and to web AX readbacks that are
+downgraded from apparent success. Native confirmation and delivered counts
+remain intact; refusal and partial-delivery branches keep their own handling.
+
+The caller reads the target state before another edit and requests a screenshot
+when accessibility cannot establish the rendered result. The typing response
+itself has no image. The canonical skill and macOS guide follow this ordering.
+The change adds no automatic screenshot, retry, or wait to the action path.
+
+The adapter change is macOS-specific. Windows and Linux retain their existing
+response generation, while the shared skill's observe-before-retry rule applies
+to all unknown edits. This work does not provide new live Windows/Linux input
+evidence. The optional escalation field remains part of the shared schema.
