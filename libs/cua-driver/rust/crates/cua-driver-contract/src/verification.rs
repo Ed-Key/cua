@@ -164,6 +164,7 @@ pub struct TextSelectionPredicate {
     pub length: u64,
     /// When present, also require this exact readable selected text.
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub text: Option<String>,
 }
 
@@ -202,6 +203,7 @@ pub struct ElementPredicate {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
     pub text_selection: Option<TextSelectionPredicate>,
 }
 

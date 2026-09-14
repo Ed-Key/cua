@@ -1897,6 +1897,7 @@ export type TextSelectionPredicate = {
  */
 export const TextSelectionPredicate = (() => {
     const defaults = () => ({
+        text: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<TextSelectionPredicate, ReturnType<typeof defaults>>(defaults);
@@ -1954,6 +1955,7 @@ export type ElementPredicate = {
  */
 export const ElementPredicate = (() => {
     const defaults = () => ({
+        textSelection: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<ElementPredicate, ReturnType<typeof defaults>>(defaults);
@@ -5155,6 +5157,8 @@ export type WindowElement = {
  */
 export const WindowElement = (() => {
     const defaults = () => ({
+        focused: undefined,
+        textSelection: undefined,
     });
     const create = (() => {
         return uniffiCreateRecord<WindowElement, ReturnType<typeof defaults>>(defaults);

@@ -25,6 +25,43 @@ LIBRARY = Path(__file__).parents[1] / "src" / "cua_driver" / _library_name()
 
 @unittest.skipUnless(LIBRARY.exists(), "host-native UniFFI library is not staged")
 class GeneratedOptionsTests(unittest.TestCase):
+    def test_selection_predicate_preserves_existing_element_constructor(self) -> None:
+        from cua_driver import ElementPredicate, ElementSelector
+
+        predicate = ElementPredicate(
+            selector=ElementSelector(role="AXTextField", label_contains=None),
+            exists=True, value_equals=None, enabled=None, selected=None,
+        )
+        self.assertIsNone(predicate.text_selection)
+
+    def test_selection_records_are_public_and_roundtrip_through_ffi(self) -> None:
+        import cua_driver
+        from cua_driver import _native_contract as contract
+
+        for name in ("TextSelectionPredicate", "TextSelection", "TextSelectionRange"):
+            self.assertIn(name, cua_driver.__all__)
+            self.assertIs(getattr(cua_driver, name), getattr(contract, name))
+
+        predicate = cua_driver.TextSelectionPredicate(location=9, length=0)
+        self.assertIsNone(predicate.text)
+        converter = contract._UniffiFfiConverterTypeTextSelectionPredicate
+        self.assertEqual(converter.lift(converter.lower(predicate)), predicate)
+        predicate = cua_driver.TextSelectionPredicate(location=5, length=4, text="this")
+        self.assertEqual(converter.lift(converter.lower(predicate)), predicate)
+
+    def test_selection_observation_preserves_existing_window_element_constructor(self) -> None:
+        from cua_driver import WindowElement
+
+        element = WindowElement(
+            element_index=0, role="AXTextField", depth=0, element_token=None,
+            label=None, value="Keep this note.", value_settable=None,
+            placeholder=None, value_description=None, enabled=True, selected=None,
+            in_web_content=False, actions=None, parent_index=None, frame=None,
+            min=None, max=None,
+        )
+        self.assertIsNone(element.focused)
+        self.assertIsNone(element.text_selection)
+
     def test_legacy_window_change_evidence_keeps_ffi_ordinal(self) -> None:
         from cua_driver import _native_contract as contract
 
