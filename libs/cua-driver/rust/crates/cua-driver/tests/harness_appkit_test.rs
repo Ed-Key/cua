@@ -1106,6 +1106,83 @@ fn harness_appkit_verify_display_text_preserves_action_snapshot() {
     );
 }
 
+/// Manual agent boundary reuses the fixture and background oracles. The agent
+/// receives only fixture identity and task text; an independent raw AX reader
+/// checks the counter before and after the completed answer is published.
+#[test]
+#[ignore]
+fn harness_appkit_agent_counter_trial() {
+    let artifacts = PathBuf::from(std::env::var("CUA_AGENT_TRIAL_DIR").expect("trial directory"));
+    assert!(artifacts.is_absolute());
+    assert!(!artifacts.exists(), "use a fresh trial directory");
+    std::fs::create_dir_all(artifacts.join("workspace")).unwrap();
+    let observer = PathBuf::from(std::env::var("CUA_AGENT_OBSERVER_BIN").expect("raw AX observer"));
+    assert!(observer.is_absolute() && observer.is_file());
+    // Agent targeting and backend are audited from its transcript, not prescribed here.
+    run_background_case_targeting(
+        "agent_counter",
+        Targeting::NotApplicable,
+        DriverRoute::Composite,
+        |pid, wid, _driver| {
+            let observe = |name: &str| {
+                let out = Command::new(&observer)
+                    .arg(pid.to_string())
+                    .output()
+                    .unwrap();
+                std::fs::write(artifacts.join(format!("{name}.stderr")), &out.stderr).unwrap();
+                assert!(out.status.success(), "independent observer failed");
+                std::fs::write(artifacts.join(format!("{name}.json")), &out.stdout).unwrap();
+                let state: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                let counters: Vec<&str> = state["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row["AXRole"] == "AXStaticText")
+                    .filter_map(|row| row["AXValue"].as_str())
+                    .filter(|value| value.starts_with("counter="))
+                    .collect();
+                assert_eq!(counters.len(), 1, "counter must be uniquely observable");
+                counters[0].to_owned()
+            };
+            assert_eq!(observe("initial-state"), "counter=0");
+            let identity =
+                serde_json::json!({"app_pid": pid, "window_id": wid, "app_path": harness_app()});
+            std::fs::write(
+                artifacts.join("workspace/process.json"),
+                identity.to_string(),
+            )
+            .unwrap();
+            std::fs::write(artifacts.join("manual-ready.json"), identity.to_string()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(360);
+            while !artifacts.join("manual-complete.json").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "agent completion deadline exceeded"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let marker: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(artifacts.join("manual-complete.json")).unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                marker["exit_code"], 0,
+                "agent did not complete successfully"
+            );
+            let answer: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(artifacts.join("answer.json")).unwrap())
+                    .unwrap();
+            let final_value = observe("final-state");
+            assert_eq!(
+                final_value, "counter=3",
+                "agent answer cannot substitute for actual fixture state"
+            );
+            assert_eq!(answer["counter"], 3);
+            assert_eq!(answer["completed"], true);
+        },
+    );
+}
+
 /// Click the increment button via element_index and verify the counter flips from 0 to 1.
 #[test]
 #[ignore]
