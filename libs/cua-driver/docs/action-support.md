@@ -61,6 +61,18 @@ integrity-level harness can exercise it.
 
 ## Native macOS
 
+Local macOS typing correction: background web-editor keystrokes select the
+exact native keyboard window inside the existing target-only focus scope.
+An AX-focused editor alone does not prove that its window can receive keys.
+This preparation does not add a pointer click, preserving existing selections.
+Focused `electron_first_snapshot_macos_test` typing cases cover fresh input,
+an addressed attempt followed by observation and conditional recovery, and
+selected replacement both before and after the first pointer action. They
+require app-owned text and the focus, z-order, cursor, and input-leak oracles.
+Web AX readback remains `unverifiable`, not independent renderer confirmation.
+This is macOS-only coverage, not a new shared-matrix certification; Windows
+and Linux adapters are unchanged.
+
 Local macOS scroll correction: Electron pixel-targeted scrolling is no longer
 rejected solely by runtime identity. The existing guarded native wheel route
 can be attempted and returns `effect:"unverifiable"`; it does not promise a renderer update. The

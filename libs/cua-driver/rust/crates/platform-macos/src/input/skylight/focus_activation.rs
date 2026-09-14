@@ -173,6 +173,29 @@ pub(super) fn with_background<T>(
     }
 }
 
+/// Select a native keyboard window without activating the foreground process.
+/// Reuse the target-only focus lifetime, including its error cleanup.
+pub(super) fn with_background_keyboard<T>(
+    ax: &impl Access,
+    pid: i32,
+    wid: u32,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+    body: impl FnOnce(bool) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    with_background(ax, pid, wid, admission, |used| {
+        let target = ax
+            .target(pid, wid)
+            .ok_or_else(|| anyhow::anyhow!("background keyboard target identity is unavailable"))?;
+        admission()?;
+        anyhow::ensure!(
+            post_make_key_window_records(wid, target, |psn, record| ax.record(psn, record)),
+            "background window selection failed"
+        );
+        admission()?;
+        body(used)
+    })
+}
+
 pub(super) fn assist(
     ax: &impl Access,
     pid: i32,
@@ -556,6 +579,68 @@ pub(crate) mod tests {
             assert_eq!(&bytes[0x3c..0x40], &[42, 0, 0, 0]);
             assert_eq!(bytes[0x8a], *transition);
         }
+    }
+
+    #[test]
+    fn background_keyboard_selects_only_target_before_input_and_cleans_up() {
+        let probe = Probe::default();
+        let result = with_background_keyboard(&probe, 2, 42, &|| Ok(()), |used| {
+            assert!(used);
+            assert_eq!(probe.records.borrow().len(), 3);
+            Ok(7)
+        });
+        assert_eq!(result.unwrap(), 7);
+        let records = probe.records.borrow();
+        assert_eq!(records.len(), 4);
+        for (psn, record) in records.iter() {
+            assert_eq!(*psn, [2; 8]);
+            assert_eq!(&record[0x3c..0x40], &[42, 0, 0, 0]);
+        }
+        assert_eq!(
+            records
+                .iter()
+                .map(|(_, r)| (r[8], r[0x8a]))
+                .collect::<Vec<_>>(),
+            [(0x0d, 1), (1, 0), (2, 0), (0x0d, 2)]
+        );
+    }
+
+    #[test]
+    fn rejected_background_key_selection_blocks_input_and_cleans_up() {
+        let probe = Probe {
+            fail_record: Some(0),
+            ..Probe::default()
+        };
+        let result = with_background_keyboard::<()>(&probe, 2, 42, &|| Ok(()), |_| {
+            panic!("typing must not follow rejected window selection")
+        });
+        assert!(result.is_err());
+        let records = probe.records.borrow();
+        assert_eq!(records.len(), 3);
+        assert_eq!(records[1].1[8], 1);
+        assert_eq!(records[2].1[8], 0x0d);
+        assert_eq!(records[2].1[0x8a], 2);
+        assert!(records.iter().all(|(psn, _)| *psn == [2; 8]));
+    }
+
+    #[test]
+    fn cancelled_background_keyboard_preparation_cleans_up_without_input() {
+        let probe = Probe {
+            cancel_on_settle: true,
+            ..Probe::default()
+        };
+        let result = with_background_keyboard::<()>(
+            &probe,
+            2,
+            42,
+            &|| {
+                anyhow::ensure!(probe.current.get(), "cancelled");
+                Ok(())
+            },
+            |_| panic!("cancelled input must not run"),
+        );
+        assert!(result.is_err());
+        assert_target_records(&probe, &[1, 2]);
     }
 
     #[test]

@@ -309,7 +309,8 @@ impl Tool for TypeTextTool {
         // Resolve the element pointer (if element_index given). Retain it out
         // of the cache so a concurrent get_window_state can't free it before
         // the blocking type below dereferences it (use-after-free → daemon
-        // crash). The guard lives to method end, past type_text_blocking.
+        // crash). Transfer the guard into the native worker and return it for
+        // final readback, so async cancellation cannot free a live target.
         let element_guard = if let (Some(idx), Some(wid)) = (element_index, window_id) {
             match self.state.element_cache.get_element_retained(pid, wid, idx) {
                 Some(e) => Some((e, idx)),
@@ -399,16 +400,20 @@ impl Tool for TypeTextTool {
         let is_terminal_target = crate::terminal::is_terminal_pid(pid);
 
         let blocking_policy = keyboard_policy.clone();
+        // A started native worker outlives cancellation of its async caller.
+        // Keep serialization through target-focus cleanup in that worker.
+        let worker_lease = _mutation_lease.as_ref().map(|lease| lease._guard.clone());
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
             "type_text.AXSelectedText",
             || async move {
                 tokio::task::spawn_blocking(move || {
+                    let _worker_lease = worker_lease;
                     let target = element_ptr.and_then(|(ptr, _)| {
                         editor_visual_target(ptr as AXUIElementRef, window_id)
                     });
-                    with_type_visual_updates(
+                    let result = with_type_visual_updates(
                         &visual_registry,
                         visual_sink.as_ref(),
                         &cursor_key,
@@ -428,12 +433,20 @@ impl Tool for TypeTextTool {
                                 }),
                             )
                         },
-                    )
+                    );
+                    (result, element_guard)
                 })
                 .await
             },
         )
         .await;
+
+        // Retain the target through final readback on normal completion. If
+        // the caller was cancelled, the worker drops it only after input ends.
+        let (result, _element_guard) = match result {
+            Ok((result, guard)) => (Ok(result), guard),
+            Err(error) => (Err(error), None),
+        };
 
         // Unwrap the delivery envelope: a structured refusal means no
         // actuator ran and the caller gets the exact reason.
@@ -1308,15 +1321,54 @@ fn type_text_blocking(
     // --- Background rung 2: CGEvent keystrokes with read-back. ---
     // Never clear here: a partial AX write is rare, and clearing would violate
     // insert-at-cursor semantics.
-    let (verified, delivered_chars) = cgevent_type_verified(
-        pid,
-        text,
-        delay_ms,
-        before.as_deref(),
-        element_ptr_and_idx,
-        /*settle_ms=*/ 0,
-        window_id,
-    )?;
+    let type_keys = || {
+        cgevent_type_verified(
+            pid,
+            text,
+            delay_ms,
+            before.as_deref(),
+            element_ptr_and_idx,
+            /*settle_ms=*/ 0,
+            window_id,
+        )
+    };
+    let (verified, delivered_chars) = if let Some(wid) =
+        window_id.filter(|_| target_in_web_area(pid, element_ptr_and_idx, window_id))
+    {
+        // AXFocused may select a DOM editor without preparing its native
+        // window for keys. Keep target-only focus through typing and readback.
+        // Unlike another pointer click, this preserves an existing selection.
+        crate::input::skylight::with_background_keyboard_focus_checked(
+            pid,
+            wid,
+            &|| {
+                use cua_driver_core::background_input::{
+                    decide_background_input, BackgroundAction, BackgroundInputDecision,
+                    ExactWindowTarget,
+                };
+                let facts = crate::ax::exact_target::gather_background_facts(
+                    pid,
+                    wid,
+                    element_ptr_and_idx.map(|(ptr, _)| ptr),
+                );
+                match decide_background_input(
+                    ExactWindowTarget { pid, window_id: wid },
+                    &facts,
+                    BackgroundAction::InsertText,
+                ) {
+                    BackgroundInputDecision::Execute { .. } => Ok(()),
+                    BackgroundInputDecision::Refuse(refusal) => anyhow::bail!(
+                        "background keyboard preparation refused ({}): {}; observe the target before repeating the edit",
+                        refusal.code,
+                        refusal.reason
+                    ),
+                }
+            },
+            |_| type_keys(),
+        )?
+    } else {
+        type_keys()?
+    };
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
         path: PATH_KEY_EVENTS,

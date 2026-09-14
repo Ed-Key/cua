@@ -38,16 +38,61 @@ fn first_background_electron_snapshot_control_accepts_first_click() {
 #[test]
 #[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
 fn background_coordinate_typing_reaches_unfocused_renderer() {
-    check_first_snapshot(true, false, Some(false));
+    check_first_snapshot(true, false, Some(TypingScenario::Fresh));
 }
 
 #[test]
 #[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
 fn background_coordinate_typing_preserves_selected_replacement() {
-    check_first_snapshot(true, false, Some(true));
+    check_first_snapshot(true, false, Some(TypingScenario::ReplaceSelection));
 }
 
-fn check_first_snapshot(background: bool, click_first: bool, typing: Option<bool>) {
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_coordinate_typing_recovers_after_addressed_attempt() {
+    check_first_snapshot(true, false, Some(TypingScenario::AfterAddressedAttempt));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_coordinate_typing_preserves_selection_before_first_pointer() {
+    check_first_snapshot(true, false, Some(TypingScenario::SelectionBeforePointer));
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypingScenario {
+    Fresh,
+    ReplaceSelection,
+    AfterAddressedAttempt,
+    SelectionBeforePointer,
+}
+
+fn log_editor_focus(pid: i32, x: f64, y: f64, label: &str) -> Option<bool> {
+    use core_foundation::base::CFRelease;
+    use platform_macos::ax::bindings::*;
+    unsafe {
+        if let Some(element) = element_at_screen_position(pid, x, y) {
+            let role = copy_string_attr(element, "AXRole");
+            let focused = copy_bool_attr(element, "AXFocused");
+            let app_focus =
+                platform_macos::input::ax_actions::is_element_focused(pid, element as usize);
+            let window_focus = copy_element_attr(element, "AXWindow").map(|window| {
+                let result = (
+                    copy_bool_attr(window, "AXFocused"),
+                    copy_bool_attr(window, "AXMain"),
+                );
+                CFRelease(window as _);
+                result
+            });
+            eprintln!("{label}: role={role:?}, AXFocused={focused:?}, app_focus={app_focus}, window_focused_main={window_focus:?}");
+            CFRelease(element as _);
+            return window_focus.and_then(|(_, main)| main);
+        }
+    }
+    None
+}
+
+fn check_first_snapshot(background: bool, click_first: bool, typing: Option<TypingScenario>) {
     let mut executable = harness_app(
         "harness-electron",
         "CuaTestHarness.Electron.app/Contents/MacOS/Electron",
@@ -247,7 +292,7 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<bool
                 std::thread::sleep(Duration::from_millis(25));
             }
         }
-        if let Some(replace_selection) = typing {
+        if let Some(scenario) = typing {
             assert!(
                 !state.is_error(),
                 "typing snapshot failed: {}",
@@ -271,8 +316,70 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<bool
                 * scale;
             assert_eq!(journal.text("lbl-input-mirror").as_deref(), Some("mirror="));
             let before_number = journal.snapshot()["number-input"].clone();
-            for payload in if replace_selection {
+            if scenario == TypingScenario::AfterAddressedAttempt {
+                let addressed = driver.call(
+                    "type_text",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "element_token":fields[0]["element_token"],
+                        "text":"Original text", "delivery_mode":"background"
+                    }),
+                );
+                eprintln!("initial addressed typing: {}", addressed.text());
+                let refreshed = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "include_screenshot":true
+                    }),
+                );
+                assert!(
+                    !refreshed.is_error(),
+                    "refresh after addressed typing failed"
+                );
+                let observed = journal.text("lbl-input-mirror");
+                // An improved addressed route may complete directly. Never
+                // append another copy when the independent app state proves it.
+                if observed.as_deref() == Some("mirror=Original text") {
+                    assert_eq!(journal.snapshot()["number-input"], before_number);
+                    return (state, elapsed);
+                }
+                assert_eq!(
+                    observed.as_deref(),
+                    Some("mirror="),
+                    "do not retry a partial edit"
+                );
+                let _ = log_editor_focus(
+                    pid as i32,
+                    x / scale + bounds.x,
+                    y / scale + bounds.y,
+                    "after addressed attempt",
+                );
+                eprintln!(
+                    "renderer state before coordinate recovery: {}",
+                    journal.snapshot()["txt-input"]
+                );
+            }
+            if scenario == TypingScenario::SelectionBeforePointer {
+                let seeded = driver.call(
+                    "set_value",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "element_token":fields[0]["element_token"],
+                        "value":"Original text", "delivery_mode":"background"
+                    }),
+                );
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while journal.text("lbl-input-mirror").as_deref() != Some("mirror=Original text") {
+                    assert!(
+                        Instant::now() < deadline,
+                        "initial value did not land: {}",
+                        seeded.text()
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+            for payload in if scenario == TypingScenario::ReplaceSelection {
                 vec!["Original text", "Replacement"]
+            } else if scenario == TypingScenario::SelectionBeforePointer {
+                vec!["Replacement"]
             } else {
                 vec!["Original text"]
             } {
@@ -319,6 +426,19 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<bool
                         );
                         std::thread::sleep(Duration::from_millis(25));
                     }
+                }
+                let main = log_editor_focus(
+                    pid as i32,
+                    x / scale + bounds.x,
+                    y / scale + bounds.y,
+                    payload,
+                );
+                if scenario == TypingScenario::SelectionBeforePointer {
+                    assert_eq!(
+                        main,
+                        Some(false),
+                        "selection must predate native window focus"
+                    );
                 }
                 let inserted = driver.call(
                     "type_text",

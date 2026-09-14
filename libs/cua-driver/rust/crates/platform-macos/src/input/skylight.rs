@@ -509,6 +509,23 @@ pub(crate) fn with_target_only_focus_checked<T>(
     )
 }
 
+/// Select the exact native keyboard window while only the target process has
+/// synthetic focus. The make-key records do not call SetFrontProcess.
+pub(crate) fn with_background_keyboard_focus_checked<T>(
+    target_pid: pid_t,
+    target_wid: u32,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+    body: impl FnOnce(bool) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    focus_activation::with_background_keyboard(
+        &focus_activation::Native,
+        target_pid,
+        target_wid,
+        admission,
+        body,
+    )
+}
+
 // ── NSMenu shortcut activation ────────────────────────────────────────────────
 
 /// Gets the PSN for the process that owns `window_id`.
@@ -643,13 +660,20 @@ fn make_exact_window_key_with(
     if !set_front(target_psn, target_wid) {
         return Ok(false);
     }
+    Ok(post_make_key_window_records(target_wid, target_psn, post))
+}
+
+fn post_make_key_window_records(
+    target_wid: u32,
+    target_psn: [u8; 8],
+    post: impl Fn([u8; 8], &[u8; 248]) -> bool,
+) -> bool {
     for event_kind in [0x01, 0x02] {
-        let record = make_key_window_record(target_wid, event_kind);
-        if !post(target_psn, &record) {
-            return Ok(false);
+        if !post(target_psn, &make_key_window_record(target_wid, event_kind)) {
+            return false;
         }
     }
-    Ok(true)
+    true
 }
 
 /// Tool-agnostic foreground-assist: briefly front `window_id`, wait for the
