@@ -16,15 +16,20 @@ pub mod session_badge;
 pub mod theme;
 pub mod theme_artifact;
 pub mod util;
+pub mod visual_events;
 pub mod z_order;
+pub use visual_events::{
+    PendingVisualState, ScrollDirection, VisualActionId, VisualEvent, VisualLifecycle,
+    VisualMailbox, VisualPhase,
+};
 
 pub use badge_glyphs::{BadgeChip, BadgeGlyph};
 pub use bezier::CubicBezier;
 pub use motion::{MotionConfig, Spring};
 pub use path_planner::{PathPlanner, PathState, PlannedPath};
 pub use render_state::{
-    paint_cursor, render_frame, FocusRect, RenderStateCore, SESSION_BADGE_FADE_SECS,
-    SESSION_BADGE_HOLD_SECS,
+    paint_cursor, paint_cursor_art, render_frame, DisplayBounds, FocusRect, RenderStateCore,
+    SESSION_BADGE_FADE_SECS, SESSION_BADGE_HOLD_SECS,
 };
 pub use session_badge::{
     paint_session_badge, sanitize_session_label, session_badge_extents, session_badge_layout,
@@ -390,9 +395,52 @@ pub fn track_pointer_command(x: f64, y: f64) -> OverlayCommand {
     }
 }
 
+/// Balance one cursor's visual press even if its action future is dropped.
+///
+/// The adapter binds `send` to its own cursor. This only resets artwork; it
+/// does not release native input, cancel a worker, or prove gesture cleanup.
+#[must_use = "keep the guard alive for the visual press interval"]
+pub struct PressedVisualGuard<F: Fn(OverlayCommand)> {
+    send: F,
+}
+
+impl<F: Fn(OverlayCommand)> PressedVisualGuard<F> {
+    pub fn new(send: F) -> Self {
+        send(OverlayCommand::SetPressed(true));
+        Self { send }
+    }
+}
+
+impl<F: Fn(OverlayCommand)> Drop for PressedVisualGuard<F> {
+    fn drop(&mut self) {
+        (self.send)(OverlayCommand::SetPressed(false));
+    }
+}
+
 #[cfg(test)]
 mod pointer_tracking_tests {
     use super::*;
+
+    #[test]
+    fn visual_press_guard_releases_only_its_bound_cursor() {
+        use std::cell::Cell;
+        let first = Cell::new(false);
+        let sibling = Cell::new(false);
+        let send = |state: &Cell<bool>, command| {
+            let OverlayCommand::SetPressed(pressed) = command else {
+                panic!("visual press guard must only change pressed artwork");
+            };
+            state.set(pressed);
+        };
+        let first_guard = PressedVisualGuard::new(|command| send(&first, command));
+        let sibling_guard = PressedVisualGuard::new(|command| send(&sibling, command));
+        assert!(first.get() && sibling.get());
+        drop(first_guard);
+        assert!(!first.get());
+        assert!(sibling.get());
+        drop(sibling_guard);
+        assert!(!sibling.get());
+    }
 
     #[test]
     fn tracked_artwork_keeps_its_tip_on_the_native_pointer() {

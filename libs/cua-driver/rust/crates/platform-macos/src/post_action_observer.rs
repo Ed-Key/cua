@@ -18,8 +18,10 @@ use cua_driver_core::tool::{ProtectedResourceOwnership, Tool, ToolDef};
 use serde_json::Value;
 
 use crate::ax::bindings::{
-    ax_get_window_id, copy_ax_windows, copy_element_array_attr, copy_string_attr,
-    element_screen_rect, AXUIElementCreateApplication, AXUIElementRef,
+    ax_get_window_id_checked, copy_element_array_attr_checked, copy_geometry_attr_checked,
+    copy_string_attr_checked, kAXErrorAttributeUnsupported as AX_ATTRIBUTE_UNSUPPORTED,
+    kAXErrorFailure, kAXErrorNoValue as AX_NO_VALUE, kAXErrorSuccess, kAXValueCGPointType,
+    kAXValueCGSizeType, AXError, AXUIElementCreateApplication, AXUIElementRef,
     AXUIElementSetMessagingTimeout,
 };
 
@@ -54,7 +56,7 @@ type RootSnapshot = HashMap<RootKey, Root>;
 
 #[derive(Default)]
 struct RootObservation {
-    roots: RootSnapshot,
+    roots: Option<RootSnapshot>,
     window_signature: HashSet<u32>,
 }
 
@@ -65,6 +67,28 @@ pub struct ObservedActionTool {
 impl ObservedActionTool {
     pub fn new(inner: Box<dyn Tool>) -> Self {
         Self { inner }
+    }
+
+    // Keep the ordering boundary independent of macOS queries so lifecycle
+    // behavior can be exercised without installing observers on a desktop.
+    async fn invoke_observed<B, Start, Finish, End>(
+        &self,
+        pid: i32,
+        args: Value,
+        start: Start,
+        finish: Finish,
+    ) -> ToolResult
+    where
+        Start: std::future::Future<Output = B>,
+        Finish: FnOnce(B, ToolResult) -> End,
+        End: std::future::Future<Output = ToolResult>,
+    {
+        crate::background_mutation::with_observation_lease(pid, async {
+            let before = start.await;
+            let result = self.inner.invoke(args).await;
+            finish(before, result).await
+        })
+        .await
     }
 }
 
@@ -112,33 +136,49 @@ impl Tool for ObservedActionTool {
         else {
             return self.inner.invoke(args).await;
         };
-        let prior_front = crate::apps::frontmost_pid();
         let suppress_cross_app = args
             .get("delivery_mode")
             .and_then(Value::as_str)
             .is_none_or(|mode| !mode.eq_ignore_ascii_case("foreground"));
-        let _suppression = prior_front
-            .filter(|_| suppress_cross_app)
-            .map(|restore_to| {
-                crate::focus_steal::begin_suppression_allowing(
-                    pid,
-                    restore_to,
-                    "ObservedActionTool",
-                )
-            });
-
-        let before = tokio::task::spawn_blocking(move || begin_observation(pid))
-            .await
-            .unwrap_or_default();
-        let mut result = self.inner.invoke(args).await;
-        let delta = tokio::task::spawn_blocking(move || observe_delta(pid, prior_front, before))
-            .await
-            .ok()
-            .flatten();
-        if let Some(delta) = delta {
-            result.surface_delta = Some(delta);
-        }
-        result
+        self.invoke_observed(
+            pid,
+            args,
+            async {
+                let prior_front = crate::apps::frontmost_pid();
+                let suppression = prior_front
+                    .filter(|_| suppress_cross_app)
+                    .map(|restore_to| {
+                        std::sync::Arc::new(crate::focus_steal::begin_suppression_allowing(
+                            pid,
+                            restore_to,
+                            "ObservedActionTool",
+                        ))
+                    });
+                let read_suppression = suppression.clone();
+                let before = crate::background_mutation::observe_blocking(move || {
+                    let _suppression = read_suppression;
+                    begin_observation(pid)
+                })
+                .await
+                .unwrap_or_default();
+                (prior_front, before, suppression)
+            },
+            |(prior_front, before, _suppression), mut result| async move {
+                let delta = crate::background_mutation::observe_blocking(move || {
+                    // The blocking read can outlive cancellation of invoke().
+                    let _suppression = _suppression;
+                    observe_delta(pid, prior_front, before)
+                })
+                .await
+                .ok()
+                .flatten();
+                if let Some(delta) = delta {
+                    result.surface_delta = Some(delta);
+                }
+                result
+            },
+        )
+        .await
     }
 }
 
@@ -147,6 +187,8 @@ fn observe_delta(
     prior_front: Option<i32>,
     before: RootObservation,
 ) -> Option<ActionSurfaceDelta> {
+    // Without a complete baseline, an existing root cannot be called new.
+    before.roots.as_ref()?;
     let deadline = Instant::now() + OBSERVATION_TIMEOUT;
     let signaled = loop {
         if foreground_changed(prior_front)
@@ -160,11 +202,15 @@ fn observe_delta(
         std::thread::sleep(POLL_INTERVAL);
     };
 
-    let mut appeared = appeared_roots(&before.roots, &snapshot_roots(pid));
+    let mut after = snapshot_roots(pid);
+    after.as_ref()?;
+    let mut appeared = appeared_roots(&before.roots, &after);
     if appeared.is_empty() && signaled {
         for _ in 0..CATCH_UP_ATTEMPTS {
             std::thread::sleep(CATCH_UP_INTERVAL);
-            appeared = appeared_roots(&before.roots, &snapshot_roots(pid));
+            after = snapshot_roots(pid);
+            after.as_ref()?;
+            appeared = appeared_roots(&before.roots, &after);
             if !appeared.is_empty() {
                 break;
             }
@@ -180,7 +226,10 @@ fn foreground_changed(prior_front: Option<i32>) -> bool {
     )
 }
 
-fn appeared_roots(before: &RootSnapshot, after: &RootSnapshot) -> Vec<Root> {
+fn appeared_roots(before: &Option<RootSnapshot>, after: &Option<RootSnapshot>) -> Vec<Root> {
+    let (Some(before), Some(after)) = (before, after) else {
+        return Vec::new();
+    };
     after
         .iter()
         .filter(|(key, _)| !before.contains_key(*key))
@@ -251,43 +300,168 @@ fn target_window_signature(pid: i32) -> HashSet<u32> {
         .collect()
 }
 
-fn snapshot_roots(pid: i32) -> RootSnapshot {
-    unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            return RootSnapshot::default();
-        }
-        AXUIElementSetMessagingTimeout(app, 0.25);
-        let windows = copy_ax_windows(app);
-        let mut roots = HashMap::new();
-        for window in windows {
-            let parent_window_id = ax_get_window_id(window);
-            insert_root(&mut roots, window, parent_window_id);
-            for attribute in ["AXSheets", "AXChildren"] {
-                for child in copy_element_array_attr(window, attribute) {
-                    let role = copy_string_attr(child, "AXRole").unwrap_or_default();
-                    if matches!(role.as_str(), "AXSheet" | "AXDialog" | "AXPopover") {
-                        insert_root(&mut roots, child, parent_window_id);
-                    }
-                    CFRelease(child as CFTypeRef);
-                }
-            }
-            CFRelease(window as CFTypeRef);
-        }
-        CFRelease(app as CFTypeRef);
-        roots
+struct OwnedAxElement(AXUIElementRef);
+
+impl Drop for OwnedAxElement {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0 as CFTypeRef) };
     }
 }
 
+#[derive(Debug, PartialEq, Eq)]
+enum SnapshotReadError {
+    Attribute(AXError),
+    TimeoutConfiguration(AXError),
+    BudgetExhausted,
+}
+
+struct SnapshotReader {
+    deadline: Instant,
+}
+
+impl SnapshotReader {
+    fn checked_read<T>(
+        &self,
+        set_timeout: impl FnOnce(f32) -> AXError,
+        read: impl FnOnce() -> Result<T, AXError>,
+    ) -> Result<T, SnapshotReadError> {
+        let remaining = self.deadline.saturating_duration_since(Instant::now());
+        if remaining < Duration::from_millis(1) {
+            return Err(SnapshotReadError::BudgetExhausted);
+        }
+        // Set each exact object before each message. Never set zero: AX treats
+        // that as a request to restore its global default timeout.
+        let timeout = remaining.min(Duration::from_millis(100)).as_secs_f32();
+        let error = set_timeout(timeout);
+        if error != kAXErrorSuccess {
+            return Err(SnapshotReadError::TimeoutConfiguration(error));
+        }
+        let result = read().map_err(SnapshotReadError::Attribute)?;
+        if Instant::now() >= self.deadline {
+            return Err(SnapshotReadError::BudgetExhausted);
+        }
+        Ok(result)
+    }
+
+    unsafe fn read<T>(
+        &self,
+        element: AXUIElementRef,
+        read: impl FnOnce() -> Result<T, AXError>,
+    ) -> Result<T, SnapshotReadError> {
+        self.checked_read(
+            |timeout| AXUIElementSetMessagingTimeout(element, timeout),
+            read,
+        )
+    }
+
+    unsafe fn elements(
+        &self,
+        element: AXUIElementRef,
+        attribute: &str,
+    ) -> Result<Vec<OwnedAxElement>, SnapshotReadError> {
+        let result = self.read(element, || {
+            // Own every copied reference before the deadline can reject it.
+            copy_element_array_attr_checked(element, attribute, 128)
+                .map(|elements| elements.into_iter().map(OwnedAxElement).collect())
+        });
+        match result {
+            Err(SnapshotReadError::Attribute(AX_NO_VALUE)) => Ok(Vec::new()),
+            Err(SnapshotReadError::Attribute(AX_ATTRIBUTE_UNSUPPORTED))
+                if attribute != "AXWindows" =>
+            {
+                Ok(Vec::new())
+            }
+            result => result,
+        }
+    }
+
+    unsafe fn optional_string(
+        &self,
+        element: AXUIElementRef,
+        attribute: &str,
+    ) -> Result<String, SnapshotReadError> {
+        match self.read(element, || copy_string_attr_checked(element, attribute)) {
+            Err(SnapshotReadError::Attribute(AX_NO_VALUE | AX_ATTRIBUTE_UNSUPPORTED)) => {
+                Ok(String::new())
+            }
+            result => result,
+        }
+    }
+
+    unsafe fn frame(&self, element: AXUIElementRef) -> Result<Option<[i64; 4]>, SnapshotReadError> {
+        let position = self.read(element, || {
+            copy_geometry_attr_checked(element, "AXPosition", kAXValueCGPointType)
+        });
+        let position = match position {
+            Err(SnapshotReadError::Attribute(AX_NO_VALUE | AX_ATTRIBUTE_UNSUPPORTED)) => {
+                return Ok(None)
+            }
+            result => result?,
+        };
+        let size = match self.read(element, || {
+            copy_geometry_attr_checked(element, "AXSize", kAXValueCGSizeType)
+        }) {
+            Err(SnapshotReadError::Attribute(AX_NO_VALUE | AX_ATTRIBUTE_UNSUPPORTED)) => {
+                return Ok(None)
+            }
+            result => result?,
+        };
+        if size[0] < 1.0 || size[1] < 1.0 {
+            return Ok(None);
+        }
+        Ok(Some(
+            [position[0], position[1], size[0], size[1]].map(|value| value.round() as i64),
+        ))
+    }
+}
+
+fn snapshot_roots(pid: i32) -> Option<RootSnapshot> {
+    let result = (|| unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return Err(SnapshotReadError::Attribute(kAXErrorFailure));
+        }
+        let app = OwnedAxElement(app);
+        let reader = SnapshotReader {
+            deadline: Instant::now() + Duration::from_millis(250),
+        };
+        let windows = reader.elements(app.0, "AXWindows")?;
+        let mut roots = HashMap::new();
+        for window in windows {
+            let parent_window_id = reader.read(window.0, || ax_get_window_id_checked(window.0))?;
+            insert_root(&reader, &mut roots, window.0, parent_window_id)?;
+            for attribute in ["AXSheets", "AXChildren"] {
+                for child in reader.elements(window.0, attribute)? {
+                    let role =
+                        reader.read(child.0, || copy_string_attr_checked(child.0, "AXRole"))?;
+                    if matches!(role.as_str(), "AXSheet" | "AXDialog" | "AXPopover") {
+                        insert_root(&reader, &mut roots, child.0, parent_window_id)?;
+                    }
+                }
+            }
+        }
+        Ok(roots)
+    })();
+    if let Err(ref error) = result {
+        tracing::debug!(
+            pid,
+            ?error,
+            "AX root snapshot unavailable; no surface delta will be inferred"
+        );
+    }
+    result.ok()
+}
+
 unsafe fn insert_root(
+    reader: &SnapshotReader,
     roots: &mut RootSnapshot,
     element: AXUIElementRef,
     parent_window_id: Option<u32>,
-) {
-    let role = copy_string_attr(element, "AXRole").unwrap_or_default();
-    let subrole = copy_string_attr(element, "AXSubrole").unwrap_or_default();
-    let title = copy_string_attr(element, "AXTitle").unwrap_or_default();
-    let own_window_id = ax_get_window_id(element);
+) -> Result<(), SnapshotReadError> {
+    let role = reader.read(element, || copy_string_attr_checked(element, "AXRole"))?;
+    let subrole = reader.optional_string(element, "AXSubrole")?;
+    let title = reader.optional_string(element, "AXTitle")?;
+    let own_window_id = reader.read(element, || ax_get_window_id_checked(element))?;
     let effective_window_id = own_window_id.or(parent_window_id);
     let key = match own_window_id {
         Some(window_id) => RootKey::Native {
@@ -300,8 +474,7 @@ unsafe fn insert_root(
             role,
             subrole,
             title: title.clone(),
-            frame: element_screen_rect(element)
-                .map(|frame| frame.map(|value| value.round() as i64)),
+            frame: reader.frame(element)?,
         },
     };
     roots.insert(
@@ -311,6 +484,7 @@ unsafe fn insert_root(
             title,
         },
     );
+    Ok(())
 }
 
 fn surface_owner(
@@ -335,6 +509,211 @@ fn surface_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exhausted_snapshot_budget_starts_no_more_ax_messages() {
+        let reader = SnapshotReader {
+            deadline: Instant::now() - Duration::from_secs(1),
+        };
+        let calls = std::cell::Cell::new(0);
+        let result = reader.checked_read(
+            |_| {
+                calls.set(calls.get() + 1);
+                kAXErrorSuccess
+            },
+            || {
+                calls.set(calls.get() + 1);
+                Ok(7)
+            },
+        );
+        assert_eq!(result, Err(SnapshotReadError::BudgetExhausted));
+        assert_eq!(calls.get(), 0);
+    }
+
+    #[test]
+    fn failed_timeout_configuration_does_not_start_an_unbounded_read() {
+        let reader = SnapshotReader {
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let read_started = std::cell::Cell::new(false);
+        let result = reader.checked_read(
+            |_| -25202,
+            || {
+                read_started.set(true);
+                Ok(7)
+            },
+        );
+        assert_eq!(result, Err(SnapshotReadError::TimeoutConfiguration(-25202)));
+        assert!(!read_started.get());
+    }
+
+    #[test]
+    fn every_ax_read_gets_a_positive_bounded_timeout_before_dispatch() {
+        let reader = SnapshotReader {
+            deadline: Instant::now() + Duration::from_secs(1),
+        };
+        let configured = std::cell::Cell::new(false);
+        let result = reader.checked_read(
+            |timeout| {
+                assert!(timeout > 0.0 && timeout <= 0.1);
+                configured.set(true);
+                kAXErrorSuccess
+            },
+            || {
+                assert!(configured.get());
+                Ok(7)
+            },
+        );
+        assert_eq!(result, Ok(7));
+    }
+
+    #[test]
+    fn complete_empty_baseline_can_still_report_the_first_window() {
+        let after = RootSnapshot::from([(
+            RootKey::Native {
+                window_id: 7,
+                role: "AXWindow".into(),
+                subrole: String::new(),
+            },
+            root(7, "First window"),
+        )]);
+        assert_eq!(
+            appeared_roots(&Some(RootSnapshot::new()), &Some(after)),
+            vec![root(7, "First window")]
+        );
+    }
+
+    #[test]
+    fn incomplete_after_read_does_not_establish_a_surface_delta() {
+        assert!(appeared_roots(&Some(RootSnapshot::new()), &None).is_empty());
+    }
+
+    #[test]
+    fn failed_before_read_cannot_make_existing_windows_appear_new() {
+        let before = RootObservation::default();
+        let after = RootSnapshot::from([(
+            RootKey::Native {
+                window_id: 7,
+                role: "AXWindow".into(),
+                subrole: "AXStandardWindow".into(),
+            },
+            root(7, "Existing document"),
+        )]);
+        assert!(
+            appeared_roots(&before.roots, &Some(after)).is_empty(),
+            "a failed baseline read is unknown, not proof that every later window is new"
+        );
+    }
+
+    struct MutationProbe;
+
+    #[async_trait]
+    impl Tool for MutationProbe {
+        fn def(&self) -> &ToolDef {
+            static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
+            DEF.get_or_init(|| ToolDef {
+                name: "click".into(),
+                description: "Observation lifecycle probe".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            })
+        }
+
+        async fn invoke(&self, args: Value) -> ToolResult {
+            let pid = args["pid"].as_i64().unwrap() as i32;
+            // Observation ownership must not impersonate focus_by_pixel's
+            // already-admitted nested call or skip fresh target admission.
+            assert!(!crate::background_mutation::held_by_current_task(pid));
+            let _lease = crate::tools::acquire_background_mutation(pid).await;
+            ToolResult::text("delivered")
+        }
+    }
+
+    #[tokio::test]
+    async fn observation_waits_for_prior_same_pid_mutation_before_snapshot() {
+        const PID: i32 = 93101;
+        let lease = crate::background_mutation::acquire(PID).await;
+        let (started_tx, mut started_rx) = tokio::sync::oneshot::channel();
+        let action = tokio::spawn(async move {
+            ObservedActionTool::new(Box::new(MutationProbe))
+                .invoke_observed(
+                    PID,
+                    serde_json::json!({"pid": PID}),
+                    async {
+                        started_tx.send(()).unwrap();
+                    },
+                    |(), result| async { result },
+                )
+                .await
+        });
+        let queued = tokio::time::timeout(Duration::from_millis(30), &mut started_rx)
+            .await
+            .is_err();
+        drop(lease);
+        let result = tokio::time::timeout(Duration::from_secs(1), action)
+            .await
+            .expect("nested actuator acquisition must not deadlock")
+            .unwrap();
+        assert_eq!(result.is_error, None);
+        assert!(
+            queued,
+            "before snapshot must wait for the previous mutation"
+        );
+    }
+
+    #[tokio::test]
+    async fn observation_retains_same_pid_lease_after_actuator_returns() {
+        const PID: i32 = 93102;
+        let (observing_tx, observing_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = tokio::sync::oneshot::channel();
+        let first = tokio::spawn(async move {
+            ObservedActionTool::new(Box::new(MutationProbe))
+                .invoke_observed(
+                    PID,
+                    serde_json::json!({"pid": PID}),
+                    async {},
+                    |(), result| async {
+                        observing_tx.send(()).unwrap();
+                        finish_rx.await.unwrap();
+                        result
+                    },
+                )
+                .await
+        });
+        tokio::time::timeout(Duration::from_secs(1), observing_rx)
+            .await
+            .expect("actuator must reach post-observation")
+            .unwrap();
+        // A different process is independent even while observation is pending.
+        let other = tokio::time::timeout(
+            Duration::from_secs(1),
+            crate::background_mutation::acquire(PID + 100),
+        )
+        .await
+        .expect("different pid must stay independent");
+        drop(other);
+        let mut sibling = tokio::spawn(crate::background_mutation::acquire(PID));
+        let queued = tokio::time::timeout(Duration::from_millis(30), &mut sibling)
+            .await
+            .is_err();
+        finish_tx.send(()).unwrap();
+        first.await.unwrap();
+        if queued {
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), sibling)
+                    .await
+                    .expect("sibling should proceed after observation")
+                    .unwrap(),
+            );
+        }
+        assert!(
+            queued,
+            "sibling must wait after dispatch until observation finishes"
+        );
+    }
 
     fn root(window_id: u32, title: &str) -> Root {
         Root {
@@ -373,7 +752,7 @@ mod tests {
         };
         let before = RootSnapshot::from([(parent.clone(), root(7, "Draft"))]);
         let mut after = RootSnapshot::from([(parent, root(7, "Draft — Edited"))]);
-        assert!(appeared_roots(&before, &after).is_empty());
+        assert!(appeared_roots(&Some(before.clone()), &Some(after.clone())).is_empty());
 
         let sheet = RootKey::Native {
             window_id: 8,
@@ -381,7 +760,10 @@ mod tests {
             subrole: String::new(),
         };
         after.insert(sheet, root(8, "Open"));
-        assert_eq!(appeared_roots(&before, &after), vec![root(8, "Open")]);
+        assert_eq!(
+            appeared_roots(&Some(before.clone()), &Some(after.clone())),
+            vec![root(8, "Open")]
+        );
     }
 
     #[test]

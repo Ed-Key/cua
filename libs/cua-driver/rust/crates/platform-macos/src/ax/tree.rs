@@ -47,6 +47,8 @@ unsafe fn set_messaging_timeout(element: AXUIElementRef) {
 /// A single node in the AX tree.
 #[derive(Debug, Clone)]
 pub struct AXNode {
+    /// Link destination, separate from AXValue.
+    pub url: Option<String>,
     /// 0-based index (Some = actionable, None = non-actionable display-only node)
     pub element_index: Option<usize>,
     pub role: String,
@@ -64,8 +66,8 @@ pub struct AXNode {
     /// The raw AXUIElementRef pointer value, for caching.
     pub element_ptr: usize,
     /// Depth in the rendered markdown tree (matches the indent level used in
-    /// `tree_markdown`). Layout containers AXScrollArea/AXGroup collapse so
-    /// children share the parent's depth.
+    /// `tree_markdown`). Unnamed AXScrollArea/AXGroup layout wrappers collapse
+    /// so children share the parent's depth; named groups retain their depth.
     pub depth: usize,
     /// `element_index` of the nearest actionable ancestor, if any. Walks the
     /// rendered tree (so it skips collapsed layout containers).
@@ -337,6 +339,15 @@ pub fn walk_tree_bounded(
     }
 }
 
+/// Keep named sections in the rendered hierarchy. Action names alone do not
+/// identify a semantic group: Chromium exposes generic show-menu/scroll actions
+/// even on anonymous layout wrappers. Addressability is evaluated separately.
+fn collapse_layout_container(role: &str, title: Option<&str>, description: Option<&str>) -> bool {
+    matches!(role, "AXGroup" | "AXScrollArea")
+        && title.is_none_or(|text| text.trim().is_empty())
+        && description.is_none_or(|text| text.trim().is_empty())
+}
+
 #[allow(clippy::too_many_arguments)]
 unsafe fn walk_element(
     element: AXUIElementRef,
@@ -370,8 +381,11 @@ unsafe fn walk_element(
 
     let in_web_content = in_web_content || is_web_content_role(&role);
 
-    // Skip pure layout containers that have no interesting content.
-    if role == "AXScrollArea" || role == "AXGroup" {
+    // Read names before deciding whether a group is only a layout wrapper.
+    // Reuse these reads below for retained nodes.
+    let title = copy_string_attr(element, "AXTitle");
+    let description = copy_string_attr(element, "AXDescription");
+    if collapse_layout_container(&role, title.as_deref(), description.as_deref()) {
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
@@ -400,7 +414,6 @@ unsafe fn walk_element(
     // This is critical for Calculator where AXTitle="" but AXDescription="2"
     // (digit buttons). Merging them would produce "2" (quoted) instead of (2)
     // (parens), breaking _find_calc_button which searches for "(2)".
-    let title = copy_string_attr(element, "AXTitle");
     // Read AXValue once with enough type information to preserve the existing
     // string-only markdown while also exposing numeric/boolean control state.
     let copied_value = copy_stringish_attr(element, "AXValue");
@@ -411,7 +424,6 @@ unsafe fn walk_element(
     let value = value
         .filter(|v| !v.trim().is_empty())
         .or_else(|| copy_string_attr(element, "AXPlaceholderValue"));
-    let description = copy_string_attr(element, "AXDescription");
     let identifier = copy_string_attr(element, "AXIdentifier");
     let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
     let actions = copy_action_names(element);
@@ -489,6 +501,11 @@ unsafe fn walk_element(
         // releases the per-child ref at the end of the caller's loop.
         CFRetain(element as CFTypeRef);
         AXNode {
+            url: if role == "AXLink" {
+                copy_url_attr(element)
+            } else {
+                None
+            },
             element_index: Some(idx),
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -523,6 +540,11 @@ unsafe fn walk_element(
         }
     } else {
         AXNode {
+            url: if role == "AXLink" {
+                copy_url_attr(element)
+            } else {
+                None
+            },
             element_index: None,
             role: role.clone(),
             title: if visible_title.is_empty() {
@@ -735,6 +757,29 @@ fn leading_indent_depth(line: &str) -> usize {
 mod tests {
     use super::*;
     use std::cell::Cell;
+
+    #[test]
+    fn named_layout_groups_survive_but_empty_wrappers_collapse() {
+        for role in ["AXGroup", "AXScrollArea"] {
+            assert!(!collapse_layout_container(role, Some("Billing"), None));
+            assert!(!collapse_layout_container(role, None, Some("Profile")));
+            assert!(!collapse_layout_container(
+                role,
+                Some("  "),
+                Some("Billing")
+            ));
+            assert!(collapse_layout_container(role, None, None));
+            assert!(collapse_layout_container(role, Some(" "), Some("\n\t")));
+        }
+        assert!(!collapse_layout_container("AXButton", None, None));
+        assert!(!collapse_layout_container("AXWebArea", None, None));
+    }
+
+    #[test]
+    fn save_query_retains_each_named_group_with_its_own_button() {
+        let tree = "- [0] AXWebArea\n  - [1] AXGroup \"Profile\"\n    - [2] AXButton \"Save\"\n    - AXStaticText = \"Unrelated\"\n  - [3] AXGroup (Billing)\n    - [4] AXButton \"Save\"\n";
+        assert_eq!(filter_tree(tree, "Save"), "- [0] AXWebArea\n  - [1] AXGroup \"Profile\"\n    - [2] AXButton \"Save\"\n  - [3] AXGroup (Billing)\n    - [4] AXButton \"Save\"\n");
+    }
 
     #[test]
     fn writable_value_controls_are_addressable_without_actions() {

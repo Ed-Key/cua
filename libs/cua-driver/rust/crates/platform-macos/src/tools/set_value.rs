@@ -177,21 +177,7 @@ impl Tool for SetValueTool {
         };
 
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-        let center_ptr = element_ptr as usize;
-        if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
-            crate::ax::bindings::element_screen_center(center_ptr as AXUIElementRef)
-        })
-        .await
-        {
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::PinAbove(window_id as u64),
-            );
-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
-            self.state
-                .cursor_registry
-                .update_position(&cursor_key, screen_x, screen_y);
-        }
+        let visual_registry = self.state.cursor_registry.clone();
         // An AXValue read-back is not ground truth for web content. Chromium,
         // WebKit, and Electron can echo the write through accessibility while
         // the renderer never observes it. Reuse type_text's bounded ancestor
@@ -211,7 +197,19 @@ impl Tool for SetValueTool {
             "set_value.AXValue",
             || async move {
                 tokio::task::spawn_blocking(move || {
-                    set_value_blocking(element_ptr, element_index, pid, &value)
+                    let target = unsafe {
+                        crate::ax::bindings::element_screen_rect(element_ptr as AXUIElementRef)
+                    }
+                    .and_then(|rect| {
+                        crate::cursor::visual::ResolvedPointerTarget::from_bounds(window_id, rect)
+                    });
+                    super::type_text::with_type_visual(
+                        &visual_registry,
+                        &crate::cursor::visual::OverlayVisualSink,
+                        &cursor_key,
+                        target,
+                        || set_value_blocking(element_ptr, element_index, pid, &value),
+                    )
                 })
                 .await
             },
@@ -668,6 +666,32 @@ fn hex_digit(n: u8) -> char {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slice_a_value_delivery_uses_scoped_target_and_keeps_error() {
+        let registry = crate::cursor::CursorRegistry::new();
+        let sink = crate::cursor::visual::test_support::RecordingSink::default();
+        let target = crate::cursor::visual::ResolvedPointerTarget::from_bounds(
+            42,
+            [10.0, 20.0, 100.0, 40.0],
+        );
+        let result = super::super::type_text::with_type_visual(
+            &registry,
+            &sink,
+            "set-value",
+            target,
+            || Err::<(), _>("AX refused"),
+        );
+        assert_eq!(result, Err("AX refused"));
+        let events = sink.1.lock().unwrap();
+        assert_eq!(events[0].target, Some((60.0, 40.0)));
+        assert_eq!(
+            events.last().unwrap().phase,
+            cursor_overlay::VisualPhase::End
+        );
+        assert!(!events
+            .iter()
+            .any(|e| e.phase == cursor_overlay::VisualPhase::Contact));
+    }
     use super::{apply_surface_trust, apply_verification_label, classify_write, SetValueOutcome};
 
     #[test]

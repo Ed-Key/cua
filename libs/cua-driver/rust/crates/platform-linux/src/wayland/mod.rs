@@ -11,11 +11,16 @@
 
 pub mod ext_screencopy;
 pub mod ext_toplevel;
+pub mod hyprland;
+pub mod hyprland_capture;
+mod hyprland_compatibility;
+pub mod hyprland_input;
 pub mod kwin_helper;
 pub mod overlay;
 pub mod persistent_vptr;
 pub(crate) mod portal;
 pub mod portal_screenshot;
+mod primary_seat;
 pub mod shell_helper;
 pub mod sway_ipc;
 mod virtual_keyboard;
@@ -383,7 +388,7 @@ struct State {
     // Live handles + a seat, kept so `click` can `activate` a target toplevel by
     // its window_id (foreign-toplevel protocol id) — the focus-based input model.
     handles: HashMap<u32, ZwlrForeignToplevelHandleV1>,
-    seat: Option<WlSeat>,
+    seats: primary_seat::Seats<WlSeat>,
     // Virtual-pointer manager + output dimensions, so `click` can land a real
     // button press at the output centre (over the just-activated window).
     vptr_manager: Option<ZwlrVirtualPointerManagerV1>,
@@ -417,7 +422,9 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
                     Some(registry.bind::<ZwlrForeignToplevelManagerV1, _, _>(name, v, qh, ()));
             } else if interface == WlSeat::interface().name {
                 let v = version.min(7);
-                state.seat = Some(registry.bind::<WlSeat, _, _>(name, v, qh, ()));
+                state
+                    .seats
+                    .add(registry.bind::<WlSeat, _, _>(name, v, qh, ()));
             } else if interface == ZwlrVirtualPointerManagerV1::interface().name {
                 state.vptr_manager = Some(registry.bind::<ZwlrVirtualPointerManagerV1, _, _>(
                     name,
@@ -446,15 +453,16 @@ impl Dispatch<wl_registry::WlRegistry, ()> for State {
 
 impl Dispatch<WlSeat, ()> for State {
     fn event(
-        _: &mut Self,
-        _: &WlSeat,
-        _: wayland_client::protocol::wl_seat::Event,
+        state: &mut Self,
+        seat: &WlSeat,
+        event: wayland_client::protocol::wl_seat::Event,
         _: &(),
         _: &Connection,
         _: &QueueHandle<Self>,
     ) {
-        // Seat name/capabilities events are irrelevant here — we only need the
-        // seat object to pass to foreign-toplevel `activate`.
+        if let wayland_client::protocol::wl_seat::Event::Name { name } = event {
+            state.seats.name(seat, name);
+        }
     }
 }
 
@@ -1065,6 +1073,23 @@ fn screenshot_window_bytes_with_dispatch(
 /// surface is currently rendered; otherwise it fails closed. Output-level
 /// capture remains available through [`screenshot_display_dispatch`].
 pub fn screenshot_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
+    screenshot_dispatch_for_pid(xid, None)
+}
+
+pub fn screenshot_dispatch_with_pid(xid: u64, pid: u32) -> anyhow::Result<Vec<u8>> {
+    screenshot_dispatch_for_pid(xid, Some(pid))
+}
+
+fn screenshot_dispatch_for_pid(xid: u64, pid: Option<u32>) -> anyhow::Result<Vec<u8>> {
+    if is_wayland() && hyprland::is_session() {
+        return hyprland::capture(xid, pid).map_err(|error| {
+            tracing::debug!("Hyprland target capture refused: {error:#}");
+            surface_identity_unproven(
+                xid,
+                "Hyprland target identity or toplevel export could not be verified",
+            )
+        });
+    }
     screenshot_window_bytes_with_dispatch(
         is_wayland(),
         xid,
@@ -1172,13 +1197,7 @@ fn checked_shell_helper_capture(
 /// point for callers outside `get_window_state`; it shares the same fail-closed
 /// Wayland contract as [`screenshot_dispatch`].
 pub fn screenshot_window_dispatch(xid: u64) -> anyhow::Result<Vec<u8>> {
-    screenshot_window_bytes_with_dispatch(
-        is_wayland(),
-        xid,
-        wayland_window_crop,
-        screenshot_display_dispatch,
-        crate::capture::screenshot_window_bytes,
-    )
+    screenshot_dispatch(xid)
 }
 
 // ── Input session helper ─────────────────────────────────────────────────────
@@ -1293,7 +1312,7 @@ pub fn open_vptr_session(activate_window_id: Option<u64>) -> anyhow::Result<Vptr
         anyhow::bail!("compositor does not expose zwlr_foreign_toplevel_manager_v1");
     }
 
-    let seat = state.seat.clone().ok_or_else(|| {
+    let seat = state.seats.selected().ok_or_else(|| {
         anyhow::anyhow!("compositor exposed no wl_seat for virtual-pointer input")
     })?;
 
@@ -1337,6 +1356,15 @@ pub fn activate_window_for_input_target(
     window_id: u64,
     target_pid: Option<u32>,
 ) -> anyhow::Result<()> {
+    if is_wayland() && hyprland::is_session() {
+        // A full compositor address must never enter the generic protocol-id
+        // or title-matching route. This observation-only adapter can attest an
+        // already-active target, but cannot switch focus to a different one.
+        if hyprland::target_is_active(window_id, target_pid)? {
+            return Ok(());
+        }
+        anyhow::bail!("foreground_unavailable: exact-address Hyprland activation is not implemented; refusing title-based activation");
+    }
     if is_inject_mode() {
         let pid = target_pid.ok_or_else(|| {
             anyhow::anyhow!(
@@ -1361,7 +1389,7 @@ pub fn activate_window_for_input_target(
 
     if let (Some(_), Some(seat), Some(handle)) = (
         state.manager.as_ref(),
-        state.seat.clone(),
+        state.seats.selected(),
         matching_handle(&state, window_id),
     ) {
         let protocol_id = handle.id().protocol_id();
@@ -1599,10 +1627,85 @@ pub fn window_local_to_output(window_id: u64, x: i32, y: i32) -> (i32, i32) {
         .unwrap_or((x, y))
 }
 
+pub(crate) fn checked_window_point(
+    point: (f64, f64),
+    ratio: f64,
+    geometry: Option<(i32, i32, u32, u32)>,
+    exact_identity: bool,
+    capture_scale: Option<f64>,
+) -> Result<(f64, f64), &'static str> {
+    if !exact_identity {
+        return Err(
+            "native Wayland exact window identity is unproven; PID/title matching is insufficient",
+        );
+    }
+    let (x, y, width, height) = geometry.ok_or("native Wayland window geometry is missing")?;
+    if width == 0 || height == 0 {
+        return Err("native Wayland window geometry is empty");
+    }
+    let scale = capture_scale
+        .ok_or("native Wayland capture-pixel to compositor-coordinate scale is unproven")?;
+    if !scale.is_finite() || scale <= 0.0 || !ratio.is_finite() || ratio <= 0.0 {
+        return Err("native Wayland capture and resize scales must be finite and positive");
+    }
+    let point =
+        cua_driver_core::geometry::screenshot_to_screen(point, ratio, scale, (x as f64, y as f64));
+    if !point.0.is_finite() || !point.1.is_finite() {
+        return Err("native Wayland cursor target is not finite");
+    }
+    Ok(point)
+}
+
+/// Exact native geometry only. Never use PID/title heuristics or X11 fallback.
+pub fn try_window_local_to_output(
+    pid: u32,
+    window_id: u64,
+    x: f64,
+    y: f64,
+    ratio: f64,
+) -> Result<(f64, f64), &'static str> {
+    if hyprland::is_session() {
+        let window = hyprland::window_for_address(window_id)
+            .ok_or("Hyprland exact window address has no live geometry")?;
+        if window.pid != pid {
+            return Err("Hyprland exact window address belongs to another PID");
+        }
+        // hyprland::capture normalizes every exported buffer to logical window
+        // dimensions before GetWindowState applies max_image_dimension.
+        return checked_window_point(
+            (x, y),
+            ratio,
+            Some((window.x, window.y, window.width, window.height)),
+            true,
+            Some(1.0),
+        );
+    }
+    if let Some(window) = sway_ipc::window_for_id(window_id) {
+        if window.pid != pid {
+            return Err("Sway exact window ID belongs to another PID");
+        }
+        // The output-crop capture path has no attested buffer scale or output
+        // identity. Tree geometry alone cannot prove screenshot pixel units.
+        return checked_window_point(
+            (x, y),
+            ratio,
+            Some((window.x, window.y, window.width, window.height)),
+            true,
+            None,
+        );
+    }
+    Err("native Wayland exact window geometry and capture scale are unavailable; requires an exact Hyprland address or Sway ID")
+}
+
 /// Resolve geometry through stable title/app identity when a foreign-toplevel
 /// object ID came from an earlier Wayland connection. Protocol object IDs are
 /// connection-local, so direct equality is only a fast path.
 pub fn window_geometry(window_id: u64) -> Option<(i32, i32, u32, u32)> {
+    if is_wayland() && hyprland::is_session() {
+        // Do not fall back to title, app-id, X11, or another compositor when
+        // an explicit native Hyprland address is missing.
+        return hyprland::window_for_address(window_id).map(|w| (w.x, w.y, w.width, w.height));
+    }
     if let Some(window) = sway_ipc::window_for_id(window_id) {
         return Some((window.x, window.y, window.width, window.height));
     }
@@ -3141,6 +3244,34 @@ fn apply_pid_filter(mut windows: Vec<WindowInfo>, filter_pid: Option<u32>) -> Ve
 /// Window-enumeration dispatcher: native Wayland when available, else X11.
 pub fn list_windows_dispatch(filter_pid: Option<u32>) -> Vec<WindowInfo> {
     if wayland_enabled() && std::env::var_os("WAYLAND_DISPLAY").is_some() {
+        if hyprland::is_session() {
+            // Hyprland IPC already attests PID and full native identity. A
+            // foreign-toplevel title join only makes that identity weaker.
+            return match hyprland::list_windows() {
+                Ok(windows) => listed_windows(apply_pid_filter(
+                    windows
+                        .into_iter()
+                        .map(|w| WindowInfo {
+                            xid: w.address,
+                            pid: Some(w.pid),
+                            app_name: w.app_id,
+                            title: w.title,
+                            is_on_screen: w.visible,
+                            z_index: None,
+                            x: w.x,
+                            y: w.y,
+                            width: w.width,
+                            height: w.height,
+                        })
+                        .collect(),
+                    filter_pid,
+                )),
+                Err(error) => {
+                    tracing::warn!("Hyprland window enumeration unavailable: {error:#}");
+                    Vec::new()
+                }
+            };
+        }
         if let Some(ws) = kwin_helper::list_window_infos() {
             return listed_windows(apply_pid_filter(ws, filter_pid));
         }
@@ -3421,6 +3552,53 @@ const _BTN_LEFT_ALIAS: u32 = BTN_LEFT;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn slice_a_known_geometry_requires_proven_scale_and_identity() {
+        assert_eq!(
+            checked_window_point(
+                (30.25, 40.25),
+                2.0,
+                Some((-100, 200, 600, 400)),
+                true,
+                Some(1.0)
+            )
+            .unwrap(),
+            (-39.5, 280.5)
+        );
+        assert_eq!(
+            checked_window_point(
+                (30.25, 40.25),
+                2.0,
+                Some((-100, 200, 600, 400)),
+                true,
+                Some(2.0)
+            )
+            .unwrap(),
+            (-69.75, 240.25)
+        );
+    }
+
+    #[test]
+    fn slice_a_missing_geometry_never_returns_the_input_point() {
+        assert!(checked_window_point((30.0, 40.0), 1.0, None, true, Some(1.0)).is_err());
+        assert!(
+            checked_window_point((30.0, 40.0), 1.0, Some((100, 200, 600, 400)), true, None)
+                .is_err()
+        );
+        assert!(checked_window_point(
+            (30.0, 40.0),
+            1.0,
+            Some((100, 200, 600, 400)),
+            false,
+            Some(1.0)
+        )
+        .is_err());
+        assert!(
+            checked_window_point((30.0, 40.0), 1.0, Some((100, 200, 0, 400)), true, Some(1.0))
+                .is_err()
+        );
+    }
 
     fn window(xid: u64, pid: Option<u32>, title: &str) -> WindowInfo {
         WindowInfo {

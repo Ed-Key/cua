@@ -22,6 +22,38 @@ use crate::apps;
 use crate::focus_guard;
 use crate::input::mouse::DragButton;
 
+fn with_drag_visual<T>(
+    registry: &crate::cursor::CursorRegistry,
+    sink: &dyn crate::cursor::visual::PointerVisualSink,
+    key: &str,
+    window: Option<u32>,
+    native: impl FnOnce(&mut dyn FnMut(f64, f64)) -> T,
+) -> T {
+    let mut handle = crate::cursor::visual::emit_action_target(
+        registry,
+        sink,
+        key,
+        None,
+        cursor_overlay::CursorAction::Drag,
+    );
+    handle.pin(window);
+    let _pressed = cursor_overlay::PressedVisualGuard::new(|command| {
+        if matches!(command, cursor_overlay::OverlayCommand::SetPressed(false)) {
+            handle.publish(
+                sink,
+                cursor_overlay::VisualPhase::End,
+                std::time::Instant::now(),
+            );
+        }
+    });
+    native(&mut |x, y| {
+        if x.is_finite() && y.is_finite() {
+            registry.update_position(key, x, y);
+            handle.track(sink, x, y);
+        }
+    })
+}
+
 pub struct DragTool {
     pub state: Arc<ToolState>,
 }
@@ -132,34 +164,30 @@ impl Tool for DragTool {
                 ClickButton::Middle => DragButton::Middle,
             };
             let cursor_for_drag = cursor_key.clone();
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::SetPressed(true),
-            );
+            let visual_registry = self.state.cursor_registry.clone();
             let result = tokio::task::spawn_blocking(move || {
                 let modifier_refs: Vec<&str> = modifiers.iter().map(String::as_str).collect();
-                crate::input::mouse::drag_at_xy_foreground_observed(
-                    from_x,
-                    from_y,
-                    to_x,
-                    to_y,
-                    duration_ms,
-                    steps,
-                    &modifier_refs,
-                    button,
-                    move |x, y| {
-                        crate::cursor::overlay::send_command(
-                            cursor_for_drag.clone(),
-                            cursor_overlay::track_pointer_command(x, y),
-                        );
+                with_drag_visual(
+                    &visual_registry,
+                    &crate::cursor::visual::OverlayVisualSink,
+                    &cursor_for_drag,
+                    None,
+                    |observe| {
+                        crate::input::mouse::drag_at_xy_foreground_observed(
+                            from_x,
+                            from_y,
+                            to_x,
+                            to_y,
+                            duration_ms,
+                            steps,
+                            &modifier_refs,
+                            button,
+                            observe,
+                        )
                     },
                 )
             })
             .await;
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::SetPressed(false),
-            );
             if matches!(&result, Ok(Ok(()))) {
                 self.state
                     .cursor_registry
@@ -277,25 +305,14 @@ impl Tool for DragTool {
                 (from_x, from_y, from_x, from_y, to_x, to_y, to_x, to_y)
             };
 
-        // Animate agent cursor along drag path (start → end).
-        if let Some(wid) = window_id {
-            crate::cursor::overlay::send_command(
-                cursor_key.clone(),
-                cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-            );
-        }
-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), from_sx, from_sy).await;
-
+        // Topology observation is owned by ObservedActionTool.
         let prior_front = apps::frontmost_pid();
 
         // Dispatch blocking drag synthesis.
         let mods_owned = modifiers.clone();
         let fg = delivery_mode.is_foreground() && window_id.is_some();
         let cursor_for_drag = cursor_key.clone();
-        crate::cursor::overlay::send_command(
-            cursor_key.clone(),
-            cursor_overlay::OverlayCommand::SetPressed(true),
-        );
+        let visual_registry = self.state.cursor_registry.clone();
         let drag_input = focus_guard::with_focus_suppressed(
             // Foreground drag deliberately activates the target so the global
             // HID stream carries the pressed-button state. A suppression lease
@@ -307,52 +324,49 @@ impl Tool for DragTool {
             || async move {
                 tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
                     let do_it = move || -> anyhow::Result<()> {
-                        let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                        if fg {
-                            // HID delivery is global, so foreground mode must
-                            // establish a real active application before the
-                            // gesture begins. The SkyLight flash can be
-                            // unavailable for Electron child windows; the
-                            // documented Cocoa activation is the fallback.
-                            apps::activate_pid(pid);
-                            std::thread::sleep(std::time::Duration::from_millis(40));
-                            let observed_cursor = cursor_for_drag.clone();
-                            return crate::input::mouse::drag_at_xy_foreground_observed(
-                                from_sx,
-                                from_sy,
-                                to_sx,
-                                to_sy,
-                                duration_ms,
-                                steps,
-                                &m,
-                                button,
-                                move |x, y| {
-                                    crate::cursor::overlay::send_command(
-                                        observed_cursor.clone(),
-                                        cursor_overlay::track_pointer_command(x, y),
-                                    );
-                                },
-                            );
-                        }
-                        crate::input::mouse::drag_at_xy_observed(
-                            pid,
-                            from_sx,
-                            from_sy,
-                            to_sx,
-                            to_sy,
-                            Some((from_lx, from_ly)),
-                            Some((to_lx, to_ly)),
+                        with_drag_visual(
+                            &visual_registry,
+                            &crate::cursor::visual::OverlayVisualSink,
+                            &cursor_for_drag,
                             window_id,
-                            duration_ms,
-                            steps,
-                            &m,
-                            button,
-                            fg,
-                            move |x, y| {
-                                crate::cursor::overlay::send_command(
-                                    cursor_for_drag.clone(),
-                                    cursor_overlay::track_pointer_command(x, y),
-                                );
+                            |observe| {
+                                let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
+                                if fg {
+                                    // HID delivery is global, so foreground mode must
+                                    // establish a real active application before the
+                                    // gesture begins. The SkyLight flash can be
+                                    // unavailable for Electron child windows; the
+                                    // documented Cocoa activation is the fallback.
+                                    apps::activate_pid(pid);
+                                    std::thread::sleep(std::time::Duration::from_millis(40));
+                                    return crate::input::mouse::drag_at_xy_foreground_observed(
+                                        from_sx,
+                                        from_sy,
+                                        to_sx,
+                                        to_sy,
+                                        duration_ms,
+                                        steps,
+                                        &m,
+                                        button,
+                                        &mut *observe,
+                                    );
+                                }
+                                crate::input::mouse::drag_at_xy_observed(
+                                    pid,
+                                    from_sx,
+                                    from_sy,
+                                    to_sx,
+                                    to_sy,
+                                    Some((from_lx, from_ly)),
+                                    Some((to_lx, to_ly)),
+                                    window_id,
+                                    duration_ms,
+                                    steps,
+                                    &m,
+                                    button,
+                                    fg,
+                                    observe,
+                                )
                             },
                         )
                     };
@@ -378,10 +392,6 @@ impl Tool for DragTool {
         )
         .await;
         let result = drag_input;
-        crate::cursor::overlay::send_command(
-            cursor_key.clone(),
-            cursor_overlay::OverlayCommand::SetPressed(false),
-        );
         if matches!(&result, Ok(Ok(()))) {
             self.state
                 .cursor_registry
@@ -428,6 +438,111 @@ impl Tool for DragTool {
             })),
             Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),
             Err(e)     => ToolResult::error(format!("Task error: {e}")),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn slice_a_fix_sparse_native_callback_keeps_drag_active_until_guard_drops() {
+        use cursor_overlay::{CursorAction, VisualPhase};
+        for fail in [false, true] {
+            let registry = crate::cursor::CursorRegistry::new();
+            let sink = crate::cursor::visual::test_support::RecordingSink::default();
+            let mut core =
+                cursor_overlay::RenderStateCore::new(cursor_overlay::CursorConfig::default());
+            core.motion.idle_hide_ms = 10.0;
+            let display = cursor_overlay::DisplayBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 100.0,
+                height: 100.0,
+            };
+            let result = with_drag_visual(&registry, &sink, "sparse-drag", Some(42), |observe| {
+                observe(40.0, 50.0);
+                let event = sink.1.lock().unwrap().last().unwrap().clone();
+                core.apply_visual_event(event.clone(), Some(display), event.timestamp);
+                core.tick_swift_constants_at(
+                    1.0,
+                    event.timestamp + std::time::Duration::from_secs(1),
+                );
+                assert_eq!(core.visual.resolved_action, CursorAction::Drag);
+                assert!(core.pressed);
+                assert_eq!(core.idle_alpha, 1.0);
+                assert!(core.path.is_none());
+                if fail {
+                    Err("native release error")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), fail);
+            let end = sink.1.lock().unwrap().last().unwrap().clone();
+            assert_eq!(end.phase, VisualPhase::End);
+            core.apply_visual_event(end.clone(), Some(display), end.timestamp);
+            assert!(!core.pressed);
+            assert_eq!(core.visual.resolved_action, CursorAction::Idle);
+        }
+    }
+
+    #[test]
+    fn slice_a_drag_tracks_only_native_callbacks_and_cleans_early_error() {
+        use cursor_overlay::VisualPhase;
+        for count in [0, 2, 3] {
+            let registry = crate::cursor::CursorRegistry::new();
+            let sink = crate::cursor::visual::test_support::RecordingSink::default();
+            let coordinates = [(10.0, 20.0), (14.0, 27.0), (-5.0, 30.0)];
+            let result = with_drag_visual(&registry, &sink, "drag-cue", Some(42), |observe| {
+                assert!(sink.1.lock().unwrap().iter().all(|e| e.target.is_none()));
+                for &(x, y) in &coordinates[..count] {
+                    observe(x, y);
+                }
+                if count < 3 {
+                    Err("early native error")
+                } else {
+                    Ok(())
+                }
+            });
+            assert_eq!(result.is_err(), count < 3);
+            let events = sink.1.lock().unwrap();
+            let points: Vec<_> = events
+                .iter()
+                .filter(|e| e.phase == VisualPhase::Tracking)
+                .map(|e| e.target.unwrap())
+                .collect();
+            assert_eq!(points, coordinates[..count]);
+            assert_eq!(events.last().unwrap().phase, VisualPhase::End);
+            assert!(!events.iter().any(|e| e.phase == VisualPhase::Contact));
+            let mut core =
+                cursor_overlay::RenderStateCore::new(cursor_overlay::CursorConfig::default());
+            let display = cursor_overlay::DisplayBounds {
+                x: -100.0,
+                y: -100.0,
+                width: 500.0,
+                height: 500.0,
+            };
+            for event in events.iter() {
+                core.apply_visual_event(event.clone(), Some(display), event.timestamp);
+                assert!(core.path.is_none(), "drag never runs a second path");
+                if event.phase == VisualPhase::Tracking {
+                    assert!(core.pressed);
+                    let (x, y) = event.target.unwrap();
+                    let cursor_overlay::OverlayCommand::SnapTo {
+                        x: art_x, y: art_y, ..
+                    } = cursor_overlay::track_pointer_command(x, y)
+                    else {
+                        unreachable!()
+                    };
+                    assert_eq!(core.pos, (art_x, art_y));
+                }
+            }
+            assert!(!core.pressed);
+            if count > 0 {
+                let pos = registry.get("drag-cue").unwrap().position.unwrap();
+                assert_eq!((pos.x, pos.y), coordinates[count - 1]);
+            }
         }
     }
 }

@@ -33,7 +33,8 @@ fn def() -> &'static ToolDef {
             PREFERRED CONSUMERS read `structuredContent.elements` (one entry per \
             indexed row with `element_index`, `role`, `label`, `value` (the \
             element's text/AXValue when present — use it to verify what a field \
-            holds), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown \
+            holds), `actions` (names of AX actions exposed by the element, \
+            omitted when empty), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown \
             `tree_markdown` stays available \
             and unchanged in shape for existing text-parsing callers — but new \
             fields will only be added to the structured side.\n\n\
@@ -446,17 +447,9 @@ impl Tool for GetWindowStateTool {
                     // pid-only key leaked one window's ratio into the other's
                     // pixel clicks.
                     if !observation_only {
-                        if let Some(ow) = orig_w {
-                            if w > 0 {
-                                self.state.resize_registry.set_ratio(
-                                    pid,
-                                    window_id,
-                                    ow as f64 / w as f64,
-                                );
-                            }
-                        } else {
-                            self.state.resize_registry.clear_ratio(pid, window_id);
-                        }
+                        self.state
+                            .resize_registry
+                            .record_capture(pid, window_id, orig_w, w);
                     }
                     Some((b64, file_path, w, h, bounds, scale))
                 }
@@ -565,8 +558,8 @@ impl Tool for GetWindowStateTool {
         // (Hermes' regex parser, Codex, Claude Code) and is signalled as
         // preferred-for-back-compat-only via the `_note` field below.
         let elements_json: Vec<serde_json::Value> = match (snapshot_id, tree_result.as_ref()) {
-            (Some(sid), Some(r)) => build_elements_array_with_token(&r.nodes, sid),
-            (None, Some(r)) if scope_matched => build_elements_array(&r.nodes),
+            (Some(sid), Some(r)) => build_elements_array_with_token(&r.nodes, Some(sid)),
+            (None, Some(r)) if scope_matched => build_elements_array_with_token(&r.nodes, None),
             _ => Vec::new(),
         };
         let elements_json = cua_driver_core::element_query::project_elements_for_query(
@@ -840,7 +833,7 @@ fn degradation_for(
 /// omitted to match the contract on the tool description.
 pub(crate) fn build_elements_array_with_token(
     nodes: &[crate::ax::tree::AXNode],
-    snapshot_id: u32,
+    snapshot_id: Option<u32>,
 ) -> Vec<serde_json::Value> {
     nodes
         .iter()
@@ -860,15 +853,21 @@ pub(crate) fn build_elements_array_with_token(
                 .map(|[x, y, w, h]| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
             let mut entry = serde_json::json!({
                 "element_index": idx,
-                // Surface 6: opaque token paired to the integer index.
-                // Tools accept either; the token has explicit validity
-                // (invalidated when the next snapshot supersedes this
-                // one in the per-pid LRU). See cua-driver-core's
-                // `element_token` module.
-                "element_token": cua_driver_core::element_token::token_for(snapshot_id, idx),
                 "role": node.role,
                 "depth": node.depth,
             });
+            // Surface 6: opaque token paired to the integer index.
+            // Tools accept either; the token has explicit validity
+            // (invalidated when the next snapshot supersedes this
+            // one in the per-pid LRU). See cua-driver-core's
+            // `element_token` module.
+            if let Some(sid) = snapshot_id {
+                entry["element_token"] =
+                    serde_json::json!(cua_driver_core::element_token::token_for(sid, idx));
+            }
+            if let Some(url) = &node.url {
+                entry["url"] = serde_json::json!(url);
+            }
             if let Some(label) = label {
                 entry["label"] = serde_json::Value::String(label);
             }
@@ -923,6 +922,9 @@ pub(crate) fn build_elements_array_with_token(
             if let Some(selected) = selected {
                 entry["selected"] = serde_json::Value::Bool(selected);
             }
+            if !node.actions.is_empty() {
+                entry["actions"] = serde_json::json!(node.actions);
+            }
             if node.in_web_content {
                 entry["in_web_content"] = serde_json::Value::Bool(true);
             }
@@ -935,26 +937,6 @@ pub(crate) fn build_elements_array_with_token(
             Some(entry)
         })
         .collect()
-}
-
-/// Back-compat wrapper for callers that don't yet have a snapshot id
-/// to pass through. Emits the same fields as the token-aware builder
-/// minus `element_token`. New call sites should prefer
-/// `build_elements_array_with_token`.
-#[allow(dead_code)]
-pub(crate) fn build_elements_array(nodes: &[crate::ax::tree::AXNode]) -> Vec<serde_json::Value> {
-    // Use a snapshot_id of 0 only to satisfy the signature; tokens
-    // built from id=0 are not registered and would fail the registry's
-    // stale check — but since this entry point is only kept for
-    // pre-existing callers (none in production after Surface 6), it
-    // strips the token field after rendering.
-    let mut out = build_elements_array_with_token(nodes, 0);
-    for entry in &mut out {
-        if let Some(obj) = entry.as_object_mut() {
-            obj.remove("element_token");
-        }
-    }
-    out
 }
 
 /// Keep the structured response aligned with a query-filtered markdown tree.
@@ -1135,6 +1117,7 @@ mod tests {
     use super::*;
     use crate::ax::tree::AXNode;
     use cua_driver_core::element_query::project_elements_for_query;
+    use serde_json::json;
 
     fn node(
         idx: Option<usize>,
@@ -1143,8 +1126,10 @@ mod tests {
         depth: usize,
         parent: Option<usize>,
         frame: Option<[f64; 4]>,
+        actions: Vec<String>,
     ) -> AXNode {
         AXNode {
+            url: None,
             element_index: idx,
             role: role.into(),
             title: title.map(|s| s.to_string()),
@@ -1152,7 +1137,7 @@ mod tests {
             description: None,
             identifier: None,
             help: None,
-            actions: vec![],
+            actions,
             element_ptr: 0,
             depth,
             parent_element_index: parent,
@@ -1168,6 +1153,37 @@ mod tests {
     }
 
     #[test]
+    fn link_url_is_serialized_without_replacing_label_or_value() {
+        let mut link = node(
+            Some(0),
+            "AXLink",
+            Some("Book"),
+            0,
+            None,
+            None,
+            vec!["AXPress".into()],
+        );
+        link.url = Some("https://example.test/book".into());
+        let entry = &build_elements_array_with_token(&[link], None)[0];
+        assert_eq!(entry["url"], "https://example.test/book");
+        assert_eq!(entry["label"], "Book");
+        assert!(entry.get("value").is_none());
+        let mut field = node(
+            Some(1),
+            "AXTextField",
+            Some("Search"),
+            0,
+            None,
+            None,
+            vec![],
+        );
+        field.value = Some("pickleball".into());
+        let entry = &build_elements_array_with_token(&[field], None)[0];
+        assert_eq!(entry["value"], "pickleball");
+        assert!(entry.get("url").is_none());
+    }
+
+    #[test]
     fn elements_match_indexed_node_count() {
         // Mix of indexed + non-indexed nodes; only indexed should surface.
         let nodes = vec![
@@ -1178,8 +1194,9 @@ mod tests {
                 0,
                 None,
                 Some([0.0, 0.0, 800.0, 600.0]),
+                vec![],
             ),
-            node(None, "AXStaticText", Some("hint"), 1, Some(0), None),
+            node(None, "AXStaticText", Some("hint"), 1, Some(0), None, vec![]),
             node(
                 Some(1),
                 "AXButton",
@@ -1187,6 +1204,7 @@ mod tests {
                 1,
                 Some(0),
                 Some([10.0, 20.0, 60.0, 24.0]),
+                vec![],
             ),
             node(
                 Some(2),
@@ -1195,9 +1213,10 @@ mod tests {
                 1,
                 Some(0),
                 Some([80.0, 20.0, 60.0, 24.0]),
+                vec![],
             ),
         ];
-        let elements = build_elements_array(&nodes);
+        let elements = build_elements_array_with_token(&nodes, None);
         assert_eq!(
             elements.len(),
             3,
@@ -1217,8 +1236,16 @@ mod tests {
     #[test]
     fn query_projection_keeps_only_rendered_actionable_rows() {
         let nodes = vec![
-            node(Some(0), "AXWindow", Some("Document"), 0, None, None),
-            node(Some(1), "AXMenuItem", Some("Window"), 1, Some(0), None),
+            node(Some(0), "AXWindow", Some("Document"), 0, None, None, vec![]),
+            node(
+                Some(1),
+                "AXMenuItem",
+                Some("Window"),
+                1,
+                Some(0),
+                None,
+                vec![],
+            ),
             node(
                 Some(2),
                 "AXMenuItem",
@@ -1226,11 +1253,28 @@ mod tests {
                 2,
                 Some(1),
                 None,
+                vec![],
             ),
-            node(Some(3), "AXMenuItem", Some("Left"), 3, Some(2), None),
-            node(Some(4), "AXButton", Some("Unrelated"), 1, Some(0), None),
+            node(
+                Some(3),
+                "AXMenuItem",
+                Some("Left"),
+                3,
+                Some(2),
+                None,
+                vec![],
+            ),
+            node(
+                Some(4),
+                "AXButton",
+                Some("Unrelated"),
+                1,
+                Some(0),
+                None,
+                vec![],
+            ),
         ];
-        let elements = build_elements_array(&nodes);
+        let elements = build_elements_array_with_token(&nodes, None);
         let filtered_markdown = concat!(
             "- [0] AXWindow \"Document\"\n",
             "  - [1] AXMenuItem \"Window\"\n",
@@ -1249,8 +1293,16 @@ mod tests {
 
     #[test]
     fn query_projection_returns_no_elements_when_markdown_has_no_match() {
-        let nodes = vec![node(Some(0), "AXButton", Some("Unrelated"), 0, None, None)];
-        let elements = build_elements_array(&nodes);
+        let nodes = vec![node(
+            Some(0),
+            "AXButton",
+            Some("Unrelated"),
+            0,
+            None,
+            None,
+            vec![],
+        )];
+        let elements = build_elements_array_with_token(&nodes, None);
 
         let projected = project_elements_for_query(elements, Some("zoomLeft"), "");
 
@@ -1260,10 +1312,10 @@ mod tests {
     #[test]
     fn unfiltered_projection_preserves_every_element() {
         let nodes = vec![
-            node(Some(0), "AXButton", Some("One"), 0, None, None),
-            node(Some(1), "AXButton", Some("Two"), 0, None, None),
+            node(Some(0), "AXButton", Some("One"), 0, None, None, vec![]),
+            node(Some(1), "AXButton", Some("Two"), 0, None, None, vec![]),
         ];
-        let elements = build_elements_array(&nodes);
+        let elements = build_elements_array_with_token(&nodes, None);
 
         let projected = project_elements_for_query(elements, None, "");
 
@@ -1279,8 +1331,9 @@ mod tests {
             3,
             Some(2),
             Some([1.5, 2.5, 33.0, 44.0]),
+            vec![],
         )];
-        let entry = &build_elements_array(&nodes)[0];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert_eq!(entry["element_index"], 7);
         assert_eq!(entry["role"], "AXButton");
         assert_eq!(entry["label"], "Go");
@@ -1305,9 +1358,10 @@ mod tests {
             1,
             None,
             None,
+            vec![],
         )];
         nodes[0].value = Some("i love u".into());
-        let entry = &build_elements_array(&nodes)[0];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert_eq!(entry["label"], "Compose message", "label stays the title");
         assert_eq!(
             entry["value"], "i love u",
@@ -1327,6 +1381,7 @@ mod tests {
             1,
             None,
             None,
+            vec![],
         )];
         nodes[0].value_state = Some("8".into());
         nodes[0].value_description = Some("8 dB".into());
@@ -1334,7 +1389,7 @@ mod tests {
         nodes[0].max_value = Some(8.0);
         nodes[0].enabled = Some(true);
         nodes[0].selected = Some(false);
-        let entry = &build_elements_array(&nodes)[0];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert_eq!(
             entry["value"], "8",
             "numeric AXValue surfaces via value_state"
@@ -1355,25 +1410,34 @@ mod tests {
             2,
             None,
             None,
+            vec![],
         )];
         nodes[0].in_web_content = true;
-        let entry = &build_elements_array(&nodes)[0];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert_eq!(entry["in_web_content"], true);
     }
 
     #[test]
     fn checkbox_value_state_normalizes_to_selected() {
-        let mut nodes = vec![node(Some(0), "AXCheckBox", Some("I agree"), 0, None, None)];
+        let mut nodes = vec![node(
+            Some(0),
+            "AXCheckBox",
+            Some("I agree"),
+            0,
+            None,
+            None,
+            vec![],
+        )];
         nodes[0].value_state = Some("0".into());
-        let entry = &build_elements_array(&nodes)[0];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert_eq!(entry["selected"], false);
     }
 
     #[test]
     fn elements_control_state_fields_omitted_when_absent() {
         // Stock behaviour is unchanged for elements without control state.
-        let nodes = vec![node(Some(0), "AXButton", Some("OK"), 0, None, None)];
-        let entry = &build_elements_array(&nodes)[0];
+        let nodes = vec![node(Some(0), "AXButton", Some("OK"), 0, None, None, vec![])];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         for key in ["value_description", "min", "max", "enabled", "selected"] {
             assert!(entry.get(key).is_none(), "{key} must be omitted");
         }
@@ -1383,10 +1447,18 @@ mod tests {
     fn elements_omit_degenerate_min_max_range() {
         // WebKit reports AXMinValue/AXMaxValue as 0.0/0.0 on non-range
         // controls (checkboxes, radios) — a degenerate range is omitted.
-        let mut nodes = vec![node(Some(0), "AXCheckBox", Some("On"), 0, None, None)];
+        let mut nodes = vec![node(
+            Some(0),
+            "AXCheckBox",
+            Some("On"),
+            0,
+            None,
+            None,
+            vec![],
+        )];
         nodes[0].min_value = Some(0.0);
         nodes[0].max_value = Some(0.0);
-        let entry = &build_elements_array(&nodes)[0];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert!(entry.get("min").is_none(), "degenerate min must be omitted");
         assert!(entry.get("max").is_none(), "degenerate max must be omitted");
     }
@@ -1394,9 +1466,9 @@ mod tests {
     #[test]
     fn elements_value_state_falls_back_to_string_value() {
         // String-valued elements keep their `value` even with no value_state.
-        let mut nodes = vec![node(Some(0), "AXComboBox", None, 0, None, None)];
+        let mut nodes = vec![node(Some(0), "AXComboBox", None, 0, None, None, vec![])];
         nodes[0].value = Some("Search".into());
-        let entry = &build_elements_array(&nodes)[0];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert_eq!(entry["value"], "Search");
     }
 
@@ -1404,16 +1476,16 @@ mod tests {
     fn elements_omit_empty_value() {
         // An empty AXValue must not emit a `value` field (matches the other
         // optional fields' omit-when-absent contract).
-        let mut nodes = vec![node(Some(0), "AXButton", Some("OK"), 0, None, None)];
+        let mut nodes = vec![node(Some(0), "AXButton", Some("OK"), 0, None, None, vec![])];
         nodes[0].value = Some(String::new());
-        let entry = &build_elements_array(&nodes)[0];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert!(entry.get("value").is_none(), "empty value must be omitted");
     }
 
     #[test]
     fn elements_omit_optional_fields_when_missing() {
-        let nodes = vec![node(Some(0), "AXUnknown", None, 0, None, None)];
-        let entry = &build_elements_array(&nodes)[0];
+        let nodes = vec![node(Some(0), "AXUnknown", None, 0, None, None, vec![])];
+        let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert!(
             entry.get("label").is_none(),
             "label must be omitted when title/value/desc/id are all empty"
@@ -1434,33 +1506,53 @@ mod tests {
     fn elements_label_fallback_chain() {
         // title missing → description → value → identifier
         let nodes = vec![
-            node(Some(0), "AXButton", None, 0, None, None),
-            node(Some(1), "AXButton", None, 0, None, None),
-            node(Some(2), "AXButton", None, 0, None, None),
+            node(Some(0), "AXButton", None, 0, None, None, vec![]),
+            node(Some(1), "AXButton", None, 0, None, None, vec![]),
+            node(Some(2), "AXButton", None, 0, None, None, vec![]),
         ];
         let mut nodes = nodes;
         nodes[0].description = Some("from-desc".into());
         nodes[1].value = Some("from-val".into());
         nodes[2].identifier = Some("from-id".into());
-        let elements = build_elements_array(&nodes);
+        let elements = build_elements_array_with_token(&nodes, None);
         assert_eq!(elements[0]["label"], "from-desc");
         assert_eq!(elements[1]["label"], "from-val");
         assert_eq!(elements[2]["label"], "from-id");
     }
 
-    /// Every element entry carries a non-empty snapshot-bound
-    /// `element_token` alongside its numeric `element_index`.
+    #[test]
+    fn build_elements_array_with_token_emits_actions_when_present() {
+        let nodes = vec![node(
+            Some(0),
+            "AXButton",
+            Some("OK"),
+            1,
+            None,
+            None,
+            vec!["AXPress".to_owned(), "AXShowMenu".to_owned()],
+        )];
+        let entries = build_elements_array_with_token(&nodes, None);
+        assert_eq!(entries[0]["actions"], json!(["AXPress", "AXShowMenu"]));
+    }
+
+    #[test]
+    fn build_elements_array_with_token_omits_actions_when_empty() {
+        let nodes = vec![node(Some(0), "AXButton", Some("OK"), 1, None, None, vec![])];
+        let entries = build_elements_array_with_token(&nodes, None);
+        assert!(entries[0].get("actions").is_none());
+    }
+
     #[test]
     fn build_elements_array_with_token_emits_element_token_per_row() {
         let reg = cua_driver_core::element_token::global();
         let pid = 0x6abc_0001_i32;
         let sid = reg.register_snapshot(pid, /* window_id = */ 9, 3);
         let nodes = vec![
-            node(Some(0), "AXButton", Some("A"), 1, None, None),
-            node(Some(1), "AXButton", Some("B"), 1, None, None),
-            node(Some(2), "AXButton", Some("C"), 1, None, None),
+            node(Some(0), "AXButton", Some("A"), 1, None, None, vec![]),
+            node(Some(1), "AXButton", Some("B"), 1, None, None, vec![]),
+            node(Some(2), "AXButton", Some("C"), 1, None, None, vec![]),
         ];
-        let entries = build_elements_array_with_token(&nodes, sid);
+        let entries = build_elements_array_with_token(&nodes, Some(sid));
         assert_eq!(entries.len(), 3);
         // Every entry must have BOTH fields (additive contract).
         for e in &entries {
@@ -1486,17 +1578,23 @@ mod tests {
         }
     }
 
-    /// Back-compat: `build_elements_array` (the old shim) must NOT emit
-    /// `element_token` — older callers that never plumb a snapshot id
-    /// through get a clean shape.
     #[test]
-    fn build_elements_array_shim_skips_element_token() {
-        let nodes = vec![node(Some(0), "AXButton", Some("A"), 1, None, None)];
-        let entries = build_elements_array(&nodes);
+    fn build_elements_array_with_token_observation_only_has_actions_no_token() {
+        let nodes = vec![node(
+            Some(0),
+            "AXButton",
+            Some("OK"),
+            1,
+            None,
+            None,
+            vec!["AXPress".to_owned(), "AXShowMenu".to_owned()],
+        )];
+        let entries = build_elements_array_with_token(&nodes, None);
         assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0]["actions"], json!(["AXPress", "AXShowMenu"]));
         assert!(
             entries[0].get("element_token").is_none(),
-            "back-compat shim must NOT emit element_token; got: {}",
+            "observation-only entries must not emit unregistered element_token: {}",
             entries[0]
         );
     }

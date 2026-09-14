@@ -12,6 +12,7 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 tokio::task_local! {
     static HELD_PID: i32;
+    static OBSERVATION_LEASE: (i32, Arc<OwnedMutexGuard<()>>);
 }
 
 fn process_locks() -> &'static Mutex<HashMap<i32, Weak<AsyncMutex<()>>>> {
@@ -36,8 +37,41 @@ fn process_lock(pid: i32) -> Arc<AsyncMutex<()>> {
 ///
 /// The returned guard must live from immediately before fresh fact gathering
 /// until dispatch, focus restoration, and postcondition verification finish.
-pub(crate) async fn acquire(pid: i32) -> OwnedMutexGuard<()> {
-    process_lock(pid).lock_owned().await
+pub(crate) async fn acquire(pid: i32) -> Arc<OwnedMutexGuard<()>> {
+    if let Some(lease) = observation_lease(pid) {
+        return lease;
+    }
+    Arc::new(process_lock(pid).lock_owned().await)
+}
+
+/// Serialize before/action/after observation with the existing mutation owner.
+/// Inner actuators may share ownership within this task, but must still gather
+/// fresh target facts. This deliberately does not set HELD_PID, which is the
+/// separate proof used by an already-admitted keyboard focus operation.
+pub(crate) async fn with_observation_lease<T>(pid: i32, future: impl Future<Output = T>) -> T {
+    let lease = acquire(pid).await;
+    OBSERVATION_LEASE.scope((pid, lease), future).await
+}
+
+pub(crate) fn observation_lease(pid: i32) -> Option<Arc<OwnedMutexGuard<()>>> {
+    OBSERVATION_LEASE
+        .try_with(|(owner, lease)| (*owner == pid).then(|| lease.clone()))
+        .ok()
+        .flatten()
+}
+
+/// Execute a synchronous AX observation away from the async executor. A started
+/// blocking task survives cancellation of its caller, so it retains ownership
+/// until the actual read returns rather than until the await is dropped.
+pub(crate) async fn observe_blocking<T: Send + 'static>(
+    read: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, tokio::task::JoinError> {
+    let lease = OBSERVATION_LEASE.try_with(|(_, lease)| lease.clone()).ok();
+    tokio::task::spawn_blocking(move || {
+        let _lease = lease;
+        read()
+    })
+    .await
 }
 
 /// Run one nested tool call with non-forgeable proof that its caller already
@@ -56,6 +90,70 @@ pub(crate) fn held_by_current_task(pid: i32) -> bool {
 mod tests {
     use super::*;
     use std::time::Duration;
+
+    #[tokio::test]
+    async fn observation_ownership_is_task_local_without_implying_input_admission() {
+        const PID: i32 = -91_007;
+        with_observation_lease(PID, async {
+            assert!(!held_by_current_task(PID));
+            assert!(observation_lease(PID).is_some());
+            assert!(observation_lease(PID + 1).is_none());
+            let inner = tokio::time::timeout(Duration::from_secs(1), acquire(PID))
+                .await
+                .expect("the inner actuator must share ownership without deadlocking");
+            drop(inner);
+            let (sees_lease, sees_admission) = tokio::spawn(async {
+                (observation_lease(PID).is_some(), held_by_current_task(PID))
+            })
+            .await
+            .unwrap();
+            assert!(!sees_lease && !sees_admission);
+        })
+        .await;
+        assert!(observation_lease(PID).is_none());
+        drop(
+            tokio::time::timeout(Duration::from_secs(1), acquire(PID))
+                .await
+                .expect("scope exit must release ownership"),
+        );
+    }
+
+    #[tokio::test]
+    async fn cancelled_observation_retains_ownership_until_blocking_read_finishes() {
+        const PID: i32 = -91_006;
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let (finish_tx, finish_rx) = std::sync::mpsc::channel();
+        let (ended_tx, ended_rx) = tokio::sync::oneshot::channel();
+        let owner = tokio::spawn(with_observation_lease(PID, async move {
+            observe_blocking(move || {
+                started_tx.send(()).unwrap();
+                finish_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+                ended_tx.send(()).unwrap();
+            })
+            .await
+        }));
+        started_rx.await.unwrap();
+        owner.abort();
+        assert!(owner.await.unwrap_err().is_cancelled());
+        let mut next = tokio::spawn(acquire(PID));
+        let queued = tokio::time::timeout(Duration::from_millis(30), &mut next)
+            .await
+            .is_err();
+        finish_tx.send(()).unwrap();
+        ended_rx.await.unwrap();
+        if queued {
+            drop(
+                tokio::time::timeout(Duration::from_secs(1), next)
+                    .await
+                    .expect("next mutation must proceed after read finishes")
+                    .unwrap(),
+            );
+        }
+        assert!(
+            queued,
+            "cancelled request must not release an active AX read's ownership"
+        );
+    }
 
     #[tokio::test]
     async fn same_pid_mutations_serialize_until_the_first_guard_drops() {

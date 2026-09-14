@@ -859,6 +859,17 @@ fn invoke_operation(
                 "GTK3 popover click failed: {}",
                 response.text()
             );
+            if mode == "foreground"
+                && platform_linux::wayland::wayland_input_enabled()
+                && platform_linux::wayland::hyprland::is_session()
+            {
+                assert_eq!(
+                    response.action_route(),
+                    Some("accessibility"),
+                    "GTK3 popover must use its semantic action: {}",
+                    response.raw
+                );
+            }
             wait_for_state(driver, pid, window_id, expected);
             assert_popover_marker(driver, pid, window_id);
             return false;
@@ -1534,3 +1545,205 @@ catalog_test!(
         },
     }
 );
+
+#[test]
+#[ignore]
+fn slice_a_linux_window_move() {
+    use cua_driver_testkit::e2e::Scope;
+    let wayland = DisplayServer::current() == DisplayServer::Wayland;
+    if wayland {
+        // A native compositor run must prove placement or the named limitation.
+        let mut driver = McpDriver::spawn_named_with_overlay("slice-a-linux-window-move").unwrap();
+        let (pid, window_id) = launch(&mut driver);
+        let (_, passed) = run_with_background_oracles(
+            &mut driver,
+            TargetWindow {
+                pid,
+                native_id: window_id,
+            },
+            |driver| {
+                let state = snapshot(driver, pid, window_id);
+                let result = driver.call(
+                    "move_cursor",
+                    serde_json::json!({"pid":pid,"window_id":window_id,"x":30.25,"y":40.25}),
+                );
+                if result.is_error() {
+                    let body = result.structured();
+                    assert_eq!(body["code"], "background_unavailable");
+                    assert_eq!(body["reason"], "unsupported_operation");
+                    assert_eq!(body["effect"], "refused");
+                    assert!(!body["detail"].as_str().unwrap_or("").is_empty());
+                    eprintln!("Wayland declared limitation: {}", body["detail"]);
+                } else {
+                    assert!(!state.is_error(), "successful placement requires a capture");
+                    // Hyprland exports logical-sized captures and exact addresses.
+                    let output = Command::new("hyprctl")
+                        .args(["clients", "-j"])
+                        .output()
+                        .expect("independent compositor geometry");
+                    assert!(output.status.success());
+                    let clients: serde_json::Value =
+                        serde_json::from_slice(&output.stdout).unwrap();
+                    let client = clients
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|w| {
+                            u64::from_str_radix(
+                                w["address"].as_str().unwrap_or("").trim_start_matches("0x"),
+                                16,
+                            )
+                            .ok()
+                                == Some(window_id)
+                        })
+                        .expect("exact Hyprland address");
+                    assert_eq!(client["pid"].as_u64(), Some(pid as u64));
+                    let ratio = client["size"][0].as_f64().unwrap()
+                        / state.structured()["screenshot_width"].as_f64().unwrap();
+                    let expected = (
+                        client["at"][0].as_f64().unwrap() + 30.25 * ratio,
+                        client["at"][1].as_f64().unwrap() + 40.25 * ratio,
+                    );
+                    let body = result.structured();
+                    assert!((body["x"].as_f64().unwrap() - expected.0).abs() < 0.000001);
+                    assert!((body["y"].as_f64().unwrap() - expected.1).abs() < 0.000001);
+                    eprintln!("Wayland exact address={window_id} expected={expected:?}");
+                }
+            },
+        )
+        .expect("Wayland desktop side-effect oracles");
+        assert!(passed.contains(&OracleKind::Focus));
+        return;
+    }
+    let case = CaseSpec::delivered(
+        "slice-a-linux-window-move",
+        "gtk3",
+        "gtk3",
+        "move_cursor",
+        Targeting::Px,
+        Delivery::NotApplicable,
+        Scope::Window,
+        DriverRoute::Composite,
+        vec![OracleKind::Cursor, OracleKind::Focus],
+    );
+    execute_case(case, |evidence| {
+        let mut driver = McpDriver::spawn_named_with_overlay("slice-a-linux-window-move").unwrap();
+        *evidence = recording_evidence(driver.recording_dir());
+        let (pid, window_id) = launch(&mut driver);
+        let config = driver.call(
+            "set_config",
+            serde_json::json!({"key":"max_image_dimension","value":300}),
+        );
+        assert!(!config.is_error(), "{}", config.text());
+        let capture = snapshot(&mut driver, pid, window_id);
+        assert!(!capture.is_error(), "{}", capture.text());
+        let width = capture.structured()["screenshot_width"]
+            .as_f64()
+            .expect("capture width");
+        let height = capture.structured()["screenshot_height"]
+            .as_f64()
+            .expect("capture height");
+        let query = |program: &str, args: &[&str]| {
+            let output = Command::new(program)
+                .env("LC_ALL", "C")
+                .args(args)
+                .output()
+                .expect("independent X11 query");
+            assert!(
+                output.status.success(),
+                "{program}: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            String::from_utf8(output.stdout).unwrap()
+        };
+        let extents = query(
+            "xprop",
+            &["-id", &window_id.to_string(), "_NET_FRAME_EXTENTS"],
+        );
+        let extents: Vec<f64> = extents
+            .split_once('=')
+            .expect("window manager frame extents")
+            .1
+            .split(',')
+            .map(|value| value.trim().parse().expect("numeric frame extent"))
+            .collect();
+        assert_eq!(extents.len(), 4);
+        let geometry_value = |geometry: &str, label: &str| -> f64 {
+            geometry
+                .lines()
+                .find_map(|line| line.trim().strip_prefix(label))
+                .expect("xwininfo geometry field")
+                .trim()
+                .parse()
+                .unwrap()
+        };
+        for (left, top) in [(120, 160), (340, 240)] {
+            let moved = Command::new("xdotool")
+                .args([
+                    "windowmove",
+                    "--sync",
+                    &window_id.to_string(),
+                    &left.to_string(),
+                    &top.to_string(),
+                ])
+                .status()
+                .unwrap();
+            assert!(moved.success());
+            // Openbox can apply the frame move after xdotool's sync returns.
+            // Wait for the independent client origin, including frame extents.
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let (ox, oy, native_width) = loop {
+                let geometry = query("xwininfo", &["-id", &window_id.to_string()]);
+                let ox = geometry_value(&geometry, "Absolute upper-left X:");
+                let oy = geometry_value(&geometry, "Absolute upper-left Y:");
+                if (ox, oy) == (left as f64 + extents[0], top as f64 + extents[2]) {
+                    break (ox, oy, geometry_value(&geometry, "Width:"));
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fixture move did not settle: origin=({ox},{oy})"
+                );
+                std::thread::sleep(Duration::from_millis(20));
+            };
+            let ratio = native_width / width;
+            assert!(ratio > 1.0, "fixture must exercise a resized capture");
+            let pointer = query("xdotool", &["getmouselocation", "--shell"]);
+            let focus = query("xdotool", &["getwindowfocus"]);
+            let result=driver.call("move_cursor",serde_json::json!({"pid":pid,"window_id":window_id,"x":30.25,"y":40.25,"session":"slice-a"}));
+            assert!(!result.is_error(), "{}", result.text());
+            let cursor = driver.call(
+                "get_agent_cursor_state",
+                serde_json::json!({"session":"slice-a"}),
+            );
+            assert!(!cursor.is_error(), "{}", cursor.text());
+            let body = &cursor.structured()["position"];
+            let error = (
+                (body["x"].as_f64().unwrap() - (ox + 30.25 * ratio)).abs(),
+                (body["y"].as_f64().unwrap() - (oy + 40.25 * ratio)).abs(),
+            );
+            assert!(
+                error.0 < 0.000001 && error.1 < 0.000001,
+                "position error {error:?}; origin=({ox},{oy}); registry={body}; move={}; after={}",
+                result.text(),
+                query("xwininfo", &["-id", &window_id.to_string()])
+            );
+            // Ignore xdotool's window-under-pointer field, which can change when the overlay appears.
+            let coords = |text: String| {
+                text.lines()
+                    .filter(|line| line.starts_with("X=") || line.starts_with("Y="))
+                    .map(str::to_owned)
+                    .collect::<Vec<_>>()
+            };
+            assert_eq!(
+                coords(query("xdotool", &["getmouselocation", "--shell"])),
+                coords(pointer)
+            );
+            assert_eq!(query("xdotool", &["getwindowfocus"]), focus);
+            eprintln!("XID={window_id} capture={width}x{height} origin=({ox},{oy}) ratio={ratio} registry_error={error:?}; pointer/focus unchanged");
+        }
+        Observation::delivered(
+            vec![OracleKind::Cursor, OracleKind::Focus],
+            Evidence::default(),
+        )
+    });
+}

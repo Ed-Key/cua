@@ -16,6 +16,10 @@
 //! If anything fails to resolve the functions return `false` and callers
 //! fall back to the public `CGEvent::post_to_pid`.
 
+mod focus_activation;
+#[cfg(test)]
+pub(crate) use focus_activation::tests::exercise as exercise_activation;
+
 use libc::pid_t;
 use std::ffi::{c_void, CStr};
 use std::os::raw::{c_char, c_int, c_uint};
@@ -488,64 +492,21 @@ impl SpaceQuery {
 
 // ── Focus-without-raise ───────────────────────────────────────────────────────
 
-/// Activate `target_pid`'s window `target_wid` without raising any windows
-/// or triggering Space-follow. Ported from yabai's
-/// `window_manager_focus_window_without_raise`.
-///
-/// Recipe:
-/// 1. `_SLPSGetFrontProcess` → capture current front PSN.
-/// 2. `SLSGetWindowOwner + SLSGetConnectionPSN` → target PSN, with
-///    `GetProcessForPID(target_pid)` as an older-system fallback.
-/// 3. Post 248-byte defocus record to front PSN (`bytes[0x8a] = 0x02`).
-/// 4. Post 248-byte focus record to target PSN (`bytes[0x8a] = 0x01`,
-///    `bytes[0x3c..0x3f]` = `target_wid` little-endian).
-///
-/// Deliberately skips `SLPSSetFrontProcessWithOptions` — see the Swift
-/// reference `FocusWithoutRaise.swift` for why omitting it keeps
-/// Chromium's user-activation gate open.
-///
-/// Returns `true` when all SPIs resolved and both posts succeeded.
-pub fn activate_without_raise(target_pid: pid_t, target_wid: u32) -> bool {
-    let post_fn = match post_event_record_to_fn() {
-        Some(f) => f,
-        None => return false,
-    };
-    let get_front = match get_front_process_fn() {
-        Some(f) => f,
-        None => return false,
-    };
-    // 8-byte PSN buffers (two UInt32s).
-    let mut prev_psn = [0u8; 8];
-    let mut target_psn = [0u8; 8];
-
-    let ok_prev = unsafe { get_front(prev_psn.as_mut_ptr() as *mut c_void) } == 0;
-    if !ok_prev {
-        return false;
-    }
-
-    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
-        return false;
-    }
-
-    // Build the 248-byte event buffer.
-    let mut buf = [0u8; 0xF8];
-    buf[0x04] = 0xF8;
-    buf[0x08] = 0x0D;
-    // Stamp target window id in little-endian at bytes 0x3c–0x3f.
-    buf[0x3C] = (target_wid & 0xFF) as u8;
-    buf[0x3D] = ((target_wid >> 8) & 0xFF) as u8;
-    buf[0x3E] = ((target_wid >> 16) & 0xFF) as u8;
-    buf[0x3F] = ((target_wid >> 24) & 0xFF) as u8;
-
-    // Step 3: defocus previous front.
-    buf[0x8A] = 0x02;
-    let defocus_ok = unsafe { post_fn(prev_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 };
-
-    // Step 4: focus target.
-    buf[0x8A] = 0x01;
-    let focus_ok = unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 };
-
-    defocus_ok && focus_ok
+/// Run background input with target-only synthetic focus. Admission is checked
+/// after native lookup and settling; cleanup remains inside the native worker.
+pub(crate) fn with_target_only_focus_checked<T>(
+    target_pid: pid_t,
+    target_wid: u32,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+    body: impl FnOnce(bool) -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    focus_activation::with_background(
+        &focus_activation::Native,
+        target_pid,
+        target_wid,
+        admission,
+        body,
+    )
 }
 
 // ── NSMenu shortcut activation ────────────────────────────────────────────────
@@ -635,29 +596,60 @@ fn make_key_window_record(window_id: u32, event_kind: u8) -> [u8; 0xF8] {
 /// make-key records for the requested WindowServer id, then let the caller
 /// raise the matching AX window. No other application window is addressed.
 pub fn make_exact_window_key(target_pid: libc::pid_t, target_wid: u32) -> bool {
+    make_exact_window_key_checked(target_pid, target_wid, &|| Ok(())).unwrap_or(false)
+}
+
+fn make_exact_window_key_checked(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
     let Some(set_front) = set_front_process_fn() else {
-        return false;
+        return Ok(false);
     };
     let Some(post) = post_event_record_to_fn() else {
-        return false;
+        return Ok(false);
     };
-    let mut target_psn = [0u8; 8];
-    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
-        return false;
-    }
+    make_exact_window_key_with(
+        target_wid,
+        || {
+            let mut psn = [0; 8];
+            get_process_psn_for_window(target_wid, target_pid, &mut psn).then_some(psn)
+        },
+        |psn, wid| unsafe { set_front(psn.as_ptr().cast(), wid, 0x200) == 0 },
+        |psn, record| unsafe { post(psn.as_ptr().cast(), record.as_ptr()) == 0 },
+        admission,
+    )
+}
+
+// The lookup and native effects are supplied at the boundary so regressions
+// exercise the same post-lookup admission and paired records as Native::key.
+fn make_exact_window_key_with(
+    target_wid: u32,
+    lookup: impl FnOnce() -> Option<[u8; 8]>,
+    set_front: impl FnOnce([u8; 8], u32) -> bool,
+    post: impl Fn([u8; 8], &[u8; 248]) -> bool,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    let Some(target_psn) = lookup() else {
+        return Ok(false);
+    };
+    // The owner/PSN lookup can outlive the action. Recheck before the native
+    // request; once admitted, preserve the existing paired record sequence.
+    admission()?;
 
     // kCPSUserGenerated = 0x200. Unlike kCPSNoWindows, this permits AppKit to
     // establish the requested native key window before it validates NSMenu.
-    if unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x200) } != 0 {
-        return false;
+    if !set_front(target_psn, target_wid) {
+        return Ok(false);
     }
     for event_kind in [0x01, 0x02] {
         let record = make_key_window_record(target_wid, event_kind);
-        if unsafe { post(target_psn.as_ptr() as *const c_void, record.as_ptr()) } != 0 {
-            return false;
+        if !post(target_psn, &record) {
+            return Ok(false);
         }
     }
-    true
+    Ok(true)
 }
 
 /// Tool-agnostic foreground-assist: briefly front `window_id`, wait for the
@@ -696,43 +688,22 @@ pub fn with_foreground_assist(
     target_wid: u32,
     body: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
-    let set_front = match set_front_process_fn() {
-        Some(f) => f,
-        None => {
-            // SPIs unavailable — run body anyway without activation.
-            body()?;
-            return Ok(false);
-        }
-    };
+    with_foreground_assist_checked(target_pid, target_wid, &|| Ok(()), body)
+}
 
-    let mut prev_psn = [0u8; 8];
-    let prev_ok = get_front_process_fn()
-        .map(|f| unsafe { f(prev_psn.as_mut_ptr() as *mut c_void) } == 0)
-        .unwrap_or(false);
-
-    let mut target_psn = [0u8; 8];
-    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
-        body()?;
-        return Ok(false);
-    }
-
-    unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
-    // `set_front` moves WindowServer's front process but does not make the
-    // target's NSWindow key, and AppKit installs a first responder only for a
-    // key window. Without this the app is "frontmost" to WindowServer while
-    // remaining, from AppKit's point of view, unfocused — so the AXFocused
-    // write in the body has no responder chain to attach to.
-    make_exact_window_key(target_pid, target_wid);
-    await_window_focused(target_pid, target_wid);
-
-    let result = body();
-
-    if prev_ok {
-        unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
-    }
-
-    result?;
-    Ok(true)
+pub(crate) fn with_foreground_assist_checked(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+    body: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<bool> {
+    focus_activation::assist(
+        &focus_activation::Native,
+        target_pid,
+        target_wid,
+        admission,
+        body,
+    )
 }
 
 /// Upper bound on how long [`with_foreground_assist`] waits for a requested
@@ -786,50 +757,22 @@ pub fn with_foreground_hid_activation(
     target_wid: u32,
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
-    let set_front = set_front_process_fn()
-        .ok_or_else(|| anyhow::anyhow!("foreground HID delivery is unavailable"))?;
+    with_foreground_hid_activation_checked(target_pid, target_wid, &|| Ok(()), action)
+}
 
-    let mut prev_psn = [0u8; 8];
-    let prev_ok = get_front_process_fn()
-        .map(|f| unsafe { f(prev_psn.as_mut_ptr() as *mut c_void) } == 0)
-        .unwrap_or(false);
-
-    let mut target_psn = [0u8; 8];
-    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
-        anyhow::bail!("could not resolve target window for foreground HID delivery");
-    }
-
-    let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(target_pid);
-    if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
-    {
-        // Re-activating an already key exact window can clear Chromium's
-        // renderer focus even though WindowServer keeps the app frontmost.
-        // The AX window proof lets us deliver directly without weakening the
-        // exact-window guard or disturbing the current key target.
-        return action();
-    }
-
-    let activated = unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
-    if activated != 0 {
-        anyhow::bail!("WindowServer rejected foreground HID activation");
-    }
-
-    make_exact_window_key(target_pid, target_wid);
-    if !await_window_focused(target_pid, target_wid) {
-        if prev_ok {
-            unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
-        }
-        anyhow::bail!("exact target window did not become focused for foreground HID delivery");
-    }
-
-    let result = action();
-    std::thread::sleep(std::time::Duration::from_millis(40));
-
-    if prev_ok {
-        unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
-    }
-
-    result
+pub(crate) fn with_foreground_hid_activation_checked(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    admission: &dyn Fn() -> anyhow::Result<()>,
+    body: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    focus_activation::hid(
+        &focus_activation::Native,
+        target_pid,
+        target_wid,
+        admission,
+        body,
+    )
 }
 
 fn preserves_exact_existing_focus(
@@ -947,4 +890,18 @@ mod tests {
             true, target, target, None, 42
         ));
     }
+}
+
+/// Cleanup stays in the synchronous native worker, including error and unwind.
+pub(crate) fn with_cleanup<T>(cleanup: impl FnOnce(), body: impl FnOnce() -> T) -> T {
+    struct Cleanup<F: FnOnce()>(Option<F>);
+    impl<F: FnOnce()> Drop for Cleanup<F> {
+        fn drop(&mut self) {
+            if let Some(cleanup) = self.0.take() {
+                cleanup();
+            }
+        }
+    }
+    let _cleanup = Cleanup(Some(cleanup));
+    body()
 }

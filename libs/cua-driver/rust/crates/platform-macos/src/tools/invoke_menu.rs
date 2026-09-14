@@ -18,7 +18,31 @@ use crate::ax::bindings::{
     AXUIElementCreateApplication, AXUIElementRef, AXUIElementSetMessagingTimeout,
 };
 
-pub struct InvokeMenuTool;
+pub(crate) fn dispatch_menu_visual<T, E>(
+    registry: &crate::cursor::CursorRegistry,
+    sink: &dyn crate::cursor::visual::PointerVisualSink,
+    key: &str,
+    bounds: Option<[f64; 4]>,
+    window: u32,
+    native: impl FnOnce() -> Result<T, E>,
+) -> Result<T, E> {
+    let target = bounds
+        .and_then(|rect| crate::cursor::visual::ResolvedPointerTarget::from_bounds(window, rect));
+    let handle = crate::cursor::visual::emit_action_target(
+        registry,
+        sink,
+        key,
+        target,
+        cursor_overlay::CursorAction::App,
+    );
+    let result = native();
+    if result.is_ok() {
+        crate::cursor::visual::emit_pointer_contact(sink, handle);
+    }
+    result
+}
+
+pub struct InvokeMenuTool(pub std::sync::Arc<crate::cursor::CursorRegistry>);
 
 const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 2.0;
 
@@ -132,7 +156,14 @@ fn choose_action(actions: &[String], final_segment: bool) -> Option<&'static str
     order.iter().copied().find(|action| supports(action))
 }
 
-unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
+unsafe fn invoke_path(
+    pid: i32,
+    path: &[String],
+    registry: &crate::cursor::CursorRegistry,
+    visual_sink: &dyn crate::cursor::visual::PointerVisualSink,
+    key: &str,
+    window: u32,
+) -> Result<(), String> {
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
         return Err("invoke_menu: target application is unavailable".into());
@@ -166,7 +197,16 @@ unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
                     return Err(error);
                 }
             };
-            let error = perform_action(target, action);
+            let bounds = crate::ax::bindings::element_screen_rect(target);
+            let error = dispatch_menu_visual(registry, visual_sink, key, bounds, window, || {
+                let error = perform_action(target, action);
+                if error == kAXErrorSuccess {
+                    Ok(error)
+                } else {
+                    Err(error)
+                }
+            })
+            .unwrap_or_else(|error| error);
             CFRelease(target as CFTypeRef);
             if error != kAXErrorSuccess {
                 return Err(format!(
@@ -291,6 +331,14 @@ impl Tool for InvokeMenuTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+        let registry = self.0.clone();
+        let visual_sink = crate::cursor::visual::InvocationVisualSink::bind(
+            self.def().name.as_str(),
+            &args,
+            &cursor_key,
+            std::sync::Arc::new(crate::cursor::visual::OverlayVisualSink),
+        );
         let input: InvokeMenuInput =
             match cua_driver_core::tool_args::parse_typed_input("invoke_menu", args) {
                 Ok(input) => input,
@@ -321,8 +369,16 @@ impl Tool for InvokeMenuTool {
                 prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
             let needs_activation = prior_frontmost != Some(pid);
 
-            let result = focus_exact_window(pid, window_id)
-                .and_then(|()| unsafe { invoke_path(pid, &path) });
+            let result = focus_exact_window(pid, window_id).and_then(|()| unsafe {
+                invoke_path(
+                    pid,
+                    &path,
+                    &registry,
+                    visual_sink.as_ref(),
+                    &cursor_key,
+                    window_id,
+                )
+            });
 
             // Restore the exact prior key window when one was observable,
             // including across applications. Falling back to app activation
@@ -369,6 +425,46 @@ impl Tool for InvokeMenuTool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn slice_a_menu_without_bounds_has_action_label_and_no_invented_target() {
+        let registry = crate::cursor::CursorRegistry::new();
+        let sink = crate::cursor::visual::test_support::RecordingSink::default();
+        let result = dispatch_menu_visual(&registry, &sink, "menu-cue", None, 42, || {
+            Ok::<_, ()>("accepted")
+        });
+        assert_eq!(result, Ok("accepted"));
+        let events = sink.1.lock().unwrap();
+        assert!(!events.is_empty());
+        assert_eq!(events[0].action, cursor_overlay::CursorAction::App);
+        assert!(events
+            .iter()
+            .all(|e| e.target.is_none() && e.bounds.is_none()));
+        assert!(registry.get("menu-cue").is_none());
+    }
+    #[test]
+    fn slice_a_menu_bounds_and_dispatch_error_never_make_false_contact() {
+        for failed in [false, true] {
+            let registry = crate::cursor::CursorRegistry::new();
+            let sink = crate::cursor::visual::test_support::RecordingSink::default();
+            let _ = dispatch_menu_visual(
+                &registry,
+                &sink,
+                "menu-item",
+                Some([20.0, 30.0, 80.0, 20.0]),
+                42,
+                || if failed { Err(()) } else { Ok(()) },
+            );
+            let events = sink.1.lock().unwrap();
+            assert_eq!(events[0].bounds, Some([20.0, 30.0, 80.0, 20.0]));
+            assert_eq!(
+                events
+                    .iter()
+                    .filter(|e| e.phase == cursor_overlay::VisualPhase::Contact)
+                    .count(),
+                usize::from(!failed)
+            );
+        }
+    }
     use super::*;
 
     #[test]

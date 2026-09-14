@@ -119,17 +119,43 @@ fn classify_exact_outcome(
     }
 }
 
-fn observe_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
-    let windows = crate::windows::visible_windows();
-    let target_visible_ordinary = windows
-        .iter()
-        .any(|window| window.pid == pid && window.window_id == window_id && window.layer == 0);
-    let frontmost_ordinary_window_id = windows
-        .iter()
+fn ordinary_window_order(
+    windows: &[crate::windows::WindowInfo],
+    pid: i32,
+    window_id: u32,
+    driver_pid: i32,
+    owned_cursor_windows: &[u32],
+) -> (bool, Option<u32>) {
+    let ordinary = windows.iter().filter(|window| {
+        window.layer == 0
+            && window.is_on_screen
+            && !(window.pid == driver_pid && owned_cursor_windows.contains(&window.window_id))
+    });
+    let target_visible_ordinary = ordinary
+        .clone()
+        .any(|window| window.pid == pid && window.window_id == window_id);
+    let frontmost_ordinary_window_id = ordinary
         .max_by_key(|window| window.z_index)
         .map(|window| window.window_id);
+    (target_visible_ordinary, frontmost_ordinary_window_id)
+}
+
+fn observe_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
+    // Host replacement/closure and NSWindow queries all run on AppKit main.
+    // Drop the host lock before enumeration, with no render/inbox lock held.
+    // Sampling here prevents a queued rebuild from interleaving the identities
+    // with this inventory. Public list_windows continues to include the cursor.
+    let (workspace_frontmost_pid, target_visible_ordinary, frontmost_ordinary_window_id) =
+        crate::cursor::overlay::on_appkit_main(move || {
+            let main = objc2_foundation::MainThreadMarker::new().expect("AppKit main thread");
+            let owned = crate::cursor::overlay::owned_cursor_window_ids(main);
+            let windows = crate::windows::visible_windows();
+            let (visible, front) =
+                ordinary_window_order(&windows, pid, window_id, std::process::id() as i32, &owned);
+            (crate::apps::frontmost_pid(), visible, front)
+        });
     ExactWindowObservation {
-        workspace_frontmost_pid: crate::apps::frontmost_pid(),
+        workspace_frontmost_pid,
         front_process_matches_target: crate::input::skylight::front_process_matches(pid, window_id),
         focused_window_id: crate::ax::bindings::focused_window_id_of_pid(pid),
         frontmost_ordinary_window_id,
@@ -423,6 +449,83 @@ impl Tool for BringToFrontTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn window(pid: i32, window_id: u32, z_index: usize) -> crate::windows::WindowInfo {
+        crate::windows::WindowInfo {
+            pid,
+            window_id,
+            z_index,
+            app_name: String::new(),
+            title: String::new(),
+            bounds: crate::windows::WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1512.0,
+                height: 982.0,
+            },
+            layer: 0,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        }
+    }
+
+    fn observed_order(
+        windows: &[crate::windows::WindowInfo],
+        owned: &[u32],
+    ) -> ExactWindowObservation {
+        let (visible, front) = ordinary_window_order(windows, 42, 7, 99, owned);
+        observation(Some(42), Some(true), Some(7), front, visible)
+    }
+
+    #[test]
+    fn owned_cursor_surface_does_not_occlude_exact_focused_window() {
+        let windows = [window(42, 7, 150), window(99, 30953, 151)];
+        let observed = observed_order(&windows, &[30953]);
+        assert!(observed.exact_postcondition(42, 7));
+        // Exclusion cannot bypass the independent process or focus predicates.
+        assert!(!ExactWindowObservation {
+            focused_window_id: Some(8),
+            ..observed
+        }
+        .exact_postcondition(42, 7));
+        assert!(!ExactWindowObservation {
+            front_process_matches_target: Some(false),
+            ..observed
+        }
+        .exact_postcondition(42, 7));
+    }
+
+    #[test]
+    fn owned_cursor_exclusion_preserves_real_occluders_and_siblings() {
+        // All have the same empty title and screen-sized geometry as the cursor.
+        for occluder in [
+            window(88, 8, 151),
+            window(42, 8, 151),
+            window(99, 8, 151),
+            window(88, 30953, 151),
+        ] {
+            let windows = [window(42, 7, 150), occluder];
+            assert!(!observed_order(&windows, &[30953]).exact_postcondition(42, 7));
+        }
+        assert!(
+            !observed_order(&[window(88, 7, 150), window(99, 30953, 151)], &[30953])
+                .exact_postcondition(42, 7)
+        );
+    }
+
+    #[test]
+    fn owned_cursor_exclusion_uses_only_current_host_identities() {
+        let windows = [window(42, 7, 150), window(99, 30953, 151)];
+        assert!(observed_order(&windows, &[30953]).exact_postcondition(42, 7));
+        // A retired host's ID must not remain exempt after removal or rebuild.
+        for current in [&[][..], &[31000][..]] {
+            assert!(!observed_order(&windows, current).exact_postcondition(42, 7));
+        }
+        let rebuilt = [window(42, 7, 150), window(99, 31000, 151)];
+        assert!(observed_order(&rebuilt, &[31000]).exact_postcondition(42, 7));
+    }
 
     fn observation(
         workspace_frontmost_pid: Option<i32>,

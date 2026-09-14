@@ -56,6 +56,9 @@ struct FixtureState {
     fail_key_down_after: Option<usize>,
     completed_key_pairs: usize,
     semantic_large_page: bool,
+    semantic_title: Option<String>,
+    semantic_link_urls: bool,
+    semantic_main_root_present: bool,
     semantic_full_dom_fails: bool,
     semantic_full_dom_times_out: bool,
     semantic_truncated_dom: bool,
@@ -82,6 +85,9 @@ impl Default for FixtureState {
             fail_key_down_after: None,
             completed_key_pairs: 0,
             semantic_large_page: false,
+            semantic_title: Some("Fixture inbox".into()),
+            semantic_link_urls: false,
+            semantic_main_root_present: true,
             semantic_full_dom_fails: false,
             semantic_full_dom_times_out: false,
             semantic_truncated_dom: false,
@@ -476,11 +482,13 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 } else if st.semantic_truncated_dom && depth == 8 {
                     MockReply::ok(truncated_semantic_document())
                 } else {
-                    MockReply::ok(if st.semantic_large_page {
+                    let mut document = if st.semantic_large_page {
                         large_semantic_document()
                     } else {
                         main_document()
-                    })
+                    };
+                    document["root"]["documentURL"] = json!(st.main_url);
+                    MockReply::ok(document)
                 }
             }
             "DOM.describeNode" if is_tab && call.params["backendNodeId"] == 999 => {
@@ -492,7 +500,28 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             "Accessibility.getFullAXTree" if is_tab => {
                 let frame_id = call.params["frameId"].as_str().unwrap_or("F_MAIN");
                 if st.semantic_large_page {
-                    MockReply::ok(large_semantic_ax_tree(frame_id))
+                    let mut tree = large_semantic_ax_tree(frame_id);
+                    if frame_id == "F_MAIN" {
+                        let nodes = tree["nodes"].as_array_mut().unwrap();
+                        if !st.semantic_main_root_present {
+                            nodes.remove(0);
+                        } else if let Some(title) = &st.semantic_title {
+                            nodes[0]["name"] = json!({"value": title});
+                        } else {
+                            nodes[0].as_object_mut().unwrap().remove("name");
+                        }
+                    }
+                    if st.semantic_link_urls {
+                        for node in tree["nodes"].as_array_mut().unwrap() {
+                            if node["name"]["value"] == "Reply"
+                                || node["name"]["value"] == "Archive item 304"
+                            {
+                                node["role"] = json!({"value":"link"});
+                                node["properties"] = json!([{"name":"url","value":{"type":"string","value":"https://example.test/book?slot=1#court"}}]);
+                            }
+                        }
+                    }
+                    MockReply::ok(tree)
                 } else {
                     MockReply::ok(json!({"nodes": []}))
                 }
@@ -1446,6 +1475,79 @@ async fn snapshot_composes_shadow_iframe_and_oopif_refs() {
 }
 
 #[tokio::test]
+async fn semantic_snapshot_refreshes_bind_time_title_from_main_document() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+
+    assert_eq!(snap["status"], "ok", "{snap}");
+    assert_eq!(snap["page"]["title"], "Fixture inbox", "{snap}");
+}
+
+#[tokio::test]
+async fn semantic_page_title_tracks_navigation_and_continuations() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.semantic_title = Some("First page".into());
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    assert_eq!(first["page"]["title"], "First page");
+
+    let destination = "https://fixture.test/second";
+    let navigation = BrowserNavigateTool::new(f.engine.clone())
+        .invoke(json!({"target_id": target, "tab_id": tab,
+            "session": SESSION, "url": destination}))
+        .await;
+    assert_eq!(navigation.structured_content.unwrap()["status"], "ok");
+    {
+        // The browser independently publishes the newly loaded document.
+        let mut state = f.state.lock().unwrap();
+        state.main_url = destination.into();
+        state.main_loader = "L_MAIN_2".into();
+        state.semantic_title = Some("Second page".into());
+    }
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_eq!(second["page"]["url"], destination);
+    assert_eq!(second["page"]["title"], "Second page");
+    let token = second["snapshot"]["continuation"].as_str().unwrap();
+    let continued = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
+    assert_eq!(continued["page"], second["page"]);
+    assert!(recorded_calls(&f, "Page.bringToFront").is_empty());
+    assert!(recorded_calls(&f, "Target.activateTarget").is_empty());
+}
+
+#[tokio::test]
+async fn semantic_page_title_clears_previous_title_when_empty_or_unavailable() {
+    for next_title in [Some(String::new()), None] {
+        let f = fixture_with(|st| st.semantic_large_page = true).await;
+        let (target, tab) = bind(&f).await;
+        let first = semantic_snapshot(&f, &target, &tab).await;
+        assert_eq!(first["page"]["title"], "Fixture inbox");
+        f.state.lock().unwrap().semantic_title = next_title;
+        let fresh = semantic_snapshot(&f, &target, &tab).await;
+        assert_eq!(fresh["page"]["title"], "");
+        let token = fresh["snapshot"]["continuation"].as_str().unwrap();
+        let continued =
+            semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
+        assert_eq!(continued["page"]["title"], "");
+    }
+}
+
+#[tokio::test]
+async fn semantic_page_title_does_not_borrow_an_embedded_frame_title() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.semantic_main_root_present = false;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let fresh = semantic_snapshot(&f, &target, &tab).await;
+    assert_eq!(fresh["page"]["title"], "");
+}
+
+#[tokio::test]
 async fn semantic_snapshot_keeps_visible_content_after_hidden_node_pressure() {
     let f = fixture_with(|st| st.semantic_large_page = true).await;
     let (target, tab) = bind(&f).await;
@@ -1639,6 +1741,7 @@ async fn semantic_continuation_is_opaque_single_use_and_reaches_offscreen_conten
     let continued = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
     assert_eq!(continued["status"], "ok", "{continued}");
     assert_eq!(continued["snapshot"]["scope"], "continuation");
+    assert_eq!(continued["page"]["title"], "Fixture inbox", "{continued}");
     assert!(
         continued["refs"]
             .as_array()
@@ -2407,4 +2510,40 @@ async fn keystrokes_use_char_events_for_text_delivery() {
     }));
     assert!(recorded_calls(&f, "Page.bringToFront").is_empty());
     assert!(recorded_calls(&f, "Target.activateTarget").is_empty());
+}
+
+#[tokio::test]
+async fn semantic_link_urls_reach_query_and_continuation_outputs() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.semantic_link_urls = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = first["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Reply")
+        .unwrap();
+    assert_eq!(reply["url"], "https://example.test/book?slot=1#court");
+    assert!(reply["value"].is_null());
+    let token = first["snapshot"]["continuation"].as_str().unwrap();
+    let continued = semantic_snapshot_with(&f, &target, &tab, json!({"continuation":token})).await;
+    let archive = continued["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Archive item 304")
+        .unwrap();
+    assert_eq!(archive["url"], "https://example.test/book?slot=1#court");
+    let queried = semantic_snapshot_with(&f, &target, &tab, json!({"query":"Reply"})).await;
+    let reply = queried["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|r| r["name"] == "Reply")
+        .unwrap();
+    assert_eq!(reply["url"], "https://example.test/book?slot=1#court");
 }

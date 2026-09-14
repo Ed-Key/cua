@@ -61,6 +61,18 @@ integrity-level harness can exercise it.
 
 ## Native macOS
 
+Local macOS scroll correction: Electron pixel-targeted scrolling is no longer
+rejected solely by runtime identity. The existing guarded native wheel route
+can be attempted and returns `effect:"unverifiable"`; it does not promise a renderer update. The
+focused `macos_electron_scroll` tests prove visible/unfocused virtualized-list
+movement and covered-window dispatch isolation separately. Covered Electron
+renderers can still stall. This does not certify full-occlusion scroll delivery.
+The historical shared-matrix table above predates this correction. Its
+Electron background PX-scroll refusal row needs recertification before release;
+the old exact-refusal expectation is not evidence for the new behavior.
+AX-addressed and untargeted Electron background scroll remain explicitly refused.
+Windows and Linux behavior is unchanged.
+
 | Harness | Proven contracts | Refusals and gaps |
 | --- | --- | --- |
 | AppKit | AX tree/capture; AX background left click, set value, and type text; PX background left/right/double click; PX foreground right/double click and slider drag; AX foreground/background scroll; desktop PX foreground left click | PX background slider drag returns exact `background_unavailable`. Native press key, hotkey, AX-addressed right/double click, and broader control combinations remain unproven. |
@@ -83,6 +95,22 @@ are capabilities, not one uniform API.
 PX background left-click rows may resolve the screen point to an actionable
 AT-SPI node. Such a pass proves the public PX-addressed behavior and its desktop
 side effects, but it does not prove raw pixel delivery to canvases or games.
+
+The [accepted Hyprland foreground extension](https://github.com/trycua/cua/issues/3550#issuecomment-5564996417)
+is planned support, not an empirical pass in this table. Production protocol v3
+advertises `foreground_target:true` and binds `FOREGROUND_TARGET` to the exact
+native top-level surface for activation, click, key, scroll, and bounded drag.
+Driver expands bounded ASCII text under the exact US keymap; Unicode and IME
+input remain outside this route. Native GTK3, Electron, and Tauri foreground
+coverage still requires the complete canonical Linux suite in native Hyprland.
+
+Foreground delivery may activate the target and move the primary cursor, with
+no restoration promise. Held keys/buttons, grabs, constraints, and drag-and-drop
+must refuse before takeover; foreground drag interruption still requires review
+and native verification. This route has no Calc/Inkscape package gate. Background
+`TARGET` retains its Calc/Inkscape qualification and never escalates to
+foreground. Observation followed by global `wtype` input is not an exact-target
+fallback. Both routes retain the common permission and lifecycle contract.
 
 ## Maintenance rule
 

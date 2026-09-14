@@ -17,6 +17,10 @@ use core_foundation::{
 };
 use std::os::raw::{c_int, c_void};
 
+#[cfg(test)]
+#[path = "bindings_test_support.rs"]
+pub(crate) mod test_support;
+
 // ── AXUIElement opaque type ──────────────────────────────────────────────────
 
 #[repr(C)]
@@ -123,6 +127,7 @@ extern "C" {
         the_type: AXValueType,
         value_ptr: *mut c_void,
     ) -> bool;
+    pub fn AXValueGetTypeID() -> CFTypeID;
 }
 
 #[repr(C)]
@@ -154,12 +159,45 @@ pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) ->
         && settable != 0
 }
 
+/// Convert a borrowed URL attribute without changing control-value coercion.
+unsafe fn coerce_url_value(value: CFTypeRef) -> Option<String> {
+    use core_foundation::url::CFURL;
+    if value.is_null() || core_foundation::base::CFGetTypeID(value) != CFURL::type_id() {
+        return None;
+    }
+    let url = CFURL::wrap_under_get_rule(value as _)
+        .absolute()
+        .get_string()
+        .to_string();
+    (!url.is_empty()).then_some(url)
+}
+
+/// Read the dedicated AXURL attribute, whose documented type is CFURLRef.
+///
+/// # Safety
+/// `element` must be a valid, live AXUIElementRef for the duration of the call.
+pub unsafe fn copy_url_attr(element: AXUIElementRef) -> Option<String> {
+    let attr = CFStr::new("AXURL");
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if error != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    let url = coerce_url_value(value);
+    CFRelease(value);
+    url
+}
+
 /// Copy a string attribute from an AX element. Returns `None` on any error.
 ///
 /// # Safety
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Option<String> {
+    #[cfg(test)]
+    if let Some(result) = test_support::copy_string_attr(element, attr_name) {
+        return result;
+    }
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
@@ -209,6 +247,10 @@ pub unsafe fn copy_number_attr(element: AXUIElementRef, attr_name: &str) -> Opti
 /// `element` must be a valid Accessibility object reference for the duration
 /// of this call.
 pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
+    #[cfg(test)]
+    if let Some(result) = test_support::copy_bool_attr(element, attr_name) {
+        return result;
+    }
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
     let attr = CFStr::new(attr_name);
@@ -228,6 +270,35 @@ pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option
     }
     CFRelease(value);
     None
+}
+
+unsafe fn coerce_binary_value(value: CFTypeRef) -> Option<bool> {
+    use core_foundation::boolean::CFBoolean;
+    use core_foundation::number::CFNumber;
+    let type_id = core_foundation::base::CFGetTypeID(value);
+    if type_id == CFBoolean::type_id() {
+        return Some(CFBoolean::wrap_under_get_rule(value as _).into());
+    }
+    if type_id == CFNumber::type_id() {
+        return match CFNumber::wrap_under_get_rule(value as _).to_f64()? {
+            0.0 => Some(false),
+            1.0 => Some(true),
+            _ => None,
+        };
+    }
+    None
+}
+
+pub unsafe fn copy_binary_attr(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
+    let attr = CFStr::new(attr_name);
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if err != kAXErrorSuccess || value.is_null() {
+        return None;
+    }
+    let result = coerce_binary_value(value);
+    CFRelease(value);
+    result
 }
 
 /// A copied AX attribute represented for both existing string-only consumers
@@ -311,6 +382,10 @@ pub unsafe fn copy_stringish_attr(
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn copy_action_names(element: AXUIElementRef) -> Vec<String> {
+    #[cfg(test)]
+    if let Some(result) = test_support::copy_action_names(element) {
+        return result;
+    }
     let mut names: CFArrayRef = std::ptr::null_mut();
     let err = AXUIElementCopyActionNames(element, &mut names);
     if err != kAXErrorSuccess || names.is_null() {
@@ -390,6 +465,10 @@ pub unsafe fn element_screen_center(element: AXUIElementRef) -> Option<(f64, f64
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn element_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
+    #[cfg(test)]
+    if let Some(result) = test_support::editor_rect(element) {
+        return result;
+    }
     // AXPosition → CGPoint
     let pos_attr = CFStr::new("AXPosition");
     let mut pos_ref: CFTypeRef = std::ptr::null();
@@ -529,6 +608,10 @@ pub unsafe fn copy_element_attr(
     element: AXUIElementRef,
     attr_name: &str,
 ) -> Option<AXUIElementRef> {
+    #[cfg(test)]
+    if let Some(result) = test_support::copy_element_attr(element, attr_name) {
+        return result;
+    }
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
@@ -548,6 +631,10 @@ pub unsafe fn copy_element_attr(
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn perform_action(element: AXUIElementRef, action_name: &str) -> AXError {
+    #[cfg(test)]
+    if let Some(result) = test_support::perform_action(element, action_name) {
+        return result;
+    }
     let action = CFStr::new(action_name);
     AXUIElementPerformAction(element, action.as_concrete_TypeRef())
 }
@@ -558,6 +645,10 @@ pub unsafe fn perform_action(element: AXUIElementRef, action_name: &str) -> AXEr
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn set_string_attr(element: AXUIElementRef, attr_name: &str, value: &str) -> AXError {
+    #[cfg(test)]
+    if let Some(result) = test_support::editor_write(element, attr_name, value) {
+        return result;
+    }
     let attr = CFStr::new(attr_name);
     let cf_value = CFStr::new(value);
     AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_value.as_CFTypeRef())
@@ -632,20 +723,25 @@ pub unsafe fn set_size_attr(
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn set_bool_attr_true(element: AXUIElementRef, attr_name: &str) -> AXError {
+    #[cfg(test)]
+    if let Some(result) = test_support::set_bool_attr_true(element, attr_name) {
+        return result;
+    }
     use core_foundation::boolean::CFBoolean;
     let attr = CFStr::new(attr_name);
     let cf_true = CFBoolean::true_value();
     AXUIElementSetAttributeValue(element, attr.as_concrete_TypeRef(), cf_true.as_CFTypeRef())
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AccessibilityOptIn {
+    ManualAccessibility,
+    EnhancedUserInterface,
+    NotAccepted,
+}
+
 /// Signal to a Chromium/Electron application root that a real assistive client
 /// is present so it materializes its full web-content accessibility tree.
-///
-/// Returns `true` when an attribute write was accepted — meaning the app was
-/// flipped from "tree off" to "tree building" and the caller should let the
-/// tree settle before walking. Returns `false` when the app does not support
-/// either attribute (native Cocoa apps such as Finder / Calculator / TextEdit),
-/// in which case no settle delay is warranted.
 ///
 /// `AXManualAccessibility` is the modern opt-in with no screen-reader side
 /// effects; `AXEnhancedUserInterface` is the legacy fallback some Electron
@@ -655,18 +751,22 @@ pub unsafe fn set_bool_attr_true(element: AXUIElementRef, attr_name: &str) -> AX
 /// # Safety
 ///
 /// `app_element` must be a valid, live application `AXUIElementRef`.
-pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> bool {
+pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> AccessibilityOptIn {
     let manual = set_bool_attr_true(app_element, "AXManualAccessibility");
     if manual == kAXErrorSuccess {
-        return true;
+        return AccessibilityOptIn::ManualAccessibility;
     }
     if manual != kAXErrorAttributeUnsupported {
         // A transient error (e.g. timeout / app busy) rather than a hard
         // "this app has no such attribute" — don't bother with the legacy
         // fallback, and don't claim enablement happened.
-        return false;
+        return AccessibilityOptIn::NotAccepted;
     }
-    set_bool_attr_true(app_element, "AXEnhancedUserInterface") == kAXErrorSuccess
+    if set_bool_attr_true(app_element, "AXEnhancedUserInterface") == kAXErrorSuccess {
+        AccessibilityOptIn::EnhancedUserInterface
+    } else {
+        AccessibilityOptIn::NotAccepted
+    }
 }
 
 /// Get the CGWindowID of an AX window element via the private `_AXUIElementGetWindow` SPI.
@@ -676,13 +776,22 @@ pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> bool
 ///
 /// `element` must be a valid, live window `AXUIElementRef`.
 pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
+    ax_get_window_id_checked(element).ok().flatten()
+}
+
+pub(crate) unsafe fn ax_get_window_id_checked(
+    element: AXUIElementRef,
+) -> Result<Option<u32>, AXError> {
     let mut wid: u32 = 0;
     let err = _AXUIElementGetWindow(element, &mut wid);
-    if err == kAXErrorSuccess && wid != 0 {
-        Some(wid)
-    } else {
-        None
+    checked_window_id(err, wid)
+}
+
+fn checked_window_id(error: AXError, window_id: u32) -> Result<Option<u32>, AXError> {
+    if error != kAXErrorSuccess {
+        return Err(error);
     }
+    Ok((window_id != 0).then_some(window_id))
 }
 
 /// Read the `AXWindows` attribute of an application element.
@@ -694,6 +803,102 @@ pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
     copy_element_array_attr(element, "AXWindows")
+}
+
+/// Copy an attribute without conflating an AX failure with an absent value.
+/// The returned Core Foundation object owns the reference from the AX copy.
+pub(crate) unsafe fn copy_attribute_checked(
+    element: AXUIElementRef,
+    attribute: &str,
+) -> Result<core_foundation::base::CFType, AXError> {
+    let attr = CFStr::new(attribute);
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    let value =
+        (!value.is_null()).then(|| core_foundation::base::CFType::wrap_under_create_rule(value));
+    checked_attribute_value(error, value)
+}
+
+fn checked_attribute_value(
+    error: AXError,
+    value: Option<core_foundation::base::CFType>,
+) -> Result<core_foundation::base::CFType, AXError> {
+    if error != kAXErrorSuccess {
+        return Err(error);
+    }
+    value.ok_or(kAXErrorFailure)
+}
+
+pub(crate) unsafe fn copy_string_attr_checked(
+    element: AXUIElementRef,
+    attribute: &str,
+) -> Result<String, AXError> {
+    let value = copy_attribute_checked(element, attribute)?;
+    if value.type_of() != CFStr::type_id() {
+        return Err(kAXErrorFailure);
+    }
+    Ok(CFStr::wrap_under_get_rule(value.as_CFTypeRef() as _).to_string())
+}
+
+pub(crate) unsafe fn copy_geometry_attr_checked(
+    element: AXUIElementRef,
+    attribute: &str,
+    value_type: AXValueType,
+) -> Result<[f64; 2], AXError> {
+    let value = copy_attribute_checked(element, attribute)?;
+    if value.type_of() != AXValueGetTypeID()
+        || !matches!(value_type, kAXValueCGPointType | kAXValueCGSizeType)
+    {
+        return Err(kAXErrorFailure);
+    }
+    let mut pair = [0.0_f64; 2];
+    if !AXValueGetValue(
+        value.as_CFTypeRef() as AXValueRef,
+        value_type,
+        pair.as_mut_ptr() as _,
+    ) || !pair.iter().all(|value| value.is_finite())
+    {
+        return Err(kAXErrorFailure);
+    }
+    Ok(pair)
+}
+
+/// Strict bounded array read for observation. Unlike the legacy projection,
+/// malformed members make the entire read unknown instead of silently hiding
+/// a possible second surface. Every successful returned element is retained.
+pub(crate) unsafe fn copy_element_array_attr_checked(
+    element: AXUIElementRef,
+    attribute: &str,
+    limit: usize,
+) -> Result<Vec<AXUIElementRef>, AXError> {
+    checked_element_array(copy_attribute_checked(element, attribute)?, limit)
+}
+
+unsafe fn checked_element_array(
+    value: core_foundation::base::CFType,
+    limit: usize,
+) -> Result<Vec<AXUIElementRef>, AXError> {
+    if value.type_of() != CFArray::<CFTypeRef>::type_id() {
+        return Err(kAXErrorFailure);
+    }
+    let array = CFArray::<CFTypeRef>::wrap_under_get_rule(value.as_CFTypeRef() as _);
+    if array.len() as usize > limit {
+        return Err(kAXErrorFailure);
+    }
+    let ax_type_id = AXUIElementGetTypeID();
+    for i in 0..array.len() {
+        let item = *array.get(i).ok_or(kAXErrorFailure)?;
+        if item.is_null() || core_foundation::base::CFGetTypeID(item) != ax_type_id {
+            return Err(kAXErrorFailure);
+        }
+    }
+    Ok((0..array.len())
+        .map(|i| {
+            let item = *array.get(i).expect("validated array member");
+            CFRetain(item);
+            item as AXUIElementRef
+        })
+        .collect())
 }
 
 /// Read an AX attribute containing an array of accessibility elements.
@@ -732,6 +937,135 @@ pub unsafe fn copy_element_array_attr(
 mod tests {
     use super::*;
     use core_foundation::{boolean::CFBoolean, number::CFNumber};
+
+    #[test]
+    fn checked_window_id_does_not_turn_a_transport_error_into_a_transient_root() {
+        assert_eq!(checked_window_id(-25204, 7), Err(-25204));
+        assert_eq!(checked_window_id(kAXErrorSuccess, 0), Ok(None));
+        assert_eq!(checked_window_id(kAXErrorSuccess, 7), Ok(Some(7)));
+    }
+
+    #[test]
+    fn checked_ax_copy_keeps_transport_failure_distinct_from_empty_value() {
+        let value = CFStr::new("existing window").as_CFType();
+        assert_eq!(
+            checked_attribute_value(-25204, Some(value.clone())),
+            Err(-25204)
+        );
+        assert_eq!(
+            checked_attribute_value(kAXErrorSuccess, None),
+            Err(kAXErrorFailure)
+        );
+        assert_eq!(
+            checked_attribute_value(kAXErrorSuccess, Some(value.clone())),
+            Ok(value)
+        );
+    }
+
+    #[test]
+    fn checked_ax_array_rejects_malformed_or_truncated_candidate_sets() {
+        unsafe {
+            let app = core_foundation::base::CFType::wrap_under_create_rule(
+                AXUIElementCreateApplication(1) as CFTypeRef,
+            );
+            let array = CFArray::from_CFTypes(&[app.clone()]);
+            let elements = checked_element_array(array.as_CFType(), 1).unwrap();
+            assert_eq!(elements.len(), 1);
+            for element in elements {
+                CFRelease(element as CFTypeRef);
+            }
+            assert_eq!(
+                checked_element_array(array.as_CFType(), 0),
+                Err(kAXErrorFailure)
+            );
+            let mixed = CFArray::from_CFTypes(&[app, CFStr::new("not an AX element").as_CFType()]);
+            assert_eq!(
+                checked_element_array(mixed.as_CFType(), 2),
+                Err(kAXErrorFailure)
+            );
+            assert_eq!(
+                checked_element_array(CFStr::new("not an array").as_CFType(), 2),
+                Err(kAXErrorFailure)
+            );
+        }
+    }
+
+    #[test]
+    fn binary_value_accepts_booleans_and_exact_zero_or_one() {
+        let true_value = CFBoolean::true_value();
+        let false_value = CFBoolean::false_value();
+        let zero = CFNumber::from(0.0);
+        let one = CFNumber::from(1.0);
+        let fractional = CFNumber::from(0.5);
+        let other = CFNumber::from(2.0);
+        let string = CFStr::new("1");
+
+        assert_eq!(
+            unsafe { coerce_binary_value(true_value.as_CFTypeRef()) },
+            Some(true)
+        );
+        assert_eq!(
+            unsafe { coerce_binary_value(false_value.as_CFTypeRef()) },
+            Some(false)
+        );
+        assert_eq!(
+            unsafe { coerce_binary_value(zero.as_CFTypeRef()) },
+            Some(false)
+        );
+        assert_eq!(
+            unsafe { coerce_binary_value(one.as_CFTypeRef()) },
+            Some(true)
+        );
+        assert_eq!(
+            unsafe { coerce_binary_value(fractional.as_CFTypeRef()) },
+            None
+        );
+        assert_eq!(unsafe { coerce_binary_value(other.as_CFTypeRef()) }, None);
+        assert_eq!(unsafe { coerce_binary_value(string.as_CFTypeRef()) }, None);
+    }
+
+    #[test]
+    fn binary_value_rejects_near_binary_and_non_finite_numbers() {
+        for value in [
+            1e-20,
+            -1e-20,
+            f64::from_bits(1),
+            -f64::from_bits(1),
+            f64::from_bits(1.0_f64.to_bits() - 1),
+            f64::from_bits(1.0_f64.to_bits() + 1),
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+        ] {
+            let number = CFNumber::from(value);
+            assert_eq!(
+                unsafe { coerce_binary_value(number.as_CFTypeRef()) },
+                None,
+                "unexpected binary state for {value:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn link_url_attribute_decodes_cfurl_without_changing_values() {
+        use core_foundation::url::{CFURLCreateWithString, CFURL};
+        let text = CFStr::new("https://example.test/book?q=a%20b#slot");
+        let raw = unsafe {
+            CFURLCreateWithString(
+                std::ptr::null(),
+                text.as_concrete_TypeRef(),
+                std::ptr::null(),
+            )
+        };
+        assert!(!raw.is_null());
+        let url = unsafe { CFURL::wrap_under_create_rule(raw) };
+        assert_eq!(
+            unsafe { coerce_url_value(url.as_CFTypeRef()) }.as_deref(),
+            Some("https://example.test/book?q=a%20b#slot")
+        );
+        assert!(unsafe { coerce_stringish_value(url.as_CFTypeRef()) }.is_none());
+        assert!(unsafe { coerce_url_value(CFNumber::from(8).as_CFTypeRef()) }.is_none());
+    }
 
     #[test]
     fn stringish_value_coerces_cfstring_cfnumber_and_cfboolean() {

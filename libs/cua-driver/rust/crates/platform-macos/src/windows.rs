@@ -88,13 +88,14 @@ pub(crate) fn visible_windows_with_space_snapshot() -> WindowEnumeration {
 /// Enumerate windows on every CGWindow layer, including the accessory layers
 /// (`layer != 0`) that [`all_windows`] hides.
 ///
-/// Only used to answer "does this CGWindowID exist, and who owns it?" — the
+/// Used for private opt-in cursor stack observations and to answer
+/// "does this CGWindowID exist, and who owns it?", a
 /// question `list_windows` must NOT answer, because surfacing tooltips,
 /// popovers, the Dock and every NSMenu window would swamp callers. Keeping the
 /// layer filter on enumeration and off identity lookup is what lets
 /// `get_window_state` tell "no such window" apart from "exists, but is not a
 /// layer-0 window" (issue #2237).
-fn all_windows_any_layer() -> Vec<WindowInfo> {
+pub(crate) fn all_windows_any_layer() -> Vec<WindowInfo> {
     enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer).windows
 }
 

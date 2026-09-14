@@ -115,6 +115,48 @@ pub struct CompiledTheme {
 }
 
 impl CompiledTheme {
+    /// Conservative logical radius around the cursor anchor touched by any frame.
+    pub fn paint_radius(&self) -> f64 {
+        let mut radius = 1.0f64;
+        for command in self
+            .actions
+            .values()
+            .flat_map(|animation| &animation.frames)
+            .flat_map(|frame| &frame.commands)
+        {
+            let mut builder = PathBuilder::new();
+            for geometry in &command.geometries {
+                append_geometry(&mut builder, geometry);
+            }
+            let Some(path) = builder
+                .finish()
+                .and_then(|path| path.transform(compiled_transform(command.transform)))
+            else {
+                continue;
+            };
+            let bounds = path.bounds();
+            let geometry_radius = [
+                (bounds.left(), bounds.top()),
+                (bounds.right(), bounds.top()),
+                (bounds.left(), bounds.bottom()),
+                (bounds.right(), bounds.bottom()),
+            ]
+            .into_iter()
+            .map(|(x, y)| f64::from(x - 64.0).hypot(f64::from(y - 64.0)))
+            .fold(0.0, f64::max);
+            let stroke_radius = command.stroke.map_or(0.0, |stroke| {
+                let scale = command.transform.scale[0]
+                    .abs()
+                    .max(command.transform.scale[1].abs());
+                // tiny-skia's default miter limit is four half-widths.
+                f64::from(stroke.width * scale * 2.0)
+            });
+            radius = radius.max(geometry_radius + stroke_radius);
+        }
+        // Include anti-aliasing and the shared floating motion.
+        (radius * f64::from(crate::theme::DISPLAY_SIZE / crate::theme::CANVAS_SIZE) + 8.0).max(8.0)
+    }
+
     pub fn content_hash(&self) -> String {
         let mut hasher = Sha256::new();
         if let Ok(bytes) = postcard::to_allocvec(self) {
@@ -777,16 +819,8 @@ pub fn paint_compiled_theme_with_tint(
     alpha: f32,
     tint: Option<[u8; 4]>,
 ) {
-    let scale = crate::theme::DISPLAY_SIZE * backing_scale / crate::theme::CANVAS_SIZE;
-    let (float_dx, float_dy, float_rotation) = if theme.id == crate::DEFAULT_THEME_ID {
-        crate::theme::shared_float_motion(visual)
-    } else {
-        (0.0, 0.0, 0.0)
-    };
-    let transform = Transform::from_translate(-64.0, -64.0)
-        .post_scale(scale, scale)
-        .post_rotate((heading - std::f32::consts::FRAC_PI_4 + float_rotation).to_degrees())
-        .post_translate(anchor_x + float_dx * scale, anchor_y + float_dy * scale);
+    let transform =
+        theme_outer_transform(theme, visual, anchor_x, anchor_y, heading, backing_scale);
     let reduced = visual.reduced_motion == crate::ReducedMotion::On;
     if let Some(animation) = theme.animation_for_action(visual.resolved_action) {
         draw_layer(
@@ -799,6 +833,102 @@ pub fn paint_compiled_theme_with_tint(
             tint,
         );
     }
+}
+
+fn theme_outer_transform(
+    theme: &CompiledTheme,
+    visual: &CursorVisualState,
+    anchor_x: f32,
+    anchor_y: f32,
+    heading: f32,
+    backing_scale: f32,
+) -> Transform {
+    let scale = crate::theme::DISPLAY_SIZE * backing_scale / crate::theme::CANVAS_SIZE;
+    let (float_dx, float_dy, float_rotation) = if theme.id == crate::DEFAULT_THEME_ID {
+        crate::theme::shared_float_motion(visual)
+    } else {
+        (0.0, 0.0, 0.0)
+    };
+    Transform::from_translate(-64.0, -64.0)
+        .post_scale(scale, scale)
+        .post_rotate((heading - std::f32::consts::FRAC_PI_4 + float_rotation).to_degrees())
+        .post_translate(anchor_x + float_dx * scale, anchor_y + float_dy * scale)
+}
+
+/// The embedded arrow's rounded nose is the minimum x+y support point on
+/// its first cubic, extended outward by half the opaque white outline width.
+/// This is a visible boundary point, not the path's first vertex or metadata
+/// hotspot. Derive it from the actual compiled body and stroke, then apply the
+/// same frame and outer transforms used by painting. No screen-space offset.
+/// Only the trusted embedded theme is supported, never a custom ID lookalike.
+pub(crate) fn default_painted_tip_offset(
+    visual: &CursorVisualState,
+    heading: f32,
+) -> Option<tiny_skia::Point> {
+    let theme = embedded_default_theme();
+    let animation = theme.animation_for_action(visual.resolved_action)?;
+    let frame = animation_frame(
+        animation,
+        visual.elapsed_secs,
+        visual.reduced_motion == crate::ReducedMotion::On,
+    )?;
+    let body = frame.commands.iter().find(|command| {
+        command.fill == Some(crate::DEFAULT_CURSOR_FILL) && command.opacity == 1.0
+    })?;
+    let outline = frame.commands.iter().find(|command| {
+        command.geometries == body.geometries
+            && command.transform == body.transform
+            && command.opacity == 1.0
+            && command
+                .stroke
+                .is_some_and(|stroke| stroke.color == [255; 4])
+    })?;
+    let CompiledGeometry::Path {
+        vertices,
+        in_tangents,
+        out_tangents,
+        closed: true,
+    } = body.geometries.first()?
+    else {
+        return None;
+    };
+    let p0 = *vertices.first()?;
+    let p3 = *vertices.get(1)?;
+    let out = *out_tangents.first()?;
+    let incoming = *in_tangents.get(1)?;
+    let p1 = [p0[0] + out[0], p0[1] + out[1]];
+    let p2 = [p3[0] + incoming[0], p3[1] + incoming[1]];
+    // Derivative of the cubic's x+y projection, with the common factor 3 removed.
+    let [v0, v1, v2, v3] = [p0, p1, p2, p3].map(|p| f64::from(p[0]) + f64::from(p[1]));
+    let a = -v0 + 3.0 * v1 - 3.0 * v2 + v3;
+    let b = 2.0 * (v0 - 2.0 * v1 + v2);
+    let c = v1 - v0;
+    let discriminant = b * b - 4.0 * a * c;
+    if a.abs() < 1e-9 || discriminant < 0.0 {
+        return None;
+    }
+    let t = [
+        (-b + discriminant.sqrt()) / (2.0 * a),
+        (-b - discriminant.sqrt()) / (2.0 * a),
+    ]
+    .into_iter()
+    .find(|t| (0.0..=1.0).contains(t) && 2.0 * a * t + b > 0.0)?;
+    let u = 1.0 - t;
+    let half_outline = f64::from(outline.stroke?.width) * 0.5 * std::f64::consts::FRAC_1_SQRT_2;
+    let coordinate = |axis: usize| {
+        (u * u * u * f64::from(p0[axis])
+            + 3.0 * u * u * t * f64::from(p1[axis])
+            + 3.0 * u * t * t * f64::from(p2[axis])
+            + t * t * t * f64::from(p3[axis])
+            - half_outline) as f32
+    };
+    let mut tip = tiny_skia::Point::from_xy(coordinate(0), coordinate(1));
+    compiled_transform(body.transform)
+        .post_concat(theme_outer_transform(
+            &theme, visual, 0.0, 0.0, heading, 1.0,
+        ))
+        .map_point(&mut tip);
+    (tip.x.is_finite() && tip.y.is_finite()).then_some(tip)
 }
 
 fn hex_digest(bytes: &[u8]) -> String {
@@ -862,6 +992,16 @@ mod tests {
         let bytes = encode_theme(&theme).unwrap();
         assert_eq!(decode_theme(&bytes).unwrap(), theme);
         assert!(decode_theme(&bytes[..20]).is_err());
+    }
+
+    #[test]
+    fn paint_radius_includes_authored_transforms() {
+        let mut theme = minimal_theme();
+        for animation in theme.actions.values_mut() {
+            animation.frames[0].commands[0].transform.position = [400.0, 64.0];
+        }
+        assert!(theme.paint_radius() > 100.0);
+        assert!(theme.paint_radius() < 150.0);
     }
 
     #[test]

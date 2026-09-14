@@ -157,6 +157,11 @@ fn wayland_overlay_backend() -> WaylandOverlayBackend {
 }
 
 #[cfg(target_os = "linux")]
+pub(crate) fn native_window_move_overlay_available() -> bool {
+    wayland_overlay_backend() != WaylandOverlayBackend::None
+}
+
+#[cfg(target_os = "linux")]
 struct X11OverlayThreadCleanup {
     receiver: Option<std::sync::mpsc::Receiver<OverlayMsg>>,
     disable_render_state: bool,

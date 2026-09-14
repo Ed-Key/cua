@@ -21,6 +21,7 @@ cua-driver-sdk = { path = "../cua-driver-sdk" }
 cursor-overlay = { path = "../cursor-overlay" }
 pip-preview = { path = "../pip-preview" }
 async-trait = "0.1"
+httparse = "1.10.1"
 base64 = { workspace = true }
 uuid = { workspace = true }
 zeroize = { workspace = true }
@@ -76,6 +77,7 @@ portal-libei = ["platform-linux/portal-libei"]
 embed-resource = "2"
 
 [dev-dependencies]
+time = { workspace = true }
 # Shared integration-test harness (MCP/CLI transports, child reaping, paths,
 # response accessors). Dev-only — never linked into the shipped driver.
 cua-driver-testkit = { path = "../cua-driver-testkit" }
@@ -93,6 +95,8 @@ tokio-tungstenite = "0.24"
 platform-windows = { path = "../platform-windows" }
 windows = { version = "0.61", features = [
     "Win32_UI_WindowsAndMessaging",
+    "Win32_Graphics_Dwm",
+    "Win32_UI_HiDpi",
     "Win32_Foundation",
     # Job Object: assign every spawned test child to a KILL_ON_JOB_CLOSE job so
     # the OS terminates the whole tree when the test process dies for ANY reason

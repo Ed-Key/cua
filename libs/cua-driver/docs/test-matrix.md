@@ -215,3 +215,73 @@ When a new action or modality is added, update this document, the shared fixture
 oracle, the Rust test, and the OS-specific runner selection together. This is
 the cross-OS checklist that prevents a Windows-only test from being mistaken
 for cross-platform coverage.
+
+## macOS named accessibility groups
+
+`standalone_browser_behavior_test::standalone_browser_native_named_groups` is
+an optional macOS Chromium regression. It verifies that a `Save` query retains
+named `AXGroup` ancestors, that each duplicate Save has the correct structured
+`parent_index`, and that anonymous wrappers do not add depth. Both section
+orders are exercised. Only Billing is clicked, once, and the fixture journal
+must report Billing = 1 and Profile = 0. This row explicitly brings the isolated
+fixture forward and uses foreground accessibility delivery. It certifies target
+selection and receiver state, not background delivery.
+
+A separate local diagnostic with the existing foreground sentinel preserved
+these group relationships but an accepted AXPress did not advance either
+counter while the Chrome fixture was covered. The grouping change did not fix
+that delivery gap. The separate first-click regression below covers its native
+Chromium delivery preparation.
+
+The macOS walker preserves groups and scroll areas with a nonblank AXTitle or
+AXDescription. Empty wrappers still collapse. Existing addressability rules
+remain in force: display-only groups appear in markdown; only addressable
+nodes appear in `elements`, whose `parent_index` names the nearest addressable
+ancestor. This change does not invent clickable targets for display-only groups.
+Windows and Linux adapters are unchanged and are not certified by this row.
+
+Focused run from `libs/cua-driver/rust`, with the authorized daemon and staged
+browser environment configured as described in the test harness guide:
+
+```sh
+CUA_E2E_BROWSER_PRODUCTS=chrome CUA_TEST_REQUIRE_EXTERNAL_BROWSERS=1 cargo test -p cua-driver --test standalone_browser_behavior_test standalone_browser_native_named_groups -- --ignored --nocapture
+```
+
+This focused regression does not replace the full candidate desktop certification.
+
+
+## macOS Chromium background first click
+
+`standalone_browser_behavior_test::standalone_browser_native_background_first_click`
+launches a fresh isolated browser for each combination of indexed or pixel
+addressing and enabled or disabled agent cursor. The Electron sentinel fully
+covers the target before the initial native snapshot. Indexed addressing uses a
+tree-only read. Pixel addressing uses the screenshot geometry. Each case sends
+exactly one native `click` to Billing Save and requires Billing = 1, Profile = 0,
+exactly one trusted page click, and the existing Focus, ZOrder, Cursor, and
+NoLeakedInput oracles. A direct window AXFocused read must remain false. CDP is
+used only by the test as an independent receiver-state oracle.
+
+On macOS, recognized Chromium targets receive a preparatory native accessibility
+hit test before background left-press dispatch. That read starts Chromium's
+asynchronous renderer hit test. Its returned element is discarded: indexed
+clicks retain their original target, and pixel delivery still checks exact
+window ancestry. A 20 ms asynchronous preparation interval gives the renderer
+an opportunity to process that lookup even when the agent cursor is disabled.
+This is a bounded timing workaround: macOS does not expose completion of
+Chromium's renderer hit test. It is not a readiness or receiver acknowledgement.
+There is no focus write, extra screenshot, or second click. The existing tool
+result still reports effect as unverifiable;
+a successful AX call alone is not receiver verification.
+
+This is a focused installed-Chrome regression, not a claim of all Chromium or
+Electron versions passing. Default browser/CDP input refusal policy is unchanged.
+Windows and Linux adapters are unchanged and unverified by this macOS row.
+
+```sh
+CUA_E2E_BROWSER_PRODUCTS=chrome CUA_TEST_REQUIRE_EXTERNAL_BROWSERS=1 cargo test -p cua-driver --test standalone_browser_behavior_test standalone_browser_native_background_first_click -- --ignored --nocapture
+```
+
+Configure the authorized installed daemon and staged fixtures as documented in
+the test harness guide. This focused test does not replace candidate desktop
+certification.

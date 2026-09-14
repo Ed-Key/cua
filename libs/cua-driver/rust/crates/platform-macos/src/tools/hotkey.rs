@@ -379,6 +379,7 @@ impl Tool for HotkeyTool {
                     args.opt_str("_session_id"),
                     from_zoom,
                     _mutation_lease.as_ref(),
+                    None,
                 )
                 .await
                 {

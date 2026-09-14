@@ -4,7 +4,7 @@ Agents should configure the bundled ``cua-driver mcp`` executable directly
 through their runtime's MCP client instead of importing a language MCP facade.
 """
 
-__version__ = "0.23.2"  # x-release-please-version
+__version__ = "0.26.1"  # x-release-please-version
 
 from ._native import (
     ActionCompletion,
@@ -25,6 +25,14 @@ from ._native import (
     DriverExecutionMode,
     DriverMetadata,
     DriverOptions,
+    ForeignDriverChannelCapabilities,
+    ForeignDriverBoundChannel,
+    ForeignDriverChannelError,
+    ForeignDriverChannelIdentity,
+    ForeignDriverEnvelopeChannel,
+    ForeignDriverEnvelopeChannelImpl,
+    ForeignDriverRequestEnvelope,
+    ForeignDriverResponseEnvelope,
     EmbeddedCuaDriverHost,
     EmbeddedDriverConnection,
     EmbeddedDriverError,
@@ -43,11 +51,28 @@ from ._native import (
     ToolResult,
     TrustedSessionOptions,
     create_trusted_session,
+    connect_remote_channel,
+    create_remote_trusted_session,
     current_mac_os_permission_status,
     open_mac_os_screen_recording_settings,
     request_mac_os_permissions,
 )
 from ._native_contract import (
+    AppInfo,
+    ClickPosition,
+    ElementFrame,
+    GetWindowStateInput,
+    InputDeliveryMode,
+    ListAppsInput,
+    ListAppsOutput,
+    ListWindowsInput,
+    ListWindowsOutput,
+    SnapshotImage,
+    WindowBounds,
+    WindowElement,
+    WindowInfo,
+    WindowStateOutput,
+
     ActionDelivery,
     ActionDeliveryMode,
     ActionEffect,
@@ -60,6 +85,8 @@ from ._native_contract import (
     ActionRoute,
     ActionWindowChange,
     ActionWindowTarget,
+
+    ActionTarget,
     BoundsExpectation,
     CaptureScope,
     ClickButton,
@@ -171,6 +198,21 @@ _NativeCuaDriver.create_private_worker = classmethod(_create_private_worker_pyth
 CuaDriver = _NativeCuaDriver
 
 __all__ = [
+    "AppInfo",
+    "ClickPosition",
+    "ElementFrame",
+    "GetWindowStateInput",
+    "InputDeliveryMode",
+    "ListAppsInput",
+    "ListAppsOutput",
+    "ListWindowsInput",
+    "ListWindowsOutput",
+    "SnapshotImage",
+    "WindowBounds",
+    "WindowElement",
+    "WindowInfo",
+    "WindowStateOutput",
+
     "ActionCompletion",
     "ActionDelivery",
     "ActionDeliveryMode",
@@ -184,6 +226,8 @@ __all__ = [
     "ActionRoute",
     "ActionWindowChange",
     "ActionWindowTarget",
+
+    "ActionTarget",
     "BoundsExpectation",
     "CaptureScope",
     "ClickButton",
@@ -212,6 +256,14 @@ __all__ = [
     "DriverExecutionMode",
     "DriverMetadata",
     "DriverOptions",
+    "ForeignDriverChannelCapabilities",
+    "ForeignDriverBoundChannel",
+    "ForeignDriverChannelError",
+    "ForeignDriverChannelIdentity",
+    "ForeignDriverEnvelopeChannel",
+    "ForeignDriverEnvelopeChannelImpl",
+    "ForeignDriverRequestEnvelope",
+    "ForeignDriverResponseEnvelope",
     "EmbeddedCuaDriverHost",
     "EmbeddedDriverConnection",
     "EmbeddedDriverError",
@@ -263,6 +315,8 @@ __all__ = [
     "WindowPredicate",
     "__version__",
     "create_trusted_session",
+    "connect_remote_channel",
+    "create_remote_trusted_session",
     "current_mac_os_permission_status",
     "get_binary_path",
     "open_mac_os_screen_recording_settings",

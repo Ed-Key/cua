@@ -63,6 +63,7 @@ pub mod element_query;
 pub mod element_token;
 pub mod expectation;
 pub mod ffmpeg_install;
+pub mod geometry;
 pub mod health_report;
 pub mod history;
 pub mod image_utils;
@@ -92,3 +93,5 @@ pub mod window_target;
 
 pub use cua_driver_contract::{CaptureScope, EscalationReason};
 pub use recording::RecordingSession;
+
+pub mod resize_registry;

@@ -200,6 +200,7 @@ where
 pub struct MacOsBrowserPlatform {
     cursor_registry: Arc<crate::cursor::CursorRegistry>,
     browser_cursors: Arc<Mutex<BrowserCursorTracker>>,
+    visual_sink: Arc<dyn crate::cursor::visual::PointerVisualSink>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -255,6 +256,7 @@ impl MacOsBrowserPlatform {
         Self {
             cursor_registry,
             browser_cursors: Arc::new(Mutex::new(BrowserCursorTracker::default())),
+            visual_sink: Arc::new(crate::cursor::visual::OverlayVisualSink),
         }
     }
 }
@@ -269,7 +271,7 @@ fn refusal(code: BrowserRefusalCode, message: impl Into<String>) -> BrowserRefus
     BrowserRefusal::new(code, message)
 }
 
-fn is_chromium(name: &str, bundle_id: &str) -> bool {
+pub(crate) fn is_chromium(name: &str, bundle_id: &str) -> bool {
     let value = format!("{name} {bundle_id}").to_ascii_lowercase();
     let products = [
         "chrome", "chromium", "electron", "brave", "edge", "vivaldi", "opera", "arc", "thorium",
@@ -796,37 +798,38 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         if !action.tab_is_active || !cursor_enabled {
             return;
         }
-        let (Some(screen_x), Some(screen_y)) = (action.screen_x, action.screen_y) else {
-            return;
+        // This callback precedes browser input dispatch. It carries intent only.
+        let kind = match action.kind {
+            BrowserVisualActionKind::Type => cursor_overlay::CursorAction::Text,
+            BrowserVisualActionKind::Scroll => cursor_overlay::CursorAction::Scroll,
+            BrowserVisualActionKind::Drag => cursor_overlay::CursorAction::Drag,
+            BrowserVisualActionKind::Hover => cursor_overlay::CursorAction::Navigate,
+            _ => cursor_overlay::CursorAction::Click,
         };
-        if !screen_x.is_finite() || !screen_y.is_finite() {
-            return;
-        }
-
-        crate::cursor::overlay::send_command(
-            action.session.clone(),
-            cursor_overlay::OverlayCommand::PinAbove(action.window_id),
-        );
-        crate::cursor::overlay::animate_cursor_to(action.session.clone(), screen_x, screen_y).await;
-        self.cursor_registry
-            .update_position(&action.session, screen_x, screen_y);
-
-        if matches!(
-            action.kind,
-            BrowserVisualActionKind::Click
-                | BrowserVisualActionKind::Type
-                | BrowserVisualActionKind::RightClick
-                | BrowserVisualActionKind::DoubleClick
-                | BrowserVisualActionKind::Drag
+        // No editor rectangle or delivered drag callbacks exist in this context.
+        // Keep these routes semantic instead of animating an invented delivery path.
+        let target = if matches!(
+            kind,
+            cursor_overlay::CursorAction::Text | cursor_overlay::CursorAction::Drag
         ) {
-            crate::cursor::overlay::send_command(
-                action.session,
-                cursor_overlay::OverlayCommand::ClickPulse {
-                    x: screen_x,
-                    y: screen_y,
-                },
-            );
-        }
+            None
+        } else {
+            let (Some(x), Some(y)) = (action.screen_x, action.screen_y) else {
+                return;
+            };
+            let Some(target) = crate::cursor::visual::point(x, y, Some(action.window_id as u32))
+            else {
+                return;
+            };
+            Some(target)
+        };
+        crate::cursor::visual::emit_action_target(
+            &self.cursor_registry,
+            self.visual_sink.as_ref(),
+            &action.session,
+            target,
+            kind,
+        );
     }
 
     async fn classify_browser(&self, pid: i64) -> Result<BrowserClassification, BrowserRefusal> {
@@ -1584,6 +1587,51 @@ mod tests {
             on_current_space: Some(true),
             space_ids: None,
         }
+    }
+
+    #[tokio::test]
+    async fn slice_a_browser_pre_dispatch_callback_is_intent_only_for_all_routes() {
+        let registry = Arc::new(crate::cursor::CursorRegistry::new());
+        let sink = Arc::new(crate::cursor::visual::test_support::RecordingSink::default());
+        let mut platform = MacOsBrowserPlatform::new(registry.clone());
+        platform.visual_sink = sink.clone();
+        for kind in [
+            BrowserVisualActionKind::Click,
+            BrowserVisualActionKind::Type,
+            BrowserVisualActionKind::Hover,
+            BrowserVisualActionKind::RightClick,
+            BrowserVisualActionKind::DoubleClick,
+            BrowserVisualActionKind::Scroll,
+            BrowserVisualActionKind::Drag,
+        ] {
+            platform
+                .visualize_browser_action(BrowserVisualAction {
+                    session: "browser-routes".into(),
+                    window_id: 77,
+                    cdp_target_id: "tab-A".into(),
+                    tab_is_active: true,
+                    screen_x: Some(321.0),
+                    screen_y: Some(456.0),
+                    kind,
+                })
+                .await;
+        }
+        let events = sink.1.lock().unwrap();
+        assert_eq!(events.len(), 7);
+        for (index, event) in events.iter().enumerate() {
+            assert_eq!(event.phase, cursor_overlay::VisualPhase::Intent);
+            assert_eq!(
+                event.target,
+                if matches!(index, 1 | 6) {
+                    None
+                } else {
+                    Some((321.0, 456.0))
+                },
+                "browser text has no editor bounds and browser drag has no delivered callbacks"
+            );
+        }
+        let pos = registry.get("browser-routes").unwrap().position.unwrap();
+        assert_eq!((pos.x, pos.y), (321.0, 456.0));
     }
 
     #[tokio::test]
