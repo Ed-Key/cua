@@ -3628,6 +3628,38 @@
                             "required": [],
                             "type": "object"
                           },
+                          "text_selection": {
+                            "additionalProperties": false,
+                            "description": "Exact selection on the currently focused native text control, in UTF-16 units.",
+                            "properties": {
+                              "length": {
+                                "description": "Zero length checks a caret position.",
+                                "format": "uint64",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "location": {
+                                "format": "uint64",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "text": {
+                                "description": "When present, also require this exact readable selected text.",
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              }
+                            },
+                            "required": [
+                              "location",
+                              "length"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
                           "value_equals": {
                             "type": [
                               "string",
@@ -5521,6 +5553,38 @@
                       },
                       "required": [],
                       "type": "object"
+                    },
+                    "text_selection": {
+                      "additionalProperties": false,
+                      "description": "Exact selection on the currently focused native text control, in UTF-16 units.",
+                      "properties": {
+                        "length": {
+                          "description": "Zero length checks a caret position.",
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "location": {
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "text": {
+                          "description": "When present, also require this exact readable selected text.",
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "location",
+                        "length"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
                     },
                     "value_equals": {
                       "type": [

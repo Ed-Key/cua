@@ -14,6 +14,46 @@ const ALL_PLATFORMS: [Platform; 3] = [Platform::Macos, Platform::Windows, Platfo
 
 pub const VERIFY_STATE_DEFAULT_TIMEOUT_MS: u64 = 5_000;
 
+#[cfg(test)]
+mod text_selection_tests {
+    use super::*;
+    use serde_json::json;
+
+    fn input(selection: serde_json::Value) -> serde_json::Value {
+        json!({"pid":42,"window_id":7,"expect":[{"element":{
+            "selector":{"role":"AXTextField"},"text_selection":selection}}]})
+    }
+
+    #[test]
+    fn selection_requests_accept_carets_and_utf16_spans() {
+        for selection in [
+            json!({"location":0,"length":0,"text":""}),
+            json!({"location":1,"length":2,"text":"😀"}),
+            json!({"location":5,"length":4}),
+        ] {
+            let parsed = serde_json::from_value::<VerifyStateInput>(input(selection));
+            assert!(parsed.is_ok(), "{parsed:?}");
+            assert!(parsed.unwrap().validate().is_ok());
+        }
+    }
+
+    #[test]
+    fn selection_requests_reject_incomplete_malformed_and_inconsistent_ranges() {
+        for selection in [
+            json!({}),
+            json!({"location":5}),
+            json!({"location":-1,"length":0}),
+            json!({"location":1,"length":1.5}),
+            json!({"location":1,"length":2,"typo":true}),
+            json!({"location":u64::MAX,"length":1}),
+            json!({"location":0,"length":1,"text":"😀"}),
+        ] {
+            let parsed = serde_json::from_value::<VerifyStateInput>(input(selection));
+            assert!(parsed.is_err() || parsed.unwrap().validate().is_err());
+        }
+    }
+}
+
 fn timeout_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({
         "type": "integer",
@@ -115,6 +155,34 @@ pub struct WindowPredicate {
     pub bounds: Option<BoundsExpectation>,
 }
 
+/// Exact selection on the currently focused native text control, in UTF-16 units.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct TextSelectionPredicate {
+    pub location: u64,
+    /// Zero length checks a caret position.
+    pub length: u64,
+    /// When present, also require this exact readable selected text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+}
+
+impl TextSelectionPredicate {
+    pub fn validate(&self) -> Result<(), String> {
+        if self.location.checked_add(self.length).is_none() {
+            return Err("text_selection range end overflows".into());
+        }
+        if self
+            .text
+            .as_ref()
+            .is_some_and(|text| text.encode_utf16().count() as u64 != self.length)
+        {
+            return Err("text_selection text length must equal length in UTF-16 units".into());
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ElementPredicate {
@@ -133,6 +201,8 @@ pub struct ElementPredicate {
     pub enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_selection: Option<TextSelectionPredicate>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
@@ -214,6 +284,11 @@ impl VerifyStateInput {
 fn invalid_predicate_message(expect: &[StatePredicate]) -> Option<String> {
     for (index, predicate) in expect.iter().enumerate() {
         if let Some(element) = predicate.element.as_ref() {
+            if let Some(selection) = element.text_selection.as_ref() {
+                if let Err(error) = selection.validate() {
+                    return Some(format!("verify_state predicate {index} {error}"));
+                }
+            }
             if element.exists == Some(false) {
                 return Some(format!(
                     "verify_state predicate {index} element.exists=false is unsupported because element snapshots are not exhaustive"

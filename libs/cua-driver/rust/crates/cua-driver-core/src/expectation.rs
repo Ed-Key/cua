@@ -448,7 +448,12 @@ fn evaluate_element(
     predicate: &ElementPredicate,
     snapshot: &ObservationSnapshot,
 ) -> (VerificationStatus, Option<UnknownReason>, Option<Value>) {
-    if predicate.exists == Some(false) {
+    if predicate.exists == Some(false)
+        || predicate
+            .text_selection
+            .as_ref()
+            .is_some_and(|selection| selection.validate().is_err())
+    {
         return (
             VerificationStatus::Unknown,
             Some(UnknownReason::InvalidPredicate),
@@ -546,7 +551,8 @@ fn evaluate_element(
     if trusted_matches.len() > 1
         && (predicate.value_equals.is_some()
             || predicate.enabled.is_some()
-            || predicate.selected.is_some())
+            || predicate.selected.is_some()
+            || predicate.text_selection.is_some())
     {
         return (
             VerificationStatus::Unknown,
@@ -591,11 +597,58 @@ fn evaluate_element(
             );
         }
     }
+    if let Some(expected) = predicate.text_selection.as_ref() {
+        let (status, reason) = evaluate_text_selection(expected, element);
+        return (status, reason, Some(project_element(element)));
+    }
     (
         VerificationStatus::Satisfied,
         None,
         Some(project_element(element)),
     )
+}
+
+fn evaluate_text_selection(
+    expected: &cua_driver_contract::TextSelectionPredicate,
+    element: &Value,
+) -> (VerificationStatus, Option<UnknownReason>) {
+    let unavailable = (
+        VerificationStatus::Unknown,
+        Some(UnknownReason::UnsupportedPredicate),
+    );
+    match element.get("focused").and_then(Value::as_bool) {
+        Some(true) => {}
+        Some(false) => return (VerificationStatus::Unsatisfied, None),
+        None => return unavailable,
+    }
+    let Some(actual) = element.get("text_selection").and_then(|value| {
+        serde_json::from_value::<cua_driver_contract::TextSelection>(value.clone()).ok()
+    }) else {
+        return unavailable;
+    };
+    let Some(range) = actual.range else {
+        return unavailable;
+    };
+    if range.location.checked_add(range.length).is_none()
+        || actual
+            .text
+            .as_ref()
+            .is_some_and(|text| text.encode_utf16().count() as u64 != range.length)
+    {
+        return unavailable;
+    }
+    if range.location != expected.location || range.length != expected.length {
+        return (VerificationStatus::Unsatisfied, None);
+    }
+    if let Some(text) = expected.text.as_ref() {
+        let Some(actual_text) = actual.text.as_ref() else {
+            return unavailable;
+        };
+        if actual_text != text {
+            return (VerificationStatus::Unsatisfied, None);
+        }
+    }
+    (VerificationStatus::Satisfied, None)
 }
 
 fn selector_matches(selector: &cua_driver_contract::ElementSelector, element: &Value) -> bool {
@@ -685,6 +738,8 @@ fn project_element(element: &Value) -> Value {
         "value",
         "enabled",
         "selected",
+        "focused",
+        "text_selection",
         "frame",
     ] {
         if let Some(value) = element.get(key) {
@@ -750,6 +805,7 @@ mod tests {
                 value_equals: Some("1".into()),
                 enabled: None,
                 selected: None,
+                text_selection: None,
             }),
         }
     }
@@ -952,6 +1008,7 @@ mod tests {
                 value_equals: None,
                 enabled: None,
                 selected: None,
+                text_selection: None,
             }),
         };
         let outcomes = evaluate_predicates(
@@ -1019,6 +1076,145 @@ mod tests {
     struct FakeProvider {
         calls: std::sync::atomic::AtomicUsize,
         snapshot: ObservationSnapshot,
+    }
+
+    #[tokio::test]
+    async fn text_selection_predicate_distinguishes_caret_range_text_and_missing_evidence() {
+        let base = json!({"element_index":3,"role":"AXTextField","label":"Draft",
+            "focused":true,"text_selection":{"range":{"location":5,"length":4},"text":"this"}});
+        let expected = json!({"location":5,"length":4,"text":"this"});
+        let cases = [
+            (base.clone(), expected.clone(), "satisfied", Value::Null),
+            (
+                base.clone(),
+                json!({"location":6,"length":4}),
+                "unsatisfied",
+                Value::Null,
+            ),
+            (
+                base.clone(),
+                json!({"location":5,"length":4,"text":"that"}),
+                "unsatisfied",
+                Value::Null,
+            ),
+            (
+                json!({"focused":true,"text_selection":{"range":{"location":9,"length":0},"text":""}}),
+                json!({"location":9,"length":0,"text":""}),
+                "satisfied",
+                Value::Null,
+            ),
+            (
+                json!({"focused":true,"text_selection":{"range":{"location":1,"length":2},"text":"😀"}}),
+                json!({"location":1,"length":2,"text":"😀"}),
+                "satisfied",
+                Value::Null,
+            ),
+            (
+                json!({"focused":false,"text_selection":base["text_selection"]}),
+                expected.clone(),
+                "unsatisfied",
+                Value::Null,
+            ),
+            (
+                json!({"focused":null,"text_selection":base["text_selection"]}),
+                expected.clone(),
+                "unknown",
+                json!("unsupported_predicate"),
+            ),
+            (
+                json!({"focused":true,"text_selection":null}),
+                expected.clone(),
+                "unknown",
+                json!("unsupported_predicate"),
+            ),
+            (
+                json!({"focused":true,"text_selection":{"range":{"location":5,"length":4}}}),
+                expected.clone(),
+                "unknown",
+                json!("unsupported_predicate"),
+            ),
+            (
+                json!({"focused":true,"text_selection":{"range":{"location":5,"length":4}}}),
+                json!({"location":5,"length":4}),
+                "satisfied",
+                Value::Null,
+            ),
+            (
+                json!({"focused":true,"text_selection":{"range":{"location":5,"length":4},"text":"wrong length"}}),
+                expected.clone(),
+                "unknown",
+                json!("unsupported_predicate"),
+            ),
+        ];
+        for (attributes, selection, status, reason) in cases {
+            let mut element = base.clone();
+            element
+                .as_object_mut()
+                .unwrap()
+                .extend(attributes.as_object().unwrap().clone());
+            let provider = Arc::new(FakeProvider {
+                calls: 0.into(),
+                snapshot: ObservationSnapshot {
+                    window: Some(window()),
+                    elements: Some(vec![element]),
+                    element_source_trusted: true,
+                    elements_complete: true,
+                },
+            });
+            let result = VerifyStateTool::new(provider).invoke(json!({"pid":42,"window_id":7,
+                "expect":[{"element":{"selector":{"label_contains":"Draft"},"text_selection":selection}}],
+                "timeout_ms":0,"include_screenshot":false})).await;
+            let output = result.structured_content.unwrap();
+            assert_eq!(output["status"], status, "{output}");
+            assert_eq!(
+                output["predicates"][0]["unknown_reason"], reason,
+                "{output}"
+            );
+            if status == "satisfied" {
+                let evidence: Value = serde_json::from_str(
+                    output["predicates"][0]["observed_json"].as_str().unwrap(),
+                )
+                .unwrap();
+                assert_eq!(evidence["focused"], true);
+                assert!(evidence["text_selection"]["range"].is_object());
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn text_selection_predicate_refuses_web_ambiguity_and_unavailable_platform_data() {
+        let native = json!({"element_index":3,"role":"AXTextField","label":"Draft","focused":true,
+            "text_selection":{"range":{"location":5,"length":4},"text":"this"}});
+        let mut web = native.clone();
+        web["in_web_content"] = json!(true);
+        let cases = [
+            (vec![web], "untrusted_source"),
+            (vec![native.clone(), native], "multi_match"),
+            (
+                vec![json!({"element_index":3,"role":"AXTextField","label":"Draft"})],
+                "unsupported_predicate",
+            ),
+        ];
+        for (elements, reason) in cases {
+            let provider = Arc::new(FakeProvider {
+                calls: 0.into(),
+                snapshot: ObservationSnapshot {
+                    window: Some(window()),
+                    elements: Some(elements),
+                    element_source_trusted: true,
+                    elements_complete: true,
+                },
+            });
+            let result = VerifyStateTool::new(provider).invoke(json!({"pid":42,"window_id":7,
+                "expect":[{"element":{"selector":{"label_contains":"Draft"},"text_selection":{"location":5,"length":4}}}],
+                "timeout_ms":0})).await;
+            let output = result.structured_content.unwrap();
+            assert_eq!(output["status"], "unknown", "{output}");
+            assert_eq!(
+                output["predicates"][0]["unknown_reason"], reason,
+                "{output}"
+            );
+        }
     }
 
     #[async_trait]

@@ -3260,19 +3260,90 @@ class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
             raise InternalError("Unexpected flag byte for optional type")
 
 @dataclass
-class ElementPredicate:
-    def __init__(self, *, selector:ElementSelector, exists:typing.Optional[bool], value_equals:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool]):
-        self.selector = selector
-        self.exists = exists
-        self.value_equals = value_equals
-        self.enabled = enabled
-        self.selected = selected
+class TextSelectionPredicate:
+    """
+    Exact selection on the currently focused native text control, in UTF-16 units.
+"""
+    def __init__(self, *, location:int, length:int, text:typing.Optional[str]):
+        self.location = location
+        self.length = length
+        self.text = text
 
 
 
 
     def __str__(self):
-        return "ElementPredicate(selector={}, exists={}, value_equals={}, enabled={}, selected={})".format(self.selector, self.exists, self.value_equals, self.enabled, self.selected)
+        return "TextSelectionPredicate(location={}, length={}, text={})".format(self.location, self.length, self.text)
+    def __eq__(self, other):
+        if self.location != other.location:
+            return False
+        if self.length != other.length:
+            return False
+        if self.text != other.text:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeTextSelectionPredicate(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return TextSelectionPredicate(
+            location=_UniffiFfiConverterUInt64.read(buf),
+            length=_UniffiFfiConverterUInt64.read(buf),
+            text=_UniffiFfiConverterOptionalString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterUInt64.check_lower(value.location)
+        _UniffiFfiConverterUInt64.check_lower(value.length)
+        _UniffiFfiConverterOptionalString.check_lower(value.text)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterUInt64.write(value.location, buf)
+        _UniffiFfiConverterUInt64.write(value.length, buf)
+        _UniffiFfiConverterOptionalString.write(value.text, buf)
+
+class _UniffiFfiConverterOptionalTypeTextSelectionPredicate(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeTextSelectionPredicate.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeTextSelectionPredicate.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeTextSelectionPredicate.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class ElementPredicate:
+    def __init__(self, *, selector:ElementSelector, exists:typing.Optional[bool], value_equals:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], text_selection:typing.Optional[TextSelectionPredicate]):
+        self.selector = selector
+        self.exists = exists
+        self.value_equals = value_equals
+        self.enabled = enabled
+        self.selected = selected
+        self.text_selection = text_selection
+
+
+
+
+    def __str__(self):
+        return "ElementPredicate(selector={}, exists={}, value_equals={}, enabled={}, selected={}, text_selection={})".format(self.selector, self.exists, self.value_equals, self.enabled, self.selected, self.text_selection)
     def __eq__(self, other):
         if self.selector != other.selector:
             return False
@@ -3283,6 +3354,8 @@ class ElementPredicate:
         if self.enabled != other.enabled:
             return False
         if self.selected != other.selected:
+            return False
+        if self.text_selection != other.text_selection:
             return False
         return True
 
@@ -3295,6 +3368,7 @@ class _UniffiFfiConverterTypeElementPredicate(_UniffiConverterRustBuffer):
             value_equals=_UniffiFfiConverterOptionalString.read(buf),
             enabled=_UniffiFfiConverterOptionalBoolean.read(buf),
             selected=_UniffiFfiConverterOptionalBoolean.read(buf),
+            text_selection=_UniffiFfiConverterOptionalTypeTextSelectionPredicate.read(buf),
         )
 
     @staticmethod
@@ -3304,6 +3378,7 @@ class _UniffiFfiConverterTypeElementPredicate(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.value_equals)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.enabled)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.selected)
+        _UniffiFfiConverterOptionalTypeTextSelectionPredicate.check_lower(value.text_selection)
 
     @staticmethod
     def write(value, buf):
@@ -3312,6 +3387,7 @@ class _UniffiFfiConverterTypeElementPredicate(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.value_equals, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.enabled, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.selected, buf)
+        _UniffiFfiConverterOptionalTypeTextSelectionPredicate.write(value.text_selection, buf)
 
 @dataclass
 class EndSessionInput:
@@ -6756,6 +6832,109 @@ class _UniffiFfiConverterTypeStartSessionOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.revived, buf)
 
 @dataclass
+class TextSelectionRange:
+    """
+    A half-open range measured in UTF-16 code units. Zero length is a caret.
+"""
+    def __init__(self, *, location:int, length:int):
+        self.location = location
+        self.length = length
+
+
+
+
+    def __str__(self):
+        return "TextSelectionRange(location={}, length={})".format(self.location, self.length)
+    def __eq__(self, other):
+        if self.location != other.location:
+            return False
+        if self.length != other.length:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeTextSelectionRange(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return TextSelectionRange(
+            location=_UniffiFfiConverterUInt64.read(buf),
+            length=_UniffiFfiConverterUInt64.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterUInt64.check_lower(value.location)
+        _UniffiFfiConverterUInt64.check_lower(value.length)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterUInt64.write(value.location, buf)
+        _UniffiFfiConverterUInt64.write(value.length, buf)
+
+class _UniffiFfiConverterOptionalTypeTextSelectionRange(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeTextSelectionRange.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeTextSelectionRange.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeTextSelectionRange.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class TextSelection:
+    """
+    Best-effort platform accessibility state, not proof of a rendered web edit.
+"""
+    def __init__(self, *, text:typing.Optional[str], range:typing.Optional[TextSelectionRange]):
+        self.text = text
+        self.range = range
+
+
+
+
+    def __str__(self):
+        return "TextSelection(text={}, range={})".format(self.text, self.range)
+    def __eq__(self, other):
+        if self.text != other.text:
+            return False
+        if self.range != other.range:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeTextSelection(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return TextSelection(
+            text=_UniffiFfiConverterOptionalString.read(buf),
+            range=_UniffiFfiConverterOptionalTypeTextSelectionRange.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterOptionalString.check_lower(value.text)
+        _UniffiFfiConverterOptionalTypeTextSelectionRange.check_lower(value.range)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterOptionalString.write(value.text, buf)
+        _UniffiFfiConverterOptionalTypeTextSelectionRange.write(value.range, buf)
+
+@dataclass
 class TypeTextInput:
     def __init__(self, *, text:str, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str]):
         self.text = text
@@ -6869,6 +7048,31 @@ class _UniffiFfiConverterTypeVerifyStateInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalUInt64.write(value.stable_samples, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.include_screenshot, buf)
 
+class _UniffiFfiConverterOptionalTypeTextSelection(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeTextSelection.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeTextSelection.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeTextSelection.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -6896,7 +7100,7 @@ class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowElement:
-    def __init__(self, *, element_index:int, role:str, depth:int, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], value_settable:typing.Optional[bool], placeholder:typing.Optional[str], value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
+    def __init__(self, *, element_index:int, role:str, depth:int, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], value_settable:typing.Optional[bool], focused:typing.Optional[bool], text_selection:typing.Optional[TextSelection], placeholder:typing.Optional[str], value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
         self.element_index = element_index
         self.role = role
         self.depth = depth
@@ -6904,6 +7108,8 @@ class WindowElement:
         self.label = label
         self.value = value
         self.value_settable = value_settable
+        self.focused = focused
+        self.text_selection = text_selection
         self.placeholder = placeholder
         self.value_description = value_description
         self.enabled = enabled
@@ -6919,7 +7125,7 @@ class WindowElement:
 
 
     def __str__(self):
-        return "WindowElement(element_index={}, role={}, depth={}, element_token={}, label={}, value={}, value_settable={}, placeholder={}, value_description={}, enabled={}, selected={}, in_web_content={}, actions={}, parent_index={}, frame={}, min={}, max={})".format(self.element_index, self.role, self.depth, self.element_token, self.label, self.value, self.value_settable, self.placeholder, self.value_description, self.enabled, self.selected, self.in_web_content, self.actions, self.parent_index, self.frame, self.min, self.max)
+        return "WindowElement(element_index={}, role={}, depth={}, element_token={}, label={}, value={}, value_settable={}, focused={}, text_selection={}, placeholder={}, value_description={}, enabled={}, selected={}, in_web_content={}, actions={}, parent_index={}, frame={}, min={}, max={})".format(self.element_index, self.role, self.depth, self.element_token, self.label, self.value, self.value_settable, self.focused, self.text_selection, self.placeholder, self.value_description, self.enabled, self.selected, self.in_web_content, self.actions, self.parent_index, self.frame, self.min, self.max)
     def __eq__(self, other):
         if self.element_index != other.element_index:
             return False
@@ -6934,6 +7140,10 @@ class WindowElement:
         if self.value != other.value:
             return False
         if self.value_settable != other.value_settable:
+            return False
+        if self.focused != other.focused:
+            return False
+        if self.text_selection != other.text_selection:
             return False
         if self.placeholder != other.placeholder:
             return False
@@ -6968,6 +7178,8 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
             label=_UniffiFfiConverterOptionalString.read(buf),
             value=_UniffiFfiConverterOptionalString.read(buf),
             value_settable=_UniffiFfiConverterOptionalBoolean.read(buf),
+            focused=_UniffiFfiConverterOptionalBoolean.read(buf),
+            text_selection=_UniffiFfiConverterOptionalTypeTextSelection.read(buf),
             placeholder=_UniffiFfiConverterOptionalString.read(buf),
             value_description=_UniffiFfiConverterOptionalString.read(buf),
             enabled=_UniffiFfiConverterOptionalBoolean.read(buf),
@@ -6989,6 +7201,8 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.label)
         _UniffiFfiConverterOptionalString.check_lower(value.value)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.value_settable)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.focused)
+        _UniffiFfiConverterOptionalTypeTextSelection.check_lower(value.text_selection)
         _UniffiFfiConverterOptionalString.check_lower(value.placeholder)
         _UniffiFfiConverterOptionalString.check_lower(value.value_description)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.enabled)
@@ -7009,6 +7223,8 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.label, buf)
         _UniffiFfiConverterOptionalString.write(value.value, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.value_settable, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.focused, buf)
+        _UniffiFfiConverterOptionalTypeTextSelection.write(value.text_selection, buf)
         _UniffiFfiConverterOptionalString.write(value.placeholder, buf)
         _UniffiFfiConverterOptionalString.write(value.value_description, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.enabled, buf)
@@ -7395,6 +7611,7 @@ __all__ = [
     "DragInput",
     "ElementFrame",
     "ElementSelector",
+    "TextSelectionPredicate",
     "ElementPredicate",
     "EndSessionInput",
     "EndSessionOutput",
@@ -7442,6 +7659,8 @@ __all__ = [
     "SnapshotImage",
     "StartSessionInput",
     "StartSessionOutput",
+    "TextSelectionRange",
+    "TextSelection",
     "TypeTextInput",
     "VerifyStateInput",
     "WindowElement",
