@@ -246,6 +246,102 @@ fn harness_appkit_background_guard_canary() {
     );
 }
 
+fn run_sequence_counter_case(action: &str, stop_after_first: bool) {
+    run_background_case(action, DriverRoute::MacosAxAction, |pid, wid, driver| {
+        let before = snapshot_elements(driver, pid, wid);
+        let read_counter = |snapshot: &ToolResponse| -> u64 {
+            snapshot
+                .tree_text()
+                .split("counter=")
+                .nth(1)
+                .expect("fixture counter label")
+                .chars()
+                .take_while(char::is_ascii_digit)
+                .collect::<String>()
+                .parse()
+                .expect("numeric fixture counter")
+        };
+        assert_eq!(read_counter(&before), 0);
+        let token = element_token_by_id(&before, "btn-increment");
+        let step = |expected: u64| {
+            serde_json::json!({
+                "tool":"click", "arguments":{"element_token":token},
+                "expect":[{"element":{
+                    "selector":{"role":"AXStaticText","label_contains":"counter="},
+                    "value_equals":format!("counter={expected}")
+                }}],
+                "timeout_ms":if stop_after_first { 250 } else { 1000 },
+                "stable_samples":if stop_after_first { 1 } else { 2 }
+            })
+        };
+        // Reusing the original token in the second step also checks that the
+        // verification provider does not invalidate the action snapshot cache.
+        let response = driver.call(
+            "run_sequence",
+            serde_json::json!({
+                "pid":pid,"window_id":wid,
+                "steps":[step(if stop_after_first { 99 } else { 1 }),step(2)]
+            }),
+        );
+        assert!(!response.is_error(), "{}", response.raw);
+        let output = response.structured();
+        println!("sequence outcome={output}");
+        // Read independently before assertions so failed runs retain the
+        // fixture state as well as the executor's reported evidence.
+        let after = snapshot_elements(driver, pid, wid);
+        let actual_counter = read_counter(&after);
+        println!("independent counter={actual_counter}");
+        let steps = output["steps"]
+            .as_array()
+            .expect("attempted sequence steps");
+        assert_eq!(steps.len(), if stop_after_first { 1 } else { 2 });
+        assert_eq!(
+            output["status"],
+            if stop_after_first {
+                "stopped"
+            } else {
+                "completed"
+            }
+        );
+        if stop_after_first {
+            assert_eq!(output["stopped_at"], 0);
+            assert_eq!(output["stop_reason"], "unsatisfied");
+            assert_eq!(steps[0]["verification"]["status"], "unsatisfied");
+        } else {
+            assert!(output["stopped_at"].is_null());
+            assert!(output["stop_reason"].is_null());
+            for step in steps {
+                assert_eq!(step["verification"]["status"], "satisfied");
+                assert_eq!(step["verification"]["stable"], true);
+                assert!(step["verification"]["samples"].as_u64().unwrap() >= 2);
+            }
+        }
+        for step in steps {
+            assert_eq!(step["action"]["route"], "accessibility");
+            assert_eq!(step["image_bytes_returned"], 0);
+        }
+        assert!(response.raw["result"]["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .all(|block| block["type"] != "image"));
+        // The independent count catches a second mutation after a failed check.
+        assert_eq!(actual_counter, if stop_after_first { 1 } else { 2 });
+    });
+}
+
+#[test]
+#[ignore = "signed local daemon and AppKit fixture required"]
+fn harness_appkit_sequence_counter_completed() {
+    run_sequence_counter_case("sequence_counter_completed", false);
+}
+
+#[test]
+#[ignore = "signed local daemon and AppKit fixture required"]
+fn harness_appkit_sequence_counter_stops() {
+    run_sequence_counter_case("sequence_counter_stops", true);
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_foreground_single_click_has_one_ordered_native_pair() {

@@ -232,6 +232,7 @@ const PRIVATE_OBSERVATION_OPERATIONS: &[&str] = &[
     "get_accessibility_tree",
     "get_window_state",
     "verify_state",
+    "run_sequence",
     "list_apps",
     "list_windows",
     "debug_window_info",
@@ -277,6 +278,7 @@ const DESKTOP_INPUT_OPERATIONS: &[&str] = &[
     "mouse_drag",
     "parallel_mouse_drag",
     "replay_trajectory",
+    "run_sequence",
     "type_text",
     "type_text_chars",
     "press_key",
@@ -738,6 +740,7 @@ pub fn enforcement_adapters_for_call(
             | "get_accessibility_tree"
             | "get_window_state"
             | "verify_state"
+            | "run_sequence"
             | "list_apps"
             | "list_windows"
             | "debug_window_info"
@@ -912,6 +915,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "check_permissions"
         | "get_accessibility_tree"
         | "verify_state"
+        | "run_sequence"
         | "set_config"
         | "escalate_session"
         | "start_recording"
@@ -1015,7 +1019,7 @@ pub fn classify_tool_call(tool: &str, args: &Value) -> RiskAssessment {
             enforcement: RiskEnforcement::Active,
             operation_sensitive: true,
         },
-        "verify_state" => RiskAssessment {
+        "verify_state" | "run_sequence" => RiskAssessment {
             class: RiskClass::R2,
             enforcement: RiskEnforcement::Active,
             operation_sensitive: true,
@@ -1192,6 +1196,7 @@ fn enforce_hard_invariants(
             | "get_accessibility_tree"
             | "get_window_state"
             | "verify_state"
+            | "run_sequence"
             | "page"
             | "browser_prepare"
     );
