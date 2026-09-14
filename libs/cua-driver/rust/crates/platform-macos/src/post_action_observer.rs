@@ -150,6 +150,7 @@ impl Tool for ObservedActionTool {
             .get("delivery_mode")
             .and_then(Value::as_str)
             .is_none_or(|mode| !mode.eq_ignore_ascii_case("foreground"));
+        let observation_args = args.clone();
         self.invoke_observed(
             pid,
             args,
@@ -174,10 +175,12 @@ impl Tool for ObservedActionTool {
                 (prior_front, before, suppression)
             },
             |(prior_front, before, _suppression), mut result| async move {
+                let wait_for_signal =
+                    needs_window_signal_wait(&self.inner.def().name, &observation_args, &result);
                 let delta = crate::background_mutation::observe_blocking(move || {
                     // The blocking read can outlive cancellation of invoke().
                     let _suppression = _suppression;
-                    observe_delta(pid, prior_front, before)
+                    observe_delta(pid, prior_front, before, wait_for_signal)
                 })
                 .await
                 .ok()
@@ -192,10 +195,85 @@ impl Tool for ObservedActionTool {
     }
 }
 
+fn needs_window_signal_wait(tool: &str, args: &Value, result: &ToolResult) -> bool {
+    use cua_driver_core::action_record::{
+        ActionEffect, ActionTransport, ActualDelivery, EvidenceKind, RequestedDelivery,
+    };
+    // A plain navigation key with native caret evidence has already been
+    // processed by the focused editor. Still inspect current roots and recover
+    // a signaled transition, but do not wait for a speculative later window.
+    // Addressed key forms can perform a separate focus action, so keep their wait.
+    if tool != "press_key"
+        || result.is_error == Some(true)
+        || !args
+            .get("pid")
+            .and_then(Value::as_i64)
+            .is_some_and(|pid| pid > 0)
+        || !args
+            .get("window_id")
+            .and_then(Value::as_u64)
+            .is_some_and(|id| id > 0)
+        || ["x", "y", "element_token", "element_index"]
+            .iter()
+            .any(|key| args.get(key).is_some())
+        || !args.get("key").and_then(Value::as_str).is_some_and(|key| {
+            matches!(
+                key.to_ascii_lowercase().as_str(),
+                "left" | "right" | "up" | "down" | "home" | "end"
+            )
+        })
+    {
+        return true;
+    }
+    if let Some(modifiers) = args.get("modifiers") {
+        if !modifiers.as_array().is_some_and(|modifiers| {
+            modifiers.iter().all(|m| {
+                m.as_str().is_some_and(|m| {
+                    matches!(
+                        m.to_ascii_lowercase().as_str(),
+                        "shift" | "cmd" | "command" | "super" | "option" | "alt"
+                    )
+                })
+            })
+        }) {
+            return true;
+        }
+    }
+    !result.action_record.as_ref().is_some_and(|record| {
+        record.validate().is_ok()
+            && record.effect == ActionEffect::Confirmed
+            && record.transport == ActionTransport::MacosCgEventPid
+            && record.requested_delivery == RequestedDelivery::Background
+            && record.actual_delivery == Some(ActualDelivery::Background)
+            && record
+                .evidence
+                .iter()
+                .any(|e| e.kind == EvidenceKind::TextSelectionReadback)
+    })
+}
+
+fn poll_window_signal(
+    wait: bool,
+    mut signaled: impl FnMut() -> bool,
+    mut expired: impl FnMut() -> bool,
+    mut pause: impl FnMut(),
+) -> bool {
+    loop {
+        if signaled() {
+            return true;
+        }
+        if !wait || expired() {
+            return false;
+        }
+        pause();
+    }
+}
+
 fn observe_delta(
     pid: i32,
     prior_front: Option<i32>,
     before: RootObservation,
+    wait_for_signal: bool,
 ) -> Option<ActionSurfaceDelta> {
     // Without a complete baseline, an existing root cannot be called new.
     let started = Instant::now();
@@ -208,21 +286,20 @@ fn observe_delta(
         return None;
     }
     let deadline = Instant::now() + OBSERVATION_TIMEOUT;
-    let signaled = loop {
-        if foreground_changed(prior_front)
-            || target_window_signature(pid) != before.window_signature
-        {
-            break true;
-        }
-        if Instant::now() >= deadline {
-            break false;
-        }
-        std::thread::sleep(POLL_INTERVAL);
-    };
+    let signaled = poll_window_signal(
+        wait_for_signal,
+        || {
+            foreground_changed(prior_front)
+                || target_window_signature(pid) != before.window_signature
+        },
+        || Instant::now() >= deadline,
+        || std::thread::sleep(POLL_INTERVAL),
+    );
 
     tracing::debug!(
         pid,
         signaled,
+        wait_for_signal,
         elapsed_ms = started.elapsed().as_millis() as u64,
         "surface observation signal wait complete"
     );
@@ -509,11 +586,7 @@ fn snapshot_roots(pid: i32) -> Option<RootSnapshot> {
         Ok(roots)
     })();
     if let Err(ref error) = result {
-        tracing::debug!(
-            pid,
-            ?error,
-            "AX root snapshot unavailable for this attempt"
-        );
+        tracing::debug!(pid, ?error, "AX root snapshot unavailable for this attempt");
     }
     tracing::debug!(pid, complete = result.is_ok(),
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -580,6 +653,141 @@ fn surface_owner(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn native_caret_result() -> ToolResult {
+        use cua_driver_core::action_record::*;
+        ToolResult::text("key").with_action_record(
+            ActionExecutionRecord::builder(
+                ActionEffect::Confirmed,
+                ActionTransport::MacosCgEventPid,
+                RequestedDelivery::Background,
+            )
+            .actual_delivery(ActualDelivery::Background)
+            .evidence(ActionEvidence {
+                kind: EvidenceKind::TextSelectionReadback,
+                detail: "same native text control changed selection".into(),
+            })
+            .build()
+            .unwrap(),
+        )
+    }
+
+    #[test]
+    fn verified_native_caret_checks_windows_without_idle_signal_wait() {
+        let args = serde_json::json!({"pid":42,"window_id":7,"key":"right","modifiers":["shift"]});
+        let wait = needs_window_signal_wait("press_key", &args, &native_caret_result());
+        let count = std::cell::Cell::new(0);
+        assert!(!poll_window_signal(
+            wait,
+            || false,
+            || count.get() >= 3,
+            || count.set(count.get() + 1)
+        ));
+        assert_eq!(
+            count.get(),
+            0,
+            "verified caret must not wait for an idle window signature"
+        );
+    }
+
+    #[test]
+    fn delayed_dialog_shortcut_keeps_signal_wait_and_ax_catch_up() {
+        let args = serde_json::json!({"pid":42,"window_id":7,"key":"o","modifiers":["cmd"]});
+        let wait = needs_window_signal_wait("press_key", &args, &native_caret_result());
+        let count = std::cell::Cell::new(0);
+        let signaled = poll_window_signal(
+            wait,
+            || count.get() == 2,
+            || count.get() >= 3,
+            || count.set(count.get() + 1),
+        );
+        assert!(signaled);
+        let mut reads = vec![None, Some(panel_snapshot())].into_iter();
+        assert_eq!(
+            poll_appeared_roots(
+                &Some(RootSnapshot::new()),
+                signaled,
+                |_| reads.next().unwrap(),
+                || {}
+            ),
+            Some(vec![root(7, "Open")])
+        );
+    }
+
+    #[test]
+    fn immediate_navigation_still_catches_an_existing_window_signal() {
+        assert!(poll_window_signal(
+            false,
+            || true,
+            || panic!("no deadline needed"),
+            || panic!("no idle pause")
+        ));
+        let mut reads = vec![Some(RootSnapshot::new()), Some(panel_snapshot())].into_iter();
+        assert_eq!(
+            poll_appeared_roots(
+                &Some(RootSnapshot::new()),
+                true,
+                |_| reads.next().unwrap(),
+                || {}
+            ),
+            Some(vec![root(7, "Open")])
+        );
+    }
+
+    #[test]
+    fn uncertain_keys_and_non_native_evidence_keep_the_window_wait() {
+        use cua_driver_core::action_record::*;
+        let args = serde_json::json!({"pid":42,"window_id":7,"key":"right"});
+        for changes in [
+            serde_json::json!({"key":"tab"}),
+            serde_json::json!({"key":"return"}),
+            serde_json::json!({"modifiers":["ctrl"]}),
+            serde_json::json!({"modifiers":["fn"]}),
+            serde_json::json!({"modifiers":[false]}),
+            serde_json::json!({"modifiers":"shift"}),
+            serde_json::json!({"element_token":"s1:3"}),
+            serde_json::json!({"x":1,"y":2}),
+            serde_json::json!({"pid":0}),
+            serde_json::json!({"window_id":null}),
+        ] {
+            let mut request = args.clone();
+            request
+                .as_object_mut()
+                .unwrap()
+                .extend(changes.as_object().unwrap().clone());
+            assert!(
+                needs_window_signal_wait("press_key", &request, &native_caret_result()),
+                "{request}"
+            );
+        }
+        for tool in ["hotkey", "type_text", "click"] {
+            assert!(needs_window_signal_wait(
+                tool,
+                &args,
+                &native_caret_result()
+            ));
+        }
+        assert!(needs_window_signal_wait(
+            "press_key",
+            &args,
+            &ToolResult::text("untrusted flag")
+                .with_structured(serde_json::json!({"verified":true,"selection_only":true}))
+        ));
+        let mut generic = native_caret_result();
+        generic.action_record.as_mut().unwrap().evidence[0].kind =
+            EvidenceKind::AccessibilityReadback;
+        assert!(needs_window_signal_wait("press_key", &args, &generic));
+        let mut foreground = native_caret_result();
+        foreground.action_record.as_mut().unwrap().actual_delivery =
+            Some(ActualDelivery::Foreground);
+        assert!(needs_window_signal_wait("press_key", &args, &foreground));
+        let mut partial = native_caret_result();
+        partial.action_record.as_mut().unwrap().effect = ActionEffect::Partial;
+        assert!(needs_window_signal_wait("press_key", &args, &partial));
+        let mut error = native_caret_result();
+        error.is_error = Some(true);
+        assert!(needs_window_signal_wait("press_key", &args, &error));
+    }
 
     fn panel_snapshot() -> RootSnapshot {
         RootSnapshot::from([(

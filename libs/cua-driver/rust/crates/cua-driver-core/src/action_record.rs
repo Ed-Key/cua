@@ -191,6 +191,9 @@ pub struct ActionEvidence {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum EvidenceKind {
     AccessibilityReadback,
+    /// Same focused native text control and value, with a changed text range.
+    /// This is evidence of selection movement, not proof that no later UI can appear.
+    TextSelectionReadback,
     BrowserReadback,
     ValueReadback,
     NativeApiResult,
@@ -328,6 +331,7 @@ impl ActionExecutionRecord {
                     matches!(
                         evidence.kind,
                         EvidenceKind::AccessibilityReadback
+                            | EvidenceKind::TextSelectionReadback
                             | EvidenceKind::BrowserReadback
                             | EvidenceKind::ValueReadback
                     )
@@ -1016,7 +1020,9 @@ fn projected_evidence(evidence: &[ActionEvidence]) -> Option<Vec<ActionEvidenceP
         .iter()
         .filter_map(|evidence| {
             let kind = match evidence.kind {
-                EvidenceKind::AccessibilityReadback => ProjectedEvidenceKind::AccessibilityReadback,
+                EvidenceKind::AccessibilityReadback | EvidenceKind::TextSelectionReadback => {
+                    ProjectedEvidenceKind::AccessibilityReadback
+                }
                 EvidenceKind::BrowserReadback => ProjectedEvidenceKind::BrowserReadback,
                 EvidenceKind::ValueReadback => ProjectedEvidenceKind::ValueReadback,
                 EvidenceKind::NativeApiResult
@@ -1074,6 +1080,7 @@ fn actual_delivery_name(delivery: ActualDelivery) -> &'static str {
 fn evidence_kind_name(kind: EvidenceKind) -> &'static str {
     match kind {
         EvidenceKind::AccessibilityReadback => "accessibility_readback",
+        EvidenceKind::TextSelectionReadback => "text_selection_readback",
         EvidenceKind::BrowserReadback => "browser_readback",
         EvidenceKind::ValueReadback => "value_readback",
         EvidenceKind::NativeApiResult => "native_api_result",

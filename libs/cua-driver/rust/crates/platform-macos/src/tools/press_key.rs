@@ -36,22 +36,30 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 struct AxKeyState {
+    role: Option<String>,
     value: Option<String>,
     selected: Option<bool>,
     text_range: Option<cua_driver_contract::TextSelectionRange>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum AxKeyChange {
+    None,
+    SelectionOnly,
+    Other,
+}
+
 #[derive(Debug)]
 enum PressKeyDeliveryOutcome {
-    Confirmed,
+    Confirmed(AxKeyChange),
     Unverifiable,
     Failed(anyhow::Error),
 }
 
-fn map_delivery_outcome(result: anyhow::Result<bool>) -> PressKeyDeliveryOutcome {
+fn map_delivery_outcome(result: anyhow::Result<AxKeyChange>) -> PressKeyDeliveryOutcome {
     match result {
-        Ok(true) => PressKeyDeliveryOutcome::Confirmed,
-        Ok(false) => PressKeyDeliveryOutcome::Unverifiable,
+        Ok(AxKeyChange::None) => PressKeyDeliveryOutcome::Unverifiable,
+        Ok(change) => PressKeyDeliveryOutcome::Confirmed(change),
         Err(error) => PressKeyDeliveryOutcome::Failed(error),
     }
 }
@@ -82,6 +90,7 @@ fn read_ax_key_state(pid: i32, window_id: Option<u32>, element_ptr: usize) -> Op
     }
     let element = element_ptr as AXUIElementRef;
     let state = AxKeyState {
+        role: unsafe { copy_string_attr(element, "AXRole") },
         value: unsafe { copy_string_attr(element, "AXValue") },
         selected: unsafe { copy_bool_attr(element, "AXSelected") },
         text_range: unsafe { crate::ax::text_state::focused_range(pid, element) },
@@ -95,7 +104,7 @@ fn dispatch_with_ax_oracle(
     window_id: Option<u32>,
     explicit_element_ptr: Option<usize>,
     dispatch: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<bool> {
+) -> anyhow::Result<AxKeyChange> {
     let (element_ptr, owns_element) = match explicit_element_ptr {
         Some(ptr) => (Some(ptr), false),
         None => unsafe {
@@ -122,7 +131,26 @@ fn dispatch_with_ax_oracle(
         }
     }
     result?;
-    Ok(matches!((before, after), (Some(before), Some(after)) if ax_state_changed(&before, &after)))
+    Ok(match (before, after) {
+        (Some(before), Some(after)) => classify_ax_key_change(&before, &after),
+        _ => AxKeyChange::None,
+    })
+}
+
+fn classify_ax_key_change(before: &AxKeyState, after: &AxKeyState) -> AxKeyChange {
+    if !ax_state_changed(before, after) {
+        return AxKeyChange::None;
+    }
+    if matches!(before.role.as_deref(), Some("AXTextField" | "AXTextArea"))
+        && before.role == after.role
+        && matches!((&before.value, &after.value), (Some(a), Some(b)) if a == b)
+        && before.selected == after.selected
+        && matches!((before.text_range, after.text_range), (Some(a), Some(b)) if a != b)
+    {
+        AxKeyChange::SelectionOnly
+    } else {
+        AxKeyChange::Other
+    }
 }
 
 fn ax_state_changed(before: &AxKeyState, after: &AxKeyState) -> bool {
@@ -131,7 +159,8 @@ fn ax_state_changed(before: &AxKeyState, after: &AxKeyState) -> bool {
         || matches!((before.text_range, after.text_range), (Some(before), Some(after)) if before != after)
 }
 
-fn action_record(confirmed: bool, foreground: bool) -> ActionExecutionRecord {
+fn action_record(change: AxKeyChange, foreground: bool) -> ActionExecutionRecord {
+    let confirmed = change != AxKeyChange::None;
     let effect = if confirmed {
         ActionEffect::Confirmed
     } else {
@@ -156,7 +185,11 @@ fn action_record(confirmed: bool, foreground: bool) -> ActionExecutionRecord {
         ActionExecutionRecord::builder(effect, transport, requested).actual_delivery(actual);
     if confirmed {
         record = record.evidence(ActionEvidence {
-            kind: EvidenceKind::AccessibilityReadback,
+            kind: if change == AxKeyChange::SelectionOnly {
+                EvidenceKind::TextSelectionReadback
+            } else {
+                EvidenceKind::AccessibilityReadback
+            },
             detail: "the same native AX element changed value or selection after the key post"
                 .into(),
         });
@@ -474,9 +507,13 @@ impl Tool for PressKeyTool {
         };
 
         match delivery_outcome {
-            outcome @ (PressKeyDeliveryOutcome::Confirmed
+            outcome @ (PressKeyDeliveryOutcome::Confirmed(_)
             | PressKeyDeliveryOutcome::Unverifiable) => {
-                let confirmed = matches!(outcome, PressKeyDeliveryOutcome::Confirmed);
+                let change = match outcome {
+                    PressKeyDeliveryOutcome::Confirmed(change) => change,
+                    _ => AxKeyChange::None,
+                };
+                let confirmed = change != AxKeyChange::None;
                 let label = if fg {
                     " (delivery_mode:foreground)"
                 } else {
@@ -489,7 +526,7 @@ impl Tool for PressKeyTool {
                 });
                 ToolResult::text(format!("✅ Pressed {display_key} on pid {pid}{label}."))
                     .with_structured(structured)
-                    .with_action_record(action_record(confirmed, fg))
+                    .with_action_record(action_record(change, fg))
             }
             PressKeyDeliveryOutcome::Failed(error) => delivery_failed(error),
         }
@@ -501,8 +538,97 @@ mod tests {
     use super::*;
 
     #[test]
+    fn native_selection_only_change_is_distinct_from_value_change() {
+        let before = AxKeyState {
+            role: Some("AXTextField".into()),
+            value: Some("Keep this note.".into()),
+            selected: None,
+            text_range: Some(cua_driver_contract::TextSelectionRange {
+                location: 5,
+                length: 0,
+            }),
+        };
+        let mut after = before.clone();
+        after.text_range = Some(cua_driver_contract::TextSelectionRange {
+            location: 5,
+            length: 4,
+        });
+        assert_eq!(
+            classify_ax_key_change(&before, &after),
+            AxKeyChange::SelectionOnly
+        );
+        after.value = Some("Keep that note.".into());
+        assert_eq!(classify_ax_key_change(&before, &after), AxKeyChange::Other);
+    }
+
+    #[test]
+    fn missing_value_focus_range_or_plain_text_role_is_not_selection_only() {
+        let before = AxKeyState {
+            role: Some("AXTextField".into()),
+            value: Some("abc".into()),
+            selected: None,
+            text_range: Some(cua_driver_contract::TextSelectionRange {
+                location: 0,
+                length: 0,
+            }),
+        };
+        let mut after = before.clone();
+        after.text_range = Some(cua_driver_contract::TextSelectionRange {
+            location: 1,
+            length: 0,
+        });
+        for role in [
+            None,
+            Some("AXComboBox"),
+            Some("AXSearchField"),
+            Some("AXButton"),
+        ] {
+            let mut old = before.clone();
+            let mut new = after.clone();
+            old.role = role.map(str::to_owned);
+            new.role = old.role.clone();
+            assert_ne!(
+                classify_ax_key_change(&old, &new),
+                AxKeyChange::SelectionOnly
+            );
+        }
+        let mut unreadable = before.clone();
+        unreadable.value = None;
+        assert_ne!(
+            classify_ax_key_change(&unreadable, &after),
+            AxKeyChange::SelectionOnly
+        );
+        let mut unfocused = after.clone();
+        unfocused.text_range = None;
+        assert_eq!(
+            classify_ax_key_change(&before, &unfocused),
+            AxKeyChange::None
+        );
+        let mut selected = after.clone();
+        selected.selected = Some(true);
+        assert_ne!(
+            classify_ax_key_change(&before, &selected),
+            AxKeyChange::SelectionOnly
+        );
+    }
+
+    #[test]
+    fn selection_evidence_keeps_the_existing_public_action_shape() {
+        let record = action_record(AxKeyChange::SelectionOnly, false);
+        assert_eq!(record.evidence[0].kind, EvidenceKind::TextSelectionReadback);
+        assert_eq!(
+            serde_json::to_value(record.public_result().unwrap()).unwrap(),
+            serde_json::json!({
+                "effect":"confirmed", "route":"synthetic_events", "delivery":{"mode":"background"},
+                "evidence":[{"kind":"value_readback"}]
+            })
+        );
+    }
+
+    #[test]
     fn native_caret_change_is_evidence_but_unreadable_or_unchanged_range_is_not() {
         let state = |range| AxKeyState {
+            role: Some("AXTextField".into()),
             value: Some("A😀BC".into()),
             selected: None,
             text_range: range,
@@ -524,11 +650,11 @@ mod tests {
     #[test]
     fn delivery_outcome_mapper_distinguishes_confirmed_unverifiable_and_failed() {
         assert!(matches!(
-            map_delivery_outcome(Ok(true)),
-            PressKeyDeliveryOutcome::Confirmed
+            map_delivery_outcome(Ok(AxKeyChange::Other)),
+            PressKeyDeliveryOutcome::Confirmed(AxKeyChange::Other)
         ));
         assert!(matches!(
-            map_delivery_outcome(Ok(false)),
+            map_delivery_outcome(Ok(AxKeyChange::None)),
             PressKeyDeliveryOutcome::Unverifiable
         ));
         let failed = map_delivery_outcome(Err(anyhow::anyhow!("post rejected")));
@@ -537,7 +663,9 @@ mod tests {
 
     #[test]
     fn accepted_without_oracle_has_no_escalation_but_ax_change_confirms() {
-        let unverifiable = action_record(false, false).public_result().unwrap();
+        let unverifiable = action_record(AxKeyChange::None, false)
+            .public_result()
+            .unwrap();
         assert_eq!(
             unverifiable.effect,
             cua_driver_contract::ActionEffect::Unverifiable
@@ -548,7 +676,9 @@ mod tests {
         );
         assert!(unverifiable.escalation.is_none());
 
-        let confirmed = action_record(true, false).public_result().unwrap();
+        let confirmed = action_record(AxKeyChange::Other, false)
+            .public_result()
+            .unwrap();
         assert_eq!(
             confirmed.effect,
             cua_driver_contract::ActionEffect::Confirmed
