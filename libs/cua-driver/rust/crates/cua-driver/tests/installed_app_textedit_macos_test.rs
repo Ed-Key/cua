@@ -171,9 +171,22 @@ fn background_open_panel_returns_a_typed_rebind() {
             .expect("start installed macOS daemon proxy");
         *evidence = recording_evidence(driver.recording_dir());
 
+        // Open a file owned by this case rather than depending on TextEdit's
+        // first-launch document chooser or borrowing a user's Untitled window.
+        let fixture = tempfile::tempdir().expect("TextEdit fixture directory");
+        let document_name = format!(
+            "cua-observer-{}.txt",
+            fixture.path().file_name().unwrap().to_string_lossy()
+        );
+        let document = fixture.path().join(&document_name);
+        let marker = "Cua observer document readiness marker";
+        std::fs::write(&document, marker).expect("write TextEdit fixture");
         let launch = driver.call(
             "launch_app",
-            serde_json::json!({ "bundle_id": "com.apple.TextEdit" }),
+            serde_json::json!({
+                "bundle_id": "com.apple.TextEdit",
+                "urls": [document.to_str().expect("fixture path")]
+            }),
         );
         assert!(
             !launch.is_error(),
@@ -181,29 +194,52 @@ fn background_open_panel_returns_a_typed_rebind() {
             launch.text()
         );
         let pid = launch.structured()["pid"].as_i64().expect("TextEdit pid");
-        let window_id = launch.structured()["windows"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|window| window["window_id"].as_u64())
-            .find(|window_id| {
-                let state = driver.call(
-                    "get_window_state",
-                    serde_json::json!({
-                        "pid": pid,
-                        "window_id": window_id,
-                        "include_screenshot": false
-                    }),
-                );
-                state.structured()["elements"]
-                    .as_array()
-                    .is_some_and(|elements| {
-                        elements
-                            .iter()
-                            .any(|element| element["role"] == "AXTextArea")
-                    })
-            })
-            .expect("TextEdit document window");
+        let ready_deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let window_id = loop {
+            let windows = driver.call("list_windows", serde_json::json!({"pid": pid}));
+            assert!(
+                !windows.is_error(),
+                "TextEdit discovery: {}",
+                windows.text()
+            );
+            let ready = windows.structured()["windows"]
+                .as_array()
+                .expect("TextEdit windows")
+                .iter()
+                .filter(|window| {
+                    let title = window["title"].as_str().unwrap_or("");
+                    title == document_name || title == document_name.trim_end_matches(".txt")
+                })
+                .filter_map(|window| window["window_id"].as_u64())
+                .find(|window_id| {
+                    let state = driver.call(
+                        "get_window_state",
+                        serde_json::json!({
+                            "pid": pid, "window_id": window_id, "include_screenshot": false
+                        }),
+                    );
+                    !state.is_error()
+                        && state.structured()["elements"]
+                            .as_array()
+                            .is_some_and(|elements| {
+                                elements.iter().any(|element| {
+                                    element["role"] == "AXTextArea"
+                                        && element["value"]
+                                            .as_str()
+                                            .is_some_and(|value| value.contains(marker))
+                                })
+                            })
+                });
+            if let Some(window_id) = ready {
+                break window_id;
+            }
+            assert!(
+                std::time::Instant::now() < ready_deadline,
+                "owned TextEdit document never exposed its contents: {}",
+                windows.text()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        };
 
         let (opened, mut passed) = run_with_background_oracles(
             &mut driver,
@@ -270,19 +306,51 @@ fn background_open_panel_returns_a_typed_rebind() {
         );
         passed.push(OracleKind::AxState);
 
-        let _ = driver.call(
-            "press_key",
+        // Resolve Cancel from a fresh snapshot. Escape may acknowledge delivery
+        // without closing this background AppKit panel.
+        let panel = driver.call(
+            "get_window_state",
             serde_json::json!({
-                "pid": panel_pid,
-                "window_id": panel_window_id,
-                "key": "escape",
+                "pid": panel_pid, "window_id": panel_window_id, "include_screenshot": false
+            }),
+        );
+        assert!(
+            !panel.is_error(),
+            "panel cleanup snapshot: {}",
+            panel.text()
+        );
+        let cancel_buttons: Vec<_> = panel.structured()["elements"]
+            .as_array()
+            .expect("panel cleanup elements")
+            .iter()
+            .filter(|element| {
+                element["role"] == "AXButton"
+                    && element["label"] == "Cancel"
+                    && element["enabled"] == true
+            })
+            .collect();
+        assert_eq!(
+            cancel_buttons.len(),
+            1,
+            "expected one enabled panel Cancel button"
+        );
+        let cancel = driver.call(
+            "click",
+            serde_json::json!({
+                "pid": panel_pid, "window_id": panel_window_id,
+                "element_token": cancel_buttons[0]["element_token"].as_str().expect("Cancel token"),
                 "delivery_mode": "background"
             }),
         );
+        assert!(!cancel.is_error(), "panel Cancel: {}", cancel.text());
         let cleanup_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
         loop {
             let windows = driver.call("list_windows", serde_json::json!({"pid": panel_pid}));
-            assert!(!windows.is_error(), "panel cleanup read: {}", windows.text());
+            assert!(
+                !windows.is_error(),
+                "panel cleanup read: {}",
+                windows.text()
+            );
             let still_visible = windows.structured()["windows"]
                 .as_array()
                 .expect("panel cleanup windows")
@@ -301,6 +369,58 @@ fn background_open_panel_returns_a_typed_rebind() {
             );
             std::thread::sleep(std::time::Duration::from_millis(50));
         }
+        let document_state = driver.call(
+            "get_window_state",
+            serde_json::json!({
+                "pid": pid, "window_id": window_id, "include_screenshot": false
+            }),
+        );
+        assert!(
+            !document_state.is_error(),
+            "owned document before close: {}",
+            document_state.text()
+        );
+        let closed = driver.call(
+            "hotkey",
+            serde_json::json!({
+                "pid": pid, "window_id": window_id, "keys": ["cmd", "w"],
+                "delivery_mode": "background"
+            }),
+        );
+        assert!(
+            !closed.is_error(),
+            "close owned document: {}",
+            closed.text()
+        );
+        let close_deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let windows = driver.call("list_windows", serde_json::json!({"pid": pid}));
+            assert!(
+                !windows.is_error(),
+                "document cleanup read: {}",
+                windows.text()
+            );
+            let present = windows.structured()["windows"]
+                .as_array()
+                .expect("document cleanup windows")
+                .iter()
+                .any(|window| window["window_id"].as_u64() == Some(window_id));
+            if !present {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < close_deadline,
+                "owned TextEdit document remained after close: {}",
+                windows.text()
+            );
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            std::fs::read_to_string(&document).unwrap(),
+            marker,
+            "dialog test must not modify its document"
+        );
+        fixture.close().expect("remove TextEdit fixture directory");
         Observation::delivered(passed, Default::default())
     });
 }
