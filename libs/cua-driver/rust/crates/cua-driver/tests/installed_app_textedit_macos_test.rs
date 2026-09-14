@@ -185,7 +185,8 @@ fn background_open_panel_returns_a_typed_rebind() {
             "launch_app",
             serde_json::json!({
                 "bundle_id": "com.apple.TextEdit",
-                "urls": [document.to_str().expect("fixture path")]
+                "urls": [document.to_str().expect("fixture path")],
+                "creates_new_application_instance": true
             }),
         );
         assert!(
