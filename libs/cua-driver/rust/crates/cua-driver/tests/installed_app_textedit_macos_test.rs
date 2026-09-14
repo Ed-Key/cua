@@ -260,6 +260,7 @@ fn background_open_panel_returns_a_typed_rebind() {
             },
         )
         .unwrap_or_else(|error| panic!("background Open-panel contract failed: {error}"));
+        eprintln!("[textedit-open-panel] {}", opened.raw);
         assert!(!opened.is_error(), "hotkey errored: {}", opened.text());
         assert_eq!(
             opened.action_effect(),
@@ -271,7 +272,7 @@ fn background_open_panel_returns_a_typed_rebind() {
         let change = &opened.structured()["window_change"];
         let candidates = change["new_windows"]
             .as_array()
-            .expect("typed window_change candidates");
+            .unwrap_or_else(|| panic!("missing typed window_change candidates: {}", opened.raw));
         assert_eq!(candidates.len(), 1, "expected one Open-panel root");
         let candidate = &candidates[0];
         let panel_pid = candidate["pid"].as_i64().expect("panel target pid");
