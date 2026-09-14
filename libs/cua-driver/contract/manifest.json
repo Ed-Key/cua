@@ -1741,6 +1741,12 @@
                     "null"
                   ]
                 },
+                "focused": {
+                  "type": [
+                    "boolean",
+                    "null"
+                  ]
+                },
                 "frame": {
                   "properties": {
                     "h": {
@@ -1817,6 +1823,42 @@
                 "selected": {
                   "type": [
                     "boolean",
+                    "null"
+                  ]
+                },
+                "text_selection": {
+                  "properties": {
+                    "range": {
+                      "properties": {
+                        "length": {
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "location": {
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        }
+                      },
+                      "required": [
+                        "location",
+                        "length"
+                      ],
+                      "type": [
+                        "object",
+                        "null"
+                      ]
+                    },
+                    "text": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    }
+                  },
+                  "type": [
+                    "object",
                     "null"
                   ]
                 },

@@ -38,6 +38,7 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 struct AxKeyState {
     value: Option<String>,
     selected: Option<bool>,
+    text_range: Option<cua_driver_contract::TextSelectionRange>,
 }
 
 #[derive(Debug)]
@@ -83,8 +84,10 @@ fn read_ax_key_state(pid: i32, window_id: Option<u32>, element_ptr: usize) -> Op
     let state = AxKeyState {
         value: unsafe { copy_string_attr(element, "AXValue") },
         selected: unsafe { copy_bool_attr(element, "AXSelected") },
+        text_range: unsafe { crate::ax::text_state::focused_range(pid, element) },
     };
-    (state.value.is_some() || state.selected.is_some()).then_some(state)
+    (state.value.is_some() || state.selected.is_some() || state.text_range.is_some())
+        .then_some(state)
 }
 
 fn dispatch_with_ax_oracle(
@@ -125,6 +128,7 @@ fn dispatch_with_ax_oracle(
 fn ax_state_changed(before: &AxKeyState, after: &AxKeyState) -> bool {
     matches!((&before.value, &after.value), (Some(before), Some(after)) if before != after)
         || matches!((before.selected, after.selected), (Some(before), Some(after)) if before != after)
+        || matches!((before.text_range, after.text_range), (Some(before), Some(after)) if before != after)
 }
 
 fn action_record(confirmed: bool, foreground: bool) -> ActionExecutionRecord {
@@ -495,6 +499,27 @@ impl Tool for PressKeyTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_caret_change_is_evidence_but_unreadable_or_unchanged_range_is_not() {
+        let state = |range| AxKeyState {
+            value: Some("A😀BC".into()),
+            selected: None,
+            text_range: range,
+        };
+        let start = Some(cua_driver_contract::TextSelectionRange {
+            location: 0,
+            length: 0,
+        });
+        let end = Some(cua_driver_contract::TextSelectionRange {
+            location: 5,
+            length: 0,
+        });
+        assert!(ax_state_changed(&state(start), &state(end)));
+        assert!(!ax_state_changed(&state(end), &state(end)));
+        assert!(!ax_state_changed(&state(None), &state(end)));
+        assert!(!ax_state_changed(&state(start), &state(None)));
+    }
 
     #[test]
     fn delivery_outcome_mapper_distinguishes_confirmed_unverifiable_and_failed() {

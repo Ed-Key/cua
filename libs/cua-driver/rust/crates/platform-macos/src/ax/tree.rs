@@ -58,6 +58,8 @@ pub struct AXNode {
     pub value: Option<String>,
     /// Reported AXValue writability, independent of whether an edit commits.
     pub value_settable: Option<bool>,
+    pub focused: Option<bool>,
+    pub text_selection: Option<cua_driver_contract::TextSelection>,
     pub placeholder: Option<String>,
     /// AXDescription — shown as `(description)` in the tree line.
     /// Kept separate from `title` so `_find_calc_button("2")` can find
@@ -318,6 +320,8 @@ pub fn walk_tree_bounded(
             );
         }
 
+        super::text_state::enrich_focused_state(pid, &mut nodes);
+
         // Release all top-level elements (copy_children / copy_ax_windows both retain).
         for child in top_level {
             CFRelease(child as CFTypeRef);
@@ -506,6 +510,8 @@ unsafe fn walk_element(
         CFRetain(element as CFTypeRef);
         AXNode {
             value_settable,
+            focused: None,
+            text_selection: None,
             url: if role == "AXLink" {
                 copy_url_attr(element)
             } else {
@@ -543,6 +549,8 @@ unsafe fn walk_element(
     } else {
         AXNode {
             value_settable,
+            focused: None,
+            text_selection: None,
             url: if role == "AXLink" {
                 copy_url_attr(element)
             } else {
@@ -676,6 +684,20 @@ fn format_node_line(node: &AXNode) -> String {
                 .join(",");
             attrs.push(format!("actions=[{}]", action_str));
         }
+        if node.focused == Some(true) {
+            attrs.push("focused".into());
+            if let Some(selection) = &node.text_selection {
+                if let Some(range) = selection.range {
+                    attrs.push(format!(
+                        "selection_utf16={}:{}",
+                        range.location, range.length
+                    ));
+                }
+                if let Some(text) = &selection.text {
+                    attrs.push(format!("selected_text={}", serde_json::json!(text)));
+                }
+            }
+        }
         if !attrs.is_empty() {
             parts.push_str(" [");
             parts.push_str(&attrs.join(" "));
@@ -703,6 +725,28 @@ fn render_lines(lines: &[(usize, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focused_selection_outline_is_lossless_and_focus_race_discards_state() {
+        let mut node = super::typed_query_tests::row(Some(3), 1, "AXTextField", "A😀BC");
+        node.focused = Some(true);
+        node.text_selection = Some(cua_driver_contract::TextSelection {
+            text: Some("A😀".into()),
+            range: Some(cua_driver_contract::TextSelectionRange {
+                location: 0,
+                length: 3,
+            }),
+        });
+        let line = format_node_line(&node);
+        assert!(line.contains("focused selection_utf16=0:3 selected_text=\"A😀\""));
+        let mut nodes = vec![node];
+        crate::ax::text_state::retain_stable_focus(&mut nodes, true);
+        assert_eq!(nodes[0].focused, Some(true));
+        crate::ax::text_state::retain_stable_focus(&mut nodes, false);
+        assert_eq!(nodes[0].focused, None);
+        assert!(nodes[0].text_selection.is_none());
+        assert!(!format_node_line(&nodes[0]).contains("selection_utf16"));
+    }
 
     #[test]
     fn value_writability_probes_only_value_controls_and_preserves_unknown() {
@@ -757,6 +801,8 @@ mod tests {
     fn rendered_raw_values_cannot_add_tree_rows_or_become_placeholders() {
         let mut node = AXNode {
             value_settable: None,
+            focused: None,
+            text_selection: None,
             url: None,
             element_index: Some(0),
             role: "AXTextArea".into(),
@@ -878,6 +924,8 @@ mod typed_query_tests {
     pub(super) fn row(index: Option<usize>, depth: usize, role: &str, value: &str) -> AXNode {
         AXNode {
             value_settable: None,
+            focused: None,
+            text_selection: None,
             url: None,
             element_index: index,
             role: role.into(),

@@ -864,6 +864,69 @@ fn harness_appkit_click_on_a_text_role_focuses_it() {
     );
 }
 
+/// Selection offsets are UTF-16 units. This exercises a two-unit emoji,
+/// a caret-only state, and a key that leaves the caret unchanged.
+#[test]
+#[ignore]
+fn harness_appkit_focused_text_selection_and_caret() {
+    run_background_case(
+        "text_selection",
+        DriverRoute::MacosAxValue,
+        |pid, wid, driver| {
+            let first = snapshot_elements(driver, pid, wid);
+            let focus = driver.call("click", serde_json::json!({
+            "pid":pid, "window_id":wid, "element_token":element_token_by_id(&first,"txt-input")
+        }));
+            assert!(!focus.is_error(), "focus: {}", focus.text());
+            let typed = driver.call(
+                "type_text",
+                serde_json::json!({"pid":pid,"window_id":wid,"text":"A😀BC"}),
+            );
+            assert!(!typed.is_error(), "typing: {}", typed.text());
+            let mut snapshot = snapshot_elements(driver, pid, wid);
+            for (key, modifiers, location, length, text, effect) in [
+                ("left", vec!["cmd"], 0, 0, "", "confirmed"),
+                ("right", vec!["shift"], 0, 1, "A", "confirmed"),
+                ("right", vec!["shift"], 0, 3, "A😀", "confirmed"),
+                ("right", vec!["cmd"], 5, 0, "", "confirmed"),
+                ("right", vec![], 5, 0, "", "unverifiable"),
+            ] {
+                let response = driver.call("press_key",serde_json::json!({
+                "pid":pid,"window_id":wid,"element_token":element_token_by_id(&snapshot,"txt-input"),
+                "key":key,"modifiers":modifiers
+            }));
+                assert!(!response.is_error(), "key: {}", response.text());
+                println!("selection key {key} {modifiers:?}: {}", response.text());
+                snapshot = snapshot_elements(driver, pid, wid);
+                let index = element_index_by_id(snapshot.tree_text(), "txt-input").unwrap();
+                let field = snapshot.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["element_index"].as_u64() == Some(index))
+                    .unwrap();
+                println!("selection evidence: {field}");
+                assert_eq!(field["value"], "A😀BC", "navigation preserves text");
+                assert_eq!(field["focused"], true);
+                assert_eq!(
+                    field["text_selection"]["range"],
+                    serde_json::json!({"location":location,"length":length})
+                );
+                assert_eq!(field["text_selection"]["text"], text);
+                assert!(snapshot
+                    .tree_text()
+                    .contains(&format!("selection_utf16={location}:{length}")));
+                assert_eq!(
+                    response.action_effect(),
+                    Some(effect),
+                    "{}",
+                    response.text()
+                );
+            }
+        },
+    );
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_element_foreground_press_key_commits_edit() {

@@ -198,6 +198,23 @@ pub struct ElementFrame {
     pub h: f64,
 }
 
+/// A half-open range measured in UTF-16 code units. Zero length is a caret.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, Eq, PartialEq, uniffi::Record)]
+pub struct TextSelectionRange {
+    pub location: u64,
+    pub length: u64,
+}
+
+/// Best-effort platform accessibility state, not proof of a rendered web edit.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Eq, PartialEq, uniffi::Record)]
+pub struct TextSelection {
+    /// Empty string means a readable empty selection; absence means unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<TextSelectionRange>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct WindowElement {
     pub element_index: u64,
@@ -214,6 +231,13 @@ pub struct WindowElement {
     /// Currently populated on macOS; absent means unknown or not queried.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_settable: Option<bool>,
+    /// Reported keyboard focus. Currently populated on macOS; absent is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused: Option<bool>,
+    /// Only read for the focused text control. Unsupported attributes stay absent.
+    /// Web accessibility state is observational, not renderer verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_selection: Option<TextSelection>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -438,5 +462,26 @@ mod tests {
             let output: WindowStateOutput = serde_json::from_value(value).unwrap();
             assert!(output.validate().is_err());
         }
+    }
+    #[test]
+    fn focused_text_selection_roundtrips_without_losing_empty_or_utf16_range() {
+        for selection in [
+            json!({"text":"A😀", "range":{"location":0,"length":3}}),
+            json!({"text":"", "range":{"location":5,"length":0}}),
+            json!({"range":{"location":0,"length":0}}),
+        ] {
+            let value = json!({"element_index":3,"role":"AXTextField","depth":1,
+                             "focused":true,"text_selection":selection});
+            let element: WindowElement = serde_json::from_value(value.clone()).unwrap();
+            let wire = serde_json::to_value(element).unwrap();
+            assert_eq!(wire["focused"], true);
+            assert_eq!(wire["text_selection"], value["text_selection"]);
+        }
+        let old: WindowElement =
+            serde_json::from_value(json!({"element_index":3,"role":"AXTextField","depth":1}))
+                .unwrap();
+        let wire = serde_json::to_value(old).unwrap();
+        assert!(wire.get("focused").is_none());
+        assert!(wire.get("text_selection").is_none());
     }
 }

@@ -1714,6 +1714,8 @@ mod tests {
     fn node(role: &str, title: Option<&str>, value: Option<&str>, actions: &[&str]) -> AXNode {
         AXNode {
             value_settable: None,
+            focused: None,
+            text_selection: None,
             url: None,
             element_index: (!actions.is_empty()).then_some(0),
             role: role.to_owned(),

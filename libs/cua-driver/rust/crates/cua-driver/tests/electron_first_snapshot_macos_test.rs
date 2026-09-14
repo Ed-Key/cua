@@ -59,12 +59,19 @@ fn background_coordinate_typing_preserves_selection_before_first_pointer() {
     check_first_snapshot(true, false, Some(TypingScenario::SelectionBeforePointer));
 }
 
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_web_selection_is_observed_without_confirming_keys() {
+    check_first_snapshot(true, false, Some(TypingScenario::ObserveSelection));
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypingScenario {
     Fresh,
     ReplaceSelection,
     AfterAddressedAttempt,
     SelectionBeforePointer,
+    ObserveSelection,
 }
 
 fn log_editor_focus(pid: i32, x: f64, y: f64, label: &str) -> Option<bool> {
@@ -376,7 +383,10 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                     std::thread::sleep(Duration::from_millis(25));
                 }
             }
-            for payload in if scenario == TypingScenario::ReplaceSelection {
+            for payload in if matches!(
+                scenario,
+                TypingScenario::ReplaceSelection | TypingScenario::ObserveSelection
+            ) {
                 vec!["Original text", "Replacement"]
             } else if scenario == TypingScenario::SelectionBeforePointer {
                 vec!["Replacement"]
@@ -426,6 +436,50 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                         );
                         std::thread::sleep(Duration::from_millis(25));
                     }
+                }
+                if scenario == TypingScenario::ObserveSelection && payload == "Replacement" {
+                    let current = driver.call(
+                        "get_window_state",
+                        serde_json::json!({
+                            "pid":pid,"window_id":wid,"include_screenshot":false
+                        }),
+                    );
+                    let field = current.structured()["elements"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|e| e["label"] == "txt-input" && e["role"] == "AXTextArea")
+                        .unwrap();
+                    eprintln!(
+                        "web selection observation: {field}; renderer: {}",
+                        journal.snapshot()["txt-input"]
+                    );
+                    assert_eq!(field["in_web_content"], true);
+                    assert_eq!(field["focused"], true);
+                    assert_eq!(
+                        field["text_selection"]["range"],
+                        serde_json::json!({"location":0,"length":13})
+                    );
+                    assert_eq!(field["text_selection"]["text"], "Original text");
+                    let key = driver.call(
+                        "press_key",
+                        serde_json::json!({
+                            "pid":pid,"window_id":wid,"element_token":field["element_token"],
+                            "key":"right","modifiers":["cmd"],"delivery_mode":"background"
+                        }),
+                    );
+                    assert!(!key.is_error(), "web key: {}", key.text());
+                    assert_eq!(
+                        key.action_effect(),
+                        Some("unverifiable"),
+                        "web AX must not confirm a key: {}",
+                        key.text()
+                    );
+                    assert_eq!(
+                        journal.text("lbl-input-mirror").as_deref(),
+                        Some("mirror=Original text")
+                    );
+                    return (state, elapsed);
                 }
                 let main = log_editor_focus(
                     pid as i32,

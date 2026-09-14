@@ -151,6 +151,8 @@ mod tests {
     fn node_with_ptr(ptr: usize) -> AXNode {
         AXNode {
             value_settable: None,
+            focused: None,
+            text_selection: None,
             url: None,
             element_index: Some(0),
             role: String::new(),
