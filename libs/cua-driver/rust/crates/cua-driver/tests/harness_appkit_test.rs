@@ -1096,12 +1096,35 @@ fn harness_appkit_type_text_background() {
 #[test]
 #[ignore]
 fn harness_appkit_type_text_waits_for_a_lagging_value_readback() {
+    let trace_dir = tempfile::tempdir().expect("create lag trace directory");
+    let trace_path = trace_dir.path().join("lag-readback.jsonl");
     run_background_case_with_env(
         "type_text_lagging_readback",
         Targeting::Ax,
         DriverRoute::MacosAxValue,
-        &[("CUA_APPKIT_AX_VALUE_LAG_MS", "900")],
+        &[
+            ("CUA_APPKIT_AX_VALUE_LAG_MS", "900"),
+            ("CUA_APPKIT_AX_VALUE_TRACE", trace_path.to_str().unwrap()),
+        ],
         |pid, wid, driver| {
+            let snap_pre = snapshot_elements(driver, pid, wid);
+            // Enter the field editor before testing AXSelectedText. An unfocused
+            // NSTextField can reject that attribute and silently exercise the
+            // already-drained keyboard route instead of this regression.
+            let (x, y, w, h) = element_pixel_frame(&snap_pre, "txt-input");
+            let focused = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid,
+                    "x": x + w / 2.0, "y": y + h / 2.0,
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(
+                !focused.is_error(),
+                "focus field editor: {}",
+                focused.text()
+            );
             let snap_pre = snapshot_elements(driver, pid, wid);
             let idx = element_index_by_id(snap_pre.tree_text(), "txt-input")
                 .expect("txt-input element_index not found");
@@ -1113,6 +1136,21 @@ fn harness_appkit_type_text_waits_for_a_lagging_value_readback() {
                     "snapshot_id": snap_pre.snapshot_id(),
                     "text": text, "delivery_mode": "background"
                 }),
+            );
+            let trace = std::fs::read_to_string(&trace_path).unwrap_or_default();
+            eprintln!("lag probe response: {}; getter trace: {trace}", resp.raw);
+            assert!(
+                resp.structured()["route"] == "accessibility" || resp.structured()["path"] == "ax",
+                "lag regression must exercise the AXSelectedText route, got {}",
+                resp.raw
+            );
+            assert!(
+                trace.lines().any(|line| {
+                    let row: serde_json::Value =
+                        serde_json::from_str(line).expect("parse lag trace");
+                    row["actual"] == text && row["reported"] != text
+                }),
+                "lag fixture did not expose delayed readback during typing"
             );
             assert!(
                 !resp.is_error(),

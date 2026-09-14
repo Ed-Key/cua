@@ -78,9 +78,20 @@ final class LaggingTextField: NSTextField {
         }
         guard let changedAt, !actual.isEmpty else { return actual }
         let elapsed = Date().timeIntervalSince(changedAt)
-        if elapsed >= lag { return actual }
         let visible = max(1, Int(Double(actual.count) * elapsed / lag))
-        return String(actual.prefix(visible))
+        let value = elapsed >= lag ? actual : String(actual.prefix(visible))
+        if let path = ProcessInfo.processInfo.environment["CUA_APPKIT_AX_VALUE_TRACE"],
+           let data = try? JSONSerialization.data(withJSONObject: ["actual": actual, "reported": value, "elapsed": elapsed]) {
+            let line = data + Data([10])
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(line)
+                handle.closeFile()
+            } else {
+                try? line.write(to: URL(fileURLWithPath: path))
+            }
+        }
+        return value
     }
 }
 
