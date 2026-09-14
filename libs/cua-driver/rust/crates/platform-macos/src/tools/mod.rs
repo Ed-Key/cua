@@ -300,7 +300,8 @@ pub(crate) async fn acquire_background_mutation(pid: i32) -> BackgroundMutationL
 /// px-focus for the keyboard family (type_text / press_key / hotkey): focus the
 /// element at (x,y) before a keystroke — the *element px action* form of a
 /// keyboard tool. Prefer non-destructive AX focus so an existing selection is
-/// retained; the foreground rung falls back to a real pixel click when needed.
+/// retained. An unfocused web editor uses the existing background pointer
+/// route; the foreground rung retains its explicit activation fallback.
 /// Reuses ClickTool's exact coordinate translation and delivery mode.
 /// `Ok(())` on success; `Err(ToolResult)` short-circuits the caller.
 #[allow(clippy::too_many_arguments)]
@@ -344,7 +345,7 @@ pub(crate) async fn focus_by_pixel(
     if from_zoom {
         click_args["from_zoom"] = serde_json::json!(true);
     }
-    let mut click_tool = click::ClickTool::new(state.clone());
+    let mut click_tool = click::ClickTool::new(state.clone()).with_keyboard_focus();
     if let Some(sink) = visual_sink {
         click_tool = click_tool.with_visual_sink(sink);
     }

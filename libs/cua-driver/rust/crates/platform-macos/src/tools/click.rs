@@ -43,6 +43,7 @@ use crate::cursor::visual::{
 pub struct ClickTool {
     state: Arc<ToolState>,
     visual_sink: Arc<dyn PointerVisualSink>,
+    keyboard_focus: bool,
 }
 
 impl ClickTool {
@@ -50,11 +51,19 @@ impl ClickTool {
         Self {
             state,
             visual_sink: Arc::new(OverlayVisualSink),
+            keyboard_focus: false,
         }
     }
 
     pub(crate) fn with_visual_sink(mut self, sink: Arc<dyn PointerVisualSink>) -> Self {
         self.visual_sink = sink;
+        self
+    }
+
+    /// Internal keyboard preparation may need renderer focus. Ordinary public
+    /// focus actions keep their accessibility-only contract.
+    pub(crate) fn with_keyboard_focus(mut self) -> Self {
+        self.keyboard_focus = true;
         self
     }
 
@@ -942,13 +951,14 @@ impl Tool for ClickTool {
                     && modifiers.is_empty()
                 {
                     let focus_only = action == "focus";
+                    let keyboard_focus = self.keyboard_focus;
                     let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
                     let receipt = delivery_receipt.clone();
                     let ax_result = tokio::task::spawn_blocking(move || unsafe {
                         receipt.ensure_current()?;
                         let Some(element) = element_at_screen_position(pid, screen_x, screen_y)
                         else {
-                            return Ok::<bool, anyhow::Error>(false);
+                            return Ok::<Option<bool>, anyhow::Error>(Some(false));
                         };
                         // The pid-scoped hit-test can resolve an element from a
                         // same-process sibling overlapping the requested point.
@@ -958,11 +968,41 @@ impl Tool for ClickTool {
                         if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid)
                         {
                             CFRelease(element as _);
-                            return Ok(false);
+                            return Ok(Some(false));
                         }
                         if let Err(error) = receipt.ensure_current() {
                             CFRelease(element as _);
                             return Err(error);
+                        }
+                        // AXFocused can be accepted by a never-activated web
+                        // editor without establishing renderer keyboard focus.
+                        // The exact-window hit target has already been validated.
+                        // Keep existing selections when it is already focused;
+                        // otherwise request the normal guarded pointer worker.
+                        if keyboard_focus && focus_only {
+                            let role = crate::ax::bindings::copy_string_attr(element, "AXRole")
+                                .unwrap_or_default();
+                            if needs_web_editor_pointer_focus(
+                                &role,
+                                super::type_text::target_in_web_area(
+                                    pid,
+                                    Some((element as usize, None)),
+                                    Some(hit_test_wid),
+                                ),
+                                // Accessory Electron windows can omit the app's
+                                // AXFocusedUIElement while the editor itself
+                                // accurately reports AXFocused. The hit target's
+                                // exact-window ownership was already checked.
+                                crate::ax::bindings::copy_bool_attr(element, "AXFocused")
+                                    == Some(true)
+                                    || crate::input::ax_actions::is_element_focused(
+                                        pid,
+                                        element as usize,
+                                    ),
+                            ) {
+                                CFRelease(element as _);
+                                return Ok(None);
+                            }
                         }
                         let delivered = if focus_only {
                             match dispatch_pixel_ax_focus(&receipt, || {
@@ -983,9 +1023,15 @@ impl Tool for ClickTool {
                             receipt.accepted();
                         }
                         CFRelease(element as _);
-                        Ok(delivered)
+                        Ok(Some(delivered))
                     })
                     .await;
+                    let ax_result = match ax_result {
+                        Ok(Ok(None)) => return None,
+                        Ok(Ok(Some(delivered))) => Ok(Ok(delivered)),
+                        Ok(Err(error)) => Ok(Err(error)),
+                        Err(error) => Err(error),
+                    };
                     return pixel_ax_dispatch_result(focus_only, ax_result);
                 }
 
@@ -1148,6 +1194,12 @@ impl Tool for ClickTool {
             )
         }
     }
+}
+
+/// A focused editor must retain its selection. Non-editor focus targets and
+/// native Cocoa controls retain the existing semantic route.
+fn needs_web_editor_pointer_focus(role: &str, in_web_content: bool, focused: bool) -> bool {
+    in_web_content && !focused && matches!(role, "AXTextArea" | "AXTextField" | "AXSearchField")
 }
 
 /// Keep posted-input evidence even when later cleanup or readback fails.
@@ -2307,5 +2359,26 @@ impl ClickTool {
         receipt: &DeliveryReceipt,
     ) -> anyhow::Result<()> {
         perform_ax_click(element, 0, 1, 42, "click", receipt, None, &[], false).map(|_| ())
+    }
+}
+
+#[cfg(test)]
+mod keyboard_editor_focus_tests {
+    use super::needs_web_editor_pointer_focus;
+
+    #[test]
+    fn unfocused_web_editors_need_pointer_delivery() {
+        for role in ["AXTextArea", "AXTextField", "AXSearchField"] {
+            assert!(needs_web_editor_pointer_focus(role, true, false));
+        }
+    }
+
+    #[test]
+    fn focused_editors_keep_selection_and_other_controls_keep_semantic_focus() {
+        assert!(!needs_web_editor_pointer_focus("AXTextArea", true, true));
+        assert!(!needs_web_editor_pointer_focus("AXTextArea", false, false));
+        assert!(!needs_web_editor_pointer_focus("AXButton", true, false));
+        assert!(!needs_web_editor_pointer_focus("AXWebArea", true, false));
+        assert!(!needs_web_editor_pointer_focus("", true, false));
     }
 }
