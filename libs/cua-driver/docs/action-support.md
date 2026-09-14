@@ -71,6 +71,15 @@ as lossless by the macOS tests. The shared JSON contract accepts an omitted
 placeholder. Native SDK libraries and generated bindings must be rebuilt
 together for the added record field.
 
+On macOS, `set_value` refuses an `AXTextField` or `AXTextArea` whose current
+`AXValue` writability is explicitly false, before value delivery or cursor
+animation. The error carries `effect:"refused"` without delivery or an
+escalation recommendation. An unavailable writability query keeps the existing
+attempt behavior. This does not establish keyboard editability, and dropdown,
+numeric and other control routes keep their existing semantics. Windows, X11
+and Wayland do not use this AX preflight and retain their platform behavior;
+this change does not certify an equivalent refusal on those platforms.
+
 The macOS adapter also reports optional `value_settable` on structured value
 controls. `true` and `false` mean that `AXUIElementIsAttributeSettable` succeeded
 and reported AXValue writable or read-only. An absent field means unknown or

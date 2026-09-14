@@ -197,18 +197,30 @@ impl Tool for SetValueTool {
             "set_value.AXValue",
             || async move {
                 tokio::task::spawn_blocking(move || {
-                    let target = unsafe {
-                        crate::ax::bindings::element_screen_rect(element_ptr as AXUIElementRef)
-                    }
-                    .and_then(|rect| {
-                        crate::cursor::visual::ResolvedPointerTarget::from_bounds(window_id, rect)
-                    });
-                    super::type_text::with_type_visual(
-                        &visual_registry,
-                        &crate::cursor::visual::OverlayVisualSink,
-                        &cursor_key,
-                        target,
-                        || set_value_blocking(element_ptr, element_index, pid, &value),
+                    let element = element_ptr as AXUIElementRef;
+                    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+                    with_text_value_writability(
+                        &role,
+                        || unsafe { crate::ax::bindings::attribute_settable(element, "AXValue") },
+                        || {
+                            let target = unsafe {
+                                crate::ax::bindings::element_screen_rect(
+                                    element_ptr as AXUIElementRef,
+                                )
+                            }
+                            .and_then(|rect| {
+                                crate::cursor::visual::ResolvedPointerTarget::from_bounds(
+                                    window_id, rect,
+                                )
+                            });
+                            super::type_text::with_type_visual(
+                                &visual_registry,
+                                &crate::cursor::visual::OverlayVisualSink,
+                                &cursor_key,
+                                target,
+                                || set_value_blocking(element_ptr, element_index, pid, &value),
+                            )
+                        },
                     )
                 })
                 .await
@@ -217,7 +229,8 @@ impl Tool for SetValueTool {
         .await;
 
         match result {
-            Ok(Ok(mut outcome)) => {
+            Ok(Ok(SetValueAttempt::Refused)) => nonsettable_text_refusal(),
+            Ok(Ok(SetValueAttempt::Applied(mut outcome))) => {
                 apply_surface_trust(&mut outcome, ax_echo_surface);
                 apply_verification_label(&mut outcome);
                 let msg = outcome.detail;
@@ -241,6 +254,36 @@ impl Tool for SetValueTool {
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+enum SetValueAttempt {
+    Refused,
+    Applied(SetValueOutcome),
+}
+
+fn with_text_value_writability(
+    role: &str,
+    read_settable: impl FnOnce() -> Option<bool>,
+    write: impl FnOnce() -> anyhow::Result<SetValueOutcome>,
+) -> anyhow::Result<SetValueAttempt> {
+    // AX writability constrains this text-value route. It does not establish
+    // whether a keyboard route or another control's semantic fallback works.
+    if matches!(role, "AXTextField" | "AXTextArea") && read_settable() == Some(false) {
+        return Ok(SetValueAttempt::Refused);
+    }
+    write().map(SetValueAttempt::Applied)
+}
+
+fn nonsettable_text_refusal() -> ToolResult {
+    ToolResult::error(
+        "Cannot set AXValue: the text control currently reports that its value is not settable. \
+         No value write was attempted. This describes AXValue writability, not keyboard editability.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "AX_VALUE_NOT_SETTABLE",
+        "effect": "refused",
+        "path": "ax",
+    }))
 }
 
 // ── Blocking implementation (runs on spawn_blocking thread) ─────────────────
@@ -666,6 +709,78 @@ fn hex_digit(n: u8) -> char {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn readonly_text_refuses_before_visual_or_value_delivery() {
+        for role in ["AXTextField", "AXTextArea"] {
+            let outcome = super::with_text_value_writability(
+                role,
+                || Some(false),
+                || {
+                    panic!(
+                        "a known non-settable text field must not reach visual or input delivery"
+                    )
+                },
+            )
+            .unwrap();
+            assert!(matches!(outcome, super::SetValueAttempt::Refused));
+        }
+    }
+
+    #[test]
+    fn writable_or_unknown_text_keeps_the_existing_value_route() {
+        for settable in [Some(true), None] {
+            let outcome = super::with_text_value_writability(
+                "AXTextArea",
+                || settable,
+                || {
+                    Ok(super::SetValueOutcome {
+                        detail: "delivered".into(),
+                        verified: Some(false),
+                        changed: None,
+                    })
+                },
+            )
+            .unwrap();
+            assert!(matches!(outcome, super::SetValueAttempt::Applied(_)));
+        }
+    }
+
+    #[test]
+    fn non_text_controls_keep_semantic_fallbacks_without_a_text_gate() {
+        for role in [
+            "AXPopUpButton",
+            "AXSlider",
+            "AXIncrementor",
+            "AXComboBox",
+            "AXCheckBox",
+        ] {
+            let result = super::with_text_value_writability(
+                role,
+                || panic!("text-only preflight must not gate another control"),
+                || Err(anyhow::anyhow!("existing route error")),
+            );
+            assert_eq!(result.err().unwrap().to_string(), "existing route error");
+        }
+    }
+
+    #[test]
+    fn readonly_text_refusal_has_no_delivery_or_recovery_escalation() {
+        let result = super::nonsettable_text_refusal();
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.unwrap();
+        assert_eq!(structured["effect"], "refused");
+        let record = cua_driver_core::action_record::ActionExecutionRecord::from_legacy(
+            "set_value",
+            &serde_json::json!({"pid":42}),
+            &structured,
+        )
+        .unwrap();
+        let public = record.public_result().unwrap();
+        assert_eq!(public.effect, cua_driver_contract::ActionEffect::Refused);
+        assert!(public.delivery.is_none());
+        assert!(public.escalation.is_none());
+    }
+
     #[test]
     fn slice_a_value_delivery_uses_scoped_target_and_keeps_error() {
         let registry = crate::cursor::CursorRegistry::new();
