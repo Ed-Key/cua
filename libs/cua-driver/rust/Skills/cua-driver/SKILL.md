@@ -337,6 +337,8 @@ scope.** Use `get_window_state(pid, window_id)` before a window action (or
 expressible window-scoped postcondition. In effective desktop scope,
 `verify_state` is intentionally refused with `window_scope_disabled`; verify
 with a fresh `get_desktop_state` result and agent-owned visual/semantic reading.
+For a bounded `run_sequence`, start with a fresh window snapshot; the executor
+performs the intervening post-action observations as described below.
 
 - **Before** — the pre-action snapshot resolves the `element_index`
   you're about to use. Indices from previous turns are stale; the
@@ -363,6 +365,65 @@ Do not make the driver invent task meaning or retry actions automatically.
 For postconditions not expressible by `verify_state`, take a fresh state
 snapshot and let the agent judge the tree and/or image explicitly. This applies
 to pixel clicks and desktop actions too.
+
+### Verified sequences on one window
+
+When `run_sequence` is advertised, it can execute one to eight `click` or
+`type_text` steps on one exact `(pid, window_id)` in the background. Use a fresh
+snapshot to resolve the targets. Each step contains its own `tool`, `arguments`
+and `expect` array. Put `tool` inside each step, not at the request root.
+
+A click step takes an `element_token` or `x` and `y`. A typing step takes
+only `text` and writes into the already focused field. It does not accept an
+element token or coordinates. When a field needs explicit targeting, use
+standalone `type_text` with its token before a sequence of later actions.
+
+Example shape after the intended text field is already focused, using a
+button token and labels resolved from the actual window:
+
+```json
+{
+  "pid": 844,
+  "window_id": 10725,
+  "steps": [
+    {
+      "tool": "type_text",
+      "arguments": {"text": "Draft title"},
+      "expect": [{"element": {
+        "selector": {"role": "AXTextField", "label_contains": "Title"},
+        "value_equals": "Draft title"
+      }}]
+    },
+    {
+      "tool": "click",
+      "arguments": {"element_token": "s0000002a:4"},
+      "expect": [{"element": {
+        "selector": {"role": "AXStaticText", "label_contains": "Status"},
+        "value_equals": "Status: Ready"
+      }}]
+    }
+  ]
+}
+```
+
+Choose predicates that establish the requested result. For exact text, prefer
+`value_equals`; a substring existence check can also match a longer wrong value.
+Batch only when all targets are already observed and later actions need no new
+UI interpretation. If navigation replaces the controls or a target must be
+discovered after a step, end the batch there and take a fresh snapshot.
+
+The executor uses `verify_state` after every child and continues only when the
+predicates are satisfied and stable. It defaults to two stable samples and a
+1000 ms verification budget per step. These private checks do not replace the
+public action-token cache. They return structured evidence without screenshots;
+request a final image separately when visual interpretation is needed.
+
+Read `status`, `stopped_at`, `stop_reason` and the attempted steps. Unknown,
+unsatisfied, refused, partial or failed actions stop the sequence. Earlier
+actions remain applied; there is no rollback or automatic retry. Reobserve
+before deciding what remains to do, rather than replaying the whole sequence.
+Web/Electron predicates can be untrusted or unknown, so use agent-interpreted
+tree or pixel observations when these predicates cannot establish the outcome.
 
 ### Read action facts without confusing them with task success
 
@@ -769,6 +830,20 @@ and the screenshot together** by default, so you can both dispatch by
 no mode flip. When you're just re-indexing before an element ax action
 and don't need fresh pixels, pass `include_screenshot:false` to skip
 the grab (a perf knob, not a modality choice).
+
+For reading exposed conversation or document text, start with
+`include_screenshot:false` when the accessibility output is usable. Request
+pixels when you need visual position, clipping, a canvas, an ambiguous effect,
+or evidence that conflicts with the tree. A text read does not prove that an
+Electron input reached the renderer; keep the existing action-verification rules.
+
+Use `query` to locate a target, not to fetch a complete message or document
+section. It keeps matching rendered rows and their ancestors, so a matching
+heading can survive while its body or surrounding replies disappear. Read
+without `query` when you need that context. Likewise, lowering `max_depth` or
+`max_elements` can omit the content beneath a visible heading. Start with the
+default bounds for contextual reading and narrow them only when you know the
+needed content remains present. Do not interpret an omitted row as absent.
 
 The response carries:
 
