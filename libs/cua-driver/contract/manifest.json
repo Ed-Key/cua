@@ -8,6 +8,150 @@
   "transport": "mcp_stdio",
   "tools": [
     {
+      "name": "act_and_read",
+      "description": "macOS: run one token-targeted background click or set_value, then read the same window's fresh accessibility state. Use when you already intend to act and inspect. Tree-only by default; observe selects query/context and optional screenshot. Returns both child results separately, including action errors. No retries or semantic verification: a fresh read does not prove the action succeeded. Not a transaction against other clients or user input. Windows and Linux are not yet supported.",
+      "platforms": [
+        "macos"
+      ],
+      "capabilities": [
+        "action.read"
+      ],
+      "annotations": {
+        "read_only": false,
+        "destructive": true,
+        "idempotent": false,
+        "open_world": false
+      },
+      "schema_mode": "canonical_runtime",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "action": {
+            "enum": [
+              "click",
+              "set_value"
+            ],
+            "type": "string"
+          },
+          "element_token": {
+            "type": "string"
+          },
+          "observe": {
+            "additionalProperties": false,
+            "default": {
+              "include_screenshot": false,
+              "query_context": false
+            },
+            "properties": {
+              "include_screenshot": {
+                "default": false,
+                "type": "boolean"
+              },
+              "max_depth": {
+                "maximum": 100,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "max_elements": {
+                "maximum": 2000,
+                "minimum": 1,
+                "type": "integer"
+              },
+              "query": {
+                "type": "string"
+              },
+              "query_context": {
+                "default": false,
+                "type": "boolean"
+              }
+            },
+            "required": [],
+            "type": "object"
+          },
+          "pid": {
+            "maximum": 2147483647,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "session": {
+            "type": "string"
+          },
+          "value": {
+            "type": "string"
+          },
+          "window_id": {
+            "maximum": 4294967295,
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pid",
+          "window_id",
+          "action",
+          "element_token"
+        ],
+        "type": "object"
+      },
+      "success_output_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "action": {
+            "additionalProperties": false,
+            "properties": {
+              "isError": {
+                "type": "boolean"
+              },
+              "structuredContent": true
+            },
+            "type": "object"
+          },
+          "observation": {
+            "additionalProperties": false,
+            "properties": {
+              "isError": {
+                "type": "boolean"
+              },
+              "structuredContent": true
+            },
+            "type": "object"
+          },
+          "timings": {
+            "additionalProperties": false,
+            "properties": {
+              "action_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "observation_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              "total_ms": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              }
+            },
+            "required": [
+              "action_ms",
+              "observation_ms",
+              "total_ms"
+            ],
+            "type": "object"
+          }
+        },
+        "required": [
+          "action",
+          "observation",
+          "timings"
+        ],
+        "type": "object"
+      }
+    },
+    {
       "name": "click",
       "description": "Click coordinates or a snapshot-bound element with an explicit target and delivery mode.",
       "platforms": [

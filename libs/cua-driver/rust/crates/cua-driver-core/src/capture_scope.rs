@@ -190,6 +190,7 @@ fn tool_scope(tool_name: &str, args: &Value) -> ToolScope {
         "get_window_state"
             | "verify_state"
             | "run_sequence"
+            | "act_and_read"
             | "get_accessibility_tree"
             | "get_app_state"
             | "screenshot"
