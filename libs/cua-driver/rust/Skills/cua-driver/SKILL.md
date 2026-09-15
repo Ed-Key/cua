@@ -625,14 +625,23 @@ one call. Open a closed search or editor control first and verify its state.
 Foreground recovery requires explicit authorization under the no-foreground
 principle. An uncertain outcome alone is not a reason to take over focus.
 
-**`set_value` stays AX-only by design** — use it when the intent is to
-replace a control's whole value: dropdowns, checkboxes, sliders, steppers,
-and native text fields such as Finder's inline rename editor. Use
-`type_text` when the intent is to insert text at the current selection or
-cursor. Its pixel counterpart is a `click`/`drag` on the control, not a
-"set value at a pixel." So: insert text → `type_text` (ax+px); replace a
-surfaced native value → `set_value`; pixel-manipulate a control →
-`click`/`drag`.
+**Choose insertion or whole-value replacement from the requested edit.**
+Use `type_text` to insert at the current selection or caret. Use `set_value`
+to replace a control's entire value, including an editable text field, dropdown,
+checkbox, slider, or stepper. Do not replace unrelated existing text when the
+request only calls for an insertion.
+
+When a text field exposes `value_settable:true` and the task supplies its complete
+intended value, prefer one `set_value` call. Filling an empty draft with a complete
+multiline checklist is one example. A whole-value write does not synthesize
+Return keystrokes; it avoids splitting that draft into separate typing and
+newline actions. This capability flag is not proof that the application applied
+the write. Verify the intended field and complete rendered result, especially
+on web content, before assuming success or retrying. Keep the existing
+uncertain-result and background-delivery rules above.
+
+`set_value` remains an accessibility operation. Pixel manipulation of a control
+uses `click` or `drag`; there is no "set value at a pixel" route.
 
 **Action responses carry closed action facts**
 
@@ -933,7 +942,7 @@ the response's `snapshot_id` with `element_index`; bare indices fail closed in
 | Double-click / open              | `double_click({pid, element_token})`                                                                            | Default action when the element advertises one (Open on Finder items / openable rows), else stamped pixel double-click at the element's center                                                                        |
 | Right click / context menu       | `right_click({pid, element_token})` or `click({pid, element_token, action:"show_menu"})`                       | Browser page content should use the typed route where available; see `BROWSER.md`                                                                                                                                     |
 | Type at cursor                   | `type_text({pid, text, element_token})` (ax) or `type_text({pid, text, window_id, x, y})` (px)                  | ax focuses the element then writes via the platform's text-set primitive; **px** pixel-clicks `(x,y)` to focus the renderer, then types — the one-call fix for Chromium/Electron inputs the AX path can't reach       |
-| Set whole non-text control value | `set_value({pid, element_token, value})`                                                                         | **AX-only by design** — dropdown/`AXPopUpButton`, checkbox, slider, stepper; **also the keyboard-commit workaround on minimized windows.** For text use `type_text`; to pixel-manipulate a control use `click`/`drag` |
+| Replace a control's whole value | `set_value({pid, window_id, element_token, value})` | Accessibility write, including editable text. Prefer for an observed settable field when the task supplies the complete replacement. Use `type_text` for insertion at a selection or caret. Verify web writes from fresh rendered state. |
 | Scroll                           | `scroll({pid, direction, amount, by, element_token})`                                                           | synthesizes per-pid PageUp/PageDown/arrows                                                                                                                                                                            |
 | Focus + send key                 | `press_key({pid, key, element_token, modifiers})` (ax) or `press_key({pid, key, x, y})` (px)                    | ax targets the element before posting the key; **px** pixel-clicks `(x,y)` to focus, then sends the key                                                                                                               |
 | Send key to pid                  | `press_key({pid, key, modifiers})`                                                                              | no focus change; key goes to pid's current focus                                                                                                                                                                      |

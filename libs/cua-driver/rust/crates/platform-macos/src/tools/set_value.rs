@@ -49,15 +49,23 @@ fn def() -> &'static ToolDef {
              \n\
              - **AXPopUpButton / select dropdown**: finds the child option whose \
              title or value matches `value` (case-insensitive) and AXPresses it \
-             directly — the native macOS popup menu is never opened, so focus \
+             directly; the native macOS popup menu is never opened, so focus \
              is never stolen. Use this for HTML <select> elements in Safari or \
              any native NSPopUpButton.\n\
              \n\
              - **All other elements**: writes AXValue directly (sliders, steppers, \
-             date pickers, native text fields that expose settable AXValue).\n\
+             date pickers, editable text fields that expose settable AXValue).\n\
              \n\
-             For free-form text entry into web inputs, prefer `type_text_chars` \
-             which synthesises key events — AXValue writes are ignored by WebKit."
+             For text, use this when the task calls for replacing the entire \
+             field value and the observed field reports value_settable:true. \
+             A complete multiline draft can be written in one call without \
+             synthesizing Return keystrokes. Use `type_text` to insert at the \
+             current selection or caret instead. Do not replace unrelated text.\n\
+             \n\
+             Web content may accept or echo an AXValue write without updating \
+             the renderer. Settable does not mean verified: check the intended \
+             field and complete rendered result before assuming success or \
+             retrying. An uncertain result does not authorize foreground input."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
