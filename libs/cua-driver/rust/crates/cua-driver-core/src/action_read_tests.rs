@@ -159,6 +159,53 @@ async fn action_read_preserves_failed_action_and_fresh_observation_without_repla
 }
 
 #[tokio::test]
+async fn action_read_error_evidence_reaches_clients_that_only_read_text() {
+    let _serial = SERIAL.lock().await;
+    for (observation_error, action_error) in [(false, true), (true, false), (true, true)] {
+        let (registry, log) = registry_with_action(observation_error, action_error);
+        let result = registry
+            .invoke_with_context("act_and_read", input(), context())
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        let text_evidence: Vec<Value> = result
+            .content
+            .iter()
+            .filter_map(|part| match part {
+                Content::Text { text, .. } => serde_json::from_str(text).ok(),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            text_evidence.len(),
+            1,
+            "missing complete JSON text evidence"
+        );
+        let output = &text_evidence[0];
+        assert_eq!(output["action"]["isError"] == true, action_error);
+        assert_eq!(output["observation"]["isError"] == true, observation_error);
+        if action_error {
+            assert_eq!(output["action"]["structuredContent"]["detail"], "retained");
+        }
+        if !observation_error {
+            assert_eq!(
+                output["observation"]["structuredContent"]["snapshot_id"],
+                "fresh"
+            );
+            assert_eq!(
+                output["observation"]["structuredContent"]["platform_extension"]["keep"],
+                true
+            );
+        }
+        assert_eq!(Some(output), result.structured_content.as_ref());
+        assert_eq!(
+            log.lock().unwrap().len(),
+            2,
+            "fallback must not replay input or recapture"
+        );
+    }
+}
+
+#[tokio::test]
 async fn action_read_bad_observation_options_reject_before_input() {
     let _serial = SERIAL.lock().await;
     let (registry, log) = registry(false);
