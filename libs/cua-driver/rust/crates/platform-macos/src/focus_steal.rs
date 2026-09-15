@@ -185,9 +185,25 @@ impl FocusStealPreventer {
         dormant: bool,
         origin: &'static str,
     ) -> Option<(i32, SuppressionLease)> {
+        Self::begin_current_suppression(dormant, None, origin)
+    }
+
+    pub(crate) fn begin_action_suppression(
+        target_pid: i32,
+        origin: &'static str,
+    ) -> Option<(i32, SuppressionLease)> {
+        Self::begin_current_suppression(false, Some(target_pid), origin)
+    }
+
+    fn begin_current_suppression(
+        dormant: bool,
+        allowed_pid: Option<i32>,
+        origin: &'static str,
+    ) -> Option<(i32, SuppressionLease)> {
         let shared = Self::shared();
-        let (prior, handle) = shared.dispatcher.add_current(
+        let (prior, handle) = shared.dispatcher.add_current_allowing(
             dormant,
+            allowed_pid,
             crate::input::skylight::frontmost_pid,
             origin,
         )?;
@@ -276,6 +292,45 @@ pub fn begin_suppression_allowing(
     origin: &'static str,
 ) -> SuppressionLease {
     FocusStealPreventer::begin_suppression_allowing(allowed_pid, restore_to, origin)
+}
+
+tokio::task_local! {
+    static ACTION_SUPPRESSION: (i32, Option<Arc<SuppressionLease>>);
+}
+
+/// Nested actuators share the action's restoration intent. An explicit None
+/// records foreground delivery, for which inner guards must remain disabled.
+pub(crate) async fn with_action_suppression<T>(
+    pid: i32,
+    lease: Option<Arc<SuppressionLease>>,
+    future: impl std::future::Future<Output = T>,
+) -> T {
+    ACTION_SUPPRESSION.scope((pid, lease), future).await
+}
+
+/// Outer None means this task has no matching action scope. Inner None means
+/// the scope deliberately disables restoration or its intent was cancelled.
+pub(crate) fn inherited_targeted_suppression(
+    target_pid: Option<i32>,
+    origin: &'static str,
+) -> Option<Option<SuppressionLease>> {
+    ACTION_SUPPRESSION
+        .try_with(|(owner, parent)| {
+            if target_pid.is_some_and(|target| target != *owner) {
+                return None;
+            }
+            Some(target_pid.and_then(|target| {
+                let parent = parent.as_ref()?;
+                let handle = parent.dispatcher.add_child(parent.handle, target, origin)?;
+                Some(SuppressionLease {
+                    handle,
+                    dispatcher: parent.dispatcher.clone(),
+                    released: false,
+                })
+            }))
+        })
+        .ok()
+        .flatten()
 }
 
 /// RAII lease. `Drop` ends the entry synchronously, so the entry is
@@ -378,9 +433,20 @@ impl Dispatcher {
         }
     }
 
+    #[cfg(test)]
     fn add_current(
         self: &Arc<Self>,
         dormant: bool,
+        foreground: impl FnOnce() -> Option<i32>,
+        origin: &'static str,
+    ) -> Option<(i32, SuppressionHandle)> {
+        self.add_current_allowing(dormant, None, foreground, origin)
+    }
+
+    fn add_current_allowing(
+        self: &Arc<Self>,
+        dormant: bool,
+        allowed_pid: Option<i32>,
         foreground: impl FnOnce() -> Option<i32>,
         origin: &'static str,
     ) -> Option<(i32, SuppressionHandle)> {
@@ -391,7 +457,7 @@ impl Dispatcher {
         }
         let handle = self.add_entry_with_activity(
             dormant.then_some(prior),
-            None,
+            allowed_pid,
             prior,
             origin,
             input_activity,
@@ -471,6 +537,47 @@ impl Dispatcher {
         let _ = self.janitor_active.send(true);
         tracing::debug!(handle = %id, ?target_pid, ?allowed_pid, restore_to, origin, phase = "registered", "focus suppression lifecycle");
         SuppressionHandle(id)
+    }
+
+    fn add_child(
+        self: &Arc<Self>,
+        parent: SuppressionHandle,
+        target_pid: i32,
+        origin: &'static str,
+    ) -> Option<SuppressionHandle> {
+        let activity = (self.read_input_activity)();
+        let id = Uuid::new_v4();
+        let restore_to;
+        {
+            let mut entries = self.entries.lock().unwrap();
+            let entry = entries.get(&parent.0)?;
+            if entry.deadline <= Instant::now() || entry.input_activity != activity {
+                entries.remove(&parent.0);
+                return None;
+            }
+            if target_pid <= 0 || target_pid == entry.restore_to {
+                return None;
+            }
+            restore_to = entry.restore_to;
+            let child = Entry {
+                sequence: entry.sequence,
+                input_activity: entry.input_activity,
+                target_pid: Some(target_pid),
+                allowed_pid: None,
+                restore_to,
+                deadline: entry.deadline,
+                origin,
+            };
+            entries.insert(id, child);
+            // A new matching entry invalidates an in-flight winner snapshot,
+            // but it must not acquire a newer operation's priority.
+            self.sequence.fetch_add(1, Ordering::Relaxed);
+        }
+        self.kick_janitor();
+        let _ = self.janitor_active.send(true);
+        tracing::debug!(handle = %id, parent = %parent.0, target_pid, restore_to, origin,
+            phase = "inherited", "focus suppression lifecycle");
+        Some(SuppressionHandle(id))
     }
 
     fn retarget(&self, handle: SuppressionHandle, target_pid: i32, origin: &'static str) -> bool {
@@ -832,6 +939,144 @@ mod tests {
         let source = input.clone();
         let dispatcher = Arc::new(Dispatcher::new(move || *source.lock().unwrap()));
         (dispatcher, input)
+    }
+
+    #[tokio::test]
+    async fn nested_guard_does_not_rearm_after_outside_input() {
+        let (d, input) = input_fixture();
+        let handle = d.add_allowing(42, 7, "test.outer");
+        let parent = Arc::new(SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        });
+        with_action_suppression(42, Some(parent), async {
+            input.lock().unwrap().0[0] = 1;
+            let restored = crate::focus_guard::with_focus_suppressed(
+                Some(42),
+                Some(99),
+                "test.inner",
+                || async { winner_pid(&d, 42) },
+            )
+            .await;
+            assert_eq!(
+                restored, None,
+                "nested guard must not absorb outside input into a new baseline"
+            );
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn nested_guard_does_not_supersede_a_newer_action() {
+        let (d, _) = input_fixture();
+        let handle = d.add_allowing(42, 7, "test.outer");
+        let parent = Arc::new(SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        });
+        let newer = d.add(None, 11, "test.newer");
+        with_action_suppression(42, Some(parent), async {
+            let restored = crate::focus_guard::with_focus_suppressed(
+                Some(42),
+                Some(99),
+                "test.inner",
+                || async { winner_pid(&d, 42) },
+            )
+            .await;
+            assert_eq!(
+                restored,
+                Some(11),
+                "a nested phase must keep the original action priority"
+            );
+        })
+        .await;
+        d.remove(newer);
+    }
+
+    #[tokio::test]
+    async fn nested_guard_uses_original_destination_and_releases_only_itself() {
+        let (d, _) = input_fixture();
+        let (prior, handle) = d
+            .add_current_allowing(false, Some(42), || Some(7), "test.outer")
+            .unwrap();
+        assert_eq!(prior, 7);
+        let parent = Arc::new(SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        });
+        with_action_suppression(42, Some(parent), async {
+            assert_eq!(winner_pid(&d, 42), None, "outer allows the addressed app");
+            let restored = crate::focus_guard::with_focus_suppressed(
+                Some(42),
+                Some(99),
+                "test.inner",
+                || async { winner_pid(&d, 42) },
+            )
+            .await;
+            assert_eq!(
+                restored,
+                Some(7),
+                "inner ignores a later or cached prior PID"
+            );
+            assert_eq!(
+                winner_pid(&d, 42),
+                None,
+                "targeted protection ends with inner guard"
+            );
+            assert_eq!(
+                winner_pid(&d, 88),
+                Some(7),
+                "outer cross-app protection remains"
+            );
+        })
+        .await;
+        assert_eq!(d.len(), 0);
+    }
+
+    #[tokio::test]
+    async fn removed_parent_does_not_fall_back_to_a_fresh_guard() {
+        let (d, _) = input_fixture();
+        let handle = d.add_allowing(42, 7, "test.outer");
+        let parent = Arc::new(SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        });
+        d.remove(handle);
+        with_action_suppression(42, Some(parent), async {
+            let result = crate::focus_guard::with_focus_suppressed(
+                Some(42),
+                Some(99),
+                "test.inner",
+                || async {
+                    inherited_targeted_suppression(Some(42), "test.check")
+                        .is_some_and(|lease| lease.is_none())
+                },
+            )
+            .await;
+            assert!(result);
+            assert_eq!(d.len(), 0);
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn foreground_scope_disables_inner_restoration_without_leaking_to_other_tasks() {
+        with_action_suppression(42, None, async {
+            assert!(inherited_targeted_suppression(Some(42), "test.foreground")
+                .is_some_and(|lease| lease.is_none()));
+            assert!(inherited_targeted_suppression(Some(43), "test.other_pid").is_none());
+            assert!(tokio::spawn(async {
+                inherited_targeted_suppression(Some(42), "test.other_task").is_none()
+            })
+            .await
+            .unwrap());
+        })
+        .await;
+        assert!(inherited_targeted_suppression(Some(42), "test.after_scope").is_none());
     }
 
     #[test]
