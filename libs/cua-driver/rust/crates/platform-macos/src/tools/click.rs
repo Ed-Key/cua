@@ -220,7 +220,8 @@ fn def() -> &'static ToolDef {
              that doesn't appear in the AX tree.\n\n\
              Two addressing modes:\n\n\
              - element_token, or element_index + snapshot_id (from get_window_state): AX action path. \
-               Works on backgrounded/hidden windows. No cursor move, no focus steal. \
+               Works on backgrounded/hidden windows without moving the real mouse pointer or stealing focus. \
+               The visible agent cursor follows the configured motion policy automatically. \
                The snapshot cache is scoped per (pid, window_id) and is replaced by the \
                next snapshot of the same window — re-snapshot every turn before clicking.\n\n\
              - x, y (window-local screenshot pixels, top-left origin of the PNG returned \
