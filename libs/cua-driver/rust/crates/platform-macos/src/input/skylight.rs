@@ -555,6 +555,51 @@ pub fn get_process_psn_for_window(window_id: u32, pid: libc::pid_t, out_psn: &mu
     false
 }
 
+/// Compare a process against the WindowServer foreground without relying on
+/// NSWorkspace's asynchronously refreshed AppKit state. This variant is for
+/// application activation notifications, which do not identify a window.
+/// Missing symbols or an unresolved process are unknown, never a match.
+pub fn front_pid_matches(target_pid: libc::pid_t) -> Option<bool> {
+    if target_pid <= 0 {
+        return None;
+    }
+    let get_target = get_process_for_pid_fn()?;
+    let get_front = get_front_process_fn()?;
+    let mut target_psn = [0u8; 8];
+    if unsafe { get_target(target_pid, target_psn.as_mut_ptr().cast()) } != 0 {
+        return None;
+    }
+    let mut front_psn = [0u8; 8];
+    if unsafe { get_front(front_psn.as_mut_ptr().cast()) } != 0 {
+        return None;
+    }
+    Some(target_psn == front_psn)
+}
+
+/// Restore a previously captured foreground process without raising all its
+/// windows. This uses the same window-zero / kCPSNoWindows restoration as the
+/// existing menu shortcut path. The caller must revalidate its suppression
+/// lease and current foreground after PID resolution. No AppKit fallback is
+/// submitted. A successful native return means the request was accepted, not
+/// that restoration completed synchronously or before the lease expires.
+pub fn restore_front_pid(target_pid: libc::pid_t, admit: &mut dyn FnMut() -> bool) -> bool {
+    if target_pid <= 0 {
+        return false;
+    }
+    let (Some(get_target), Some(set_front)) = (get_process_for_pid_fn(), set_front_process_fn())
+    else {
+        return false;
+    };
+    let mut target_psn = [0u8; 8];
+    if unsafe { get_target(target_pid, target_psn.as_mut_ptr().cast()) } != 0 {
+        return false;
+    }
+    if !admit() {
+        return false;
+    }
+    unsafe { set_front(target_psn.as_ptr().cast(), 0, 0x400) == 0 }
+}
+
 /// Return whether WindowServer currently considers the exact window's process
 /// frontmost. Unlike `NSWorkspace.frontmostApplication`, this query does not
 /// depend on the caller's AppKit run loop processing an activation update.
