@@ -182,6 +182,7 @@ impl Tool for ObservedActionTool {
                     };
                     (Some(prior), Some(std::sync::Arc::new(lease)))
                 } else {
+                    crate::focus_steal::FocusStealPreventer::retire_action_tails();
                     (crate::input::skylight::frontmost_pid(), None)
                 };
                 let read_suppression = suppression.clone();
@@ -198,6 +199,8 @@ impl Tool for ObservedActionTool {
             |before, mut result| async move {
                 let wait_for_signal =
                     needs_window_signal_wait(&self.inner.def().name, &observation_args, &result);
+                let tail_deadline = (!wait_for_signal).then(|| Instant::now() + OBSERVATION_TIMEOUT);
+                let tail_lease = before.suppression.clone();
                 let delta = crate::background_mutation::observe_blocking(move || {
                     // The blocking read can outlive cancellation of invoke().
                     let _suppression = before.suppression;
@@ -208,6 +211,11 @@ impl Tool for ObservedActionTool {
                 .flatten();
                 if let Some(delta) = delta {
                     result.surface_delta = Some(delta);
+                }
+                if let (Some(lease), Some(deadline)) = (tail_lease, tail_deadline) {
+                    // Drop the task handle, not the protection it owns. The
+                    // dispatcher still enforces input cancellation and expiry.
+                    drop(lease.retain_until(deadline));
                 }
                 result
             },

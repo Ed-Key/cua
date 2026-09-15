@@ -17,11 +17,16 @@ The immediate path still reads the window signature and current accessibility
 roots. An existing transition signal receives the same bounded AX publication
 catch-up and owner resolution as before. The input gate, focus suppression,
 same-process mutation lease, and action verification remain in place.
-The observer's cross-application suppression lease ends when this shorter
-observation completes. It therefore no longer covers the remaining portion of
-the former 400 ms interval for delayed helper-app activations. The key handler's
-targeted 50 ms post-action suppression is unchanged. This is a protection-window
-tradeoff as well as a latency change and requires live focus checks.
+After the immediate observation, the original cross-application suppression
+lease may remain until 400 ms after actuator completion. This bounded retention
+runs independently of the response and holds no process mutation lock. Time
+spent observing consumes that deadline; it does not start another 400 ms wait.
+Outside input cancels restoration. A newer root operation or explicit foreground
+action retires completed protection, and an older action cannot install it after
+newer intent has occurred. Refresh and nested guard creation cannot renew it.
+The key handler's targeted 50 ms suppression and the outer guard's allowance
+for the addressed process are unchanged. These remain best-effort focus checks,
+not a guarantee against all delayed activations.
 
 This is adaptive, best-effort observation. A selection-only change proves the
 editor processed the key; it does not prove an application cannot schedule a
