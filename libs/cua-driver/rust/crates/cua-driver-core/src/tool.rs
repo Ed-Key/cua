@@ -838,9 +838,14 @@ impl ToolRegistry {
         self.register(Box::new(crate::recording_tools::InstallFfmpegTool));
     }
 
-    /// Register the bounded composite after the action and verification tools.
+    /// Register bounded composites after action and observation tools.
+    /// The action/read convenience currently exposes only the macOS contract.
     pub fn register_sequence_tools(&mut self) {
         self.register(Box::new(crate::sequence::RunSequenceTool::new(
+            self.replay_registry.clone(),
+        )));
+        #[cfg(target_os = "macos")]
+        self.register(Box::new(crate::action_read::ActAndReadTool::new(
             self.replay_registry.clone(),
         )));
     }
@@ -1514,6 +1519,7 @@ impl ToolRegistry {
                     | "get_recording_state"
                     | "replay_trajectory"
                     | "run_sequence"
+                    | "act_and_read"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
         let _desktop_action = if requires_desktop_coordination(

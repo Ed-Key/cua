@@ -45,6 +45,9 @@ pub fn parent_liveness_stdin_enabled() -> bool {
     embedded_mode() && std::env::var_os(PARENT_LIVENESS_STDIN_ENV).is_some_and(|value| value == "1")
 }
 
+pub mod action_read;
+#[cfg(all(test, target_os = "macos"))]
+mod action_read_tests;
 pub mod action_record;
 pub mod action_target;
 pub mod authorization;
