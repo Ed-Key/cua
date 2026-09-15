@@ -54,6 +54,9 @@ use crate::apps;
 use crate::focus_steal;
 
 /// Wrap an async closure `f` with a targeted focus-steal suppressor.
+/// Within ObservedActionTool, inherit its validated baseline and priority.
+/// A cancelled parent never falls back to a newly sampled restoration intent.
+/// The explicit prior PID below applies only outside an action scope.
 ///
 /// - `target_pid` — the pid the action is dispatched to. `Some(pid)` is
 ///   the standard case; `None` skips the targeted entry entirely because the
@@ -95,18 +98,25 @@ where
         _ => false,
     };
 
-    let _lease = if should_arm {
-        // unwrap()s are safe — `should_arm` is true only when both are Some.
-        Some(focus_steal::begin_suppression(
-            target_pid,
-            prior_frontmost.unwrap(),
-            origin,
-        ))
-    } else {
-        None
-    };
+    let _lease =
+        if let Some(inherited) = focus_steal::inherited_targeted_suppression(target_pid, origin) {
+            inherited
+        } else if should_arm {
+            // unwrap()s are safe — `should_arm` is true only when both are Some.
+            Some(focus_steal::begin_suppression(
+                target_pid,
+                prior_frontmost.unwrap(),
+                origin,
+            ))
+        } else {
+            None
+        };
 
-    let result = f().await;
+    let action = f();
+    let result = match &_lease {
+        Some(lease) => lease.keep_alive_while(action).await,
+        None => action.await,
+    };
 
     // Post-action settle — give the reactive observer time to fire on
     // any side-effect activation before we drop the lease. Matches

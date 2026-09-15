@@ -60,6 +60,13 @@ struct RootObservation {
     window_signature: HashSet<u32>,
 }
 
+#[derive(Default)]
+struct ActionObservation {
+    prior_front: Option<i32>,
+    roots: RootObservation,
+    suppression: Option<std::sync::Arc<crate::focus_steal::SuppressionLease>>,
+}
+
 pub struct ObservedActionTool {
     inner: Box<dyn Tool>,
 }
@@ -71,7 +78,7 @@ impl ObservedActionTool {
 
     // Keep the ordering boundary independent of macOS queries so lifecycle
     // behavior can be exercised without installing observers on a desktop.
-    async fn invoke_observed<B, Start, Finish, End>(
+    async fn invoke_observed<Start, Finish, End>(
         &self,
         pid: i32,
         args: Value,
@@ -79,24 +86,34 @@ impl ObservedActionTool {
         finish: Finish,
     ) -> ToolResult
     where
-        Start: std::future::Future<Output = B>,
-        Finish: FnOnce(B, ToolResult) -> End,
+        Start: std::future::Future<Output = Result<ActionObservation, ToolResult>>,
+        Finish: FnOnce(ActionObservation, ToolResult) -> End,
         End: std::future::Future<Output = ToolResult>,
     {
         crate::background_mutation::with_observation_lease(pid, async {
             let started = Instant::now();
-            let before = start.await;
+            let before = match start.await {
+                Ok(before) => before,
+                Err(refusal) => return refusal,
+            };
             tracing::debug!(pid, tool = %self.inner.def().name, phase = "before_complete",
                 elapsed_ms = started.elapsed().as_millis() as u64, "post-action observer lifecycle");
-            let action_started = Instant::now();
-            let result = self.inner.invoke(args).await;
-            tracing::debug!(pid, tool = %self.inner.def().name, phase = "actuator_complete",
-                elapsed_ms = action_started.elapsed().as_millis() as u64, "post-action observer lifecycle");
-            let result = finish(before, result).await;
-            tracing::debug!(pid, tool = %self.inner.def().name, phase = "complete",
-                elapsed_ms = started.elapsed().as_millis() as u64,
-                has_delta = result.surface_delta.is_some(), "post-action observer lifecycle");
-            result
+            let suppression = before.suppression.clone();
+            let action = crate::focus_steal::with_action_suppression(pid, suppression.clone(), async {
+                let action_started = Instant::now();
+                let result = self.inner.invoke(args).await;
+                tracing::debug!(pid, tool = %self.inner.def().name, phase = "actuator_complete",
+                    elapsed_ms = action_started.elapsed().as_millis() as u64, "post-action observer lifecycle");
+                let result = finish(before, result).await;
+                tracing::debug!(pid, tool = %self.inner.def().name, phase = "complete",
+                    elapsed_ms = started.elapsed().as_millis() as u64,
+                    has_delta = result.surface_delta.is_some(), "post-action observer lifecycle");
+                result
+            });
+            match suppression {
+                Some(lease) => lease.keep_alive_while(action).await,
+                None => action.await,
+            }
         })
         .await
     }
@@ -154,30 +171,34 @@ impl Tool for ObservedActionTool {
             pid,
             args,
             async {
-                let prior_front = crate::apps::frontmost_pid();
-                let suppression = prior_front
-                    .filter(|_| suppress_cross_app)
-                    .map(|restore_to| {
-                        std::sync::Arc::new(crate::focus_steal::begin_suppression_allowing(
-                            pid,
-                            restore_to,
-                            "ObservedActionTool",
-                        ))
-                    });
+                let (prior_front, suppression) = if suppress_cross_app {
+                    let Some((prior, lease)) = crate::focus_steal::FocusStealPreventer::begin_action_suppression(pid, "ObservedActionTool") else {
+                        return Err(ToolResult::error(
+                            "Action was not dispatched: a stable foreground/input baseline could not be captured. Refresh app state before retrying.",
+                        ).with_structured(serde_json::json!({
+                            "error": "BACKGROUND_ACTION_UNAVAILABLE", "dispatched": false,
+                        })));
+                    };
+                    (Some(prior), Some(std::sync::Arc::new(lease)))
+                } else {
+                    (crate::input::skylight::frontmost_pid(), None)
+                };
                 let read_suppression = suppression.clone();
-                let before = crate::background_mutation::observe_blocking(move || {
+                let read = crate::background_mutation::observe_blocking(move || {
                     let _suppression = read_suppression;
                     begin_observation(pid)
-                })
-                .await
-                .unwrap_or_default();
-                (prior_front, before, suppression)
+                });
+                let roots = match &suppression {
+                    Some(lease) => lease.keep_alive_while(read).await,
+                    None => read.await,
+                }.unwrap_or_default();
+                Ok(ActionObservation { prior_front, roots, suppression })
             },
-            |(prior_front, before, _suppression), mut result| async move {
+            |before, mut result| async move {
                 let delta = crate::background_mutation::observe_blocking(move || {
                     // The blocking read can outlive cancellation of invoke().
-                    let _suppression = _suppression;
-                    observe_delta(pid, prior_front, before)
+                    let _suppression = before.suppression;
+                    observe_delta(pid, before.prior_front, before.roots)
                 })
                 .await
                 .ok()
@@ -279,7 +300,7 @@ fn poll_appeared_roots(
 
 fn foreground_changed(prior_front: Option<i32>) -> bool {
     matches!(
-        (prior_front, crate::apps::frontmost_pid()),
+        (prior_front, crate::input::skylight::frontmost_pid()),
         (Some(before), Some(after)) if before != after
     )
 }
@@ -509,11 +530,7 @@ fn snapshot_roots(pid: i32) -> Option<RootSnapshot> {
         Ok(roots)
     })();
     if let Err(ref error) = result {
-        tracing::debug!(
-            pid,
-            ?error,
-            "AX root snapshot unavailable for this attempt"
-        );
+        tracing::debug!(pid, ?error, "AX root snapshot unavailable for this attempt");
     }
     tracing::debug!(pid, complete = result.is_ok(),
         elapsed_ms = started.elapsed().as_millis() as u64,
@@ -801,6 +818,37 @@ mod tests {
         }
     }
 
+    struct EffectProbe(std::sync::Arc<std::sync::atomic::AtomicBool>);
+
+    #[async_trait]
+    impl Tool for EffectProbe {
+        fn def(&self) -> &ToolDef {
+            MutationProbe.def()
+        }
+        async fn invoke(&self, _: Value) -> ToolResult {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+            ToolResult::text("dispatched")
+        }
+    }
+
+    #[tokio::test]
+    async fn unavailable_action_baseline_refuses_before_actuator() {
+        let effect = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let result = ObservedActionTool::new(Box::new(EffectProbe(effect.clone())))
+            .invoke_observed(
+                93103,
+                serde_json::json!({"pid":93103}),
+                async { Err::<ActionObservation, _>(ToolResult::error("baseline unavailable")) },
+                |_, result| async { result },
+            )
+            .await;
+        assert!(
+            !effect.load(std::sync::atomic::Ordering::SeqCst),
+            "baseline failure must stop the actual actuator"
+        );
+        assert_eq!(result.is_error, Some(true));
+    }
+
     #[tokio::test]
     async fn observation_waits_for_prior_same_pid_mutation_before_snapshot() {
         const PID: i32 = 93101;
@@ -813,8 +861,9 @@ mod tests {
                     serde_json::json!({"pid": PID}),
                     async {
                         started_tx.send(()).unwrap();
+                        Ok(ActionObservation::default())
                     },
-                    |(), result| async { result },
+                    |_, result| async { result },
                 )
                 .await
         });
@@ -843,8 +892,8 @@ mod tests {
                 .invoke_observed(
                     PID,
                     serde_json::json!({"pid": PID}),
-                    async {},
-                    |(), result| async {
+                    async { Ok(ActionObservation::default()) },
+                    |_, result| async {
                         observing_tx.send(()).unwrap();
                         finish_rx.await.unwrap();
                         result
