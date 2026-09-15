@@ -85,6 +85,11 @@ type GetFrontProcessFn = unsafe extern "C" fn(*mut c_void) -> i32;
 /// Deprecated but still resolves. Writes the target pid's 8-byte PSN.
 type GetProcessForPIDFn = unsafe extern "C" fn(pid_t, *mut c_void) -> i32;
 
+/// `OSStatus GetProcessPID(const ProcessSerialNumber *psn, pid_t *pid)`
+/// Public HIServices API, deprecated but thread-safe. Resolved dynamically so
+/// absence returns unknown rather than falling back to cached AppKit state.
+type GetProcessPIDFn = unsafe extern "C" fn(*const c_void, *mut pid_t) -> i32;
+
 /// Factory: `+[SLSEventAuthenticationMessage messageWithEventRecord:pid:version:]`
 /// ObjC send: `(id self, SEL _cmd, void* record, int32 pid, uint32 version) -> id`
 type FactoryMsgSendFn = unsafe extern "C" fn(
@@ -225,6 +230,11 @@ fn get_front_process_fn() -> Option<GetFrontProcessFn> {
 fn get_process_for_pid_fn() -> Option<GetProcessForPIDFn> {
     static SYM: OnceLock<Option<GetProcessForPIDFn>> = OnceLock::new();
     *SYM.get_or_init(|| find_sym(b"GetProcessForPID\0").map(|p| unsafe { as_fn(p) }))
+}
+
+fn get_process_pid_fn() -> Option<GetProcessPIDFn> {
+    static SYM: OnceLock<Option<GetProcessPIDFn>> = OnceLock::new();
+    *SYM.get_or_init(|| find_sym(b"GetProcessPID\0").map(|p| unsafe { as_fn(p) }))
 }
 
 /// `true` when `SLEventPostToPid` resolved.
@@ -553,6 +563,33 @@ pub fn get_process_psn_for_window(window_id: u32, pid: libc::pid_t, out_psn: &mu
         return unsafe { get_pid_psn(pid, out_psn.as_mut_ptr() as *mut c_void) } == 0;
     }
     false
+}
+
+/// Read the WindowServer foreground process directly, including applications
+/// with no visible window. A process change during PID lookup is unknown.
+/// This is a checked snapshot, not an atomic guarantee about later actions.
+pub(crate) fn frontmost_pid() -> Option<i32> {
+    let get_front = get_front_process_fn()?;
+    let get_pid = get_process_pid_fn()?;
+    read_front_pid_with(
+        || {
+            let mut psn = [0u32; 2];
+            (unsafe { get_front(psn.as_mut_ptr().cast()) } == 0).then_some(psn)
+        },
+        |psn| {
+            let mut pid = 0;
+            (unsafe { get_pid(psn.as_ptr().cast(), &mut pid) } == 0).then_some(pid)
+        },
+    )
+}
+
+fn read_front_pid_with(
+    mut foreground: impl FnMut() -> Option<[u32; 2]>,
+    mut resolve_pid: impl FnMut([u32; 2]) -> Option<i32>,
+) -> Option<i32> {
+    let process = foreground()?;
+    let pid = resolve_pid(process).filter(|pid| *pid > 0)?;
+    (foreground()? == process).then_some(pid)
 }
 
 /// Compare a process against the WindowServer foreground without relying on
@@ -910,6 +947,43 @@ pub fn with_menu_shortcut_activation(
 #[cfg(test)]
 mod tests {
     use super::{make_key_window_record, preserves_exact_existing_focus};
+
+    #[test]
+    fn foreground_resolution_rejects_a_process_change() {
+        let mut values = [Some([0, 10]), Some([0, 11])].into_iter();
+        assert_eq!(
+            super::read_front_pid_with(|| values.next().unwrap(), |_| Some(7)),
+            None
+        );
+    }
+
+    #[test]
+    fn foreground_resolution_rejects_unknown_and_invalid_pid() {
+        assert_eq!(super::read_front_pid_with(|| None, |_| Some(7)), None);
+        assert_eq!(super::read_front_pid_with(|| Some([0, 10]), |_| None), None);
+        assert_eq!(
+            super::read_front_pid_with(|| Some([0, 10]), |_| Some(0)),
+            None
+        );
+        assert_eq!(
+            super::read_front_pid_with(|| Some([0, 10]), |_| Some(-1)),
+            None
+        );
+    }
+
+    #[test]
+    fn foreground_resolution_returns_a_stable_process() {
+        assert_eq!(
+            super::read_front_pid_with(
+                || Some([0, 10]),
+                |psn| {
+                    assert_eq!(psn, [0, 10]);
+                    Some(7)
+                }
+            ),
+            Some(7)
+        );
+    }
 
     #[test]
     fn make_key_records_address_only_the_exact_window() {
