@@ -368,7 +368,14 @@ pub fn contracts() -> Vec<ToolContract> {
             screenshot as uninterpreted visual evidence for a multimodal caller. Predicate \
             results are satisfied, unsatisfied, or unknown; unknown never implies success. \
             Accessibility projections are conservative: absence remains unknown unless the \
-            observed search domain is proven exhaustive."
+            observed search domain is proven exhaustive. Use timeout_ms:0 for a single \
+            current-state check (stable_samples must be omitted or 1); this skips polling, \
+            not observation work. Omitted timeout_ms uses a 5000 ms polling budget and normally \
+            requires two consecutive satisfied samples. Use polling when waiting for a \
+            supported, trustworthy state transition. Web accessibility values are not \
+            renderer proof: for untrusted_source, inspect fresh rendered evidence rather \
+            than repeatedly checking the same AX value. A screenshot can be returned \
+            with include_screenshot:true, but only the caller interprets it."
             .into(),
         platforms: ALL_PLATFORMS.to_vec(),
         aliases: Vec::new(),

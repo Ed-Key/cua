@@ -333,8 +333,11 @@ themselves.
 
 **Every action MUST be bracketed by observation for the session's effective
 scope.** Use `get_window_state(pid, window_id)` before a window action (or
-`get_desktop_state(session)` in desktop scope), then use `verify_state` for an
-expressible window-scoped postcondition. In effective desktop scope,
+`get_desktop_state(session)` in desktop scope), then establish the postcondition
+from fresh evidence. Use `verify_state` for a supported, trusted structured
+check or read the rendered outcome when that is the appropriate evidence.
+Do not add a second check when the first already establishes the complete
+postcondition. In effective desktop scope,
 `verify_state` is intentionally refused with `window_scope_disabled`; verify
 with a fresh `get_desktop_state` result and agent-owned visual/semantic reading.
 For a bounded `run_sequence`, start with a fresh window snapshot; the executor
@@ -360,6 +363,21 @@ content, ambiguous matches, missing targets, unavailable observations, and
 requested consecutive sample count is `stability_unproven`, not success.
 Negative element existence is conservative: when an accessibility projection
 cannot prove its search domain exhaustive, absence remains `unknown`.
+
+Choose verification from the evidence the postcondition needs:
+
+- For a supported structured check of the current state, use
+  `verify_state(..., timeout_ms:0)`. This takes one sample without polling;
+  omit `stable_samples` or set it to `1`. It does not prove stability over time.
+- When waiting for a supported, trustworthy state transition, use bounded
+  polling and the required stable samples. Omitting `timeout_ms` can wait
+  five seconds. A transient unavailable observation may recover during that wait.
+- For an Electron or other web-content value whose AX echo is untrusted,
+  inspect a fresh rendered screenshot or a supported, exactly bound browser
+  read. Repeating the same AX value predicate does not make it renderer proof.
+  If a current post-action image already establishes the complete postcondition,
+  do not add a redundant AX verification call. If it is unclear, gather the
+  missing evidence; do not assume success or replay the action blindly.
 
 Do not make the driver invent task meaning or retry actions automatically.
 For postconditions not expressible by `verify_state`, take a fresh state
@@ -593,7 +611,7 @@ on the action call, and that one choice selects the rung:
 
 `ax`↔`element_index`, `px`↔pixel `x,y`. We retired the word "vision"
 for the _dispatch_ path — it conflated perception with dispatch.
-Perception is always both; dispatch is `ax` or `px`.
+Perception returns the tree and optional pixels; dispatch is `ax` or `px`.
 
 **The keyboard family has both forms too.** `type_text`, `press_key`,
 and `hotkey` take a snapshot-bound element target (ax) **or** `x,y` (px) — mutually
@@ -673,10 +691,10 @@ can pixel-target in the background, so they target `pixel`. See
 
 ## The verify-then-escalate ladder (algorithm)
 
-Every snapshot already hands you both the tree and the screenshot, so
-verifying never means "go take a screenshot" — it means cross-check
-the tree against the pixels you already have, and only change
-_dispatch rung_ on a real signal. Walk the rungs:
+Snapshots include pixels by default; tree-only reads omit them. Reuse a fresh
+post-action image when it establishes the outcome. Request one when rendered
+evidence is needed and the current read has none. Choose the verification mode
+above before changing the input route. Walk the rungs:
 
 ```
 # Routes 0–1 — resolve non-GUI, exact geometry, and supported page outcomes first
@@ -687,13 +705,15 @@ _dispatch rung_ on a real signal. Walk the rungs:
 # Continue below only when the postcondition actually requires native UI interaction.
 
 # Route 2 — element AX/UIA/AT-SPI action, backgrounded
-get_window_state(pid, window_id)            # tree + screenshot, both, always
+get_window_state(pid, window_id)            # ground the target; tree-only when sufficient
 resp = click(pid, element_token)            # or type_text / set_value / press_key
-check = verify_state(                       # bounded structured read-back
+check = verify_state(                       # only for a supported, trusted predicate
     pid, window_id,
     expect=[...],
+    timeout_ms=0,                           # current-state check; use a bounded wait for a transition
     include_screenshot=true                 # optional evidence for multimodal harness
 )
+# For an untrusted web value, read fresh rendered state instead of polling its AX echo.
 
 if check.status == "satisfied":
     done                                    # driver-verified
@@ -702,17 +722,18 @@ if check.status == "unknown" and check has an image:
     harness reads the image                  # model-owned visual interpretation
     if visual outcome is satisfied: done
 
-# escalate only on a real signal
-if resp.effect == "suspected_noop"
-   or resp.escalation.target == "pixel"
-   or get_window_state.degraded            # empty tree → non-AX surface
-   or check.status != "satisfied"
-   or the tree looks wrong vs the screenshot:   # e.g. an h:1 / off-viewport row
+# An uncertain result or suggested pixel route requests evidence, not another click.
+if check.status != "satisfied" or the tree disagrees with the pixels:
+    gather fresh post-action evidence      # bounded polling for a recoverable trusted transition
+    if the complete outcome is established: done
+    if delivery or outcome remains uncertain: stop and report the uncertainty
 
-    # Route 3 — element px action off the SAME screenshot
-    pick the target pixel from the screenshot already in the response
-    click(pid, x, y)                        # background pixel — still no foreground
-    verify_state(..., include_screenshot=true)
+# Route 3: repeat input only when fresh evidence establishes the effect did not land
+# and retrying is appropriate for this action. Never blindly replay an uncertain write.
+if the intended effect is confirmed absent and a pixel retry is appropriate:
+    pick the target from a fresh screenshot
+    click(pid, window_id, x, y)             # background delivery
+    observe the result using the evidence choice above
     if it landed: done
 
 # Route 4 — background delivery was dropped (insert/click never arrived)
@@ -733,12 +754,11 @@ desktop_action(target={kind:"desktop", display_id:"primary"}, ...)
 get_desktop_state()                         # verify in the same coordinate frame
 ```
 
-The two ideas to hold onto: (1) the AX tree **lies** on canvas / web /
-Catalyst / virtualized surfaces, so an unchanged-or-bogus tree plus
-`suspected_noop`/`degraded` — or a tree that simply disagrees with the
-screenshot — is your cue to do an **element px action** off the
-screenshot you already have; (2) `px` is a _conscious_ switch to the
-pixel addressing path, not a different capture.
+Accessibility can be incomplete or misleading on canvas, web, Catalyst, and
+virtualized surfaces. A degraded result or disagreement with pixels calls for
+fresh observation. Retry only when that evidence establishes the effect did
+not land and the retry is appropriate. Pixel addressing chooses where to send
+an action; it does not by itself establish whether an earlier action landed.
 
 **Window state → what works**
 
@@ -906,13 +926,11 @@ can't, which is exactly why you cross-check them:
   value).
 
 Default to dispatching by `element_token` (the **element ax action**) —
-it's the verifiable, backgroundable rung. Do an **element px action**
-(`x,y` off the same screenshot) when the tree can't disambiguate
-(repeated/empty labels), when it's empty (`degraded` — non-AX
-surface), when an action came back `suspected_noop`, or when the tree
-disagrees with the pixels. You never re-capture to switch — the
-screenshot is already there; you just change _how you address_ the
-target.
+it's the verifiable, backgroundable rung. Use an **element px action**
+when fresh pixels identify a target that the tree cannot reliably address.
+For a retry, first establish from fresh evidence that the earlier effect did
+not land and repeating input is appropriate. Reuse a current screenshot, or
+request one if the current read omitted pixels; do not act from a stale image.
 
 Reach for pixel coordinates only when the target is a canvas /
 video / WebGL / custom-drawn surface that isn't in the tree
@@ -937,7 +955,7 @@ the response's `snapshot_id` with `element_index`; bare indices fail closed in
 | Set an exact window frame        | `set_window_frame({pid, window_id, x, y, width, height})`                                                       | uses the platform window manager and returns `confirmed` only after geometry readback; inspect `list_windows` again before continuing when the result is not confirmed                                                |
 | Invoke a native application menu | `invoke_menu({pid, window_id, path:["Window","Arrange","Left"]})`                                              | resolves exact immediate-child labels from live native state at every hop; refuses missing, ambiguous, or disabled segments and never falls back to pixels; verify the command's semantic effect afterward          |
 | Snapshot a window                | `get_window_state({pid, window_id})`                                                                            | returns `tree_markdown` + `screenshot_*`; populates the `(pid, window_id)` element_index cache                                                                                                                        |
-| Verify a postcondition           | `verify_state({pid, window_id, expect, include_screenshot?})`                                                   | polls bounded structured predicates; returns `satisfied`, `unsatisfied`, or `unknown`. Optional final image is interpreted by the agent harness, never by the driver                                                 |
+| Verify a postcondition           | `verify_state({pid, window_id, expect, timeout_ms?, include_screenshot?})` | `timeout_ms:0` checks once; bounded polling waits for supported, trusted transitions. Untrusted web values need fresh rendered evidence. Optional images are interpreted by the agent, never the driver. |
 | Left click                       | `click({pid, element_token})` or `click({pid, window_id, element_index, snapshot_id})`                          | default `action: "press"`. Pixel form: `click({pid, x, y})` (window_id optional) — `modifier: ["cmd"\|"ctrl"]`                                                                                                        |
 | Double-click / open              | `double_click({pid, element_token})`                                                                            | Default action when the element advertises one (Open on Finder items / openable rows), else stamped pixel double-click at the element's center                                                                        |
 | Right click / context menu       | `right_click({pid, element_token})` or `click({pid, element_token, action:"show_menu"})`                       | Browser page content should use the typed route where available; see `BROWSER.md`                                                                                                                                     |
@@ -1115,11 +1133,15 @@ point for new browser workflows.
 
 ## Verify after every action — mandatory
 
-**Always** verify after an action. Prefer
-`verify_state({pid, window_id, expect})` for structured state such as a
+**Always** verify after an action. Choose the observation that can establish
+the postcondition; a separate `verify_state` call is not mandatory when fresh
+post-action evidence already establishes it. Use
+`verify_state({pid, window_id, expect, timeout_ms:0})` for a current structured check such as a
 window's existence/bounds or a semantic element's existence, value, enabled
-state, or selected state. Use its bounded poll and stable-sample requirement
-instead of hand-written sleeps. `unknown` means the driver could not establish
+state, or selected state from a trusted source. For an expected transition,
+use its bounded poll and stable-sample requirement instead of hand-written
+sleeps. Use fresh rendered evidence for untrusted web-content values.
+`unknown` means the driver could not establish
 the predicate; it is not success. Once a session has effective desktop scope,
 use a fresh `get_desktop_state(session)` result instead—window-scoped
 `verify_state` is denied by that capture policy.
@@ -1131,18 +1153,13 @@ decides whether to stop, retry, or advance the ladder. For a postcondition not
 expressible by the tool, explicitly take a fresh `get_window_state` snapshot
 and have the harness judge its tree and image.
 
-Switch to an **element px action** only on a real signal: the action
-response carried `effect:"suspected_noop"`, verification returned
-`unsatisfied`/`unknown`, the snapshot came back `degraded` (empty tree →
-non-AX surface), the tree looks unchanged/unreadable or disagrees with the screenshot, or
-`escalation.target` points you there (`pixel`). That's the
-verify-then-escalate ladder in the behavior-matrix section. If the tree
-is unchanged AND the screenshot confirms nothing moved, the action
-likely failed silently — **tell the user what you attempted and what
-you observed**, don't paper over with "done" language (and consider
-`delivery_mode:"foreground"` when `escalation.target ==
-"foreground"`). Agents that skip this step report success on
-silently-dropped actions — the single most common failure mode.
+An `unknown`, degraded, or unchanged accessibility result, or a suggested
+`pixel` route, is a reason to inspect fresh rendered evidence. It is not proof
+that the input failed. Repeat an **element px action** only when fresh evidence
+establishes that the intended effect did not land and retrying is appropriate
+for that action. If delivery remains uncertain, report what was attempted and
+observed instead of replaying input. Foreground recovery still requires the
+user's authorization; uncertainty does not grant it.
 
 ## Recording trajectories
 
@@ -1182,7 +1199,9 @@ respective companion files.
   pixel frame. An **element ax action** addresses by index, an
   **element px action** by `x,y`. Default to `element_index` and only
   do a px action on a real signal (`suspected_noop` / `degraded` /
-  repeated labels / tree-disagrees-with-pixels). Don't pass an
+  repeated labels / tree-disagrees-with-pixels), after fresh observation.
+  These signals alone do not establish failed delivery or authorize a retry.
+  Don't pass an
   `element_index` you read off the screenshot, and don't pixel-click a
   coordinate you computed from the tree's (possibly lying) frame
   without checking it against the image.
