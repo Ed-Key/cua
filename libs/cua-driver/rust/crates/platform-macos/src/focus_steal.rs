@@ -19,6 +19,8 @@
 //! Destination lookup happens before a final lease and foreground check.
 //! Unknown foreground state or unavailable native symbols reject restoration.
 //! The request runs on the observer queue, without an AppKit activation fallback.
+//! A change in desktop input counters invalidates existing guards before any
+//! restoration. This also yields to global synthetic input from other software.
 //! Native acceptance does not guarantee synchronous completion or prevent every
 //! transient focus change. Protection ends when the matching lease ends.
 //!
@@ -83,11 +85,50 @@ const JANITOR_TICK: Duration = Duration::from_secs(1);
 #[derive(Copy, Clone, Debug, Hash, Eq, PartialEq)]
 pub struct SuppressionHandle(Uuid);
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct InputActivity([u32; 16]);
+
+// Read public counters without collecting event content or installing an input tap.
+// A change is a conservative cancellation signal, not proof of physical user
+// intent. Global synthetic input also counts; key autorepeat is not counted.
+fn read_input_activity() -> InputActivity {
+    use core_graphics::event::CGEventType;
+    use core_graphics::event_source::CGEventSourceStateID;
+    extern "C" {
+        fn CGEventSourceCounterForEventType(state_id: i32, event_type: u32) -> u32;
+    }
+    let types = [
+        CGEventType::LeftMouseDown,
+        CGEventType::LeftMouseUp,
+        CGEventType::RightMouseDown,
+        CGEventType::RightMouseUp,
+        CGEventType::MouseMoved,
+        CGEventType::LeftMouseDragged,
+        CGEventType::RightMouseDragged,
+        CGEventType::KeyDown,
+        CGEventType::KeyUp,
+        CGEventType::FlagsChanged,
+        CGEventType::ScrollWheel,
+        CGEventType::TabletPointer,
+        CGEventType::TabletProximity,
+        CGEventType::OtherMouseDown,
+        CGEventType::OtherMouseUp,
+        CGEventType::OtherMouseDragged,
+    ];
+    InputActivity(types.map(|kind| unsafe {
+        CGEventSourceCounterForEventType(
+            CGEventSourceStateID::CombinedSessionState as i32,
+            kind as u32,
+        )
+    }))
+}
+
 /// Dispatcher-internal entry shape.
 #[derive(Debug)]
 struct Entry {
     /// Registration order, used to choose one restore destination on overlap.
     sequence: u64,
+    input_activity: InputActivity,
     /// `Some(pid)` matches only that pid's activations. `None` is a
     /// wildcard — matches any activation whose pid != `restore_to`.
     /// The wildcard variant is used while a launch is in flight and the
@@ -127,7 +168,7 @@ impl FocusStealPreventer {
         static SINGLETON: OnceLock<Arc<FocusStealPreventer>> = OnceLock::new();
         SINGLETON
             .get_or_init(|| {
-                let dispatcher = Arc::new(Dispatcher::new());
+                let dispatcher = Arc::new(Dispatcher::new(read_input_activity));
                 install_observer(&dispatcher);
                 Arc::new(FocusStealPreventer { dispatcher })
             })
@@ -246,6 +287,7 @@ impl Drop for SuppressionLease {
 /// scan is fine.
 pub(crate) struct Dispatcher {
     entries: Mutex<HashMap<Uuid, Entry>>,
+    read_input_activity: Box<dyn Fn() -> InputActivity + Send + Sync>,
     /// Incremented under the entries lock so registration and order agree.
     sequence: AtomicU64,
     /// `true` while the janitor task should keep running. The janitor
@@ -255,10 +297,11 @@ pub(crate) struct Dispatcher {
 }
 
 impl Dispatcher {
-    fn new() -> Self {
+    fn new(read_input_activity: impl Fn() -> InputActivity + Send + Sync + 'static) -> Self {
         let (tx, _rx) = tokio::sync::watch::channel(false);
         Self {
             entries: Mutex::new(HashMap::new()),
+            read_input_activity: Box::new(read_input_activity),
             sequence: AtomicU64::new(0),
             janitor_active: tx,
             janitor_started: Mutex::new(false),
@@ -300,10 +343,12 @@ impl Dispatcher {
         origin: &'static str,
     ) -> SuppressionHandle {
         let id = Uuid::new_v4();
+        let input_activity = (self.read_input_activity)();
         {
             let mut guard = self.entries.lock().unwrap();
             let entry = Entry {
                 sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+                input_activity,
                 target_pid,
                 allowed_pid,
                 restore_to,
@@ -339,11 +384,20 @@ impl Dispatcher {
     /// policy in upstream PR #1539. Return its identity as well as destination
     /// so a later check cannot confuse a replacement with the original lease.
     fn winner_for_activation(&self, activated_pid: i32) -> Option<(SuppressionHandle, i32)> {
+        let generation = self.sequence.load(Ordering::Relaxed);
+        let activity = (self.read_input_activity)();
         let mut guard = self.entries.lock().unwrap();
+        // A concurrent registration may have sampled newer input. Do not use
+        // this older native read to delete it or select the previous intent.
+        if self.sequence.load(Ordering::Relaxed) != generation {
+            return None;
+        }
         // Reap expired entries first — keeps the dispatcher honest even
         // if the janitor hasn't ticked yet.
         let now = Instant::now();
-        guard.retain(|_, e| e.deadline > now);
+        // Input permanently invalidates prior restoration intent. Do not leave
+        // an older overlapping entry available as a fallback after takeover.
+        guard.retain(|_, e| e.deadline > now && e.input_activity == activity);
         guard
             .iter()
             .filter(|(_, e)| {
@@ -619,9 +673,120 @@ mod tests {
         d.winner_for_activation(activated_pid).map(|(_, pid)| pid)
     }
 
+    fn input_fixture() -> (Arc<Dispatcher>, Arc<Mutex<InputActivity>>) {
+        let input = Arc::new(Mutex::new(InputActivity::default()));
+        let source = input.clone();
+        let dispatcher = Arc::new(Dispatcher::new(move || *source.lock().unwrap()));
+        (dispatcher, input)
+    }
+
+    #[test]
+    fn registration_during_input_read_does_not_cancel_the_new_guard() {
+        use std::sync::atomic::AtomicBool;
+        let input = Arc::new(Mutex::new(InputActivity::default()));
+        let insert = Arc::new(AtomicBool::new(false));
+        let target = Arc::new(OnceLock::<std::sync::Weak<Dispatcher>>::new());
+        let source = input.clone();
+        let trigger = insert.clone();
+        let owner = target.clone();
+        let d = Arc::new(Dispatcher::new(move || {
+            let observed = *source.lock().unwrap();
+            if trigger.swap(false, Ordering::SeqCst) {
+                // Another action registers after this native read sampled the
+                // old counter values, but before it returns them to dispatch.
+                source.lock().unwrap().0[0] = 1;
+                owner
+                    .get()
+                    .unwrap()
+                    .upgrade()
+                    .unwrap()
+                    .add(Some(42), 9, "test.concurrent");
+            }
+            observed
+        }));
+        target.set(Arc::downgrade(&d)).unwrap();
+        d.add(Some(42), 7, "test.before_read");
+        insert.store(true, Ordering::SeqCst);
+        assert_eq!(
+            winner_pid(&d, 42),
+            None,
+            "a stale read must not select old intent"
+        );
+        assert_eq!(
+            winner_pid(&d, 42),
+            Some(9),
+            "stale counter evidence must not delete the new guard"
+        );
+        assert_eq!(d.len(), 1);
+    }
+
+    #[test]
+    fn desktop_input_cancels_overlapping_guards_permanently() {
+        let (d, input) = input_fixture();
+        d.add(None, 7, "test.old_wildcard");
+        d.add(Some(42), 8, "test.old_specific");
+        input.lock().unwrap().0[0] = 1;
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || Some(42), |pid, _| restored.push(pid));
+        assert!(
+            restored.is_empty(),
+            "desktop input must supersede old restoration intent"
+        );
+        assert_eq!(
+            d.len(),
+            0,
+            "older overlapping guards must not survive takeover"
+        );
+        *input.lock().unwrap() = InputActivity::default();
+        d.dispatch_activation(42, || Some(42), |pid, _| restored.push(pid));
+        assert!(
+            restored.is_empty(),
+            "counter reset must not resurrect cancelled guards"
+        );
+    }
+
+    #[test]
+    fn desktop_input_during_restore_lookup_prevents_native_mutation() {
+        let (d, input) = input_fixture();
+        d.add(Some(42), 7, "test.input_during_lookup");
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || Some(42),
+            |pid, admit| {
+                input.lock().unwrap().0[0] = 1;
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert!(
+            restored.is_empty(),
+            "input during native lookup must cancel submission"
+        );
+    }
+
+    #[test]
+    fn new_guard_after_desktop_input_uses_new_restoration_intent() {
+        let (d, input) = input_fixture();
+        d.add(None, 7, "test.before_input");
+        input.lock().unwrap().0[0] = 1;
+        let current = d.add(Some(42), 9, "test.after_input");
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || Some(42), |pid, _| restored.push(pid));
+        assert_eq!(restored, vec![9]);
+        d.remove(current);
+        d.dispatch_activation(42, || Some(42), |pid, _| restored.push(pid));
+        assert_eq!(
+            restored,
+            vec![9],
+            "removing the new guard must not revive the old one"
+        );
+    }
+
     #[test]
     fn lease_release_during_restore_lookup_prevents_native_mutation() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let handle = d.add(Some(42), 7, "test.lookup_release");
         let mut restored = Vec::new();
         d.dispatch_activation(
@@ -643,7 +808,7 @@ mod tests {
 
     #[test]
     fn newer_foreground_during_restore_lookup_prevents_native_mutation() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _handle = d.add(Some(42), 7, "test.lookup_switch");
         let front = std::cell::Cell::new(42);
         let mut restored = Vec::new();
@@ -665,7 +830,7 @@ mod tests {
 
     #[test]
     fn delayed_activation_does_not_restore_over_a_newer_foreground_app() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _h = d.add(Some(42), 7, "test.delayed");
         let mut restored = Vec::new();
         d.dispatch_activation(42, || Some(99), |pid, _admit| restored.push(pid));
@@ -677,7 +842,7 @@ mod tests {
 
     #[test]
     fn unknown_foreground_does_not_authorize_restoration() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _h = d.add(Some(42), 7, "test.unknown");
         let mut restored = Vec::new();
         d.dispatch_activation(42, || None, |pid, _admit| restored.push(pid));
@@ -689,7 +854,7 @@ mod tests {
 
     #[test]
     fn current_matching_activation_still_restores_the_prior_app() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _h = d.add(Some(42), 7, "test.current");
         let mut restored = Vec::new();
         d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
@@ -698,7 +863,7 @@ mod tests {
 
     #[test]
     fn overlapping_entries_dispatch_only_the_latest_matching_restore() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _a = d.add(Some(42), 7, "test.first");
         let _b = d.add(Some(42), 8, "test.second");
         let mut restored = Vec::new();
@@ -713,7 +878,7 @@ mod tests {
     #[test]
     fn wildcard_and_target_overlap_use_registration_order() {
         for (older, newer) in [(None, Some(42)), (Some(42), None), (None, None)] {
-            let d = Arc::new(Dispatcher::new());
+            let d = Arc::new(Dispatcher::new(InputActivity::default));
             let _a = d.add(older, 7, "test.older");
             let b = d.add(newer, 8, "test.newer");
             let mut restored = Vec::new();
@@ -732,7 +897,7 @@ mod tests {
 
     #[test]
     fn released_lease_cannot_restore_after_foreground_read() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _older = d.add(Some(42), 6, "test.older");
         let handle = d.add(Some(42), 7, "test.released");
         let mut lease = Some(SuppressionLease {
@@ -757,7 +922,7 @@ mod tests {
 
     #[test]
     fn expired_lease_cannot_restore_after_foreground_read() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let handle = d.add(Some(42), 7, "test.expired");
         let mut restored = Vec::new();
         d.dispatch_activation(
@@ -783,7 +948,7 @@ mod tests {
     fn newer_matching_entry_invalidates_the_in_flight_restore() {
         // Equal destinations still belong to different action lifetimes.
         for destination in [7, 8] {
-            let d = Arc::new(Dispatcher::new());
+            let d = Arc::new(Dispatcher::new(InputActivity::default));
             let _h = d.add(Some(42), 7, "test.old");
             let mut restored = Vec::new();
             d.dispatch_activation(
@@ -803,7 +968,7 @@ mod tests {
 
     #[test]
     fn unrelated_registration_during_read_does_not_block_current_restore() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _h = d.add(Some(42), 7, "test.current");
         let mut restored = Vec::new();
         d.dispatch_activation(
@@ -819,7 +984,7 @@ mod tests {
 
     #[test]
     fn dispatch_preserves_target_and_wildcard_matching_policy() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let h = d.add(Some(42), 7, "test.target");
         let mut restored = Vec::new();
         d.dispatch_activation(99, || Some(99), |pid, _admit| restored.push(pid));
@@ -842,7 +1007,7 @@ mod tests {
     /// match, and remove() drops it.
     #[test]
     fn dispatcher_add_match_remove() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let h = d.add(Some(42), 7, "test.add");
         assert_eq!(d.len(), 1);
         let matches = winner_pid(&d, 42);
@@ -857,7 +1022,7 @@ mod tests {
     /// except the entry's own restore_to pid.
     #[test]
     fn wildcard_matches_all_but_restore_to() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _h = d.add(None, 7, "test.wild");
         // pid 99 != restore_to 7 → should match.
         assert_eq!(winner_pid(&d, 99), Some(7));
@@ -870,7 +1035,7 @@ mod tests {
     /// continuing to suppress unrelated cross-app activations.
     #[test]
     fn wildcard_can_allow_intentional_target_activation() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _h = d.add_allowing(42, 7, "test.allow");
 
         assert!(
@@ -892,7 +1057,7 @@ mod tests {
     #[test]
     fn lease_drop_removes_entry() {
         // Use a private dispatcher to avoid singleton coupling.
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let h = d.add(Some(1), 2, "test.lease");
         let lease = SuppressionLease {
             handle: h,
@@ -907,7 +1072,7 @@ mod tests {
     /// Explicit release() short-circuits the Drop path.
     #[test]
     fn lease_release_removes_entry() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let h = d.add(Some(1), 2, "test.lease");
         let lease = SuppressionLease {
             handle: h,
@@ -922,7 +1087,7 @@ mod tests {
     /// reap_expired and winner_for_activation — both must purge it.
     #[test]
     fn deadline_reaps_leaked_entry() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         // Insert a handle manually with a past deadline.
         let id = Uuid::new_v4();
         {
@@ -931,6 +1096,7 @@ mod tests {
                 id,
                 Entry {
                     sequence: 0,
+                    input_activity: InputActivity::default(),
                     target_pid: Some(42),
                     allowed_pid: None,
                     restore_to: 7,
@@ -950,7 +1116,7 @@ mod tests {
     /// restarts on next add. Spin up a tokio runtime to host the task.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn janitor_starts_stops_restarts() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         // First add → janitor starts.
         let h1 = d.add(Some(1), 2, "test.j1");
         d.kick_janitor();
@@ -981,7 +1147,7 @@ mod tests {
     /// stranding the janitor forever.
     #[test]
     fn add_always_kicks_janitor_after_initial_runtime_miss() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         // Outside any tokio runtime — kick_janitor's `try_current` guard
         // returns Err, the function returns without setting started.
         let h1 = d.add(Some(1), 2, "test.no_runtime");
@@ -1021,7 +1187,7 @@ mod tests {
     /// A newer unrelated registration does not supersede a matching lease.
     #[test]
     fn latest_nonmatching_registration_does_not_change_the_winner() {
-        let d = Arc::new(Dispatcher::new());
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
         let _a = d.add(Some(42), 1, "test.m1");
         let _b = d.add(Some(99), 2, "test.m2");
         assert_eq!(winner_pid(&d, 42), Some(1));
