@@ -623,21 +623,6 @@ impl Tool for ClickTool {
                 };
             }
 
-            if let Some((cx, cy)) = center {
-                // Pin overlay above target window first.
-                crate::cursor::overlay::send_command(
-                    cursor_key.clone(),
-                    cursor_overlay::OverlayCommand::PinAbove(wid as u64),
-                );
-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
-                // Keep the registry in sync with the overlay so
-                // get_agent_cursor_state reports a truthful position even when
-                // the click was dispatched via the AX path (no pixel coords).
-                self.state
-                    .cursor_registry
-                    .update_position(&cursor_key, cx, cy);
-                self.state.cursor_registry.note_press(&cursor_key, cx, cy);
-            }
 
             // Finder icon/list items can expose a readable AXSelected state
             // while refusing both AXSelected writes and AXPress. Resolve a
@@ -703,6 +688,30 @@ impl Tool for ClickTool {
                     .is_err()
             {
                 selection_pixel = None;
+            }
+
+            // Pin the overlay and glide the cursor to the element before the
+            // AX action (Swift's animateAndWait), keeping the registry truthful
+            // for AX-dispatched clicks. When the selection target's pointer
+            // frame was refused, a refused click must not move the public
+            // cursor: move it only after the action succeeds. Adapted from
+            // 1d958bf45 (#3631).
+            let position_cursor = || async {
+                if let Some((cx, cy)) = center {
+                    crate::cursor::overlay::send_command(
+                        cursor_key.clone(),
+                        cursor_overlay::OverlayCommand::PinAbove(wid as u64),
+                    );
+                    crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
+                    self.state
+                        .cursor_registry
+                        .update_position(&cursor_key, cx, cy);
+                    self.state.cursor_registry.note_press(&cursor_key, cx, cy);
+                }
+            };
+            let defer_cursor_position = selection_center.is_some() && selection_pixel.is_none();
+            if !defer_cursor_position {
+                position_cursor().await;
             }
 
             // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
@@ -813,6 +822,9 @@ impl Tool for ClickTool {
                 ))) => {
                     // For text inputs, wait 800ms for WebKit DOM focus to settle
                     // before returning — matches the Swift reference behaviour.
+                    if defer_cursor_position {
+                        position_cursor().await;
+                    }
                     if needs_webkit_delay {
                         tokio::time::sleep(std::time::Duration::from_millis(800)).await;
                     }
