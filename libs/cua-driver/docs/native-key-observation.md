@@ -17,6 +17,11 @@ The immediate path still reads the window signature and current accessibility
 roots. An existing transition signal receives the same bounded AX publication
 catch-up and owner resolution as before. The input gate, focus suppression,
 same-process mutation lease, and action verification remain in place.
+The observer's cross-application suppression lease ends when this shorter
+observation completes. It therefore no longer covers the remaining portion of
+the former 400 ms interval for delayed helper-app activations. The key handler's
+targeted 50 ms post-action suppression is unchanged. This is a protection-window
+tradeoff as well as a latency change and requires live focus checks.
 
 This is adaptive, best-effort observation. A selection-only change proves the
 editor processed the key; it does not prove an application cannot schedule a
