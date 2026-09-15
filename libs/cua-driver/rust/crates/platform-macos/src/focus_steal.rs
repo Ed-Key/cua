@@ -128,6 +128,8 @@ fn read_input_activity() -> InputActivity {
 /// Dispatcher-internal entry shape.
 #[derive(Debug)]
 struct Entry {
+    /// Completed operation protection has an absolute, non-renewable deadline.
+    is_tail: bool,
     /// Registration order, used to choose one restore destination on overlap.
     sequence: u64,
     input_activity: InputActivity,
@@ -175,6 +177,12 @@ impl FocusStealPreventer {
                 Arc::new(FocusStealPreventer { dispatcher })
             })
             .clone()
+    }
+
+    /// Explicit foreground actions create new intent even without registering
+    /// a restoration lease. Retire completed tails before their native request.
+    pub(crate) fn retire_action_tails() {
+        Self::shared().dispatcher.retire_tails();
     }
 
     /// Capture current foreground and input together, after singleton setup.
@@ -342,6 +350,20 @@ pub struct SuppressionLease {
 }
 
 impl SuppressionLease {
+    /// Retain completed action protection without delaying the result.
+    pub(crate) fn retain_until(
+        self: Arc<Self>,
+        deadline: Instant,
+    ) -> Option<tokio::task::JoinHandle<()>> {
+        if !self.dispatcher.prepare_tail(self.handle, deadline) {
+            return None;
+        }
+        Some(tokio::spawn(async move {
+            tokio::time::sleep_until(tokio::time::Instant::from_std(deadline)).await;
+            drop(self);
+        }))
+    }
+
     /// Keep a pending launch protected without registering fresh restoration
     /// intent. Cancellation stops renewal, but does not abort the OS launch.
     pub(crate) async fn keep_alive_while<F: std::future::Future>(&self, future: F) -> F::Output {
@@ -415,6 +437,8 @@ pub(crate) struct Dispatcher {
     read_input_activity: Box<dyn Fn() -> InputActivity + Send + Sync>,
     /// Incremented under the entries lock so registration and order agree.
     sequence: AtomicU64,
+    /// New root intent, excluding inherited guards and lease refreshes.
+    latest_root: AtomicU64,
     /// `true` while the janitor task should keep running. The janitor
     /// loop watches for transitions to detect when to start/stop.
     janitor_active: tokio::sync::watch::Sender<bool>,
@@ -428,6 +452,7 @@ impl Dispatcher {
             entries: Mutex::new(HashMap::new()),
             read_input_activity: Box::new(read_input_activity),
             sequence: AtomicU64::new(0),
+            latest_root: AtomicU64::new(0),
             janitor_active: tx,
             janitor_started: Mutex::new(false),
         }
@@ -519,8 +544,14 @@ impl Dispatcher {
         let id = Uuid::new_v4();
         {
             let mut guard = self.entries.lock().unwrap();
+            // A later operation owns subsequent focus intent. Completed
+            // tails must not resume after this operation's guard is dropped.
+            guard.retain(|_, entry| !entry.is_tail);
+            let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+            self.latest_root.store(sequence, Ordering::Relaxed);
             let entry = Entry {
-                sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
+                is_tail: false,
+                sequence,
                 input_activity,
                 target_pid,
                 allowed_pid,
@@ -555,11 +586,12 @@ impl Dispatcher {
                 entries.remove(&parent.0);
                 return None;
             }
-            if target_pid <= 0 || target_pid == entry.restore_to {
+            if entry.is_tail || target_pid <= 0 || target_pid == entry.restore_to {
                 return None;
             }
             restore_to = entry.restore_to;
             let child = Entry {
+                is_tail: false,
                 sequence: entry.sequence,
                 input_activity: entry.input_activity,
                 target_pid: Some(target_pid),
@@ -580,6 +612,38 @@ impl Dispatcher {
         Some(SuppressionHandle(id))
     }
 
+    fn prepare_tail(&self, handle: SuppressionHandle, deadline: Instant) -> bool {
+        let activity = (self.read_input_activity)();
+        let mut entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get_mut(&handle.0) else {
+            return false;
+        };
+        if entry.is_tail {
+            return false;
+        }
+        if entry.deadline <= Instant::now()
+            || deadline <= Instant::now()
+            || entry.input_activity != activity
+            || entry.sequence != self.latest_root.load(Ordering::Relaxed)
+        {
+            entries.remove(&handle.0);
+            return false;
+        }
+        entry.is_tail = true;
+        entry.deadline = entry.deadline.min(deadline);
+        self.sequence.fetch_add(1, Ordering::Relaxed);
+        tracing::debug!(handle = %handle.0, remaining_ms = entry.deadline.saturating_duration_since(Instant::now()).as_millis() as u64,
+            phase = "tail", "focus suppression lifecycle");
+        true
+    }
+
+    fn retire_tails(&self) {
+        let mut entries = self.entries.lock().unwrap();
+        entries.retain(|_, entry| !entry.is_tail);
+        let sequence = self.sequence.fetch_add(1, Ordering::Relaxed);
+        self.latest_root.store(sequence, Ordering::Relaxed);
+    }
+
     fn retarget(&self, handle: SuppressionHandle, target_pid: i32, origin: &'static str) -> bool {
         self.refresh(handle, Some(target_pid), Some(origin))
     }
@@ -595,6 +659,9 @@ impl Dispatcher {
         let Some(entry) = entries.get_mut(&handle.0) else {
             return false;
         };
+        if entry.is_tail {
+            return false;
+        }
         let now = Instant::now();
         if entry.deadline <= now || entry.input_activity != activity {
             entries.remove(&handle.0);
@@ -939,6 +1006,165 @@ mod tests {
         let source = input.clone();
         let dispatcher = Arc::new(Dispatcher::new(move || *source.lock().unwrap()));
         (dispatcher, input)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn fast_action_keeps_protection_after_return_until_its_deadline() {
+        let (d, _) = input_fixture();
+        let handle = d.add_allowing(42, 7, "test.action");
+        let lease = Arc::new(SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        });
+        let task = lease.retain_until(Instant::now() + Duration::from_millis(400));
+        assert_eq!(
+            winner_pid(&d, 88),
+            Some(7),
+            "returning a fast result must not drop delayed-activation protection"
+        );
+        task.expect("bounded retention task").await.unwrap();
+        assert_eq!(
+            winner_pid(&d, 88),
+            None,
+            "deadline must release the completed action"
+        );
+    }
+
+    #[test]
+    fn tail_does_not_survive_a_newer_completed_action() {
+        let (d, _) = input_fixture();
+        let old = d.add_allowing(42, 7, "test.old");
+        assert!(d.prepare_tail(old, Instant::now() + Duration::from_millis(400)));
+        let new = d.add_allowing(88, 9, "test.new");
+        d.remove(new);
+        assert_eq!(
+            winner_pid(&d, 88),
+            None,
+            "old protection must not return after the next action ends"
+        );
+    }
+
+    #[test]
+    fn tail_handoff_rejects_a_newer_action_even_after_it_ends() {
+        let (d, _) = input_fixture();
+        let old = d.add_allowing(42, 7, "test.old");
+        let new = d.add_allowing(88, 9, "test.new");
+        d.remove(new);
+        assert!(
+            !d.prepare_tail(old, Instant::now() + Duration::from_millis(400)),
+            "older operation cannot establish a late tail"
+        );
+    }
+
+    #[test]
+    fn tail_foreground_intent_retires_pending_and_prevents_late_handoff() {
+        let (d, _) = input_fixture();
+        let active = d.add_allowing(42, 7, "test.active");
+        let pending = d.add_allowing(41, 7, "test.pending");
+        assert!(d.prepare_tail(pending, Instant::now() + Duration::from_millis(400)));
+        d.retire_tails();
+        assert!(!d.prepare_tail(active, Instant::now() + Duration::from_millis(400)));
+        d.remove(active);
+        assert_eq!(
+            winner_pid(&d, 88),
+            None,
+            "explicit foreground intent must retire completed protection"
+        );
+    }
+
+    #[test]
+    fn tail_cannot_be_renewed_retargeted_or_inherited() {
+        let (d, _) = input_fixture();
+        let handle = d.add_allowing(42, 7, "test.action");
+        let deadline = Instant::now() + Duration::from_millis(400);
+        assert!(d.prepare_tail(handle, deadline));
+        assert!(!d.refresh(handle, None, None));
+        assert!(!d.retarget(handle, 88, "test.late"));
+        assert!(d.add_child(handle, 88, "test.child").is_none());
+        assert_eq!(d.entries.lock().unwrap()[&handle.0].deadline, deadline);
+        assert_eq!(
+            winner_pid(&d, 88),
+            Some(7),
+            "a stray refresh must not delete a valid tail"
+        );
+        assert_eq!(
+            winner_pid(&d, 42),
+            None,
+            "keep the addressed process allowed"
+        );
+    }
+
+    #[test]
+    fn tail_cancels_on_input_and_cannot_start_after_its_deadline() {
+        let (d, input) = input_fixture();
+        let handle = d.add_allowing(42, 7, "test.tail");
+        assert!(d.prepare_tail(handle, Instant::now() + Duration::from_millis(400)));
+        input.lock().unwrap().0[0] += 1;
+        assert_eq!(winner_pid(&d, 88), None);
+        assert!(!d.prepare_tail(handle, Instant::now() + Duration::from_millis(400)));
+        let late = d.add_allowing(42, 7, "test.slow_observation");
+        assert!(
+            !d.prepare_tail(late, Instant::now() - Duration::from_millis(1)),
+            "slow observation must consume the original deadline"
+        );
+        assert_eq!(winner_pid(&d, 88), None);
+    }
+
+    #[test]
+    fn tail_retirement_during_native_lookup_blocks_final_admission() {
+        let (d, _) = input_fixture();
+        let handle = d.add_allowing(42, 7, "test.tail");
+        assert!(d.prepare_tail(handle, Instant::now() + Duration::from_millis(400)));
+        let mut restored = false;
+        d.dispatch_activation(
+            88,
+            || Some(88),
+            |_, admit| {
+                d.retire_tails();
+                restored = admit();
+            },
+        );
+        assert!(!restored);
+    }
+
+    #[test]
+    fn tail_handoff_ignores_nested_guard_registration_and_refresh() {
+        let (d, _) = input_fixture();
+        let handle = d.add_allowing(42, 7, "test.root");
+        let child = d.add_child(handle, 42, "test.child").unwrap();
+        assert!(d.refresh(child, None, None));
+        d.remove(child);
+        assert!(d.refresh(handle, None, None));
+        assert!(d.prepare_tail(handle, Instant::now() + Duration::from_millis(400)));
+        assert_eq!(winner_pid(&d, 88), Some(7));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn tail_retention_does_not_hold_the_process_mutation_lock() {
+        let (d, _) = input_fixture();
+        let handle = d.add_allowing(42, 7, "test.tail");
+        let lease = Arc::new(SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        });
+        let task = crate::background_mutation::with_observation_lease(-93111, async {
+            lease
+                .retain_until(Instant::now() + Duration::from_millis(400))
+                .unwrap()
+        })
+        .await;
+        let next = tokio::time::timeout(
+            Duration::from_millis(10),
+            crate::background_mutation::acquire(-93111),
+        )
+        .await
+        .expect("completed action must release mutation ownership before the tail ends");
+        assert_eq!(winner_pid(&d, 88), Some(7));
+        drop(next);
+        task.await.unwrap();
+        assert_eq!(winner_pid(&d, 88), None);
     }
 
     #[tokio::test]
@@ -1767,6 +1993,7 @@ mod tests {
             guard.insert(
                 id,
                 Entry {
+                    is_tail: false,
                     sequence: 0,
                     input_activity: InputActivity::default(),
                     target_pid: Some(42),

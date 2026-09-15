@@ -365,6 +365,8 @@ impl Tool for BringToFrontTool {
                 }));
             }
 
+            crate::focus_steal::FocusStealPreventer::retire_action_tails();
+
             // The persistent kCPSNoWindows request owns process activation
             // without broadly ordering every application window. The separate
             // kCPSUserGenerated sequence then makes only the requested window
@@ -411,6 +413,7 @@ impl Tool for BringToFrontTool {
             );
         }
 
+        crate::focus_steal::FocusStealPreventer::retire_action_tails();
         let request_accepted = unsafe {
             app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows)
         };
