@@ -16,7 +16,7 @@ thread_local! {
 use crate::{
     pip_hook,
     protocol::{Content, ToolResult},
-    recording::{now_ms, screenshot_for, RecordingSession},
+    recording::{now_ms, RecordingSession},
     recording_tools::{
         GetRecordingStateTool, ReplayRegistrySlot, ReplayTrajectoryTool, StartRecordingTool,
         StopRecordingTool,
@@ -1694,23 +1694,16 @@ impl ToolRegistry {
             );
         }
 
-        // Experimental PiP push — only when --experimental-pip is on argv
-        // (otherwise `pip_enabled()` is false and we skip the screenshot
-        // entirely to avoid wasted capture work). We push for the same set
-        // of action tools the recording pipeline cares about (non-read-only,
-        // not the recording-control meta-tools) so the live view matches
-        // what the recorder would have captured for the turn.
+        // Preview capture and presentation never hold the action result.
+        // The dedicated worker coalesces pending requests when it is busy.
+        // Recording keeps its independent evidence lifecycle above.
         if pip_hook::pip_enabled() && should_record && !private_consent_turn {
-            let window_id = args.opt_u64("window_id");
-            let pid = args.opt_i64("pid");
-            if let Some(png_bytes) = screenshot_for(window_id, pid) {
-                let label = synthesize_action_label(name, &public_args);
-                pip_hook::push_pip_frame(pip_hook::PipHookFrame {
-                    png_bytes,
-                    action_label: label,
-                    timestamp_ms: now_ms(),
-                });
-            }
+            pip_hook::request_pip_frame(
+                args.opt_u64("window_id"),
+                args.opt_i64("pid"),
+                synthesize_action_label(name, &public_args),
+                now_ms(),
+            );
         }
 
         result

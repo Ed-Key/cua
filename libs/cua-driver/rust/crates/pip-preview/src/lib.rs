@@ -253,9 +253,8 @@ impl PipConfig {
 /// A single frame pushed into the PiP window after a tool call lands.
 ///
 /// `png_bytes` are the raw PNG bytes produced by the platform
-/// screenshot callback — the same path that powers `screenshot.png`
-/// in the recording pipeline, so PiP shows exactly what the recorder
-/// sees.
+/// screenshot callback used by recording. Preview capture runs independently
+/// and may show a later state; it is not per-action verification evidence.
 #[derive(Debug, Clone)]
 pub struct PipFrame {
     pub png_bytes: Vec<u8>,
