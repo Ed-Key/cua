@@ -118,17 +118,22 @@ impl Tool for ActAndReadTool {
             "OBSERVATION RESULT (unchanged child content follows)",
         ));
         content.extend(observation_content);
+        let output = serde_json::to_value(ActAndReadOutput {
+            action,
+            observation,
+            timings,
+        })
+        .expect("action/read output serializes");
+        if is_error {
+            // Some MCP clients expose only text content on tool errors. Keep
+            // the refusal and fresh observation metadata available to those
+            // clients without clearing the error or replaying either child.
+            content.push(Content::text(output.to_string()));
+        }
         ToolResult {
             content,
             is_error: Some(is_error),
-            structured_content: Some(
-                serde_json::to_value(ActAndReadOutput {
-                    action,
-                    observation,
-                    timings,
-                })
-                .expect("action/read output serializes"),
-            ),
+            structured_content: Some(output),
             ..Default::default()
         }
     }
