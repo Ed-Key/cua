@@ -115,12 +115,12 @@ fn def() -> &'static ToolDef {
                 "max_elements": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Cap on the total number of AX nodes walked. Truncates depth-first; markdown and structured elements truncate together. Omit for the default (2 000). Lower this for Electron / Obsidian / large web apps that produce 10k+ element trees and blow context windows."
+                    "description": "AX nodes visited before query filtering, including containers and menus. Omit for normal reads (default 2000). Use query/query_context to reduce returned text. Lower this to bound collection work; later content or a matching target may then be omitted even when the response is small."
                 },
                 "max_depth": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (25). Lower this for deep menu/Electron trees."
+                    "description": "AX traversal depth before query filtering. Omit for normal reads (default 25). Lowering this can exclude deeper matching content."
                 },
                 "max_dimension": {
                     "type": "integer",

@@ -48,11 +48,13 @@
                 "type": "boolean"
               },
               "max_depth": {
+                "description": "AX traversal depth before query filtering. Omit for normal reads\n(default 25). Lowering this can exclude deeper matching content.",
                 "maximum": 100,
                 "minimum": 1,
                 "type": "integer"
               },
               "max_elements": {
+                "description": "AX nodes visited before query filtering, including containers and menus.\nOmit for normal reads (default 2000). Use query/query_context to reduce\nreturned text. Lower this to bound collection work; later content or a\nmatching target may then be omitted even when the response is small.",
                 "maximum": 2000,
                 "minimum": 1,
                 "type": "integer"

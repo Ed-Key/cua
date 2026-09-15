@@ -57,6 +57,10 @@ pub struct ActionReadObservation {
     pub query: Option<String>,
     #[serde(default)]
     pub query_context: bool,
+    /// AX nodes visited before query filtering, including containers and menus.
+    /// Omit for normal reads (default 2000). Use query/query_context to reduce
+    /// returned text. Lower this to bound collection work; later content or a
+    /// matching target may then be omitted even when the response is small.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -64,6 +68,8 @@ pub struct ActionReadObservation {
     )]
     #[schemars(schema_with = "elements")]
     pub max_elements: Option<u32>,
+    /// AX traversal depth before query filtering. Omit for normal reads
+    /// (default 25). Lowering this can exclude deeper matching content.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
