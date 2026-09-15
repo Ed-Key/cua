@@ -866,11 +866,16 @@ pixels when you need visual position, clipping, a canvas, an ambiguous effect,
 or evidence that conflicts with the tree. A text read does not prove that an
 Electron input reached the renderer; keep the existing action-verification rules.
 
-Use `query` to locate a target, not to fetch a complete message or document
-section. It keeps matching rendered rows and their ancestors, so a matching
-heading can survive while its body or surrounding replies disappear. Read
-without `query` when you need that context. Likewise, lowering `max_depth` or
-`max_elements` can omit the content beneath a visible heading. Start with the
+An ordinary `query` keeps matching logical rows and their ancestors, so a
+matching heading can survive while its body disappears. When the live tool
+schema advertises `query_context`, set it to true with a nonblank `query` to
+also read that heading's collected descendants. This is useful for a message
+body or document subsection. Check `tree_markdown` too: display-only child text
+may have no structured element record. The option does not load more content
+or establish completeness. Sibling replies are included only if their ancestor
+also matches the query. Read without `query` when you need surrounding replies
+or when the tool does not offer context. Lowering `max_depth` or `max_elements`
+can still omit content beneath a heading. Start with the
 default bounds for contextual reading and narrow them only when you know the
 needed content remains present. Do not interpret an omitted row as absent.
 
