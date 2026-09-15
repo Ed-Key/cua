@@ -192,6 +192,15 @@ Standard Claude Code MCP registration:
 claude mcp add --transport stdio cua-driver -- cua-driver mcp
 ```
 
+`get_window_state` and, where available, `act_and_read` advertise a 250,000-character
+text-result budget through MCP `_meta["anthropic/maxResultSizeChars"]`. Supporting
+Claude Code versions can retain larger accessibility observations directly in
+context instead of replacing them with a saved-file reference. This is a client
+hint, not a new driver truncation limit. It does not change tree contents, traversal
+limits, or screenshot defaults. Image-bearing results remain subject to Claude
+Code's `MAX_MCP_OUTPUT_TOKENS` limit. Other clients may ignore the hint. See
+[Claude Code's per-tool output limits](https://code.claude.com/docs/en/mcp#raise-the-limit-for-a-specific-tool).
+
 If you want Claude Code's vision/computer-use-style flow to ground on CuaDriver window screenshots, register the compatibility mode:
 
 ```bash

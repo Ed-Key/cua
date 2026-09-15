@@ -426,6 +426,9 @@ fn daemon_tools_list_from(tools_list: &Value) -> Value {
                         .expect("daemon tool entry is an object")
                         .insert("output_schema".into(), output_schema.clone());
                 }
+                if let Some(meta) = tool.get("_meta") {
+                    daemon_tool["_meta"] = meta.clone();
+                }
                 daemon_tool
             })
             .collect::<Vec<_>>();
@@ -484,6 +487,10 @@ mod tests {
                 },
                 "capabilities": ["probe.read"],
                 "risk": {"level": "low"},
+                "_meta": {
+                    "anthropic/maxResultSizeChars": 250000,
+                    "example.org/hint": {"nested": true}
+                },
                 "outputSchema": {
                     "type": "object",
                     "required": ["value"],
@@ -504,11 +511,18 @@ mod tests {
             json!(["value"])
         );
         assert_eq!(daemon["tools"][0]["read_only"], true);
+        assert_eq!(daemon["tools"][0]["_meta"], tools_list["tools"][0]["_meta"]);
         assert_eq!(
             daemon["enforcement_adapters"][0]["id"],
             "browser_prepare.existing_profile"
         );
         assert_eq!(daemon["tool_observation_owner"], "daemon");
+    }
+
+    #[test]
+    fn daemon_shape_does_not_invent_tool_metadata() {
+        let daemon = daemon_tools_list_from(&json!({"tools": [{"name": "click"}]}));
+        assert!(daemon["tools"][0].get("_meta").is_none());
     }
 
     #[tokio::test]
