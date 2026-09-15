@@ -402,6 +402,7 @@ mod tests {
             element_ptr: 7,
             depth,
             parent_element_index: None,
+            parent_node_position: None,
             frame: None,
             value_state: None,
             value_description: None,

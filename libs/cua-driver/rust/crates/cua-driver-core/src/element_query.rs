@@ -67,10 +67,8 @@ pub fn select_preorder_rows(
     rows: impl IntoIterator<Item = (usize, bool)>,
     include_descendants: bool,
 ) -> Vec<usize> {
-    let mut parents: Vec<Option<usize>> = Vec::new();
-    let mut under_match: Vec<bool> = Vec::new();
-    let mut selected: Vec<bool> = Vec::new();
     let mut stack: Vec<(usize, usize)> = Vec::new();
+    let mut parented = Vec::new();
     for (depth, matches) in rows {
         while stack
             .last()
@@ -79,11 +77,31 @@ pub fn select_preorder_rows(
             stack.pop();
         }
         let parent = stack.last().map(|(_, position)| *position);
+        parented.push((parent, matches));
+        stack.push((depth, parented.len() - 1));
+    }
+    select_parented_rows(parented, include_descendants)
+}
+
+/// Select rows using the walker's nearest retained parent positions. A parent
+/// must precede its child. Unlike rendered depths, these edges remain reliable
+/// when a native container is omitted from the snapshot.
+pub fn select_parented_rows(
+    rows: impl IntoIterator<Item = (Option<usize>, bool)>,
+    include_descendants: bool,
+) -> Vec<usize> {
+    let mut parents: Vec<Option<usize>> = Vec::new();
+    let mut under_match: Vec<bool> = Vec::new();
+    let mut selected: Vec<bool> = Vec::new();
+    for (parent, matches) in rows {
+        assert!(
+            parent.is_none_or(|p| p < parents.len()),
+            "parents must precede children"
+        );
         let ancestor_matches = parent.is_some_and(|position| under_match[position]);
         parents.push(parent);
         under_match.push(matches || ancestor_matches);
         selected.push(matches || (include_descendants && ancestor_matches));
-        stack.push((depth, selected.len() - 1));
     }
     // Propagate selection upward only after descendant selection is finished,
     // so a retained ancestor cannot accidentally pull in a sibling branch.

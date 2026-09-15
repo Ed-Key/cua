@@ -166,6 +166,7 @@ mod tests {
             element_ptr: ptr,
             depth: 0,
             parent_element_index: None,
+            parent_node_position: None,
             frame: None,
             value_state: None,
             value_description: None,

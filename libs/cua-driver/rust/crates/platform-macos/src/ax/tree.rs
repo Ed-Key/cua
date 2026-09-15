@@ -77,6 +77,9 @@ pub struct AXNode {
     /// `element_index` of the nearest actionable ancestor, if any. Walks the
     /// rendered tree (so it skips collapsed layout containers).
     pub parent_element_index: Option<usize>,
+    /// Position of the nearest retained logical parent in the full node vector.
+    /// Includes display-only parents and survives omitted native containers.
+    pub parent_node_position: Option<usize>,
     /// Screen-coordinate bounding rect `[x, y, width, height]` captured at
     /// walk time. `None` when AX didn't report a usable position+size.
     pub frame: Option<[f64; 4]>,
@@ -204,6 +207,20 @@ pub fn walk_tree_bounded(
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
+    walk_tree_bounded_with_context(pid, window_id, query, max_elements, max_depth, false)
+}
+
+/// Like [`walk_tree_bounded`], optionally retaining collected descendants of
+/// query matches. This only projects the bounded snapshot; it does not expand
+/// the walk, recover unloaded content, or establish completeness.
+pub fn walk_tree_bounded_with_context(
+    pid: i32,
+    window_id: Option<u32>,
+    query: Option<&str>,
+    max_elements: usize,
+    max_depth: usize,
+    include_descendants: bool,
+) -> TreeWalkResult {
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut index_counter = 0usize;
     // Shared visited-node counter passed into walk_element to enforce the cap.
@@ -310,6 +327,7 @@ pub fn walk_tree_bounded(
                 child,
                 0,
                 None,
+                None,
                 false,
                 &mut nodes,
                 &mut index_counter,
@@ -331,9 +349,7 @@ pub fn walk_tree_bounded(
     }
 
     let truncated_flag = truncated;
-    // Preserve the public matches-plus-ancestors query policy. The internal
-    // selector also supports descendant context without reading the app again.
-    let projection = project_tree_nodes(&nodes, query, false);
+    let projection = project_tree_nodes(&nodes, query, include_descendants);
     let mut tree_markdown = projection.markdown;
     let query_node_positions = query.map(|_| projection.node_positions);
 
@@ -369,6 +385,7 @@ unsafe fn walk_element(
     element: AXUIElementRef,
     depth: usize,
     parent_index: Option<usize>,
+    parent_node_position: Option<usize>,
     in_web_content: bool,
     nodes: &mut Vec<AXNode>,
     counter: &mut usize,
@@ -410,6 +427,7 @@ unsafe fn walk_element(
                 child,
                 depth,
                 parent_index,
+                parent_node_position,
                 in_web_content,
                 nodes,
                 counter,
@@ -475,6 +493,7 @@ unsafe fn walk_element(
                 child,
                 depth + 1,
                 parent_index,
+                parent_node_position,
                 in_web_content,
                 nodes,
                 counter,
@@ -537,6 +556,7 @@ unsafe fn walk_element(
             element_ptr,
             depth,
             parent_element_index: parent_index,
+            parent_node_position,
             frame,
             value_state: control_state.value_state.clone(),
             value_description: control_state.value_description.clone(),
@@ -576,6 +596,7 @@ unsafe fn walk_element(
             element_ptr,
             depth,
             parent_element_index: parent_index,
+            parent_node_position,
             frame,
             value_state: control_state.value_state.clone(),
             value_description: control_state.value_description.clone(),
@@ -592,6 +613,7 @@ unsafe fn walk_element(
     // indexed rows are addressable in click(element_index=N)).
     let next_parent = node.element_index.or(parent_index);
 
+    let next_parent_position = Some(nodes.len());
     nodes.push(node);
 
     let children = copy_children(element);
@@ -600,6 +622,7 @@ unsafe fn walk_element(
             child,
             depth + 1,
             next_parent,
+            next_parent_position,
             in_web_content,
             nodes,
             counter,
@@ -728,7 +751,7 @@ mod tests {
 
     #[test]
     fn focused_selection_outline_is_lossless_and_focus_race_discards_state() {
-        let mut node = super::typed_query_tests::row(Some(3), 1, "AXTextField", "A😀BC");
+        let mut node = super::typed_query_tests::row(Some(3), 1, Some(0), "AXTextField", "A😀BC");
         node.focused = Some(true);
         node.text_selection = Some(cua_driver_contract::TextSelection {
             text: Some("A😀".into()),
@@ -783,12 +806,12 @@ mod tests {
     fn save_query_retains_each_named_group_with_its_own_button() {
         use super::typed_query_tests::row;
         let nodes = vec![
-            row(Some(0), 0, "AXWebArea", "Page"),
-            row(Some(1), 1, "AXGroup", "Profile"),
-            row(Some(2), 2, "AXButton", "Save"),
-            row(None, 2, "AXStaticText", "Unrelated"),
-            row(Some(3), 1, "AXGroup", "Billing"),
-            row(Some(4), 2, "AXButton", "Save"),
+            row(Some(0), 0, None, "AXWebArea", "Page"),
+            row(Some(1), 1, Some(0), "AXGroup", "Profile"),
+            row(Some(2), 2, Some(1), "AXButton", "Save"),
+            row(None, 2, Some(1), "AXStaticText", "Unrelated"),
+            row(Some(3), 1, Some(0), "AXGroup", "Billing"),
+            row(Some(4), 2, Some(4), "AXButton", "Save"),
         ];
         let result = project_tree_nodes(&nodes, Some("Save"), false);
         assert_eq!(result.node_positions, vec![0, 1, 2, 4, 5]);
@@ -816,6 +839,7 @@ mod tests {
             element_ptr: 0,
             depth: 0,
             parent_element_index: None,
+            parent_node_position: None,
             frame: None,
             value_state: None,
             value_description: None,
@@ -896,10 +920,10 @@ pub(crate) fn project_tree_nodes(
 ) -> TreeQueryProjection {
     let needle = query.map(str::to_lowercase);
     let lines: Vec<_> = nodes.iter().map(format_node_line).collect();
-    let node_positions = cua_driver_core::element_query::select_preorder_rows(
+    let node_positions = cua_driver_core::element_query::select_parented_rows(
         nodes.iter().zip(&lines).map(|(node, line)| {
             (
-                node.depth,
+                node.parent_node_position,
                 needle
                     .as_ref()
                     .is_none_or(|q| line.to_lowercase().contains(q)),
@@ -921,7 +945,13 @@ pub(crate) fn project_tree_nodes(
 mod typed_query_tests {
     use super::*;
 
-    pub(super) fn row(index: Option<usize>, depth: usize, role: &str, value: &str) -> AXNode {
+    pub(super) fn row(
+        index: Option<usize>,
+        depth: usize,
+        parent: Option<usize>,
+        role: &str,
+        value: &str,
+    ) -> AXNode {
         AXNode {
             value_settable: None,
             focused: None,
@@ -939,6 +969,7 @@ mod typed_query_tests {
             element_ptr: 0,
             depth,
             parent_element_index: None,
+            parent_node_position: parent,
             frame: None,
             value_state: Some(value.into()),
             value_description: None,
@@ -953,14 +984,15 @@ mod typed_query_tests {
     #[test]
     fn multiline_text_cannot_select_an_unrelated_target_id() {
         let nodes = vec![
-            row(Some(0), 0, "AXWindow", "Messages"),
+            row(Some(0), 0, None, "AXWindow", "Messages"),
             row(
                 Some(1),
                 1,
+                Some(0),
                 "AXStaticText",
                 "Message body\n- [2] AXButton needle",
             ),
-            row(Some(2), 1, "AXButton", "Unrelated button"),
+            row(Some(2), 1, Some(0), "AXButton", "Unrelated button"),
         ];
         let result = project_tree_nodes(&nodes, Some("needle"), false);
         assert_eq!(result.node_positions, vec![0, 1]);
@@ -972,8 +1004,8 @@ mod typed_query_tests {
     fn multiline_values_stay_one_outline_row_and_keep_their_raw_value() {
         let text = "First line\n- [99] AXButton not-a-target\rLast line";
         let nodes = vec![
-            row(Some(0), 0, "AXWindow", "Messages"),
-            row(Some(1), 1, "AXStaticText", text),
+            row(Some(0), 0, None, "AXWindow", "Messages"),
+            row(Some(1), 1, Some(0), "AXStaticText", text),
         ];
         let result = project_tree_nodes(&nodes, None, false);
         assert_eq!(result.markdown.lines().count(), 2);
@@ -982,12 +1014,34 @@ mod typed_query_tests {
     }
 
     #[test]
+    fn omitted_sibling_container_does_not_make_its_child_part_of_previous_match() {
+        // Native shape: Window -> [M09, empty AXSplitGroup -> M10].
+        // The split group is omitted, so M10 retains depth 2 but its nearest
+        // retained parent is Window, not M09.
+        let mut sibling = row(Some(2), 2, Some(0), "AXButton", "M10 unrelated");
+        sibling.parent_element_index = Some(0);
+        let nodes = vec![
+            row(Some(0), 0, None, "AXWindow", "Messages"),
+            row(Some(1), 1, Some(0), "AXGroup", "M09"),
+            sibling,
+        ];
+        assert_eq!(
+            project_tree_nodes(&nodes, Some("M09"), true).node_positions,
+            vec![0, 1]
+        );
+        assert_eq!(
+            project_tree_nodes(&nodes, Some("M10"), false).node_positions,
+            vec![0, 2]
+        );
+    }
+
+    #[test]
     fn context_retains_display_only_body_and_original_node_positions() {
         let nodes = vec![
-            row(Some(0), 0, "AXWindow", "Messages"),
-            row(Some(7), 1, "AXGroup", "M09"),
-            row(None, 2, "AXStaticText", "Keep preliminary wording"),
-            row(Some(12), 1, "AXGroup", "M10 reply"),
+            row(Some(0), 0, None, "AXWindow", "Messages"),
+            row(Some(7), 1, Some(0), "AXGroup", "M09"),
+            row(None, 2, Some(1), "AXStaticText", "Keep preliminary wording"),
+            row(Some(12), 1, Some(0), "AXGroup", "M10 reply"),
         ];
         let context = project_tree_nodes(&nodes, Some("m09"), true);
         assert_eq!(context.node_positions, vec![0, 1, 2]);
@@ -999,6 +1053,40 @@ mod typed_query_tests {
         );
         assert_eq!(
             project_tree_nodes(&nodes, None, false).node_positions,
+            vec![0, 1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn context_tracks_display_only_parents_separately_from_actionable_ancestry() {
+        let nodes = vec![
+            row(Some(0), 0, None, "AXWindow", "Messages"),
+            row(None, 1, Some(0), "AXGroup", "M09"),
+            row(
+                None,
+                3,
+                Some(1),
+                "AXStaticText",
+                "Body through omitted wrapper",
+            ),
+            row(
+                Some(2),
+                3,
+                Some(0),
+                "AXButton",
+                "Unrelated through sibling wrapper",
+            ),
+        ];
+        assert_eq!(
+            project_tree_nodes(&nodes, Some("M09"), true).node_positions,
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            project_tree_nodes(&nodes, Some("Body"), false).node_positions,
+            vec![0, 1, 2]
+        );
+        assert_eq!(
+            project_tree_nodes(&nodes, Some("Messages"), true).node_positions,
             vec![0, 1, 2, 3]
         );
     }

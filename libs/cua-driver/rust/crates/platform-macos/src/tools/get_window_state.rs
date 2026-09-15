@@ -80,6 +80,11 @@ fn def() -> &'static ToolDef {
             element_index values are unchanged, the complete snapshot remains actionable, \
             and `element_count` continues to report its total size; \
             `filtered_element_count` reports the projected response size.\n\n\
+            Set `query_context:true` to also retain the matched nodes' descendants \
+            already collected within the walk limits. Requires a nonblank `query` \
+            and accessibility enabled. Sibling replies are included only if the query \
+            matches their ancestor too. Unloaded content remains unavailable, and a \
+            missing match does not prove absence.\n\n\
             Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
             context-window blow-up on Electron / Obsidian / large web apps that \
             produce 10k+ element trees. When applied, BOTH the markdown \
@@ -93,6 +98,7 @@ fn def() -> &'static ToolDef {
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
                 "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching actionable rows plus their actionable ancestors without renumbering element_index values." },
+                "query_context": { "type": "boolean", "description": "Default false. With a nonblank query and accessibility enabled, also keep matched nodes' collected descendants, including display-only text in the outline. Preserves original indices and tokens. Bounded snapshot only: does not fetch unloaded content or infer sibling replies or completeness. macOS only." },
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_accessibility_tree": {
                     "type": "boolean",
@@ -186,6 +192,20 @@ impl Tool for GetWindowStateTool {
             Ok(v) => v,
             Err(e) => return e,
         };
+        let query = args.opt_str("query");
+        let query_context = match args.get("query_context") {
+            None | Some(Value::Bool(false)) => false,
+            Some(Value::Bool(true)) => true,
+            Some(_) => return ToolResult::error("query_context must be a boolean"),
+        };
+        if query_context
+            && (query.as_deref().is_none_or(|q| q.trim().is_empty())
+                || args.get("include_accessibility_tree") == Some(&Value::Bool(false)))
+        {
+            return ToolResult::error(
+                "query_context:true requires a nonblank query and include_accessibility_tree:true (or omitted)",
+            );
+        }
 
         // Issue #2237: pre-flight the requested window against WindowServer
         // BEFORE the (up to 20 s) AX walk. An id that no window carries, or
@@ -215,7 +235,6 @@ impl Tool for GetWindowStateTool {
             }
         }
 
-        let query = args.opt_str("query");
         let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
             // Expand ~ prefix.
             if let Some(relative) = s.strip_prefix("~/") {
@@ -303,12 +322,13 @@ impl Tool for GetWindowStateTool {
             // walker also applies a native per-element messaging timeout because
             // dropping a spawn_blocking JoinHandle cannot cancel a blocked AX call.
             let walk_future = tokio::task::spawn_blocking(move || {
-                crate::ax::tree::walk_tree_bounded(
+                crate::ax::tree::walk_tree_bounded_with_context(
                     pid,
                     Some(window_id),
                     q.as_deref(),
                     max_elements,
                     max_depth,
+                    query_context,
                 )
             });
             match tokio::time::timeout(std::time::Duration::from_secs(20), walk_future).await {
@@ -1128,6 +1148,62 @@ mod window_scope_contract_tests {
     /// window_id required (schema not loosened), and documents the degenerate
     /// both-false case in its description.
     #[test]
+    fn schema_exposes_optional_query_context() {
+        let schema = &def().input_schema;
+        assert_eq!(schema["properties"]["query_context"]["type"], "boolean");
+        assert!(!schema["required"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!("query_context")));
+    }
+
+    #[tokio::test]
+    async fn query_context_invalid_requests_fail_before_window_lookup() {
+        let tool = GetWindowStateTool::new(Arc::new(ToolState::default()));
+        for extra in [
+            serde_json::json!({"query_context": true}),
+            serde_json::json!({"query_context": true, "query": "  \n"}),
+            serde_json::json!({"query_context": true, "query": 42}),
+            serde_json::json!({"query_context": true, "query": "M09", "include_accessibility_tree": false}),
+            serde_json::json!({"query_context": "true", "query": "M09"}),
+            serde_json::json!({"query_context": null, "query": "M09"}),
+        ] {
+            let mut args = serde_json::json!({"pid": -1, "window_id": 0});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = tool.invoke(args.clone()).await;
+            assert_eq!(result.is_error, Some(true));
+            assert!(
+                serde_json::to_string(&result)
+                    .unwrap()
+                    .contains("query_context"),
+                "{args}: {result:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn query_context_false_and_omitted_preserve_queryless_requests() {
+        let tool = GetWindowStateTool::new(Arc::new(ToolState::default()));
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"query_context": false}),
+        ] {
+            let mut args =
+                serde_json::json!({"pid": -1, "window_id": 0, "include_accessibility_tree": false});
+            args.as_object_mut()
+                .unwrap()
+                .extend(extra.as_object().unwrap().clone());
+            let result = tool.invoke(args).await;
+            assert_eq!(
+                result.structured_content.unwrap()["code"],
+                "window_id_not_found"
+            );
+        }
+    }
+
+    #[test]
     fn schema_advertises_capture_only_controls() {
         let d = def();
         let props = &d.input_schema["properties"];
@@ -1205,6 +1281,7 @@ mod tests {
             element_ptr: 0,
             depth,
             parent_element_index: parent,
+            parent_node_position: parent,
             frame,
             value_state: None,
             value_description: None,
@@ -1511,6 +1588,67 @@ mod tests {
             window_scope: Some(crate::ax::WindowScope::Matched),
         };
         build_snapshot_elements(&tree, None, false)
+    }
+
+    #[test]
+    fn contextual_query_preserves_child_text_urls_and_action_tokens() {
+        let raw = "First line\n- [99] AXButton pretend\rLast line";
+        let mut body = node(None, "AXStaticText", None, 2, Some(1), None, vec![]);
+        body.value = Some(raw.into());
+        let mut link = node(
+            Some(2),
+            "AXLink",
+            Some("Reference"),
+            2,
+            Some(1),
+            None,
+            vec![],
+        );
+        link.url = Some("https://example.test/message".into());
+        let nodes = vec![
+            node(Some(0), "AXWindow", Some("Messages"), 0, None, None, vec![]),
+            node(Some(1), "AXGroup", Some("M09"), 1, Some(0), None, vec![]),
+            body,
+            link,
+            node(
+                Some(3),
+                "AXGroup",
+                Some("M10 sibling reply"),
+                1,
+                Some(0),
+                None,
+                vec![],
+            ),
+        ];
+        for (context, expected_ids) in [(false, vec![0, 1]), (true, vec![0, 1, 2])] {
+            let projection = crate::ax::tree::project_tree_nodes(&nodes, Some("M09"), context);
+            let tree = crate::ax::tree::TreeWalkResult {
+                tree_markdown: projection.markdown,
+                nodes: nodes.clone(),
+                query_node_positions: Some(projection.node_positions),
+                truncated: false,
+                window_scope: Some(crate::ax::WindowScope::Matched),
+            };
+            let records = build_snapshot_elements(&tree, Some(7), false);
+            let ids: Vec<_> = records
+                .iter()
+                .map(|e| e["element_index"].as_u64().unwrap())
+                .collect();
+            assert_eq!(ids, expected_ids);
+            assert_eq!(tree.tree_markdown.contains("First line"), context);
+            assert!(!tree.tree_markdown.contains("M10 sibling"));
+            assert_eq!(tree.nodes[2].value.as_deref(), Some(raw));
+            assert_eq!(
+                tree.nodes.len(),
+                5,
+                "projection must not discard cache nodes"
+            );
+            if context {
+                assert_eq!(records[2]["url"], "https://example.test/message");
+                assert_eq!(records[2]["element_token"], "s00000007:2");
+                assert_eq!(tree.tree_markdown.lines().count(), 4);
+            }
+        }
     }
 
     #[test]
