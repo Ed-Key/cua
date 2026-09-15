@@ -14,10 +14,13 @@
 //!
 //! The preventer subscribes to
 //! `NSWorkspace.didActivateApplicationNotification` and, when an activation
-//! matches a registered suppression entry, immediately re-activates the
-//! prior frontmost app on a background thread. AppKit's
-//! `-[NSRunningApplication activateWithOptions:]` is documented thread-safe
-//! — no main-thread hop required.
+//! matches a registered suppression entry, requests restoration of the
+//! prior frontmost process through the existing WindowServer process API.
+//! Destination lookup happens before a final lease and foreground check.
+//! Unknown foreground state or unavailable native symbols reject restoration.
+//! The request runs on the observer queue, without an AppKit activation fallback.
+//! Native acceptance does not guarantee synchronous completion or prevent every
+//! transient focus change. Protection ends when the matching lease ends.
 //!
 //! ## Layered design (matches PR #1521)
 //!
@@ -61,8 +64,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use objc2_app_kit::{
-    NSApplicationActivationOptions, NSRunningApplication, NSWorkspace, NSWorkspaceApplicationKey,
-    NSWorkspaceDidActivateApplicationNotification,
+    NSWorkspace, NSWorkspaceApplicationKey, NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::NSOperationQueue;
 use uuid::Uuid;
@@ -370,7 +372,7 @@ impl Dispatcher {
         &self,
         activated_pid: i32,
         mut frontmost_pid: impl FnMut() -> Option<i32>,
-        mut restore: impl FnMut(i32),
+        mut restore: impl FnMut(i32, &mut dyn FnMut() -> bool),
     ) {
         let Some(winner) = self.winner_for_activation(activated_pid) else {
             tracing::debug!(
@@ -395,7 +397,15 @@ impl Dispatcher {
         // reinterpret an in-flight notification using a fallback lease.
         if self.winner_for_activation(activated_pid) == Some(winner) {
             tracing::debug!(activated_pid, handle = %winner.0.0, restore_to = winner.1, decision = "restore", "focus activation dispatch");
-            restore(winner.1);
+            restore(winner.1, &mut || {
+                if self.winner_for_activation(activated_pid) != Some(winner) {
+                    return false;
+                }
+                if frontmost_pid() != Some(activated_pid) {
+                    return false;
+                }
+                self.winner_for_activation(activated_pid) == Some(winner)
+            });
         } else {
             tracing::debug!(
                 activated_pid,
@@ -571,24 +581,27 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
     };
 
     tracing::debug!(activated_pid, "focus activation notification received");
-    dispatcher.dispatch_activation(activated_pid, crate::apps::frontmost_pid, restore_focus);
+    dispatcher.dispatch_activation(
+        activated_pid,
+        || {
+            let matches = crate::input::skylight::front_pid_matches(activated_pid);
+            tracing::debug!(activated_pid, ?matches, "WindowServer activation freshness");
+            matches.filter(|matches| *matches).map(|_| activated_pid)
+        },
+        restore_focus,
+    );
 }
 
-/// Re-activate `pid` if it's still running. Safe to call from any
-/// thread — Apple documents `activateWithOptions:` as thread-safe.
-fn restore_focus(pid: i32) {
-    unsafe {
-        if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
-            let accepted = app.activateWithOptions(NSApplicationActivationOptions(0));
-            tracing::debug!(
-                restore_to = pid,
-                accepted,
-                "focus restoration request returned"
-            );
-        } else {
-            tracing::debug!(restore_to = pid, "focus restoration target unavailable");
-        }
-    }
+/// Restore the guarded prior process without AppKit's delayed activation
+/// request. Recheck the original lease and actual foreground after resolving
+/// the destination, immediately before the WindowServer mutation.
+fn restore_focus(pid: i32, admit: &mut dyn FnMut() -> bool) {
+    let accepted = crate::input::skylight::restore_front_pid(pid, admit);
+    tracing::debug!(
+        restore_to = pid,
+        accepted,
+        "WindowServer focus restoration returned"
+    );
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -607,11 +620,55 @@ mod tests {
     }
 
     #[test]
+    fn lease_release_during_restore_lookup_prevents_native_mutation() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.lookup_release");
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || Some(42),
+            |pid, admit| {
+                // Native target resolution can outlive cancellation of the action.
+                d.remove(handle);
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert!(
+            restored.is_empty(),
+            "an expired operation must not restore later"
+        );
+    }
+
+    #[test]
+    fn newer_foreground_during_restore_lookup_prevents_native_mutation() {
+        let d = Arc::new(Dispatcher::new());
+        let _handle = d.add(Some(42), 7, "test.lookup_switch");
+        let front = std::cell::Cell::new(42);
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || Some(front.get()),
+            |pid, admit| {
+                front.set(99);
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert!(
+            restored.is_empty(),
+            "restoration must not undo a newer app switch"
+        );
+    }
+
+    #[test]
     fn delayed_activation_does_not_restore_over_a_newer_foreground_app() {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(Some(42), 7, "test.delayed");
         let mut restored = Vec::new();
-        d.dispatch_activation(42, || Some(99), |pid| restored.push(pid));
+        d.dispatch_activation(42, || Some(99), |pid, _admit| restored.push(pid));
         assert!(
             restored.is_empty(),
             "a queued notification must not undo a newer app switch"
@@ -623,7 +680,7 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(Some(42), 7, "test.unknown");
         let mut restored = Vec::new();
-        d.dispatch_activation(42, || None, |pid| restored.push(pid));
+        d.dispatch_activation(42, || None, |pid, _admit| restored.push(pid));
         assert!(
             restored.is_empty(),
             "missing current state cannot authorize activation"
@@ -635,7 +692,7 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(Some(42), 7, "test.current");
         let mut restored = Vec::new();
-        d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
+        d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
         assert_eq!(restored, vec![7]);
     }
 
@@ -645,7 +702,7 @@ mod tests {
         let _a = d.add(Some(42), 7, "test.first");
         let _b = d.add(Some(42), 8, "test.second");
         let mut restored = Vec::new();
-        d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
+        d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
         assert_eq!(
             restored,
             vec![8],
@@ -660,11 +717,11 @@ mod tests {
             let _a = d.add(older, 7, "test.older");
             let b = d.add(newer, 8, "test.newer");
             let mut restored = Vec::new();
-            d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
+            d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
             assert_eq!(restored, vec![8]);
             d.remove(b);
             restored.clear();
-            d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
+            d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
             assert_eq!(
                 restored,
                 vec![7],
@@ -690,7 +747,7 @@ mod tests {
                 drop(lease.take());
                 Some(42)
             },
-            |pid| restored.push(pid),
+            |pid, _admit| restored.push(pid),
         );
         assert!(
             restored.is_empty(),
@@ -714,7 +771,7 @@ mod tests {
                     .deadline = Instant::now() - Duration::from_secs(1);
                 Some(42)
             },
-            |pid| restored.push(pid),
+            |pid, _admit| restored.push(pid),
         );
         assert!(
             restored.is_empty(),
@@ -735,7 +792,7 @@ mod tests {
                     d.add(Some(42), destination, "test.new");
                     Some(42)
                 },
-                |pid| restored.push(pid),
+                |pid, _admit| restored.push(pid),
             );
             assert!(
                 restored.is_empty(),
@@ -755,7 +812,7 @@ mod tests {
                 d.add(Some(99), 8, "test.unrelated");
                 Some(42)
             },
-            |pid| restored.push(pid),
+            |pid, _admit| restored.push(pid),
         );
         assert_eq!(restored, vec![7]);
     }
@@ -765,15 +822,15 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.target");
         let mut restored = Vec::new();
-        d.dispatch_activation(99, || Some(99), |pid| restored.push(pid));
+        d.dispatch_activation(99, || Some(99), |pid, _admit| restored.push(pid));
         assert!(restored.is_empty());
         d.remove(h);
 
         let _h = d.add_allowing(42, 7, "test.wildcard");
-        d.dispatch_activation(42, || Some(42), |pid| restored.push(pid));
-        d.dispatch_activation(7, || Some(7), |pid| restored.push(pid));
+        d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+        d.dispatch_activation(7, || Some(7), |pid, _admit| restored.push(pid));
         assert!(restored.is_empty());
-        d.dispatch_activation(99, || Some(99), |pid| restored.push(pid));
+        d.dispatch_activation(99, || Some(99), |pid, _admit| restored.push(pid));
         assert_eq!(
             restored,
             vec![7],
