@@ -315,12 +315,14 @@ impl Dispatcher {
         // Signal the janitor that there's work to do (it will start a
         // fresh tokio interval on the next tick).
         let _ = self.janitor_active.send(true);
+        tracing::debug!(handle = %id, ?target_pid, ?allowed_pid, restore_to, origin, phase = "registered", "focus suppression lifecycle");
         SuppressionHandle(id)
     }
 
     /// Remove an entry. When the map drains to empty, signals the janitor
     /// to stop until the next add.
     fn remove(&self, handle: SuppressionHandle) {
+        tracing::debug!(handle = %handle.0, phase = "released", "focus suppression lifecycle");
         let now_empty = {
             let mut guard = self.entries.lock().unwrap();
             guard.remove(&handle.0);
@@ -371,16 +373,35 @@ impl Dispatcher {
         mut restore: impl FnMut(i32),
     ) {
         let Some(winner) = self.winner_for_activation(activated_pid) else {
+            tracing::debug!(
+                activated_pid,
+                decision = "no_matching_lease",
+                "focus activation dispatch"
+            );
             return;
         };
-        if frontmost_pid() != Some(activated_pid) {
+        let current_front = frontmost_pid();
+        if current_front != Some(activated_pid) {
+            tracing::debug!(
+                activated_pid,
+                ?current_front,
+                decision = "foreground_changed",
+                "focus activation dispatch"
+            );
             return;
         }
         // The foreground read can overlap cancellation, expiry, or another
         // registration. Drop this dispatch if the choice changed; do not
         // reinterpret an in-flight notification using a fallback lease.
         if self.winner_for_activation(activated_pid) == Some(winner) {
+            tracing::debug!(activated_pid, handle = %winner.0.0, restore_to = winner.1, decision = "restore", "focus activation dispatch");
             restore(winner.1);
+        } else {
+            tracing::debug!(
+                activated_pid,
+                decision = "lease_changed",
+                "focus activation dispatch"
+            );
         }
     }
 
@@ -521,6 +542,7 @@ fn install_observer(dispatcher: &Arc<Dispatcher>) {
     // process lifetime.
     std::mem::forget(token);
     std::mem::forget(queue);
+    tracing::debug!("focus activation observer installed");
 }
 
 /// Match a single activation notification against the dispatcher and,
@@ -548,6 +570,7 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
         pid as i32
     };
 
+    tracing::debug!(activated_pid, "focus activation notification received");
     dispatcher.dispatch_activation(activated_pid, crate::apps::frontmost_pid, restore_focus);
 }
 
@@ -556,7 +579,14 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
 fn restore_focus(pid: i32) {
     unsafe {
         if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
-            let _ = app.activateWithOptions(NSApplicationActivationOptions(0));
+            let accepted = app.activateWithOptions(NSApplicationActivationOptions(0));
+            tracing::debug!(
+                restore_to = pid,
+                accepted,
+                "focus restoration request returned"
+            );
+        } else {
+            tracing::debug!(restore_to = pid, "focus restoration target unavailable");
         }
     }
 }
