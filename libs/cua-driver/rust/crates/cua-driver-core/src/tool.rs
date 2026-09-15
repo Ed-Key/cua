@@ -179,6 +179,15 @@ impl ToolDef {
             "capabilities": caps,
             "risk": risk,
         });
+        if matches!(self.name.as_str(), "get_window_state" | "act_and_read") {
+            // Claude Code otherwise persists large text observations to disk,
+            // replacing the tree in context with a file reference. This bounded
+            // client hint retains ordinary window trees without changing their
+            // content or the driver's traversal limits. Image-bearing results
+            // still follow the client's token limit. Other clients may ignore it.
+            // https://code.claude.com/docs/en/mcp#raise-the-limit-for-a-specific-tool
+            entry["_meta"] = serde_json::json!({"anthropic/maxResultSizeChars": 250_000});
+        }
         // Advertise the refusal envelope alongside the success shape. MCP
         // holds every `structuredContent` we emit — refusals included — to
         // the advertised schema, and a success-only schema made strict
@@ -5258,6 +5267,7 @@ mod capability_tests {
         "get_recording_state",
         "replay_trajectory",
         "run_sequence",
+        "act_and_read",
         "install_ffmpeg",
         "install_extension",
         // misc
@@ -5352,6 +5362,7 @@ mod capability_tests {
         "recording.install_dependency",
         // bounded action composites
         "sequence.run",
+        "action.read",
         "extension.install",
         "visual.regions.parse",
         // page
@@ -5494,6 +5505,35 @@ mod capability_tests {
             destructive: false,
             idempotent: false,
             open_world: false,
+        }
+    }
+
+    #[test]
+    fn window_observations_advertise_a_bounded_client_text_budget() {
+        for name in ["get_window_state", "act_and_read"] {
+            let entry = dummy_def(name).to_list_entry();
+            assert_eq!(
+                entry["_meta"]["anthropic/maxResultSizeChars"], 250_000,
+                "{name} must let the client retain a complete window observation"
+            );
+            assert_eq!(entry["inputSchema"], serde_json::json!({"type":"object"}));
+            assert!(entry["outputSchema"].is_object(), "{name}");
+        }
+    }
+
+    #[test]
+    fn other_tools_keep_the_clients_default_text_budget() {
+        for name in [
+            "click",
+            "type_text",
+            "verify_state",
+            "run_sequence",
+            "unknown",
+        ] {
+            assert!(
+                dummy_def(name).to_list_entry().get("_meta").is_none(),
+                "{name}"
+            );
         }
     }
 

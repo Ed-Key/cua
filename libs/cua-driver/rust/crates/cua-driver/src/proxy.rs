@@ -729,6 +729,11 @@ fn fetch_tools_list_from_daemon(
                     .expect("MCP tool entry is an object")
                     .insert("outputSchema".into(), output_schema.clone());
             }
+            // Preserve the executing daemon's client hints, including hints
+            // unknown to this proxy version. Do not invent them for old daemons.
+            if let Some(meta) = t.get("_meta") {
+                tool["_meta"] = meta.clone();
+            }
             tool
         })
         .collect();
@@ -1284,6 +1289,73 @@ mod tests {
         .await;
         assert!(result.is_err());
         assert!(!dispatched.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn daemon_tool_metadata_survives_the_stdio_proxy() {
+        use std::io::{BufRead as _, Write as _};
+        use std::os::unix::net::UnixListener;
+
+        // Only the daemon boundary is substituted. Exercise the real socket
+        // reader, daemon-to-MCP conversion, and stdio tools/list handler.
+        let directory = tempfile::Builder::new()
+            .prefix("cua-meta-")
+            .tempdir_in("/tmp")
+            .unwrap();
+        let path = directory.path().join("daemon.sock");
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut line = String::new();
+            std::io::BufReader::new(&stream)
+                .read_line(&mut line)
+                .unwrap();
+            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
+            assert_eq!(request["method"], "list");
+            let response = DaemonResponse::ok(serde_json::json!({"tools": [
+                {"name":"get_window_state", "input_schema":{"type":"object"},
+                 "output_schema":{"type":"object"},
+                 "_meta":{"anthropic/maxResultSizeChars":250000,"example.org/hint":{"nested":true}}},
+                {"name":"get_window_state", "input_schema":{"type":"object"}}
+            ]}));
+            writeln!(stream, "{}", serde_json::to_string(&response).unwrap()).unwrap();
+        });
+        let (tools, _) =
+            fetch_tools_list_from_daemon(path.to_str().unwrap(), "metadata-test").unwrap();
+        server.join().unwrap();
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+        let mut output = Vec::new();
+        run_proxy_io(
+            BufReader::new(&input[..]),
+            &mut output,
+            "unused.sock",
+            &Arc::new(tools),
+            "metadata-test",
+            false,
+        )
+        .await
+        .unwrap();
+        let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let tools = &response["result"]["tools"];
+        assert_eq!(
+            tools[0]["_meta"],
+            serde_json::json!({"anthropic/maxResultSizeChars":250000,"example.org/hint":{"nested":true}})
+        );
+        assert_eq!(
+            tools[0]["inputSchema"],
+            serde_json::json!({"type":"object"})
+        );
+        assert_eq!(
+            tools[0]["outputSchema"],
+            serde_json::json!({"type":"object"})
+        );
+        // A newer proxy must not invent a hint for an older daemon, even for
+        // the same tool name. The executing daemon owns its advertised policy.
+        assert!(tools[1].get("_meta").is_none());
     }
 
     #[tokio::test]
