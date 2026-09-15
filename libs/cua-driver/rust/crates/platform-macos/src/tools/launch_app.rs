@@ -14,7 +14,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "launch_app".into(),
         description:
-            "Request a macOS app launch without foreground activation. Reflex app activations are suppressed on a best-effort basis; desktop input cancels restoration.\n\n\
+            "Request a macOS app launch without foreground activation. Reflex app activations are suppressed on a best-effort basis; desktop input cancels restoration. Refuses before dispatch if a stable foreground/input baseline cannot be captured.\n\n\
              Provide either `bundle_id` (preferred — unambiguous, e.g. `com.apple.calculator`) \
              or `name` (e.g. \"Calculator\"). If both are given, bundle_id wins.\n\n\
              Optional `urls` are handed to the app as open targets — for Finder, pass a folder \
@@ -34,7 +34,9 @@ fn def() -> &'static ToolDef {
              Returns the launched app's pid, bundle_id, name, and a `windows` array \
              (same shape as `list_windows`) so callers can skip an extra round-trip before \
              `get_window_state(pid, window_id)`. `launch_state` distinguishes whether the \
-             request was sent, the process is running, and a window is ready. When the \
+             request was sent, the process is running, and a window is ready. A pre-dispatch \
+             foreground refusal reports only `launch_state.requested: false`; process and \
+             window state are not established. When the \
              launched pid differs from the prior foreground pid, the response may include \
              `self_activation_suppressed: bool`: true means the prior app is foreground at \
              the final in-call check; false means it is not, including intentional user switching. \
@@ -184,17 +186,10 @@ impl Tool for LaunchAppTool {
                 && !creates_new_instance
                 && crate::apps::finder_folder_handoff(bundle_id, &urls)
         });
-        let prior_frontmost = crate::apps::frontmost_pid();
-        let launch_lease = prior_frontmost.map(|prior| {
-            // Finder needs its folder-open activation to pass through. A
-            // self-targeted entry is dormant until retargeted after launch,
-            // but still preserves the original input snapshot for cancellation.
-            crate::focus_steal::FocusStealPreventer::begin_suppression(
-                finder_folder_handoff.then_some(prior),
-                prior,
-                "LaunchAppTool.pre",
-            )
-        });
+        let capture = crate::focus_steal::FocusStealPreventer::begin_launch_suppression(
+            finder_folder_handoff,
+            "LaunchAppTool.pre",
+        );
 
         // Predicate captured BEFORE moving inputs into spawn_blocking.
         // Same condition that selects the `openURLs:withApplicationAtURL:`
@@ -211,7 +206,7 @@ impl Tool for LaunchAppTool {
         // blocking task returns (pid, app_info, windows). Suppression
         // upgrade happens AFTER the blocking call returns (back on the
         // async runtime), then we sleep holding the targeted lease.
-        let launch_task = tokio::task::spawn_blocking(move || {
+        let launched = spawn_launch(capture, move || {
             let pid = if let Some(ref bid) = bundle_id {
                 if urls.is_empty()
                     && additional_arguments.is_empty()
@@ -258,15 +253,14 @@ impl Tool for LaunchAppTool {
 
             Ok::<_, anyhow::Error>((pid, app_info, windows))
         });
-        let launch_result = match &launch_lease {
-            Some(lease) => lease.keep_alive_while(launch_task).await,
-            None => launch_task.await,
+        let ((prior, lease), launch_task) = match launched {
+            Ok(launched) => launched,
+            Err(refusal) => return refusal,
         };
+        let launch_result = lease.keep_alive_while(launch_task).await;
 
         let mut self_activation_suppressed: Option<bool> = None;
-        if let (Ok(Ok((pid, _, _))), Some(prior), Some(lease)) =
-            (&launch_result, prior_frontmost, launch_lease)
-        {
+        if let Ok(Ok((pid, _, _))) = &launch_result {
             if *pid != prior {
                 // This updates the existing entry atomically. There is no
                 // wildcard-to-targeted registration gap (the race addressed
@@ -357,6 +351,26 @@ impl Tool for LaunchAppTool {
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+fn spawn_launch<T: Send + 'static>(
+    capture: Option<(i32, crate::focus_steal::SuppressionLease)>,
+    launch: impl FnOnce() -> T + Send + 'static,
+) -> Result<
+    (
+        (i32, crate::focus_steal::SuppressionLease),
+        tokio::task::JoinHandle<T>,
+    ),
+    ToolResult,
+> {
+    let capture = capture.ok_or_else(|| {
+        structured_launch_error(
+            "BACKGROUND_LAUNCH_UNAVAILABLE",
+            "Launch request was not sent: a stable foreground/input baseline could not be captured. Refresh app state before retrying.".to_owned(),
+            serde_json::json!({ "launch_state": { "requested": false } }),
+        )
+    })?;
+    Ok((capture, tokio::task::spawn_blocking(launch)))
 }
 
 fn contains_remote_debugging_flag(value: &str) -> bool {
@@ -586,6 +600,37 @@ mod tests {
     use cua_driver_core::tool::Tool;
     use serde_json::json;
     use std::path::PathBuf;
+
+    #[tokio::test]
+    async fn unknown_foreground_refuses_before_dispatching_launch() {
+        use std::sync::{
+            atomic::{AtomicBool, Ordering},
+            Arc,
+        };
+        let dispatched = Arc::new(AtomicBool::new(false));
+        let observed = dispatched.clone();
+        let result = super::spawn_launch(None, move || {
+            observed.store(true, Ordering::SeqCst);
+        });
+        let refusal = match result {
+            Err(refusal) => refusal,
+            Ok((_, task)) => {
+                task.await.expect("launch task completed");
+                panic!(
+                    "unknown foreground dispatched launch: {}",
+                    dispatched.load(Ordering::SeqCst)
+                );
+            }
+        };
+        assert!(!dispatched.load(Ordering::SeqCst));
+        assert_eq!(refusal.is_error, Some(true));
+        let payload = refusal.structured_content.expect("structured refusal");
+        assert_eq!(payload["error"], "BACKGROUND_LAUNCH_UNAVAILABLE");
+        assert_eq!(payload["launch_state"]["requested"], false);
+        assert!(payload["launch_state"].get("process_running").is_none());
+        assert!(payload["launch_state"].get("window_ready").is_none());
+        assert!(payload.get("self_activation_suppressed").is_none());
+    }
 
     #[test]
     fn local_file_target_treats_plain_paths_as_files() {

@@ -177,6 +177,30 @@ impl FocusStealPreventer {
             .clone()
     }
 
+    /// Capture current foreground and input together, after singleton setup.
+    /// A changing or unresolved capture does not authorize restoration. Input
+    /// arriving after validation is still compared with the original snapshot
+    /// at dispatch, never absorbed into a freshly sampled registration.
+    pub(crate) fn begin_launch_suppression(
+        dormant: bool,
+        origin: &'static str,
+    ) -> Option<(i32, SuppressionLease)> {
+        let shared = Self::shared();
+        let (prior, handle) = shared.dispatcher.add_current(
+            dormant,
+            crate::input::skylight::frontmost_pid,
+            origin,
+        )?;
+        Some((
+            prior,
+            SuppressionLease {
+                handle,
+                dispatcher: Arc::clone(&shared.dispatcher),
+                released: false,
+            },
+        ))
+    }
+
     /// Begin suppressing focus-steals targeting `target_pid` (or any pid
     /// when `None`, the wildcard). Returns a `SuppressionLease` whose
     /// `Drop` ends the entry synchronously.
@@ -354,6 +378,27 @@ impl Dispatcher {
         }
     }
 
+    fn add_current(
+        self: &Arc<Self>,
+        dormant: bool,
+        foreground: impl FnOnce() -> Option<i32>,
+        origin: &'static str,
+    ) -> Option<(i32, SuppressionHandle)> {
+        let input_activity = (self.read_input_activity)();
+        let prior = foreground().filter(|pid| *pid > 0)?;
+        if (self.read_input_activity)() != input_activity {
+            return None;
+        }
+        let handle = self.add_entry_with_activity(
+            dormant.then_some(prior),
+            None,
+            prior,
+            origin,
+            input_activity,
+        );
+        Some((prior, handle))
+    }
+
     /// Add an entry, return its handle. Always attempts to start the
     /// janitor task — `kick_janitor()` is idempotent and is the only
     /// reliable path to recover if the very first add happened before
@@ -388,8 +433,24 @@ impl Dispatcher {
         restore_to: i32,
         origin: &'static str,
     ) -> SuppressionHandle {
+        self.add_entry_with_activity(
+            target_pid,
+            allowed_pid,
+            restore_to,
+            origin,
+            (self.read_input_activity)(),
+        )
+    }
+
+    fn add_entry_with_activity(
+        self: &Arc<Self>,
+        target_pid: Option<i32>,
+        allowed_pid: Option<i32>,
+        restore_to: i32,
+        origin: &'static str,
+        input_activity: InputActivity,
+    ) -> SuppressionHandle {
         let id = Uuid::new_v4();
-        let input_activity = (self.read_input_activity)();
         {
             let mut guard = self.entries.lock().unwrap();
             let entry = Entry {
@@ -771,6 +832,79 @@ mod tests {
         let source = input.clone();
         let dispatcher = Arc::new(Dispatcher::new(move || *source.lock().unwrap()));
         (dispatcher, input)
+    }
+
+    #[test]
+    fn input_during_foreground_capture_does_not_arm_restoration() {
+        let (d, input) = input_fixture();
+        let captured = d.add_current(
+            false,
+            || {
+                input.lock().unwrap().0[0] = 1;
+                Some(7)
+            },
+            "test.capture_input",
+        );
+        assert!(
+            captured.is_none(),
+            "old foreground must not be paired with new input"
+        );
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn invalid_foreground_capture_does_not_arm_restoration() {
+        let (d, _) = input_fixture();
+        assert!(d
+            .add_current(false, || Some(0), "test.capture_zero")
+            .is_none());
+        assert!(d
+            .add_current(false, || Some(-1), "test.capture_negative")
+            .is_none());
+        assert!(d
+            .add_current(false, || None, "test.capture_unknown")
+            .is_none());
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn registration_preserves_the_captured_input_baseline() {
+        let reads = Arc::new(AtomicU64::new(0));
+        let source = reads.clone();
+        let d = Arc::new(Dispatcher::new(move || {
+            let count = source.fetch_add(1, Ordering::SeqCst);
+            let mut activity = InputActivity::default();
+            if count >= 2 {
+                activity.0[0] = 1;
+            }
+            activity
+        }));
+        let captured = d.add_current(false, || Some(7), "test.capture_then_input");
+        assert!(captured.is_some());
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || Some(42),
+            |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert!(
+            restored.is_empty(),
+            "registration must not resample after capture validation"
+        );
+    }
+
+    #[test]
+    fn stable_foreground_capture_restores_the_captured_pid() {
+        let (d, _) = input_fixture();
+        let (prior, _) = d
+            .add_current(false, || Some(9), "test.capture_stable")
+            .unwrap();
+        assert_eq!(prior, 9);
+        assert_eq!(winner_pid(&d, 42), Some(9));
     }
 
     #[test]
