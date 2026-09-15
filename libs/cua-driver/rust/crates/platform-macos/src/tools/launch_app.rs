@@ -14,7 +14,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "launch_app".into(),
         description:
-            "Launch a macOS app in the background — the target does NOT come to the foreground.\n\n\
+            "Request a macOS app launch without foreground activation. Reflex app activations are suppressed on a best-effort basis; desktop input cancels restoration.\n\n\
              Provide either `bundle_id` (preferred — unambiguous, e.g. `com.apple.calculator`) \
              or `name` (e.g. \"Calculator\"). If both are given, bundle_id wins.\n\n\
              Optional `urls` are handed to the app as open targets — for Finder, pass a folder \
@@ -35,10 +35,11 @@ fn def() -> &'static ToolDef {
              (same shape as `list_windows`) so callers can skip an extra round-trip before \
              `get_window_state(pid, window_id)`. `launch_state` distinguishes whether the \
              request was sent, the process is running, and a window is ready. When the \
-             focus-steal belt-and-braces \
-             demotion check ran (target pid ≠ prior frontmost), the response also includes \
-             `self_activation_suppressed: bool` — true if focus stayed with the prior \
-             frontmost, false if the launched app held focus despite the re-demote attempt."
+             launched pid differs from the prior foreground pid, the response may include \
+             `self_activation_suppressed: bool`: true means the prior app is foreground at \
+             the final in-call check; false means it is not, including intentional user switching. \
+             Omitted if foreground cannot be established. This snapshot does not prove \
+             uninterrupted focus or describe later watchdog outcomes."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -174,42 +175,26 @@ impl Tool for LaunchAppTool {
             s
         };
 
-        // ── Layer-3 focus-steal suppression (3-phase wrap) ───────────────
-        //
-        // Captures the prior frontmost pid, arms a wildcard suppression
-        // BEFORE the launch (covers self-activations the target fires
-        // synchronously during `open()`), then upgrades to a targeted
-        // suppression keyed to the actual launched pid. Briefly holds
-        // BOTH leases so a self-activation arriving in the wildcard→
-        // targeted gap is still caught — that race is what hoang17's
-        // Swift PR #1521 explicitly fixes; we do not regress it here.
-        //
-        // After 500ms (enough for `applicationDidFinishLaunching` +
-        // any reflex `NSApp.activate(...)` to fire and get suppressed)
-        // both leases are dropped. The belt-and-braces step at the end
-        // re-activates the prior frontmost if the target is still
-        // frontmost — handles the intra-`open()` synchronous activation
-        // that fired before we could arm with the real pid.
-        let prior_frontmost = crate::apps::frontmost_pid();
+        // One lease owns restoration intent through launch and its bounded
+        // watchdog. Retargeting preserves its input snapshot and priority, so
+        // a later phase cannot re-arm focus restoration after desktop input.
         let finder_folder_handoff = response_bundle_id.as_deref().is_some_and(|bundle_id| {
             additional_arguments.is_empty()
                 && env.is_empty()
                 && !creates_new_instance
                 && crate::apps::finder_folder_handoff(bundle_id, &urls)
         });
-
-        // Finder's synchronous folder-open selector must be allowed to activate
-        // long enough to perform the request. Use the ordinary targeted
-        // post-launch guard to restore the prior foreground app immediately.
-        let wildcard_lease = prior_frontmost
-            .filter(|_| !finder_folder_handoff)
-            .map(|prior| {
-                crate::focus_steal::FocusStealPreventer::begin_suppression(
-                    None,
-                    prior,
-                    "LaunchAppTool.pre",
-                )
-            });
+        let prior_frontmost = crate::apps::frontmost_pid();
+        let launch_lease = prior_frontmost.map(|prior| {
+            // Finder needs its folder-open activation to pass through. A
+            // self-targeted entry is dormant until retargeted after launch,
+            // but still preserves the original input snapshot for cancellation.
+            crate::focus_steal::FocusStealPreventer::begin_suppression(
+                finder_folder_handoff.then_some(prior),
+                prior,
+                "LaunchAppTool.pre",
+            )
+        });
 
         // Predicate captured BEFORE moving inputs into spawn_blocking.
         // Same condition that selects the `openURLs:withApplicationAtURL:`
@@ -226,7 +211,7 @@ impl Tool for LaunchAppTool {
         // blocking task returns (pid, app_info, windows). Suppression
         // upgrade happens AFTER the blocking call returns (back on the
         // async runtime), then we sleep holding the targeted lease.
-        let launch_result = tokio::task::spawn_blocking(move || {
+        let launch_task = tokio::task::spawn_blocking(move || {
             let pid = if let Some(ref bid) = bundle_id {
                 if urls.is_empty()
                     && additional_arguments.is_empty()
@@ -272,176 +257,55 @@ impl Tool for LaunchAppTool {
             };
 
             Ok::<_, anyhow::Error>((pid, app_info, windows))
-        })
-        .await;
+        });
+        let launch_result = match &launch_lease {
+            Some(lease) => lease.keep_alive_while(launch_task).await,
+            None => launch_task.await,
+        };
 
-        // Upgrade to targeted suppression now that we know the real pid.
-        // Keep the wildcard lease alive until immediately AFTER we've
-        // armed the targeted one — that's the PR #1521 overlap window.
-        //
-        // `self_activation_suppressed` is the outcome of the belt-and-
-        // braces demotion check: `None` when the check didn't run
-        // (no prior frontmost / launch failed / pid == prior), `Some(true)`
-        // when the target was NOT frontmost after the suppression window
-        // (or we successfully re-demoted it), `Some(false)` when the
-        // re-demote failed and the target is still stealing focus.
-        // Surfaced in the structured response so callers can observe
-        // whether focus-steal prevention actually held.
         let mut self_activation_suppressed: Option<bool> = None;
-        if let Ok(Ok((pid, _, _))) = &launch_result {
-            if let Some(prior) = prior_frontmost {
-                if *pid != prior {
-                    let targeted_lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
-                        Some(*pid),
-                        prior,
-                        "LaunchAppTool.post",
-                    );
-                    // Now safe to drop the wildcard — targeted is armed.
-                    drop(wildcard_lease);
-                    // Hold the targeted lease long enough to cover the
-                    // ENTIRE post-launch activation window.
-                    //
-                    // - Fast path (bundle-only launch, no urls/args/env):
-                    //   500ms covers `applicationDidFinishLaunching` plus
-                    //   any reflex `NSApp.activate(...)`. Matches Swift
-                    //   LaunchAppTool.swift exactly.
-                    //
-                    // - Slow path (urls / additional_arguments / env /
-                    //   creates_new_instance): 2500ms. The slow-path
-                    //   `openURLs:withApplicationAtURL:` chain triggers a
-                    //   second activation when the file-open delivers to
-                    //   the just-launched app — Electron apps (VSCode,
-                    //   Cursor, Slack) re-`app.focus()` from inside their
-                    //   `open-file` JS handler, AFTER our 500ms window
-                    //   would have already closed. Empirically VSCode's
-                    //   late activation can land anywhere from ~700ms to
-                    //   ~2000ms after the openURLs return. The observer-
-                    //   based lease catches any activation that lands
-                    //   WHILE held, so widening the window converts the
-                    //   late activation from a contract violation into
-                    //   another auto-demote.
+        if let (Ok(Ok((pid, _, _))), Some(prior), Some(lease)) =
+            (&launch_result, prior_frontmost, launch_lease)
+        {
+            if *pid != prior {
+                // This updates the existing entry atomically. There is no
+                // wildcard-to-targeted registration gap (the race addressed
+                // by hoang17's Swift PR #1521) and no fresh input baseline.
+                let mut guarding = lease.retarget(*pid, "LaunchAppTool.post");
+                if guarding {
+                    // Preserve the existing launch settling windows. File/URL
+                    // delivery can trigger a second activation in Electron.
                     let window_ms: u64 = if slow_launch_path { 2500 } else { 500 };
                     tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
-                    drop(targeted_lease);
-
-                    // Belt-and-braces LOOP: if the target ever pops back
-                    // to the foreground after the lease drops (rare —
-                    // observer already covered the suppression window —
-                    // but happens when the activation fires literally on
-                    // the same tokio tick the lease dropped), demote it.
-                    // Loop 5x200ms = 1s of post-window coverage. Each
-                    // iteration is cheap (one frontmost_pid + maybe one
-                    // activate_pid call) so this stays well under the
-                    // RPC budget even when the demote keeps working.
-                    let mut demotion_succeeded = true;
                     for _ in 0..5 {
-                        let frontmost_now = crate::apps::frontmost_pid();
-                        if frontmost_now != Some(*pid) {
-                            // Not frontmost — nothing to do this tick.
-                            continue;
-                        }
-                        let activated = crate::apps::activate_pid(prior);
-                        let still_frontmost = crate::apps::frontmost_pid() == Some(*pid);
-                        if still_frontmost {
-                            tracing::warn!(
-                                target: "platform_macos::tools::launch_app",
-                                launched_pid = *pid,
-                                prior_pid = prior,
-                                activate_pid_returned = activated,
-                                "belt-and-braces demotion iteration failed: \
-                                 launched app remained frontmost after \
-                                 re-activating prior — will retry"
-                            );
-                            demotion_succeeded = false;
-                        } else {
-                            demotion_succeeded = true;
+                        guarding = lease.retarget(*pid, "LaunchAppTool.retry");
+                        if !guarding || !lease.restore_if_frontmost(*pid) {
+                            break;
                         }
                         tokio::time::sleep(std::time::Duration::from_millis(200)).await;
                     }
-                    // Final in-call state determines the structured response.
-                    let final_frontmost = crate::apps::frontmost_pid();
-                    self_activation_suppressed =
-                        Some(final_frontmost != Some(*pid) && demotion_succeeded);
+                }
+                // Measure foreground independently of request acceptance. An
+                // unknown WindowServer read supplies no suppression claim.
+                self_activation_suppressed = crate::input::skylight::front_pid_matches(prior);
 
-                    // Detached late-activation watchdog (slow path only).
-                    //
-                    // Why: Electron apps with no workspace open (cold-
-                    // launched VSCode / Cursor / Slack with a file URL)
-                    // re-activate AGAIN when their Welcome window
-                    // finishes loading — empirically 4-8 seconds after
-                    // the `openURLs:withApplicationAtURL:` call returns.
-                    // That's well past the in-call suppression window
-                    // and any reasonable extension of it that an agent
-                    // workflow would tolerate as caller latency.
-                    //
-                    // Solution: hold a fresh observer-backed lease in
-                    // the background for ~8s, demoting if the launched
-                    // pid pops back. The caller doesn't wait — the tool
-                    // already returned its honest `self_activation_
-                    // suppressed` for the in-call window. The detached
-                    // task just keeps the no-foreground-steal contract
-                    // honored past the RPC boundary.
-                    //
-                    // Note on process lifecycle: this watchdog only runs
-                    // when the tokio runtime stays alive — i.e. in the
-                    // long-running `cua-driver mcp` / `cua-driver serve`
-                    // daemon modes. The one-shot `cua-driver call` mode
-                    // exits as soon as the tool returns, taking the
-                    // detached task with it. Acceptable because the
-                    // contract is "no foreground steal during a session
-                    // the agent is driving" — `cua-driver call` doesn't
-                    // have a session that outlives the call.
-                    //
-                    // Tradeoffs:
-                    // - Caller latency unchanged (~2.5s for slow path).
-                    // - Total observer coverage: ~10.5s post-launch.
-                    // - CPU: the observer fires per activation event,
-                    //   not per poll; the 250ms tick is just for the
-                    //   manual belt-and-braces demote. Cheap.
-                    // - If a legitimate user click activates Code while
-                    //   the watchdog is alive, we'll demote them. Worst
-                    //   case ~10s of "I clicked Code and it didn't come
-                    //   forward" — acceptable trade for an automation
-                    //   scenario where the agent just launched it.
-                    if slow_launch_path {
-                        let launched_pid = *pid;
-                        let prior_pid = prior;
-                        tokio::spawn(async move {
-                            let _lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
-                                Some(launched_pid),
-                                prior_pid,
-                                "LaunchAppTool.watchdog",
-                            );
-                            let mut late_activations = 0u32;
-                            for _ in 0..32 {
-                                // 32 × 250ms = 8s
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                if crate::apps::frontmost_pid() == Some(launched_pid) {
-                                    late_activations += 1;
-                                    let _ = crate::apps::activate_pid(prior_pid);
-                                }
+                // Retain the existing eight-second late-activation window for
+                // slow launches. Each tick renews only the same live intent.
+                // Cancellation or expiry ends the watchdog permanently. It
+                // must never directly activate the previously foreground app.
+                if slow_launch_path && guarding {
+                    let launched_pid = *pid;
+                    tokio::spawn(async move {
+                        for _ in 0..32 {
+                            tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                            if !lease.retarget(launched_pid, "LaunchAppTool.watchdog") {
+                                break;
                             }
-                            if late_activations > 0 {
-                                tracing::warn!(
-                                    target: "platform_macos::tools::launch_app",
-                                    launched_pid,
-                                    prior_pid,
-                                    late_activations,
-                                    "watchdog demoted post-RPC late activations \
-                                     — slow-path window may need tuning"
-                                );
-                            }
-                        });
-                    }
-                } else {
-                    // pid == prior frontmost (re-launch of an already-
-                    // frontmost app). Just drop the wildcard.
-                    drop(wildcard_lease);
+                            lease.restore_if_frontmost(launched_pid);
+                        }
+                    });
                 }
             }
-        } else {
-            // Launch failed; just drop the lease.
-            drop(wildcard_lease);
         }
 
         match launch_result {
@@ -453,7 +317,7 @@ impl Tool for LaunchAppTool {
                 );
 
                 let mut summary =
-                    format!("Launched {app_name} (pid {pid}) in background.{port_summary}");
+                    format!("Launched {app_name} (pid {pid}) with background launch requested.{port_summary}");
 
                 if !windows.is_empty() {
                     summary.push_str("\n\nWindows:");
@@ -482,11 +346,8 @@ impl Tool for LaunchAppTool {
                     "windows": windows_json,
                     "launch_state": launch_state(true, true, !windows.is_empty()),
                 });
-                // Only emit `self_activation_suppressed` when the
-                // belt-and-braces demotion check actually ran. `None`
-                // means the launch didn't enter the focus-steal path
-                // (no prior frontmost, or pid == prior) — surfacing
-                // a stale `false` would be misleading.
+                // This is a final foreground snapshot, not proof of continuous
+                // preservation. Unknown native state leaves the field absent.
                 if let Some(suppressed) = self_activation_suppressed {
                     structured["self_activation_suppressed"] = serde_json::Value::Bool(suppressed);
                 }

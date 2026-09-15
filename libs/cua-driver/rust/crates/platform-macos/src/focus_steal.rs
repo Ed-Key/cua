@@ -37,7 +37,9 @@
 //! 3. **5s monotonic deadline** — every entry stamps an
 //!    `Instant::now() + 5s`. The observer prunes expired entries before
 //!    matching, so a leaked lease can't cause a stale entry to keep
-//!    re-activating the prior frontmost app forever.
+//!    re-activating the prior frontmost app forever. A pending launch and its
+//!    bounded watchdog may renew a live entry without changing its input
+//!    snapshot or priority. Cancelled and expired entries cannot be renewed.
 //! 4. **1s janitor** — a tokio interval task wakes up every second
 //!    while the dispatcher is non-empty, prunes expired entries, and
 //!    stops when the map drains. Re-starts when the next entry is
@@ -261,6 +263,50 @@ pub struct SuppressionLease {
 }
 
 impl SuppressionLease {
+    /// Keep a pending launch protected without registering fresh restoration
+    /// intent. Cancellation stops renewal, but does not abort the OS launch.
+    pub(crate) async fn keep_alive_while<F: std::future::Future>(&self, future: F) -> F::Output {
+        tokio::pin!(future);
+        let mut tick = tokio::time::interval(JANITOR_TICK);
+        tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            tokio::select! {
+                result = &mut future => return result,
+                _ = tick.tick() => {
+                    if !self.dispatcher.refresh(self.handle, None, None) {
+                        return future.await;
+                    }
+                }
+            }
+        }
+    }
+
+    /// Continue this operation with a known target without capturing new input
+    /// intent or changing its priority relative to newer operations. Renew only
+    /// a live entry; input cancellation and expiry cannot be undone.
+    pub(crate) fn retarget(&self, target_pid: i32, origin: &'static str) -> bool {
+        self.dispatcher.retarget(self.handle, target_pid, origin)
+    }
+
+    /// A manual retry uses exactly the same admission checks as the observer,
+    /// and may only act for this lease. Native acceptance is not completion.
+    pub(crate) fn restore_if_frontmost(&self, target_pid: i32) -> bool {
+        let mut accepted = false;
+        self.dispatcher.dispatch_activation_checked(
+            target_pid,
+            Some(self.handle),
+            || {
+                crate::input::skylight::front_pid_matches(target_pid)
+                    .filter(|matches| *matches)
+                    .map(|_| target_pid)
+            },
+            |prior, admit| {
+                accepted = crate::input::skylight::restore_front_pid(prior, admit);
+            },
+        );
+        accepted
+    }
+
     /// Explicit release. Useful if the caller wants to drop the lease
     /// before its scope ends without taking the `Drop` path.
     pub fn release(mut self) {
@@ -366,6 +412,40 @@ impl Dispatcher {
         SuppressionHandle(id)
     }
 
+    fn retarget(&self, handle: SuppressionHandle, target_pid: i32, origin: &'static str) -> bool {
+        self.refresh(handle, Some(target_pid), Some(origin))
+    }
+
+    fn refresh(
+        &self,
+        handle: SuppressionHandle,
+        target_pid: Option<i32>,
+        origin: Option<&'static str>,
+    ) -> bool {
+        let activity = (self.read_input_activity)();
+        let mut entries = self.entries.lock().unwrap();
+        let Some(entry) = entries.get_mut(&handle.0) else {
+            return false;
+        };
+        let now = Instant::now();
+        if entry.deadline <= now || entry.input_activity != activity {
+            entries.remove(&handle.0);
+            return false;
+        }
+        if let Some(target_pid) = target_pid {
+            entry.target_pid = Some(target_pid);
+            entry.allowed_pid = None;
+        }
+        entry.deadline = now + ENTRY_DEADLINE;
+        if let Some(origin) = origin {
+            entry.origin = origin;
+        }
+        // Invalidate concurrent snapshots, while preserving this entry's
+        // original sequence so a later phase cannot supersede a newer action.
+        self.sequence.fetch_add(1, Ordering::Relaxed);
+        true
+    }
+
     /// Remove an entry. When the map drains to empty, signals the janitor
     /// to stop until the next add.
     fn remove(&self, handle: SuppressionHandle) {
@@ -401,7 +481,7 @@ impl Dispatcher {
         guard
             .iter()
             .filter(|(_, e)| {
-                if e.allowed_pid == Some(activated_pid) {
+                if e.restore_to == activated_pid || e.allowed_pid == Some(activated_pid) {
                     return false;
                 }
                 match e.target_pid {
@@ -425,6 +505,16 @@ impl Dispatcher {
     fn dispatch_activation(
         &self,
         activated_pid: i32,
+        frontmost_pid: impl FnMut() -> Option<i32>,
+        restore: impl FnMut(i32, &mut dyn FnMut() -> bool),
+    ) {
+        self.dispatch_activation_checked(activated_pid, None, frontmost_pid, restore);
+    }
+
+    fn dispatch_activation_checked(
+        &self,
+        activated_pid: i32,
+        required_handle: Option<SuppressionHandle>,
         mut frontmost_pid: impl FnMut() -> Option<i32>,
         mut restore: impl FnMut(i32, &mut dyn FnMut() -> bool),
     ) {
@@ -436,6 +526,9 @@ impl Dispatcher {
             );
             return;
         };
+        if required_handle.is_some_and(|handle| handle != winner.0) {
+            return;
+        }
         let current_front = frontmost_pid();
         if current_front != Some(activated_pid) {
             tracing::debug!(
@@ -678,6 +771,206 @@ mod tests {
         let source = input.clone();
         let dispatcher = Arc::new(Dispatcher::new(move || *source.lock().unwrap()));
         (dispatcher, input)
+    }
+
+    #[test]
+    fn launch_phase_must_not_rearm_cancelled_restoration() {
+        let (d, input) = input_fixture();
+        let before_launch = d.add(None, 7, "test.launch.pre");
+        input.lock().unwrap().0[0] = 1;
+        assert!(!d.retarget(before_launch, 42, "test.launch.post"));
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || Some(42),
+            |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert!(
+            restored.is_empty(),
+            "launch completion must not undo intervening input"
+        );
+    }
+
+    #[test]
+    fn dormant_launch_guard_does_not_restore_any_process() {
+        let d = Arc::new(Dispatcher::new(InputActivity::default));
+        d.add(Some(7), 7, "test.finder.handoff");
+        assert_eq!(winner_pid(&d, 42), None);
+        assert_eq!(
+            winner_pid(&d, 7),
+            None,
+            "a dormant guard must not restore itself"
+        );
+    }
+
+    #[test]
+    fn launch_retarget_preserves_intent_and_newer_action_priority() {
+        let (d, _) = input_fixture();
+        let launching = d.add(None, 7, "test.launch.pre");
+        assert!(d.retarget(launching, 42, "test.launch.post"));
+        assert_eq!(winner_pid(&d, 42), Some(7));
+        assert_eq!(
+            winner_pid(&d, 99),
+            None,
+            "targeting must end wildcard suppression"
+        );
+        let newer = d.add(Some(42), 9, "test.newer_action");
+        assert!(d.retarget(launching, 42, "test.launch.watchdog"));
+        assert_eq!(
+            winner_pid(&d, 42),
+            Some(9),
+            "renewal must not outrank a newer action"
+        );
+        d.remove(newer);
+        assert_eq!(winner_pid(&d, 42), Some(7));
+    }
+
+    #[test]
+    fn expired_launch_guard_cannot_be_renewed() {
+        let (d, _) = input_fixture();
+        let handle = d.add(None, 7, "test.launch.pre");
+        d.entries
+            .lock()
+            .unwrap()
+            .get_mut(&handle.0)
+            .unwrap()
+            .deadline = Instant::now();
+        assert!(!d.retarget(handle, 42, "test.launch.post"));
+        assert_eq!(winner_pid(&d, 42), None);
+        assert_eq!(d.len(), 0);
+    }
+
+    #[test]
+    fn cancelled_launch_guard_cannot_return_on_a_later_watchdog_tick() {
+        let (d, input) = input_fixture();
+        let handle = d.add(None, 7, "test.launch.pre");
+        assert!(d.retarget(handle, 42, "test.launch.post"));
+        input.lock().unwrap().0[0] = 1;
+        assert!(!d.retarget(handle, 42, "test.launch.watchdog"));
+        *input.lock().unwrap() = InputActivity::default();
+        assert!(!d.retarget(handle, 42, "test.launch.watchdog"));
+        assert_eq!(winner_pid(&d, 42), None);
+    }
+
+    #[test]
+    fn manual_launch_retry_does_not_borrow_another_actions_guard() {
+        let (d, _) = input_fixture();
+        let handle = d.add(Some(42), 7, "test.launch");
+        d.add(Some(42), 9, "test.newer_action");
+        let mut restored = Vec::new();
+        d.dispatch_activation_checked(
+            42,
+            Some(handle),
+            || Some(42),
+            |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn manual_launch_retry_checks_input_at_native_submission() {
+        let (d, input) = input_fixture();
+        let handle = d.add(Some(42), 7, "test.launch");
+        let mut restored = Vec::new();
+        d.dispatch_activation_checked(
+            42,
+            Some(handle),
+            || Some(42),
+            |pid, admit| {
+                input.lock().unwrap().0[0] = 1;
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert!(restored.is_empty());
+    }
+
+    #[test]
+    fn quiet_manual_launch_retry_restores_its_original_foreground() {
+        let (d, _) = input_fixture();
+        let handle = d.add(Some(42), 7, "test.launch");
+        let mut restored = Vec::new();
+        d.dispatch_activation_checked(
+            42,
+            Some(handle),
+            || Some(42),
+            |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert_eq!(restored, vec![7]);
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_launch_renews_the_same_guard() {
+        let (d, _) = input_fixture();
+        let handle = d.add(None, 7, "test.launch.pre");
+        let lease = SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        };
+        let initial_deadline = Instant::now() + Duration::from_secs(2);
+        d.entries
+            .lock()
+            .unwrap()
+            .get_mut(&handle.0)
+            .unwrap()
+            .deadline = initial_deadline;
+        let result = lease
+            .keep_alive_while(async {
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                assert!(
+                    d.entries.lock().unwrap().get(&handle.0).unwrap().deadline > initial_deadline,
+                    "pending launch must renew its original entry"
+                );
+                assert_eq!(winner_pid(&d, 42), Some(7));
+                74
+            })
+            .await;
+        assert_eq!(result, 74);
+        assert!(lease.retarget(42, "test.launch.post"));
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn pending_launch_cancels_renewal_but_still_returns_launch_result() {
+        let (d, input) = input_fixture();
+        let handle = d.add(None, 7, "test.launch.pre");
+        let lease = SuppressionLease {
+            handle,
+            dispatcher: d.clone(),
+            released: false,
+        };
+        let result = lease
+            .keep_alive_while(async {
+                tokio::time::sleep(Duration::from_millis(1500)).await;
+                input.lock().unwrap().0[0] = 1;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                assert_eq!(
+                    d.len(),
+                    0,
+                    "renewal must cancel before any activation arrives"
+                );
+                *input.lock().unwrap() = InputActivity::default();
+                74
+            })
+            .await;
+        assert_eq!(
+            result, 74,
+            "takeover does not cancel the launch request itself"
+        );
+        assert!(!lease.retarget(42, "test.launch.post"));
     }
 
     #[test]
