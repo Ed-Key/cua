@@ -506,3 +506,15 @@ starting point for new browser workflows.
 If the user instead asks to navigate _within_ an already-open Finder
 window, use `invoke_menu` with the Go menu path (see "Navigating native
 menu bars" above), for example `path:["Go","Downloads"]`.
+
+
+### Pair a known action with its next observation
+
+When the advertised tools include `act_and_read`, use it for a known, fresh-target click followed by a state read. It executes the existing action once, then returns the existing observation in the same tool response. For a known window-content task, the request shape is:
+
+```javascript
+act_and_read({pid, window_id, action:"click", element_token,
+  observe:{include_screenshot:false}})
+```
+
+For replacing an entire writable field, the same tool accepts `action:"set_value"` and `value`. Request `observe.include_screenshot:true` when the resulting rendered field needs verification. Read action status and observation separately: an observation does not promote an uncertain action to success. Use ordinary tools for discovery or unsupported actions. On an action error, inspect the returned observation before deciding the next action. If transport fails or times out, stop issuing input and report the uncertainty. A timeout is not proof that input stopped; never blindly replay the action.
