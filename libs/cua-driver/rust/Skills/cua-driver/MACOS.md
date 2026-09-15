@@ -510,3 +510,10 @@ starting point for new browser workflows.
 If the user instead asks to navigate _within_ an already-open Finder
 window, use the menu-bar flow from "Navigating native menu bars"
 above (click Go → pick a menu item → re-snapshot → click it).
+
+
+### Reading content inside a macOS window
+
+A window snapshot also includes separate application-menu roots. Take an unfiltered read when first discovering the app's surfaces. Once the target AXWindow is identified and the task concerns its content, use `query:"AXWindow", query_context:true` on subsequent `get_window_state` calls. This retains the matching window's collected descendants, including display-only text, while avoiding unrelated menu-bar output.
+
+For menu navigation, a top-level sheet/dialog, or an unexpected state, take an unfiltered read to discover those surfaces. A window-content query is not complete application state. The query matches substrings in rendered rows, not an exact role selector. It does not fetch unloaded content or establish absence. Use target tokens from the latest snapshot of that window.
