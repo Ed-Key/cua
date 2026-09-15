@@ -517,3 +517,15 @@ above (click Go → pick a menu item → re-snapshot → click it).
 A window snapshot also includes separate application-menu roots. Take an unfiltered read when first discovering the app's surfaces. Once the target AXWindow is identified and the task concerns its content, use `query:"AXWindow", query_context:true` on subsequent `get_window_state` calls. This retains the matching window's collected descendants, including display-only text, while avoiding unrelated menu-bar output.
 
 For menu navigation, a top-level sheet/dialog, or an unexpected state, take an unfiltered read to discover those surfaces. A window-content query is not complete application state. The query matches substrings in rendered rows, not an exact role selector. It does not fetch unloaded content or establish absence. Use target tokens from the latest snapshot of that window.
+
+
+### Pair a known action with its next observation
+
+When the advertised tools include `act_and_read`, use it for a known, fresh-target click followed by a state read. It executes the existing action once, then returns the existing observation in the same tool response. For a known window-content task, the request shape is:
+
+```javascript
+act_and_read({pid, window_id, action:"click", element_token,
+  observe:{query:"AXWindow", query_context:true, include_screenshot:false}})
+```
+
+For replacing an entire writable field, the same tool accepts `action:"set_value"` and `value`. Request `observe.include_screenshot:true` when the resulting rendered field needs verification. Read action status and observation separately: an observation does not promote an uncertain action to success. Use ordinary tools for discovery or unsupported actions. On an action error, inspect the returned observation before deciding the next action. If transport fails or times out, stop issuing input and report the uncertainty. A timeout is not proof that input stopped; never blindly replay the action.
