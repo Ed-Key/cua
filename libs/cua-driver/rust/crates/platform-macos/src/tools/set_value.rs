@@ -194,10 +194,13 @@ impl Tool for SetValueTool {
 
         // A native field can accept AXValue without notifying its delegate
         // until AppKit has installed its field editor. Reuse the existing
-        // exact-target gate under the same lease before preparing that editor.
-        // Semantic-only targets (hidden/minimized or competing windows) retain
-        // their direct AX route without a new focus mutation. Web content and
-        // non-text controls also retain their existing behavior.
+        // exact-window visibility gate under the same lease before preparing
+        // that editor. The WindowPointer gate proves a visible exact target
+        // without requiring a singleton keyboard destination. No pointer or
+        // keyboard event is sent: AXFocused addresses the retained element,
+        // just as an accessibility click on a native text field already does.
+        // Hidden/minimized targets, web content and non-text controls retain
+        // their existing behavior.
         let prepare_native_text = !ax_echo_surface
             && matches!(
                 unsafe { copy_string_attr(element_ptr as AXUIElementRef, "AXRole") }.as_deref(),
@@ -207,7 +210,7 @@ impl Tool for SetValueTool {
                 .gate_again(
                     window_id,
                     Some(element_ptr),
-                    cua_driver_core::background_input::BackgroundAction::InsertText,
+                    cua_driver_core::background_input::BackgroundAction::WindowPointer,
                 )
                 .await
                 .is_ok();
