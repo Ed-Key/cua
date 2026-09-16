@@ -319,8 +319,12 @@ fn run_editor_identity_case(mode: &str) {
                 );
                 assert_eq!(
                     response.structured()["effect"],
-                    "confirmed",
-                    "complete native edit should be confirmed when target identity is established"
+                    if mode == "replace" {
+                        "unverifiable"
+                    } else {
+                        "confirmed"
+                    },
+                    "a replaced addressed element requires fresh observation"
                 );
             }
         },
