@@ -66,15 +66,17 @@ fn stalled_preview_does_not_hold_actions_and_only_latest_pending_target_is_captu
         }
     });
     let mut registry = ToolRegistry::new();
-    registry.register(Box::new(NativeInput(ToolDef {
-        name: "click".into(),
-        description: "native input boundary".into(),
-        input_schema: json!({"type":"object"}),
-        read_only: false,
-        destructive: false,
-        idempotent: false,
-        open_world: false,
-    })));
+    for name in ["click", "bring_to_front"] {
+        registry.register(Box::new(NativeInput(ToolDef {
+            name: name.into(),
+            description: "native input boundary".into(),
+            input_schema: json!({"type":"object"}),
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        })));
+    }
     let registry = Arc::new(registry);
     let (returned_tx, returned) = mpsc::channel();
     let first_registry = registry.clone();
@@ -138,6 +140,7 @@ fn stalled_preview_does_not_hold_actions_and_only_latest_pending_target_is_captu
     // The renderer is now stalled after receiving frame107. This must not
     // hold either an action result or the publication lock for later actions.
     let (next_done, next_completed) = mpsc::channel();
+    let final_registry = registry.clone();
     let next = std::thread::spawn(move || {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         let result = runtime.block_on(registry.invoke_with_context(
@@ -159,4 +162,18 @@ fn stalled_preview_does_not_hold_actions_and_only_latest_pending_target_is_captu
     let next_frame = frames.recv_timeout(Duration::from_secs(3)).unwrap();
     assert_eq!(next_frame.png_bytes, 108_u64.to_be_bytes());
     assert_eq!(captures.try_recv().unwrap(), (Some(108), Some(42)));
+
+    // Legacy embedders historically receive frames after non-read-only tools,
+    // including mutations outside the narrower native ActionResult contract.
+    let runtime = tokio::runtime::Runtime::new().unwrap();
+    let result = runtime.block_on(final_registry.invoke_with_context(
+        "bring_to_front",
+        json!({"pid":42,"window_id":109}),
+        context(),
+    ));
+    assert_ne!(result.is_error, Some(true));
+    let frame = frames
+        .recv_timeout(Duration::from_secs(2))
+        .expect("legacy preview lost non-ActionResult mutation");
+    assert_eq!(frame.png_bytes, 109_u64.to_be_bytes());
 }

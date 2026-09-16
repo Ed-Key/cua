@@ -37,7 +37,17 @@ pub struct PipCaptureRequest {
     pub timestamp_ms: u64,
 }
 
-static PIP_REQUESTS: OnceLock<watch::Sender<Option<PipCaptureRequest>>> = OnceLock::new();
+#[derive(Clone)]
+struct PendingPreview {
+    session: Option<String>,
+    request: PipCaptureRequest,
+}
+
+struct Publisher {
+    sender: watch::Sender<Option<PendingPreview>>,
+    session_scoped: bool,
+}
+static PIP_REQUESTS: OnceLock<Publisher> = OnceLock::new();
 
 enum Consumer {
     Legacy(Box<dyn Fn(PipHookFrame) + Send + Sync>),
@@ -58,10 +68,21 @@ pub fn set_pip_observer_fn(f: impl FnMut(PipCaptureRequest) -> bool + Send + 'st
 
 fn start_worker(mut consumer: Consumer) {
     PIP_REQUESTS.get_or_init(|| {
-        let (sender, mut receiver) = watch::channel::<Option<PipCaptureRequest>>(None);
+        let (sender, mut receiver) = watch::channel::<Option<PendingPreview>>(None);
+        let session_scoped = matches!(&consumer, Consumer::Observer(_));
+        // Own the hook with the worker, so a closed observer cannot leave a
+        // live cleanup callback behind. The legacy image callback cannot clear
+        // its renderer and therefore retains its historical lifecycle.
+        let cleanup = session_scoped.then(|| {
+            let sender = sender.clone();
+            crate::session::register_scoped_session_end_hook(move |session| {
+                clear_session_preview(&sender, session);
+            })
+        });
         let started = std::thread::Builder::new()
             .name("cua-pip-publisher".into())
             .spawn(move || {
+                let _cleanup = cleanup;
                 let runtime = match tokio::runtime::Builder::new_current_thread().build() {
                     Ok(runtime) => runtime,
                     Err(error) => {
@@ -74,7 +95,8 @@ fn start_worker(mut consumer: Consumer) {
                         // Release the watch borrow before any native or embedder
                         // work. Publishers must never wait for either callback.
                         let request = receiver.borrow_and_update().clone();
-                        let Some(request) = request else { continue };
+                        let Some(pending) = request else { continue };
+                        let request = pending.request;
                         if let Consumer::Observer(publish) = &mut consumer {
                             if !publish(request) {
                                 break;
@@ -100,14 +122,27 @@ fn start_worker(mut consumer: Consumer) {
         if let Err(error) = started {
             tracing::warn!(%error, "PiP capture worker could not start");
         }
-        sender
+        Publisher {
+            sender,
+            session_scoped,
+        }
     });
 }
 
 /// True while the preview publisher is running. This is not an acknowledgement
 /// that the helper rendered a frame. A closed publisher disables further work.
 pub fn pip_enabled() -> bool {
-    PIP_REQUESTS.get().is_some_and(|sender| !sender.is_closed())
+    PIP_REQUESTS
+        .get()
+        .is_some_and(|publisher| !publisher.sender.is_closed())
+}
+
+/// The observer follows session-owned native actions. Legacy screenshot
+/// consumers retain their original non-read-only tool eligibility.
+pub fn uses_session_ownership() -> bool {
+    PIP_REQUESTS
+        .get()
+        .is_some_and(|publisher| publisher.session_scoped)
 }
 
 /// Replace pending preview work. Capture and renderer callbacks run only on
@@ -118,12 +153,67 @@ pub fn request_pip_frame(
     action_label: String,
     timestamp_ms: u64,
 ) {
-    if let Some(sender) = PIP_REQUESTS.get().filter(|sender| !sender.is_closed()) {
-        sender.send_replace(Some(PipCaptureRequest {
-            window_id,
-            pid,
-            action_label,
-            timestamp_ms,
-        }));
+    publish_preview(None, window_id, pid, action_label, timestamp_ms);
+}
+
+/// Publish a target owned by the registry's runtime-private session identity.
+/// Public labels alone are not unique across independently authorized clients.
+pub(crate) fn request_pip_frame_for_session(
+    session: &str,
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    action_label: String,
+    timestamp_ms: u64,
+) {
+    publish_preview(Some(session), window_id, pid, action_label, timestamp_ms);
+}
+
+fn publish_preview(
+    session: Option<&str>,
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    action_label: String,
+    timestamp_ms: u64,
+) {
+    if let Some(publisher) = PIP_REQUESTS
+        .get()
+        .filter(|publisher| !publisher.sender.is_closed())
+    {
+        let sender = &publisher.sender;
+        sender.send_if_modified(|pending| {
+            // Serialize this check with clearing the same pending slot. End
+            // hooks run after the session tombstone lock has been released.
+            // A late action must not resurrect a session's cleared preview.
+            if session.is_some_and(crate::session::is_session_ending) {
+                return false;
+            }
+            *pending = Some(PendingPreview {
+                session: session.map(str::to_owned),
+                request: PipCaptureRequest {
+                    window_id,
+                    pid,
+                    action_label,
+                    timestamp_ms,
+                },
+            });
+            true
+        });
     }
+}
+
+fn clear_session_preview(sender: &watch::Sender<Option<PendingPreview>>, session: &str) {
+    sender.send_if_modified(|pending| {
+        let Some(pending) = pending else { return false };
+        if pending.session.as_deref() != Some(session) {
+            return false;
+        }
+        pending.session = None;
+        pending.request = PipCaptureRequest {
+            window_id: None,
+            pid: None,
+            action_label: "Session ended".into(),
+            timestamp_ms: crate::recording::now_ms(),
+        };
+        true
+    });
 }

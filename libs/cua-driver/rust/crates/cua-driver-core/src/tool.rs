@@ -1697,13 +1697,29 @@ impl ToolRegistry {
         // Preview capture and presentation never hold the action result.
         // The dedicated worker coalesces pending requests when it is busy.
         // Recording keeps its independent evidence lifecycle above.
-        if pip_hook::pip_enabled() && should_record && !private_consent_turn {
-            pip_hook::request_pip_frame(
-                args.opt_u64("window_id"),
-                args.opt_i64("pid"),
-                synthesize_action_label(name, &public_args),
-                now_ms(),
-            );
+        let session_preview = pip_hook::uses_session_ownership();
+        let preview_action = if session_preview {
+            cua_driver_contract::is_action_result_tool(resolved_name)
+        } else {
+            should_record
+        };
+        if pip_hook::pip_enabled() && preview_action && !private_consent_turn {
+            if !session_preview {
+                pip_hook::request_pip_frame(
+                    args.opt_u64("window_id"),
+                    args.opt_i64("pid"),
+                    synthesize_action_label(name, &public_args),
+                    now_ms(),
+                );
+            } else if let Some(session) = runtime_session.as_deref() {
+                pip_hook::request_pip_frame_for_session(
+                    session,
+                    args.opt_u64("window_id"),
+                    args.opt_i64("pid"),
+                    synthesize_action_label(name, &public_args),
+                    now_ms(),
+                );
+            }
         }
 
         result
