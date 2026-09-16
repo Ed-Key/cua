@@ -100,6 +100,17 @@ cargo test -p cua-driver --test standalone_browser_behavior_test \
   standalone_browser_pixel_ax_focus_recovery -- --exact --ignored --nocapture --test-threads=1
 ```
 
+The macOS `standalone_browser_first_native_snapshot_contains_page` row checks
+cold native accessibility without a forced renderer-accessibility launch flag.
+After the fixture's own load marker and foreground setup, it performs one
+native read, then clicks the link token from that read and verifies the destination tab.
+Recording begins before browser launch so capture setup cannot warm the renderer.
+It awards fixture and protocol evidence, not uninterrupted foreground isolation.
+Select it with the same authorized guest environment and `--exact --ignored
+--nocapture --test-threads=1`. Chrome is the verified product for this row;
+other Chromium products need their own live coverage. This readiness correction
+is macOS-specific. Windows and Linux adapters are unchanged.
+
 Historical `*-plan.md`, `*-journal.md`, and release evidence documents record
 what was run at that time. They are not current execution instructions and do
 not override this guide or `scripts/ci/README.md`.
