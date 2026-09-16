@@ -1838,6 +1838,117 @@ fn harness_appkit_verify_display_text_preserves_action_snapshot() {
 #[cfg(feature = "manual-agent-trials")]
 #[test]
 #[ignore = "external agent coordinator and raw AX observer required"]
+fn harness_appkit_agent_editor_recovery_trial() {
+    let artifacts = PathBuf::from(std::env::var("CUA_AGENT_TRIAL_DIR").expect("trial directory"));
+    assert!(artifacts.is_absolute() && !artifacts.exists());
+    std::fs::create_dir_all(artifacts.join("workspace")).unwrap();
+    let observer = PathBuf::from(std::env::var("CUA_AGENT_OBSERVER_BIN").expect("raw AX observer"));
+    assert!(observer.is_absolute() && observer.is_file());
+    let preflight = std::env::var("CUA_AGENT_EDITOR_PREFLIGHT").as_deref() == Ok("1");
+    let trace = artifacts.join("editor-journal.jsonl");
+    run_background_case_with_env(
+        if preflight {
+            "agent_editor_preflight"
+        } else {
+            "agent_editor_recovery"
+        },
+        Targeting::NotApplicable,
+        DriverRoute::Composite,
+        &[
+            ("CUA_APPKIT_EDITOR_TRANSITION", "divert"),
+            ("CUA_APPKIT_EDITOR_TRACE", trace.to_str().unwrap()),
+        ],
+        |pid, wid, _driver| {
+            let observe = |name: &str| {
+                let out = Command::new(&observer)
+                    .arg(pid.to_string())
+                    .output()
+                    .unwrap();
+                std::fs::write(artifacts.join(format!("{name}.stderr")), &out.stderr).unwrap();
+                assert!(out.status.success(), "independent observer failed");
+                std::fs::write(artifacts.join(format!("{name}.json")), &out.stdout).unwrap();
+                let state: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+                let counters: Vec<&str> = state["rows"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .filter(|row| row["AXRole"] == "AXStaticText")
+                    .filter_map(|row| row["AXValue"].as_str())
+                    .filter(|value| value.starts_with("counter="))
+                    .collect();
+                assert_eq!(counters.len(), 1, "counter must be uniquely observable");
+                counters[0].to_owned()
+            };
+            assert_eq!(observe("initial-state"), "counter=0");
+            let identity =
+                serde_json::json!({"app_pid":pid,"window_id":wid,"app_path":harness_app()});
+            std::fs::write(
+                artifacts.join("workspace/process.json"),
+                identity.to_string(),
+            )
+            .unwrap();
+            std::fs::write(artifacts.join("manual-ready.json"), identity.to_string()).unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(480);
+            while !artifacts.join("manual-complete.json").exists() {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "agent completion deadline exceeded"
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            let marker: serde_json::Value = serde_json::from_slice(
+                &std::fs::read(artifacts.join("manual-complete.json")).unwrap(),
+            )
+            .unwrap();
+            // Capture actual state even when the coordinator reports failure.
+            let counter = observe("final-state");
+            let journal: Vec<serde_json::Value> = std::fs::read_to_string(&trace)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let last = journal.last().unwrap();
+            std::fs::write(
+                artifacts.join("actual-outcome.json"),
+                serde_json::json!({
+                    "counter":counter,"editor":last,"preflight":preflight
+                })
+                .to_string(),
+            )
+            .unwrap();
+            assert_eq!(
+                marker["exit_code"], 0,
+                "agent did not complete successfully"
+            );
+            let answer: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(artifacts.join("answer.json")).unwrap())
+                    .unwrap();
+            assert_eq!(
+                last["other"], "hello",
+                "unrelated field must remain unchanged"
+            );
+            assert!(journal.iter().all(|row| row["other"] == "hello"));
+            assert_eq!(
+                last["target"],
+                if preflight { "" } else { "hello" },
+                "agent answer cannot substitute for actual field state"
+            );
+            assert_eq!(counter, if preflight { "counter=0" } else { "counter=1" });
+            assert_eq!(last["transitions"], if preflight { 0 } else { 1 });
+            if preflight {
+                assert_eq!(last["keys"], 0, "read-only readiness must not type");
+            }
+            assert_eq!(answer["target"], last["target"]);
+            assert_eq!(answer["other"], "hello");
+            assert_eq!(answer["counter"], if preflight { 0 } else { 1 });
+            assert_eq!(answer["completed"], true);
+        },
+    );
+}
+
+#[cfg(feature = "manual-agent-trials")]
+#[test]
+#[ignore = "external agent coordinator and raw AX observer required"]
 fn harness_appkit_agent_counter_trial() {
     let artifacts = PathBuf::from(std::env::var("CUA_AGENT_TRIAL_DIR").expect("trial directory"));
     assert!(artifacts.is_absolute());
