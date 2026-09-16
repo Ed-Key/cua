@@ -192,6 +192,26 @@ impl Tool for SetValueTool {
             Some(window_id),
         );
 
+        // A native field can accept AXValue without notifying its delegate
+        // until AppKit has installed its field editor. Reuse the existing
+        // exact-target gate under the same lease before preparing that editor.
+        // Semantic-only targets (hidden/minimized or competing windows) retain
+        // their direct AX route without a new focus mutation. Web content and
+        // non-text controls also retain their existing behavior.
+        let prepare_native_text = !ax_echo_surface
+            && matches!(
+                unsafe { copy_string_attr(element_ptr as AXUIElementRef, "AXRole") }.as_deref(),
+                Some("AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox")
+            )
+            && _mutation_lease
+                .gate_again(
+                    window_id,
+                    Some(element_ptr),
+                    cua_driver_core::background_input::BackgroundAction::InsertText,
+                )
+                .await
+                .is_ok();
+
         // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
         // AXValue writes on popups / sliders can cause reflex activations
         // in Chromium-based apps; the AXPopUpButton path also AXPresses a
@@ -205,7 +225,15 @@ impl Tool for SetValueTool {
             "set_value.AXValue",
             || async move {
                 tokio::task::spawn_blocking(move || {
-                    set_value_blocking(element_guard.as_ptr(), element_index, pid, &value)
+                    let element_ptr = element_guard.as_ptr();
+                    if prepare_native_text
+                        && !crate::input::ax_actions::is_element_focused(pid, element_ptr)
+                    {
+                        crate::input::ax_actions::focus_element(element_ptr)?;
+                    }
+                    // Preparation is best effort, not evidence of delivery.
+                    // Keep target-bound readback.
+                    set_value_blocking(element_ptr, element_index, pid, &value)
                 })
                 .await
             },
