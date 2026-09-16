@@ -1688,6 +1688,127 @@ fn harness_appkit_type_text_background() {
     );
 }
 
+// Compare native value assignment and insertion with the app's own change
+// and commit labels. Diagnostic cases record the mirror; the regression
+// requires a notification without accepting submission as a substitute.
+fn run_value_notification_probe(prepare: bool, typing: bool, require_notification: bool) {
+    let label = if require_notification {
+        "regression"
+    } else if typing {
+        "typing"
+    } else if prepare {
+        "prepared"
+    } else {
+        "unprepared"
+    };
+    run_background_case_with_env(
+        &format!("value_notification_{label}"),
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[],
+        |pid, wid, driver| {
+            let native = slice_a_tree(pid, wid);
+            assert!(!native.truncated);
+            let field = native
+                .nodes
+                .iter()
+                .find(|n| n.identifier.as_deref() == Some("txt-input"))
+                .unwrap();
+            assert_eq!(field.role, "AXTextField");
+            let ptr = field.element_ptr;
+            let observe = || {
+                let state = slice_a_tree(pid, wid);
+                assert!(!state.truncated);
+                let value = |id: &str| {
+                    let matches: Vec<_> = state
+                        .nodes
+                        .iter()
+                        .filter(|n| n.identifier.as_deref() == Some(id))
+                        .collect();
+                    assert_eq!(matches.len(), 1, "unique native field {id}");
+                    matches[0].value.clone().expect("readable native value")
+                };
+                serde_json::json!({
+                    "field":value("txt-input"), "mirror":value("lbl-input-mirror"),
+                    "commit":value("lbl-input-commit"), "counter":value("lbl-counter"),
+                    "focused":platform_macos::input::ax_actions::is_element_focused(pid as i32, ptr)
+                })
+            };
+            let before = observe();
+            assert_eq!(before["field"], "");
+            assert_eq!(before["mirror"], "");
+            assert_eq!(before["focused"], false);
+            if prepare {
+                platform_macos::input::ax_actions::focus_element(ptr).unwrap();
+            }
+            let prepared = observe();
+            assert_eq!(prepared["focused"], prepare);
+            assert_eq!(prepared["field"], "");
+            assert_eq!(
+                prepared["mirror"], "",
+                "focus alone must not fabricate an edit"
+            );
+            let snapshot = snapshot_elements(driver, pid, wid);
+            let mut arguments = serde_json::json!({
+                "pid":pid, "window_id":wid,
+                "element_token":element_token_by_id(&snapshot, "txt-input")
+            });
+            let payload = "Research ready";
+            if typing {
+                arguments["text"] = payload.into();
+                arguments["delivery_mode"] = "background".into();
+            } else {
+                arguments["value"] = payload.into();
+            }
+            let started = std::time::Instant::now();
+            let response = driver.call(if typing { "type_text" } else { "set_value" }, arguments);
+            let call_ms = started.elapsed().as_millis();
+            let after = observe();
+            eprintln!(
+                "value notification {}",
+                serde_json::json!({
+                    "prepare":prepare,"typing":typing,"require_notification":require_notification,
+                    "before":before,"prepared":prepared,"after":after,"call_ms":call_ms,"response":response.raw
+                })
+            );
+            assert!(!response.is_error(), "{}", response.raw);
+            assert_eq!(after["field"], payload);
+            assert_eq!(
+                after["commit"], "committed=none",
+                "do not submit the field to obtain a notification"
+            );
+            assert_eq!(after["counter"], "counter=0");
+            if typing || require_notification {
+                assert_eq!(
+                    after["mirror"], payload,
+                    "the app must observe the text change without committing"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_value_notification_unprepared() {
+    run_value_notification_probe(false, false, false);
+}
+#[test]
+#[ignore]
+fn harness_appkit_value_notification_prepared() {
+    run_value_notification_probe(true, false, false);
+}
+#[test]
+#[ignore]
+fn harness_appkit_value_notification_typing() {
+    run_value_notification_probe(false, true, false);
+}
+#[test]
+#[ignore]
+fn harness_appkit_set_value_notifies_without_commit() {
+    run_value_notification_probe(false, false, true);
+}
+
 // Isolate the existing native focus helper from input and verification timing.
 fn run_typing_preparation_probe(prepare: bool) {
     use core_foundation::{base::TCFType, string::CFString};
