@@ -349,6 +349,87 @@ fn harness_appkit_editor_identity_diversion() {
     run_editor_identity_case("divert");
 }
 
+fn run_typing_preexisting_case(key_mode: &str) {
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("typing-preexisting.jsonl");
+    run_background_case_with_env(
+        &format!("typing_preexisting_{key_mode}"),
+        Targeting::Ax,
+        DriverRoute::MacosCgEventPid,
+        &[
+            ("CUA_APPKIT_EDITOR_TRANSITION", "stable"),
+            ("CUA_APPKIT_EDITOR_INITIAL", "hello"),
+            ("CUA_APPKIT_EDITOR_KEYS", key_mode),
+            ("CUA_APPKIT_EDITOR_TRACE", trace.to_str().unwrap()),
+        ],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let token = element_token_by_id(&before, "txt-transition-target");
+            let response = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid":pid,"window_id":wid,"element_token":token,
+                    "text":"hello","delay_ms":40,"delivery_mode":"background"
+                }),
+            );
+            let after = snapshot_elements(driver, pid, wid);
+            let raw = std::fs::read_to_string(&trace).expect("app-owned key journal");
+            eprintln!(
+                "preexisting key_mode={key_mode}; response={}; journal={raw}; snapshot={}",
+                response.raw,
+                after.tree_text()
+            );
+            let rows: Vec<serde_json::Value> = raw
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let last = rows.last().unwrap();
+            assert_eq!(rows[0]["target"], "hello");
+            assert_eq!(last["keys"], 5, "one payload without retry");
+            assert_eq!(last["transitions"], 0);
+            assert_eq!(last["focused"], "target");
+            assert!(rows.iter().all(|row| row["other"] == "hello"));
+            assert_eq!(
+                last["target"],
+                match key_mode {
+                    "all" => "hellohello",
+                    "first" => "helloh",
+                    "drop" => "hello",
+                    _ => unreachable!(),
+                }
+            );
+            let output = response.structured();
+            if key_mode == "all" {
+                assert!(!response.is_error());
+                assert_eq!(output["effect"], "confirmed");
+            } else {
+                assert_ne!(
+                    output["effect"], "confirmed",
+                    "pre-existing payload cannot confirm the new insertion"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_typing_preexisting_drop() {
+    run_typing_preexisting_case("drop");
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_typing_preexisting_prefix() {
+    run_typing_preexisting_case("first");
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_typing_preexisting_append() {
+    run_typing_preexisting_case("all");
+}
+
 fn run_editor_sequence_case(mode: &str, ambiguous: bool) {
     let journal = tempfile::tempdir().unwrap();
     let trace = journal.path().join("editor-sequence.jsonl");
