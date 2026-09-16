@@ -1722,7 +1722,7 @@ fn run_value_notification_probe(
     let label = if sibling && prepare {
         "sibling_prepared"
     } else if sibling {
-        "sibling"
+        "sibling_regression"
     } else if require_notification {
         "regression"
     } else if typing {
@@ -1851,16 +1851,6 @@ fn run_value_notification_probe(
                     "do not submit the field to obtain a notification"
                 );
                 assert_eq!(after["counter"], "counter=0");
-                if sibling && !prepare {
-                    assert_eq!(
-                        after["focused"], false,
-                        "semantic-only delivery must not gain a focus mutation"
-                    );
-                    assert_eq!(
-                        after["mirror"], "",
-                        "record the semantic-only notification limitation explicitly"
-                    );
-                }
                 if typing || require_notification {
                     assert_eq!(
                         after["mirror"], payload,
@@ -1895,8 +1885,8 @@ fn harness_appkit_set_value_notifies_without_commit() {
 
 #[test]
 #[ignore]
-fn harness_appkit_set_value_semantic_only_preserves_focus() {
-    run_value_notification_probe(false, false, false, true);
+fn harness_appkit_set_value_sibling_notifies_without_commit() {
+    run_value_notification_probe(false, false, true, true);
 }
 
 // Operator probe: isolate exact-element AX preparation from the product's
