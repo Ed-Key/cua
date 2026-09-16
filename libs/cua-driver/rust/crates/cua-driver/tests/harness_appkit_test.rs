@@ -1258,10 +1258,31 @@ fn harness_appkit_typing_repeated_and_selected_text() {
                 ("identical_replacement", "A😀B", true, "A😀B"),
             ] {
                 if select_all {
+                    let before_selection = snapshot_elements(driver, pid, wid);
                     let selected = driver.call("press_key", serde_json::json!({
-                    "pid":pid,"window_id":wid,"key":"a","modifiers":["cmd"],"delivery_mode":"background"
+                    "pid":pid,"window_id":wid,"element_token":element_token_by_id(&before_selection,"txt-input"),
+                    "key":"left","modifiers":["cmd","shift"],"delivery_mode":"background"
                 }));
                     assert!(!selected.is_error(), "select all: {}", selected.text());
+                    let selection = snapshot_elements(driver, pid, wid);
+                    let index = element_index_by_id(selection.tree_text(), "txt-input").unwrap();
+                    let field = selection.structured()["elements"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|e| e["element_index"].as_u64() == Some(index))
+                        .unwrap();
+                    eprintln!(
+                        "selection setup phase={phase}; response={}; field={field}",
+                        selected.raw
+                    );
+                    assert_eq!(
+                        field["text_selection"]["range"],
+                        serde_json::json!({
+                            "location":0,"length":field["value"].as_str().unwrap().encode_utf16().count()
+                        }),
+                        "replacement setup must select the entire value before any input"
+                    );
                 }
                 let response = driver.call(
                     "type_text",
