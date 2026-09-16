@@ -599,6 +599,15 @@ final class BringToFrontMatrixWindows: NSObject, NSTextFieldDelegate {
             secondary.contentView = content
         }
         secondary.orderFront(nil)
+        if mode == "editable",
+           let draft = ProcessInfo.processInfo.environment["CUA_HARNESS_SIBLING_DRAFT"],
+           let field = editField {
+            // Seed a real, uncommitted edit before agent observation begins.
+            // Let AppKit deliver its normal delegate callback to the mirror.
+            field.selectText(nil)
+            guard let editor = field.currentEditor() else { fatalError("missing sibling field editor") }
+            editor.insertText(draft)
+        }
 
         if mode == "sheet" {
             let candidate = NSWindow(
