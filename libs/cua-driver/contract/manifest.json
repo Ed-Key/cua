@@ -9,7 +9,7 @@
   "tools": [
     {
       "name": "act_and_read",
-      "description": "macOS: run one token-targeted background click or set_value, then read the same window's fresh accessibility state. Use when you already intend to act and inspect. Tree-only by default; observe selects query/context and optional screenshot. Returns both child results separately, including action errors. No retries or semantic verification: a fresh read does not prove the action succeeded. Not a transaction against other clients or user input. Windows and Linux are not yet supported.",
+      "description": "macOS: run one token-targeted background click, set_value or scroll, then read the same window's fresh accessibility state. Use when you already intend to act and inspect. Scroll requires direction, accepts optional by and amount, and uses the existing scroll tool defaults. Tree-only by default; observe selects query/context and optional screenshot. Returns both child results separately, including action errors. No retries or semantic verification: a fresh read does not prove the action succeeded. Not a transaction against other clients or user input. Windows and Linux are not yet supported.",
       "platforms": [
         "macos"
       ],
@@ -29,7 +29,32 @@
           "action": {
             "enum": [
               "click",
-              "set_value"
+              "set_value",
+              "scroll"
+            ],
+            "type": "string"
+          },
+          "amount": {
+            "description": "Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.",
+            "maximum": 50,
+            "minimum": 1,
+            "type": "integer"
+          },
+          "by": {
+            "description": "Scroll only. Omit to retain the scroll tool's line default.",
+            "enum": [
+              "line",
+              "page"
+            ],
+            "type": "string"
+          },
+          "direction": {
+            "description": "Required only for scroll. Uses the existing background scroll route.",
+            "enum": [
+              "up",
+              "down",
+              "left",
+              "right"
             ],
             "type": "string"
           },

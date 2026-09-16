@@ -297,6 +297,46 @@ pub(crate) async fn acquire_background_mutation(pid: i32) -> BackgroundMutationL
     }
 }
 
+/// Keep an exact background web window ready for keys without changing its
+/// editor selection. Call only while holding the existing mutation lease;
+/// retained element pointers remain owned by the caller. Native controls and
+/// PID-only requests keep their existing delivery path.
+pub(super) fn with_background_web_key_focus<T>(
+    pid: i32,
+    window_id: Option<u32>,
+    element_ptr: Option<usize>,
+    dispatch: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let Some(wid) = window_id.filter(|_| {
+        type_text::target_in_web_area(pid, element_ptr.map(|ptr| (ptr, None)), window_id)
+    }) else {
+        return dispatch();
+    };
+    crate::input::skylight::with_background_keyboard_focus_checked(
+        pid,
+        wid,
+        &|| {
+            use cua_driver_core::background_input::{
+                decide_background_input, BackgroundAction, BackgroundInputDecision,
+                ExactWindowTarget,
+            };
+            let facts = crate::ax::exact_target::gather_background_facts(pid, wid, element_ptr);
+            match decide_background_input(
+                ExactWindowTarget { pid, window_id: wid },
+                &facts,
+                BackgroundAction::GenericKey,
+            ) {
+                BackgroundInputDecision::Execute { .. } => Ok(()),
+                BackgroundInputDecision::Refuse(refusal) => anyhow::bail!(
+                    "background key preparation refused ({}): {}; observe the target before repeating the key",
+                    refusal.code, refusal.reason
+                ),
+            }
+        },
+        |_| dispatch(),
+    )
+}
+
 /// px-focus for the keyboard family (type_text / press_key / hotkey): focus the
 /// element at (x,y) before a keystroke — the *element px action* form of a
 /// keyboard tool. Prefer non-destructive AX focus so an existing selection is

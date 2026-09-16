@@ -199,9 +199,29 @@ fn run_case_with_env(
             .expect("start installed macOS daemon proxy");
         *evidence = recording_evidence(driver.recording_dir());
         let harness = Harness::launch_with_env(env);
-        let (wid, _) = driver
+        let (wid, title) = driver
             .find_window(harness.pid as i64, "CuaTestHarness AppKit")
             .expect("AppKit main window not found");
+        // The shared helper matches substrings, which can select the optional
+        // "CuaTestHarness AppKit Secondary" window. Bind the exact main window
+        // before starting its recording and background oracles.
+        let wid = if title == "CuaTestHarness AppKit" {
+            wid
+        } else {
+            let windows = driver.call("list_windows", serde_json::json!({"pid": harness.pid}));
+            let matches: Vec<_> = windows.structured()["windows"]
+                .as_array()
+                .expect("window list")
+                .iter()
+                .filter(|w| {
+                    w["pid"].as_u64() == Some(harness.pid as u64)
+                        && w["title"] == "CuaTestHarness AppKit"
+                })
+                .filter_map(|w| w["window_id"].as_u64())
+                .collect();
+            assert_eq!(matches.len(), 1, "unique AppKit main window required");
+            matches[0]
+        };
         if delivery != cua_driver_testkit::e2e::Delivery::Background {
             driver.start_behavior_recording();
         }
@@ -252,6 +272,314 @@ fn run_background_case_with_env(
 }
 
 // ── tests ────────────────────────────────────────────────────────────────────
+
+fn run_editor_identity_case(mode: &str) {
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("editor-identity.jsonl");
+    run_background_case_with_env(
+        &format!("editor_identity_{mode}"),
+        Targeting::Ax,
+        DriverRoute::MacosCgEventPid,
+        &[
+            ("CUA_APPKIT_EDITOR_TRANSITION", mode),
+            ("CUA_APPKIT_EDITOR_TRACE", trace.to_str().unwrap()),
+        ],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            eprintln!(
+                "editor identity initial mode={mode}; snapshot={}",
+                before.raw
+            );
+            let token = element_token_by_id(&before, "txt-transition-target");
+            let response = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid, "window_id": wid, "element_token": token,
+                    "text": "hello", "delay_ms": 40, "delivery_mode": "background"
+                }),
+            );
+            let after = snapshot_elements(driver, pid, wid);
+            let raw = std::fs::read_to_string(&trace).expect("app-owned editor journal");
+            eprintln!(
+                "editor identity mode={mode}; response={}; journal={raw}; snapshot={}",
+                response.raw,
+                after.tree_text()
+            );
+            let rows: Vec<serde_json::Value> = raw
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let last = rows.last().expect("journal rows");
+            assert_eq!(last["keys"], 5, "fixture must receive every character once");
+            assert_eq!(
+                last["other"], "hello",
+                "other field must keep its initial text"
+            );
+            assert!(
+                response.structured()["route"] == "synthetic_events"
+                    || response.structured()["path"] == "key_events",
+                "must exercise post-keystroke readback: {}",
+                response.raw
+            );
+            if mode == "divert" {
+                assert_eq!(last["target"], "", "target deliberately took no text");
+                assert_eq!(last["transitions"], 1);
+                assert_ne!(
+                    response.structured()["effect"],
+                    "confirmed",
+                    "text in another field cannot confirm the requested edit"
+                );
+            } else {
+                assert_eq!(last["target"], "hello");
+                assert_eq!(last["transitions"], if mode == "replace" { 1 } else { 0 });
+                assert!(
+                    !response.is_error(),
+                    "complete edit reported an error: {}",
+                    response.raw
+                );
+                assert_eq!(
+                    response.structured()["effect"],
+                    if mode == "replace" {
+                        "unverifiable"
+                    } else {
+                        "confirmed"
+                    },
+                    "a replaced addressed element requires fresh observation"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_identity_stable() {
+    run_editor_identity_case("stable");
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_identity_replacement() {
+    run_editor_identity_case("replace");
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_identity_diversion() {
+    run_editor_identity_case("divert");
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_typing_preexisting_ax_noop() {
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("typing-preexisting.jsonl");
+    run_background_case_with_env(
+        "typing_preexisting_ax_noop",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[
+            ("CUA_APPKIT_EDITOR_TRANSITION", "stable"),
+            ("CUA_APPKIT_EDITOR_INITIAL", "hello"),
+            ("CUA_APPKIT_EDITOR_TRACE", trace.to_str().unwrap()),
+        ],
+        |pid, wid, driver| {
+            if let Ok(probe) = std::env::var("CUA_TYPING_CAPABILITY_PROBE") {
+                let output = std::process::Command::new(probe)
+                    .arg(pid.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "read-only capability probe: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                eprintln!(
+                    "typing capability probe={}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
+            let before = snapshot_elements(driver, pid, wid);
+            let token = element_token_by_id(&before, "txt-transition-target");
+            let response = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid":pid,"window_id":wid,"element_token":token,
+                    "text":"hello","delay_ms":40,"delivery_mode":"background"
+                }),
+            );
+            let after = snapshot_elements(driver, pid, wid);
+            let raw = std::fs::read_to_string(&trace).expect("app-owned key journal");
+            eprintln!(
+                "preexisting AX response={}; journal={raw}; snapshot={}",
+                response.raw,
+                after.tree_text()
+            );
+            let rows: Vec<serde_json::Value> = raw
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            assert_eq!(
+                rows.len(),
+                1,
+                "no key input or retry after the accepted AX write"
+            );
+            assert_eq!(rows[0]["target"], "hello");
+            assert_eq!(rows[0]["other"], "hello");
+            assert_eq!(rows[0]["keys"], 0);
+            assert_eq!(rows[0]["transitions"], 0);
+            assert!(!response.is_error());
+            assert_eq!(response.structured()["route"], "accessibility");
+            assert_ne!(
+                response.structured()["effect"],
+                "confirmed",
+                "an unchanged pre-existing payload cannot confirm the new insertion"
+            );
+        },
+    );
+}
+
+fn run_editor_sequence_case(mode: &str, ambiguous: bool) {
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("editor-sequence.jsonl");
+    run_background_case_with_env(
+        &format!(
+            "editor_sequence_{}",
+            if ambiguous { "ambiguous" } else { mode }
+        ),
+        Targeting::Ax,
+        DriverRoute::MacosCgEventPid,
+        &[
+            ("CUA_APPKIT_EDITOR_TRANSITION", mode),
+            ("CUA_APPKIT_EDITOR_TRACE", trace.to_str().unwrap()),
+        ],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let target = element_token_by_id(&before, "txt-transition-target");
+            let increment = element_token_by_id(&before, "btn-increment");
+            let selector = if ambiguous {
+                serde_json::json!({"role":"AXTextField"})
+            } else {
+                serde_json::json!({"role":"AXTextField","label_contains":"Transition target"})
+            };
+            let response = driver.call(
+                "run_sequence",
+                serde_json::json!({
+                    "pid":pid,"window_id":wid,
+                    "steps":[
+                        {"tool":"click","arguments":{"element_token":target},
+                         "expect":[{"element":{
+                             "selector":{"role":"AXTextField","label_contains":"Transition target"},
+                             "value_equals":""}}],"timeout_ms":1000,"stable_samples":2},
+                        {"tool":"type_text","arguments":{"text":"hello"},
+                         "expect":[{"element":{"selector":selector,"value_equals":"hello"}}],
+                         "timeout_ms":1000,"stable_samples":2},
+                        {"tool":"click","arguments":{"element_token":increment},
+                         "expect":[{"element":{
+                             "selector":{"role":"AXStaticText","label_contains":"counter="},
+                             "value_equals":"counter=1"}}],"timeout_ms":1000,"stable_samples":2}
+                    ]
+                }),
+            );
+            let after = snapshot_elements(driver, pid, wid);
+            let raw = std::fs::read_to_string(&trace).expect("app-owned editor journal");
+            eprintln!("editor sequence mode={mode} ambiguous={ambiguous}; response={}; journal={raw}; snapshot={}",
+                response.raw, after.raw);
+            let rows: Vec<serde_json::Value> = raw
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let last = rows.last().unwrap();
+            assert_eq!(last["keys"], 5, "one payload, with no retries");
+            assert_eq!(last["target"], if mode == "divert" { "" } else { "hello" });
+            assert_eq!(last["other"], "hello");
+            assert!(!response.is_error(), "{}", response.raw);
+            let output = response.structured();
+            let steps = output["steps"].as_array().unwrap();
+            let changed_editor = matches!(mode, "replace" | "divert");
+            assert_eq!(
+                steps[1]["action"]["effect"],
+                if changed_editor {
+                    "unverifiable"
+                } else {
+                    "confirmed"
+                },
+                "implicit typing cannot confirm delivery using a different focused editor"
+            );
+            if changed_editor {
+                assert!(steps[1]["action"]["delivery"]["delivered_count"].is_null());
+            }
+            let stopped = mode == "divert" || ambiguous;
+            assert_eq!(
+                output["status"],
+                if stopped { "stopped" } else { "completed" }
+            );
+            assert_eq!(steps.len(), if stopped { 2 } else { 3 });
+            if stopped {
+                assert_eq!(output["stopped_at"], 1);
+                assert!(
+                    after.tree_text().contains("counter=0"),
+                    "later click must not execute"
+                );
+                assert!(!after.tree_text().contains("counter=1"));
+                if ambiguous {
+                    assert_eq!(output["stop_reason"], "unknown");
+                    assert_eq!(steps[1]["verification"]["status"], "unknown");
+                    assert_eq!(
+                        steps[1]["verification"]["predicates"][0]["unknown_reason"],
+                        "multi_match"
+                    );
+                } else {
+                    assert_eq!(
+                        output["stop_reason"], "unsatisfied",
+                        "fresh target evidence must stop after the unverifiable action"
+                    );
+                    assert_eq!(steps[1]["verification"]["status"], "unsatisfied");
+                }
+            } else {
+                assert!(after.tree_text().contains("counter=1"));
+                assert!(!after.tree_text().contains("counter=0"));
+                for step in steps {
+                    assert_eq!(step["verification"]["status"], "satisfied");
+                    assert_eq!(step["verification"]["stable"], true);
+                    assert!(step["observation_count"].as_u64().unwrap() >= 2);
+                }
+            }
+            for step in steps {
+                assert_eq!(step["image_bytes_returned"], 0);
+            }
+            assert!(response.raw["result"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "image"));
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_sequence_stable() {
+    run_editor_sequence_case("stable", false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_sequence_replacement() {
+    run_editor_sequence_case("replace", false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_sequence_diversion() {
+    run_editor_sequence_case("divert", false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_sequence_ambiguous() {
+    run_editor_sequence_case("stable", true);
+}
 
 /// A heartbeat is not the receipt for a setup click. Delayed setup input must
 /// be consumed before a background read enters its observation boundary.
@@ -929,6 +1257,126 @@ fn harness_appkit_focused_text_selection_and_caret() {
 
 #[test]
 #[ignore]
+fn harness_appkit_typing_repeated_and_selected_text() {
+    run_typing_repeated_and_selected_text(false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_addressed_typing_preserves_selection() {
+    run_typing_repeated_and_selected_text(true);
+}
+
+fn run_typing_repeated_and_selected_text(addressed: bool) {
+    run_background_case(
+        if addressed {
+            "addressed_typing_selected"
+        } else {
+            "typing_repeated_selected"
+        },
+        DriverRoute::MacosAxValue,
+        |pid, wid, driver| {
+            let first = snapshot_elements(driver, pid, wid);
+            let (x, y, w, h) = element_pixel_frame(&first, "txt-input");
+            let focus = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid":pid,"window_id":wid,"x":x+w/2.0,"y":y+h/2.0,"delivery_mode":"background"
+                }),
+            );
+            assert!(!focus.is_error(), "focus: {}", focus.text());
+            for (phase, text, select_all, expected) in [
+                ("initial", "hello", false, "hello"),
+                ("duplicate_append", "hello", false, "hellohello"),
+                ("shorter_replacement", "A😀B", true, "A😀B"),
+                ("identical_replacement", "A😀B", true, "A😀B"),
+            ] {
+                if select_all {
+                    let before_selection = snapshot_elements(driver, pid, wid);
+                    let selected = driver.call("press_key", serde_json::json!({
+                    "pid":pid,"window_id":wid,"element_token":element_token_by_id(&before_selection,"txt-input"),
+                    "key":"left","modifiers":["cmd","shift"],"delivery_mode":"background"
+                }));
+                    assert!(!selected.is_error(), "select all: {}", selected.text());
+                    let selection = snapshot_elements(driver, pid, wid);
+                    let index = element_index_by_id(selection.tree_text(), "txt-input").unwrap();
+                    let field = selection.structured()["elements"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|e| e["element_index"].as_u64() == Some(index))
+                        .unwrap();
+                    eprintln!(
+                        "selection setup phase={phase}; response={}; field={field}",
+                        selected.raw
+                    );
+                    assert_eq!(
+                        field["text_selection"]["range"],
+                        serde_json::json!({
+                            "location":0,"length":field["value"].as_str().unwrap().encode_utf16().count()
+                        }),
+                        "replacement setup must select the entire value before any input"
+                    );
+                }
+                let mut arguments = serde_json::json!({
+                    "pid":pid,"window_id":wid,"text":text,"delivery_mode":"background"
+                });
+                if addressed {
+                    let current = snapshot_elements(driver, pid, wid);
+                    arguments["element_token"] =
+                        serde_json::json!(element_token_by_id(&current, "txt-input"));
+                }
+                let response = driver.call("type_text", arguments);
+                let native = slice_a_tree(pid, wid);
+                assert_eq!(
+                    native
+                        .nodes
+                        .iter()
+                        .find(|node| node.identifier.as_deref() == Some("txt-input"))
+                        .and_then(|node| node.value.as_deref()),
+                    Some(expected),
+                    "independent native value must reflect exactly one edit"
+                );
+                let after = snapshot_elements(driver, pid, wid);
+                let index = element_index_by_id(after.tree_text(), "txt-input").unwrap();
+                let field = after.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["element_index"].as_u64() == Some(index))
+                    .unwrap();
+                eprintln!(
+                    "insertion control phase={phase}; response={}; field={field}",
+                    response.raw
+                );
+                assert_eq!(
+                    field["value"], expected,
+                    "one exact insertion or replacement"
+                );
+                assert_eq!(
+                    field["text_selection"]["range"],
+                    serde_json::json!({
+                        "location":expected.encode_utf16().count(),"length":0
+                    })
+                );
+                assert!(!response.is_error(), "{}", response.raw);
+                assert_eq!(
+                    response.structured()["effect"],
+                    "confirmed",
+                    "{phase}: {}",
+                    response.raw
+                );
+                assert_eq!(
+                    response.structured()["delivery"]["delivered_count"],
+                    text.chars().count()
+                );
+            }
+        },
+    );
+}
+
+#[test]
+#[ignore]
 fn harness_appkit_element_foreground_press_key_commits_edit() {
     run_case(
         native_foreground_case(
@@ -1051,6 +1499,12 @@ fn harness_appkit_px_background_press_key_reports_honest_delivery_truth() {
                 assert!(!set.is_error(), "set command failed: {}", set.text());
 
                 let focused = snapshot_elements(driver, harness.pid, wid);
+                assert!(
+                    focused.tree_text().contains("committed=none"),
+                    "command ran before Return: {}",
+                    focused.tree_text()
+                );
+                assert!(!oracle_path.exists(), "child process ran before Return");
                 let (x, y, width, height) = element_pixel_frame(&focused, "txt-input");
                 let pressed = driver.call(
                     "press_key",
@@ -1070,10 +1524,37 @@ fn harness_appkit_px_background_press_key_reports_honest_delivery_truth() {
                 );
                 assert_eq!(pressed.action_route(), Some("synthetic_events"));
                 assert_eq!(pressed.action_delivery_mode(), Some("background"));
-                assert_eq!(pressed.action_effect(), Some("unverifiable"));
+                // AppKit selects the committed text after Return. The native
+                // selection oracle can confirm that change, independently of
+                // whether the controlled child process eventually runs.
+                assert_eq!(pressed.action_effect(), Some("confirmed"));
+                assert_eq!(
+                    pressed.structured()["evidence"],
+                    serde_json::json!([{"kind":"value_readback"}])
+                );
+                let committed = snapshot_elements(driver, harness.pid, wid);
+                assert!(
+                    committed
+                        .tree_text()
+                        .contains("committed=printf cua-press-key"),
+                    "Return did not commit the command: {}",
+                    committed.tree_text()
+                );
+                let field_index = element_index_by_id(committed.tree_text(), "txt-input").unwrap();
+                let field = committed.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|element| element["element_index"].as_u64() == Some(field_index))
+                    .unwrap();
+                assert_eq!(field["value"], "printf cua-press-key");
+                assert_eq!(
+                    field["text_selection"]["range"],
+                    serde_json::json!({"location":0,"length":20})
+                );
                 assert!(
                     pressed.structured()["escalation"].is_null(),
-                    "accepted post without a positive oracle must not claim delivery_failed: {}",
+                    "a confirmed native change must not claim delivery_failed: {}",
                     pressed.raw
                 );
 
@@ -1260,10 +1741,454 @@ fn harness_appkit_type_text_background() {
     );
 }
 
+// Compare native value assignment and insertion with the app's own change
+// and commit labels. Diagnostic cases record the mirror; the regression
+// requires a notification without accepting submission as a substitute.
+fn run_value_notification_probe(
+    prepare: bool,
+    typing: bool,
+    require_notification: bool,
+    sibling: bool,
+) {
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use platform_macos::ax::bindings::{copy_children, copy_string_attr, AXUIElementRef};
+    let label = if sibling && prepare {
+        "sibling_prepared"
+    } else if sibling {
+        "sibling_regression"
+    } else if require_notification {
+        "regression"
+    } else if typing {
+        "typing"
+    } else if prepare {
+        "prepared"
+    } else {
+        "unprepared"
+    };
+    run_background_case_with_env(
+        &format!("value_notification_{label}"),
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        if sibling {
+            &[("CUA_HARNESS_BRING_TO_FRONT_MODE", "ordinary")]
+        } else {
+            &[]
+        },
+        |pid, wid, driver| {
+            let native = slice_a_tree(pid, wid);
+            assert!(!native.truncated);
+            let field = native
+                .nodes
+                .iter()
+                .find(|n| n.identifier.as_deref() == Some("txt-input"))
+                .unwrap();
+            assert_eq!(field.role, "AXTextField");
+            let ptr = field.element_ptr;
+            let window = native.nodes.iter().find(|n| n.role == "AXWindow").unwrap();
+            assert!(
+                window.element_index.is_some(),
+                "retain owner must hold the window"
+            );
+            let observe = || {
+                // The display tree deliberately omits empty static labels.
+                // Read the fixture's direct window children without that filter;
+                // CF owners release every copied child even if an assertion fails.
+                let children: Vec<CFType> = unsafe {
+                    copy_children(window.element_ptr as AXUIElementRef)
+                        .into_iter()
+                        .map(|child| CFType::wrap_under_create_rule(child as CFTypeRef))
+                        .collect()
+                };
+                let value = |id: &str| {
+                    let matches: Vec<_> = children
+                        .iter()
+                        .filter(|child| unsafe {
+                            copy_string_attr(child.as_CFTypeRef() as AXUIElementRef, "AXIdentifier")
+                                .as_deref()
+                                == Some(id)
+                        })
+                        .collect();
+                    assert_eq!(matches.len(), 1, "unique native field {id}");
+                    unsafe {
+                        copy_string_attr(matches[0].as_CFTypeRef() as AXUIElementRef, "AXValue")
+                    }
+                    .expect("readable native value")
+                };
+                serde_json::json!({
+                    "field":value("txt-input"), "mirror":value("lbl-input-mirror"),
+                    "commit":value("lbl-input-commit"), "counter":value("lbl-counter"),
+                    "focused":platform_macos::input::ax_actions::is_element_focused(pid as i32, ptr)
+                })
+            };
+            if sibling {
+                let facts = platform_macos::ax::exact_target::gather_background_facts(
+                    pid as i32,
+                    wid as u32,
+                    Some(ptr),
+                );
+                assert!(
+                    facts.competing_keyboard_destinations > 0,
+                    "the semantic-only control must have a competing destination"
+                );
+            }
+            let before = observe();
+            assert_eq!(before["field"], "");
+            assert_eq!(before["mirror"], "");
+            assert_eq!(before["focused"], false);
+            if prepare {
+                platform_macos::input::ax_actions::focus_element(ptr).unwrap();
+            }
+            let prepared = observe();
+            assert_eq!(prepared["focused"], prepare);
+            assert_eq!(prepared["field"], "");
+            assert_eq!(
+                prepared["mirror"], "",
+                "focus alone must not fabricate an edit"
+            );
+            // Replacing an existing value, preserving numeric-looking text,
+            // Unicode, clearing, and an idempotent repeat must all leave the
+            // app's change mirror consistent without ending editing.
+            let payloads: &[&str] = if require_notification {
+                &["Research ready", "007", "Ω café", "", "", "Research ready"]
+            } else {
+                &["Research ready"]
+            };
+            for &payload in payloads {
+                let snapshot = snapshot_elements(driver, pid, wid);
+                let mut arguments = serde_json::json!({
+                    "pid":pid, "window_id":wid,
+                    "element_token":element_token_by_id(&snapshot, "txt-input")
+                });
+                if typing {
+                    arguments["text"] = payload.into();
+                    arguments["delivery_mode"] = "background".into();
+                } else {
+                    arguments["value"] = payload.into();
+                }
+                let started = std::time::Instant::now();
+                let response =
+                    driver.call(if typing { "type_text" } else { "set_value" }, arguments);
+                let call_ms = started.elapsed().as_millis();
+                let after = observe();
+                eprintln!(
+                    "value notification {}",
+                    serde_json::json!({
+                        "prepare":prepare,"typing":typing,"require_notification":require_notification,
+                        "before":before,"prepared":prepared,"after":after,"call_ms":call_ms,"response":response.raw
+                    })
+                );
+                assert!(!response.is_error(), "{}", response.raw);
+                assert_eq!(after["field"], payload);
+                assert_eq!(
+                    after["commit"], "committed=none",
+                    "do not submit the field to obtain a notification"
+                );
+                assert_eq!(after["counter"], "counter=0");
+                if typing || require_notification {
+                    assert_eq!(
+                        after["mirror"], payload,
+                        "the app must observe the text change without committing"
+                    );
+                }
+            }
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_value_notification_unprepared() {
+    run_value_notification_probe(false, false, false, false);
+}
+#[test]
+#[ignore]
+fn harness_appkit_value_notification_prepared() {
+    run_value_notification_probe(true, false, false, false);
+}
+#[test]
+#[ignore]
+fn harness_appkit_value_notification_typing() {
+    run_value_notification_probe(false, true, false, false);
+}
+#[test]
+#[ignore]
+fn harness_appkit_set_value_notifies_without_commit() {
+    run_value_notification_probe(false, false, true, false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_set_value_sibling_notifies_without_commit() {
+    run_value_notification_probe(false, false, true, true);
+}
+
+// Operator probe: isolate exact-element AX preparation from the product's
+// conservative keyboard eligibility check. It must keep all background oracles
+// while notifying the target's delegate with a competing same-PID window.
+#[test]
+#[ignore]
+fn harness_appkit_value_notification_sibling_prepared() {
+    run_value_notification_probe(true, false, true, true);
+}
+
+// Exercise two real AppKit field editors, including a preexisting sibling
+// draft. The app-owned labels expose both change and end-editing callbacks.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_two_editable_windows() {
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use platform_macos::ax::bindings::{copy_children, copy_string_attr, AXUIElementRef};
+    run_background_case_with_env(
+        "set_value_two_editable_windows",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[("CUA_HARNESS_BRING_TO_FRONT_MODE", "editable")],
+        |pid, wid, driver| {
+            let listing = driver.call("list_windows", serde_json::json!({"pid":pid}));
+            let siblings: Vec<_> = listing.structured()["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|w| w["pid"] == pid && w["title"] == "CuaTestHarness AppKit Secondary")
+                .filter_map(|w| w["window_id"].as_u64())
+                .collect();
+            assert_eq!(siblings.len(), 1);
+            let sibling_wid = siblings[0];
+            assert_ne!(wid, sibling_wid);
+            // Keep both independent AX trees alive for their retained pointers.
+            let main_tree = slice_a_tree(pid, wid);
+            let sibling_tree = slice_a_tree(pid, sibling_wid);
+            assert!(!main_tree.truncated && !sibling_tree.truncated);
+            let main_ptr = main_tree
+                .nodes
+                .iter()
+                .find(|n| n.role == "AXWindow")
+                .unwrap()
+                .element_ptr;
+            let sibling_ptr = sibling_tree
+                .nodes
+                .iter()
+                .find(|n| n.role == "AXWindow")
+                .unwrap()
+                .element_ptr;
+            let read = |ptr: usize, ids: &[&str]| {
+                let children: Vec<CFType> = unsafe {
+                    copy_children(ptr as AXUIElementRef)
+                        .into_iter()
+                        .map(|p| CFType::wrap_under_create_rule(p as CFTypeRef))
+                        .collect()
+                };
+                ids.iter()
+                    .map(|id| {
+                        let matches: Vec<_> = children
+                            .iter()
+                            .filter(|c| unsafe {
+                                copy_string_attr(c.as_CFTypeRef() as AXUIElementRef, "AXIdentifier")
+                                    .as_deref()
+                                    == Some(*id)
+                            })
+                            .collect();
+                        assert_eq!(matches.len(), 1, "unique fixture value {id}");
+                        unsafe {
+                            copy_string_attr(matches[0].as_CFTypeRef() as AXUIElementRef, "AXValue")
+                        }
+                        .expect("readable fixture value")
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let observe = || {
+                serde_json::json!({
+                    "main":read(main_ptr, &["txt-input", "lbl-input-mirror", "lbl-input-commit", "lbl-counter"]),
+                    "sibling":read(sibling_ptr, &["txt-sibling-input", "lbl-sibling-mirror", "lbl-sibling-commit"])
+                })
+            };
+            let initial = observe();
+            assert_eq!(
+                initial["main"],
+                serde_json::json!(["", "", "committed=none", "counter=0"])
+            );
+            assert_eq!(
+                initial["sibling"],
+                serde_json::json!(["", "", "committed=none"])
+            );
+            let mut main_value = "";
+            let mut sibling_value = "";
+            for (target_wid, id, value) in [
+                (sibling_wid, "txt-sibling-input", "Sibling draft"),
+                (wid, "txt-input", "Main draft"),
+                (sibling_wid, "txt-sibling-input", "Sibling revised"),
+                (wid, "txt-input", "Main revised"),
+            ] {
+                let before = observe();
+                let snapshot = snapshot_elements(driver, pid, target_wid);
+                let response = driver.call(
+                    "set_value",
+                    serde_json::json!({
+                        "pid":pid, "window_id":target_wid,
+                        "element_token":element_token_by_id(&snapshot, id), "value":value
+                    }),
+                );
+                let after = observe();
+                eprintln!(
+                    "two editable windows {}",
+                    serde_json::json!({
+                        "target_window":target_wid,"value":value,"before":before,"after":after,"response":response.raw
+                    })
+                );
+                assert!(!response.is_error(), "{}", response.raw);
+                if target_wid == wid {
+                    main_value = value;
+                } else {
+                    sibling_value = value;
+                }
+                assert_eq!(
+                    after["main"],
+                    serde_json::json!([main_value, main_value, "committed=none", "counter=0"])
+                );
+                assert_eq!(
+                    after["sibling"],
+                    serde_json::json!([sibling_value, sibling_value, "committed=none"])
+                );
+            }
+            // Positive control: the commit oracle must change when the fixture
+            // deliberately ends sibling editing, while the main edit survives.
+            let snapshot = snapshot_elements(driver, pid, sibling_wid);
+            let response = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid":pid, "window_id":sibling_wid,
+                    "element_token":element_token_by_id(&snapshot, "btn-sibling-end-edit"),
+                    "delivery_mode":"background"
+                }),
+            );
+            let after = observe();
+            eprintln!(
+                "two editable commit control {}",
+                serde_json::json!({"after":after,"response":response.raw})
+            );
+            assert!(!response.is_error(), "{}", response.raw);
+            assert_eq!(
+                after["main"],
+                serde_json::json!([main_value, main_value, "committed=none", "counter=0"])
+            );
+            assert_eq!(
+                after["sibling"],
+                serde_json::json!([
+                    sibling_value,
+                    sibling_value,
+                    format!("committed={sibling_value}")
+                ])
+            );
+        },
+    );
+}
+
+// Isolate the existing native focus helper from input and verification timing.
+fn run_typing_preparation_probe(prepare: bool) {
+    use core_foundation::{base::TCFType, string::CFString};
+    use platform_macos::ax::bindings::*;
+    let label = if prepare { "focused" } else { "unprepared" };
+    run_background_case_with_env(
+        &format!("typing_preparation_{label}"),
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[],
+        |pid, wid, driver| {
+            // Reuse the independent native tree's retain owner. The preparation
+            // is a fixture diagnostic, not a second driver or input retry.
+            let native = slice_a_tree(pid, wid);
+            assert!(!native.truncated);
+            let field = native
+                .nodes
+                .iter()
+                .find(|node| node.identifier.as_deref() == Some("txt-input"))
+                .expect("native fixture text field");
+            assert_eq!(field.role, "AXTextField");
+            assert!(field.element_index.is_some());
+            let ptr = field.element_ptr;
+            let evidence = || {
+                let mut writable = 0;
+                let name = CFString::new("AXSelectedText");
+                let error = unsafe {
+                    AXUIElementIsAttributeSettable(
+                        ptr as AXUIElementRef,
+                        name.as_concrete_TypeRef(),
+                        &mut writable,
+                    )
+                };
+                serde_json::json!({
+                    "focused": platform_macos::input::ax_actions::is_element_focused(pid as i32, ptr),
+                    "value": unsafe { copy_string_attr(ptr as AXUIElementRef, "AXValue") },
+                    "selected_text_settable_error": error,
+                    "selected_text_settable": if error == kAXErrorSuccess { Some(writable != 0) } else { None },
+                })
+            };
+            let before = evidence();
+            assert_eq!(before["focused"], false, "fresh field starts unfocused");
+            assert_eq!(before["value"], "");
+            let preparation_started = std::time::Instant::now();
+            if prepare {
+                platform_macos::input::ax_actions::focus_element(ptr).unwrap();
+            }
+            let prepared = evidence();
+            let preparation_ms = preparation_started.elapsed().as_millis();
+            assert_eq!(prepared["focused"], prepare, "check actual focus identity");
+            assert_eq!(prepared["value"], "", "preparation cannot insert text");
+            let snapshot = snapshot_elements(driver, pid, wid);
+            let started = std::time::Instant::now();
+            let response = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid":pid,"window_id":wid,
+                    "element_token":element_token_by_id(&snapshot,"txt-input"),
+                    "text":"focus-cua","delivery_mode":"background"
+                }),
+            );
+            let call_ms = started.elapsed().as_millis();
+            let after = slice_a_tree(pid, wid);
+            let value = after
+                .nodes
+                .iter()
+                .find(|node| node.identifier.as_deref() == Some("txt-input"))
+                .and_then(|node| node.value.as_deref())
+                .expect("fresh native field value");
+            eprintln!(
+                "typing preparation {}",
+                serde_json::json!({
+                    "prepare":prepare,"before":before,"prepared":prepared,
+                    "preparation_ms":preparation_ms,"call_ms":call_ms,
+                    "response":response.raw,"native_after":value,
+                })
+            );
+            assert!(!response.is_error(), "{}", response.raw);
+            assert_eq!(value, "focus-cua", "exact native field contents");
+            assert_eq!(response.structured()["effect"], "confirmed");
+            assert_eq!(response.structured()["delivery"]["delivered_count"], 9);
+            assert_eq!(
+                response.structured()["route"],
+                "accessibility",
+                "addressed native typing should prepare the field before its AX write"
+            );
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_typing_preparation_unprepared() {
+    run_typing_preparation_probe(false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_typing_preparation_focused() {
+    run_typing_preparation_probe(true);
+}
+
 /// A field whose `AXValue` catches up with the write over the next second is
 /// not a partially typed field. The AX rung used to read the value back once,
 /// microseconds after the write returned, and published the prefix it caught
-/// as `type_text_incomplete` — measured in Contacts as "delivered 6 of 14"
+/// as `type_text_incomplete`: measured in Contacts as "delivered 6 of 14"
 /// for a phone number the card in fact held in full.
 #[test]
 #[ignore]

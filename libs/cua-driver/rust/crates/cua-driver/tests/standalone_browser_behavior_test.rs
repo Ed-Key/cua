@@ -1344,6 +1344,7 @@ fn spawn_browser_command(
     position: (i32, i32),
     force_high_device_scale: bool,
     disable_quiet_notification_prompts: bool,
+    force_renderer_accessibility: bool,
 ) {
     let mut command = command_for_browser(
         spec,
@@ -1361,6 +1362,10 @@ fn spawn_browser_command(
     }
     if force_high_device_scale {
         command.arg("--force-device-scale-factor=2");
+    }
+    if force_renderer_accessibility {
+        // This row isolates input recovery from Chromium AX cold-start readiness.
+        command.arg("--force-renderer-accessibility");
     }
     let child = spawn_in_job(&mut command).expect("launch standalone browser");
     eprintln!(
@@ -1402,6 +1407,7 @@ fn launch_browser_with_driver(
         TEST_BROWSER_INITIAL_POSITION,
         label.contains("multi-tab"),
         label.contains("browser-owned-permission"),
+        label.contains("pixel-ax-focus-recovery"),
     );
     navigate_initial_page(cdp_port, &server);
     record_browser_provenance(spec, cdp_port);
@@ -2005,6 +2011,159 @@ fn run_background_type(spec: &BrowserSpec) {
             wait_for_value(&fixture.server, "txt-input", "standalone-browser");
             Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
         })
+    });
+}
+
+/// A recovery regression, not a zero-activation background certification.
+/// New-tab navigation may activate Chromium even when the click is app-scoped.
+#[cfg(target_os = "macos")]
+fn run_pixel_ax_focus_recovery(spec: &BrowserSpec) {
+    use cua_driver_testkit::observer::{DesktopObserver, NativeObserver};
+
+    let scenario = format!("macos-{}-pixel-ax-focus-recovery", spec.name);
+    let case = CaseSpec::delivered(
+        scenario.clone(),
+        spec.name.clone(),
+        "standalone-chromium-native-content",
+        "pixel_ax_focus_recovery",
+        Targeting::Px,
+        Delivery::Background,
+        Scope::Window,
+        DriverRoute::MacosAxAction,
+        // Focus means uninterrupted focus in the canonical observer. Do not
+        // award that oracle for a weaker post-action restoration assertion.
+        vec![OracleKind::FixtureState, OracleKind::Protocol],
+    );
+    execute_case(case, |evidence| {
+        let html = standalone_fixture_html().replace(
+            "</style>",
+            "#standalone-new-tab { position:fixed;left:40px;top:120px;z-index:9999;padding:20px;background:white;color:black; } </style>",
+        );
+        let mut fixture = launch_browser_with_html(spec, &scenario, html);
+        *evidence = recording_evidence(fixture.driver.recording_dir());
+        let raised = fixture.driver.call(
+            "bring_to_front",
+            serde_json::json!({"pid":fixture.pid,"window_id":fixture.window_id}),
+        );
+        assert!(!raised.is_error(), "fixture setup: {}", raised.raw);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        loop {
+            let snapshot = fixture.driver.call(
+                "get_window_state",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id,
+                    "query":"AXWindow","query_context":true,"include_screenshot":false,
+                    "max_elements":1000,
+                }),
+            );
+            assert!(
+                !snapshot.is_error(),
+                "link observation: {}",
+                snapshot.structured()
+            );
+            let links = snapshot.structured()["elements"]
+                .as_array()
+                .expect("elements")
+                .iter()
+                .filter(|e| e["role"] == "AXLink" && e["label"] == "Open standalone tab")
+                .cloned()
+                .collect::<Vec<_>>();
+            if links.len() == 1 {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "expected one native link: {}",
+                snapshot.structured()
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        // Tree-only readiness omits capture dimensions. Resolve coordinates
+        // from one fresh screenshot-backed state after the page is ready.
+        let snapshot = fixture.driver.call(
+            "get_window_state",
+            serde_json::json!({"pid":fixture.pid,"window_id":fixture.window_id,
+                "query":"AXWindow","query_context":true,"include_screenshot":true,
+                "max_elements":1000}),
+        );
+        assert!(!snapshot.is_error(), "capture: {}", snapshot.text());
+        let state = snapshot.structured();
+        let links = state["elements"]
+            .as_array()
+            .expect("captured elements")
+            .iter()
+            .filter(|e| e["role"] == "AXLink" && e["label"] == "Open standalone tab")
+            .collect::<Vec<_>>();
+        assert_eq!(links.len(), 1, "expected one captured link");
+        let link = links[0];
+        let bounds = &state["window_bounds"];
+        let frame = &link["frame"];
+        let scale = state["screenshot_scale"]
+            .as_f64()
+            .expect("screenshot scale");
+        let x = (frame["x"].as_f64().unwrap() + frame["w"].as_f64().unwrap() / 2.0
+            - bounds["x"].as_f64().unwrap())
+            * scale;
+        let y = (frame["y"].as_f64().unwrap() + frame["h"].as_f64().unwrap() / 2.0
+            - bounds["y"].as_f64().unwrap())
+            * scale;
+        assert!(x >= 0.0 && x < state["screenshot_width"].as_f64().unwrap());
+        assert!(y >= 0.0 && y < state["screenshot_height"].as_f64().unwrap());
+
+        let sentinel = ForegroundSentinel::launch(&mut fixture.driver);
+        let target = TargetWindow {
+            pid: fixture.pid,
+            native_id: fixture.window_id,
+        };
+        sentinel
+            .prepare_background_observation(&mut fixture.driver, target)
+            .expect("establish background posture");
+        fixture.driver.start_behavior_recording();
+        sentinel
+            .prepare_background_observation(&mut fixture.driver, target)
+            .expect("restore background posture after recording setup");
+        let observer = DesktopObserver::new(NativeObserver::new(), target);
+        let before = observer.snapshot().expect("foreground before click");
+        assert_eq!(before.foreground, Some(u64::from(sentinel.target().pid)));
+        let clicked = fixture.driver.call(
+            "click",
+            serde_json::json!({"pid":fixture.pid,"window_id":fixture.window_id,
+                "x":x,"y":y,"delivery_mode":"background"}),
+        );
+        let after = observer.snapshot().expect("foreground at click completion");
+        assert!(!clicked.is_error(), "click: {}", clicked.raw);
+        assert_eq!(
+            clicked.action_route(),
+            Some("accessibility"),
+            "{}",
+            clicked.raw
+        );
+        wait_for_text(&fixture.server, "standalone-tab-state", "new_tab=open");
+        let destination = format!("{}?tab=second", fixture.server.page_url());
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let pages =
+                browser_http_json(fixture.cdp_port, "/json/list").expect("destination targets");
+            if pages
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|page| page["url"] == destination)
+            {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "new destination tab missing: {pages}"
+            );
+            thread::sleep(Duration::from_millis(50));
+        }
+        assert_eq!(after.foreground, before.foreground,
+            "coordinate AX click must restore the original app before returning; before={before:?}, after={after:?}");
+        Observation::delivered(
+            vec![OracleKind::FixtureState, OracleKind::Protocol],
+            Evidence::default(),
+        )
     });
 }
 
@@ -4959,6 +5118,11 @@ standalone_browser_test!(
     standalone_browser_native_named_groups,
     run_native_named_groups
 );
+#[cfg(target_os = "macos")]
+standalone_browser_test!(
+    standalone_browser_pixel_ax_focus_recovery,
+    run_pixel_ax_focus_recovery
+);
 standalone_browser_test!(standalone_browser_roundtrip, run_roundtrip);
 standalone_browser_test!(
     standalone_browser_trust_gated_dom_click,
@@ -5219,3 +5383,102 @@ standalone_browser_test!(
 #[cfg(target_os = "macos")]
 #[path = "support/macos_electron_scroll.rs"]
 mod macos_electron_scroll;
+
+/// A ready renderer must be represented in the first native observation.
+/// No launch flag, AX polling helper or semantic-browser snapshot may prime it.
+#[cfg(target_os = "macos")]
+#[test]
+#[ignore = "requires an installed Chrome and an authorized macOS daemon"]
+fn standalone_browser_first_native_snapshot_contains_page() {
+    run_browser_scenario(|spec| {
+        let scenario = format!("macos-{}-first-native-page", spec.name);
+        let case = CaseSpec::delivered(
+            scenario.clone(),
+            spec.name.clone(),
+            "standalone-chromium-native-content",
+            "first_native_snapshot_and_click",
+            Targeting::Ax,
+            Delivery::Background,
+            Scope::Window,
+            DriverRoute::MacosAxAction,
+            vec![OracleKind::FixtureState, OracleKind::Protocol],
+        );
+        execute_case(case, |evidence| {
+            let mut driver = spawn_driver(&scenario);
+            *evidence = recording_evidence(driver.recording_dir());
+            // Record before launching Chrome: capture setup must not give a cold
+            // renderer extra time between enablement and the first observation.
+            driver.start_behavior_recording();
+            let mut fixture =
+                launch_browser_with_driver(spec, &scenario, standalone_fixture_html(), driver);
+            assert!(fixture.server.contains("WEB_HARNESS_MARKER_v1"));
+            let raised = fixture.driver.call(
+                "bring_to_front",
+                serde_json::json!({"pid":fixture.pid,"window_id":fixture.window_id}),
+            );
+            assert!(!raised.is_error());
+            let started = Instant::now();
+            let snapshot = fixture.driver.call(
+                "get_window_state",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id,"query":"AXWindow",
+                    "query_context":true,"include_screenshot":false,"max_elements":1000
+                }),
+            );
+            assert!(!snapshot.is_error());
+            let state = snapshot.structured();
+            let links = state["elements"]
+                .as_array()
+                .expect("elements")
+                .iter()
+                .filter(|e| e["role"] == "AXLink" && e["label"] == "Open standalone tab")
+                .collect::<Vec<_>>();
+            eprintln!(
+                "first_native_page elapsed_ms={} requested_links={} total={} returned={}",
+                started.elapsed().as_millis(),
+                links.len(),
+                state["total_element_count"],
+                state["returned_element_count"]
+            );
+            assert_eq!(
+                links.len(),
+                1,
+                "the first native snapshot must include the ready page link"
+            );
+            let clicked = fixture.driver.call(
+                "click",
+                serde_json::json!({
+                    "pid":fixture.pid,"window_id":fixture.window_id,
+                    "element_token":links[0]["element_token"],"delivery_mode":"background"
+                }),
+            );
+            assert!(!clicked.is_error(), "{}", clicked.raw);
+            assert_eq!(clicked.action_route(), Some("accessibility"));
+            wait_for_text(&fixture.server, "standalone-tab-state", "new_tab=open");
+            let destination = format!("{}?tab=second", fixture.server.page_url());
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let pages =
+                    browser_http_json(fixture.cdp_port, "/json/list").expect("destination targets");
+                if pages
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .any(|page| page["url"] == destination)
+                {
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "new destination tab missing: {pages}"
+                );
+                thread::sleep(Duration::from_millis(50));
+            }
+            // This row proves readiness and delivery, not uninterrupted focus.
+            Observation::delivered(
+                vec![OracleKind::FixtureState, OracleKind::Protocol],
+                Evidence::default(),
+            )
+        });
+    });
+}

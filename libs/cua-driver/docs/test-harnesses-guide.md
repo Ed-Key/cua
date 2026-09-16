@@ -86,6 +86,31 @@ standalone Chrome/Edge matrix: the macOS wrapper accepts
 `--standalone-browser`, while the Windows and Linux workflow is
 `.github/workflows/e2e-rust-standalone-browsers.yml`.
 
+The macOS `standalone_browser_pixel_ax_focus_recovery` row is a focused
+recovery regression. It uses the existing standalone browser fixture and
+foreground sentinel, verifies coordinate-addressed AX delivery and a new
+destination tab, then checks the foreground app at click completion. It does
+not award the uninterrupted `Focus` oracle: brief activation remains a separate
+failure in strict background tests. This row enables renderer accessibility
+for its own browser launch to isolate recovery from AX cold-start readiness.
+Run it through the authorized guest Terminal environment, selecting only:
+
+```sh
+cargo test -p cua-driver --test standalone_browser_behavior_test \
+  standalone_browser_pixel_ax_focus_recovery -- --exact --ignored --nocapture --test-threads=1
+```
+
+The macOS `standalone_browser_first_native_snapshot_contains_page` row checks
+cold native accessibility without a forced renderer-accessibility launch flag.
+After the fixture's own load marker and foreground setup, it performs one
+native read, then clicks the link token from that read and verifies the destination tab.
+Recording begins before browser launch so capture setup cannot warm the renderer.
+It awards fixture and protocol evidence, not uninterrupted foreground isolation.
+Select it with the same authorized guest environment and `--exact --ignored
+--nocapture --test-threads=1`. Chrome is the verified product for this row;
+other Chromium products need their own live coverage. This readiness correction
+is macOS-specific. Windows and Linux adapters are unchanged.
+
 Historical `*-plan.md`, `*-journal.md`, and release evidence documents record
 what was run at that time. They are not current execution instructions and do
 not override this guide or `scripts/ci/README.md`.
@@ -320,6 +345,54 @@ desktop observer is attached to shared and native action rows wherever
 background delivery is tested.
 
 ### macOS
+
+#### Focused Chromium and Electron text insertion
+
+On macOS, `type_text` uses the existing keyboard route for web content in
+recognized Chromium and Electron apps. It does not first write `AXSelectedText`,
+whose acknowledgment can leave the renderer unchanged. Native controls and other
+web engines retain their accessibility insertion route. The exact-window
+keyboard gate, synthesis budget, and unverified web-readback result still apply.
+This is a macOS adapter correction; Windows and Linux routing is unchanged.
+
+Inside an authorized macOS test session, run only the addressed insertion rows:
+
+```sh
+cargo test -p cua-driver --test electron_first_snapshot_macos_test background_addressed_typing -- --ignored --nocapture --test-threads=1
+```
+
+The three rows check a fresh editor, append, and partial-selection replacement
+against the fixture-owned renderer journal, while the foreground sentinel checks
+focus, z-order, cursor position, and input isolation. A setup failure is not a
+text-delivery result. These diagnostic rows do not replace the full candidate
+matrix or imply that a behavior recording was produced.
+
+#### Focused background web keyboard navigation
+
+On macOS, exact-window background `press_key` and `hotkey` calls use the
+existing checked background keyboard focus preparation for web content. This
+preparation preserves the editor selection and rechecks exact-window admission
+before posting keys. Native controls, PID-only requests, and foreground delivery
+keep their existing routes. Web key results remain unverified; delivery alone
+does not prove that an application performed the requested command. Windows
+and Linux adapters are unchanged and are not qualified by these macOS tests.
+
+Inside an authorized macOS test session, run:
+
+```sh
+cargo test -p cua-driver --test electron_first_snapshot_macos_test background_web_ -- --ignored --nocapture --test-threads=1
+cargo test -p cua-driver --test harness_appkit_test harness_appkit_focused_text_selection_and_caret -- --exact --ignored --nocapture --test-threads=1
+```
+
+The Electron cases use a fixture-owned renderer journal to check addressed
+Command+Right, pixel-targeted Command+Right, and addressed Command+A. The pixel
+target is near the start of the editor so its focus click cannot impersonate
+movement to the end. They assert unchanged text and an untouched second editor,
+with the existing focus, z-order, cursor, and input-isolation sentinel. The
+filter also runs the existing web-selection observation control. The AppKit
+control checks native caret and selection behavior, including UTF-16 ranges.
+These are focused diagnostics, not full candidate certification.
+
 
 Runner: `libs/cua-driver/tests/runners/macos-lume/run-all.sh`
 

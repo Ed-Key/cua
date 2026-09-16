@@ -104,6 +104,7 @@ final class LaggingTextField: NSTextField {
 // MARK: - Controller
 
 final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
+    private var editorIdentity: EditorIdentityFixture?
     let window: NSWindow
     let counterLabel = NSTextField(labelWithString: "counter=0")
     var counterValue = 0
@@ -214,6 +215,11 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             textInput.widthAnchor.constraint(equalToConstant: 240),
         ])
         content.addArrangedSubview(inputRow)
+
+        if let fixture = EditorIdentityFixture(environment: ProcessInfo.processInfo.environment) {
+            editorIdentity = fixture
+            content.addArrangedSubview(fixture.row)
+        }
 
         // click_target — a REAL NSButton so it is in the AX tree and addressable
         // by element_index (AppKit NSButton ignores synthetic pixel clicks, but
@@ -556,21 +562,52 @@ final class ClickTargetButton: NSButton {
 }
 
 // Opt-in windows for the persistent exact-window activation certification.
-// Ordinary harness launches remain byte-for-byte and behaviorally unchanged.
-final class BringToFrontMatrixWindows {
+// Ordinary harness launches keep the existing window layout and behavior.
+final class BringToFrontMatrixWindows: NSObject, NSTextFieldDelegate {
     let secondary: NSWindow
     var sheet: NSWindow?
     var floating: NSPanel?
+    private var editField: NSTextField?
+    private let editMirror = NSTextField(labelWithString: "")
+    private let editCommit = NSTextField(labelWithString: "committed=none")
 
     init(parent: NSWindow, mode: String) {
         secondary = NSWindow(
             contentRect: NSRect(x: 40, y: 40, width: 420, height: 240),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        super.init()
         secondary.title = kSecondaryWindowTitle
         secondary.isReleasedWhenClosed = false
         secondary.isRestorable = false
         secondary.contentView = NSTextField(labelWithString: "bring_to_front secondary ordinary window")
+        if mode == "editable" {
+            let content = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 240))
+            let field = NSTextField(string: "")
+            field.frame = NSRect(x: 20, y: 180, width: 380, height: 24)
+            field.setAccessibilityIdentifier("txt-sibling-input")
+            field.delegate = self
+            editField = field
+            editMirror.frame = NSRect(x: 20, y: 140, width: 380, height: 24)
+            editMirror.setAccessibilityIdentifier("lbl-sibling-mirror")
+            editCommit.frame = NSRect(x: 20, y: 100, width: 380, height: 24)
+            editCommit.setAccessibilityIdentifier("lbl-sibling-commit")
+            let endEdit = NSButton(title: "End sibling edit", target: self,
+                                   action: #selector(endSiblingEdit))
+            endEdit.frame = NSRect(x: 20, y: 40, width: 180, height: 32)
+            endEdit.setAccessibilityIdentifier("btn-sibling-end-edit")
+            for view in [field, editMirror, editCommit, endEdit] { content.addSubview(view) }
+            secondary.contentView = content
+        }
         secondary.orderFront(nil)
+        if mode == "editable",
+           let draft = ProcessInfo.processInfo.environment["CUA_HARNESS_SIBLING_DRAFT"],
+           let field = editField {
+            // Seed a real, uncommitted edit before agent observation begins.
+            // Let AppKit deliver its normal delegate callback to the mirror.
+            field.selectText(nil)
+            guard let editor = field.currentEditor() else { fatalError("missing sibling field editor") }
+            editor.insertText(draft)
+        }
 
         if mode == "sheet" {
             let candidate = NSWindow(
@@ -592,6 +629,21 @@ final class BringToFrontMatrixWindows {
             floating = candidate
         }
     }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField, field === editField else { return }
+        editMirror.stringValue = field.stringValue
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField, field === editField else { return }
+        editCommit.stringValue = "committed=\(field.stringValue)"
+    }
+
+    @objc private func endSiblingEdit() {
+        secondary.makeFirstResponder(nil)
+    }
+
 }
 
 func writeBringToFrontWindowReport(

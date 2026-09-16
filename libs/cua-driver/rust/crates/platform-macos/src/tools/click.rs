@@ -955,77 +955,95 @@ impl Tool for ClickTool {
                     let keyboard_focus = self.keyboard_focus;
                     let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
                     let receipt = delivery_receipt.clone();
-                    let ax_result = tokio::task::spawn_blocking(move || unsafe {
-                        receipt.ensure_current()?;
-                        let Some(element) = element_at_screen_position(pid, screen_x, screen_y)
-                        else {
-                            return Ok::<Option<bool>, anyhow::Error>(Some(false));
-                        };
-                        // The pid-scoped hit-test can resolve an element from a
-                        // same-process sibling overlapping the requested point.
-                        // Require proven ancestry in the requested window before
-                        // acting; otherwise fall through to the routed pixel path
-                        // (already gated for this exact window).
-                        if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid)
-                        {
-                            CFRelease(element as _);
-                            return Ok(Some(false));
-                        }
-                        if let Err(error) = receipt.ensure_current() {
-                            CFRelease(element as _);
-                            return Err(error);
-                        }
-                        // AXFocused can be accepted by a never-activated web
-                        // editor without establishing renderer keyboard focus.
-                        // The exact-window hit target has already been validated.
-                        // Keep existing selections when it is already focused;
-                        // otherwise request the normal guarded pointer worker.
-                        if keyboard_focus && focus_only {
-                            let role = crate::ax::bindings::copy_string_attr(element, "AXRole")
-                                .unwrap_or_default();
-                            if needs_web_editor_pointer_focus(
-                                &role,
-                                super::type_text::target_in_web_area(
-                                    pid,
-                                    Some((element as usize, None)),
-                                    Some(hit_test_wid),
-                                ),
-                                // Accessory Electron windows can omit the app's
-                                // AXFocusedUIElement while the editor itself
-                                // accurately reports AXFocused. The hit target's
-                                // exact-window ownership was already checked.
-                                crate::ax::bindings::copy_bool_attr(element, "AXFocused")
-                                    == Some(true)
-                                    || crate::input::ax_actions::is_element_focused(
-                                        pid,
-                                        element as usize,
-                                    ),
-                            ) {
-                                CFRelease(element as _);
-                                return Ok(None);
-                            }
-                        }
-                        let delivered = if focus_only {
-                            match dispatch_pixel_ax_focus(&receipt, || {
-                                crate::ax::bindings::set_bool_attr_true(element, "AXFocused")
-                            }) {
-                                Ok(accepted) => accepted,
-                                Err(error) => {
+                    // Coordinate targeting can deliver AXPress too. Inherit the
+                    // action's focus baseline just like token-addressed AX input;
+                    // the outer guard permits activation of this target process.
+                    let prior_front = overlay::on_appkit_main(apps::frontmost_pid);
+                    let ax_result = focus_guard::with_focus_suppressed(
+                        Some(pid),
+                        prior_front,
+                        "click.pixel_ax",
+                        || async move {
+                            tokio::task::spawn_blocking(move || unsafe {
+                                receipt.ensure_current()?;
+                                let Some(element) =
+                                    element_at_screen_position(pid, screen_x, screen_y)
+                                else {
+                                    return Ok::<Option<bool>, anyhow::Error>(Some(false));
+                                };
+                                // The pid-scoped hit-test can resolve an element from a
+                                // same-process sibling overlapping the requested point.
+                                // Require proven ancestry in the requested window before
+                                // acting; otherwise fall through to the routed pixel path
+                                // (already gated for this exact window).
+                                if crate::ax::exact_target::element_window_id(element)
+                                    != Some(hit_test_wid)
+                                {
+                                    CFRelease(element as _);
+                                    return Ok(Some(false));
+                                }
+                                if let Err(error) = receipt.ensure_current() {
                                     CFRelease(element as _);
                                     return Err(error);
                                 }
-                            }
-                        } else {
-                            let press = core_foundation::string::CFString::new("AXPress");
-                            AXUIElementPerformAction(element, press.as_concrete_TypeRef())
-                                == kAXErrorSuccess
-                        };
-                        if delivered {
-                            receipt.accepted();
-                        }
-                        CFRelease(element as _);
-                        Ok(Some(delivered))
-                    })
+                                // AXFocused can be accepted by a never-activated web
+                                // editor without establishing renderer keyboard focus.
+                                // The exact-window hit target has already been validated.
+                                // Keep existing selections when it is already focused;
+                                // otherwise request the normal guarded pointer worker.
+                                if keyboard_focus && focus_only {
+                                    let role =
+                                        crate::ax::bindings::copy_string_attr(element, "AXRole")
+                                            .unwrap_or_default();
+                                    if needs_web_editor_pointer_focus(
+                                        &role,
+                                        super::type_text::target_in_web_area(
+                                            pid,
+                                            Some((element as usize, None)),
+                                            Some(hit_test_wid),
+                                        ),
+                                        // Accessory Electron windows can omit the app's
+                                        // AXFocusedUIElement while the editor itself
+                                        // accurately reports AXFocused. The hit target's
+                                        // exact-window ownership was already checked.
+                                        crate::ax::bindings::copy_bool_attr(element, "AXFocused")
+                                            == Some(true)
+                                            || crate::input::ax_actions::is_element_focused(
+                                                pid,
+                                                element as usize,
+                                            ),
+                                    ) {
+                                        CFRelease(element as _);
+                                        return Ok(None);
+                                    }
+                                }
+                                let delivered = if focus_only {
+                                    match dispatch_pixel_ax_focus(&receipt, || {
+                                        crate::ax::bindings::set_bool_attr_true(
+                                            element,
+                                            "AXFocused",
+                                        )
+                                    }) {
+                                        Ok(accepted) => accepted,
+                                        Err(error) => {
+                                            CFRelease(element as _);
+                                            return Err(error);
+                                        }
+                                    }
+                                } else {
+                                    let press = core_foundation::string::CFString::new("AXPress");
+                                    AXUIElementPerformAction(element, press.as_concrete_TypeRef())
+                                        == kAXErrorSuccess
+                                };
+                                if delivered {
+                                    receipt.accepted();
+                                }
+                                CFRelease(element as _);
+                                Ok(Some(delivered))
+                            })
+                            .await
+                        },
+                    )
                     .await;
                     let ax_result = match ax_result {
                         Ok(Ok(None)) => return None,

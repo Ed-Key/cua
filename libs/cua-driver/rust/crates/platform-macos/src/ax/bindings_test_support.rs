@@ -102,6 +102,9 @@ fn with_fixture<T>(
 }
 
 pub(super) fn copy_string_attr(element: AXUIElementRef, attr: &str) -> Option<Option<String>> {
+    if let Some(value) = typing_focus_value(element, attr) {
+        return Some(value);
+    }
     if let Some(value) = with_editor(element, |fixture| match attr {
         "AXRole" => Some(fixture.role.clone()),
         "AXTitle" => Some("Editor".into()),
@@ -229,6 +232,9 @@ impl Drop for EditorScope {
     }
 }
 pub(crate) fn focused_editor(pid: i32, wid: u32) -> Option<Option<AXUIElementRef>> {
+    if let Some(value) = typing_focus_element(pid, Some(wid)) {
+        return Some(value);
+    }
     if pid != -9876 {
         return None;
     }
@@ -243,6 +249,127 @@ pub(crate) fn focused_editor(pid: i32, wid: u32) -> Option<Option<AXUIElementRef
                     as AXUIElementRef,
             )
         })
+    })
+}
+
+thread_local! {
+    static TYPING_FOCUS: RefCell<Option<TypingFocusFixture>> = const { RefCell::new(None) };
+}
+struct TypingFocusFixture {
+    elements: [usize; 2],
+    values: [Option<String>; 2],
+    ranges: [Option<cua_driver_contract::TextSelectionRange>; 2],
+    focused: Option<usize>,
+    window: u32,
+    switch_on_read: bool,
+}
+pub(crate) struct TypingFocusScope {
+    _elements: [core_foundation::string::CFString; 2],
+}
+impl TypingFocusScope {
+    pub fn install() -> Self {
+        use core_foundation::{base::TCFType, string::CFString};
+        let elements = [
+            CFString::new("Typing original editor"),
+            CFString::new("Typing other editor"),
+        ];
+        TYPING_FOCUS.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(TypingFocusFixture {
+                elements: elements
+                    .each_ref()
+                    .map(|value| value.as_concrete_TypeRef() as usize),
+                values: [Some(String::new()), Some("hello".into())],
+                ranges: [None, None],
+                focused: Some(0),
+                window: 42,
+                switch_on_read: false,
+            });
+        });
+        Self {
+            _elements: elements,
+        }
+    }
+    pub fn focus(&self, index: Option<usize>, window: u32) {
+        TYPING_FOCUS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            let fixture = slot.as_mut().unwrap();
+            fixture.focused = index;
+            fixture.window = window;
+        });
+    }
+    pub fn value(&self, index: usize, value: Option<&str>) {
+        TYPING_FOCUS.with(|slot| {
+            slot.borrow_mut().as_mut().unwrap().values[index] = value.map(str::to_owned)
+        });
+    }
+    pub fn switch_on_next_read(&self) {
+        TYPING_FOCUS.with(|slot| slot.borrow_mut().as_mut().unwrap().switch_on_read = true);
+    }
+    pub fn range(&self, index: usize, location: u64, length: u64) {
+        TYPING_FOCUS.with(|slot| {
+            slot.borrow_mut().as_mut().unwrap().ranges[index] =
+                Some(cua_driver_contract::TextSelectionRange { location, length });
+        });
+    }
+    pub fn element_ptr(&self, index: usize) -> usize {
+        TYPING_FOCUS.with(|slot| slot.borrow().as_ref().unwrap().elements[index])
+    }
+}
+impl Drop for TypingFocusScope {
+    fn drop(&mut self) {
+        TYPING_FOCUS.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+pub(crate) fn typing_focus_element(
+    pid: i32,
+    window: Option<u32>,
+) -> Option<Option<AXUIElementRef>> {
+    if pid != -9880 {
+        return None;
+    }
+    TYPING_FOCUS.with(|slot| {
+        let slot = slot.borrow();
+        let fixture = slot.as_ref().expect("typing scope required");
+        Some(
+            fixture
+                .focused
+                .filter(|_| window.is_none_or(|wid| wid == fixture.window))
+                .map(|index| unsafe {
+                    core_foundation::base::CFRetain(fixture.elements[index] as CFTypeRef)
+                        as AXUIElementRef
+                }),
+        )
+    })
+}
+fn typing_focus_value(element: AXUIElementRef, attr: &str) -> Option<Option<String>> {
+    TYPING_FOCUS.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let fixture = slot.as_mut()?;
+        let index = fixture
+            .elements
+            .iter()
+            .position(|&ptr| ptr == element as usize)?;
+        assert_eq!(attr, "AXValue");
+        let value = fixture.values[index].clone();
+        if fixture.switch_on_read {
+            fixture.focused = Some(1);
+            fixture.switch_on_read = false;
+        }
+        Some(value)
+    })
+}
+pub(crate) fn typing_focus_range(
+    element: AXUIElementRef,
+) -> Option<Option<cua_driver_contract::TextSelectionRange>> {
+    TYPING_FOCUS.with(|slot| {
+        let slot = slot.borrow();
+        let fixture = slot.as_ref()?;
+        let index = fixture
+            .elements
+            .iter()
+            .position(|&ptr| ptr == element as usize)?;
+        Some(fixture.ranges[index])
     })
 }
 fn with_editor<T>(element: AXUIElementRef, f: impl FnOnce(&mut EditorFixture) -> T) -> Option<T> {

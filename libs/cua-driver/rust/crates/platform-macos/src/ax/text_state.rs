@@ -41,6 +41,10 @@ unsafe fn decode_range(value: &CFType) -> Option<TextSelectionRange> {
 }
 
 pub(crate) unsafe fn read_range(element: AXUIElementRef) -> Option<TextSelectionRange> {
+    #[cfg(test)]
+    if let Some(range) = super::bindings::test_support::typing_focus_range(element) {
+        return range;
+    }
     let value = copy_attribute_checked(element, "AXSelectedTextRange").ok()?;
     decode_range(&value)
 }

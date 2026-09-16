@@ -34,6 +34,7 @@ pub const kAXErrorSuccess: AXError = 0;
 pub const kAXErrorFailure: AXError = -25200;
 pub const kAXErrorInvalidUIElement: AXError = -25202;
 pub const kAXErrorAttributeUnsupported: AXError = -25205;
+pub const kAXErrorNotImplemented: AXError = -25208;
 pub const kAXErrorNoValue: AXError = -25212;
 pub const kAXErrorAPIDisabled: AXError = -25211;
 
@@ -536,6 +537,10 @@ pub unsafe fn element_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
 ///
 /// The caller must release any returned element exactly once with `CFRelease`.
 pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
+    #[cfg(test)]
+    if let Some(result) = test_support::typing_focus_element(pid, None) {
+        return result;
+    }
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
         return None;
@@ -748,6 +753,8 @@ pub unsafe fn set_bool_attr_true(element: AXUIElementRef, attr_name: &str) -> AX
 pub enum AccessibilityOptIn {
     ManualAccessibility,
     EnhancedUserInterface,
+    /// The legacy setter may have scheduled work before its superclass errored.
+    EnhancedUserInterfaceUnconfirmed,
     NotAccepted,
 }
 
@@ -773,10 +780,10 @@ pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> Acce
         // fallback, and don't claim enablement happened.
         return AccessibilityOptIn::NotAccepted;
     }
-    if set_bool_attr_true(app_element, "AXEnhancedUserInterface") == kAXErrorSuccess {
-        AccessibilityOptIn::EnhancedUserInterface
-    } else {
-        AccessibilityOptIn::NotAccepted
+    match set_bool_attr_true(app_element, "AXEnhancedUserInterface") {
+        kAXErrorSuccess => AccessibilityOptIn::EnhancedUserInterface,
+        kAXErrorNotImplemented => AccessibilityOptIn::EnhancedUserInterfaceUnconfirmed,
+        _ => AccessibilityOptIn::NotAccepted,
     }
 }
 

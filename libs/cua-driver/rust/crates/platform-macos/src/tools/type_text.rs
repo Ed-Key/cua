@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use cua_driver_contract::TypeTextInput;
 use cua_driver_core::{
     protocol::ToolResult,
+    text_insertion::{classify_insertion, TextInsertionProgress as TypedProgress},
     tool::{Tool, ToolDef},
     tool_args::parse_typed_projection,
 };
@@ -36,7 +37,7 @@ use crate::ax::bindings::{
     copy_string_attr, focused_element_of_pid, kAXErrorSuccess, set_string_attr, AXUIElementRef,
 };
 use crate::focus_guard;
-use core_foundation::base::CFRelease;
+use core_foundation::base::{CFEqual, CFRelease, CFType, CFTypeRef, TCFType};
 use cua_driver_core::background_input::BackgroundRefusal;
 
 use super::ToolState;
@@ -95,12 +96,14 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "type_text".into(),
         description:
-            "Insert text into the target pid via `AXSetAttribute(kAXSelectedText)`. \
-             Works for standard Cocoa text fields and text views. No keystrokes are \
-             synthesized — special keys (Return / Escape / arrows) go through \
-             `press_key` / `hotkey`. For Chromium / Electron inputs that don't \
-             implement `kAXSelectedText`, the tool falls back to CGEvent \
-             character synthesis automatically when the estimated route stays \
+            "Insert text at the target editor's current caret or selection. \
+             Native Cocoa fields and other supported editors use AXSelectedText. \
+             Web editors in recognized Chromium / Electron apps use CGEvent \
+             character synthesis directly, preserving the existing value outside \
+             the selection. Native controls in those apps retain AX insertion. \
+             Special keys (Return / Escape / arrows) go through `press_key` / \
+             `hotkey`. Keyboard delivery requires an unambiguous destination \
+             and an estimated duration \
              within the daemon transport budget. Longer synthesized routes are \
              refused before character events and return a safe chunk size; \
              one-call AX insertion remains uncapped.\n\n\
@@ -392,13 +395,6 @@ impl Tool for TypeTextTool {
 
         let prior_front = apps::frontmost_pid();
 
-        // Terminal-emulator short-circuit: when the target pid belongs
-        // to a known terminal (Ghostty / Terminal.app / iTerm2 / …), the
-        // AX value-set is silently dropped — see crate::terminal docs.
-        // Skip the AX path entirely so the caller never sees the
-        // "success but nothing typed" symptom.
-        let is_terminal_target = crate::terminal::is_terminal_pid(pid);
-
         let blocking_policy = keyboard_policy.clone();
         // A started native worker outlives cancellation of its async caller.
         // Keep serialization through target-focus cleanup in that worker.
@@ -410,6 +406,7 @@ impl Tool for TypeTextTool {
             || async move {
                 tokio::task::spawn_blocking(move || {
                     let _worker_lease = worker_lease;
+                    let backend = TextInputBackend::for_pid(pid);
                     let target = element_ptr.and_then(|(ptr, _)| {
                         editor_visual_target(ptr as AXUIElementRef, window_id)
                     });
@@ -424,7 +421,7 @@ impl Tool for TypeTextTool {
                                 &text_clone,
                                 element_ptr,
                                 delay_ms,
-                                is_terminal_target,
+                                backend,
                                 delivery_mode,
                                 window_id,
                                 blocking_policy,
@@ -722,6 +719,32 @@ const DELIVERY_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::f
 /// observable, which would otherwise clobber the first write.
 const FOCUS_REAPPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(30);
 
+/// Select only known engine workarounds. AXWebArea alone also includes
+/// WebKit, whose semantic selected-text insertion must remain available.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextInputBackend {
+    Terminal,
+    Chromium,
+    Other,
+}
+
+impl TextInputBackend {
+    fn for_pid(pid: i32) -> Self {
+        if crate::terminal::is_terminal_pid(pid) {
+            return Self::Terminal;
+        }
+        let name = apps::get_app_name_for_pid(pid).unwrap_or_default();
+        let bundle = apps::bundle_id_for_pid(pid).unwrap_or_default();
+        if crate::browser::platform::is_chromium(&name, &bundle)
+            || crate::browser::ElectronJs::is_electron(pid)
+        {
+            Self::Chromium
+        } else {
+            Self::Other
+        }
+    }
+}
+
 /// Keyboard-rung policy for one window-addressed background insert, decided
 /// once by the pure exact-target core before any input is posted.
 #[derive(Clone, Debug)]
@@ -803,14 +826,6 @@ struct TypeTextOutcome {
     delivered_chars: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TypedProgress {
-    Complete,
-    Partial(usize),
-    Unchanged,
-    Unverifiable,
-}
-
 fn foreground_settle_ms(pid: i32, frontmost_pid: Option<i32>) -> u64 {
     if frontmost_pid == Some(pid) {
         20
@@ -819,90 +834,102 @@ fn foreground_settle_ms(pid: i32, frontmost_pid: Option<i32>) -> u64 {
     }
 }
 
-/// Read-back verification for a keystroke rung: did the typed text actually land?
-///
-/// `before`/`after` are `AXValue` read from the target field before and after
-/// the keystrokes. Returns whether we can *positively confirm* the text landed:
-/// - unreadable `after` (`None`) → unverifiable → `false` (Catalyst case; the
-///   agent must confirm via screenshot).
-/// - `after` contains the complete text → `true`.
-/// - empty input text → trivially `true`.
-///
-/// Apps that normalize input (smart quotes, autocomplete) may fail the
-/// substring/length test even though something landed — we report `false`
-/// (unverified) rather than erroring, so the agent can still confirm.
 #[cfg(test)]
 fn verify_typed(before: Option<&str>, after: Option<&str>, text: &str) -> bool {
     matches!(typed_progress(before, after, text), TypedProgress::Complete)
 }
 
-/// Classify an observable insertion without mistaking a prefix for complete
-/// delivery. A positive length delta is an exact delivered-character count for
-/// insert-at-cursor typing; it is capped at the request size defensively.
+#[cfg(test)]
 fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> TypedProgress {
-    if text.is_empty() {
-        return TypedProgress::Complete;
-    }
-    let Some(after) = after else {
-        return TypedProgress::Unverifiable;
-    };
-    if after.contains(text) {
-        return TypedProgress::Complete;
-    }
-    let Some(before) = before else {
-        return TypedProgress::Unverifiable;
-    };
-    let delivered = after
-        .chars()
-        .count()
-        .saturating_sub(before.chars().count())
-        .min(text.chars().count());
-    if delivered == 0 {
-        TypedProgress::Unchanged
-    } else {
-        TypedProgress::Partial(delivered)
+    classify_insertion(before, None, after, None, text)
+}
+
+/// Own the focused element only when it belongs to the requested window.
+/// Without a window, preserve the legacy process-scoped focus lookup.
+fn readback_focus(pid: i32, window_id: Option<u32>) -> Option<CFType> {
+    unsafe {
+        let element = match window_id {
+            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+            None => focused_element_of_pid(pid),
+        }?;
+        Some(CFType::wrap_under_create_rule(element as CFTypeRef))
     }
 }
 
-/// Read the focused/target field's `AXValue`, for before/after read-back.
-/// Re-fetches the focused element each call when no explicit element is given
-/// (cheap, and focus is stable across our own keystrokes).
-fn read_axvalue(pid: i32, element_ptr_and_idx: Option<(usize, Option<usize>)>) -> Option<String> {
-    if let Some((ptr, _)) = element_ptr_and_idx {
-        unsafe { copy_string_attr(ptr as AXUIElementRef, "AXValue") }
-    } else if let Some(el) = unsafe { focused_element_of_pid(pid) } {
-        let v = unsafe { copy_string_attr(el, "AXValue") };
-        unsafe {
-            CFRelease(el as _);
-        }
-        v
-    } else {
-        None
-    }
-}
-
-/// Window-bound variant of [`read_axvalue`]: when no explicit element is
-/// addressed and a `window_id` is known, the focused element is used ONLY when
-/// its ancestry provably resolves to that exact window. A sibling window's
-/// focused field must never supply before/after evidence for the requested
-/// target — an unprovable focus reads as `None` (unverifiable), never as
-/// sibling data. Without a window the legacy pid-global read applies.
-fn read_axvalue_bound(
+/// Per-invocation evidence used by the existing insertion classifier.
+/// Implicit typing must not compare values from two different focused fields.
+/// Retaining the original element also prevents its pointer from being recycled.
+struct TypingReadback {
     pid: i32,
-    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    element: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
-) -> Option<String> {
-    if element_ptr_and_idx.is_some() {
-        return read_axvalue(pid, element_ptr_and_idx);
+    focused: Option<CFType>,
+    before: Option<String>,
+    before_range: Option<cua_driver_contract::TextSelectionRange>,
+}
+
+impl TypingReadback {
+    fn capture(pid: i32, element: Option<(usize, Option<usize>)>, window_id: Option<u32>) -> Self {
+        let mut readback = Self {
+            pid,
+            element,
+            window_id,
+            focused: if element.is_none() {
+                readback_focus(pid, window_id)
+            } else {
+                None
+            },
+            before: None,
+            before_range: None,
+        };
+        (readback.before, readback.before_range) = readback.sample();
+        readback
     }
-    match window_id {
-        Some(wid) => unsafe {
-            let el = crate::ax::exact_target::focused_element_in_window(pid, wid)?;
-            let v = copy_string_attr(el, "AXValue");
-            CFRelease(el as _);
-            v
-        },
-        None => read_axvalue(pid, None),
+
+    fn selection(&self) -> Option<cua_driver_contract::TextSelectionRange> {
+        let ptr = self
+            .element
+            .map(|(ptr, _)| ptr as AXUIElementRef)
+            .or_else(|| {
+                self.focused
+                    .as_ref()
+                    .map(|el| el.as_CFTypeRef() as AXUIElementRef)
+            })?;
+        unsafe { crate::ax::text_state::focused_range(self.pid, ptr) }
+    }
+
+    fn sample(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<cua_driver_contract::TextSelectionRange>,
+    ) {
+        let range = self.selection();
+        let value = self.read();
+        let after = self.selection();
+        (value, (range == after).then_some(range).flatten())
+    }
+
+    fn read(&self) -> Option<String> {
+        if let Some((ptr, _)) = self.element {
+            // The caller's retained cache guard owns the addressed element.
+            return unsafe { copy_string_attr(ptr as AXUIElementRef, "AXValue") };
+        }
+        let original = self.focused.as_ref()?;
+        let current = readback_focus(self.pid, self.window_id)?;
+        unsafe {
+            if CFEqual(original.as_CFTypeRef(), current.as_CFTypeRef()) == 0 {
+                return None;
+            }
+            let value = copy_string_attr(current.as_CFTypeRef() as AXUIElementRef, "AXValue");
+            // Focus can change during an AX read. Discard that sample too.
+            // A replacement editor needs fresh observation, not a guess that
+            // the newly focused field is the same logical target.
+            let after = readback_focus(self.pid, self.window_id)?;
+            (CFEqual(original.as_CFTypeRef(), after.as_CFTypeRef()) != 0)
+                .then_some(value)
+                .flatten()
+        }
     }
 }
 
@@ -985,10 +1012,9 @@ fn cgevent_type_verified(
     pid: i32,
     text: &str,
     delay_ms: u64,
-    before: Option<&str>,
+    readback: &TypingReadback,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
-    window_id: Option<u32>,
 ) -> anyhow::Result<(bool, Option<usize>)> {
     // Focus the target element so the keystrokes land in IT. Critical in
     // foreground mode: a freshly-fronted window's keyboard focus may be on the
@@ -1016,6 +1042,9 @@ fn cgevent_type_verified(
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     }
+    // Focus preparation can change the caret or selection. Sample immediately
+    // before posting input, while retaining the original target identity.
+    let (before, selection) = readback.sample();
     crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
 
     // CGEvent posting is asynchronous with respect to the renderer. In
@@ -1024,18 +1053,29 @@ fn cgevent_type_verified(
     // visible instead of treating any growth as success. If the deadline
     // expires after observable growth, surface the exact partial count.
     let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
-    Ok(await_typed_delivery(before, text, deadline, || {
-        read_axvalue_bound(pid, element_ptr_and_idx, window_id)
-    }))
+    Ok(delivery_from_progress(
+        await_typed_progress_with_selection(before.as_deref(), selection, text, deadline, || {
+            readback.sample()
+        }),
+        text,
+    ))
 }
 
+#[cfg(test)]
 fn await_typed_delivery(
     before: Option<&str>,
     text: &str,
     deadline: std::time::Instant,
     read_value: impl FnMut() -> Option<String>,
 ) -> (bool, Option<usize>) {
-    match await_typed_progress(before, text, deadline, read_value) {
+    delivery_from_progress(
+        await_typed_progress(before, text, deadline, read_value),
+        text,
+    )
+}
+
+fn delivery_from_progress(progress: TypedProgress, text: &str) -> (bool, Option<usize>) {
+    match progress {
         TypedProgress::Complete => (true, Some(text.chars().count())),
         TypedProgress::Partial(delivered) => (false, Some(delivered)),
         TypedProgress::Unchanged => (false, Some(0)),
@@ -1043,42 +1083,49 @@ fn await_typed_delivery(
     }
 }
 
-/// Poll the target's read-back until it proves complete delivery or the
-/// deadline passes, and report the strongest reading observed.
-///
-/// Both delivery rungs need this: neither a posted keystroke nor an accepted
-/// `AXSelectedText` write is applied by the time the call that sent it
-/// returns. Chromium acknowledges the posting process with a long tail still
-/// queued, and an AppKit field rebuilds its editor around the insertion —
-/// measured in Contacts, where the value read microseconds after the write
-/// held "(408) " of "(408) 961-1560" and was complete ~20 ms later. Sampling
-/// once turns that window into a false partial.
+#[cfg(test)]
 fn await_typed_progress(
     before: Option<&str>,
     text: &str,
     deadline: std::time::Instant,
     mut read_value: impl FnMut() -> Option<String>,
 ) -> TypedProgress {
+    await_typed_progress_with_selection(before, None, text, deadline, || (read_value(), None))
+}
+
+/// Settle the existing AX or keyboard readback without treating an old payload
+/// as proof of delivery. Unchanged ambiguous values may still be pending; poll
+/// them within the existing deadline and retain uncertainty if nothing resolves.
+fn await_typed_progress_with_selection(
+    before: Option<&str>,
+    selection: Option<cua_driver_contract::TextSelectionRange>,
+    text: &str,
+    deadline: std::time::Instant,
+    mut read_value: impl FnMut() -> (
+        Option<String>,
+        Option<cua_driver_contract::TextSelectionRange>,
+    ),
+) -> TypedProgress {
     let mut best_partial = None;
     loop {
-        let after = read_value();
-        match typed_progress(before, after.as_deref(), text) {
+        let (after, after_selection) = read_value();
+        let progress =
+            classify_insertion(before, selection, after.as_deref(), after_selection, text);
+        match progress {
             TypedProgress::Complete => return TypedProgress::Complete,
             TypedProgress::Partial(delivered) => {
                 best_partial =
                     Some(best_partial.map_or(delivered, |best: usize| best.max(delivered)));
             }
+            TypedProgress::Unverifiable if before.is_some() && after.as_deref() == before => {}
             TypedProgress::Unverifiable => return TypedProgress::Unverifiable,
-            TypedProgress::Unchanged => {
-                // A readable unchanged value is an observed zero-character
-                // delivery, not an unverifiable success.
-                best_partial.get_or_insert(0);
-            }
+            TypedProgress::Unchanged => {}
         }
         if std::time::Instant::now() >= deadline {
-            return match best_partial {
-                Some(delivered) if delivered > 0 => TypedProgress::Partial(delivered),
-                _ => TypedProgress::Unchanged,
+            return if progress == TypedProgress::Unverifiable {
+                progress
+            } else {
+                best_partial.map(TypedProgress::Partial).unwrap_or(progress)
             };
         }
         std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
@@ -1101,17 +1148,17 @@ fn type_text_blocking(
     text: &str,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     delay_ms: u64,
-    is_terminal_target: bool,
+    backend: TextInputBackend,
     delivery_mode: super::DeliveryMode,
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
-    resolved_editor: Option<&mut dyn FnMut(AXUIElementRef)>,
+    mut resolved_editor: Option<&mut dyn FnMut(AXUIElementRef)>,
 ) -> anyhow::Result<TypeTextDelivery> {
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
     // window-addressed request it must come from the exact target window,
     // never a same-process sibling.
-    let before = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
+    let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -1149,10 +1196,9 @@ fn type_text_blocking(
                 pid,
                 text,
                 delay_ms,
-                before.as_deref(),
+                &readback,
                 element_ptr_and_idx,
                 foreground_settle_ms,
-                window_id,
             )
         };
         let ((verified, delivered_chars), fronted) = match window_id {
@@ -1212,7 +1258,7 @@ fn type_text_blocking(
     }
 
     // --- Background rung 0: terminal emulator → CGEvent only (AX is dropped). ---
-    if is_terminal_target {
+    if backend == TextInputBackend::Terminal {
         // A terminal insert has no semantic AX rung: when the exact-target
         // decision restricted this request to semantic-only, there is nothing
         // safe to run — refuse before posting anything.
@@ -1238,10 +1284,9 @@ fn type_text_blocking(
             pid,
             text,
             delay_ms,
-            before.as_deref(),
+            &readback,
             element_ptr_and_idx,
             /*settle_ms=*/ 0,
-            window_id,
         )?;
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
@@ -1265,6 +1310,25 @@ fn type_text_blocking(
             }
         },
     };
+    // Chromium accepts AXSelectedText but its web accessibility action
+    // dispatcher does not implement ReplaceSelectedText. Choose the existing
+    // keyboard rung before writing, rather than retrying an uncertain AX edit.
+    // WebKit and native controls retain semantic insertion. The exact-window
+    // gate and synthesis budget still apply, including semantic-only refusal.
+    let ax_target = ax_target.filter(|&(element, owns, idx)| {
+        if backend != TextInputBackend::Chromium
+            || !target_in_web_area(pid, Some((element as usize, idx)), window_id)
+        {
+            return true;
+        }
+        if let Some(observed) = resolved_editor.as_deref_mut() {
+            observed(element);
+        }
+        if owns {
+            unsafe { CFRelease(element as _) };
+        }
+        false
+    });
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
         if let Some(observed) = resolved_editor {
@@ -1272,6 +1336,26 @@ fn type_text_blocking(
         }
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+        // An unfocused native field may accept AXSelectedText without editing:
+        // its field editor is not installed yet. Reuse the keyboard rung's
+        // exact-element preparation before the first write, avoiding a full
+        // no-op delivery drain. Do not broaden semantic-only requests or touch
+        // implicit/web targets. Already-focused selections must stay intact.
+        if element_ptr_and_idx.is_some()
+            && window_id.is_some()
+            && matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed)
+            && matches!(
+                role.as_str(),
+                "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
+            )
+            && !target_in_web_area(pid, element_ptr_and_idx, window_id)
+            && !crate::input::ax_actions::is_element_focused(pid, element as usize)
+        {
+            crate::input::ax_actions::focus_element(element as usize)?;
+            // A focus write is not proof of focus or insertion. Sample the
+            // retained target and its current selection, then verify normally.
+            (readback.before, readback.before_range) = readback.sample();
+        }
         let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
         // Classify the write before considering synthesis. Complete AX
         // delivery returns immediately. Partial delivery is surfaced as such
@@ -1284,11 +1368,12 @@ fn type_text_blocking(
         // app is still rebuilding is never reported as a partial insertion.
         let ax_progress = if err == kAXErrorSuccess {
             let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
-            Some(await_typed_progress(
-                before.as_deref(),
+            Some(await_typed_progress_with_selection(
+                readback.before.as_deref(),
+                readback.before_range,
                 text,
                 deadline,
-                || unsafe { copy_string_attr(element, "AXValue") },
+                || readback.sample(),
             ))
         } else {
             None
@@ -1344,7 +1429,9 @@ fn type_text_blocking(
              falling back to CGEvent keystrokes"
         );
     } else {
-        tracing::debug!("No focused element for pid {pid}; using CGEvent keystrokes");
+        tracing::debug!(
+            "No semantic insertion target for pid {pid}; considering CGEvent keystrokes"
+        );
     }
 
     // The semantic AX rung did not land and this request is restricted to it:
@@ -1374,10 +1461,9 @@ fn type_text_blocking(
             pid,
             text,
             delay_ms,
-            before.as_deref(),
+            &readback,
             element_ptr_and_idx,
             /*settle_ms=*/ 0,
-            window_id,
         )
     };
     let (verified, delivered_chars) = if let Some(wid) =
@@ -1463,7 +1549,7 @@ mod tests {
                         "hello",
                         None,
                         0,
-                        false,
+                        TextInputBackend::Other,
                         super::super::DeliveryMode::Background,
                         Some(42),
                         BackgroundKeyboardPolicy::Allowed,
@@ -1548,10 +1634,10 @@ mod tests {
     use super::*;
 
     /// Sanity-check that the terminal short-circuit can be expressed as a
-    /// pure function of `is_terminal_target`: when true, the code goes
+    /// pure function of the terminal backend: when selected, the code goes
     /// to key-event synthesis without consulting AX. This test stands
     /// in for an integration test (which would need a running terminal)
-    /// — it exercises the branch by injecting `is_terminal_target=true`
+    /// — it exercises the branch by injecting `TextInputBackend::Terminal`
     /// with a non-existent pid and checking we get the expected error
     /// shape from the CGEvent path (not from the AX path).
     ///
@@ -1570,14 +1656,14 @@ mod tests {
             "x",
             None,
             0,
-            /*is_terminal_target=*/ true,
+            TextInputBackend::Terminal,
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
             None,
         );
         // We don't care whether r is Ok or Err — what matters is that
-        // calling it with is_terminal_target=true is safe and never
+        // calling it with the terminal backend is safe and never
         // dereferences null AX pointers.
         let _ = r;
     }
@@ -1597,7 +1683,7 @@ mod tests {
             "x",
             None,
             0,
-            /*is_terminal_target=*/ true,
+            TextInputBackend::Terminal,
             super::super::DeliveryMode::Background,
             Some(7),
             BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
@@ -1607,6 +1693,92 @@ mod tests {
             Ok(TypeTextDelivery::Refused(returned)) => assert_eq!(returned, refusal),
             other => panic!("expected a structured refusal, got {:?}", other.is_ok()),
         }
+    }
+
+    #[test]
+    fn other_web_engines_keep_semantic_insertion_when_keys_are_refused() {
+        let _fixture =
+            crate::ax::bindings::test_support::EditorScope::install("AXWebArea", None, || {});
+        let result = type_text_blocking(
+            -9876,
+            "XYZ",
+            None,
+            0,
+            TextInputBackend::Other,
+            super::super::DeliveryMode::Background,
+            Some(42),
+            BackgroundKeyboardPolicy::SemanticOnly(BackgroundRefusal {
+                code: cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+                reason: "same-process sibling window".into(),
+                advice: None,
+            }),
+            None,
+        )
+        .unwrap();
+        let TypeTextDelivery::Typed(outcome) = result else {
+            panic!("non-Chromium web engines retain their semantic insertion route");
+        };
+        assert_eq!(outcome.path, PATH_AX);
+        assert_eq!(outcome.delivered_chars, Some(3));
+    }
+
+    #[test]
+    fn web_insertion_checks_synthesis_budget_before_any_ax_write() {
+        // The scoped AX boundary identifies web ancestry. Oversized input must
+        // reach the existing preflight without an AX mutation or real keys.
+        let _fixture =
+            crate::ax::bindings::test_support::EditorScope::install("AXWebArea", None, || {
+                panic!("web insertion must not write AXSelectedText")
+            });
+        let result = type_text_blocking(
+            -9876,
+            &"x".repeat(6_500),
+            None,
+            0,
+            TextInputBackend::Chromium,
+            super::super::DeliveryMode::Background,
+            Some(42),
+            BackgroundKeyboardPolicy::Allowed,
+            None,
+        )
+        .unwrap();
+        let TypeTextDelivery::SynthesisRefused {
+            path, ax_attempt, ..
+        } = result
+        else {
+            panic!("oversized web insertion must stop before input");
+        };
+        assert_eq!(path, PATH_KEY_EVENTS);
+        assert_eq!(ax_attempt, AxAttempt::NotAttempted);
+    }
+
+    #[test]
+    fn web_insertion_preserves_semantic_only_refusal_without_writing() {
+        let _fixture =
+            crate::ax::bindings::test_support::EditorScope::install("AXWebArea", None, || {
+                panic!("web insertion must not write AXSelectedText")
+            });
+        let refusal = BackgroundRefusal {
+            code: cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+            reason: "same-process sibling window".into(),
+            advice: None,
+        };
+        let result = type_text_blocking(
+            -9876,
+            "XYZ",
+            None,
+            0,
+            TextInputBackend::Chromium,
+            super::super::DeliveryMode::Background,
+            Some(42),
+            BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
+            None,
+        )
+        .unwrap();
+        let TypeTextDelivery::Refused(actual) = result else {
+            panic!("web insertion may not bypass the keyboard gate");
+        };
+        assert_eq!(actual, refusal);
     }
 
     #[test]
@@ -1622,7 +1794,7 @@ mod tests {
             &text,
             None,
             0,
-            false,
+            TextInputBackend::Other,
             super::super::DeliveryMode::Background,
             Some(42),
             BackgroundKeyboardPolicy::Allowed,
@@ -1645,7 +1817,7 @@ mod tests {
             &text,
             None,
             0,
-            /*is_terminal_target=*/ true,
+            TextInputBackend::Terminal,
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
@@ -1677,7 +1849,7 @@ mod tests {
     fn large_atomic_ax_payloads_are_not_subject_to_the_synthesis_budget() {
         assert!(synthesis_preflight(TextDeliveryRoute::AtomicAx, 100_000, 200).is_none());
         assert_eq!(
-            typed_progress(None, Some(&"x".repeat(11_500)), &"x".repeat(11_500)),
+            typed_progress(Some(""), Some(&"x".repeat(11_500)), &"x".repeat(11_500)),
             TypedProgress::Complete,
             "a successful one-call AX insertion remains eligible regardless of size"
         );
@@ -1718,7 +1890,7 @@ mod tests {
     #[test]
     fn verify_typed_contains_full_request_is_verified() {
         assert!(verify_typed(Some(""), Some("hi"), "hi")); // contains
-        assert!(verify_typed(Some("ab"), Some("ab hi"), "hi")); // contains, appended
+        assert!(verify_typed(Some("ab "), Some("ab hi"), "hi")); // contains, appended
     }
 
     #[test]
@@ -1774,11 +1946,21 @@ mod tests {
     #[test]
     fn a_write_the_field_never_took_stays_unchanged() {
         assert_eq!(
-            await_typed_progress(
+            await_typed_progress_with_selection(
                 Some("old"),
+                Some(cua_driver_contract::TextSelectionRange {
+                    location: 3,
+                    length: 0
+                }),
                 "new value",
                 std::time::Instant::now(),
-                || Some("old".to_owned())
+                || (
+                    Some("old".to_owned()),
+                    Some(cua_driver_contract::TextSelectionRange {
+                        location: 3,
+                        length: 0
+                    })
+                )
             ),
             TypedProgress::Unchanged
         );
@@ -1793,6 +1975,224 @@ mod tests {
     #[test]
     fn verify_typed_empty_text_is_trivially_verified() {
         assert!(verify_typed(None, None, ""));
+    }
+
+    #[test]
+    fn typing_insertion_preexisting_value_does_not_prove_new_input() {
+        assert_eq!(
+            typed_progress(Some("hello"), Some("hello"), "hello"),
+            TypedProgress::Unverifiable,
+            "unchanged text cannot distinguish dropped input from identical replacement"
+        );
+    }
+
+    #[test]
+    fn typing_insertion_existing_payload_does_not_hide_a_prefix() {
+        assert_ne!(
+            typed_progress(Some("hello"), Some("helloh"), "hello"),
+            TypedProgress::Complete,
+            "the old payload is still present after only the first new character"
+        );
+    }
+
+    #[test]
+    fn typing_insertion_old_suffix_cannot_complete_a_new_prefix() {
+        assert_ne!(
+            typed_progress(Some("llo"), Some("hello"), "hello"),
+            TypedProgress::Complete,
+            "inserting only he before the old llo produces the full string too"
+        );
+    }
+
+    #[test]
+    fn typing_insertion_unrelated_growth_does_not_supply_a_retry_offset() {
+        assert_eq!(
+            typed_progress(Some("old"), Some("oldXYZ"), "hello"),
+            TypedProgress::Unverifiable,
+            "three additional characters are not necessarily three delivered characters"
+        );
+    }
+
+    #[test]
+    fn typing_insertion_unknown_before_is_not_observed_delivery() {
+        assert_eq!(
+            typed_progress(None, Some("hello"), "hello"),
+            TypedProgress::Unverifiable
+        );
+    }
+
+    #[test]
+    fn typing_insertion_full_duplicate_append_is_observable() {
+        assert_eq!(
+            typed_progress(Some("hello"), Some("hellohello"), "hello"),
+            TypedProgress::Complete
+        );
+    }
+
+    #[test]
+    fn typing_insertion_samples_selection_after_existing_focus_preparation() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        scope.value(0, Some("hello"));
+        scope.range(0, 5, 0);
+        scope.focus(Some(1), 42);
+        let readback =
+            TypingReadback::capture(-9880, Some((scope.element_ptr(0), Some(7))), Some(42));
+        assert_eq!(
+            readback.before_range, None,
+            "an unfocused range is not an active caret"
+        );
+        scope.focus(Some(0), 42);
+        let (before, selection) = readback.sample();
+        assert_eq!(
+            selection,
+            Some(cua_driver_contract::TextSelectionRange {
+                location: 5,
+                length: 0
+            })
+        );
+        scope.value(0, Some("helloh"));
+        scope.range(0, 6, 0);
+        assert_eq!(
+            await_typed_progress_with_selection(
+                before.as_deref(),
+                selection,
+                "hello",
+                std::time::Instant::now(),
+                || readback.sample()
+            ),
+            TypedProgress::Partial(1)
+        );
+    }
+
+    #[test]
+    fn typing_insertion_waits_for_an_ambiguous_old_value_to_resolve() {
+        let mut values = [Some("hello".to_owned()), Some("hellohello".to_owned())].into_iter();
+        let mut reads = 0;
+        assert_eq!(
+            await_typed_progress(
+                Some("hello"),
+                "hello",
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                || {
+                    reads += 1;
+                    values.next().flatten()
+                }
+            ),
+            TypedProgress::Complete
+        );
+        assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn typing_insertion_drain_preserves_an_observed_selected_deletion() {
+        assert_eq!(
+            await_typed_progress_with_selection(
+                Some("old"),
+                Some(cua_driver_contract::TextSelectionRange {
+                    location: 0,
+                    length: 3
+                }),
+                "new",
+                std::time::Instant::now(),
+                || (
+                    Some(String::new()),
+                    Some(cua_driver_contract::TextSelectionRange {
+                        location: 0,
+                        length: 0
+                    })
+                )
+            ),
+            TypedProgress::Partial(0),
+            "an applied edit must not enter another input route as unchanged"
+        );
+    }
+
+    fn focused_delivery(readback: &TypingReadback) -> (bool, Option<usize>) {
+        await_typed_delivery(
+            readback.before.as_deref(),
+            "hello",
+            std::time::Instant::now(),
+            || readback.read(),
+        )
+    }
+
+    #[test]
+    fn typing_identity_does_not_confirm_a_different_focused_field() {
+        for window in [Some(42), None] {
+            let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+            let readback = TypingReadback::capture(-9880, None, window);
+            assert_eq!(readback.before.as_deref(), Some(""));
+            scope.focus(Some(1), 42);
+            assert_eq!(focused_delivery(&readback), (false, None));
+        }
+    }
+
+    #[test]
+    fn typing_identity_does_not_count_another_fields_length_as_delivery() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.value(1, Some("unrelated pre-existing contents"));
+        scope.focus(Some(1), 42);
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_replacement_requires_fresh_observation() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.value(0, None);
+        scope.focus(Some(1), 42);
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_preserves_stable_complete_partial_and_zero_readback() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        assert_eq!(focused_delivery(&readback), (false, Some(0)));
+        scope.value(0, Some("hel"));
+        assert_eq!(focused_delivery(&readback), (false, Some(3)));
+        scope.value(0, Some("hello"));
+        assert_eq!(focused_delivery(&readback), (true, Some(5)));
+    }
+
+    #[test]
+    fn typing_identity_rejects_missing_or_sibling_focus() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.focus(None, 42);
+        assert_eq!(focused_delivery(&readback), (false, None));
+        scope.focus(Some(1), 99);
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_cannot_confirm_focus_that_was_missing_at_start() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        scope.focus(None, 42);
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.focus(Some(1), 42);
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_discards_a_value_sample_if_focus_changes_during_read() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.value(0, Some("hello"));
+        scope.switch_on_next_read();
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_keeps_addressed_readback_bound_to_its_retained_element() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback =
+            TypingReadback::capture(-9880, Some((scope.element_ptr(0), Some(7))), Some(42));
+        scope.focus(Some(1), 42);
+        assert_eq!(focused_delivery(&readback), (false, Some(0)));
+        scope.value(0, Some("hello"));
+        assert_eq!(focused_delivery(&readback), (true, Some(5)));
     }
 
     #[test]

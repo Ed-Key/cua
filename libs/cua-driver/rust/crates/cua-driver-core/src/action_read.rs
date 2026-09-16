@@ -82,11 +82,23 @@ impl Tool for ActAndReadTool {
             }
         }
         let mut action = json!({"pid":input.pid,"window_id":input.window_id,"element_token":input.element_token});
-        if input.action == ActionReadAction::Click {
+        if matches!(
+            input.action,
+            ActionReadAction::Click | ActionReadAction::Scroll
+        ) {
             action["delivery_mode"] = json!("background");
         }
         if let Some(value) = input.value {
             action["value"] = json!(value);
+        }
+        if let Some(direction) = input.direction {
+            action["direction"] = json!(direction);
+        }
+        if let Some(by) = input.by {
+            action["by"] = json!(by);
+        }
+        if let Some(amount) = input.amount {
+            action["amount"] = json!(amount);
         }
         let mut observation = serde_json::to_value(input.observe).expect("observation serializes");
         observation["pid"] = json!(input.pid);

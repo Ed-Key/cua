@@ -197,6 +197,29 @@ impl Tool for SetValueTool {
             Some(window_id),
         );
 
+        // A native field can accept AXValue without notifying its delegate
+        // until AppKit has installed its field editor. Reuse the existing
+        // exact-window visibility gate under the same lease before preparing
+        // that editor. The WindowPointer gate proves a visible exact target
+        // without requiring a singleton keyboard destination. No pointer or
+        // keyboard event is sent: AXFocused addresses the retained element,
+        // just as an accessibility click on a native text field already does.
+        // Hidden/minimized targets, web content and non-text controls retain
+        // their existing behavior.
+        let prepare_native_text = !ax_echo_surface
+            && matches!(
+                unsafe { copy_string_attr(element_ptr as AXUIElementRef, "AXRole") }.as_deref(),
+                Some("AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox")
+            )
+            && _mutation_lease
+                .gate_again(
+                    window_id,
+                    Some(element_ptr),
+                    cua_driver_core::background_input::BackgroundAction::WindowPointer,
+                )
+                .await
+                .is_ok();
+
         let prior_front = apps::frontmost_pid();
 
         let result = focus_guard::with_focus_suppressed(
@@ -226,7 +249,19 @@ impl Tool for SetValueTool {
                                 &crate::cursor::visual::OverlayVisualSink,
                                 &cursor_key,
                                 target,
-                                || set_value_blocking(element_ptr, element_index, pid, &value),
+                                || {
+                                    if prepare_native_text
+                                        && !crate::input::ax_actions::is_element_focused(
+                                            pid,
+                                            element_ptr,
+                                        )
+                                    {
+                                        crate::input::ax_actions::focus_element(element_ptr)?;
+                                    }
+                                    // Preparation is best effort, not evidence
+                                    // of delivery. Keep target-bound readback.
+                                    set_value_blocking(element_ptr, element_index, pid, &value)
+                                },
                             )
                         },
                     )
