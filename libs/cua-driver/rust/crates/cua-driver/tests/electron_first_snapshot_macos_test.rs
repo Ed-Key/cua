@@ -83,8 +83,29 @@ fn background_addressed_typing_preserves_partial_selection() {
     check_first_snapshot(true, false, Some(TypingScenario::AddressedSelection));
 }
 
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_web_addressed_key_moves_caret_without_changing_text() {
+    check_first_snapshot(true, false, Some(TypingScenario::AddressedKey));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_web_pixel_key_moves_caret_without_changing_text() {
+    check_first_snapshot(true, false, Some(TypingScenario::PixelKey));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_web_addressed_hotkey_moves_caret_without_changing_text() {
+    check_first_snapshot(true, false, Some(TypingScenario::AddressedHotkey));
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypingScenario {
+    AddressedKey,
+    PixelKey,
+    AddressedHotkey,
     AddressedFresh,
     AddressedAppend,
     AddressedSelection,
@@ -179,6 +200,7 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
             <button id="select-input" data-cua-id="select-input"
               onclick="const field=document.getElementById('txt-input');field.focus();field.select()">Select input text</button>
             <button aria-label="Select suffix" onclick="const f=document.getElementById('txt-input');f.focus();f.setSelectionRange(5,8)">Select suffix</button>
+            <button aria-label="Place caret at start" onclick="const f=document.getElementById('txt-input');f.focus();f.setSelectionRange(0,0)">Place caret at start</button>
             <button aria-label="Place caret at end" onclick="const f=document.getElementById('txt-input');f.focus();f.setSelectionRange(8,8)">Place caret at end</button>"#,
         );
         let anchor = "if ('value' in element) entry.value = element.value;";
@@ -346,6 +368,131 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                 * scale;
             assert_eq!(journal.text("lbl-input-mirror").as_deref(), Some("mirror="));
             let before_number = journal.snapshot()["number-input"].clone();
+            if matches!(
+                scenario,
+                TypingScenario::AddressedKey
+                    | TypingScenario::PixelKey
+                    | TypingScenario::AddressedHotkey
+            ) {
+                let seeded = driver.call(
+                    "set_value",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "element_token":fields[0]["element_token"],
+                        "value":"KEEP abc"
+                    }),
+                );
+                assert!(!seeded.is_error(), "seed failed: {}", seeded.text());
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while journal.snapshot()["txt-input"]["value"] != "KEEP abc" {
+                    assert!(Instant::now() < deadline, "seed did not reach renderer");
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                let current = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":pid,"window_id":wid,"include_screenshot":false
+                    }),
+                );
+                let token = current.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["role"] == "AXButton" && e["label"] == "Place caret at start")
+                    .unwrap()["element_token"]
+                    .clone();
+                let selected = driver.call(
+                    "click",
+                    serde_json::json!({
+                        "pid":pid,"window_id":wid,"element_token":token,"delivery_mode":"background"
+                    }),
+                );
+                assert!(
+                    !selected.is_error(),
+                    "caret setup failed: {}",
+                    selected.text()
+                );
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let actual = journal.snapshot()["txt-input"].clone();
+                    if actual["focused"] == true
+                        && actual["selectionStart"] == 0
+                        && actual["selectionEnd"] == 0
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "caret setup not established: {actual}"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                let current = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":pid,"window_id":wid,"include_screenshot":false
+                    }),
+                );
+                let token = current.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["role"] == "AXTextArea" && e["label"] == "txt-input")
+                    .unwrap()["element_token"]
+                    .clone();
+                let mut args =
+                    serde_json::json!({"pid":pid,"window_id":wid,"delivery_mode":"background"});
+                if scenario == TypingScenario::PixelKey {
+                    // A center click alone can put the caret at the end and
+                    // conceal a dropped key. Click at the start of the line.
+                    args["x"] =
+                        serde_json::json!((field["x"].as_f64().unwrap() + 4.0 - bounds.x) * scale);
+                    args["y"] =
+                        serde_json::json!((field["y"].as_f64().unwrap() + 15.0 - bounds.y) * scale);
+                } else {
+                    args["element_token"] = token;
+                }
+                let tool = if scenario == TypingScenario::AddressedHotkey {
+                    // Select all, so a fallback focus click cannot satisfy the
+                    // expected range without the actual modifier chord.
+                    args["keys"] = serde_json::json!(["cmd", "a"]);
+                    "hotkey"
+                } else {
+                    args["key"] = serde_json::json!("right");
+                    args["modifiers"] = serde_json::json!(["cmd"]);
+                    "press_key"
+                };
+                let key = driver.call(tool, args);
+                assert!(!key.is_error(), "key delivery failed: {}", key.text());
+                assert_eq!(
+                    key.action_effect(),
+                    Some("unverifiable"),
+                    "web key success must not be inferred from AX"
+                );
+                let start = if scenario == TypingScenario::AddressedHotkey {
+                    0
+                } else {
+                    8
+                };
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let actual = journal.snapshot()["txt-input"].clone();
+                    assert_eq!(actual["value"], "KEEP abc", "navigation changed the text");
+                    if actual["selectionStart"] == start && actual["selectionEnd"] == 8 {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "background {tool} did not move the actual selection: {actual}"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                assert_eq!(
+                    journal.snapshot()["number-input"],
+                    before_number,
+                    "other editor changed"
+                );
+                return (state, elapsed);
+            }
             if matches!(
                 scenario,
                 TypingScenario::AddressedFresh

@@ -367,6 +367,32 @@ focus, z-order, cursor position, and input isolation. A setup failure is not a
 text-delivery result. These diagnostic rows do not replace the full candidate
 matrix or imply that a behavior recording was produced.
 
+#### Focused background web keyboard navigation
+
+On macOS, exact-window background `press_key` and `hotkey` calls use the
+existing checked background keyboard focus preparation for web content. This
+preparation preserves the editor selection and rechecks exact-window admission
+before posting keys. Native controls, PID-only requests, and foreground delivery
+keep their existing routes. Web key results remain unverified; delivery alone
+does not prove that an application performed the requested command. Windows
+and Linux adapters are unchanged and are not qualified by these macOS tests.
+
+Inside an authorized macOS test session, run:
+
+```sh
+cargo test -p cua-driver --test electron_first_snapshot_macos_test background_web_ -- --ignored --nocapture --test-threads=1
+cargo test -p cua-driver --test harness_appkit_test harness_appkit_focused_text_selection_and_caret -- --exact --ignored --nocapture --test-threads=1
+```
+
+The Electron cases use a fixture-owned renderer journal to check addressed
+Command+Right, pixel-targeted Command+Right, and addressed Command+A. The pixel
+target is near the start of the editor so its focus click cannot impersonate
+movement to the end. They assert unchanged text and an untouched second editor,
+with the existing focus, z-order, cursor, and input-isolation sentinel. The
+filter also runs the existing web-selection observation control. The AppKit
+control checks native caret and selection behavior, including UTF-16 ranges.
+These are focused diagnostics, not full candidate certification.
+
 
 Runner: `libs/cua-driver/tests/runners/macos-lume/run-all.sh`
 

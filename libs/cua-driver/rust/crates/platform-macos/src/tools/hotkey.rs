@@ -460,9 +460,18 @@ impl Tool for HotkeyTool {
                         }
                         // background (default): auth-envelope post to the pid, no
                         // raise — even when window_id was supplied for targeting.
-                        (false, false, _, Some(ptr)) => {
-                            focus_hotkey_element(pid, ptr)?;
-                            crate::input::keyboard::hotkey(pid, &key, &m)
+                        (false, _, _, _) => {
+                            if !coordinate_focus {
+                                if let Some(ptr) = element_ptr {
+                                    focus_hotkey_element(pid, ptr)?;
+                                }
+                            }
+                            super::with_background_web_key_focus(
+                                pid,
+                                window_id,
+                                element_ptr,
+                                || crate::input::keyboard::hotkey(pid, &key, &m),
+                            )
                         }
                         _ => crate::input::keyboard::hotkey(pid, &key, &m),
                     }
