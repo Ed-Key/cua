@@ -1692,6 +1692,8 @@ fn harness_appkit_type_text_background() {
 // and commit labels. Diagnostic cases record the mirror; the regression
 // requires a notification without accepting submission as a substitute.
 fn run_value_notification_probe(prepare: bool, typing: bool, require_notification: bool) {
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use platform_macos::ax::bindings::{copy_children, copy_string_attr, AXUIElementRef};
     let label = if require_notification {
         "regression"
     } else if typing {
@@ -1716,17 +1718,35 @@ fn run_value_notification_probe(prepare: bool, typing: bool, require_notificatio
                 .unwrap();
             assert_eq!(field.role, "AXTextField");
             let ptr = field.element_ptr;
+            let window = native.nodes.iter().find(|n| n.role == "AXWindow").unwrap();
+            assert!(
+                window.element_index.is_some(),
+                "retain owner must hold the window"
+            );
             let observe = || {
-                let state = slice_a_tree(pid, wid);
-                assert!(!state.truncated);
+                // The display tree deliberately omits empty static labels.
+                // Read the fixture's direct window children without that filter;
+                // CF owners release every copied child even if an assertion fails.
+                let children: Vec<CFType> = unsafe {
+                    copy_children(window.element_ptr as AXUIElementRef)
+                        .into_iter()
+                        .map(|child| CFType::wrap_under_create_rule(child as CFTypeRef))
+                        .collect()
+                };
                 let value = |id: &str| {
-                    let matches: Vec<_> = state
-                        .nodes
+                    let matches: Vec<_> = children
                         .iter()
-                        .filter(|n| n.identifier.as_deref() == Some(id))
+                        .filter(|child| unsafe {
+                            copy_string_attr(child.as_CFTypeRef() as AXUIElementRef, "AXIdentifier")
+                                .as_deref()
+                                == Some(id)
+                        })
                         .collect();
                     assert_eq!(matches.len(), 1, "unique native field {id}");
-                    matches[0].value.clone().expect("readable native value")
+                    unsafe {
+                        copy_string_attr(matches[0].as_CFTypeRef() as AXUIElementRef, "AXValue")
+                    }
+                    .expect("readable native value")
                 };
                 serde_json::json!({
                     "field":value("txt-input"), "mirror":value("lbl-input-mirror"),
