@@ -536,6 +536,10 @@ pub unsafe fn element_screen_rect(element: AXUIElementRef) -> Option<[f64; 4]> {
 ///
 /// The caller must release any returned element exactly once with `CFRelease`.
 pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
+    #[cfg(test)]
+    if let Some(result) = test_support::typing_focus_element(pid, None) {
+        return result;
+    }
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
         return None;
