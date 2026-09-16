@@ -1238,8 +1238,22 @@ fn harness_appkit_focused_text_selection_and_caret() {
 #[test]
 #[ignore]
 fn harness_appkit_typing_repeated_and_selected_text() {
+    run_typing_repeated_and_selected_text(false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_addressed_typing_preserves_selection() {
+    run_typing_repeated_and_selected_text(true);
+}
+
+fn run_typing_repeated_and_selected_text(addressed: bool) {
     run_background_case(
-        "typing_repeated_selected",
+        if addressed {
+            "addressed_typing_selected"
+        } else {
+            "typing_repeated_selected"
+        },
         DriverRoute::MacosAxValue,
         |pid, wid, driver| {
             let first = snapshot_elements(driver, pid, wid);
@@ -1284,11 +1298,24 @@ fn harness_appkit_typing_repeated_and_selected_text() {
                         "replacement setup must select the entire value before any input"
                     );
                 }
-                let response = driver.call(
-                    "type_text",
-                    serde_json::json!({
-                        "pid":pid,"window_id":wid,"text":text,"delivery_mode":"background"
-                    }),
+                let mut arguments = serde_json::json!({
+                    "pid":pid,"window_id":wid,"text":text,"delivery_mode":"background"
+                });
+                if addressed {
+                    let current = snapshot_elements(driver, pid, wid);
+                    arguments["element_token"] =
+                        serde_json::json!(element_token_by_id(&current, "txt-input"));
+                }
+                let response = driver.call("type_text", arguments);
+                let native = slice_a_tree(pid, wid);
+                assert_eq!(
+                    native
+                        .nodes
+                        .iter()
+                        .find(|node| node.identifier.as_deref() == Some("txt-input"))
+                        .and_then(|node| node.value.as_deref()),
+                    Some(expected),
+                    "independent native value must reflect exactly one edit"
                 );
                 let after = snapshot_elements(driver, pid, wid);
                 let index = element_index_by_id(after.tree_text(), "txt-input").unwrap();

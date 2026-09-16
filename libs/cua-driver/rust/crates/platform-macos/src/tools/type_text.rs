@@ -1136,7 +1136,7 @@ fn type_text_blocking(
     // An unreadable value is not evidence that the field is empty — and for a
     // window-addressed request it must come from the exact target window,
     // never a same-process sibling.
-    let readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
+    let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -1295,6 +1295,26 @@ fn type_text_blocking(
         }
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+        // An unfocused native field may accept AXSelectedText without editing:
+        // its field editor is not installed yet. Reuse the keyboard rung's
+        // exact-element preparation before the first write, avoiding a full
+        // no-op delivery drain. Do not broaden semantic-only requests or touch
+        // implicit/web targets. Already-focused selections must stay intact.
+        if element_ptr_and_idx.is_some()
+            && window_id.is_some()
+            && matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed)
+            && matches!(
+                role.as_str(),
+                "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
+            )
+            && !target_in_web_area(pid, element_ptr_and_idx, window_id)
+            && !crate::input::ax_actions::is_element_focused(pid, element as usize)
+        {
+            crate::input::ax_actions::focus_element(element as usize)?;
+            // A focus write is not proof of focus or insertion. Sample the
+            // retained target and its current selection, then verify normally.
+            (readback.before, readback.before_range) = readback.sample();
+        }
         let err = unsafe { set_string_attr(element, "AXSelectedText", text) };
         // Classify the write before considering synthesis. Complete AX
         // delivery returns immediately. Partial delivery is surfaced as such
