@@ -96,12 +96,14 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "type_text".into(),
         description:
-            "Insert text into the target pid via `AXSetAttribute(kAXSelectedText)`. \
-             Works for standard Cocoa text fields and text views. No keystrokes are \
-             synthesized — special keys (Return / Escape / arrows) go through \
-             `press_key` / `hotkey`. For Chromium / Electron inputs that don't \
-             implement `kAXSelectedText`, the tool falls back to CGEvent \
-             character synthesis automatically when the estimated route stays \
+            "Insert text at the target editor's current caret or selection. \
+             Native Cocoa fields and other supported editors use AXSelectedText. \
+             Web editors in recognized Chromium / Electron apps use CGEvent \
+             character synthesis directly, preserving the existing value outside \
+             the selection. Native controls in those apps retain AX insertion. \
+             Special keys (Return / Escape / arrows) go through `press_key` / \
+             `hotkey`. Keyboard delivery requires an unambiguous destination \
+             and an estimated duration \
              within the daemon transport budget. Longer synthesized routes are \
              refused before character events and return a safe chunk size; \
              one-call AX insertion remains uncapped.\n\n\
