@@ -1376,6 +1376,7 @@ pub fn render_frame(
 /// Both are in **logical** screen points, just like `core.pos`.
 ///
 /// `backing_scale` is the destination-pixmap-pixels per logical-point ratio.
+/// Ratios below 1.0 downsample source points for a smaller preview image.
 /// On a 2× retina macOS display the caller sizes the pixmap at the screen's
 /// PHYSICAL pixel dimensions (logical × backing_scale) and passes `2.0` so
 /// the cursor renders at native resolution instead of being upsampled by
@@ -1443,8 +1444,14 @@ fn paint_cursor_impl(
     }
     let (cursor_x, cursor_y) = core.pos;
 
-    let s = backing_scale.max(1.0) as f64; // logical-pt → pixmap-pixel scale
-    let sf = s as f32;
+    // A preview may downsample logical source points into fewer image pixels.
+    // Keep every finite positive ratio; desktop backing scales remain unchanged.
+    let sf = if backing_scale.is_finite() && backing_scale > 0.0 {
+        backing_scale
+    } else {
+        1.0
+    };
+    let s = f64::from(sf);
 
     // Cursor anchor in pixmap-pixel space: subtract the (logical) origin
     // first, then scale into pixmap pixels.
@@ -1567,7 +1574,7 @@ fn paint_cursor_impl(
             art_x as f32,
             art_y as f32,
             heading as f32,
-            backing_scale.max(1.0),
+            sf,
             alpha_scale,
             tint,
         );
@@ -1581,7 +1588,7 @@ fn paint_cursor_impl(
             px as f32,
             py as f32,
             heading as f32,
-            backing_scale.max(1.0),
+            sf,
             alpha_scale,
             crate::session_fill_rgba(&core.cfg.cursor_id),
         );
@@ -1594,7 +1601,7 @@ fn paint_cursor_impl(
             delivery,
             target,
             cursor: (px as f32, py as f32),
-            backing_scale: backing_scale.max(1.0),
+            backing_scale: sf,
             label_alpha: core.session_badge_alpha(),
             chip_alpha: core.session_badge_chip_alpha(),
             clip: Some((pm.width() as f32, pm.height() as f32)),
@@ -1995,6 +2002,69 @@ mod backing_scale_tests {
         let mut pm = tiny_skia::Pixmap::new(pm_size, pm_size).unwrap();
         paint_cursor(&mut pm, &core, 0.0, 0.0, None, backing_scale);
         pm
+    }
+
+    #[test]
+    fn fractional_preview_rasters_keep_source_position_and_artwork_scale() {
+        fn bounds(pm: &tiny_skia::Pixmap) -> [f64; 4] {
+            let mut edges = [
+                f64::INFINITY,
+                f64::INFINITY,
+                f64::NEG_INFINITY,
+                f64::NEG_INFINITY,
+            ];
+            for (index, _) in pm
+                .pixels()
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.alpha() > 96)
+            {
+                let x = (index as u32 % pm.width()) as f64;
+                let y = (index as u32 / pm.width()) as f64;
+                edges = [
+                    edges[0].min(x),
+                    edges[1].min(y),
+                    edges[2].max(x),
+                    edges[3].max(y),
+                ];
+            }
+            assert!(
+                edges.iter().all(|v| v.is_finite()),
+                "cursor was clipped out of the preview"
+            );
+            edges
+        }
+        for label in [None, Some("Agent")] {
+            let raster = |scale: f32, origin: (f64, f64)| {
+                let mut core = RenderStateCore::new(CursorConfig::default());
+                core.pos = (origin.0 + 400.0, origin.1 + 300.0);
+                core.placed = true;
+                core.idle_alpha = 1.0;
+                core.visible = true;
+                core.session_label = label.map(str::to_owned);
+                render_frame(
+                    &core,
+                    (800.0 * scale) as u32,
+                    (600.0 * scale) as u32,
+                    origin.0,
+                    origin.1,
+                    None,
+                    scale,
+                )
+            };
+            let reference = bounds(&raster(1.0, (0.0, 0.0)));
+            // 320x240 at 1x and 2x Retina both downsample this source; 1x/2x
+            // desktop scales remain included in the same actual-pixel check.
+            for scale in [0.4, 0.8, 1.0, 2.0] {
+                for origin in [(0.0, 0.0), (-1200.0, -300.0)] {
+                    let actual = bounds(&raster(scale, origin));
+                    for (edge, expected) in actual.into_iter().zip(reference) {
+                        assert!((edge - expected * f64::from(scale)).abs() <= 3.0,
+                            "misplaced/scaled raster: scale={scale}, origin={origin:?}, label={label:?}, actual={actual:?}, reference={reference:?}");
+                    }
+                }
+            }
+        }
     }
 
     /// The compiled artifact contains vector geometry. Skia must rasterize it

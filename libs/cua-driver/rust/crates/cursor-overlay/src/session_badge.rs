@@ -317,7 +317,11 @@ pub fn session_badge_layout(input: SessionBadgeInput<'_>) -> Option<SessionBadge
     let Some(font) = font() else {
         return None;
     };
-    let scale = input.backing_scale.max(1.0);
+    let scale = if input.backing_scale.is_finite() && input.backing_scale > 0.0 {
+        input.backing_scale
+    } else {
+        1.0
+    };
     let label_alpha = input.label_alpha.clamp(0.0, 1.0);
     let chip_alpha = input.chip_alpha.clamp(0.0, 1.0);
     let show_label = input.label.is_some() && label_alpha > 0.001;
