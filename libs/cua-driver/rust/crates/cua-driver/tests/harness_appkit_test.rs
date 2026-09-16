@@ -349,17 +349,18 @@ fn harness_appkit_editor_identity_diversion() {
     run_editor_identity_case("divert");
 }
 
-fn run_typing_preexisting_case(key_mode: &str) {
+#[test]
+#[ignore]
+fn harness_appkit_typing_preexisting_ax_noop() {
     let journal = tempfile::tempdir().unwrap();
     let trace = journal.path().join("typing-preexisting.jsonl");
     run_background_case_with_env(
-        &format!("typing_preexisting_{key_mode}"),
+        "typing_preexisting_ax_noop",
         Targeting::Ax,
-        DriverRoute::MacosCgEventPid,
+        DriverRoute::MacosAxValue,
         &[
             ("CUA_APPKIT_EDITOR_TRANSITION", "stable"),
             ("CUA_APPKIT_EDITOR_INITIAL", "hello"),
-            ("CUA_APPKIT_EDITOR_KEYS", key_mode),
             ("CUA_APPKIT_EDITOR_TRACE", trace.to_str().unwrap()),
         ],
         |pid, wid, driver| {
@@ -375,7 +376,7 @@ fn run_typing_preexisting_case(key_mode: &str) {
             let after = snapshot_elements(driver, pid, wid);
             let raw = std::fs::read_to_string(&trace).expect("app-owned key journal");
             eprintln!(
-                "preexisting key_mode={key_mode}; response={}; journal={raw}; snapshot={}",
+                "preexisting AX response={}; journal={raw}; snapshot={}",
                 response.raw,
                 after.tree_text()
             );
@@ -383,51 +384,24 @@ fn run_typing_preexisting_case(key_mode: &str) {
                 .lines()
                 .map(|line| serde_json::from_str(line).unwrap())
                 .collect();
-            let last = rows.last().unwrap();
-            assert_eq!(rows[0]["target"], "hello");
-            assert_eq!(last["keys"], 5, "one payload without retry");
-            assert_eq!(last["transitions"], 0);
-            assert_eq!(last["focused"], "target");
-            assert!(rows.iter().all(|row| row["other"] == "hello"));
             assert_eq!(
-                last["target"],
-                match key_mode {
-                    "all" => "hellohello",
-                    "first" => "helloh",
-                    "drop" => "hello",
-                    _ => unreachable!(),
-                }
+                rows.len(),
+                1,
+                "no key input or retry after the accepted AX write"
             );
-            let output = response.structured();
-            if key_mode == "all" {
-                assert!(!response.is_error());
-                assert_eq!(output["effect"], "confirmed");
-            } else {
-                assert_ne!(
-                    output["effect"], "confirmed",
-                    "pre-existing payload cannot confirm the new insertion"
-                );
-            }
+            assert_eq!(rows[0]["target"], "hello");
+            assert_eq!(rows[0]["other"], "hello");
+            assert_eq!(rows[0]["keys"], 0);
+            assert_eq!(rows[0]["transitions"], 0);
+            assert!(!response.is_error());
+            assert_eq!(response.structured()["route"], "accessibility");
+            assert_ne!(
+                response.structured()["effect"],
+                "confirmed",
+                "an unchanged pre-existing payload cannot confirm the new insertion"
+            );
         },
     );
-}
-
-#[test]
-#[ignore]
-fn harness_appkit_typing_preexisting_drop() {
-    run_typing_preexisting_case("drop");
-}
-
-#[test]
-#[ignore]
-fn harness_appkit_typing_preexisting_prefix() {
-    run_typing_preexisting_case("first");
-}
-
-#[test]
-#[ignore]
-fn harness_appkit_typing_preexisting_append() {
-    run_typing_preexisting_case("all");
 }
 
 fn run_editor_sequence_case(mode: &str, ambiguous: bool) {

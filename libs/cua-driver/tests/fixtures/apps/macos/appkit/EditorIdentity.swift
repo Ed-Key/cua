@@ -1,8 +1,8 @@
 import AppKit
 
-// Opt-in input/readback diagnostic. A key-only control makes the selected
-// input route explicit: AX string setters are not implemented. No timers or
-// external input drive transitions; the first received key triggers them.
+// Opt-in input/readback diagnostic. Text changes only on key delivery.
+// AppKit may acknowledge an AXSelectedText write without changing this view.
+// No timers or external input drive transitions; the first key triggers them.
 final class IdentityTextField: NSView {
     var value: String = "" { didSet { needsDisplay = true } }
     var onKey: ((IdentityTextField, String) -> Void)?
@@ -47,7 +47,6 @@ final class EditorIdentityFixture {
     private var retired: [IdentityTextField] = []
     private let mode: String
     private let trace: String
-    private let keyMode: String
     private var keys = 0
     private var transitions = 0
 
@@ -57,9 +56,6 @@ final class EditorIdentityFixture {
               let trace = environment["CUA_APPKIT_EDITOR_TRACE"] else { return nil }
         self.mode = mode
         self.trace = trace
-        let keyMode = environment["CUA_APPKIT_EDITOR_KEYS"] ?? "all"
-        guard ["all", "drop", "first"].contains(keyMode) else { return nil }
-        self.keyMode = keyMode
         row.orientation = .horizontal
         row.spacing = 12
         configure(target, id: "txt-transition-target", label: "Transition target")
@@ -102,7 +98,7 @@ final class EditorIdentityFixture {
             // already populated field, which deliberately ignores later keys.
             transitions += 1
             row.window?.makeFirstResponder(other)
-        } else if field === target && (keyMode == "all" || (keyMode == "first" && keys == 1)) {
+        } else if field === target {
             target.value += key
         }
         NSAccessibility.post(element: target, notification: .valueChanged)
@@ -113,7 +109,7 @@ final class EditorIdentityFixture {
         let focused = row.window?.firstResponder === target ? "target"
             : row.window?.firstResponder === other ? "other" : "none"
         let state: [String: Any] = [
-            "phase": phase, "mode": mode, "keyMode": keyMode, "key": key, "keys": keys,
+            "phase": phase, "mode": mode, "key": key, "keys": keys,
             "transitions": transitions, "target": target.value,
             "other": other.value, "focused": focused,
             "retired": retired.map { $0.value }
