@@ -253,6 +253,98 @@ fn run_background_case_with_env(
 
 // ── tests ────────────────────────────────────────────────────────────────────
 
+fn run_editor_identity_case(mode: &str) {
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("editor-identity.jsonl");
+    run_background_case_with_env(
+        &format!("editor_identity_{mode}"),
+        Targeting::Ax,
+        DriverRoute::MacosCgEventPid,
+        &[
+            ("CUA_APPKIT_EDITOR_TRANSITION", mode),
+            ("CUA_APPKIT_EDITOR_TRACE", trace.to_str().unwrap()),
+        ],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            eprintln!(
+                "editor identity initial mode={mode}; snapshot={}",
+                before.raw
+            );
+            let token = element_token_by_id(&before, "txt-transition-target");
+            let response = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid, "window_id": wid, "element_token": token,
+                    "text": "hello", "delay_ms": 40, "delivery_mode": "background"
+                }),
+            );
+            let after = snapshot_elements(driver, pid, wid);
+            let raw = std::fs::read_to_string(&trace).expect("app-owned editor journal");
+            eprintln!(
+                "editor identity mode={mode}; response={}; journal={raw}; snapshot={}",
+                response.raw,
+                after.tree_text()
+            );
+            let rows: Vec<serde_json::Value> = raw
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let last = rows.last().expect("journal rows");
+            assert_eq!(last["keys"], 5, "fixture must receive every character once");
+            assert_eq!(
+                last["other"], "hello",
+                "other field must keep its initial text"
+            );
+            assert!(
+                response.structured()["route"] == "synthetic_events"
+                    || response.structured()["path"] == "key_events",
+                "must exercise post-keystroke readback: {}",
+                response.raw
+            );
+            if mode == "divert" {
+                assert_eq!(last["target"], "", "target deliberately took no text");
+                assert_eq!(last["transitions"], 1);
+                assert_ne!(
+                    response.structured()["effect"],
+                    "confirmed",
+                    "text in another field cannot confirm the requested edit"
+                );
+            } else {
+                assert_eq!(last["target"], "hello");
+                assert_eq!(last["transitions"], if mode == "replace" { 1 } else { 0 });
+                assert!(
+                    !response.is_error(),
+                    "complete edit reported an error: {}",
+                    response.raw
+                );
+                assert_eq!(
+                    response.structured()["effect"],
+                    "confirmed",
+                    "complete native edit should be confirmed when target identity is established"
+                );
+            }
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_identity_stable() {
+    run_editor_identity_case("stable");
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_identity_replacement() {
+    run_editor_identity_case("replace");
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_identity_diversion() {
+    run_editor_identity_case("divert");
+}
+
 /// A heartbeat is not the receipt for a setup click. Delayed setup input must
 /// be consumed before a background read enters its observation boundary.
 #[test]

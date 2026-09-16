@@ -104,6 +104,7 @@ final class LaggingTextField: NSTextField {
 // MARK: - Controller
 
 final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
+    private var editorIdentity: EditorIdentityFixture?
     let window: NSWindow
     let counterLabel = NSTextField(labelWithString: "counter=0")
     var counterValue = 0
@@ -214,6 +215,11 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             textInput.widthAnchor.constraint(equalToConstant: 240),
         ])
         content.addArrangedSubview(inputRow)
+
+        if let fixture = EditorIdentityFixture(environment: ProcessInfo.processInfo.environment) {
+            editorIdentity = fixture
+            content.addArrangedSubview(fixture.row)
+        }
 
         // click_target — a REAL NSButton so it is in the AX tree and addressable
         // by element_index (AppKit NSButton ignores synthetic pixel clicks, but
