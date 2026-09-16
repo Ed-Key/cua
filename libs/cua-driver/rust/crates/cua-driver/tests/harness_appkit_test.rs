@@ -1661,10 +1661,107 @@ fn harness_appkit_type_text_background() {
     );
 }
 
+// Isolate the existing native focus helper from input and verification timing.
+fn run_typing_preparation_probe(prepare: bool) {
+    use core_foundation::{base::TCFType, string::CFString};
+    use platform_macos::ax::bindings::*;
+    let label = if prepare { "focused" } else { "unprepared" };
+    run_background_case_with_env(
+        &format!("typing_preparation_{label}"),
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[],
+        |pid, wid, driver| {
+            // Reuse the independent native tree's retain owner. The preparation
+            // is a fixture diagnostic, not a second driver or input retry.
+            let native = slice_a_tree(pid, wid);
+            assert!(!native.truncated);
+            let field = native
+                .nodes
+                .iter()
+                .find(|node| node.identifier.as_deref() == Some("txt-input"))
+                .expect("native fixture text field");
+            assert_eq!(field.role, "AXTextField");
+            assert!(field.element_index.is_some());
+            let ptr = field.element_ptr;
+            let evidence = || {
+                let mut writable = 0;
+                let name = CFString::new("AXSelectedText");
+                let error = unsafe {
+                    AXUIElementIsAttributeSettable(
+                        ptr as AXUIElementRef,
+                        name.as_concrete_TypeRef(),
+                        &mut writable,
+                    )
+                };
+                serde_json::json!({
+                    "focused": platform_macos::input::ax_actions::is_element_focused(pid as i32, ptr),
+                    "value": unsafe { copy_string_attr(ptr as AXUIElementRef, "AXValue") },
+                    "selected_text_settable_error": error,
+                    "selected_text_settable": if error == kAXErrorSuccess { Some(writable != 0) } else { None },
+                })
+            };
+            let before = evidence();
+            assert_eq!(before["focused"], false, "fresh field starts unfocused");
+            assert_eq!(before["value"], "");
+            let preparation_started = std::time::Instant::now();
+            if prepare {
+                platform_macos::input::ax_actions::focus_element(ptr).unwrap();
+            }
+            let prepared = evidence();
+            let preparation_ms = preparation_started.elapsed().as_millis();
+            assert_eq!(prepared["focused"], prepare, "check actual focus identity");
+            assert_eq!(prepared["value"], "", "preparation cannot insert text");
+            let snapshot = snapshot_elements(driver, pid, wid);
+            let started = std::time::Instant::now();
+            let response = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid":pid,"window_id":wid,
+                    "element_token":element_token_by_id(&snapshot,"txt-input"),
+                    "text":"focus-cua","delivery_mode":"background"
+                }),
+            );
+            let call_ms = started.elapsed().as_millis();
+            let after = slice_a_tree(pid, wid);
+            let value = after
+                .nodes
+                .iter()
+                .find(|node| node.identifier.as_deref() == Some("txt-input"))
+                .and_then(|node| node.value.as_deref())
+                .expect("fresh native field value");
+            eprintln!(
+                "typing preparation {}",
+                serde_json::json!({
+                    "prepare":prepare,"before":before,"prepared":prepared,
+                    "preparation_ms":preparation_ms,"call_ms":call_ms,
+                    "response":response.raw,"native_after":value,
+                })
+            );
+            assert!(!response.is_error(), "{}", response.raw);
+            assert_eq!(value, "focus-cua", "exact native field contents");
+            assert_eq!(response.structured()["effect"], "confirmed");
+            assert_eq!(response.structured()["delivery"]["delivered_count"], 9);
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_typing_preparation_unprepared() {
+    run_typing_preparation_probe(false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_typing_preparation_focused() {
+    run_typing_preparation_probe(true);
+}
+
 /// A field whose `AXValue` catches up with the write over the next second is
 /// not a partially typed field. The AX rung used to read the value back once,
 /// microseconds after the write returned, and published the prefix it caught
-/// as `type_text_incomplete` — measured in Contacts as "delivered 6 of 14"
+/// as `type_text_incomplete`: measured in Contacts as "delivered 6 of 14"
 /// for a phone number the card in fact held in full.
 #[test]
 #[ignore]
