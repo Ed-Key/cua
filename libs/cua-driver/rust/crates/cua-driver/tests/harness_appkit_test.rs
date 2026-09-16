@@ -1719,7 +1719,9 @@ fn run_value_notification_probe(
 ) {
     use core_foundation::base::{CFType, CFTypeRef, TCFType};
     use platform_macos::ax::bindings::{copy_children, copy_string_attr, AXUIElementRef};
-    let label = if sibling {
+    let label = if sibling && prepare {
+        "sibling_prepared"
+    } else if sibling {
         "sibling"
     } else if require_notification {
         "regression"
@@ -1849,7 +1851,7 @@ fn run_value_notification_probe(
                     "do not submit the field to obtain a notification"
                 );
                 assert_eq!(after["counter"], "counter=0");
-                if sibling {
+                if sibling && !prepare {
                     assert_eq!(
                         after["focused"], false,
                         "semantic-only delivery must not gain a focus mutation"
@@ -1895,6 +1897,15 @@ fn harness_appkit_set_value_notifies_without_commit() {
 #[ignore]
 fn harness_appkit_set_value_semantic_only_preserves_focus() {
     run_value_notification_probe(false, false, false, true);
+}
+
+// Operator probe: isolate exact-element AX preparation from the product's
+// conservative keyboard eligibility check. It must keep all background oracles
+// while notifying the target's delegate with a competing same-PID window.
+#[test]
+#[ignore]
+fn harness_appkit_value_notification_sibling_prepared() {
+    run_value_notification_probe(true, false, true, true);
 }
 
 // Isolate the existing native focus helper from input and verification timing.
