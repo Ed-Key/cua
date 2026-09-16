@@ -58,7 +58,7 @@ impl ObserverUpdate {
         }
     }
 
-    fn validate(&self) -> anyhow::Result<()> {
+    pub(crate) fn validate(&self) -> anyhow::Result<()> {
         anyhow::ensure!(self.version == 1, "unsupported preview protocol");
         anyhow::ensure!(self.generation > 0, "invalid preview generation");
         anyhow::ensure!(

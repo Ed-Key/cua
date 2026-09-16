@@ -2,16 +2,21 @@
 //! The caller installs `publish` on the dedicated core preview worker so pipe
 //! backpressure cannot reach an action task.
 
+use std::collections::BTreeMap;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
-use cua_driver_core::pip_hook::PipCaptureRequest;
+use cua_driver_core::pip_hook::{PipCaptureRequest, PipSessionSnapshot};
 use pip_preview::observer::{write_update, ObserverUpdate, WindowTarget};
+use pip_preview::session_observer::{write_snapshot, ObserverSnapshot};
 
 pub struct ObserverProcess {
     child: Child,
     input: ChildStdin,
     generation: u64,
     target: Option<WindowTarget>,
+    sessions: BTreeMap<String, (u64, ObserverUpdate)>,
+    next_preview_id: u64,
+    revision: u64,
 }
 
 impl ObserverProcess {
@@ -39,6 +44,9 @@ impl ObserverProcess {
             input,
             generation: 0,
             target: None,
+            sessions: BTreeMap::new(),
+            next_preview_id: 0,
+            revision: 0,
         })
     }
 
@@ -59,6 +67,57 @@ impl ObserverProcess {
         }
         update.generation = self.generation;
         write_update(&mut self.input, &update).is_ok()
+    }
+
+    pub fn publish_sessions(&mut self, snapshot: PipSessionSnapshot) -> bool {
+        let result = self.send_sessions(snapshot);
+        if let Err(error) = &result {
+            tracing::warn!(%error, "PiP observer disabled; input remains available");
+        }
+        result.is_ok()
+    }
+
+    fn send_sessions(&mut self, snapshot: PipSessionSnapshot) -> anyhow::Result<()> {
+        self.sessions
+            .retain(|session, _| snapshot.contains_key(session));
+        for (session, request) in snapshot {
+            let mut update = ObserverUpdate::new(
+                1,
+                request.window_id,
+                request.pid,
+                &request.action_label,
+                request.timestamp_ms,
+            );
+            let id = if let Some((id, previous)) = self.sessions.get(&session) {
+                update.generation = previous.generation;
+                if previous.target != update.target {
+                    update.generation = update
+                        .generation
+                        .checked_add(1)
+                        .ok_or_else(|| anyhow::anyhow!("preview generation exhausted"))?;
+                }
+                *id
+            } else {
+                self.next_preview_id = self
+                    .next_preview_id
+                    .checked_add(1)
+                    .ok_or_else(|| anyhow::anyhow!("preview IDs exhausted"))?;
+                self.next_preview_id
+            };
+            self.sessions.insert(session, (id, update));
+        }
+        self.revision = self
+            .revision
+            .checked_add(1)
+            .ok_or_else(|| anyhow::anyhow!("preview revision exhausted"))?;
+        write_snapshot(
+            &mut self.input,
+            &ObserverSnapshot {
+                version: 2,
+                revision: self.revision,
+                previews: self.sessions.values().cloned().collect(),
+            },
+        )
     }
 }
 
@@ -211,6 +270,62 @@ mod tests {
     }
 
     #[test]
+    fn sessions_keep_independent_ids_and_generations_across_the_actual_pipe() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("sessions.jsonl");
+        let mut command = Command::new("/bin/sh");
+        command
+            .args(["-c", "exec /usr/bin/head -n 4 > \"$1\"", "preview-test"])
+            .arg(&path);
+        let mut observer = ObserverProcess::spawn_command(&mut command).unwrap();
+        let mut sessions = PipSessionSnapshot::from([
+            ("private-a".into(), request(Some(7))),
+            ("private-b".into(), request(Some(8))),
+        ]);
+        assert!(observer.publish_sessions(sessions.clone()));
+        sessions.insert("private-a".into(), request(Some(9)));
+        assert!(observer.publish_sessions(sessions.clone()));
+        sessions.remove("private-a");
+        assert!(observer.publish_sessions(sessions.clone()));
+        sessions.insert("private-c".into(), request(Some(7)));
+        assert!(observer.publish_sessions(sessions));
+        wait_for_exit(&mut observer.child);
+        let text = std::fs::read_to_string(path).unwrap();
+        assert!(
+            !text.contains("private-"),
+            "runtime session identity leaked to helper"
+        );
+        let updates: Vec<serde_json::Value> = text
+            .lines()
+            .map(|s| serde_json::from_str(s).unwrap())
+            .collect();
+        assert_eq!(updates[0]["previews"]["1"]["target"]["window_id"], 7);
+        assert_eq!(updates[0]["previews"]["2"]["target"]["window_id"], 8);
+        assert_eq!(updates[1]["previews"]["1"]["generation"], 2);
+        assert_eq!(updates[1]["previews"]["2"]["generation"], 1);
+        assert_eq!(
+            updates[2]["previews"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["2"]
+        );
+        assert_eq!(updates[3]["previews"]["3"]["target"]["window_id"], 7);
+        assert_eq!(
+            updates
+                .iter()
+                .map(|s| s["revision"].as_u64().unwrap())
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3, 4]
+        );
+        assert!(
+            !observer.publish_sessions(PipSessionSnapshot::new()),
+            "closed pipe remained available"
+        );
+    }
+
+    #[test]
     fn dropping_observer_reaps_its_owned_process() {
         let mut command = Command::new("/bin/sh");
         command.args(["-c", "exec sleep 60"]);
@@ -251,7 +366,10 @@ mod tests {
             entered.send(()).unwrap();
             let mut delivered = 0;
             for _ in 0..100_000 {
-                if !observer.publish(request(Some(7))) {
+                if !observer.publish_sessions(PipSessionSnapshot::from([(
+                    "stalled-agent".into(),
+                    request(Some(7)),
+                )])) {
                     break;
                 }
                 delivered += 1;

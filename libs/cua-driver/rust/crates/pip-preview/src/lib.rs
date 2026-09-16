@@ -17,6 +17,7 @@
 use std::sync::OnceLock;
 
 pub mod observer;
+pub mod session_observer;
 
 /// Canonical `~/.cua-driver/config.json` path matching what the per-platform
 /// `set_config` tools write to. Resolves `$HOME` first (Unix/macOS) and falls
