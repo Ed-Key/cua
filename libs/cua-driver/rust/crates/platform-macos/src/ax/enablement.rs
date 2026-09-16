@@ -120,14 +120,18 @@ fn next_attempt(
 
 fn wait_outcome(
     opt_in: AccessibilityOptIn,
+    known_chromium: bool,
     prior_timeouts: u32,
     attempted_at: Instant,
     await_tree: impl FnOnce() -> bool,
 ) -> Option<Wait> {
     match opt_in {
         AccessibilityOptIn::NotAccepted => None,
-        AccessibilityOptIn::EnhancedUserInterface => Some(Wait::Complete),
-        AccessibilityOptIn::ManualAccessibility => Some(if await_tree() {
+        AccessibilityOptIn::EnhancedUserInterfaceUnconfirmed if !known_chromium => None,
+        AccessibilityOptIn::EnhancedUserInterface if !known_chromium => Some(Wait::Complete),
+        AccessibilityOptIn::ManualAccessibility
+        | AccessibilityOptIn::EnhancedUserInterface
+        | AccessibilityOptIn::EnhancedUserInterfaceUnconfirmed => Some(if await_tree() {
             Wait::Complete
         } else {
             Wait::TimedOut {
@@ -228,20 +232,31 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
     // expose a native-only web tree before its debounced full mode is ready;
     // AXPress then acknowledges the first control without reaching the renderer.
     // Keep the bounded web-content wait on the ordinary enablement path.
-    let outcome = wait_outcome(
-        enable_chromium_accessibility(app_element),
-        prior_timeouts,
-        attempted_at,
-        || {
-            await_web_content(
-                || probe_web_content(app_element),
-                || {
-                    enable_chromium_accessibility(app_element);
-                },
-                pump_for,
-            )
-        },
+    let opt_in = enable_chromium_accessibility(app_element);
+    // Chrome can schedule its legacy opt-in before the superclass setter
+    // returns NotImplemented. Scope this uncertainty to known Chromium apps;
+    // unrelated native applications must not pay a web-content wait.
+    let known_chromium = matches!(
+        opt_in,
+        AccessibilityOptIn::EnhancedUserInterface
+            | AccessibilityOptIn::EnhancedUserInterfaceUnconfirmed
+    ) && crate::browser::platform::is_chromium(
+        &crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
+        &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
     );
+    let outcome = wait_outcome(opt_in, known_chromium, prior_timeouts, attempted_at, || {
+        await_web_content(
+            || probe_web_content(app_element),
+            || {
+                // Repeated legacy requests restart Chromium's debounce
+                // timer. Only the modern Electron path needs reassertion.
+                if opt_in == AccessibilityOptIn::ManualAccessibility {
+                    enable_chromium_accessibility(app_element);
+                }
+            },
+            pump_for,
+        )
+    });
     if let (Some(stamp), Some(wait)) = (stamp, outcome) {
         if let Ok(mut state) = ENABLEMENT_STATE.lock() {
             state.insert(pid, ProcessEnablement { stamp, wait });
@@ -341,7 +356,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_manual_accessibility_path_polls_for_web_content() {
+    fn unrelated_native_legacy_paths_do_not_poll_for_web_content() {
         let now = Instant::now();
         let polls = Cell::new(0u32);
         let probe = || {
@@ -350,18 +365,24 @@ mod tests {
         };
 
         assert_eq!(
-            wait_outcome(AccessibilityOptIn::EnhancedUserInterface, 0, now, probe),
+            wait_outcome(
+                AccessibilityOptIn::EnhancedUserInterface,
+                false,
+                0,
+                now,
+                probe
+            ),
             Some(Wait::Complete),
             "an app that only accepts AXEnhancedUserInterface has no web area to wait for"
         );
         assert_eq!(
-            wait_outcome(AccessibilityOptIn::NotAccepted, 0, now, probe),
+            wait_outcome(AccessibilityOptIn::NotAccepted, false, 0, now, probe),
             None
         );
         assert_eq!(
             polls.get(),
             0,
-            "only the Chromium opt-in may pay the materialization wait"
+            "unrelated native apps must not pay the materialization wait"
         );
     }
 
@@ -370,7 +391,13 @@ mod tests {
         let now = Instant::now();
         let stamp = (100, 10);
 
-        let wait = wait_outcome(AccessibilityOptIn::ManualAccessibility, 0, now, || true);
+        let wait = wait_outcome(
+            AccessibilityOptIn::ManualAccessibility,
+            false,
+            0,
+            now,
+            || true,
+        );
         assert_eq!(wait, Some(Wait::Complete));
 
         let cached = ProcessEnablement {
@@ -390,7 +417,13 @@ mod tests {
         let stamp = (100, 10);
         let backoff = Duration::from_secs_f64(MATERIALIZE_RETRY_BACKOFF_SECONDS);
 
-        let wait = wait_outcome(AccessibilityOptIn::ManualAccessibility, 0, now, || false);
+        let wait = wait_outcome(
+            AccessibilityOptIn::ManualAccessibility,
+            false,
+            0,
+            now,
+            || false,
+        );
         assert_eq!(
             wait,
             Some(Wait::TimedOut {
@@ -487,6 +520,67 @@ mod tests {
             !log.iter()
                 .any(|e| e == &format!("settle:{CHROMIUM_SETTLE_SECONDS}")),
             "no post-materialization settle when nothing materialized"
+        );
+    }
+}
+
+#[cfg(test)]
+mod legacy_tests {
+    use super::*;
+
+    #[test]
+    fn unconfirmed_legacy_request_requires_observed_web_content() {
+        let now = Instant::now();
+        assert_eq!(
+            wait_outcome(
+                AccessibilityOptIn::EnhancedUserInterfaceUnconfirmed,
+                true,
+                0,
+                now,
+                || true
+            ),
+            Some(Wait::Complete)
+        );
+        assert_eq!(
+            wait_outcome(
+                AccessibilityOptIn::EnhancedUserInterfaceUnconfirmed,
+                true,
+                0,
+                now,
+                || false
+            ),
+            Some(Wait::TimedOut {
+                attempts: 1,
+                attempted_at: now
+            })
+        );
+        assert_eq!(
+            wait_outcome(
+                AccessibilityOptIn::EnhancedUserInterfaceUnconfirmed,
+                false,
+                0,
+                now,
+                || panic!("native app must not poll for web content")
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn accepted_legacy_chromium_request_still_waits_for_its_renderer() {
+        let now = Instant::now();
+        assert_eq!(
+            wait_outcome(
+                AccessibilityOptIn::EnhancedUserInterface,
+                true,
+                0,
+                now,
+                || false
+            ),
+            Some(Wait::TimedOut {
+                attempts: 1,
+                attempted_at: now
+            })
         );
     }
 }
