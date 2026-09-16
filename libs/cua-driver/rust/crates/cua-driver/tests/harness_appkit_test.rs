@@ -345,6 +345,136 @@ fn harness_appkit_editor_identity_diversion() {
     run_editor_identity_case("divert");
 }
 
+fn run_editor_sequence_case(mode: &str, ambiguous: bool) {
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("editor-sequence.jsonl");
+    run_background_case_with_env(
+        &format!(
+            "editor_sequence_{}",
+            if ambiguous { "ambiguous" } else { mode }
+        ),
+        Targeting::Ax,
+        DriverRoute::MacosCgEventPid,
+        &[
+            ("CUA_APPKIT_EDITOR_TRANSITION", mode),
+            ("CUA_APPKIT_EDITOR_TRACE", trace.to_str().unwrap()),
+        ],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let target = element_token_by_id(&before, "txt-transition-target");
+            let increment = element_token_by_id(&before, "btn-increment");
+            let selector = if ambiguous {
+                serde_json::json!({"role":"AXTextField"})
+            } else {
+                serde_json::json!({"role":"AXTextField","label_contains":"Transition target"})
+            };
+            let response = driver.call(
+                "run_sequence",
+                serde_json::json!({
+                    "pid":pid,"window_id":wid,
+                    "steps":[
+                        {"tool":"click","arguments":{"element_token":target},
+                         "expect":[{"element":{
+                             "selector":{"role":"AXTextField","label_contains":"Transition target"},
+                             "value_equals":""}}],"timeout_ms":1000,"stable_samples":2},
+                        {"tool":"type_text","arguments":{"text":"hello"},
+                         "expect":[{"element":{"selector":selector,"value_equals":"hello"}}],
+                         "timeout_ms":1000,"stable_samples":2},
+                        {"tool":"click","arguments":{"element_token":increment},
+                         "expect":[{"element":{
+                             "selector":{"role":"AXStaticText","label_contains":"counter="},
+                             "value_equals":"counter=1"}}],"timeout_ms":1000,"stable_samples":2}
+                    ]
+                }),
+            );
+            let after = snapshot_elements(driver, pid, wid);
+            let raw = std::fs::read_to_string(&trace).expect("app-owned editor journal");
+            eprintln!("editor sequence mode={mode} ambiguous={ambiguous}; response={}; journal={raw}; snapshot={}",
+                response.raw, after.raw);
+            let rows: Vec<serde_json::Value> = raw
+                .lines()
+                .map(|line| serde_json::from_str(line).unwrap())
+                .collect();
+            let last = rows.last().unwrap();
+            assert_eq!(last["keys"], 5, "one payload, with no retries");
+            assert_eq!(last["target"], if mode == "divert" { "" } else { "hello" });
+            assert_eq!(last["other"], "hello");
+            assert!(!response.is_error(), "{}", response.raw);
+            let output = response.structured();
+            let steps = output["steps"].as_array().unwrap();
+            let stopped = mode == "divert" || ambiguous;
+            assert_eq!(
+                output["status"],
+                if stopped { "stopped" } else { "completed" }
+            );
+            assert_eq!(steps.len(), if stopped { 2 } else { 3 });
+            if stopped {
+                assert_eq!(output["stopped_at"], 1);
+                assert!(
+                    after.tree_text().contains("counter=0"),
+                    "later click must not execute"
+                );
+                assert!(!after.tree_text().contains("counter=1"));
+                if ambiguous {
+                    assert_eq!(output["stop_reason"], "unknown");
+                    assert_eq!(steps[1]["verification"]["status"], "unknown");
+                    assert_eq!(
+                        steps[1]["verification"]["predicates"][0]["unknown_reason"],
+                        "multi_match"
+                    );
+                } else if steps[1]["action"]["effect"] == "confirmed" {
+                    assert_eq!(
+                        output["stop_reason"], "unsatisfied",
+                        "fresh target evidence must override the incorrect action confirmation"
+                    );
+                } else {
+                    assert_eq!(output["stop_reason"], "action_error");
+                }
+            } else {
+                assert!(after.tree_text().contains("counter=1"));
+                assert!(!after.tree_text().contains("counter=0"));
+                for step in steps {
+                    assert_eq!(step["verification"]["status"], "satisfied");
+                    assert_eq!(step["verification"]["stable"], true);
+                    assert!(step["observation_count"].as_u64().unwrap() >= 2);
+                }
+            }
+            for step in steps {
+                assert_eq!(step["image_bytes_returned"], 0);
+            }
+            assert!(response.raw["result"]["content"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .all(|block| block["type"] != "image"));
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_sequence_stable() {
+    run_editor_sequence_case("stable", false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_sequence_replacement() {
+    run_editor_sequence_case("replace", false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_sequence_diversion() {
+    run_editor_sequence_case("divert", false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_editor_sequence_ambiguous() {
+    run_editor_sequence_case("stable", true);
+}
+
 /// A heartbeat is not the receipt for a setup click. Delayed setup input must
 /// be consumed before a background read enters its observation boundary.
 #[test]
