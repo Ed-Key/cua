@@ -1898,6 +1898,158 @@ fn harness_appkit_value_notification_sibling_prepared() {
     run_value_notification_probe(true, false, true, true);
 }
 
+// Exercise two real AppKit field editors, including a preexisting sibling
+// draft. The app-owned labels expose both change and end-editing callbacks.
+#[test]
+#[ignore]
+fn harness_appkit_set_value_two_editable_windows() {
+    use core_foundation::base::{CFType, CFTypeRef, TCFType};
+    use platform_macos::ax::bindings::{copy_children, copy_string_attr, AXUIElementRef};
+    run_background_case_with_env(
+        "set_value_two_editable_windows",
+        Targeting::Ax,
+        DriverRoute::MacosAxValue,
+        &[("CUA_HARNESS_BRING_TO_FRONT_MODE", "editable")],
+        |pid, wid, driver| {
+            let listing = driver.call("list_windows", serde_json::json!({"pid":pid}));
+            let siblings: Vec<_> = listing.structured()["windows"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|w| w["pid"] == pid && w["title"] == "CuaTestHarness AppKit Secondary")
+                .filter_map(|w| w["window_id"].as_u64())
+                .collect();
+            assert_eq!(siblings.len(), 1);
+            let sibling_wid = siblings[0];
+            assert_ne!(wid, sibling_wid);
+            // Keep both independent AX trees alive for their retained pointers.
+            let main_tree = slice_a_tree(pid, wid);
+            let sibling_tree = slice_a_tree(pid, sibling_wid);
+            assert!(!main_tree.truncated && !sibling_tree.truncated);
+            let main_ptr = main_tree
+                .nodes
+                .iter()
+                .find(|n| n.role == "AXWindow")
+                .unwrap()
+                .element_ptr;
+            let sibling_ptr = sibling_tree
+                .nodes
+                .iter()
+                .find(|n| n.role == "AXWindow")
+                .unwrap()
+                .element_ptr;
+            let read = |ptr: usize, ids: &[&str]| {
+                let children: Vec<CFType> = unsafe {
+                    copy_children(ptr as AXUIElementRef)
+                        .into_iter()
+                        .map(|p| CFType::wrap_under_create_rule(p as CFTypeRef))
+                        .collect()
+                };
+                ids.iter()
+                    .map(|id| {
+                        let matches: Vec<_> = children
+                            .iter()
+                            .filter(|c| unsafe {
+                                copy_string_attr(c.as_CFTypeRef() as AXUIElementRef, "AXIdentifier")
+                                    .as_deref()
+                                    == Some(*id)
+                            })
+                            .collect();
+                        assert_eq!(matches.len(), 1, "unique fixture value {id}");
+                        unsafe {
+                            copy_string_attr(matches[0].as_CFTypeRef() as AXUIElementRef, "AXValue")
+                        }
+                        .expect("readable fixture value")
+                    })
+                    .collect::<Vec<_>>()
+            };
+            let observe = || {
+                serde_json::json!({
+                    "main":read(main_ptr, &["txt-input", "lbl-input-mirror", "lbl-input-commit", "lbl-counter"]),
+                    "sibling":read(sibling_ptr, &["txt-sibling-input", "lbl-sibling-mirror", "lbl-sibling-commit"])
+                })
+            };
+            let initial = observe();
+            assert_eq!(
+                initial["main"],
+                serde_json::json!(["", "", "committed=none", "counter=0"])
+            );
+            assert_eq!(
+                initial["sibling"],
+                serde_json::json!(["", "", "committed=none"])
+            );
+            let mut main_value = "";
+            let mut sibling_value = "";
+            for (target_wid, id, value) in [
+                (sibling_wid, "txt-sibling-input", "Sibling draft"),
+                (wid, "txt-input", "Main draft"),
+                (sibling_wid, "txt-sibling-input", "Sibling revised"),
+                (wid, "txt-input", "Main revised"),
+            ] {
+                let before = observe();
+                let snapshot = snapshot_elements(driver, pid, target_wid);
+                let response = driver.call(
+                    "set_value",
+                    serde_json::json!({
+                        "pid":pid, "window_id":target_wid,
+                        "element_token":element_token_by_id(&snapshot, id), "value":value
+                    }),
+                );
+                let after = observe();
+                eprintln!(
+                    "two editable windows {}",
+                    serde_json::json!({
+                        "target_window":target_wid,"value":value,"before":before,"after":after,"response":response.raw
+                    })
+                );
+                assert!(!response.is_error(), "{}", response.raw);
+                if target_wid == wid {
+                    main_value = value;
+                } else {
+                    sibling_value = value;
+                }
+                assert_eq!(
+                    after["main"],
+                    serde_json::json!([main_value, main_value, "committed=none", "counter=0"])
+                );
+                assert_eq!(
+                    after["sibling"],
+                    serde_json::json!([sibling_value, sibling_value, "committed=none"])
+                );
+            }
+            // Positive control: the commit oracle must change when the fixture
+            // deliberately ends sibling editing, while the main edit survives.
+            let snapshot = snapshot_elements(driver, pid, sibling_wid);
+            let response = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid":pid, "window_id":sibling_wid,
+                    "element_token":element_token_by_id(&snapshot, "btn-sibling-end-edit"),
+                    "delivery_mode":"background"
+                }),
+            );
+            let after = observe();
+            eprintln!(
+                "two editable commit control {}",
+                serde_json::json!({"after":after,"response":response.raw})
+            );
+            assert!(!response.is_error(), "{}", response.raw);
+            assert_eq!(
+                after["main"],
+                serde_json::json!([main_value, main_value, "committed=none", "counter=0"])
+            );
+            assert_eq!(
+                after["sibling"],
+                serde_json::json!([
+                    sibling_value,
+                    sibling_value,
+                    format!("committed={sibling_value}")
+                ])
+            );
+        },
+    );
+}
+
 // Isolate the existing native focus helper from input and verification timing.
 fn run_typing_preparation_probe(prepare: bool) {
     use core_foundation::{base::TCFType, string::CFString};
