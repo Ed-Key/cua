@@ -25,6 +25,7 @@ use async_trait::async_trait;
 use cua_driver_contract::TypeTextInput;
 use cua_driver_core::{
     protocol::ToolResult,
+    text_insertion::{classify_insertion, TextInsertionProgress as TypedProgress, TextSelectionRange},
     tool::{Tool, ToolDef},
     tool_args::parse_typed_projection,
 };
@@ -867,14 +868,6 @@ struct TypeTextOutcome {
     delivered_chars: Option<usize>,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum TypedProgress {
-    Complete,
-    Partial(usize),
-    Unchanged,
-    Unverifiable,
-}
-
 fn foreground_settle_ms(pid: i32, frontmost_pid: Option<i32>) -> u64 {
     if frontmost_pid == Some(pid) {
         20
@@ -892,35 +885,9 @@ fn foreground_settle_ms(pid: i32, frontmost_pid: Option<i32>) -> u64 {
 /// - `after` contains the complete text → `Complete`.
 /// - empty input text → trivially `Complete`.
 ///
-/// Otherwise classify an observable insertion without mistaking a prefix for
-/// complete delivery. A positive length delta is an exact delivered-character
-/// count for insert-at-cursor typing; it is capped at the request size
-/// defensively. Apps that normalize input (smart quotes, autocomplete) may fail
-/// the substring/length test even though something landed — we report it as
-/// unverified rather than erroring, so the agent can still confirm.
+#[cfg(test)]
 fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> TypedProgress {
-    if text.is_empty() {
-        return TypedProgress::Complete;
-    }
-    let Some(after) = after else {
-        return TypedProgress::Unverifiable;
-    };
-    if after.contains(text) {
-        return TypedProgress::Complete;
-    }
-    let Some(before) = before else {
-        return TypedProgress::Unverifiable;
-    };
-    let delivered = after
-        .chars()
-        .count()
-        .saturating_sub(before.chars().count())
-        .min(text.chars().count());
-    if delivered == 0 {
-        TypedProgress::Unchanged
-    } else {
-        TypedProgress::Partial(delivered)
-    }
+    classify_insertion(before, None, after, None, text)
 }
 
 /// Own the focused element only when it belongs to the requested window.
@@ -944,6 +911,7 @@ struct TypingReadback {
     window_id: Option<u32>,
     focused: Option<CFType>,
     before: Option<String>,
+    before_range: Option<TextSelectionRange>,
 }
 
 impl TypingReadback {
@@ -958,9 +926,34 @@ impl TypingReadback {
                 None
             },
             before: None,
+            before_range: None,
         };
-        readback.before = readback.read();
+        (readback.before, readback.before_range) = readback.sample();
         readback
+    }
+
+    fn selection(&self) -> Option<TextSelectionRange> {
+        let ptr = self
+            .element
+            .map(|(ptr, _)| ptr as AXUIElementRef)
+            .or_else(|| {
+                self.focused
+                    .as_ref()
+                    .map(|el| el.as_CFTypeRef() as AXUIElementRef)
+            })?;
+        unsafe { crate::ax::text_state::focused_range(self.pid, ptr) }
+    }
+
+    fn sample(
+        &self,
+    ) -> (
+        Option<String>,
+        Option<TextSelectionRange>,
+    ) {
+        let range = self.selection();
+        let value = self.read();
+        let after = self.selection();
+        (value, (range == after).then_some(range).flatten())
     }
 
     fn read(&self) -> Option<String> {
@@ -1130,6 +1123,9 @@ fn cgevent_type_verified(
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
     }
+    // Focus preparation can change the caret or selection. Sample immediately
+    // before posting input, while retaining the original target identity.
+    let (before, selection) = readback.sample();
     crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
 
     // CGEvent posting is asynchronous with respect to the renderer. In
@@ -1138,21 +1134,29 @@ fn cgevent_type_verified(
     // visible instead of treating any growth as success. If the deadline
     // expires after observable growth, surface the exact partial count.
     let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
-    Ok(await_typed_delivery(
-        readback.before.as_deref(),
+    Ok(delivery_from_progress(
+        await_typed_progress_with_selection(before.as_deref(), selection, text, deadline, || {
+            readback.sample()
+        }),
         text,
-        deadline,
-        || readback.read(),
     ))
 }
 
+#[cfg(test)]
 fn await_typed_delivery(
     before: Option<&str>,
     text: &str,
     deadline: std::time::Instant,
     read_value: impl FnMut() -> Option<String>,
 ) -> (bool, Option<usize>) {
-    match await_typed_progress(before, text, deadline, read_value) {
+    delivery_from_progress(
+        await_typed_progress(before, text, deadline, read_value),
+        text,
+    )
+}
+
+fn delivery_from_progress(progress: TypedProgress, text: &str) -> (bool, Option<usize>) {
+    match progress {
         TypedProgress::Complete => (true, Some(text.chars().count())),
         TypedProgress::Partial(delivered) => (false, Some(delivered)),
         TypedProgress::Unchanged => (false, Some(0)),
@@ -1163,39 +1167,49 @@ fn await_typed_delivery(
 /// Poll the target's read-back until it proves complete delivery or the
 /// deadline passes, and report the strongest reading observed.
 ///
-/// Both delivery rungs need this: neither a posted keystroke nor an accepted
-/// `AXSelectedText` write is applied by the time the call that sent it
-/// returns. Chromium acknowledges the posting process with a long tail still
-/// queued, and an AppKit field rebuilds its editor around the insertion —
-/// measured in Contacts, where the value read microseconds after the write
-/// held "(408) " of "(408) 961-1560" and was complete ~20 ms later. Sampling
-/// once turns that window into a false partial.
+#[cfg(test)]
 fn await_typed_progress(
     before: Option<&str>,
     text: &str,
     deadline: std::time::Instant,
     mut read_value: impl FnMut() -> Option<String>,
 ) -> TypedProgress {
+    await_typed_progress_with_selection(before, None, text, deadline, || (read_value(), None))
+}
+
+/// Settle the existing AX or keyboard readback without treating an old payload
+/// as proof of delivery. Unchanged ambiguous values may still be pending; poll
+/// them within the existing deadline and retain uncertainty if nothing resolves.
+fn await_typed_progress_with_selection(
+    before: Option<&str>,
+    selection: Option<TextSelectionRange>,
+    text: &str,
+    deadline: std::time::Instant,
+    mut read_value: impl FnMut() -> (
+        Option<String>,
+        Option<TextSelectionRange>,
+    ),
+) -> TypedProgress {
     let mut best_partial = None;
     loop {
-        let after = read_value();
-        match typed_progress(before, after.as_deref(), text) {
+        let (after, after_selection) = read_value();
+        let progress =
+            classify_insertion(before, selection, after.as_deref(), after_selection, text);
+        match progress {
             TypedProgress::Complete => return TypedProgress::Complete,
             TypedProgress::Partial(delivered) => {
                 best_partial =
                     Some(best_partial.map_or(delivered, |best: usize| best.max(delivered)));
             }
+            TypedProgress::Unverifiable if before.is_some() && after.as_deref() == before => {}
             TypedProgress::Unverifiable => return TypedProgress::Unverifiable,
-            TypedProgress::Unchanged => {
-                // A readable unchanged value is an observed zero-character
-                // delivery, not an unverifiable success.
-                best_partial.get_or_insert(0);
-            }
+            TypedProgress::Unchanged => {}
         }
         if std::time::Instant::now() >= deadline {
-            return match best_partial {
-                Some(delivered) if delivered > 0 => TypedProgress::Partial(delivered),
-                _ => TypedProgress::Unchanged,
+            return if progress == TypedProgress::Unverifiable {
+                progress
+            } else {
+                best_partial.map(TypedProgress::Partial).unwrap_or(progress)
             };
         }
         std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
@@ -1228,7 +1242,6 @@ fn type_text_blocking(
     // window-addressed request it must come from the exact target window,
     // never a same-process sibling.
     let readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
-    let before = &readback.before;
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -1396,11 +1409,12 @@ fn type_text_blocking(
         // app is still rebuilding is never reported as a partial insertion.
         let ax_progress = if err == kAXErrorSuccess {
             let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
-            Some(await_typed_progress(
-                before.as_deref(),
+            Some(await_typed_progress_with_selection(
+                readback.before.as_deref(),
+                readback.before_range,
                 text,
                 deadline,
-                || readback.read(),
+                || readback.sample(),
             ))
         } else {
             None
@@ -1499,6 +1513,84 @@ fn type_text_blocking(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typing_insertion_samples_selection_after_existing_focus_preparation() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        scope.value(0, Some("hello"));
+        scope.range(0, 5, 0);
+        scope.focus(Some(1), 42);
+        let readback =
+            TypingReadback::capture(-9880, Some((scope.element_ptr(0), Some(7))), Some(42));
+        assert_eq!(
+            readback.before_range, None,
+            "an unfocused range is not an active caret"
+        );
+        scope.focus(Some(0), 42);
+        let (before, selection) = readback.sample();
+        assert_eq!(
+            selection,
+            Some(TextSelectionRange {
+                location: 5,
+                length: 0
+            })
+        );
+        scope.value(0, Some("helloh"));
+        scope.range(0, 6, 0);
+        assert_eq!(
+            await_typed_progress_with_selection(
+                before.as_deref(),
+                selection,
+                "hello",
+                std::time::Instant::now(),
+                || readback.sample()
+            ),
+            TypedProgress::Partial(1)
+        );
+    }
+
+    #[test]
+    fn typing_insertion_waits_for_an_ambiguous_old_value_to_resolve() {
+        let mut values = [Some("hello".to_owned()), Some("hellohello".to_owned())].into_iter();
+        let mut reads = 0;
+        assert_eq!(
+            await_typed_progress(
+                Some("hello"),
+                "hello",
+                std::time::Instant::now() + std::time::Duration::from_secs(1),
+                || {
+                    reads += 1;
+                    values.next().flatten()
+                }
+            ),
+            TypedProgress::Complete
+        );
+        assert_eq!(reads, 2);
+    }
+
+    #[test]
+    fn typing_insertion_drain_preserves_an_observed_selected_deletion() {
+        assert_eq!(
+            await_typed_progress_with_selection(
+                Some("old"),
+                Some(TextSelectionRange {
+                    location: 0,
+                    length: 3
+                }),
+                "new",
+                std::time::Instant::now(),
+                || (
+                    Some(String::new()),
+                    Some(TextSelectionRange {
+                        location: 0,
+                        length: 0
+                    })
+                )
+            ),
+            TypedProgress::Partial(0),
+            "an applied edit must not enter another input route as unchanged"
+        );
+    }
+
     #[test]
     fn typing_insertion_preexisting_value_does_not_prove_new_input() {
         assert_eq!(
@@ -1807,7 +1899,7 @@ mod tests {
     fn large_atomic_ax_payloads_are_not_subject_to_the_synthesis_budget() {
         assert!(synthesis_preflight(TextDeliveryRoute::AtomicAx, 100_000, 200).is_none());
         assert_eq!(
-            typed_progress(None, Some(&"x".repeat(11_500)), &"x".repeat(11_500)),
+            typed_progress(Some(""), Some(&"x".repeat(11_500)), &"x".repeat(11_500)),
             TypedProgress::Complete,
             "a successful one-call AX insertion remains eligible regardless of size"
         );
@@ -1847,7 +1939,9 @@ mod tests {
             (Some(""), None, "hi", Unverifiable),
             (None, Some("h"), "hi", Unverifiable),
             (Some(""), Some("hi"), "hi", Complete),
-            (Some("ab"), Some("ab hi"), "hi", Complete),
+            (Some("ab"), Some("abhi"), "hi", Complete),
+            // A space the caller never typed appeared: not the requested insertion.
+            (Some("ab"), Some("ab hi"), "hi", Unverifiable),
             // An observable prefix is partial delivery, never completion.
             (
                 Some(""),
@@ -1855,7 +1949,9 @@ mod tests {
                 "BEGINpayloadEND",
                 Partial(12),
             ),
-            (Some("ab"), Some("ab"), "hi", Unchanged),
+            // Without a caret, an unchanged old value cannot distinguish dropped
+            // input from an identical replacement.
+            (Some("ab"), Some("ab"), "hi", Unverifiable),
             (None, None, "", Complete),
         ] {
             assert_eq!(
@@ -1906,11 +2002,21 @@ mod tests {
     #[test]
     fn a_write_the_field_never_took_stays_unchanged() {
         assert_eq!(
-            await_typed_progress(
+            await_typed_progress_with_selection(
                 Some("old"),
+                Some(TextSelectionRange {
+                    location: 3,
+                    length: 0
+                }),
                 "new value",
                 std::time::Instant::now(),
-                || Some("old".to_owned())
+                || (
+                    Some("old".to_owned()),
+                    Some(TextSelectionRange {
+                        location: 3,
+                        length: 0
+                    })
+                )
             ),
             TypedProgress::Unchanged
         );

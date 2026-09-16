@@ -258,6 +258,7 @@ thread_local! {
 struct TypingFocusFixture {
     elements: [usize; 2],
     values: [Option<String>; 2],
+    ranges: [Option<cua_driver_core::text_insertion::TextSelectionRange>; 2],
     focused: Option<usize>,
     window: u32,
     switch_on_read: bool,
@@ -279,6 +280,7 @@ impl TypingFocusScope {
                     .each_ref()
                     .map(|value| value.as_concrete_TypeRef() as usize),
                 values: [Some(String::new()), Some("hello".into())],
+                ranges: [None, None],
                 focused: Some(0),
                 window: 42,
                 switch_on_read: false,
@@ -303,6 +305,12 @@ impl TypingFocusScope {
     }
     pub fn switch_on_next_read(&self) {
         TYPING_FOCUS.with(|slot| slot.borrow_mut().as_mut().unwrap().switch_on_read = true);
+    }
+    pub fn range(&self, index: usize, location: u64, length: u64) {
+        TYPING_FOCUS.with(|slot| {
+            slot.borrow_mut().as_mut().unwrap().ranges[index] =
+                Some(cua_driver_core::text_insertion::TextSelectionRange { location, length });
+        });
     }
     pub fn element_ptr(&self, index: usize) -> usize {
         TYPING_FOCUS.with(|slot| slot.borrow().as_ref().unwrap().elements[index])
@@ -349,6 +357,19 @@ fn typing_focus_value(element: AXUIElementRef, attr: &str) -> Option<Option<Stri
             fixture.switch_on_read = false;
         }
         Some(value)
+    })
+}
+pub(crate) fn typing_focus_range(
+    element: AXUIElementRef,
+) -> Option<Option<cua_driver_core::text_insertion::TextSelectionRange>> {
+    TYPING_FOCUS.with(|slot| {
+        let slot = slot.borrow();
+        let fixture = slot.as_ref()?;
+        let index = fixture
+            .elements
+            .iter()
+            .position(|&ptr| ptr == element as usize)?;
+        Some(fixture.ranges[index])
     })
 }
 fn with_editor<T>(element: AXUIElementRef, f: impl FnOnce(&mut EditorFixture) -> T) -> Option<T> {
