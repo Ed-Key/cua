@@ -37,7 +37,7 @@ use crate::ax::bindings::{
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
-use core_foundation::base::CFRelease;
+use core_foundation::base::{CFEqual, CFRelease, CFType, CFTypeRef, TCFType};
 use cua_driver_core::background_input::BackgroundRefusal;
 
 use super::ToolState;
@@ -923,45 +923,66 @@ fn typed_progress(before: Option<&str>, after: Option<&str>, text: &str) -> Type
     }
 }
 
-/// Read the focused/target field's `AXValue`, for before/after read-back.
-/// Re-fetches the focused element each call when no explicit element is given
-/// (cheap, and focus is stable across our own keystrokes).
-fn read_axvalue(pid: i32, element_ptr_and_idx: Option<(usize, Option<usize>)>) -> Option<String> {
-    if let Some((ptr, _)) = element_ptr_and_idx {
-        unsafe { copy_string_attr(ptr as AXUIElementRef, "AXValue") }
-    } else if let Some(el) = unsafe { focused_element_of_pid(pid) } {
-        let v = unsafe { copy_string_attr(el, "AXValue") };
-        unsafe {
-            CFRelease(el as _);
-        }
-        v
-    } else {
-        None
+/// Own the focused element only when it belongs to the requested window.
+/// Without a window, preserve the legacy process-scoped focus lookup.
+fn readback_focus(pid: i32, window_id: Option<u32>) -> Option<CFType> {
+    unsafe {
+        let element = match window_id {
+            Some(wid) => crate::ax::exact_target::focused_element_in_window(pid, wid),
+            None => focused_element_of_pid(pid),
+        }?;
+        Some(CFType::wrap_under_create_rule(element as CFTypeRef))
     }
 }
 
-/// Window-bound variant of [`read_axvalue`]: when no explicit element is
-/// addressed and a `window_id` is known, the focused element is used ONLY when
-/// its ancestry provably resolves to that exact window. A sibling window's
-/// focused field must never supply before/after evidence for the requested
-/// target — an unprovable focus reads as `None` (unverifiable), never as
-/// sibling data. Without a window the legacy pid-global read applies.
-fn read_axvalue_bound(
+/// Per-invocation evidence used by the existing insertion classifier.
+/// Implicit typing must not compare values from two different focused fields.
+/// Retaining the original element also prevents its pointer from being recycled.
+struct TypingReadback {
     pid: i32,
-    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    element: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
-) -> Option<String> {
-    if element_ptr_and_idx.is_some() {
-        return read_axvalue(pid, element_ptr_and_idx);
+    focused: Option<CFType>,
+    before: Option<String>,
+}
+
+impl TypingReadback {
+    fn capture(pid: i32, element: Option<(usize, Option<usize>)>, window_id: Option<u32>) -> Self {
+        let mut readback = Self {
+            pid,
+            element,
+            window_id,
+            focused: if element.is_none() {
+                readback_focus(pid, window_id)
+            } else {
+                None
+            },
+            before: None,
+        };
+        readback.before = readback.read();
+        readback
     }
-    match window_id {
-        Some(wid) => unsafe {
-            let el = crate::ax::exact_target::focused_element_in_window(pid, wid)?;
-            let v = copy_string_attr(el, "AXValue");
-            CFRelease(el as _);
-            v
-        },
-        None => read_axvalue(pid, None),
+
+    fn read(&self) -> Option<String> {
+        if let Some((ptr, _)) = self.element {
+            // The caller's retained cache guard owns the addressed element.
+            return unsafe { copy_string_attr(ptr as AXUIElementRef, "AXValue") };
+        }
+        let original = self.focused.as_ref()?;
+        let current = readback_focus(self.pid, self.window_id)?;
+        unsafe {
+            if CFEqual(original.as_CFTypeRef(), current.as_CFTypeRef()) == 0 {
+                return None;
+            }
+            let value = copy_string_attr(current.as_CFTypeRef() as AXUIElementRef, "AXValue");
+            // Focus can change during an AX read. Discard that sample too.
+            // A replacement editor needs fresh observation, not a guess that
+            // the newly focused field is the same logical target.
+            let after = readback_focus(self.pid, self.window_id)?;
+            (CFEqual(original.as_CFTypeRef(), after.as_CFTypeRef()) != 0)
+                .then_some(value)
+                .flatten()
+        }
     }
 }
 
@@ -1079,10 +1100,9 @@ fn cgevent_type_verified(
     pid: i32,
     text: &str,
     delay_ms: u64,
-    before: Option<&str>,
+    readback: &TypingReadback,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
-    window_id: Option<u32>,
 ) -> anyhow::Result<(bool, Option<usize>)> {
     // Focus the target element so the keystrokes land in IT. Critical in
     // foreground mode: a freshly-fronted window's keyboard focus may be on the
@@ -1118,9 +1138,12 @@ fn cgevent_type_verified(
     // visible instead of treating any growth as success. If the deadline
     // expires after observable growth, surface the exact partial count.
     let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
-    Ok(await_typed_delivery(before, text, deadline, || {
-        read_axvalue_bound(pid, element_ptr_and_idx, window_id)
-    }))
+    Ok(await_typed_delivery(
+        readback.before.as_deref(),
+        text,
+        deadline,
+        || readback.read(),
+    ))
 }
 
 fn await_typed_delivery(
@@ -1204,7 +1227,8 @@ fn type_text_blocking(
     // An unreadable value is not evidence that the field is empty — and for a
     // window-addressed request it must come from the exact target window,
     // never a same-process sibling.
-    let before = read_axvalue_bound(pid, element_ptr_and_idx, window_id);
+    let readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
+    let before = &readback.before;
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
@@ -1242,10 +1266,9 @@ fn type_text_blocking(
                 pid,
                 text,
                 delay_ms,
-                before.as_deref(),
+                &readback,
                 element_ptr_and_idx,
                 foreground_settle_ms,
-                window_id,
             )
         };
         let ((verified, delivered_chars), fronted) = match window_id {
@@ -1331,10 +1354,9 @@ fn type_text_blocking(
             pid,
             text,
             delay_ms,
-            before.as_deref(),
+            &readback,
             element_ptr_and_idx,
             /*settle_ms=*/ 0,
-            window_id,
         )?;
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
@@ -1378,7 +1400,7 @@ fn type_text_blocking(
                 before.as_deref(),
                 text,
                 deadline,
-                || unsafe { copy_string_attr(element, "AXValue") },
+                || readback.read(),
             ))
         } else {
             None
@@ -1463,10 +1485,9 @@ fn type_text_blocking(
         pid,
         text,
         delay_ms,
-        before.as_deref(),
+        &readback,
         element_ptr_and_idx,
         /*settle_ms=*/ 0,
-        window_id,
     )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
@@ -1478,6 +1499,94 @@ fn type_text_blocking(
 
 #[cfg(test)]
 mod tests {
+    fn focused_delivery(readback: &TypingReadback) -> (bool, Option<usize>) {
+        await_typed_delivery(
+            readback.before.as_deref(),
+            "hello",
+            std::time::Instant::now(),
+            || readback.read(),
+        )
+    }
+
+    #[test]
+    fn typing_identity_does_not_confirm_a_different_focused_field() {
+        for window in [Some(42), None] {
+            let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+            let readback = TypingReadback::capture(-9880, None, window);
+            assert_eq!(readback.before.as_deref(), Some(""));
+            scope.focus(Some(1), 42);
+            assert_eq!(focused_delivery(&readback), (false, None));
+        }
+    }
+
+    #[test]
+    fn typing_identity_does_not_count_another_fields_length_as_delivery() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.value(1, Some("unrelated pre-existing contents"));
+        scope.focus(Some(1), 42);
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_replacement_requires_fresh_observation() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.value(0, None);
+        scope.focus(Some(1), 42);
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_preserves_stable_complete_partial_and_zero_readback() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        assert_eq!(focused_delivery(&readback), (false, Some(0)));
+        scope.value(0, Some("hel"));
+        assert_eq!(focused_delivery(&readback), (false, Some(3)));
+        scope.value(0, Some("hello"));
+        assert_eq!(focused_delivery(&readback), (true, Some(5)));
+    }
+
+    #[test]
+    fn typing_identity_rejects_missing_or_sibling_focus() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.focus(None, 42);
+        assert_eq!(focused_delivery(&readback), (false, None));
+        scope.focus(Some(1), 99);
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_cannot_confirm_focus_that_was_missing_at_start() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        scope.focus(None, 42);
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.focus(Some(1), 42);
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_discards_a_value_sample_if_focus_changes_during_read() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback = TypingReadback::capture(-9880, None, Some(42));
+        scope.value(0, Some("hello"));
+        scope.switch_on_next_read();
+        assert_eq!(focused_delivery(&readback), (false, None));
+    }
+
+    #[test]
+    fn typing_identity_keeps_addressed_readback_bound_to_its_retained_element() {
+        let scope = crate::ax::bindings::test_support::TypingFocusScope::install();
+        let readback =
+            TypingReadback::capture(-9880, Some((scope.element_ptr(0), Some(7))), Some(42));
+        scope.focus(Some(1), 42);
+        assert_eq!(focused_delivery(&readback), (false, Some(0)));
+        scope.value(0, Some("hello"));
+        assert_eq!(focused_delivery(&readback), (true, Some(5)));
+    }
+
 
     #[test]
     fn unknown_native_typing_requests_observation_without_another_input_route() {
