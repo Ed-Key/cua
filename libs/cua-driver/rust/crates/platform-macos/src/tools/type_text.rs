@@ -1499,6 +1499,58 @@ fn type_text_blocking(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn typing_insertion_preexisting_value_does_not_prove_new_input() {
+        assert_eq!(
+            typed_progress(Some("hello"), Some("hello"), "hello"),
+            TypedProgress::Unverifiable,
+            "unchanged text cannot distinguish dropped input from identical replacement"
+        );
+    }
+
+    #[test]
+    fn typing_insertion_existing_payload_does_not_hide_a_prefix() {
+        assert_ne!(
+            typed_progress(Some("hello"), Some("helloh"), "hello"),
+            TypedProgress::Complete,
+            "the old payload is still present after only the first new character"
+        );
+    }
+
+    #[test]
+    fn typing_insertion_old_suffix_cannot_complete_a_new_prefix() {
+        assert_ne!(
+            typed_progress(Some("llo"), Some("hello"), "hello"),
+            TypedProgress::Complete,
+            "inserting only he before the old llo produces the full string too"
+        );
+    }
+
+    #[test]
+    fn typing_insertion_unrelated_growth_does_not_supply_a_retry_offset() {
+        assert_eq!(
+            typed_progress(Some("old"), Some("oldXYZ"), "hello"),
+            TypedProgress::Unverifiable,
+            "three additional characters are not necessarily three delivered characters"
+        );
+    }
+
+    #[test]
+    fn typing_insertion_unknown_before_is_not_observed_delivery() {
+        assert_eq!(
+            typed_progress(None, Some("hello"), "hello"),
+            TypedProgress::Unverifiable
+        );
+    }
+
+    #[test]
+    fn typing_insertion_full_duplicate_append_is_observable() {
+        assert_eq!(
+            typed_progress(Some("hello"), Some("hellohello"), "hello"),
+            TypedProgress::Complete
+        );
+    }
+
     fn focused_delivery(readback: &TypingReadback) -> (bool, Option<usize>) {
         await_typed_delivery(
             readback.before.as_deref(),
