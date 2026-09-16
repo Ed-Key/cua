@@ -364,6 +364,21 @@ fn harness_appkit_typing_preexisting_ax_noop() {
             ("CUA_APPKIT_EDITOR_TRACE", trace.to_str().unwrap()),
         ],
         |pid, wid, driver| {
+            if let Ok(probe) = std::env::var("CUA_TYPING_CAPABILITY_PROBE") {
+                let output = std::process::Command::new(probe)
+                    .arg(pid.to_string())
+                    .output()
+                    .unwrap();
+                assert!(
+                    output.status.success(),
+                    "read-only capability probe: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                eprintln!(
+                    "typing capability probe={}",
+                    String::from_utf8_lossy(&output.stdout)
+                );
+            }
             let before = snapshot_elements(driver, pid, wid);
             let token = element_token_by_id(&before, "txt-transition-target");
             let response = driver.call(
@@ -1214,6 +1229,78 @@ fn harness_appkit_focused_text_selection_and_caret() {
                     Some(effect),
                     "{}",
                     response.text()
+                );
+            }
+        },
+    );
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_typing_repeated_and_selected_text() {
+    run_background_case(
+        "typing_repeated_selected",
+        DriverRoute::MacosAxValue,
+        |pid, wid, driver| {
+            let first = snapshot_elements(driver, pid, wid);
+            let (x, y, w, h) = element_pixel_frame(&first, "txt-input");
+            let focus = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid":pid,"window_id":wid,"x":x+w/2.0,"y":y+h/2.0,"delivery_mode":"background"
+                }),
+            );
+            assert!(!focus.is_error(), "focus: {}", focus.text());
+            for (phase, text, select_all, expected) in [
+                ("initial", "hello", false, "hello"),
+                ("duplicate_append", "hello", false, "hellohello"),
+                ("shorter_replacement", "A😀B", true, "A😀B"),
+                ("identical_replacement", "A😀B", true, "A😀B"),
+            ] {
+                if select_all {
+                    let selected = driver.call("press_key", serde_json::json!({
+                    "pid":pid,"window_id":wid,"key":"a","modifiers":["cmd"],"delivery_mode":"background"
+                }));
+                    assert!(!selected.is_error(), "select all: {}", selected.text());
+                }
+                let response = driver.call(
+                    "type_text",
+                    serde_json::json!({
+                        "pid":pid,"window_id":wid,"text":text,"delivery_mode":"background"
+                    }),
+                );
+                let after = snapshot_elements(driver, pid, wid);
+                let index = element_index_by_id(after.tree_text(), "txt-input").unwrap();
+                let field = after.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["element_index"].as_u64() == Some(index))
+                    .unwrap();
+                eprintln!(
+                    "insertion control phase={phase}; response={}; field={field}",
+                    response.raw
+                );
+                assert_eq!(
+                    field["value"], expected,
+                    "one exact insertion or replacement"
+                );
+                assert_eq!(
+                    field["text_selection"]["range"],
+                    serde_json::json!({
+                        "location":expected.encode_utf16().count(),"length":0
+                    })
+                );
+                assert!(!response.is_error(), "{}", response.raw);
+                assert_eq!(
+                    response.structured()["effect"],
+                    "confirmed",
+                    "{phase}: {}",
+                    response.raw
+                );
+                assert_eq!(
+                    response.structured()["delivery"]["delivered_count"],
+                    text.chars().count()
                 );
             }
         },

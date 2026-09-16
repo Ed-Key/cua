@@ -86,6 +86,7 @@ pub mod session_authorization;
 pub mod session_manifest;
 pub mod session_tools;
 pub mod socket_io;
+pub mod text_insertion;
 pub mod text_sanitize;
 pub mod tool;
 pub mod tool_args;
