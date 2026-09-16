@@ -3152,6 +3152,7 @@ name = "pip-preview"
 version = "0.26.1"
 dependencies = [
  "anyhow",
+ "serde",
  "serde_json",
  "tracing",
 ]

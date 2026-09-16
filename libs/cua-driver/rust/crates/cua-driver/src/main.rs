@@ -26,6 +26,8 @@ mod driver_service_http;
 mod history_runtime;
 mod mcp_envelope;
 mod mcp_http;
+#[cfg(target_os = "macos")]
+mod preview_observer;
 mod private_worker;
 mod proxy;
 mod release_channel;
@@ -228,6 +230,24 @@ fn run_cursor_theme_command(args: &[String]) -> ! {
 /// No-op when `--experimental-pip` is not on argv. On Windows / Linux
 /// the factory returns "not yet implemented" — we log and continue
 /// without a window so the rest of the daemon keeps working.
+#[cfg(target_os = "macos")]
+fn maybe_init_pip() {
+    let cfg = match pip_preview::default_config_path() {
+        Some(path) => pip_preview::PipConfig::from_args_and_file(&path),
+        None => pip_preview::PipConfig::from_args(),
+    };
+    if !cfg.enabled {
+        return;
+    }
+    match preview_observer::ObserverProcess::spawn(&cfg) {
+        Ok(mut observer) => {
+            cua_driver_core::pip_hook::set_pip_observer_fn(move |request| observer.publish(request))
+        }
+        Err(error) => eprintln!("PiP observer unavailable: {error}"),
+    }
+}
+
+#[cfg(not(target_os = "macos"))]
 fn maybe_init_pip() {
     let cfg = match pip_preview::default_config_path() {
         Some(p) => pip_preview::PipConfig::from_args_and_file(&p),
@@ -460,6 +480,9 @@ mod mcp_runtime_selection_tests {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    if let Some(code) = preview_observer::run_if_requested() {
+        std::process::exit(code);
+    }
     if let Some(code) = platform_macos::permissions::gate::run_permission_probe_if_requested() {
         std::process::exit(code);
     }
@@ -600,10 +623,6 @@ fn main() {
             // before any blocking work so the banner can land on stderr
             // early in the serve lifecycle.
             version_check::maybe_announce_update();
-            let pip_cfg = match pip_preview::default_config_path() {
-                Some(p) => pip_preview::PipConfig::from_args_and_file(&p),
-                None => pip_preview::PipConfig::from_args(),
-            };
             maybe_init_pip();
 
             // Agent-cursor overlay. The DAEMON is the process that actually
@@ -711,14 +730,10 @@ fn main() {
 
             // Keep the main thread alive for the daemon.
             //
-            // PiP needs the AppKit main run loop to process the
-            // dispatch_async_f calls that push frames into NSImageView;
-            // park main in NSApplication.run() when --experimental-pip is
-            // on. Otherwise just join the serve thread so the process
-            // stays up as long as the daemon does.
-            if pip_cfg.enabled {
-                platform_macos::pip::run_appkit_main_loop();
-            } else if cursor_cfg.enabled {
+            // PiP owns its own process and AppKit run loop. The daemon still
+            // needs its main queue for foreground reads and input preparation,
+            // even when it has no cursor windows.
+            if cursor_cfg.enabled {
                 // Render the agent-cursor overlay: park the main thread in the
                 // AppKit run loop so the overlay NSWindow draws. `run_on_main_thread`
                 // self-guards on `has_graphic_access()` and returns immediately
@@ -726,6 +741,9 @@ fn main() {
                 // join so the daemon still serves headless. The serve thread runs
                 // on its background thread regardless.
                 platform_macos::cursor::overlay::run_on_main_thread();
+                let _ = serve_handle.join();
+            } else if platform_macos::session::has_graphic_access() {
+                platform_macos::pip::run_appkit_main_loop();
                 let _ = serve_handle.join();
             } else {
                 let _ = serve_handle.join();

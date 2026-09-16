@@ -16,6 +16,8 @@
 
 use std::sync::OnceLock;
 
+pub mod observer;
+
 /// Canonical `~/.cua-driver/config.json` path matching what the per-platform
 /// `set_config` tools write to. Resolves `$HOME` first (Unix/macOS) and falls
 /// back to `%USERPROFILE%` (Windows, where `HOME` is usually unset). Returns

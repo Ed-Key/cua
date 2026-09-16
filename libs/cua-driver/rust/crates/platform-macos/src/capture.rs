@@ -306,6 +306,25 @@ struct WindowCapturePlan {
     identity: WindowCaptureIdentity,
 }
 
+/// Prepare a fresh, exact-window plan for the isolated preview process.
+/// Reuse the one-shot capture identity validation without its shared worker,
+/// cache, PNG encoding, or compatibility fallback.
+pub(crate) fn preview_window_capture_plan(
+    window_id: u32,
+    pid: i32,
+) -> anyhow::Result<(
+    screencapturekit::prelude::SCContentFilter,
+    screencapturekit::prelude::SCStreamConfiguration,
+)> {
+    let identity = current_window_capture_identity(window_id)?;
+    anyhow::ensure!(
+        identity.pid == pid && pid > 0,
+        "preview window owner changed"
+    );
+    let plan = build_window_capture_plan(window_id, identity)?;
+    Ok((plan.filter.clone(), plan.config.clone()))
+}
+
 /// Cheap WindowServer fingerprint used to reject a cached filter after a
 /// resize/move, owner change, layer change, or CGWindowID reuse. Float fields
 /// are kept as their exact bit patterns because both CGWindowList and

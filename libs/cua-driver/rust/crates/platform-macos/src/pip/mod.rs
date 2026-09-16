@@ -46,6 +46,8 @@ use std::sync::Mutex;
 
 use pip_preview::{PipBackend, PipBackendFactory, PipConfig, PipFrame};
 
+pub mod observer;
+
 // ── CGColor objc2 encoding shim ────────────────────────────────────────────
 //
 // `[NSColor CGColor]` returns a `CGColorRef` whose Objective-C type encoding
@@ -190,9 +192,9 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
 
 // ── AppKit main loop helper for Serve mode ───────────────────────────────
 
-/// Park the main thread in `NSApplication.run()`. Used by `cua-driver
-/// serve --experimental-pip` so the dispatch_async_f → main queue
-/// path PiP frames go through can be drained. Mirrors the cursor
+/// Park the main thread in `NSApplication.run()`. Used by the private preview
+/// helper and GUI daemons without cursor windows so main-queue work can run.
+/// Mirrors the cursor
 /// overlay's `run_appkit` startup (Accessory activation policy →
 /// finishLaunching → run) without installing the overlay's
 /// CALayer-backed window itself.
