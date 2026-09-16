@@ -3,7 +3,7 @@
 use super::*;
 use cua_driver_testkit::observer::{DesktopObserver, NativeObserver};
 
-fn run_scroll(covered: bool, element_target: bool) {
+fn run_scroll(covered: bool, element_target: bool, combined: bool) {
     if !covered {
         assert!(
             unsafe { platform_macos::ax::bindings::AXIsProcessTrusted() },
@@ -305,11 +305,24 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
             arguments["element_token"] = serde_json::json!(token);
         }
         let scroll_started = Instant::now();
-        let response = fixture.driver.call("scroll", arguments);
+        let response = if combined {
+            assert!(element_target);
+            arguments.as_object_mut().unwrap().remove("delivery_mode");
+            arguments["action"] = serde_json::json!("scroll");
+            arguments["observe"] = serde_json::json!({"include_screenshot":false});
+            fixture.driver.call("act_and_read", arguments)
+        } else {
+            fixture.driver.call("scroll", arguments)
+        };
         let scroll_elapsed = scroll_started.elapsed();
         assert!(!response.is_error(), "{}", response.raw);
-        assert_eq!(response.action_effect(), Some("unverifiable"));
-        assert_eq!(response.action_route(), Some("synthetic_events"));
+        let action_result = if combined {
+            response.structured()["action"]["structuredContent"].clone()
+        } else {
+            response.structured().clone()
+        };
+        assert_eq!(action_result["effect"], "unverifiable");
+        assert_eq!(action_result["route"], "synthetic_events");
         let deadline = Instant::now() + Duration::from_secs(2);
         let after = loop {
             let state = read();
@@ -345,28 +358,38 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                 })
                 .expect("scroll must reveal a newly rendered message inside the viewport");
             let read_started = Instant::now();
-            let snapshot = fixture.driver.call(
-                "get_window_state",
-                serde_json::json!({
-                    "pid":fixture.pid,"window_id":fixture.window_id,"capture_mode":"ax"
-                }),
-            );
+            let snapshot = if combined {
+                let output = response.structured();
+                assert_ne!(output["observation"]["isError"], true);
+                output["observation"]["structuredContent"].clone()
+            } else {
+                let snapshot = fixture.driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":fixture.pid,"window_id":fixture.window_id,"capture_mode":"ax"
+                    }),
+                );
+                assert!(!snapshot.is_error(), "{}", snapshot.raw);
+                snapshot.structured().clone()
+            };
             let read_elapsed = read_started.elapsed();
-            assert!(!snapshot.is_error(), "{}", snapshot.raw);
+            assert_eq!(snapshot["pid"], fixture.pid);
+            assert_eq!(snapshot["window_id"], fixture.window_id);
+            assert!(snapshot["snapshot_id"].is_string());
             assert!(
-                snapshot.structured()["elements"]
+                snapshot["elements"]
                     .as_array()
                     .expect("structured accessibility elements")
                     .iter()
                     .any(|element| element["label"] == new_row || element["value"] == new_row),
-                "fresh AX read omitted newly visible {new_row}: {}",
-                snapshot.text()
+                "returned AX read omitted newly visible {new_row}: {snapshot}"
             );
             eprintln!(
                 "[electron-scroll-timing] {}",
                 serde_json::json!({
                     "scroll_call_ms":scroll_elapsed.as_secs_f64()*1000.0,
-                    "following_ax_read_ms":read_elapsed.as_secs_f64()*1000.0,
+                    "combined_action_read":combined,
+                    "following_ax_read_ms":(!combined).then_some(read_elapsed.as_secs_f64()*1000.0),
                     "new_row":new_row
                 })
             );
@@ -401,25 +424,25 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
 #[test]
 #[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
 fn visible_background_scroll_loads_rows() {
-    run_scroll(false, false);
+    run_scroll(false, false, false);
 }
 
 #[test]
 #[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
 fn covered_background_dispatch_stays_unverified() {
-    run_scroll(true, false);
+    run_scroll(true, false, false);
 }
 
 #[test]
 #[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
 fn visible_background_element_scroll_loads_rows() {
-    run_scroll(false, true);
+    run_scroll(false, true, false);
 }
 
 #[test]
 #[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
 fn covered_background_element_dispatch_stays_unverified() {
-    run_scroll(true, true);
+    run_scroll(true, true, false);
 }
 
 #[test]
@@ -505,4 +528,10 @@ fetch(window.__CUA_E2E_FIXTURE_JOURNAL_URL,{method:'POST',headers:{'Content-Type
         !delta.violations().is_empty(),
         "the intentional focus change must fail the focus oracle"
     );
+}
+
+#[test]
+#[ignore = "requires the built Electron fixture and an authorized macOS daemon"]
+fn visible_background_scroll_and_read_returns_new_rows() {
+    run_scroll(false, true, true);
 }

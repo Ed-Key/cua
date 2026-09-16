@@ -60,3 +60,36 @@ fn action_read_invalid_observation_is_rejected_before_native_lookup() {
             .is_none());
     }
 }
+
+#[test]
+fn action_read_invalid_scroll_is_rejected_before_native_lookup() {
+    let mut d = driver();
+    for (i, patch) in [
+        json!({}),
+        json!({"direction":null}),
+        json!({"direction":"up","amount":0}),
+        json!({"direction":"up","amount":51}),
+        json!({"direction":"up","value":"not allowed"}),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let mut arguments = json!({"pid":2147483647,"window_id":1,"action":"scroll","element_token":"never-dispatched"});
+        arguments
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        d.send(&json!({"jsonrpc":"2.0","id":i+2,"method":"tools/call","params":{"name":"act_and_read","arguments":arguments}}));
+        let response = d.recv();
+        assert_eq!(response["result"]["isError"], true, "{response}");
+        assert!(
+            response["result"]["content"]
+                .to_string()
+                .contains("invalid arguments"),
+            "{response}"
+        );
+        assert!(response
+            .pointer("/result/structuredContent/action")
+            .is_none());
+    }
+}

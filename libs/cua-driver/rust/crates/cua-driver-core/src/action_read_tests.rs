@@ -87,7 +87,7 @@ fn registry(observation_error: bool) -> (Arc<ToolRegistry>, Log) {
 fn registry_with_action(observation_error: bool, action_error: bool) -> (Arc<ToolRegistry>, Log) {
     let mut registry = ToolRegistry::new();
     let log = Arc::new(Mutex::new(vec![]));
-    for name in ["click", "set_value", "get_window_state"] {
+    for name in ["click", "set_value", "scroll", "get_window_state"] {
         registry.register(Box::new(NativeIo {
             def: ToolDef {
                 name: name.into(),
@@ -406,9 +406,19 @@ fn action_read_has_observation_and_input_authorization_without_a_parent_cursor_a
 async fn action_read_child_permissions_never_fall_back_to_unrestricted() {
     use std::io::Write;
     let _serial = SERIAL.lock().await;
-    for (allowed, expected) in [
-        ("act_and_read, click", vec!["click"]),
-        ("act_and_read, get_window_state", vec!["get_window_state"]),
+    for (allowed, expected, args) in [
+        ("act_and_read, click", vec!["click"], input()),
+        (
+            "act_and_read, get_window_state",
+            vec!["get_window_state"],
+            input(),
+        ),
+        ("act_and_read, scroll", vec!["scroll"], scroll_input()),
+        (
+            "act_and_read, get_window_state",
+            vec!["get_window_state"],
+            scroll_input(),
+        ),
     ] {
         let mut file = tempfile::NamedTempFile::new().unwrap();
         write!(file,"version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [{allowed}]\nresources:\n  desktop:\n    windows:\n      - pid: 42\n        window_id: 7\n").unwrap();
@@ -425,7 +435,7 @@ async fn action_read_child_permissions_never_fall_back_to_unrestricted() {
             .unwrap();
         let (registry, log) = registry(false);
         let result = registry
-            .invoke_with_context("act_and_read", input(), ctx)
+            .invoke_with_context("act_and_read", args, ctx)
             .await;
         assert_eq!(result.is_error, Some(true));
         assert_eq!(
@@ -471,4 +481,151 @@ async fn action_read_records_only_the_child_action() {
     let action: Value =
         serde_json::from_slice(&std::fs::read(turns[0].join("action.json")).unwrap()).unwrap();
     assert_eq!(action["tool"], "click");
+}
+
+fn scroll_input() -> Value {
+    json!({"pid":42,"window_id":7,"action":"scroll","element_token":"fresh-token",
+        "direction":"up","by":"page","amount":4})
+}
+
+#[tokio::test]
+async fn action_read_scroll_preserves_child_results_and_never_replays() {
+    let _serial = SERIAL.lock().await;
+    for (action_error, observation_error) in
+        [(false, false), (true, false), (false, true), (true, true)]
+    {
+        let (registry, log) = registry_with_action(observation_error, action_error);
+        let result = registry
+            .invoke_with_context("act_and_read", scroll_input(), context())
+            .await;
+        let calls = log.lock().unwrap();
+        assert_eq!(
+            calls.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+            ["scroll", "get_window_state"]
+        );
+        assert_eq!(calls[0].1["direction"], "up");
+        assert_eq!(calls[0].1["by"], "page");
+        assert_eq!(calls[0].1["amount"], 4);
+        assert_eq!(calls[0].1["delivery_mode"], "background");
+        assert_eq!(calls[1].1["pid"], 42);
+        assert_eq!(calls[1].1["window_id"], 7);
+        assert_eq!(calls[1].1["include_screenshot"], false);
+        assert_eq!(
+            result.is_error == Some(true),
+            action_error || observation_error
+        );
+        let output = result.structured_content.unwrap();
+        if !action_error {
+            assert_eq!(
+                output["action"]["structuredContent"]["effect"],
+                "unverifiable"
+            );
+        }
+        if !observation_error {
+            assert_eq!(
+                output["observation"]["structuredContent"]["snapshot_id"],
+                "fresh"
+            );
+        }
+        assert_eq!(output["action"]["isError"] == true, action_error);
+        assert_eq!(output["observation"]["isError"] == true, observation_error);
+    }
+}
+
+#[tokio::test]
+async fn action_read_scroll_omits_default_options_and_keeps_session_context() {
+    let _serial = SERIAL.lock().await;
+    let (registry, log) = registry_with_action(false, false);
+    let ctx = context();
+    let result = registry
+        .invoke_with_context(
+            "act_and_read",
+            json!({
+        "pid":42,"window_id":7,"action":"scroll","element_token":"fresh-token",
+        "direction":"left","session":"scroll-session"}),
+            ctx.clone(),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let calls = log.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(calls[0].1.get("by").is_none());
+    assert!(calls[0].1.get("amount").is_none());
+    assert_eq!(calls[0].1["direction"], "left");
+    for (_, args) in calls.iter() {
+        assert_eq!(args["session"], ctx.runtime_session_key("scroll-session"));
+    }
+}
+
+#[tokio::test]
+async fn action_read_invalid_scroll_options_reject_before_either_child() {
+    let _serial = SERIAL.lock().await;
+    let (registry, log) = registry_with_action(false, false);
+    for patch in [
+        json!({"direction":null}),
+        json!({"direction":"diagonal"}),
+        json!({"by":null}),
+        json!({"by":"pixel"}),
+        json!({"amount":null}),
+        json!({"amount":0}),
+        json!({"amount":51}),
+        json!({"amount":1.5}),
+        json!({"action":"click"}),
+        json!({"action":"set_value","value":"text"}),
+        json!({"value":"not-a-scroll-option"}),
+    ] {
+        let mut args = scroll_input();
+        args.as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        let result = registry
+            .invoke_with_context("act_and_read", args, context())
+            .await;
+        assert_eq!(result.is_error, Some(true), "{result:?}");
+    }
+    let mut missing = scroll_input();
+    missing.as_object_mut().unwrap().remove("direction");
+    assert_eq!(
+        registry
+            .invoke_with_context("act_and_read", missing, context())
+            .await
+            .is_error,
+        Some(true)
+    );
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[test]
+fn action_read_scroll_schema_accepts_bounded_options_and_rejects_nulls() {
+    use cua_driver_contract::{ActAndReadInput, ToolInput};
+    let schema = ActAndReadInput::input_schema();
+    let validator = jsonschema::validator_for(&schema).unwrap();
+    for direction in ["up", "down", "left", "right"] {
+        for amount in [1, 50] {
+            let mut value = scroll_input();
+            value["direction"] = json!(direction);
+            value["amount"] = json!(amount);
+            assert!(validator.is_valid(&value));
+            serde_json::from_value::<ActAndReadInput>(value)
+                .unwrap()
+                .validate()
+                .unwrap();
+        }
+    }
+    for patch in [
+        json!({"direction":null}),
+        json!({"by":null}),
+        json!({"amount":null}),
+        json!({"amount":0}),
+        json!({"amount":51}),
+        json!({"direction":"diagonal"}),
+        json!({"by":"pixel"}),
+    ] {
+        let mut value = scroll_input();
+        value
+            .as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        assert!(!validator.is_valid(&value), "{value}");
+    }
 }
