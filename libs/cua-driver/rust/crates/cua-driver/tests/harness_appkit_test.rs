@@ -1742,6 +1742,11 @@ fn run_typing_preparation_probe(prepare: bool) {
             assert_eq!(value, "focus-cua", "exact native field contents");
             assert_eq!(response.structured()["effect"], "confirmed");
             assert_eq!(response.structured()["delivery"]["delivered_count"], 9);
+            assert_eq!(
+                response.structured()["route"],
+                "accessibility",
+                "addressed native typing should prepare the field before its AX write"
+            );
         },
     );
 }
