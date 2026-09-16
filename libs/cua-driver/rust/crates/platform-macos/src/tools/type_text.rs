@@ -1855,6 +1855,84 @@ mod tests {
         );
     }
 
+    fn review_readback_delivery(
+        scope: &crate::ax::bindings::test_support::ReadbackScope,
+    ) -> (bool, Option<usize>) {
+        await_typed_delivery(Some(""), "hello", std::time::Instant::now(), || {
+            read_typed_value(
+                -9877,
+                Some((scope.addressed_ptr(), Some(7))),
+                Some(42),
+                Some(""),
+                "hello",
+            )
+        })
+    }
+
+    fn review_original_readback_delivery(
+        scope: &crate::ax::bindings::test_support::ReadbackScope,
+    ) -> (bool, Option<usize>) {
+        // The integrated candidate's exact pre-contribution readback call.
+        await_typed_delivery(Some(""), "hello", std::time::Instant::now(), || {
+            read_axvalue_bound(-9877, Some((scope.addressed_ptr(), Some(7))), Some(42))
+        })
+    }
+
+    #[test]
+    fn review_readback_must_not_confirm_text_in_a_different_same_window_field() {
+        // The requested editor remained empty. A distinct focused field
+        // already contains the payload; no edit to the requested field landed.
+        let scope =
+            crate::ax::bindings::test_support::ReadbackScope::install(Some(""), Some("hello"), 42);
+        assert_eq!(review_original_readback_delivery(&scope), (false, Some(0)));
+        assert_eq!(
+            review_readback_delivery(&scope),
+            (false, Some(0)),
+            "same-window focus is not proof that this is the intended editor"
+        );
+    }
+
+    #[test]
+    fn review_readback_must_not_count_unrelated_focused_text_as_inserted_characters() {
+        let scope = crate::ax::bindings::test_support::ReadbackScope::install(
+            Some(""),
+            Some("unrelated existing content"),
+            42,
+        );
+        assert_eq!(review_original_readback_delivery(&scope), (false, Some(0)));
+        assert_eq!(
+            review_readback_delivery(&scope),
+            (false, Some(0)),
+            "length in another field cannot prove progress in the addressed field"
+        );
+    }
+
+    #[test]
+    fn review_readback_rejects_a_focused_editor_from_another_window() {
+        let scope =
+            crate::ax::bindings::test_support::ReadbackScope::install(Some(""), Some("hello"), 99);
+        assert_eq!(review_readback_delivery(&scope), (false, Some(0)));
+    }
+
+    #[test]
+    fn review_readback_keeps_complete_addressed_evidence() {
+        let scope = crate::ax::bindings::test_support::ReadbackScope::install(
+            Some("hello"),
+            Some("unrelated existing content"),
+            42,
+        );
+        assert_eq!(review_readback_delivery(&scope), (true, Some(5)));
+    }
+
+    #[test]
+    fn review_readback_candidate_recovers_an_unreadable_pointer_from_focused_value() {
+        // Characterizes the contribution's intended benefit. This boundary
+        // test does not establish that the focused editor replaced the target.
+        let scope =
+            crate::ax::bindings::test_support::ReadbackScope::install(None, Some("hello"), 42);
+        assert_eq!(review_readback_delivery(&scope), (true, Some(5)));
+    }
+
     #[test]
     fn an_unrelated_focused_element_never_downgrades_the_addressed_read() {
         assert_eq!(

@@ -102,6 +102,9 @@ fn with_fixture<T>(
 }
 
 pub(super) fn copy_string_attr(element: AXUIElementRef, attr: &str) -> Option<Option<String>> {
+    if let Some(value) = readback_value(element, attr) {
+        return Some(value);
+    }
     if let Some(value) = with_editor(element, |fixture| match attr {
         "AXRole" => Some(fixture.role.clone()),
         "AXTitle" => Some("Editor".into()),
@@ -229,6 +232,15 @@ impl Drop for EditorScope {
     }
 }
 pub(crate) fn focused_editor(pid: i32, wid: u32) -> Option<Option<AXUIElementRef>> {
+    if pid == -9877 {
+        return READBACK.with(|slot| {
+            let slot = slot.borrow();
+            let fixture = slot.as_ref().expect("readback scope must be installed");
+            Some((wid == fixture.focused_window).then(|| unsafe {
+                core_foundation::base::CFRetain(fixture.focused as CFTypeRef) as AXUIElementRef
+            }))
+        });
+    }
     if pid != -9876 {
         return None;
     }
@@ -263,5 +275,71 @@ pub(super) fn editor_write(element: AXUIElementRef, attr: &str, value: &str) -> 
         }
         fixture.value.push_str(value);
         kAXErrorSuccess
+    })
+}
+
+// Two distinct editors at the AX boundary. This scope performs no UI input.
+thread_local! {
+    static READBACK: RefCell<Option<ReadbackFixture>> = const { RefCell::new(None) };
+}
+struct ReadbackFixture {
+    addressed: usize,
+    addressed_value: Option<String>,
+    focused: usize,
+    focused_value: Option<String>,
+    focused_window: u32,
+}
+pub(crate) struct ReadbackScope {
+    addressed: core_foundation::string::CFString,
+    _focused: core_foundation::string::CFString,
+}
+impl ReadbackScope {
+    pub fn install(
+        addressed_value: Option<&str>,
+        focused_value: Option<&str>,
+        focused_window: u32,
+    ) -> Self {
+        use core_foundation::base::TCFType;
+        let addressed = core_foundation::string::CFString::new("Addressed review editor");
+        let focused = core_foundation::string::CFString::new("Distinct focused review editor");
+        READBACK.with(|slot| {
+            assert!(slot.borrow().is_none());
+            *slot.borrow_mut() = Some(ReadbackFixture {
+                addressed: addressed.as_concrete_TypeRef() as usize,
+                addressed_value: addressed_value.map(str::to_owned),
+                focused: focused.as_concrete_TypeRef() as usize,
+                focused_value: focused_value.map(str::to_owned),
+                focused_window,
+            });
+        });
+        Self {
+            addressed,
+            _focused: focused,
+        }
+    }
+    pub fn addressed_ptr(&self) -> usize {
+        use core_foundation::base::TCFType;
+        self.addressed.as_concrete_TypeRef() as usize
+    }
+}
+impl Drop for ReadbackScope {
+    fn drop(&mut self) {
+        READBACK.with(|slot| *slot.borrow_mut() = None);
+    }
+}
+fn readback_value(element: AXUIElementRef, attr: &str) -> Option<Option<String>> {
+    READBACK.with(|slot| {
+        let slot = slot.borrow();
+        let fixture = slot.as_ref()?;
+        let ptr = element as usize;
+        if ptr != fixture.addressed && ptr != fixture.focused {
+            return None;
+        }
+        assert_eq!(attr, "AXValue");
+        Some(if ptr == fixture.addressed {
+            fixture.addressed_value.clone()
+        } else {
+            fixture.focused_value.clone()
+        })
     })
 }
