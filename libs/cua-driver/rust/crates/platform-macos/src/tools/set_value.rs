@@ -197,6 +197,26 @@ impl Tool for SetValueTool {
             Some(window_id),
         );
 
+        // A native field can accept AXValue without notifying its delegate
+        // until AppKit has installed its field editor. Reuse the existing
+        // exact-target gate under the same lease before preparing that editor.
+        // Semantic-only targets (hidden/minimized or competing windows) retain
+        // their direct AX route without a new focus mutation. Web content and
+        // non-text controls also retain their existing behavior.
+        let prepare_native_text = !ax_echo_surface
+            && matches!(
+                unsafe { copy_string_attr(element_ptr as AXUIElementRef, "AXRole") }.as_deref(),
+                Some("AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox")
+            )
+            && _mutation_lease
+                .gate_again(
+                    window_id,
+                    Some(element_ptr),
+                    cua_driver_core::background_input::BackgroundAction::InsertText,
+                )
+                .await
+                .is_ok();
+
         let prior_front = apps::frontmost_pid();
 
         let result = focus_guard::with_focus_suppressed(
@@ -226,7 +246,19 @@ impl Tool for SetValueTool {
                                 &crate::cursor::visual::OverlayVisualSink,
                                 &cursor_key,
                                 target,
-                                || set_value_blocking(element_ptr, element_index, pid, &value),
+                                || {
+                                    if prepare_native_text
+                                        && !crate::input::ax_actions::is_element_focused(
+                                            pid,
+                                            element_ptr,
+                                        )
+                                    {
+                                        crate::input::ax_actions::focus_element(element_ptr)?;
+                                    }
+                                    // Preparation is best effort, not evidence
+                                    // of delivery. Keep target-bound readback.
+                                    set_value_blocking(element_ptr, element_index, pid, &value)
+                                },
                             )
                         },
                     )
