@@ -7,20 +7,34 @@
 use std::ffi::c_void;
 use std::io::BufReader;
 use std::sync::{
-    atomic::{AtomicBool, AtomicU64, Ordering},
+    atomic::{AtomicBool, Ordering},
     Mutex, OnceLock,
 };
 use std::time::Duration;
 
 use pip_preview::{
-    observer::{read_update, ObserverUpdate},
+    observer::ObserverUpdate,
+    session_observer::{read_snapshot, ObserverSnapshot, SnapshotReceiver},
     PipConfig,
 };
 use screencapturekit::prelude::{
     CMSampleBufferExt, CMSampleBufferSCExt, CMTime, SCStream, SCStreamOutputType,
 };
 
-static DESIRED_GENERATION: AtomicU64 = AtomicU64::new(0);
+use std::collections::BTreeMap;
+static DESIRED: OnceLock<tokio::sync::watch::Receiver<Option<ObserverSnapshot>>> = OnceLock::new();
+fn desired() -> Option<ObserverSnapshot> {
+    DESIRED.get().and_then(|r| r.borrow().clone())
+}
+pub(super) fn current(id: u64, generation: u64) -> bool {
+    DESIRED.get().is_some_and(|r| {
+        r.borrow().as_ref().is_some_and(|s| {
+            s.previews
+                .get(&id)
+                .is_some_and(|u| u.generation == generation)
+        })
+    })
+}
 static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
 
 fn request_refresh() {
@@ -29,16 +43,29 @@ fn request_refresh() {
     }
 }
 
-#[derive(Default)]
-struct Presentation<T> {
+pub(super) struct Presentation<T> {
     generation: u64,
     frame: Option<T>,
     label: String,
     clear: bool,
     scheduled: bool,
     available: bool,
+    pub(super) hidden: bool,
 }
 
+impl<T> Default for Presentation<T> {
+    fn default() -> Self {
+        Self {
+            generation: 0,
+            frame: None,
+            label: String::new(),
+            clear: true,
+            scheduled: false,
+            available: false,
+            hidden: false,
+        }
+    }
+}
 impl<T> Presentation<T> {
     fn select(&mut self, generation: u64, label: String) -> bool {
         if generation < self.generation {
@@ -88,77 +115,105 @@ impl<T> Presentation<T> {
     }
 }
 
-fn presentation() -> &'static Mutex<Presentation<screencapturekit::CGImage>> {
-    static STATE: OnceLock<Mutex<Presentation<screencapturekit::CGImage>>> = OnceLock::new();
+#[derive(Default)]
+pub(super) struct Sessions<T> {
+    pub(super) entries: BTreeMap<u64, Presentation<T>>,
+    revision: u64,
+}
+pub(super) struct Draw<T> {
+    pub(super) generation: u64,
+    pub(super) frame: Option<T>,
+    pub(super) clear: bool,
+    pub(super) label: String,
+}
+impl<T> Sessions<T> {
+    fn sync(&mut self, snapshot: &ObserverSnapshot) {
+        if snapshot.revision <= self.revision {
+            return;
+        }
+        self.revision = snapshot.revision;
+        self.entries
+            .retain(|id, _| snapshot.previews.contains_key(id));
+        for (&id, update) in &snapshot.previews {
+            self.entries
+                .entry(id)
+                .or_default()
+                .select(update.generation, update.action_label.clone());
+        }
+    }
+    fn frame(&mut self, id: u64, generation: u64, image: T) -> bool {
+        self.entries
+            .get_mut(&id)
+            .is_some_and(|p| !p.hidden && p.frame(generation, image))
+    }
+    fn detach(&mut self) -> BTreeMap<u64, Draw<T>> {
+        self.entries
+            .iter_mut()
+            .map(|(&id, p)| {
+                p.scheduled = false;
+                (
+                    id,
+                    Draw {
+                        generation: p.generation,
+                        frame: p.frame.take(),
+                        clear: std::mem::take(&mut p.clear),
+                        label: p.label.clone(),
+                    },
+                )
+            })
+            .collect()
+    }
+}
+pub(super) fn presentation() -> &'static Mutex<Sessions<screencapturekit::CGImage>> {
+    static STATE: OnceLock<Mutex<Sessions<screencapturekit::CGImage>>> = OnceLock::new();
     STATE.get_or_init(|| {
-        Mutex::new(Presentation {
-            generation: 0,
-            frame: None,
-            label: String::new(),
-            clear: true,
-            scheduled: false,
-            available: false,
+        Mutex::new(Sessions {
+            entries: BTreeMap::new(),
+            revision: 0,
         })
     })
 }
-
-fn select_display(generation: u64, label: String) {
-    let schedule = presentation().lock().unwrap().select(generation, label);
-    if schedule {
-        request_refresh();
+fn unavailable_display(id: u64, generation: u64) {
+    if let Some(state) = presentation().lock().unwrap().entries.get_mut(&id) {
+        state.unavailable(generation);
     }
+    request_refresh();
 }
-
-fn unavailable_display(generation: u64) {
-    let schedule = presentation().lock().unwrap().unavailable(generation);
-    if schedule {
-        request_refresh();
-    }
-}
-
-fn activate_display(update: &ObserverUpdate) -> bool {
-    let mut state = presentation().lock().unwrap();
-    if DESIRED_GENERATION.load(Ordering::Acquire) != update.generation
-        || !state.activate(update.generation)
-    {
+fn activate_display(id: u64, update: &ObserverUpdate) -> bool {
+    if !current(id, update.generation) {
         return false;
     }
-    let schedule = state.select(update.generation, update.action_label.clone());
-    drop(state);
-    if schedule {
-        request_refresh();
+    let mut states = presentation().lock().unwrap();
+    let Some(state) = states.entries.get_mut(&id) else {
+        return false;
+    };
+    if state.hidden || !state.activate(update.generation) {
+        return false;
     }
+    state.select(update.generation, update.action_label.clone());
+    drop(states);
+    request_refresh();
     true
 }
-
-fn publish_frame(generation: u64, image: screencapturekit::CGImage) {
-    if DESIRED_GENERATION.load(Ordering::Acquire) != generation {
+fn publish_frame(id: u64, generation: u64, image: screencapturekit::CGImage) {
+    if !current(id, generation) {
         return;
     }
-    // Dropping a frame is preferable to making ScreenCaptureKit wait for AppKit.
-    let schedule = match presentation().try_lock() {
-        Ok(mut state) => state.frame(generation, image),
-        Err(_) => false,
-    };
-    if schedule {
+    // The lock covers only mailbox transfer. AppKit never holds it.
+    if presentation().lock().unwrap().frame(id, generation, image) {
         request_refresh();
     }
 }
-
 fn publish_control(
-    update: ObserverUpdate,
-    sender: &tokio::sync::watch::Sender<Option<ObserverUpdate>>,
+    snapshot: ObserverSnapshot,
+    sender: &tokio::sync::watch::Sender<Option<ObserverSnapshot>>,
 ) {
-    tracing::debug!(generation = update.generation, target = ?update.target, "preview target received");
-    // This reader must stay independent of native capture AND AppKit, so it
-    // can terminate the helper on EOF even if either subsystem hangs.
-    DESIRED_GENERATION.store(update.generation, Ordering::Release);
-    sender.send_replace(Some(update));
+    sender.send_replace(Some(snapshot));
     request_refresh();
 }
 
 #[repr(C)]
-struct NativeCGImage {
+pub(super) struct NativeCGImage {
     _opaque: [u8; 0],
 }
 unsafe impl objc2::RefEncode for NativeCGImage {
@@ -167,53 +222,17 @@ unsafe impl objc2::RefEncode for NativeCGImage {
 }
 
 unsafe extern "C" fn render(ctx: *mut c_void) {
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
-    use objc2_foundation::NSSize;
     drop(Box::from_raw(ctx as *mut ()));
     REFRESH_PENDING.store(false, Ordering::Release);
-    // Capture can drop frames while this helper-only lock is held. The control
-    // reader never takes it, and can still receive EOF during an AppKit stall.
-    let mut state = presentation().lock().unwrap();
-    state.scheduled = false;
-    if state.generation != DESIRED_GENERATION.load(Ordering::Acquire) {
-        state.frame = None;
-        state.clear = true;
-    }
-    let handles = super::HANDLES.lock().unwrap();
-    let Some(handles) = handles.as_ref() else {
+    let Some(snapshot) = desired() else {
         return;
     };
-    let view = handles.image_view as *mut AnyObject;
-    if state.clear {
-        let _: () = msg_send![view, setImage: std::ptr::null_mut::<AnyObject>()];
-        state.clear = false;
-    }
-    if let Some(frame) = state.frame.take() {
-        let cg_image = frame.as_ptr() as *mut NativeCGImage;
-        let alloc: *mut AnyObject = msg_send![class!(NSImage), alloc];
-        let image: *mut AnyObject =
-            msg_send![alloc, initWithCGImage: cg_image size: NSSize::new(0.0, 0.0)];
-        if !image.is_null() {
-            let _: () = msg_send![view, setImage: image];
-            let _: () = msg_send![image, release];
-        }
-    }
-    let changed = state.generation != DESIRED_GENERATION.load(Ordering::Acquire);
-    if changed {
-        let _: () = msg_send![view, setImage: std::ptr::null_mut::<AnyObject>()];
-    }
-    let label = if changed {
-        "Switching preview"
-    } else {
-        state.label.as_str()
+    let draws = {
+        let mut state = presentation().lock().unwrap();
+        state.sync(&snapshot);
+        state.detach()
     };
-    if let Ok(label) = std::ffi::CString::new(label) {
-        let text: *mut AnyObject =
-            msg_send![class!(NSString), stringWithUTF8String: label.as_ptr() as *const u8];
-        let label = handles.label as *mut AnyObject;
-        let _: () = msg_send![label, setStringValue: text];
-    }
+    super::observer_panels::render(&snapshot, draws);
 }
 
 fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
@@ -226,7 +245,7 @@ fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
     )
 }
 
-fn capture(update: &ObserverUpdate) -> anyhow::Result<SCStream> {
+fn capture(id: u64, update: &ObserverUpdate) -> anyhow::Result<SCStream> {
     let target = update
         .target
         .ok_or_else(|| anyhow::anyhow!("preview has no target"))?;
@@ -244,7 +263,7 @@ fn capture(update: &ObserverUpdate) -> anyhow::Result<SCStream> {
     stream
         .add_output_handler(
             move |sample: screencapturekit::cm::CMSampleBuffer, kind| {
-                if DESIRED_GENERATION.load(Ordering::Acquire) != generation
+                if !current(id, generation)
                     || kind != SCStreamOutputType::Screen
                     || sample
                         .frame_status()
@@ -253,7 +272,7 @@ fn capture(update: &ObserverUpdate) -> anyhow::Result<SCStream> {
                     return;
                 }
                 if let Ok(image) = sample.cg_image() {
-                    publish_frame(generation, image);
+                    publish_frame(id, generation, image);
                 }
             },
             SCStreamOutputType::Screen,
@@ -262,11 +281,11 @@ fn capture(update: &ObserverUpdate) -> anyhow::Result<SCStream> {
     // ScreenCaptureKit can deliver the only complete frame of a static window
     // before start_capture returns. Admit that frame before starting the stream.
     anyhow::ensure!(
-        activate_display(update),
+        activate_display(id, update),
         "preview target superseded before capture"
     );
     if let Err(error) = stream.start_capture() {
-        unavailable_display(generation);
+        unavailable_display(id, generation);
         anyhow::bail!("preview stream: {error}");
     }
     Ok(stream)
@@ -283,20 +302,20 @@ pub fn run(cfg: PipConfig) -> anyhow::Result<()> {
         crate::permissions::status::screen_recording_granted(),
         "preview needs an existing Screen Recording grant"
     );
-    super::dispatch_to_main(cfg, super::init_cb);
-    let (sender, mut receiver) = tokio::sync::watch::channel::<Option<ObserverUpdate>>(None);
+    super::observer_panels::configure(cfg);
+    let (sender, mut receiver) = tokio::sync::watch::channel::<Option<ObserverSnapshot>>(None);
+    let _ = DESIRED.set(receiver.clone());
     std::thread::Builder::new()
         .name("cua-preview-control".into())
         .spawn(move || {
             let mut reader = BufReader::new(std::io::stdin());
-            let mut previous = None::<ObserverUpdate>;
+            let mut previous = SnapshotReceiver::default();
             let code = loop {
-                match read_update(&mut reader) {
+                match read_snapshot(&mut reader) {
                     Ok(Some(update)) => {
-                        if previous.as_ref().is_some_and(|old| !update.follows(old)) {
+                        if previous.accept(&update).is_err() {
                             break 1;
                         }
-                        previous = Some(update.clone());
                         publish_control(update, &sender);
                     }
                     Ok(None) => break 0,
@@ -324,55 +343,71 @@ pub fn run(cfg: PipConfig) -> anyhow::Result<()> {
                 }
             };
             runtime.block_on(async {
-                let mut active = None::<SCStream>;
-                let mut active_key = None;
+                // ponytail: one capture worker serializes native startup; use per-owner workers if startup latency becomes material.
+                let mut active = BTreeMap::<u64, (SCStream, (u64, i32, u32, u64, u64))>::new();
                 loop {
-                    let update = receiver.borrow_and_update().clone();
-                    if let Some(update) = update {
-                        select_display(update.generation, update.action_label.clone());
-                        let key = update.target.and_then(|target| {
-                            crate::windows::window_info_by_id(target.window_id)
-                                .filter(|window| window.pid == target.pid)
-                                .map(|window| {
-                                    (
-                                        update.generation,
-                                        target.pid,
-                                        target.window_id,
-                                        window.bounds.width.to_bits(),
-                                        window.bounds.height.to_bits(),
-                                    )
-                                })
-                        });
-                        if key.is_none() {
-                            tracing::debug!(generation = update.generation, target = ?update.target,
-                                "preview target absent or no longer matches WindowServer");
-                        }
-                        if key != active_key || (key.is_some() && active.is_none()) {
-                            unavailable_display(update.generation);
-                            if let Some(stream) = active.take() {
+                    let snapshot = receiver.borrow_and_update().clone();
+                    if let Some(snapshot) = snapshot {
+                        presentation().lock().unwrap().sync(&snapshot);
+                        let removed: Vec<_> = active
+                            .keys()
+                            .filter(|id| !snapshot.previews.contains_key(id))
+                            .copied()
+                            .collect();
+                        for id in removed {
+                            if let Some((stream, _)) = active.remove(&id) {
                                 let _ = stream.stop_capture();
                             }
-                            active_key = key;
-                            if key.is_some() {
-                                match capture(&update) {
-                                    Ok(stream) => {
-                                        // A newer target may have arrived during startup.
-                                        if activate_display(&update) {
-                                            active = Some(stream);
-                                        } else {
-                                            let _ = stream.stop_capture();
-                                            active_key = None;
-                                        }
-                                    }
-                                    Err(error) => {
-                                        tracing::debug!(%error, "preview capture unavailable");
-                                    }
+                        }
+                        for (&id, update) in &snapshot.previews {
+                            let hidden = presentation()
+                                .lock()
+                                .unwrap()
+                                .entries
+                                .get(&id)
+                                .is_none_or(|p| p.hidden);
+                            let key = if hidden {
+                                None
+                            } else {
+                                update.target.and_then(|target| {
+                                    crate::windows::window_info_by_id(target.window_id)
+                                        .filter(|window| window.pid == target.pid)
+                                        .map(|window| {
+                                            (
+                                                update.generation,
+                                                target.pid,
+                                                target.window_id,
+                                                window.bounds.width.to_bits(),
+                                                window.bounds.height.to_bits(),
+                                            )
+                                        })
+                                })
+                            };
+                            if active.get(&id).map(|(_, key)| *key) != key {
+                                unavailable_display(id, update.generation);
+                                if let Some((stream, _)) = active.remove(&id) {
+                                    let _ = stream.stop_capture();
                                 }
                             }
+                            if let Some(key) = key {
+                                if !active.contains_key(&id) {
+                                    match capture(id, update) {
+                                        Ok(stream) if current(id, update.generation) => {
+                                            active.insert(id, (stream, key));
+                                        }
+                                        Ok(stream) => {
+                                            let _ = stream.stop_capture();
+                                        }
+                                        Err(error) => {
+                                            tracing::debug!(%error, "preview capture unavailable");
+                                        }
+                                    }
+                                }
+                            } else {
+                                unavailable_display(id, update.generation);
+                            }
                         }
-                        if key.is_none() {
-                            unavailable_display(update.generation);
-                        }
+                        request_refresh();
                     }
                     tokio::select! {
                         changed = receiver.changed() => { if changed.is_err() { return; } },
@@ -394,32 +429,93 @@ mod tests {
     };
 
     #[test]
+    fn delayed_snapshot_cannot_resurrect_owner_or_reset_unavailable() {
+        let mut state = Sessions::<u8>::default();
+        state.sync(&snapshot(&[(1, 1)]));
+        state.entries.get_mut(&1).unwrap().unavailable(1);
+        state.sync(&snapshot(&[(1, 1)]));
+        assert_eq!(state.entries[&1].label, "Preview unavailable");
+        state.sync(&ObserverSnapshot {
+            revision: 2,
+            ..snapshot(&[])
+        });
+        state.sync(&snapshot(&[(1, 1)]));
+        assert!(state.entries.is_empty());
+    }
+
+    #[test]
+    fn control_reader_does_not_wait_for_presentation() {
+        let held = presentation().lock().unwrap();
+        let (sender, receiver) = tokio::sync::watch::channel(None);
+        let (done, finished) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            publish_control(snapshot(&[(1, 1)]), &sender);
+            done.send(()).unwrap();
+        });
+        let early = finished.recv_timeout(Duration::from_secs(1));
+        drop(held);
+        worker.join().unwrap();
+        assert!(early.is_ok());
+        assert_eq!(receiver.borrow().as_ref().unwrap().previews.len(), 1);
+    }
+
+    #[test]
+    fn owners_are_independent_and_removed_frames_are_rejected() {
+        let mut state = Sessions::<u8>::default();
+        state.sync(&snapshot(&[(1, 1), (2, 1)]));
+        state.entries.get_mut(&1).unwrap().activate(1);
+        state.entries.get_mut(&2).unwrap().activate(1);
+        state.frame(1, 1, 10);
+        state.frame(2, 1, 20);
+        assert_eq!(state.entries[&1].frame, Some(10));
+        assert_eq!(state.entries[&2].frame, Some(20));
+        state.sync(&ObserverSnapshot {
+            revision: 2,
+            ..snapshot(&[(2, 1)])
+        });
+        assert!(!state.frame(1, 1, 99));
+        assert_eq!(state.entries[&2].frame, Some(20));
+    }
+
+    #[test]
+    fn detached_render_keeps_the_next_static_frame_and_hidden_state() {
+        let mut state = Sessions::<u8>::default();
+        state.sync(&snapshot(&[(1, 1)]));
+        state.entries.get_mut(&1).unwrap().activate(1);
+        let detached = state.detach();
+        state.frame(1, 1, 42);
+        drop(detached);
+        assert_eq!(state.detach()[&1].frame, Some(42));
+        state.entries.get_mut(&1).unwrap().hidden = true;
+        state.sync(&ObserverSnapshot {
+            revision: 2,
+            ..snapshot(&[(1, 2)])
+        });
+        assert!(state.entries[&1].hidden);
+        assert!(!state.frame(1, 2, 43));
+    }
+
+    fn snapshot(entries: &[(u64, u64)]) -> ObserverSnapshot {
+        ObserverSnapshot {
+            version: 2,
+            revision: 1,
+            previews: entries
+                .iter()
+                .map(|&(id, generation)| {
+                    (
+                        id,
+                        ObserverUpdate::new(generation, Some(7), Some(42), "click", 1),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
     fn capture_dimensions_preserve_aspect_and_bound_large_and_thin_windows() {
         assert_eq!(preview_dimensions(3840, 2160), (1280, 720));
         assert_eq!(preview_dimensions(600, 800), (600, 800));
         assert_eq!(preview_dimensions(1, 10000), (1, 1280));
-    }
-
-    #[test]
-    fn control_reader_does_not_wait_for_the_renderer_lock() {
-        let held_ui = presentation().lock().unwrap();
-        let (sender, receiver) = tokio::sync::watch::channel(None);
-        let (done, finished) = std::sync::mpsc::channel();
-        let reader = std::thread::spawn(move || {
-            publish_control(
-                ObserverUpdate::new(1, Some(7), Some(42), "click", 12),
-                &sender,
-            );
-            done.send(()).unwrap();
-        });
-        let early = finished.recv_timeout(Duration::from_secs(1));
-        drop(held_ui);
-        reader.join().unwrap();
-        assert!(
-            early.is_ok(),
-            "control reader could not reach EOF while AppKit held the renderer lock"
-        );
-        assert_eq!(receiver.borrow().as_ref().unwrap().generation, 1);
     }
 
     #[test]
@@ -494,6 +590,7 @@ mod tests {
             clear: false,
             scheduled: false,
             available: true,
+            hidden: false,
         };
         assert!(presentation.frame(1, Image(releases.clone())));
         for _ in 0..100 {

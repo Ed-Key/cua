@@ -241,7 +241,9 @@ fn maybe_init_pip() {
     }
     match preview_observer::ObserverProcess::spawn(&cfg) {
         Ok(mut observer) => {
-            cua_driver_core::pip_hook::set_pip_observer_fn(move |request| observer.publish(request))
+            cua_driver_core::pip_hook::set_pip_session_observer_fn(move |request| {
+                observer.publish_sessions(request)
+            })
         }
         Err(error) => eprintln!("PiP observer unavailable: {error}"),
     }

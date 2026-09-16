@@ -47,6 +47,7 @@ use std::sync::Mutex;
 use pip_preview::{PipBackend, PipBackendFactory, PipConfig, PipFrame};
 
 pub mod observer;
+mod observer_panels;
 
 // ── CGColor objc2 encoding shim ────────────────────────────────────────────
 //
