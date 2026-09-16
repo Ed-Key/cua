@@ -65,8 +65,29 @@ fn background_web_selection_is_observed_without_confirming_keys() {
     check_first_snapshot(true, false, Some(TypingScenario::ObserveSelection));
 }
 
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_addressed_typing_reaches_unfocused_renderer() {
+    check_first_snapshot(true, false, Some(TypingScenario::AddressedFresh));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_addressed_typing_appends_without_replacing_value() {
+    check_first_snapshot(true, false, Some(TypingScenario::AddressedAppend));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_addressed_typing_preserves_partial_selection() {
+    check_first_snapshot(true, false, Some(TypingScenario::AddressedSelection));
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TypingScenario {
+    AddressedFresh,
+    AddressedAppend,
+    AddressedSelection,
     Fresh,
     ReplaceSelection,
     AfterAddressedAttempt,
@@ -156,7 +177,9 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
             r#"<textarea id="txt-input" data-cua-id="txt-input"
             aria-label="txt-input" rows="2" cols="30"></textarea>
             <button id="select-input" data-cua-id="select-input"
-              onclick="const field=document.getElementById('txt-input');field.focus();field.select()">Select input text</button>"#,
+              onclick="const field=document.getElementById('txt-input');field.focus();field.select()">Select input text</button>
+            <button aria-label="Select suffix" onclick="const f=document.getElementById('txt-input');f.focus();f.setSelectionRange(5,8)">Select suffix</button>
+            <button aria-label="Place caret at end" onclick="const f=document.getElementById('txt-input');f.focus();f.setSelectionRange(8,8)">Place caret at end</button>"#,
         );
         let anchor = "if ('value' in element) entry.value = element.value;";
         assert_eq!(html.matches(anchor).count(), 1);
@@ -323,6 +346,121 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                 * scale;
             assert_eq!(journal.text("lbl-input-mirror").as_deref(), Some("mirror="));
             let before_number = journal.snapshot()["number-input"].clone();
+            if matches!(
+                scenario,
+                TypingScenario::AddressedFresh
+                    | TypingScenario::AddressedAppend
+                    | TypingScenario::AddressedSelection
+            ) {
+                if scenario != TypingScenario::AddressedFresh {
+                    let seeded = driver.call(
+                        "set_value",
+                        serde_json::json!({
+                            "pid":pid, "window_id":wid, "element_token":fields[0]["element_token"],
+                            "value":"KEEP abc"
+                        }),
+                    );
+                    assert!(!seeded.is_error(), "seed failed: {}", seeded.text());
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    while journal.snapshot()["txt-input"]["value"] != "KEEP abc" {
+                        assert!(Instant::now() < deadline, "seed did not reach renderer");
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                    let label = if scenario == TypingScenario::AddressedAppend {
+                        "Place caret at end"
+                    } else {
+                        "Select suffix"
+                    };
+                    let current = driver.call(
+                        "get_window_state",
+                        serde_json::json!({
+                            "pid":pid, "window_id":wid, "include_screenshot":false
+                        }),
+                    );
+                    let token = current.structured()["elements"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|e| e["role"] == "AXButton" && e["label"] == label)
+                        .unwrap()["element_token"]
+                        .clone();
+                    let selected = driver.call("click", serde_json::json!({
+                        "pid":pid, "window_id":wid, "element_token":token, "delivery_mode":"background"
+                    }));
+                    assert!(
+                        !selected.is_error(),
+                        "selection failed: {}",
+                        selected.text()
+                    );
+                    let start = if scenario == TypingScenario::AddressedAppend {
+                        8
+                    } else {
+                        5
+                    };
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        let field = journal.snapshot()["txt-input"].clone();
+                        if field["focused"] == true
+                            && field["selectionStart"] == start
+                            && field["selectionEnd"] == 8
+                        {
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "selection not established: {field}"
+                        );
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }
+                let current = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "include_screenshot":false
+                    }),
+                );
+                let token = current.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["role"] == "AXTextArea" && e["label"] == "txt-input")
+                    .unwrap()["element_token"]
+                    .clone();
+                let inserted = driver.call(
+                    "type_text",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "element_token":token,
+                        "text":"XYZ", "delivery_mode":"background"
+                    }),
+                );
+                let expected = match scenario {
+                    TypingScenario::AddressedAppend => "KEEP abcXYZ",
+                    TypingScenario::AddressedSelection => "KEEP XYZ",
+                    _ => "XYZ",
+                };
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while journal.snapshot()["txt-input"]["value"] != expected {
+                    assert!(
+                        Instant::now() < deadline,
+                        "addressed insertion did not reach renderer: {}; journal: {}",
+                        inserted.text(),
+                        journal.snapshot()
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                assert!(!inserted.is_error(), "typing failed: {}", inserted.text());
+                assert_eq!(
+                    inserted.action_effect(),
+                    Some("unverifiable"),
+                    "web AX is not renderer proof"
+                );
+                assert_eq!(
+                    journal.snapshot()["number-input"],
+                    before_number,
+                    "other editor changed"
+                );
+                return (state, elapsed);
+            }
             if scenario == TypingScenario::AfterAddressedAttempt {
                 let addressed = driver.call(
                     "type_text",

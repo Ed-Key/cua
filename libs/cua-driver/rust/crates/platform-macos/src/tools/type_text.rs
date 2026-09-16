@@ -393,13 +393,6 @@ impl Tool for TypeTextTool {
 
         let prior_front = apps::frontmost_pid();
 
-        // Terminal-emulator short-circuit: when the target pid belongs
-        // to a known terminal (Ghostty / Terminal.app / iTerm2 / …), the
-        // AX value-set is silently dropped — see crate::terminal docs.
-        // Skip the AX path entirely so the caller never sees the
-        // "success but nothing typed" symptom.
-        let is_terminal_target = crate::terminal::is_terminal_pid(pid);
-
         let blocking_policy = keyboard_policy.clone();
         // A started native worker outlives cancellation of its async caller.
         // Keep serialization through target-focus cleanup in that worker.
@@ -411,6 +404,7 @@ impl Tool for TypeTextTool {
             || async move {
                 tokio::task::spawn_blocking(move || {
                     let _worker_lease = worker_lease;
+                    let backend = TextInputBackend::for_pid(pid);
                     let target = element_ptr.and_then(|(ptr, _)| {
                         editor_visual_target(ptr as AXUIElementRef, window_id)
                     });
@@ -425,7 +419,7 @@ impl Tool for TypeTextTool {
                                 &text_clone,
                                 element_ptr,
                                 delay_ms,
-                                is_terminal_target,
+                                backend,
                                 delivery_mode,
                                 window_id,
                                 blocking_policy,
@@ -722,6 +716,32 @@ const DELIVERY_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::f
 /// an app that installs its own first responder just after activation is
 /// observable, which would otherwise clobber the first write.
 const FOCUS_REAPPLY_DELAY: std::time::Duration = std::time::Duration::from_millis(30);
+
+/// Select only known engine workarounds. AXWebArea alone also includes
+/// WebKit, whose semantic selected-text insertion must remain available.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TextInputBackend {
+    Terminal,
+    Chromium,
+    Other,
+}
+
+impl TextInputBackend {
+    fn for_pid(pid: i32) -> Self {
+        if crate::terminal::is_terminal_pid(pid) {
+            return Self::Terminal;
+        }
+        let name = apps::get_app_name_for_pid(pid).unwrap_or_default();
+        let bundle = apps::bundle_id_for_pid(pid).unwrap_or_default();
+        if crate::browser::platform::is_chromium(&name, &bundle)
+            || crate::browser::ElectronJs::is_electron(pid)
+        {
+            Self::Chromium
+        } else {
+            Self::Other
+        }
+    }
+}
 
 /// Keyboard-rung policy for one window-addressed background insert, decided
 /// once by the pure exact-target core before any input is posted.
@@ -1126,11 +1146,11 @@ fn type_text_blocking(
     text: &str,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     delay_ms: u64,
-    is_terminal_target: bool,
+    backend: TextInputBackend,
     delivery_mode: super::DeliveryMode,
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
-    resolved_editor: Option<&mut dyn FnMut(AXUIElementRef)>,
+    mut resolved_editor: Option<&mut dyn FnMut(AXUIElementRef)>,
 ) -> anyhow::Result<TypeTextDelivery> {
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -1236,7 +1256,7 @@ fn type_text_blocking(
     }
 
     // --- Background rung 0: terminal emulator → CGEvent only (AX is dropped). ---
-    if is_terminal_target {
+    if backend == TextInputBackend::Terminal {
         // A terminal insert has no semantic AX rung: when the exact-target
         // decision restricted this request to semantic-only, there is nothing
         // safe to run — refuse before posting anything.
@@ -1288,6 +1308,25 @@ fn type_text_blocking(
             }
         },
     };
+    // Chromium accepts AXSelectedText but its web accessibility action
+    // dispatcher does not implement ReplaceSelectedText. Choose the existing
+    // keyboard rung before writing, rather than retrying an uncertain AX edit.
+    // WebKit and native controls retain semantic insertion. The exact-window
+    // gate and synthesis budget still apply, including semantic-only refusal.
+    let ax_target = ax_target.filter(|&(element, owns, idx)| {
+        if backend != TextInputBackend::Chromium
+            || !target_in_web_area(pid, Some((element as usize, idx)), window_id)
+        {
+            return true;
+        }
+        if let Some(observed) = resolved_editor.as_deref_mut() {
+            observed(element);
+        }
+        if owns {
+            unsafe { CFRelease(element as _) };
+        }
+        false
+    });
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
         if let Some(observed) = resolved_editor {
@@ -1388,7 +1427,9 @@ fn type_text_blocking(
              falling back to CGEvent keystrokes"
         );
     } else {
-        tracing::debug!("No focused element for pid {pid}; using CGEvent keystrokes");
+        tracing::debug!(
+            "No semantic insertion target for pid {pid}; considering CGEvent keystrokes"
+        );
     }
 
     // The semantic AX rung did not land and this request is restricted to it:
@@ -1506,7 +1547,7 @@ mod tests {
                         "hello",
                         None,
                         0,
-                        false,
+                        TextInputBackend::Other,
                         super::super::DeliveryMode::Background,
                         Some(42),
                         BackgroundKeyboardPolicy::Allowed,
@@ -1591,10 +1632,10 @@ mod tests {
     use super::*;
 
     /// Sanity-check that the terminal short-circuit can be expressed as a
-    /// pure function of `is_terminal_target`: when true, the code goes
+    /// pure function of the terminal backend: when selected, the code goes
     /// to key-event synthesis without consulting AX. This test stands
     /// in for an integration test (which would need a running terminal)
-    /// — it exercises the branch by injecting `is_terminal_target=true`
+    /// — it exercises the branch by injecting `TextInputBackend::Terminal`
     /// with a non-existent pid and checking we get the expected error
     /// shape from the CGEvent path (not from the AX path).
     ///
@@ -1613,14 +1654,14 @@ mod tests {
             "x",
             None,
             0,
-            /*is_terminal_target=*/ true,
+            TextInputBackend::Terminal,
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
             None,
         );
         // We don't care whether r is Ok or Err — what matters is that
-        // calling it with is_terminal_target=true is safe and never
+        // calling it with the terminal backend is safe and never
         // dereferences null AX pointers.
         let _ = r;
     }
@@ -1640,7 +1681,7 @@ mod tests {
             "x",
             None,
             0,
-            /*is_terminal_target=*/ true,
+            TextInputBackend::Terminal,
             super::super::DeliveryMode::Background,
             Some(7),
             BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
@@ -1650,6 +1691,92 @@ mod tests {
             Ok(TypeTextDelivery::Refused(returned)) => assert_eq!(returned, refusal),
             other => panic!("expected a structured refusal, got {:?}", other.is_ok()),
         }
+    }
+
+    #[test]
+    fn other_web_engines_keep_semantic_insertion_when_keys_are_refused() {
+        let _fixture =
+            crate::ax::bindings::test_support::EditorScope::install("AXWebArea", None, || {});
+        let result = type_text_blocking(
+            -9876,
+            "XYZ",
+            None,
+            0,
+            TextInputBackend::Other,
+            super::super::DeliveryMode::Background,
+            Some(42),
+            BackgroundKeyboardPolicy::SemanticOnly(BackgroundRefusal {
+                code: cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+                reason: "same-process sibling window".into(),
+                advice: None,
+            }),
+            None,
+        )
+        .unwrap();
+        let TypeTextDelivery::Typed(outcome) = result else {
+            panic!("non-Chromium web engines retain their semantic insertion route");
+        };
+        assert_eq!(outcome.path, PATH_AX);
+        assert_eq!(outcome.delivered_chars, Some(3));
+    }
+
+    #[test]
+    fn web_insertion_checks_synthesis_budget_before_any_ax_write() {
+        // The scoped AX boundary identifies web ancestry. Oversized input must
+        // reach the existing preflight without an AX mutation or real keys.
+        let _fixture =
+            crate::ax::bindings::test_support::EditorScope::install("AXWebArea", None, || {
+                panic!("web insertion must not write AXSelectedText")
+            });
+        let result = type_text_blocking(
+            -9876,
+            &"x".repeat(6_500),
+            None,
+            0,
+            TextInputBackend::Chromium,
+            super::super::DeliveryMode::Background,
+            Some(42),
+            BackgroundKeyboardPolicy::Allowed,
+            None,
+        )
+        .unwrap();
+        let TypeTextDelivery::SynthesisRefused {
+            path, ax_attempt, ..
+        } = result
+        else {
+            panic!("oversized web insertion must stop before input");
+        };
+        assert_eq!(path, PATH_KEY_EVENTS);
+        assert_eq!(ax_attempt, AxAttempt::NotAttempted);
+    }
+
+    #[test]
+    fn web_insertion_preserves_semantic_only_refusal_without_writing() {
+        let _fixture =
+            crate::ax::bindings::test_support::EditorScope::install("AXWebArea", None, || {
+                panic!("web insertion must not write AXSelectedText")
+            });
+        let refusal = BackgroundRefusal {
+            code: cua_driver_core::background_input::refusal_codes::SAME_PID_KEYBOARD_AMBIGUITY,
+            reason: "same-process sibling window".into(),
+            advice: None,
+        };
+        let result = type_text_blocking(
+            -9876,
+            "XYZ",
+            None,
+            0,
+            TextInputBackend::Chromium,
+            super::super::DeliveryMode::Background,
+            Some(42),
+            BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
+            None,
+        )
+        .unwrap();
+        let TypeTextDelivery::Refused(actual) = result else {
+            panic!("web insertion may not bypass the keyboard gate");
+        };
+        assert_eq!(actual, refusal);
     }
 
     #[test]
@@ -1665,7 +1792,7 @@ mod tests {
             &text,
             None,
             0,
-            false,
+            TextInputBackend::Other,
             super::super::DeliveryMode::Background,
             Some(42),
             BackgroundKeyboardPolicy::Allowed,
@@ -1688,7 +1815,7 @@ mod tests {
             &text,
             None,
             0,
-            /*is_terminal_target=*/ true,
+            TextInputBackend::Terminal,
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,

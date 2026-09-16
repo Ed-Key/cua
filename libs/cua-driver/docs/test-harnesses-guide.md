@@ -346,6 +346,28 @@ background delivery is tested.
 
 ### macOS
 
+#### Focused Chromium and Electron text insertion
+
+On macOS, `type_text` uses the existing keyboard route for web content in
+recognized Chromium and Electron apps. It does not first write `AXSelectedText`,
+whose acknowledgment can leave the renderer unchanged. Native controls and other
+web engines retain their accessibility insertion route. The exact-window
+keyboard gate, synthesis budget, and unverified web-readback result still apply.
+This is a macOS adapter correction; Windows and Linux routing is unchanged.
+
+Inside an authorized macOS test session, run only the addressed insertion rows:
+
+```sh
+cargo test -p cua-driver --test electron_first_snapshot_macos_test background_addressed_typing -- --ignored --nocapture --test-threads=1
+```
+
+The three rows check a fresh editor, append, and partial-selection replacement
+against the fixture-owned renderer journal, while the foreground sentinel checks
+focus, z-order, cursor position, and input isolation. A setup failure is not a
+text-delivery result. These diagnostic rows do not replace the full candidate
+matrix or imply that a behavior recording was produced.
+
+
 Runner: `libs/cua-driver/tests/runners/macos-lume/run-all.sh`
 
 | Runner area               | Rust test                              | Real harness or app                     |
