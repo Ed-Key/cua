@@ -15,9 +15,11 @@ pub struct WindowTarget {
     pub window_id: u32,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObserverUpdate {
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub visuals: Vec<ObserverVisual>,
     pub version: u8,
     pub generation: u64,
     pub target: Option<WindowTarget>,
@@ -40,6 +42,7 @@ impl ObserverUpdate {
         timestamp_ms: u64,
     ) -> Self {
         Self {
+            visuals: Vec::new(),
             version: 1,
             generation,
             target: window_id.zip(pid).and_then(|(window_id, pid)| {
@@ -71,7 +74,96 @@ impl ObserverUpdate {
                 && !self.action_label.chars().any(char::is_control),
             "invalid preview label"
         );
+        anyhow::ensure!(self.visuals.len() <= 3, "too many preview visual phases");
+        for visual in &self.visuals {
+            anyhow::ensure!(
+                self.target
+                    .is_some_and(|t| visual.window == u64::from(t.window_id)),
+                "cursor belongs to another window"
+            );
+            anyhow::ensure!(
+                visual.order > 0 && visual.id.generation > 0 && visual.id.action > 0,
+                "invalid cursor identity"
+            );
+            anyhow::ensure!(
+                visual
+                    .target
+                    .is_none_or(|(x, y)| x.is_finite() && y.is_finite())
+                    && visual.bounds.is_none_or(|b| b.iter().all(|v| v.is_finite())
+                        && b[2] > 0.0
+                        && b[3] > 0.0),
+                "invalid cursor geometry"
+            );
+            anyhow::ensure!(
+                visual.event(std::time::Instant::now()).is_valid(),
+                "invalid cursor phase"
+            );
+        }
+        anyhow::ensure!(
+            self.visuals
+                .windows(2)
+                .all(|v| v[0].order < v[1].order && v[0].id == v[1].id),
+            "unordered cursor phases"
+        );
         Ok(())
+    }
+}
+
+fn unix_ms() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(u64::MAX as u128) as u64
+}
+
+/// Bounded cursor metadata. Coordinates are logical screen points, never the
+/// physical pointer, and event ages preserve delivery timing across the pipe.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct ObserverVisual {
+    pub order: u64,
+    pub id: cursor_overlay::VisualActionId,
+    pub timestamp_ms: u64,
+    pub window: u64,
+    pub target: Option<(f64, f64)>,
+    pub bounds: Option<[f64; 4]>,
+    pub action: cursor_overlay::CursorAction,
+    pub phase: cursor_overlay::VisualPhase,
+    pub scroll_direction: Option<cursor_overlay::ScrollDirection>,
+}
+impl ObserverVisual {
+    pub fn from_event(value: cursor_overlay::visual_events::PublishedVisualEvent) -> Option<Self> {
+        let e = value.event;
+        Some(Self {
+            order: value.order,
+            id: e.id,
+            timestamp_ms: unix_ms()
+                .saturating_sub(e.timestamp.elapsed().as_millis().min(u64::MAX as u128) as u64),
+            window: e.window?,
+            target: e.target,
+            bounds: e.bounds,
+            action: e.action,
+            phase: e.phase,
+            scroll_direction: e.scroll_direction,
+        })
+    }
+    pub fn event(&self, received: std::time::Instant) -> cursor_overlay::VisualEvent {
+        cursor_overlay::VisualEvent {
+            id: self.id,
+            timestamp: received
+                .checked_sub(std::time::Duration::from_millis(
+                    unix_ms().saturating_sub(self.timestamp_ms),
+                ))
+                .unwrap_or(received),
+            target: self.target,
+            window: Some(self.window),
+            bounds: self.bounds,
+            action: self.action,
+            phase: self.phase,
+            scroll_direction: self.scroll_direction,
+            modifiers: None,
+        }
     }
 }
 
@@ -113,6 +205,61 @@ pub fn write_update(writer: &mut impl Write, update: &ObserverUpdate) -> anyhow:
 mod tests {
     use super::*;
     use std::io::Cursor;
+
+    #[test]
+    fn cursor_wire_rejects_wrong_window_nonfinite_and_unordered_phases() {
+        use cursor_overlay::{CursorAction, VisualActionId, VisualPhase};
+        let visual = ObserverVisual {
+            order: 1,
+            id: VisualActionId {
+                generation: 1,
+                action: 1,
+            },
+            timestamp_ms: unix_ms(),
+            window: 7,
+            target: Some((120.0, 140.0)),
+            bounds: None,
+            action: CursorAction::Click,
+            phase: VisualPhase::Intent,
+            scroll_direction: None,
+        };
+        let mut update = ObserverUpdate::new(1, Some(7), Some(42), "click", 1);
+        update.visuals = vec![visual.clone()];
+        let mut bytes = Vec::new();
+        write_update(&mut bytes, &update).unwrap();
+        assert_eq!(
+            read_update(&mut Cursor::new(bytes)).unwrap().unwrap(),
+            update
+        );
+        for bad in [
+            ObserverVisual {
+                window: 8,
+                ..visual.clone()
+            },
+            ObserverVisual {
+                target: Some((f64::NAN, 1.0)),
+                ..visual.clone()
+            },
+            ObserverVisual {
+                order: 0,
+                ..visual.clone()
+            },
+        ] {
+            update.visuals = vec![bad];
+            assert!(update.validate().is_err());
+        }
+        update.visuals = vec![visual.clone(), visual.clone()];
+        assert!(update.validate().is_err());
+        update.visuals = vec![ObserverVisual {
+            phase: VisualPhase::Contact,
+            target: None,
+            ..visual.clone()
+        }];
+        assert!(update.validate().is_err());
+        update.visuals = vec![visual];
+        update.target = None;
+        assert!(update.validate().is_err());
+    }
 
     #[test]
     fn invalid_or_incomplete_window_identity_clears_instead_of_wrapping_ids() {

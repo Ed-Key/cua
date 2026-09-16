@@ -620,8 +620,15 @@ pub fn begin_visual_action(key: &str) -> Option<cursor_overlay::VisualActionId> 
 pub fn publish_visual_event(key: &str, event: cursor_overlay::VisualEvent) -> bool {
     let accepted = {
         let mut inbox = inbox().lock().unwrap();
-        let accepted = inbox.publish(key, event);
+        let accepted = inbox.publish(key, event.clone());
         if accepted {
+            cua_driver_core::pip_hook::publish_visual(
+                key,
+                cursor_overlay::visual_events::PublishedVisualEvent {
+                    order: inbox.visual.current_order(),
+                    event,
+                },
+            );
             let template = inbox.template_motion.clone();
             inbox.motion.entry(key.to_owned()).or_insert(template);
         }
@@ -2353,7 +2360,7 @@ fn apply_native_order(
 
 /// Create a `CGImage` from a `tiny_skia::Pixmap` (premultiplied RGBA).
 /// Returns a `+1` retained pointer that the caller must release.
-fn pixmap_to_cgimage(pixmap: tiny_skia::Pixmap) -> Option<usize> {
+pub(crate) fn pixmap_to_cgimage(pixmap: tiny_skia::Pixmap) -> Option<usize> {
     let w = pixmap.width() as usize;
     let h = pixmap.height() as usize;
     if w == 0 || h == 0 {
@@ -2455,6 +2462,83 @@ fn pixmap_to_cgimage(pixmap: tiny_skia::Pixmap) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn pip_fanout_preserves_desktop_events_with_disabled_overlay() {
+        use cua_driver_core::{
+            protocol::ToolResult,
+            tool::{Tool, ToolDef, ToolRegistry},
+        };
+        use serde_json::{json, Value};
+        struct Input(ToolDef);
+        #[async_trait::async_trait]
+        impl Tool for Input {
+            fn def(&self) -> &ToolDef {
+                &self.0
+            }
+            async fn invoke(&self, args: Value) -> ToolResult {
+                let key = args["_session_id"].as_str().unwrap();
+                send_command(
+                    key.into(),
+                    cursor_overlay::OverlayCommand::SetEnabled(false),
+                );
+                let id = begin_visual_action(key).unwrap();
+                for phase in [
+                    cursor_overlay::VisualPhase::Intent,
+                    cursor_overlay::VisualPhase::Contact,
+                ] {
+                    assert!(publish_visual_event(
+                        key,
+                        cursor_overlay::VisualEvent {
+                            id,
+                            phase,
+                            timestamp: std::time::Instant::now(),
+                            target: Some((120.0, 140.0)),
+                            window: Some(77),
+                            bounds: None,
+                            action: cursor_overlay::CursorAction::Click,
+                            scroll_direction: None,
+                            modifiers: None
+                        }
+                    ));
+                }
+                let desktop = inbox().lock().unwrap().visual.take_pending();
+                assert!(desktop[key].latest.is_some() && desktop[key].contact.is_some());
+                ToolResult::text("landed")
+            }
+        }
+        let (tx, rx) = std::sync::mpsc::channel();
+        cua_driver_core::pip_hook::set_pip_session_observer_fn(move |snapshot| {
+            let _ = tx.send(snapshot);
+            true
+        });
+        let mut registry = ToolRegistry::new();
+        registry.register(Box::new(Input(ToolDef {
+            name: "click".into(),
+            description: String::new(),
+            input_schema: json!({"type":"object"}),
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        })));
+        let result = registry
+            .invoke(
+                "click",
+                json!({"pid":42,"window_id":77,"x":120,"y":140,"session":"pip-disabled-desktop"}),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+        loop {
+            let snapshot = rx
+                .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+                .unwrap();
+            if snapshot.values().any(|r| r.visual.contact.is_some()) {
+                break;
+            }
+        }
+    }
 
     #[test]
     fn owned_cursor_ids_follow_live_host_surfaces_only() {

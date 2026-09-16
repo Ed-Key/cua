@@ -4,13 +4,15 @@ use std::time::Instant;
 
 use crate::{CursorAction, CursorKey};
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord)]
+#[derive(
+    Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, serde::Serialize, serde::Deserialize,
+)]
 pub struct VisualActionId {
     pub generation: u64,
     pub action: u64,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum VisualPhase {
     Intent,
     Contact,
@@ -18,7 +20,7 @@ pub enum VisualPhase {
     End,
 }
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum ScrollDirection {
     Up,
     Down,
@@ -68,12 +70,43 @@ pub enum VisualLifecycle {
     Revive,
 }
 
-#[derive(Default, Debug)]
+#[derive(Clone, Default, Debug)]
 pub struct PendingVisualState {
     pub lifecycle: Option<(u64, VisualLifecycle)>,
     pub latest: Option<PublishedVisualEvent>,
     pub contact: Option<PublishedVisualEvent>,
     pub end: Option<PublishedVisualEvent>,
+}
+
+impl PendingVisualState {
+    /// Retain at most one event per phase family, including contact when a
+    /// subsequent tracking event arrives before an independent observer drains.
+    pub fn push(&mut self, published: PublishedVisualEvent) {
+        let old = self
+            .latest
+            .as_ref()
+            .or(self.contact.as_ref())
+            .or(self.end.as_ref());
+        if old.is_some_and(|old| old.event.id != published.event.id) {
+            self.latest = None;
+            self.contact = None;
+            self.end = None;
+        }
+        match published.event.phase {
+            VisualPhase::Contact => self.contact = Some(published),
+            VisualPhase::End => self.end = Some(published),
+            VisualPhase::Intent | VisualPhase::Tracking => self.latest = Some(published),
+        }
+    }
+    pub fn ordered(&self) -> Vec<PublishedVisualEvent> {
+        let mut events: Vec<_> = [&self.latest, &self.contact, &self.end]
+            .into_iter()
+            .flatten()
+            .cloned()
+            .collect();
+        events.sort_by_key(|event| event.order);
+        events
+    }
 }
 
 #[derive(Default)]
@@ -100,6 +133,9 @@ impl VisualMailbox {
                     .owner
                     .is_some_and(|(owner, _, phase)| owner == id && phase != VisualPhase::End)
         })
+    }
+    pub fn current_order(&self) -> u64 {
+        self.order
     }
     pub fn next_order(&mut self) -> u64 {
         self.order += 1;
@@ -158,16 +194,12 @@ impl VisualMailbox {
         let order = self.next_order();
         let pending = self.pending.entry(key.to_owned()).or_default();
         if new_owner {
-            pending.latest = None;
-            pending.contact = None;
-            pending.end = None;
+            *pending = PendingVisualState {
+                lifecycle: pending.lifecycle,
+                ..Default::default()
+            };
         }
-        let published = PublishedVisualEvent { order, event };
-        match published.event.phase {
-            VisualPhase::Contact => pending.contact = Some(published),
-            VisualPhase::End => pending.end = Some(published),
-            VisualPhase::Intent | VisualPhase::Tracking => pending.latest = Some(published),
-        }
+        pending.push(PublishedVisualEvent { order, event });
         true
     }
     pub fn remove(&mut self, key: &str) {

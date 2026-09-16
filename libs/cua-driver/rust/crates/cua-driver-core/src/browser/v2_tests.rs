@@ -2547,3 +2547,53 @@ async fn semantic_link_urls_reach_query_and_continuation_outputs() {
         .unwrap();
     assert_eq!(reply["url"], "https://example.test/book?slot=1#court");
 }
+
+#[tokio::test]
+async fn pip_registry_browser_bound_action_uses_validated_native_target() {
+    let f = fixture().await;
+    let (tx, rx) = std::sync::mpsc::channel();
+    crate::pip_hook::set_pip_session_observer_fn(move |snapshot| {
+        let _ = tx.send(snapshot);
+        true
+    });
+    let mut registry = crate::tool::ToolRegistry::new();
+    registry.register(Box::new(GetBrowserStateTool::new(f.engine.clone())));
+    registry.register(Box::new(BrowserClickTool::new(f.engine.clone())));
+    let bound = registry
+        .invoke(
+            "get_browser_state",
+            json!({"pid":1,"window_id":7,"session":"pip-browser"}),
+        )
+        .await;
+    assert_ne!(bound.is_error, Some(true), "{bound:?}");
+    let bound = structured(&bound);
+    let target = bound["target_id"].as_str().unwrap();
+    let tab = bound["tabs"][0]["tab_id"].as_str().unwrap();
+    let snap = registry
+        .invoke(
+            "get_browser_state",
+            json!({"target_id":target,"tab_id":tab,"session":"pip-browser"}),
+        )
+        .await;
+    assert_ne!(snap.is_error, Some(true), "{snap:?}");
+    let main_ref = ref_of(structured(&snap), "main", "main-btn");
+    let clicked = registry
+        .invoke(
+            "browser_click",
+            json!({"target_id":target,"tab_id":tab,"ref":main_ref,"session":"pip-browser"}),
+        )
+        .await;
+    assert_ne!(clicked.is_error, Some(true), "{clicked:?}");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(3);
+    loop {
+        let snapshot = rx
+            .recv_timeout(deadline.saturating_duration_since(std::time::Instant::now()))
+            .unwrap();
+        if snapshot
+            .values()
+            .any(|r| r.pid == Some(1) && r.window_id == Some(7))
+        {
+            break;
+        }
+    }
+}

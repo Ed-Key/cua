@@ -795,7 +795,9 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 cursor_overlay::OverlayCommand::SetEnabled(enabled),
             );
         }
-        if !action.tab_is_active || !cursor_enabled {
+        if !action.tab_is_active
+            || (!cursor_enabled && !cua_driver_core::pip_hook::has_session_preview(&action.session))
+        {
             return;
         }
         // This callback precedes browser input dispatch. It carries intent only.

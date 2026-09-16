@@ -1601,6 +1601,7 @@ impl BrowserEngine {
                 .capability_manifest();
             authorize_live_browser_origin(manifest, &live_url)?;
         }
+        crate::pip_hook::resolved_target(record.pid, record.window_id);
         Ok(ValidatedTab {
             conn,
             record,

@@ -1205,6 +1205,7 @@ dependencies = [
  "ciborium",
  "coset",
  "cua-driver-contract",
+ "cursor-overlay",
  "fs2",
  "futures-util",
  "getrandom 0.4.2",
@@ -3152,6 +3153,7 @@ name = "pip-preview"
 version = "0.26.1"
 dependencies = [
  "anyhow",
+ "cursor-overlay",
  "serde",
  "serde_json",
  "tracing",

@@ -12,7 +12,7 @@ use crate::observer::ObserverUpdate;
 /// with an explicit error; it must never silently discard some agents.
 pub const MAX_SNAPSHOT_BYTES: usize = 256 * 1024;
 
-#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ObserverSnapshot {
     pub version: u8,

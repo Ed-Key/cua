@@ -500,6 +500,7 @@ pub fn resolve_element_args_wide(
                     ),
                 ));
             }
+            crate::pip_hook::resolved_target(i64::from(pid), wid);
             Ok(ResolvedElement::Element {
                 window_id: Some(wid),
                 element_index: resolved_idx,
@@ -522,6 +523,7 @@ pub fn resolve_element_args_wide(
                     ),
                 ));
             }
+            crate::pip_hook::resolved_target(i64::from(pid), wid);
             Ok(ResolvedElement::Element {
                 window_id: Some(wid),
                 element_index: idx,

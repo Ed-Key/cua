@@ -5,15 +5,15 @@
 use std::collections::BTreeMap;
 use std::process::{Child, ChildStdin, Command, Stdio};
 
-use cua_driver_core::pip_hook::{PipCaptureRequest, PipSessionSnapshot};
-use pip_preview::observer::{write_update, ObserverUpdate, WindowTarget};
+#[cfg(test)]
+use cua_driver_core::pip_hook::PipCaptureRequest;
+use cua_driver_core::pip_hook::PipSessionSnapshot;
+use pip_preview::observer::{ObserverUpdate, ObserverVisual};
 use pip_preview::session_observer::{write_snapshot, ObserverSnapshot};
 
 pub struct ObserverProcess {
     child: Child,
     input: ChildStdin,
-    generation: u64,
-    target: Option<WindowTarget>,
     sessions: BTreeMap<String, (u64, ObserverUpdate)>,
     next_preview_id: u64,
     revision: u64,
@@ -42,31 +42,10 @@ impl ObserverProcess {
         Ok(Self {
             child,
             input,
-            generation: 0,
-            target: None,
             sessions: BTreeMap::new(),
             next_preview_id: 0,
             revision: 0,
         })
-    }
-
-    pub fn publish(&mut self, request: PipCaptureRequest) -> bool {
-        let mut update = ObserverUpdate::new(
-            self.generation,
-            request.window_id,
-            request.pid,
-            &request.action_label,
-            request.timestamp_ms,
-        );
-        if self.generation == 0 || self.target != update.target {
-            let Some(generation) = self.generation.checked_add(1) else {
-                return false;
-            };
-            self.generation = generation;
-            self.target = update.target;
-        }
-        update.generation = self.generation;
-        write_update(&mut self.input, &update).is_ok()
     }
 
     pub fn publish_sessions(&mut self, snapshot: PipSessionSnapshot) -> bool {
@@ -88,6 +67,12 @@ impl ObserverProcess {
                 &request.action_label,
                 request.timestamp_ms,
             );
+            update.visuals = request
+                .visual
+                .ordered()
+                .into_iter()
+                .filter_map(ObserverVisual::from_event)
+                .collect();
             let id = if let Some((id, previous)) = self.sessions.get(&session) {
                 update.generation = previous.generation;
                 if previous.target != update.target {
@@ -185,6 +170,7 @@ mod tests {
 
     fn request(window_id: Option<u64>) -> PipCaptureRequest {
         PipCaptureRequest {
+            visual: Default::default(),
             window_id,
             pid: Some(42),
             action_label: "click".into(),
@@ -201,72 +187,6 @@ mod tests {
             assert!(Instant::now() < deadline, "observer did not exit");
             std::thread::sleep(Duration::from_millis(5));
         }
-    }
-
-    #[test]
-    fn child_receives_metadata_and_closed_pipe_disables_delivery() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("received.json");
-        let mut command = Command::new("/bin/sh");
-        command
-            .args([
-                "-c",
-                "IFS= read -r line; printf '%s\\n' \"$line\" > \"$1\"",
-                "preview-test",
-            ])
-            .arg(&path);
-        let mut observer = ObserverProcess::spawn_command(&mut command).unwrap();
-        assert!(observer.publish(request(Some(7))));
-        wait_for_exit(&mut observer.child);
-        let value: serde_json::Value =
-            serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
-        assert_eq!(
-            value,
-            serde_json::json!({
-                "version":1,"generation":1,"target":{"pid":42,"window_id":7},
-                "action_label":"click","timestamp_ms":12,
-            })
-        );
-        assert!(!observer.publish(request(Some(8))));
-    }
-
-    #[test]
-    fn only_target_changes_advance_capture_generation() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("updates.jsonl");
-        let mut command = Command::new("/bin/sh");
-        command
-            .args(["-c", "exec /usr/bin/head -n 4 > \"$1\"", "preview-test"])
-            .arg(&path);
-        let mut observer = ObserverProcess::spawn_command(&mut command).unwrap();
-        for target in [Some(7), Some(7), None, Some(7)] {
-            assert!(observer.publish(request(target)));
-        }
-        wait_for_exit(&mut observer.child);
-        let bytes = std::fs::read(path).unwrap();
-        let mut reader = std::io::Cursor::new(bytes);
-        let updates: Vec<_> = (0..4)
-            .map(|_| {
-                pip_preview::observer::read_update(&mut reader)
-                    .unwrap()
-                    .unwrap()
-            })
-            .collect();
-        assert_eq!(
-            updates
-                .iter()
-                .map(|update| update.generation)
-                .collect::<Vec<_>>(),
-            vec![1, 1, 2, 3]
-        );
-        assert_eq!(updates[2].target, None);
-        assert_eq!(
-            updates[3].target,
-            Some(WindowTarget {
-                pid: 42,
-                window_id: 7
-            })
-        );
     }
 
     #[test]

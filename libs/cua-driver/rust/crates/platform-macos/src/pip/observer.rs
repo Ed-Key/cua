@@ -36,6 +36,10 @@ pub(super) fn current(id: u64, generation: u64) -> bool {
     })
 }
 static REFRESH_PENDING: AtomicBool = AtomicBool::new(false);
+static CURSOR_ANIMATING: AtomicBool = AtomicBool::new(false);
+pub(super) fn animate_cursor(active: bool) {
+    CURSOR_ANIMATING.store(active, Ordering::Release);
+}
 
 fn request_refresh() {
     if !REFRESH_PENDING.swap(true, Ordering::AcqRel) {
@@ -50,6 +54,7 @@ pub(super) struct Presentation<T> {
     clear: bool,
     scheduled: bool,
     available: bool,
+    bounds: Option<cursor_overlay::DisplayBounds>,
     pub(super) hidden: bool,
 }
 
@@ -62,6 +67,7 @@ impl<T> Default for Presentation<T> {
             clear: true,
             scheduled: false,
             available: false,
+            bounds: None,
             hidden: false,
         }
     }
@@ -75,6 +81,7 @@ impl<T> Presentation<T> {
             self.frame = None;
             self.clear = true;
             self.available = false;
+            self.bounds = None;
         }
         self.generation = generation;
         self.label = label;
@@ -125,6 +132,7 @@ pub(super) struct Draw<T> {
     pub(super) frame: Option<T>,
     pub(super) clear: bool,
     pub(super) label: String,
+    pub(super) bounds: Option<cursor_overlay::DisplayBounds>,
 }
 impl<T> Sessions<T> {
     fn sync(&mut self, snapshot: &ObserverSnapshot) {
@@ -158,6 +166,7 @@ impl<T> Sessions<T> {
                         frame: p.frame.take(),
                         clear: std::mem::take(&mut p.clear),
                         label: p.label.clone(),
+                        bounds: if p.available { p.bounds } else { None },
                     },
                 )
             })
@@ -235,7 +244,7 @@ unsafe extern "C" fn render(ctx: *mut c_void) {
     super::observer_panels::render(&snapshot, draws);
 }
 
-fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
+pub(super) fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
     let width = f64::from(width.max(1));
     let height = f64::from(height.max(1));
     let scale = (1280.0 / width.max(height)).min(1.0);
@@ -371,8 +380,30 @@ pub fn run(cfg: PipConfig) -> anyhow::Result<()> {
                             } else {
                                 update.target.and_then(|target| {
                                     crate::windows::window_info_by_id(target.window_id)
-                                        .filter(|window| window.pid == target.pid)
+                                        .filter(|window| {
+                                            window.pid == target.pid
+                                                && [
+                                                    window.bounds.x,
+                                                    window.bounds.y,
+                                                    window.bounds.width,
+                                                    window.bounds.height,
+                                                ]
+                                                .iter()
+                                                .all(|v| v.is_finite())
+                                                && window.bounds.width > 0.0
+                                                && window.bounds.height > 0.0
+                                        })
                                         .map(|window| {
+                                            if let Some(p) =
+                                                presentation().lock().unwrap().entries.get_mut(&id)
+                                            {
+                                                p.bounds = Some(cursor_overlay::DisplayBounds {
+                                                    x: window.bounds.x,
+                                                    y: window.bounds.y,
+                                                    width: window.bounds.width,
+                                                    height: window.bounds.height,
+                                                });
+                                            }
                                             (
                                                 update.generation,
                                                 target.pid,
@@ -415,6 +446,16 @@ pub fn run(cfg: PipConfig) -> anyhow::Result<()> {
                     }
                 }
             });
+        })?;
+    // Cursor animation never requests a screenshot. Main-thread refreshes
+    // coalesce independently from the eight-fps native window streams.
+    std::thread::Builder::new()
+        .name("cua-preview-animation".into())
+        .spawn(|| loop {
+            std::thread::sleep(Duration::from_millis(33));
+            if CURSOR_ANIMATING.load(Ordering::Acquire) {
+                request_refresh();
+            }
         })?;
     super::run_appkit_main_loop();
     Ok(())
@@ -590,6 +631,7 @@ mod tests {
             clear: false,
             scheduled: false,
             available: true,
+            bounds: None,
             hidden: false,
         };
         assert!(presentation.frame(1, Image(releases.clone())));

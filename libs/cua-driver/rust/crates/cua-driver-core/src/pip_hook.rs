@@ -14,6 +14,7 @@
 //! happens independently and may show a later state than recording evidence.
 //! A preview frame must not be used to verify a particular action's outcome.
 
+use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use tokio::sync::watch;
@@ -32,6 +33,7 @@ pub struct PipHookFrame {
 
 #[derive(Clone, Debug)]
 pub struct PipCaptureRequest {
+    pub visual: cursor_overlay::PendingVisualState,
     pub window_id: Option<u64>,
     pub pid: Option<i64>,
     pub action_label: String,
@@ -218,6 +220,12 @@ fn publish_preview(
                 return false;
             }
             let request = PipCaptureRequest {
+                visual: pending
+                    .sessions
+                    .get(session.unwrap_or(""))
+                    .filter(|old| old.window_id == window_id && old.pid == pid)
+                    .map(|old| old.visual.clone())
+                    .unwrap_or_default(),
                 window_id,
                 pid,
                 action_label,
@@ -250,6 +258,7 @@ fn clear_session_preview(sender: &watch::Sender<PreviewState>, session: &str, al
         }
         pending.session = None;
         pending.request = PipCaptureRequest {
+            visual: Default::default(),
             window_id: None,
             pid: None,
             action_label: "Session ended".into(),
@@ -257,4 +266,100 @@ fn clear_session_preview(sender: &watch::Sender<PreviewState>, session: &str, al
         };
         true
     });
+}
+
+// Only the authorized tool body owns this scope. Resolution during permission
+// checks or read-only calls must not create a preview.
+tokio::task_local! {
+    static INVOCATION: (Option<(String, String)>, Cell<Option<(i64, u64)>>);
+}
+
+pub(crate) async fn scope_action<T>(
+    session: Option<&str>,
+    label: String,
+    future: impl std::future::Future<Output = T>,
+) -> (T, Option<(i64, u64)>) {
+    INVOCATION
+        .scope(
+            (session.map(|s| (s.to_owned(), label)), Cell::new(None)),
+            async {
+                let value = future.await;
+                (value, INVOCATION.with(|scope| scope.1.get()))
+            },
+        )
+        .await
+}
+
+/// Record the exact target already resolved by an adapter, without native work.
+/// Call on the invocation task before handing input to a blocking worker.
+pub fn resolved_target(pid: i64, window_id: u64) {
+    let _ = INVOCATION.try_with(|scope| {
+        if let Some((session, label)) = scope.0.as_ref() {
+            scope.1.set(Some((pid, window_id)));
+            request_pip_frame_for_session(
+                session,
+                Some(window_id),
+                Some(pid),
+                label.clone(),
+                crate::recording::now_ms(),
+            );
+        }
+    });
+}
+
+/// Fan out an already admitted desktop event. No renderer, lookup, or pipe work
+/// occurs under this short watch update, and ended owners cannot be recreated.
+pub fn publish_visual(
+    session: &str,
+    published: cursor_overlay::visual_events::PublishedVisualEvent,
+) {
+    let Some(publisher) = PIP_REQUESTS
+        .get()
+        .filter(|p| p.session_snapshots && !p.sender.is_closed())
+    else {
+        return;
+    };
+    publisher.sender.send_if_modified(|state| {
+        if crate::session::is_session_ending(session) {
+            return false;
+        }
+        let Some(request) = state.sessions.get_mut(session) else {
+            return false;
+        };
+        if published.event.window != request.window_id {
+            return false;
+        }
+        request.visual.push(published);
+        true
+    });
+}
+
+pub(crate) fn finish_action_preview(
+    session: &str,
+    succeeded: bool,
+    resolved: Option<(i64, u64)>,
+    window_id: Option<u64>,
+    pid: Option<i64>,
+    label: String,
+    timestamp: u64,
+) {
+    let (pid, window_id) = if succeeded {
+        resolved
+            .map(|(pid, window)| (Some(pid), Some(window)))
+            .unwrap_or((pid, window_id))
+    } else {
+        (None, None)
+    };
+    request_pip_frame_for_session(session, window_id, pid, label, timestamp);
+}
+
+pub(crate) fn uses_session_snapshots() -> bool {
+    PIP_REQUESTS.get().is_some_and(|p| p.session_snapshots)
+}
+
+/// A disabled desktop cursor may still publish into its own active preview.
+pub fn has_session_preview(session: &str) -> bool {
+    PIP_REQUESTS
+        .get()
+        .is_some_and(|p| !p.sender.is_closed() && p.sender.borrow().sessions.contains_key(session))
 }

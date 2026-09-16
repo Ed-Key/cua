@@ -1561,9 +1561,30 @@ impl ToolRegistry {
             })
             .flatten();
 
-        let mut result = crate::recording::scope_dispatch_click_capture(
-            pending_turn.as_ref(),
-            tool.invoke(args.clone()),
+        let preview_session = (pip_hook::pip_enabled()
+            && pip_hook::uses_session_snapshots()
+            && cua_driver_contract::is_action_result_tool(resolved_name)
+            && !private_consent_turn)
+            .then_some(runtime_session.as_deref())
+            .flatten();
+        if let Some(session) = preview_session
+            .filter(|_| args.opt_u64("window_id").is_some() && args.opt_i64("pid").is_some())
+        {
+            pip_hook::request_pip_frame_for_session(
+                session,
+                args.opt_u64("window_id"),
+                args.opt_i64("pid"),
+                resolved_name.to_owned(),
+                now_ms(),
+            );
+        }
+        let (mut result, resolved_preview_target) = pip_hook::scope_action(
+            preview_session,
+            resolved_name.to_owned(),
+            crate::recording::scope_dispatch_click_capture(
+                pending_turn.as_ref(),
+                tool.invoke(args.clone()),
+            ),
         )
         .await;
         drop(lifecycle_dispatch);
@@ -1712,11 +1733,13 @@ impl ToolRegistry {
                     now_ms(),
                 );
             } else if let Some(session) = runtime_session.as_deref() {
-                pip_hook::request_pip_frame_for_session(
+                pip_hook::finish_action_preview(
                     session,
+                    result.is_error != Some(true),
+                    resolved_preview_target,
                     args.opt_u64("window_id"),
                     args.opt_i64("pid"),
-                    synthesize_action_label(name, &public_args),
+                    name.to_owned(),
                     now_ms(),
                 );
             }
