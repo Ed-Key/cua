@@ -521,7 +521,7 @@ For menu navigation, a top-level sheet/dialog, or an unexpected state, take an u
 
 ### Pair a known action with its next observation
 
-When the advertised tools include `act_and_read`, use it for a known, fresh-target click followed by a state read. It executes the existing action once, then returns the existing observation in the same tool response. For a known window-content task, the request shape is:
+When the advertised tools include `act_and_read`, use it for a known, fresh-target click or supported scroll followed by a state read. It executes the existing action once, then returns the existing observation in the same tool response. For a known window-content task, the request shape is:
 
 ```javascript
 act_and_read({pid, window_id, action:"click", element_token,
@@ -529,3 +529,12 @@ act_and_read({pid, window_id, action:"click", element_token,
 ```
 
 For replacing an entire writable field, the same tool accepts `action:"set_value"` and `value`. Request `observe.include_screenshot:true` when the resulting rendered field needs verification. Read action status and observation separately: an observation does not promote an uncertain action to success. Use ordinary tools for discovery or unsupported actions. On an action error, inspect the returned observation before deciding the next action. If transport fails or times out, stop issuing input and report the uncertainty. A timeout is not proof that input stopped; never blindly replay the action.
+
+When `act_and_read` advertises scroll, it also accepts `action:"scroll"`, a fresh `element_token` for the intended scroll container, and `direction` (`up`, `down`, `left`, or `right`). Optional `by` (`line` or `page`) and `amount` (1 through 50) have the same defaults as the ordinary scroll tool. It returns the subsequent read in the same response. For example:
+
+```javascript
+act_and_read({pid, window_id, action:"scroll", element_token, direction:"up",
+  observe:{query:"AXWindow", query_context:true, include_screenshot:false}})
+```
+
+Choose direction and distance from the task and current state. A fresh read can still precede an app's delayed update; inspect its contents before deciding what to do next. Use ordinary scroll for unsupported targets or options. Do not add animation waits.
