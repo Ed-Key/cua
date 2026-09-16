@@ -1691,10 +1691,17 @@ fn harness_appkit_type_text_background() {
 // Compare native value assignment and insertion with the app's own change
 // and commit labels. Diagnostic cases record the mirror; the regression
 // requires a notification without accepting submission as a substitute.
-fn run_value_notification_probe(prepare: bool, typing: bool, require_notification: bool) {
+fn run_value_notification_probe(
+    prepare: bool,
+    typing: bool,
+    require_notification: bool,
+    sibling: bool,
+) {
     use core_foundation::base::{CFType, CFTypeRef, TCFType};
     use platform_macos::ax::bindings::{copy_children, copy_string_attr, AXUIElementRef};
-    let label = if require_notification {
+    let label = if sibling {
+        "sibling"
+    } else if require_notification {
         "regression"
     } else if typing {
         "typing"
@@ -1707,7 +1714,11 @@ fn run_value_notification_probe(prepare: bool, typing: bool, require_notificatio
         &format!("value_notification_{label}"),
         Targeting::Ax,
         DriverRoute::MacosAxValue,
-        &[],
+        if sibling {
+            &[("CUA_HARNESS_BRING_TO_FRONT_MODE", "ordinary")]
+        } else {
+            &[]
+        },
         |pid, wid, driver| {
             let native = slice_a_tree(pid, wid);
             assert!(!native.truncated);
@@ -1754,6 +1765,17 @@ fn run_value_notification_probe(prepare: bool, typing: bool, require_notificatio
                     "focused":platform_macos::input::ax_actions::is_element_focused(pid as i32, ptr)
                 })
             };
+            if sibling {
+                let facts = platform_macos::ax::exact_target::gather_background_facts(
+                    pid as i32,
+                    wid as u32,
+                    Some(ptr),
+                );
+                assert!(
+                    facts.competing_keyboard_destinations > 0,
+                    "the semantic-only control must have a competing destination"
+                );
+            }
             let before = observe();
             assert_eq!(before["field"], "");
             assert_eq!(before["mirror"], "");
@@ -1807,6 +1829,16 @@ fn run_value_notification_probe(prepare: bool, typing: bool, require_notificatio
                     "do not submit the field to obtain a notification"
                 );
                 assert_eq!(after["counter"], "counter=0");
+                if sibling {
+                    assert_eq!(
+                        after["focused"], false,
+                        "semantic-only delivery must not gain a focus mutation"
+                    );
+                    assert_eq!(
+                        after["mirror"], "",
+                        "record the semantic-only notification limitation explicitly"
+                    );
+                }
                 if typing || require_notification {
                     assert_eq!(
                         after["mirror"], payload,
@@ -1821,22 +1853,28 @@ fn run_value_notification_probe(prepare: bool, typing: bool, require_notificatio
 #[test]
 #[ignore]
 fn harness_appkit_value_notification_unprepared() {
-    run_value_notification_probe(false, false, false);
+    run_value_notification_probe(false, false, false, false);
 }
 #[test]
 #[ignore]
 fn harness_appkit_value_notification_prepared() {
-    run_value_notification_probe(true, false, false);
+    run_value_notification_probe(true, false, false, false);
 }
 #[test]
 #[ignore]
 fn harness_appkit_value_notification_typing() {
-    run_value_notification_probe(false, true, false);
+    run_value_notification_probe(false, true, false, false);
 }
 #[test]
 #[ignore]
 fn harness_appkit_set_value_notifies_without_commit() {
-    run_value_notification_probe(false, false, true);
+    run_value_notification_probe(false, false, true, false);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_set_value_semantic_only_preserves_focus() {
+    run_value_notification_probe(false, false, false, true);
 }
 
 // Isolate the existing native focus helper from input and verification timing.
