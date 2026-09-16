@@ -565,7 +565,9 @@ fn wake_renderer() {
 }
 
 pub(crate) fn approach_enabled(key: &str) -> bool {
-    inbox().lock().unwrap().approach_enabled(key)
+    // Disabled/headless hosts never initialize the renderer. The default inbox
+    // policy must not make those hosts wait for a presentation that cannot run.
+    CMD_TX.get().is_some() && inbox().lock().unwrap().approach_enabled(key)
 }
 pub(crate) fn register_target(
     key: &str,
@@ -5076,6 +5078,28 @@ mod tests {
     async fn quick_approach_deadline_does_not_take_the_stalled_render_lock() {
         use crate::cursor::visual::{point, DeliveryReceipt};
         use crate::tools::{ClickTool, ToolState};
+        // A stalled renderer must be initialized, unlike a --no-overlay host.
+        // Isolate its one-time globals from other tests. init creates channels
+        // and Rust render state only; this child never starts AppKit.
+        const CHILD: &str = "CUA_TEST_STALLED_CURSOR_RENDERER";
+        if std::env::var_os(CHILD).is_none() {
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "cursor::overlay::tests::quick_approach_deadline_does_not_take_the_stalled_render_lock",
+                ])
+                .env(CHILD, "1")
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}\n{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+        init(CursorConfig::default());
         let _stalled = RENDER.lock().unwrap();
         let tool = ClickTool::new(std::sync::Arc::new(ToolState::default()));
         let receipt = DeliveryReceipt::default();

@@ -677,6 +677,31 @@ impl PointerVisualSink for OverlayVisualSink {
 }
 
 #[cfg(test)]
+mod unavailable_overlay_tests {
+    use super::*;
+
+    // Registering tools with --no-overlay skips overlay::init. Exercise the real
+    // sink and receipt so an absent renderer cannot become a click prerequisite.
+    #[tokio::test]
+    async fn click_without_overlay_does_not_require_presentation() {
+        let registry = super::super::CursorRegistry::default();
+        let receipt = begin_pointer_action(
+            &registry,
+            Arc::new(OverlayVisualSink),
+            "click-without-overlay",
+            point(100.0, 100.0, Some(17)),
+            CursorAction::Click,
+        );
+        let result = receipt.prepare_click().await;
+        assert!(
+            matches!(result, Ok(None)),
+            "unexpected admission: {:?}",
+            result.err()
+        );
+    }
+}
+
+#[cfg(test)]
 pub(crate) mod test_support {
     use super::*;
     use std::sync::Mutex;
