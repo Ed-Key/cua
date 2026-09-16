@@ -199,9 +199,29 @@ fn run_case_with_env(
             .expect("start installed macOS daemon proxy");
         *evidence = recording_evidence(driver.recording_dir());
         let harness = Harness::launch_with_env(env);
-        let (wid, _) = driver
+        let (wid, title) = driver
             .find_window(harness.pid as i64, "CuaTestHarness AppKit")
             .expect("AppKit main window not found");
+        // The shared helper matches substrings, which can select the optional
+        // "CuaTestHarness AppKit Secondary" window. Bind the exact main window
+        // before starting its recording and background oracles.
+        let wid = if title == "CuaTestHarness AppKit" {
+            wid
+        } else {
+            let windows = driver.call("list_windows", serde_json::json!({"pid": harness.pid}));
+            let matches: Vec<_> = windows.structured()["windows"]
+                .as_array()
+                .expect("window list")
+                .iter()
+                .filter(|w| {
+                    w["pid"].as_u64() == Some(harness.pid as u64)
+                        && w["title"] == "CuaTestHarness AppKit"
+                })
+                .filter_map(|w| w["window_id"].as_u64())
+                .collect();
+            assert_eq!(matches.len(), 1, "unique AppKit main window required");
+            matches[0]
+        };
         if delivery != cua_driver_testkit::e2e::Delivery::Background {
             driver.start_behavior_recording();
         }
