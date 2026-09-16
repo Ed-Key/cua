@@ -14,6 +14,7 @@
 //! happens independently and may show a later state than recording evidence.
 //! A preview frame must not be used to verify a particular action's outcome.
 
+use std::collections::BTreeMap;
 use std::sync::OnceLock;
 use tokio::sync::watch;
 
@@ -43,15 +44,27 @@ struct PendingPreview {
     request: PipCaptureRequest,
 }
 
+/// Desired previews indexed by runtime-private session identity. Local callers
+/// must not expose these keys as user-facing task names or log them.
+pub type PipSessionSnapshot = BTreeMap<String, PipCaptureRequest>;
+
+#[derive(Clone, Default)]
+struct PreviewState {
+    latest: Option<PendingPreview>,
+    sessions: PipSessionSnapshot,
+}
+
 struct Publisher {
-    sender: watch::Sender<Option<PendingPreview>>,
+    sender: watch::Sender<PreviewState>,
     session_scoped: bool,
+    session_snapshots: bool,
 }
 static PIP_REQUESTS: OnceLock<Publisher> = OnceLock::new();
 
 enum Consumer {
     Legacy(Box<dyn Fn(PipHookFrame) + Send + Sync>),
     Observer(Box<dyn FnMut(PipCaptureRequest) -> bool + Send>),
+    Sessions(Box<dyn FnMut(PipSessionSnapshot) -> bool + Send>),
 }
 
 /// Register the platform-side push callback. `main.rs` calls this
@@ -66,17 +79,25 @@ pub fn set_pip_observer_fn(f: impl FnMut(PipCaptureRequest) -> bool + Send + 'st
     start_worker(Consumer::Observer(Box::new(f)));
 }
 
+/// Publish the latest desired state of every live preview session. A busy
+/// observer may skip intermediate states, but never loses another session.
+/// Removing an entry closes only that preview. An empty snapshot closes all.
+pub fn set_pip_session_observer_fn(f: impl FnMut(PipSessionSnapshot) -> bool + Send + 'static) {
+    start_worker(Consumer::Sessions(Box::new(f)));
+}
+
 fn start_worker(mut consumer: Consumer) {
     PIP_REQUESTS.get_or_init(|| {
-        let (sender, mut receiver) = watch::channel::<Option<PendingPreview>>(None);
-        let session_scoped = matches!(&consumer, Consumer::Observer(_));
+        let (sender, mut receiver) = watch::channel(PreviewState::default());
+        let session_scoped = !matches!(&consumer, Consumer::Legacy(_));
+        let session_snapshots = matches!(&consumer, Consumer::Sessions(_));
         // Own the hook with the worker, so a closed observer cannot leave a
         // live cleanup callback behind. The legacy image callback cannot clear
         // its renderer and therefore retains its historical lifecycle.
         let cleanup = session_scoped.then(|| {
             let sender = sender.clone();
             crate::session::register_scoped_session_end_hook(move |session| {
-                clear_session_preview(&sender, session);
+                clear_session_preview(&sender, session, session_snapshots);
             })
         });
         let started = std::thread::Builder::new()
@@ -94,8 +115,16 @@ fn start_worker(mut consumer: Consumer) {
                     while receiver.changed().await.is_ok() {
                         // Release the watch borrow before any native or embedder
                         // work. Publishers must never wait for either callback.
-                        let request = receiver.borrow_and_update().clone();
-                        let Some(pending) = request else { continue };
+                        let state = receiver.borrow_and_update().clone();
+                        if let Consumer::Sessions(publish) = &mut consumer {
+                            if !publish(state.sessions) {
+                                break;
+                            }
+                            continue;
+                        }
+                        let Some(pending) = state.latest else {
+                            continue;
+                        };
                         let request = pending.request;
                         if let Consumer::Observer(publish) = &mut consumer {
                             if !publish(request) {
@@ -125,6 +154,7 @@ fn start_worker(mut consumer: Consumer) {
         Publisher {
             sender,
             session_scoped,
+            session_snapshots,
         }
     });
 }
@@ -187,23 +217,34 @@ fn publish_preview(
             if session.is_some_and(crate::session::is_session_ending) {
                 return false;
             }
-            *pending = Some(PendingPreview {
-                session: session.map(str::to_owned),
-                request: PipCaptureRequest {
-                    window_id,
-                    pid,
-                    action_label,
-                    timestamp_ms,
-                },
-            });
+            let request = PipCaptureRequest {
+                window_id,
+                pid,
+                action_label,
+                timestamp_ms,
+            };
+            if publisher.session_snapshots {
+                let Some(session) = session else { return false };
+                pending.sessions.insert(session.to_owned(), request);
+            } else {
+                pending.latest = Some(PendingPreview {
+                    session: session.map(str::to_owned),
+                    request,
+                });
+            }
             true
         });
     }
 }
 
-fn clear_session_preview(sender: &watch::Sender<Option<PendingPreview>>, session: &str) {
-    sender.send_if_modified(|pending| {
-        let Some(pending) = pending else { return false };
+fn clear_session_preview(sender: &watch::Sender<PreviewState>, session: &str, all_sessions: bool) {
+    sender.send_if_modified(|state| {
+        if all_sessions {
+            return state.sessions.remove(session).is_some();
+        }
+        let Some(pending) = &mut state.latest else {
+            return false;
+        };
         if pending.session.as_deref() != Some(session) {
             return false;
         }
