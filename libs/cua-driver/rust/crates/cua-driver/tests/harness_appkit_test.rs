@@ -964,6 +964,12 @@ fn harness_appkit_px_background_press_key_reports_honest_delivery_truth() {
                 assert!(!set.is_error(), "set command failed: {}", set.text());
 
                 let focused = snapshot_elements(driver, harness.pid, wid);
+                assert!(
+                    focused.tree_text().contains("committed=none"),
+                    "command ran before Return: {}",
+                    focused.tree_text()
+                );
+                assert!(!oracle_path.exists(), "child process ran before Return");
                 let (x, y, width, height) = element_pixel_frame(&focused, "txt-input");
                 let pressed = driver.call(
                     "press_key",
@@ -983,10 +989,37 @@ fn harness_appkit_px_background_press_key_reports_honest_delivery_truth() {
                 );
                 assert_eq!(pressed.action_route(), Some("synthetic_events"));
                 assert_eq!(pressed.action_delivery_mode(), Some("background"));
-                assert_eq!(pressed.action_effect(), Some("unverifiable"));
+                // AppKit selects the committed text after Return. The native
+                // selection oracle can confirm that change, independently of
+                // whether the controlled child process eventually runs.
+                assert_eq!(pressed.action_effect(), Some("confirmed"));
+                assert_eq!(
+                    pressed.structured()["evidence"],
+                    serde_json::json!([{"kind":"value_readback"}])
+                );
+                let committed = snapshot_elements(driver, harness.pid, wid);
+                assert!(
+                    committed
+                        .tree_text()
+                        .contains("committed=printf cua-press-key"),
+                    "Return did not commit the command: {}",
+                    committed.tree_text()
+                );
+                let field_index = element_index_by_id(committed.tree_text(), "txt-input").unwrap();
+                let field = committed.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|element| element["element_index"].as_u64() == Some(field_index))
+                    .unwrap();
+                assert_eq!(field["value"], "printf cua-press-key");
+                assert_eq!(
+                    field["text_selection"]["range"],
+                    serde_json::json!({"location":0,"length":20})
+                );
                 assert!(
                     pressed.structured()["escalation"].is_null(),
-                    "accepted post without a positive oracle must not claim delivery_failed: {}",
+                    "a confirmed native change must not claim delivery_failed: {}",
                     pressed.raw
                 );
 
