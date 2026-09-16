@@ -402,6 +402,19 @@ fn run_editor_sequence_case(mode: &str, ambiguous: bool) {
             assert!(!response.is_error(), "{}", response.raw);
             let output = response.structured();
             let steps = output["steps"].as_array().unwrap();
+            let changed_editor = matches!(mode, "replace" | "divert");
+            assert_eq!(
+                steps[1]["action"]["effect"],
+                if changed_editor {
+                    "unverifiable"
+                } else {
+                    "confirmed"
+                },
+                "implicit typing cannot confirm delivery using a different focused editor"
+            );
+            if changed_editor {
+                assert!(steps[1]["action"]["delivery"]["delivered_count"].is_null());
+            }
             let stopped = mode == "divert" || ambiguous;
             assert_eq!(
                 output["status"],
@@ -422,13 +435,12 @@ fn run_editor_sequence_case(mode: &str, ambiguous: bool) {
                         steps[1]["verification"]["predicates"][0]["unknown_reason"],
                         "multi_match"
                     );
-                } else if steps[1]["action"]["effect"] == "confirmed" {
+                } else {
                     assert_eq!(
                         output["stop_reason"], "unsatisfied",
-                        "fresh target evidence must override the incorrect action confirmation"
+                        "fresh target evidence must stop after the unverifiable action"
                     );
-                } else {
-                    assert_eq!(output["stop_reason"], "action_error");
+                    assert_eq!(steps[1]["verification"]["status"], "unsatisfied");
                 }
             } else {
                 assert!(after.tree_text().contains("counter=1"));
