@@ -86,6 +86,20 @@ standalone Chrome/Edge matrix: the macOS wrapper accepts
 `--standalone-browser`, while the Windows and Linux workflow is
 `.github/workflows/e2e-rust-standalone-browsers.yml`.
 
+The macOS `standalone_browser_pixel_ax_focus_recovery` row is a focused
+recovery regression. It uses the existing standalone browser fixture and
+foreground sentinel, verifies coordinate-addressed AX delivery and a new
+destination tab, then checks the foreground app at click completion. It does
+not award the uninterrupted `Focus` oracle: brief activation remains a separate
+failure in strict background tests. This row enables renderer accessibility
+for its own browser launch to isolate recovery from AX cold-start readiness.
+Run it through the authorized guest Terminal environment, selecting only:
+
+```sh
+cargo test -p cua-driver --test standalone_browser_behavior_test \
+  standalone_browser_pixel_ax_focus_recovery -- --exact --ignored --nocapture --test-threads=1
+```
+
 Historical `*-plan.md`, `*-journal.md`, and release evidence documents record
 what was run at that time. They are not current execution instructions and do
 not override this guide or `scripts/ci/README.md`.
