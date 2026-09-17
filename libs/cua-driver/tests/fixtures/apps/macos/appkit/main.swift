@@ -109,7 +109,11 @@ final class WindowDiscoveryApplication: NSApplication {
     override func accessibilityWindows() -> [Any]? {
         guard let mode = discoveryMode else { return super.accessibilityWindows() }
         if mode == "listed-sibling" {
-            return super.accessibilityWindows()?.filter { ($0 as? NSWindow) !== mainWindow }
+            // AppKit can clear mainWindow when the sentinel takes focus. Keep
+            // the intended target absent from AXWindows throughout the test.
+            return super.accessibilityWindows()?.filter {
+                ($0 as? NSWindow)?.accessibilityIdentifier() != kWindowAID
+            }
         }
         return []
     }
