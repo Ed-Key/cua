@@ -254,6 +254,30 @@ pub(super) fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
     )
 }
 
+// WindowServer can retain a closed NSWindow's identity and backing store.
+// kCGWindowIsOnscreen means ordered on screen, not unoccluded, so covered
+// windows remain eligible. Minimized, ordered-out and other-Space windows
+// reported off screen are explicitly unavailable until ordered on screen again;
+// their retained pixels are not evidence of a live source.
+fn source_is_capturable(
+    target: pip_preview::observer::WindowTarget,
+    window: &crate::windows::WindowInfo,
+) -> bool {
+    window.window_id == target.window_id
+        && window.pid == target.pid
+        && window.is_on_screen
+        && [
+            window.bounds.x,
+            window.bounds.y,
+            window.bounds.width,
+            window.bounds.height,
+        ]
+        .iter()
+        .all(|v| v.is_finite())
+        && window.bounds.width > 0.0
+        && window.bounds.height > 0.0
+}
+
 fn capture(id: u64, update: &ObserverUpdate) -> anyhow::Result<SCStream> {
     let target = update
         .target
@@ -380,19 +404,7 @@ pub fn run(cfg: PipConfig) -> anyhow::Result<()> {
                             } else {
                                 update.target.and_then(|target| {
                                     crate::windows::window_info_by_id(target.window_id)
-                                        .filter(|window| {
-                                            window.pid == target.pid
-                                                && [
-                                                    window.bounds.x,
-                                                    window.bounds.y,
-                                                    window.bounds.width,
-                                                    window.bounds.height,
-                                                ]
-                                                .iter()
-                                                .all(|v| v.is_finite())
-                                                && window.bounds.width > 0.0
-                                                && window.bounds.height > 0.0
-                                        })
+                                        .filter(|window| source_is_capturable(target, window))
                                         .map(|window| {
                                             if let Some(p) =
                                                 presentation().lock().unwrap().entries.get_mut(&id)
@@ -468,6 +480,78 @@ mod tests {
         atomic::{AtomicUsize, Ordering},
         Arc,
     };
+
+    #[test]
+    fn retained_closed_source_is_unavailable_without_substituting_its_cover() {
+        let target = pip_preview::observer::WindowTarget {
+            pid: 87718,
+            window_id: 6834,
+        };
+        let source = crate::windows::WindowInfo {
+            window_id: target.window_id,
+            pid: target.pid,
+            app_name: "PreviewFixture".into(),
+            title: "Preview target".into(),
+            bounds: crate::windows::WindowBounds {
+                x: 100.0,
+                y: 158.0,
+                width: 600.0,
+                height: 360.0,
+            },
+            layer: 0,
+            z_index: 1,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        };
+        let cover = crate::windows::WindowInfo {
+            window_id: 6835,
+            title: "Preview covering window".into(),
+            z_index: 2,
+            ..source.clone()
+        };
+        let mut windows = vec![cover, source];
+        // Fully covered still means ordered on screen. Exact-window capture
+        // must remain eligible regardless of a higher sibling's equal bounds.
+        assert_eq!(
+            windows
+                .iter()
+                .find(|w| source_is_capturable(target, w))
+                .map(|w| w.window_id),
+            Some(target.window_id)
+        );
+        // Live07: close without releasing NSWindow retains its WindowServer
+        // identity and bounds, but kCGWindowIsOnscreen is absent (parsed false).
+        windows[1].is_on_screen = false;
+        assert!(
+            windows
+                .iter()
+                .find(|w| source_is_capturable(target, w))
+                .is_none(),
+            "retained closed window or same-pid cover stayed capturable"
+        );
+        let mut p = Presentation::<u8>::default();
+        p.select(1, "click".into());
+        p.activate(1);
+        p.frame(1, 42);
+        p.unavailable(1);
+        assert_eq!(p.label, "Preview unavailable");
+        assert!(p.frame.is_none() && p.clear);
+        assert!(
+            !p.frame(1, 43),
+            "late stream frame restored closed source pixels"
+        );
+        windows[1].is_on_screen = true;
+        assert!(
+            source_is_capturable(target, &windows[1]),
+            "ordered-in source cannot resume"
+        );
+        assert!(!source_is_capturable(
+            pip_preview::observer::WindowTarget { pid: 1, ..target },
+            &windows[1]
+        ));
+    }
 
     #[test]
     fn delayed_snapshot_cannot_resurrect_owner_or_reset_unavailable() {
