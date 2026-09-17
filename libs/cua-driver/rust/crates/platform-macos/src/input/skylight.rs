@@ -394,6 +394,24 @@ pub fn main_connection_id() -> Option<u32> {
     connection_id_fn().map(|f| unsafe { f() })
 }
 
+/// Whether WindowServer still displays this window, including on other Spaces.
+/// Unlike `kCGWindowIsOnscreen`, this stays true for an ordinary off-Space
+/// window, but is false once minimized, closed, or ordered out. Unknown SPI
+/// state must not be treated as permission to keep presenting retained pixels.
+pub(crate) fn window_is_ordered_in(window_id: u32) -> Option<bool> {
+    type Query = unsafe extern "C" fn(u32, u32, *mut u8) -> i32;
+    static QUERY: OnceLock<Option<Query>> = OnceLock::new();
+    let query =
+        (*QUERY.get_or_init(|| find_sym(b"SLSWindowIsOrderedIn\0").map(|p| unsafe { as_fn(p) })))?;
+    let mut ordered = u8::MAX;
+    let status = unsafe { query(main_connection_id()?, window_id, &mut ordered) };
+    match (status, ordered) {
+        (0, 0) => Some(false),
+        (0, 1) => Some(true),
+        _ => None,
+    }
+}
+
 /// Return the current active macOS Space (desktop) ID.
 ///
 /// Uses the private `CGSGetActiveSpace` SPI from SkyLight.  Returns `None`

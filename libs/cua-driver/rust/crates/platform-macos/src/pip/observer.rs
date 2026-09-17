@@ -254,18 +254,15 @@ pub(super) fn preview_dimensions(width: u32, height: u32) -> (u32, u32) {
     )
 }
 
-// WindowServer can retain a closed NSWindow's identity and backing store.
-// kCGWindowIsOnscreen means ordered on screen, not unoccluded, so covered
-// windows remain eligible. Minimized, ordered-out and other-Space windows
-// reported off screen are explicitly unavailable until ordered on screen again;
-// their retained pixels are not evidence of a live source.
+// Off-Space is not the same as closed. Query native ordering only for an
+// offscreen source; unknown, minimized and ordered-out sources stay unavailable.
 fn source_is_capturable(
     target: pip_preview::observer::WindowTarget,
     window: &crate::windows::WindowInfo,
+    ordered_in: impl FnOnce() -> Option<bool>,
 ) -> bool {
     window.window_id == target.window_id
         && window.pid == target.pid
-        && window.is_on_screen
         && [
             window.bounds.x,
             window.bounds.y,
@@ -276,6 +273,7 @@ fn source_is_capturable(
         .all(|v| v.is_finite())
         && window.bounds.width > 0.0
         && window.bounds.height > 0.0
+        && (window.is_on_screen || ordered_in() == Some(true))
 }
 
 fn capture(id: u64, update: &ObserverUpdate) -> anyhow::Result<SCStream> {
@@ -404,7 +402,13 @@ pub fn run(cfg: PipConfig) -> anyhow::Result<()> {
                             } else {
                                 update.target.and_then(|target| {
                                     crate::windows::window_info_by_id(target.window_id)
-                                        .filter(|window| source_is_capturable(target, window))
+                                        .filter(|window| {
+                                            source_is_capturable(target, window, || {
+                                                crate::input::skylight::window_is_ordered_in(
+                                                    target.window_id,
+                                                )
+                                            })
+                                        })
                                         .map(|window| {
                                             if let Some(p) =
                                                 presentation().lock().unwrap().entries.get_mut(&id)
@@ -482,6 +486,49 @@ mod tests {
     };
 
     #[test]
+    fn open_source_on_another_space_remains_capturable() {
+        let target = pip_preview::observer::WindowTarget {
+            pid: 87718,
+            window_id: 6834,
+        };
+        let source = crate::windows::WindowInfo {
+            window_id: target.window_id,
+            pid: target.pid,
+            app_name: "PreviewFixture".into(),
+            title: "Preview target".into(),
+            bounds: crate::windows::WindowBounds {
+                x: 100.0,
+                y: 158.0,
+                width: 600.0,
+                height: 360.0,
+            },
+            layer: 0,
+            z_index: 1,
+            is_on_screen: false,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        };
+        assert!(
+            source_is_capturable(target, &source, || Some(true)),
+            "ordered-in source on another Space must remain capturable"
+        );
+        assert!(
+            !source_is_capturable(target, &source, || Some(false)),
+            "minimized or ordered-out source must not admit retained pixels"
+        );
+        assert!(
+            !source_is_capturable(target, &source, || None),
+            "unknown ordering must not admit retained pixels"
+        );
+        let mut invalid = source.clone();
+        invalid.bounds.width = f64::NAN;
+        assert!(!source_is_capturable(target, &invalid, || panic!(
+            "invalid bounds"
+        )));
+    }
+
+    #[test]
     fn retained_closed_source_is_unavailable_without_substituting_its_cover() {
         let target = pip_preview::observer::WindowTarget {
             pid: 87718,
@@ -517,7 +564,7 @@ mod tests {
         assert_eq!(
             windows
                 .iter()
-                .find(|w| source_is_capturable(target, w))
+                .find(|w| source_is_capturable(target, w, || Some(false)))
                 .map(|w| w.window_id),
             Some(target.window_id)
         );
@@ -527,7 +574,7 @@ mod tests {
         assert!(
             windows
                 .iter()
-                .find(|w| source_is_capturable(target, w))
+                .find(|w| source_is_capturable(target, w, || Some(false)))
                 .is_none(),
             "retained closed window or same-pid cover stayed capturable"
         );
@@ -544,12 +591,15 @@ mod tests {
         );
         windows[1].is_on_screen = true;
         assert!(
-            source_is_capturable(target, &windows[1]),
+            source_is_capturable(target, &windows[1], || panic!(
+                "onscreen needs no ordering lookup"
+            )),
             "ordered-in source cannot resume"
         );
         assert!(!source_is_capturable(
             pip_preview::observer::WindowTarget { pid: 1, ..target },
-            &windows[1]
+            &windows[1],
+            || panic!("wrong owner must not query ordering")
         ));
     }
 
