@@ -114,12 +114,29 @@ mod tests {
     }
 
     #[test]
+    fn lone_preview_is_untitled_and_several_count_from_one() {
+        assert_eq!(title(0, 1), "Agent");
+        assert_eq!(title(0, 3), "Agent 1");
+        assert_eq!(title(2, 3), "Agent 3");
+    }
+
+    #[test]
     fn geometry_keeps_user_frame_on_available_display() {
         let screen = NSRect::new(NSPoint::new(-1440.0, 0.0), NSSize::new(1440.0, 900.0));
         let user = NSRect::new(NSPoint::new(-1200.0, 100.0), NSSize::new(420.0, 300.0));
         assert_eq!(constrain(user, &[screen]), user);
         let gone = NSRect::new(NSPoint::new(2000.0, 1000.0), NSSize::new(2000.0, 1200.0));
         assert_eq!(constrain(gone, &[screen]), screen);
+    }
+}
+
+/// Window title. Preview IDs are private, monotonic, and never reused, so a
+/// lone panel would otherwise read "Agent 3". Number only when several are live.
+fn title(index: usize, total: usize) -> String {
+    if total <= 1 {
+        "Agent".to_owned()
+    } else {
+        format!("Agent {}", index + 1)
     }
 }
 
@@ -211,7 +228,7 @@ unsafe fn create(id: u64, index: usize, cfg: &PipConfig, screens: &[NSRect]) -> 
     let _: () = msg_send![window, setBecomesKeyOnlyIfNeeded: true];
     let _: () = msg_send![window, setLevel: 3i64];
     let _: () = msg_send![window, setCollectionBehavior: (1u64 | (1 << 8))];
-    let _: () = msg_send![window, setTitle: text(&format!("Agent {id}"))];
+    let _: () = msg_send![window, setTitle: text("Agent")];
     let _: () = msg_send![window, setContentMinSize: NSSize::new(180.0, 120.0)];
     let content: *mut AnyObject = msg_send![window, contentView];
     let color: *mut AnyObject = msg_send![class!(NSColor), colorWithCalibratedHue: ((id as f64 * 0.61803398875) % 1.0) saturation: 0.6f64 brightness: 0.5f64 alpha: 1.0f64];
@@ -264,9 +281,10 @@ unsafe fn menu(ui: &mut Panels) {
         ui.status = status as usize;
     }
     let menu: *mut AnyObject = msg_send![class!(NSMenu), new];
-    for (id, panel) in &ui.entries {
+    let total = ui.entries.len();
+    for (index, panel) in ui.entries.values().enumerate() {
         let alloc: *mut AnyObject = msg_send![class!(NSMenuItem), alloc];
-        let item: *mut AnyObject = msg_send![alloc, initWithTitle: text(&format!("Show Agent {id}")) action: sel!(orderFront:) keyEquivalent: text("")];
+        let item: *mut AnyObject = msg_send![alloc, initWithTitle: text(&format!("Show {}", title(index, total))) action: sel!(orderFront:) keyEquivalent: text("")];
         let _: () = msg_send![item, setTarget: panel.window as *mut AnyObject];
         let _: () = msg_send![menu, addItem: item];
         let _: () = msg_send![item, release];
@@ -321,7 +339,13 @@ pub(super) unsafe fn render(
             animate |= render_cursor(id, panel, snapshot.previews.get(&id), if valid && visible { draw.bounds } else { None });
         }
         observer::animate_cursor(animate);
-        if changed { menu(&mut ui); }
+        if changed {
+            let total = ui.entries.len();
+            for (index, panel) in ui.entries.values().enumerate() {
+                let _: () = msg_send![panel.window as *mut AnyObject, setTitle: text(&title(index, total))];
+            }
+            menu(&mut ui);
+        }
     });
 }
 
