@@ -2508,7 +2508,11 @@ export type GetWindowStateInput = {
     screenshotOutFile?: string,
     maxElements?: number,
     maxDepth?: number,
-    maxDimension?: number
+    maxDimension?: number,
+    /**
+     * macOS only: return only rows changed since the previous look at this window.
+     */
+    diff?: boolean
 }
 
 /**
@@ -2541,7 +2545,8 @@ const FfiConverterTypeGetWindowStateInput = (() => {
                 screenshotOutFile: FfiConverterOptionalString.read(from),
                 maxElements: FfiConverterOptionalUInt32.read(from),
                 maxDepth: FfiConverterOptionalUInt32.read(from),
-                maxDimension: FfiConverterOptionalUInt32.read(from)
+                maxDimension: FfiConverterOptionalUInt32.read(from),
+                diff: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -2555,6 +2560,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
             FfiConverterOptionalUInt32.write(value.maxElements, into);
             FfiConverterOptionalUInt32.write(value.maxDepth, into);
             FfiConverterOptionalUInt32.write(value.maxDimension, into);
+            FfiConverterOptionalBoolean.write(value.diff, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterUInt32.allocationSize(value.pid) +
@@ -2566,7 +2572,8 @@ const FfiConverterTypeGetWindowStateInput = (() => {
              FfiConverterOptionalString.allocationSize(value.screenshotOutFile) +
              FfiConverterOptionalUInt32.allocationSize(value.maxElements) +
              FfiConverterOptionalUInt32.allocationSize(value.maxDepth) +
-             FfiConverterOptionalUInt32.allocationSize(value.maxDimension);
+             FfiConverterOptionalUInt32.allocationSize(value.maxDimension) +
+             FfiConverterOptionalBoolean.allocationSize(value.diff);
 
         }
     };

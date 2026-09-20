@@ -89,6 +89,10 @@ pub struct GetWindowStateInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "positive_integer_schema")]
     pub max_dimension: Option<u32>,
+    /// macOS only: return only rows changed since the previous look at this window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "bool_schema")]
+    pub diff: Option<bool>,
 }
 
 impl ToolInput for GetWindowStateInput {

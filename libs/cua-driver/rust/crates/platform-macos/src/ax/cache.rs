@@ -16,7 +16,10 @@
 //! `CacheKey`, `CachedSnapshot`, and the `Drop` impl that fires `CFRelease`
 //! when an entry is replaced or removed.
 
+use std::collections::HashMap;
+
 use super::bindings::AXUIElementRef;
+use super::diff::{rows_of, Rows};
 use super::tree::AXNode;
 use core_foundation::base::{CFRelease, CFRetain, CFTypeRef};
 use cua_driver_core::element_cache::ElementCacheCore;
@@ -62,13 +65,44 @@ pub struct CacheKey {
 /// Cached snapshot for one (pid, window_id) pair.
 pub struct CachedSnapshot {
     /// element_index → raw AXUIElementRef pointer (retained, as usize for Send).
-    pub elements: Vec<usize>,
+    /// Sparse: numbers persist across snapshots while the element does.
+    pub elements: HashMap<usize, usize>,
+    /// Rendered rows and control state, the basis of the next diff.
+    pub rows: Rows,
+    /// Next never-used element_index for this window.
+    pub next_id: usize,
+    /// `(max_elements, max_depth)` the walk used; a diff is only meaningful
+    /// against a snapshot taken with the same bounds.
+    pub bounds: (usize, usize),
 }
 
 impl Drop for CachedSnapshot {
     fn drop(&mut self) {
         // Release the extra CFRetain that walk_element added for each cached ptr.
-        for ptr in &self.elements {
+        for ptr in self.elements.values() {
+            if *ptr != 0 {
+                unsafe { CFRelease(*ptr as AXUIElementRef as CFTypeRef) };
+            }
+        }
+    }
+}
+
+/// The previous snapshot of a window, borrowed for identity matching with its
+/// own retain on every element so a concurrent replace cannot free them
+/// mid-comparison. Released on drop.
+pub struct PriorSnapshot {
+    /// `(element_index, retained ptr)` pairs.
+    pub elements: Vec<(usize, usize)>,
+    pub rows: Rows,
+    pub next_id: usize,
+    pub bounds: (usize, usize),
+}
+
+unsafe impl Send for PriorSnapshot {}
+
+impl Drop for PriorSnapshot {
+    fn drop(&mut self) {
+        for (_, ptr) in &self.elements {
             if *ptr != 0 {
                 unsafe { CFRelease(*ptr as AXUIElementRef as CFTypeRef) };
             }
@@ -89,14 +123,57 @@ impl ElementCache {
     }
 
     /// Replace the snapshot for (pid, window_id) with the nodes from a fresh walk.
-    pub fn update(&self, pid: i32, window_id: u32, nodes: &[AXNode]) {
-        let elements: Vec<usize> = nodes
+    /// `next_id` is the window's next unused element_index after stable
+    /// renumbering (see `diff::assign_stable_indices`); pass 0 when unknown.
+    pub fn update(
+        &self,
+        pid: i32,
+        window_id: u32,
+        nodes: &[AXNode],
+        next_id: usize,
+        bounds: (usize, usize),
+    ) {
+        let elements: HashMap<usize, usize> = nodes
             .iter()
-            .filter(|n| n.element_index.is_some())
-            .map(|n| n.element_ptr)
+            .filter_map(|n| n.element_index.map(|id| (id, n.element_ptr)))
             .collect();
-        self.core
-            .insert(CacheKey { pid, window_id }, CachedSnapshot { elements });
+        let next_id = next_id.max(elements.keys().max().map_or(0, |m| m + 1));
+        self.core.insert(
+            CacheKey { pid, window_id },
+            CachedSnapshot {
+                elements,
+                rows: rows_of(nodes),
+                next_id,
+                bounds,
+            },
+        );
+    }
+
+    /// Borrow the previous snapshot for identity matching before replacing it.
+    /// Every returned pointer carries an extra retain, released when the
+    /// `PriorSnapshot` drops, so a concurrent [`update`](Self::update) cannot
+    /// free an element while `CFEqual` is comparing it.
+    pub fn prior(&self, pid: i32, window_id: u32) -> Option<PriorSnapshot> {
+        self.core.with_snapshot(&CacheKey { pid, window_id }, |s| {
+            let elements: Vec<(usize, usize)> = s
+                .elements
+                .iter()
+                .map(|(&id, &ptr)| {
+                    if ptr != 0 {
+                        // Safety: inside the cache lock, so the snapshot's own
+                        // retain is still held right now.
+                        unsafe { CFRetain(ptr as AXUIElementRef as CFTypeRef) };
+                    }
+                    (id, ptr)
+                })
+                .collect();
+            PriorSnapshot {
+                elements,
+                rows: s.rows.clone(),
+                next_id: s.next_id,
+                bounds: s.bounds,
+            }
+        })
     }
 
     /// Look up + `CFRetain` the element for `element_index` in (pid, window_id),
@@ -114,7 +191,7 @@ impl ElementCache {
     ) -> Option<RetainedElement> {
         self.core
             .with_snapshot(&CacheKey { pid, window_id }, |s| {
-                let ptr = s.elements.get(element_index).copied()?;
+                let ptr = s.elements.get(&element_index).copied()?;
                 if ptr != 0 {
                     // Safety: still inside `with_snapshot`'s lock, so the
                     // snapshot (and thus this CFTypeRef) is alive right now.
@@ -194,7 +271,7 @@ mod tests {
         // to the cache, and CachedSnapshot::drop releases that retain.
         unsafe { CFRetain(ptr as CFTypeRef) };
         let cache = ElementCache::new();
-        cache.update(1, 2, &[node_with_ptr(ptr)]);
+        cache.update(1, 2, &[node_with_ptr(ptr)], 1, (0, 0));
         assert_eq!(
             unsafe { CFGetRetainCount(ptr as CFTypeRef) },
             base + 1,
@@ -213,7 +290,7 @@ mod tests {
 
         // Concurrent get_window_state replaces the snapshot → old one dropped →
         // CFRelease of the cache's retain. The guard's retain must remain.
-        cache.update(1, 2, &[]);
+        cache.update(1, 2, &[], 0, (0, 0));
         assert_eq!(
             unsafe { CFGetRetainCount(ptr as CFTypeRef) },
             base + 1,
@@ -234,7 +311,7 @@ mod tests {
     fn missing_index_returns_none() {
         let cache = ElementCache::new();
         assert!(cache.get_element_retained(1, 2, 0).is_none());
-        cache.update(1, 2, &[]);
+        cache.update(1, 2, &[], 0, (0, 0));
         assert!(cache.get_element_retained(1, 2, 5).is_none());
     }
 }

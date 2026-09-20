@@ -3843,7 +3843,7 @@ class _UniffiFfiConverterTypeGetSessionStateInput(_UniffiConverterRustBuffer):
 
 @dataclass
 class GetWindowStateInput:
-    def __init__(self, *, pid:int, window_id:int, session:typing.Optional[str], query:typing.Optional[str], include_accessibility_tree:typing.Optional[bool], include_screenshot:typing.Optional[bool], screenshot_out_file:typing.Optional[str], max_elements:typing.Optional[int], max_depth:typing.Optional[int], max_dimension:typing.Optional[int]):
+    def __init__(self, *, pid:int, window_id:int, session:typing.Optional[str], query:typing.Optional[str], include_accessibility_tree:typing.Optional[bool], include_screenshot:typing.Optional[bool], screenshot_out_file:typing.Optional[str], max_elements:typing.Optional[int], max_depth:typing.Optional[int], max_dimension:typing.Optional[int], diff:typing.Optional[bool]):
         self.pid = pid
         self.window_id = window_id
         self.session = session
@@ -3854,12 +3854,13 @@ class GetWindowStateInput:
         self.max_elements = max_elements
         self.max_depth = max_depth
         self.max_dimension = max_dimension
+        self.diff = diff
 
 
 
 
     def __str__(self):
-        return "GetWindowStateInput(pid={}, window_id={}, session={}, query={}, include_accessibility_tree={}, include_screenshot={}, screenshot_out_file={}, max_elements={}, max_depth={}, max_dimension={})".format(self.pid, self.window_id, self.session, self.query, self.include_accessibility_tree, self.include_screenshot, self.screenshot_out_file, self.max_elements, self.max_depth, self.max_dimension)
+        return "GetWindowStateInput(pid={}, window_id={}, session={}, query={}, include_accessibility_tree={}, include_screenshot={}, screenshot_out_file={}, max_elements={}, max_depth={}, max_dimension={}, diff={})".format(self.pid, self.window_id, self.session, self.query, self.include_accessibility_tree, self.include_screenshot, self.screenshot_out_file, self.max_elements, self.max_depth, self.max_dimension, self.diff)
     def __eq__(self, other):
         if self.pid != other.pid:
             return False
@@ -3881,6 +3882,8 @@ class GetWindowStateInput:
             return False
         if self.max_dimension != other.max_dimension:
             return False
+        if self.diff != other.diff:
+            return False
         return True
 
 class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
@@ -3897,6 +3900,7 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
             max_elements=_UniffiFfiConverterOptionalUInt32.read(buf),
             max_depth=_UniffiFfiConverterOptionalUInt32.read(buf),
             max_dimension=_UniffiFfiConverterOptionalUInt32.read(buf),
+            diff=_UniffiFfiConverterOptionalBoolean.read(buf),
         )
 
     @staticmethod
@@ -3911,6 +3915,7 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalUInt32.check_lower(value.max_elements)
         _UniffiFfiConverterOptionalUInt32.check_lower(value.max_depth)
         _UniffiFfiConverterOptionalUInt32.check_lower(value.max_dimension)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.diff)
 
     @staticmethod
     def write(value, buf):
@@ -3924,6 +3929,7 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalUInt32.write(value.max_elements, buf)
         _UniffiFfiConverterOptionalUInt32.write(value.max_depth, buf)
         _UniffiFfiConverterOptionalUInt32.write(value.max_dimension, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.diff, buf)
 
 @dataclass
 class HotkeyInput:

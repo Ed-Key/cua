@@ -2,9 +2,11 @@
 //!
 //! # AX element indexing
 //! Every *actionable* element in the tree is assigned an `element_index` (0-based,
-//! depth-first). The index is stable within a single `get_window_state` snapshot
-//! and is passed to `click`, `type_text`, etc. to identify the target element
-//! without requiring pixel coordinates.
+//! depth-first on the first look at a window). Later looks at the same window
+//! keep a row's number while macOS reports the same element (`diff` module),
+//! so numbers become sparse over time but never point at a different element.
+//! The index is passed to `click`, `type_text`, etc. to identify the target
+//! element without requiring pixel coordinates.
 //!
 //! # Tree format (treeMarkdown)
 //! ```text
@@ -18,6 +20,7 @@
 
 pub mod bindings;
 pub mod cache;
+pub mod diff;
 pub mod enablement;
 pub mod exact_target;
 pub mod tree;

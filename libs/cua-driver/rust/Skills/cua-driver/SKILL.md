@@ -895,10 +895,24 @@ needed content remains present. Do not interpret an omitted row as absent.
 The response carries:
 
 - `tree_markdown` — every actionable element tagged `[N]`; the structured row
-  with the same `element_index` carries its opaque `element_token`. The tree can be very large (Finder is
+  with the same `element_index` carries its opaque `element_token`. On macOS a
+  row keeps its number across later looks at the same window while it is the
+  same native element, so numbers become sparse over time; a new element never
+  takes a number an earlier row had. The application menu bar is not part of a
+  window snapshot (use `invoke_menu`). The tree can be very large (Finder is
   ~1600 elements, ~190 KB); when it exceeds token limits the MCP
   harness saves it to a file and returns the path. Use `Bash` +
   `jq -r '.tree_markdown'` + `grep` to pull the section you need.
+- `diff` (macOS, opt-in) — pass `diff:true` on a repeat look at a window you
+  already snapshotted with the same `max_elements`/`max_depth` and no `query`.
+  `tree_markdown` then lists only what changed: `+` rows that appeared, `~`
+  rows whose text or control state changed, `x` display-only text that
+  vanished, plus `removed rows: 40-42`. The structured `diff` field carries the
+  same ids and `elements` holds only added/changed rows. Rows the diff did not
+  mention are unchanged, keep their number, and their tokens from the earlier
+  response stay valid for as long as they stay unchanged. The full outline is
+  returned instead when it would be shorter. Pass `diff:false` (the default)
+  whenever you need the whole outline again.
 - `effect` / `escalation` / `degraded` — the verify-then-escalate
   signals (see the behavior matrix above): `degraded: true` means the
   tree came back empty (non-AX surface), so you act by **`px`** off the
@@ -1210,8 +1224,10 @@ respective companion files.
 ## Things to avoid
 
 - **Never** reuse an element target across a re-snapshot of the same window.
-  A new snapshot invalidates older tokens immediately. Bare `element_index`
-  input is rejected; use `element_token` or `element_index` + `snapshot_id`.
+  A new snapshot invalidates older tokens immediately, with one exception: a
+  macOS `diff:true` look keeps earlier tokens valid only for rows it reported
+  as unchanged. Bare `element_index` input is rejected; use `element_token` or
+  `element_index` + `snapshot_id`.
 - **Don't conflate the two addressing modes.** The tree gives you
   `element_index` handles; the screenshot (same call) gives you the
   pixel frame. An **element ax action** addresses by index, an

@@ -791,6 +791,7 @@ fn sdk_window_input(fixture: &Fixture) -> GetWindowStateInput {
         max_elements: None,
         max_depth: None,
         max_dimension: None,
+        diff: None,
     }
 }
 

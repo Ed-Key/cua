@@ -122,7 +122,7 @@ impl TokenRegistry {
     /// Preserve full native identities on platforms with 64-bit window IDs.
     /// The token format is unchanged; only the server-side binding is wider.
     pub fn register_snapshot_wide(&self, pid: i32, window_id: u64, element_count: usize) -> u32 {
-        self.register_snapshot_entry(pid, window_id, element_count, None)
+        self.register_snapshot_entry(pid, window_id, element_count, None, None)
     }
 
     /// Window-scoped AT-SPI snapshots retain application-wide (sparse) indices.
@@ -136,6 +136,32 @@ impl TokenRegistry {
                 .max()
                 .map_or(0, |index| index.saturating_add(1)),
             Some(indices.iter().copied().collect()),
+            None,
+        )
+    }
+
+    /// Like [`register_snapshot_indices`](Self::register_snapshot_indices), but
+    /// the window's immediately previous snapshot stays resolvable for exactly
+    /// `unchanged` indices. The caller guarantees each of those numbers still
+    /// names the same native element with the same rendered row (a diff proved
+    /// it), so a token from the previous look cannot land on a different row.
+    /// Every other prior token for the window becomes stale as before.
+    pub fn register_snapshot_indices_graced(
+        &self,
+        pid: i32,
+        window_id: u64,
+        indices: &[usize],
+        unchanged: &[usize],
+    ) -> u32 {
+        self.register_snapshot_entry(
+            pid,
+            window_id,
+            indices
+                .iter()
+                .max()
+                .map_or(0, |index| index.saturating_add(1)),
+            Some(indices.iter().copied().collect()),
+            Some(unchanged.iter().copied().collect()),
         )
     }
 
@@ -145,6 +171,7 @@ impl TokenRegistry {
         window_id: u64,
         element_count: usize,
         indices: Option<std::collections::HashSet<usize>>,
+        grace_prior: Option<std::collections::HashSet<usize>>,
     ) -> u32 {
         // Keep the full 32-bit counter. Truncating to 16 bits repeats an id
         // every 65,536 process-global snapshots. A long-lived daemon can then
@@ -157,19 +184,55 @@ impl TokenRegistry {
         // Every platform replaces its per-window element cache on the next
         // snapshot. Retaining an older token for the same window would resolve
         // that token against the new cache and could target a different row.
-        // Invalidate it at the same boundary as the cache replacement.
-        lane.retain(|entry| entry.window_id != window_id);
+        // Invalidate it at the same boundary as the cache replacement, except
+        // for the indices a diff proved unchanged. Every earlier snapshot of
+        // the window keeps exactly the indices that have stayed unchanged
+        // since it was taken (its set shrinks with each diff), so a token from
+        // several looks ago still works while its row never moved.
+        match grace_prior {
+            Some(unchanged) => {
+                for entry in lane.iter_mut().filter(|e| e.window_id == window_id) {
+                    let kept: std::collections::HashSet<usize> = match entry.indices.take() {
+                        Some(prev) => prev.intersection(&unchanged).copied().collect(),
+                        None => unchanged
+                            .iter()
+                            .copied()
+                            .filter(|i| *i <= entry.max_element_index)
+                            .collect(),
+                    };
+                    entry.indices = Some(kept);
+                }
+                lane.retain(|e| {
+                    e.window_id != window_id || e.indices.as_ref().is_some_and(|s| !s.is_empty())
+                });
+            }
+            None => lane.retain(|entry| entry.window_id != window_id),
+        }
         lane.push(SnapshotEntry {
             snapshot_id: id,
             window_id,
             max_element_index: element_count.saturating_sub(1),
             indices,
         });
-        // Evict oldest. The loop guards against pre-existing over-cap
-        // state from a previous version of the binary; in steady state
-        // this fires exactly once per call.
+        // Evict down to the cap. Graced entries let one window hold several
+        // snapshots, so first retire the oldest extra entry of whichever window
+        // holds the most; only when every window is down to one entry does the
+        // lane-wide oldest go. A window's only snapshot is never displaced by
+        // another window's repeated looks.
         while lane.len() > LRU_CAP_PER_PID {
-            lane.remove(0);
+            let mut per_window: HashMap<u64, usize> = HashMap::new();
+            for entry in lane.iter() {
+                *per_window.entry(entry.window_id).or_default() += 1;
+            }
+            let crowded = per_window
+                .iter()
+                .filter(|(_, &count)| count > 1)
+                .max_by_key(|(_, &count)| count)
+                .map(|(&window, _)| window);
+            let victim = crowded
+                .and_then(|window| lane.iter().position(|entry| entry.window_id == window))
+                .unwrap_or(0);
+            lane.remove(victim);
         }
         id
     }
@@ -541,6 +604,52 @@ mod tests {
 
     fn fresh_registry() -> TokenRegistry {
         TokenRegistry::new()
+    }
+
+    /// A diff response keeps the previous snapshot's tokens valid for exactly
+    /// the rows it proved unchanged; touched rows and older snapshots still
+    /// go stale.
+    #[test]
+    fn graced_registration_keeps_only_unchanged_prior_tokens_alive() {
+        let reg = fresh_registry();
+        let older = reg.register_snapshot_indices(7, 9, &[0, 1, 2]);
+        let prior = reg.register_snapshot_indices(7, 9, &[0, 1, 2]);
+        assert!(reg.resolve(7, &format_token(older, 0)).is_err(), "plain re-register stales");
+        // Row 1 changed, row 3 is new, rows 0 and 2 are unchanged.
+        let latest = reg.register_snapshot_indices_graced(7, 9, &[0, 1, 2, 3], &[0, 2]);
+        assert_eq!(reg.resolve(7, &format_token(prior, 0)), Ok((9, 0)));
+        assert_eq!(reg.resolve(7, &format_token(prior, 2)), Ok((9, 2)));
+        assert!(reg.resolve(7, &format_token(prior, 1)).is_err(), "changed row is stale");
+        assert!(reg.resolve(7, &format_token(prior, 3)).is_err(), "never in prior");
+        assert_eq!(reg.resolve(7, &format_token(latest, 3)), Ok((9, 3)));
+        // Grace chains: a later diff that leaves row 0 alone but changes row 2
+        // keeps the two-looks-old token for 0 and retires it for 2.
+        let newest = reg.register_snapshot_indices_graced(7, 9, &[0, 2, 3], &[0, 3]);
+        assert_eq!(reg.resolve(7, &format_token(prior, 0)), Ok((9, 0)));
+        assert!(reg.resolve(7, &format_token(prior, 2)).is_err(), "changed since that look");
+        assert_eq!(reg.resolve(7, &format_token(latest, 3)), Ok((9, 3)));
+        assert_eq!(reg.resolve(7, &format_token(newest, 2)), Ok((9, 2)));
+        // The next snapshot without grace retires every earlier entry.
+        reg.register_snapshot_indices(7, 9, &[0, 2, 3]);
+        assert!(reg.resolve(7, &format_token(prior, 0)).is_err());
+        assert!(reg.resolve(7, &format_token(latest, 3)).is_err());
+        assert!(reg.resolve(7, &format_token(newest, 2)).is_err());
+    }
+
+    /// Repeated graced looks at one window must not push another window's
+    /// only snapshot out of the per-pid cap.
+    #[test]
+    fn graced_snapshots_evict_their_own_window_before_another_windows_only_entry() {
+        let reg = fresh_registry();
+        let a = reg.register_snapshot_indices(7, 1, &[0, 1]);
+        let mut b_tokens = Vec::new();
+        for _ in 0..(LRU_CAP_PER_PID + 3) {
+            b_tokens.push(reg.register_snapshot_indices_graced(7, 2, &[0, 1], &[0, 1]));
+        }
+        assert_eq!(reg.resolve(7, &format_token(a, 1)), Ok((1, 1)), "window A survives");
+        assert!(reg.snapshot_count(7) <= LRU_CAP_PER_PID);
+        assert_eq!(reg.resolve(7, &format_token(*b_tokens.last().unwrap(), 0)), Ok((2, 0)));
+        assert!(reg.resolve(7, &format_token(b_tokens[0], 0)).is_err(), "oldest B look was evicted");
     }
 
     #[test]

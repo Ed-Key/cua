@@ -171,8 +171,8 @@ pub struct TreeWalkResult {
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
 ///
 /// `window_id` — when Some, only the AXWindow matching that CGWindowID is
-/// walked (plus non-window children like the menu bar). When None, all
-/// top-level children are walked.
+/// walked (plus non-window, non-menu-bar children such as sheets). When None,
+/// all top-level children are walked.
 ///
 /// At the application root we union `AXChildren` with freshly discoverable
 /// application windows. Background windows can be absent from `AXChildren`,
@@ -369,6 +369,36 @@ pub fn walk_tree_bounded_with_context(
     }
 }
 
+/// UIKit/SwiftUI custom accessibility actions surface through AXUIElementCopyActionNames
+/// as the description of the action object, e.g. `Name:Heart\nTarget:0x0\nSelector:(null)`.
+/// Only the name carries meaning; the target and selector are always placeholders.
+/// Standard `AX*` names pass through unchanged.
+fn display_action_name(raw: String) -> String {
+    match raw.strip_prefix("Name:") {
+        Some(rest) => rest.split('\n').next().unwrap_or(rest).trim().to_owned(),
+        None => raw,
+    }
+}
+
+/// Action names for the markdown outline. Every element answers
+/// `AXScrollToVisible` and `AXShowMenu`, and every row inside a scroll view
+/// answers the page-scroll pair, whose presence flips with scroll position and
+/// would mark whole transcripts "changed" in a diff. The `scroll` and
+/// `right_click` tools already cover all four, so listing them per row is pure
+/// noise. Addressability and dispatch still use the full `AXNode::actions` list.
+fn rendered_action_names(actions: &[String]) -> Vec<String> {
+    actions
+        .iter()
+        .filter(|a| {
+            !matches!(
+                a.as_str(),
+                "AXScrollToVisible" | "AXShowMenu" | "AXScrollUpByPage" | "AXScrollDownByPage"
+            )
+        })
+        .map(|a| a.strip_prefix("AX").unwrap_or(a).to_lowercase())
+        .collect()
+}
+
 /// Keep named sections in the rendered hierarchy. Action names alone do not
 /// identify a semantic group: Chromium exposes generic show-menu/scroll actions
 /// even on anonymous layout wrappers. Addressability is evaluated separately.
@@ -453,7 +483,10 @@ unsafe fn walk_element(
     let placeholder = copy_string_attr(element, "AXPlaceholderValue");
     let identifier = copy_string_attr(element, "AXIdentifier");
     let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
-    let actions = copy_action_names(element);
+    let actions: Vec<String> = copy_action_names(element)
+        .into_iter()
+        .map(display_action_name)
+        .collect();
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
@@ -657,7 +690,7 @@ mod web_content_role_tests {
     }
 }
 
-fn format_node_line(node: &AXNode) -> String {
+pub(crate) fn format_node_line(node: &AXNode) -> String {
     let mut parts = String::new();
 
     // Common prefix (with or without index).
@@ -696,13 +729,8 @@ fn format_node_line(node: &AXNode) -> String {
         if let Some(h) = &node.help {
             attrs.push(format!("help=\"{}\"", h));
         }
-        if !node.actions.is_empty() {
-            let action_str = node
-                .actions
-                .iter()
-                .map(|a| a.strip_prefix("AX").unwrap_or(a).to_lowercase())
-                .collect::<Vec<_>>()
-                .join(",");
+        let action_str = rendered_action_names(&node.actions).join(",");
+        if !action_str.is_empty() {
             attrs.push(format!("actions=[{}]", action_str));
         }
         if node.focused == Some(true) {
@@ -729,7 +757,7 @@ fn format_node_line(node: &AXNode) -> String {
     parts
 }
 
-fn render_lines(lines: &[(usize, String)]) -> String {
+pub(crate) fn render_lines(lines: &[(usize, String)]) -> String {
     let mut out = String::new();
     for (depth, line) in lines {
         for _ in 0..*depth {
@@ -746,6 +774,37 @@ fn render_lines(lines: &[(usize, String)]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn custom_action_names_keep_only_the_name() {
+        assert_eq!(
+            display_action_name("Name:Tapback Details…\nTarget:0x0\nSelector:(null)".into()),
+            "Tapback Details…"
+        );
+        assert_eq!(display_action_name("Name:Pin\nTarget:0x0\nSelector:(null)".into()), "Pin");
+        assert_eq!(display_action_name("AXPress".into()), "AXPress");
+        assert_eq!(display_action_name("Name:".into()), "");
+    }
+
+    #[test]
+    fn outline_hides_universal_actions_but_keeps_the_rest() {
+        let actions: Vec<String> = [
+            "AXPress",
+            "AXScrollToVisible",
+            "AXCancel",
+            "AXShowMenu",
+            "AXScrollUpByPage",
+            "AXScrollDownByPage",
+            "Heart",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(rendered_action_names(&actions), ["press", "cancel", "heart"]);
+        let only_universal: Vec<String> = ["AXScrollToVisible", "AXShowMenu", "AXScrollDownByPage"]
+            .map(str::to_owned)
+            .to_vec();
+        assert!(rendered_action_names(&only_universal).is_empty());
+    }
 
     #[test]
     fn focused_selection_outline_is_lossless_and_focus_race_discards_state() {
