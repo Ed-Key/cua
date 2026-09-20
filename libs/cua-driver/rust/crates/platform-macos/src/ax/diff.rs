@@ -103,23 +103,12 @@ pub struct OutlineDiff {
     pub added: Vec<usize>,
     pub changed: Vec<usize>,
     pub removed: Vec<usize>,
-    /// Display-only lines that appeared or vanished.
-    pub display_added: usize,
-    pub display_removed: usize,
     pub markdown: String,
 }
 
 impl OutlineDiff {
     pub fn touched(&self) -> HashSet<usize> {
         self.added.iter().chain(&self.changed).copied().collect()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.added.is_empty()
-            && self.changed.is_empty()
-            && self.removed.is_empty()
-            && self.display_added == 0
-            && self.display_removed == 0
     }
 }
 
@@ -197,8 +186,6 @@ pub fn diff_outline(prior: &Rows, nodes: &[AXNode], window_title: &str) -> Outli
         added,
         changed,
         removed,
-        display_added,
-        display_removed,
         markdown,
     }
 }
@@ -320,7 +307,6 @@ mod tests {
         assert_eq!(diff.changed, vec![0]);
         assert_eq!(diff.added, vec![3]);
         assert_eq!(diff.removed, vec![1]);
-        assert_eq!((diff.display_added, diff.display_removed), (1, 1));
         assert!(diff.markdown.contains("removed rows: 1\n"), "{}", diff.markdown);
         assert!(diff.markdown.contains("~ [0] AXButton = \"Save…\""), "{}", diff.markdown);
         assert!(diff.markdown.contains("  + [3] AXButton = \"Send\""), "{}", diff.markdown);
@@ -330,7 +316,7 @@ mod tests {
 
         let same = diff_outline(&rows_of(&second), &second, "Dialog");
         assert!(same.markdown.starts_with("No changes"));
-        assert!(same.is_empty() && same.touched().is_empty());
+        assert!(same.touched().is_empty());
     }
 
     #[test]
