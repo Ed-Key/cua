@@ -65,6 +65,9 @@ from ._native import (
     request_mac_os_permissions,
 )
 from ._native_contract import (
+    ActAndReadInput,
+    ActionReadAction,
+    ActionReadObservation,
     AppInfo,
     ClickPosition,
     ElementFrame,
@@ -125,7 +128,11 @@ from ._native_contract import (
     PressKeyInput,
     ScrollBy,
     ScrollDirection,
+    RunSequenceInput,
     ScrollInput,
+    SequenceArguments,
+    SequenceStep,
+    SequenceTool,
     SessionStateOutput,
     SetAgentCursorEnabledInput,
     SetAgentCursorMotionInput,
@@ -220,6 +227,13 @@ _NativeCuaDriver.create_private_worker = classmethod(_create_private_worker_pyth
 CuaDriver = _NativeCuaDriver
 
 __all__ = [
+    "ActAndReadInput",
+    "ActionReadAction",
+    "ActionReadObservation",
+    "RunSequenceInput",
+    "SequenceArguments",
+    "SequenceStep",
+    "SequenceTool",
     "AppInfo",
     "ClickPosition",
     "ElementFrame",
