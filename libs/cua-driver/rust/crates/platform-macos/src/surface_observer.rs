@@ -511,8 +511,15 @@ impl Tool for SurfaceNoted {
                 let recording_session = session.clone();
                 // The guard rides with the blocking snapshot, so cancelling
                 // this call cannot release it while the snapshot still runs.
+                // A panic in the snapshot must not strand the guard: catch it,
+                // drop the baseline (unknown), and keep the action guarded.
                 let guard = tokio::task::spawn_blocking(move || {
-                    record_before_action(&recording_session, pid);
+                    let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        record_before_action(&recording_session, pid)
+                    }));
+                    if recorded.is_err() {
+                        pending().remove(&(recording_session, pid));
+                    }
                     guard
                 })
                 .await
@@ -530,7 +537,13 @@ impl Tool for SurfaceNoted {
                 }
                 let guard = key_guard(&session, pid).await;
                 let change = tokio::task::spawn_blocking(move || {
-                    let change = take_window_change(&session, pid);
+                    let change = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        take_window_change(&session, pid)
+                    }))
+                    .unwrap_or_else(|_| {
+                        pending().remove(&(session, pid));
+                        None
+                    });
                     drop(guard);
                     change
                 })
