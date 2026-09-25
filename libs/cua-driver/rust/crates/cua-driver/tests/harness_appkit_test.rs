@@ -130,7 +130,10 @@ fn snapshot_elements(driver: &mut McpDriver, pid: u32, window_id: u64) -> ToolRe
         serde_json::json!({
             "pid": pid as i64,
             "window_id": window_id,
-            "capture_mode": "ax"
+            "capture_mode": "ax",
+            // Tests look rows up by id on every read; a change-only diff has
+            // no rows to search.
+            "diff": false
         }),
     )
 }
