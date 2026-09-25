@@ -973,6 +973,13 @@ fn harness_appkit_px_background_press_key_reports_honest_delivery_truth() {
                 assert!(!set.is_error(), "set command failed: {}", set.text());
 
                 let focused = snapshot_elements(driver, harness.pid, wid);
+                assert!(
+                    focused.tree_text().contains("committed=none"),
+                    "command ran before Return: {}",
+                    focused.tree_text()
+                );
+                assert!(!oracle_path.exists(), "child process ran before Return");
+                // Baseline before Return: nothing committed and no command run.
                 let (x, y, width, height) = element_pixel_frame(&focused, "txt-input");
                 let pressed = driver.call(
                     "press_key",

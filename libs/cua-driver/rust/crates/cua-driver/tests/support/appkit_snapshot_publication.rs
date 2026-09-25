@@ -330,6 +330,22 @@ fn harness_appkit_pending_snapshot_cannot_retarget_token() {
             Some(original_index),
             "a replaced element must not reuse the old row number"
         );
+        // The old token must be refused once the replacement snapshot is
+        // published, not merely fail to act during capture.
+        let replayed = driver.call(
+            "click",
+            serde_json::json!({
+                "pid": harness.pid, "window_id": window, "element_token": old_token,
+                "delivery_mode": "foreground"
+            }),
+        );
+        assert!(replayed.is_error(), "old token was accepted: {}", replayed.text());
+        assert_eq!(
+            replayed.structured()["refusal"]["code"].as_str(),
+            Some("stale_element_token"),
+            "old token refusal: {}",
+            replayed.raw
+        );
         let fresh = element_token_by_id(&second, "snapshot-replacement");
         let recovered = driver.call(
             "click",
