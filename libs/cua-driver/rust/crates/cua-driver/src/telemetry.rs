@@ -2239,6 +2239,12 @@ fn telemetry_home_dir() -> Option<PathBuf> {
 }
 
 fn home_root() -> Option<PathBuf> {
+    // A test build never touches the developer's real home (config,
+    // identity, legacy migration). Tests that need a telemetry home set
+    // CUA_DRIVER_TELEMETRY_HOME to a temp dir (with_isolated_home).
+    if cfg!(test) {
+        return None;
+    }
     std::env::var_os("HOME")
         .or_else(|| std::env::var_os("USERPROFILE"))
         .map(PathBuf::from)
