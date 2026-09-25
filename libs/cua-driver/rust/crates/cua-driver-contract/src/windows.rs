@@ -252,6 +252,13 @@ pub struct WindowElement {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// Reported keyboard focus. Currently populated on macOS; absent is unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focused: Option<bool>,
+    /// Only read for the focused text control. Unsupported attributes stay absent.
+    /// Web accessibility state is observational, not renderer verification.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text_selection: Option<TextSelection>,
     /// The hint an empty field shows (`AXPlaceholderValue`); never content.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub placeholder: Option<String>,
@@ -282,6 +289,23 @@ pub struct WindowElement {
 pub struct SnapshotImage {
     pub mime_type: String,
     pub data_base64: String,
+}
+
+/// A half-open range measured in UTF-16 code units. Zero length is a caret.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, Eq, PartialEq, uniffi::Record)]
+pub struct TextSelectionRange {
+    pub location: u64,
+    pub length: u64,
+}
+
+/// Best-effort platform accessibility state, not proof of a rendered web edit.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Eq, PartialEq, uniffi::Record)]
+pub struct TextSelection {
+    /// Empty string means a readable empty selection; absence means unavailable.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub text: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub range: Option<TextSelectionRange>,
 }
 
 /// One window an app opened after an action, addressable with

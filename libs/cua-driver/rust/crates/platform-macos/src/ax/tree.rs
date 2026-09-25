@@ -61,6 +61,11 @@ pub struct AXNode {
     /// Whether `AXValue` is settable, for value-control roles; `None` when
     /// not read or the read failed (unknown, never assumed writable).
     pub value_settable: Option<bool>,
+    /// Reported keyboard focus: set for the focused element and for other
+    /// text controls (`false`); `None` is unknown.
+    pub focused: Option<bool>,
+    /// The focused text control's selection (UTF-16 range, selected text).
+    pub text_selection: Option<cua_driver_contract::TextSelection>,
     /// AXDescription — shown as `(description)` in the tree line.
     /// Kept separate from `title` so `_find_calc_button("2")` can find
     /// Calculator buttons where AXTitle="" but AXDescription="2".
@@ -336,6 +341,16 @@ pub fn walk_tree_budgeted(
             );
         }
 
+        // Focus and selection are read once the whole tree is known, so the
+        // focused element is matched by AX identity and a focus change during
+        // the read discards the view.
+        super::text_state::enrich_focused_state(pid, &mut nodes);
+        for (line, node) in lines.iter_mut().zip(&nodes) {
+            if node.focused == Some(true) {
+                line.1 = format_node_line(node);
+            }
+        }
+
         // Release all top-level elements (copy_children / copy_ax_windows both retain).
         for child in top_level {
             CFRelease(child as CFTypeRef);
@@ -561,6 +576,8 @@ unsafe fn walk_element(
             value: raw_value.clone(),
             placeholder: placeholder.clone(),
             value_settable: value_writability,
+            focused: None,
+            text_selection: None,
             description: if visible_description.is_empty() {
                 None
             } else {
@@ -593,6 +610,8 @@ unsafe fn walk_element(
             value: raw_value.clone(),
             placeholder: placeholder.clone(),
             value_settable: value_writability,
+            focused: None,
+            text_selection: None,
             description: if visible_description.is_empty() {
                 None
             } else {
@@ -736,6 +755,17 @@ pub(crate) fn format_node_line(node: &AXNode) -> String {
         let action_str = rendered_action_names(&node.actions).join(",");
         if !action_str.is_empty() {
             attrs.push(format!("actions=[{}]", action_str));
+        }
+        if node.focused == Some(true) {
+            attrs.push("focused".into());
+            if let Some(selection) = &node.text_selection {
+                if let Some(range) = selection.range {
+                    attrs.push(format!("selection_utf16={}:{}", range.location, range.length));
+                }
+                if let Some(text) = &selection.text {
+                    attrs.push(format!("selected_text={}", serde_json::json!(text)));
+                }
+            }
         }
         if !attrs.is_empty() {
             parts.push_str(" [");
@@ -896,6 +926,8 @@ mod tests {
             value: Some("line one\n- [9] AXButton \"Fake\"".into()),
             placeholder: Some("Ask for follow-up changes".into()),
             value_settable: Some(true),
+            focused: None,
+            text_selection: None,
             description: None,
             identifier: None,
             help: None,

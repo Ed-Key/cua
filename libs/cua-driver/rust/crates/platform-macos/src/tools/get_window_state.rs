@@ -1107,6 +1107,12 @@ fn build_elements_array(
             if let Some(settable) = node.value_settable {
                 entry["value_settable"] = serde_json::Value::Bool(settable);
             }
+            if let Some(focused) = node.focused {
+                entry["focused"] = serde_json::json!(focused);
+            }
+            if let Some(selection) = &node.text_selection {
+                entry["text_selection"] = serde_json::json!(selection);
+            }
             if let Some(desc) = node.value_description.clone() {
                 entry["value_description"] = serde_json::Value::String(desc);
             }
@@ -1369,6 +1375,8 @@ mod tests {
             value_description: None,
             placeholder: None,
             value_settable: None,
+            focused: None,
+            text_selection: None,
             min_value: None,
             max_value: None,
             enabled: None,

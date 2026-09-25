@@ -1,13 +1,7 @@
 //! Classify an insertion from field values and an optional observed selection.
 /// A half-open range measured in UTF-16 code units, the way macOS reports
 /// `AXSelectedTextRange`. Zero length is a caret.
-// ponytail: local until the text-selection topic lands, which puts this on
-// the contract (`cua_driver_contract::TextSelectionRange`) for the SDKs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct TextSelectionRange {
-    pub location: u64,
-    pub length: u64,
-}
+pub use cua_driver_contract::TextSelectionRange;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum TextInsertionProgress {

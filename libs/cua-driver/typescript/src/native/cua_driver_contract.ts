@@ -5847,6 +5847,101 @@ const FfiConverterTypeSurfaceWindow = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * A half-open range measured in UTF-16 code units. Zero length is a caret.
+ */
+export type TextSelectionRange = {
+    location: bigint,
+    length: bigint
+}
+
+/**
+ * Generated factory for {@link TextSelectionRange} record objects.
+ */
+export const TextSelectionRange = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<TextSelectionRange, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<TextSelectionRange>,
+    });
+})();
+
+const FfiConverterTypeTextSelectionRange = (() => {
+    type TypeName = TextSelectionRange;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                location: FfiConverterUInt64.read(from),
+                length: FfiConverterUInt64.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterUInt64.write(value.location, into);
+            FfiConverterUInt64.write(value.length, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterUInt64.allocationSize(value.location) +
+             FfiConverterUInt64.allocationSize(value.length);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * Best-effort platform accessibility state, not proof of a rendered web edit.
+ */
+export type TextSelection = {
+    /**
+     * Empty string means a readable empty selection; absence means unavailable.
+     */
+    text?: string,
+    range?: TextSelectionRange
+}
+
+/**
+ * Generated factory for {@link TextSelection} record objects.
+ */
+export const TextSelection = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<TextSelection, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<TextSelection>,
+    });
+})();
+
+const FfiConverterTypeTextSelection = (() => {
+    type TypeName = TextSelection;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                text: FfiConverterOptionalString.read(from),
+                range: FfiConverterOptionalTypeTextSelectionRange.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterOptionalString.write(value.text, into);
+            FfiConverterOptionalTypeTextSelectionRange.write(value.range, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalString.allocationSize(value.text) +
+             FfiConverterOptionalTypeTextSelectionRange.allocationSize(value.range);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type TypeTextInput = {
     text: string,
     target?: ActionTarget,
@@ -6173,6 +6268,15 @@ export type WindowElement = {
     label?: string,
     value?: string,
     /**
+     * Reported keyboard focus. Currently populated on macOS; absent is unknown.
+     */
+    focused?: boolean,
+    /**
+     * Only read for the focused text control. Unsupported attributes stay absent.
+     * Web accessibility state is observational, not renderer verification.
+     */
+    textSelection?: TextSelection,
+    /**
      * The hint an empty field shows (`AXPlaceholderValue`); never content.
      */
     placeholder?: string,
@@ -6218,6 +6322,8 @@ const FfiConverterTypeWindowElement = (() => {
                 elementToken: FfiConverterOptionalString.read(from),
                 label: FfiConverterOptionalString.read(from),
                 value: FfiConverterOptionalString.read(from),
+                focused: FfiConverterOptionalBoolean.read(from),
+                textSelection: FfiConverterOptionalTypeTextSelection.read(from),
                 placeholder: FfiConverterOptionalString.read(from),
                 valueSettable: FfiConverterOptionalBoolean.read(from),
                 valueDescription: FfiConverterOptionalString.read(from),
@@ -6238,6 +6344,8 @@ const FfiConverterTypeWindowElement = (() => {
             FfiConverterOptionalString.write(value.elementToken, into);
             FfiConverterOptionalString.write(value.label, into);
             FfiConverterOptionalString.write(value.value, into);
+            FfiConverterOptionalBoolean.write(value.focused, into);
+            FfiConverterOptionalTypeTextSelection.write(value.textSelection, into);
             FfiConverterOptionalString.write(value.placeholder, into);
             FfiConverterOptionalBoolean.write(value.valueSettable, into);
             FfiConverterOptionalString.write(value.valueDescription, into);
@@ -6257,6 +6365,8 @@ const FfiConverterTypeWindowElement = (() => {
              FfiConverterOptionalString.allocationSize(value.elementToken) +
              FfiConverterOptionalString.allocationSize(value.label) +
              FfiConverterOptionalString.allocationSize(value.value) +
+             FfiConverterOptionalBoolean.allocationSize(value.focused) +
+             FfiConverterOptionalTypeTextSelection.allocationSize(value.textSelection) +
              FfiConverterOptionalString.allocationSize(value.placeholder) +
              FfiConverterOptionalBoolean.allocationSize(value.valueSettable) +
              FfiConverterOptionalString.allocationSize(value.valueDescription) +
@@ -6577,11 +6687,17 @@ const FfiConverterOptionalTypeCaptureScope = new FfiConverterOptional(FfiConvert
 // FfiConverter for CursorThemeSelection | undefined
 const FfiConverterOptionalTypeCursorThemeSelection = new FfiConverterOptional(FfiConverterTypeCursorThemeSelection);
 
+// FfiConverter for TextSelectionRange | undefined
+const FfiConverterOptionalTypeTextSelectionRange = new FfiConverterOptional(FfiConverterTypeTextSelectionRange);
+
 // FfiConverter for Array<SurfaceWindow>
 const FfiConverterSequenceTypeSurfaceWindow = new FfiConverterArray(FfiConverterTypeSurfaceWindow);
 
 // FfiConverter for SurfaceWindow | undefined
 const FfiConverterOptionalTypeSurfaceWindow = new FfiConverterOptional(FfiConverterTypeSurfaceWindow);
+
+// FfiConverter for TextSelection | undefined
+const FfiConverterOptionalTypeTextSelection = new FfiConverterOptional(FfiConverterTypeTextSelection);
 
 // FfiConverter for ElementFrame | undefined
 const FfiConverterOptionalTypeElementFrame = new FfiConverterOptional(FfiConverterTypeElementFrame);
@@ -6718,6 +6834,8 @@ export default Object.freeze({
     FfiConverterTypeStartSessionOutput,
     FfiConverterTypeStatePredicate,
     FfiConverterTypeSurfaceWindow,
+    FfiConverterTypeTextSelection,
+    FfiConverterTypeTextSelectionRange,
     FfiConverterTypeTypeTextInput,
     FfiConverterTypeUnknownReason,
     FfiConverterTypeVerificationStatus,

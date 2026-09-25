@@ -288,6 +288,8 @@ mod tests {
             value_description: None,
             placeholder: None,
             value_settable: None,
+            focused: None,
+            text_selection: None,
             min_value: None,
             max_value: None,
             enabled: None,
