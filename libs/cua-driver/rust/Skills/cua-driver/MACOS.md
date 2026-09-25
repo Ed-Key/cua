@@ -523,7 +523,7 @@ When `act_and_read` advertises scroll, it also accepts `action:"scroll"`, a fres
 
 ```javascript
 act_and_read({pid, window_id, action:"scroll", element_token, direction:"up",
-  observe:{query:"AXWindow", query_context:true, include_screenshot:false}})
+  observe:{include_screenshot:false}})
 ```
 
 Choose direction and distance from the task and current state. A fresh read can still precede an app's delayed update; inspect its contents before deciding what to do next. Use ordinary scroll for unsupported targets or options. Do not add animation waits.
