@@ -612,16 +612,33 @@ impl Tool for ClickTool {
 
             // Finder icon/list items can expose a readable AXSelected state
             // while refusing both AXSelected writes and AXPress. Resolve a
-            // verified coordinate frame only for those collection-like
-            // elements so perform_ax_click can cross that one failed semantic
-            // rung internally and confirm the result by AX read-back.
+            // verified coordinate frame for those collection-like elements so
+            // perform_ax_click can cross that one failed semantic rung
+            // internally and confirm the result by AX read-back. A text-entry
+            // control gets the same fallback at its own center: it has no
+            // AXPress, and an AXFocused write can be rejected or clobbered.
             let selection_center = if effective_action == "press" {
                 let selection_guard = element_guard.clone();
                 tokio::task::spawn_blocking(move || {
-                    crate::input::ax_actions::nearest_container_selection_state(
-                        selection_guard.as_ptr(),
-                    )
-                    .and_then(|_| nearest_selectable_container_center(selection_guard.as_ptr()))
+                    let ptr = selection_guard.as_ptr();
+                    crate::input::ax_actions::nearest_container_selection_state(ptr)
+                        .and_then(|_| nearest_selectable_container_center(ptr))
+                        .or_else(|| {
+                            let role = unsafe {
+                                crate::ax::bindings::copy_string_attr(
+                                    ptr as crate::ax::bindings::AXUIElementRef,
+                                    "AXRole",
+                                )
+                            }
+                            .unwrap_or_default();
+                            is_text_entry_role(&role)
+                                .then(|| unsafe {
+                                    crate::ax::bindings::element_screen_center(
+                                        ptr as crate::ax::bindings::AXUIElementRef,
+                                    )
+                                })
+                                .flatten()
+                        })
                 })
                 .await
                 .unwrap_or(None)

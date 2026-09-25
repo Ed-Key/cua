@@ -38,7 +38,7 @@ use crate::ax::bindings::{
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
-use core_foundation::base::{CFEqual, CFRelease, CFType, CFTypeRef, TCFType};
+use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFType, CFTypeRef, TCFType};
 use cua_driver_core::background_input::BackgroundRefusal;
 
 use super::ToolState;
@@ -281,6 +281,22 @@ impl Tool for TypeTextTool {
             } else {
                 (None, BackgroundKeyboardPolicy::Allowed)
             };
+        // Preparing an unfocused native field (an AXFocused write on the exact
+        // addressed element) is an exact-window mutation like set_value's, not
+        // a keyboard rung. Authorize it through the same lease re-gate, so a
+        // competing sibling window that makes typing semantic-only still gets
+        // its field editor installed before the AX write.
+        let prepare_native_text = match (_mutation_lease.as_ref(), element_guard.as_ref(), window_id) {
+            (Some(lease), Some((guard, _)), Some(wid)) => lease
+                .gate_again(
+                    wid,
+                    Some(guard.as_ptr() as usize),
+                    cua_driver_core::background_input::BackgroundAction::InsertText,
+                )
+                .await
+                .is_ok(),
+            _ => matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed),
+        };
 
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_index) for an *element px action*: pixel-click the
@@ -396,6 +412,7 @@ impl Tool for TypeTextTool {
                         delivery_mode,
                         window_id,
                         blocking_policy,
+                        prepare_native_text,
                     )
                 })
                 .await
@@ -1236,6 +1253,7 @@ fn type_text_blocking(
     delivery_mode: super::DeliveryMode,
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
+    prepare_native_text: bool,
 ) -> anyhow::Result<TypeTextDelivery> {
     // Original field value before any rung drives read-back verification only.
     // An unreadable value is not evidence that the field is empty — and for a
@@ -1385,13 +1403,17 @@ fn type_text_blocking(
     // window — a sibling window's focused field is not the requested target.
     let ax_target: Option<(AXUIElementRef, bool, Option<usize>)> = match element_ptr_and_idx {
         Some((ptr, idx)) => Some((ptr as AXUIElementRef, /*owns=*/ false, idx)),
-        None => match window_id {
-            Some(wid) => unsafe { crate::ax::exact_target::focused_element_in_window(pid, wid) }
-                .map(|el| (el, /*owns=*/ true, None)),
-            None => {
-                unsafe { focused_element_of_pid(pid) }.map(|el| (el, /*owns=*/ true, None))
-            }
-        },
+        // The readback already retained the editor that was focused when this
+        // request started, resolved against the exact window. Write into that
+        // same editor instead of resolving focus a second time: a focus change
+        // in between would let the write land in one field while the readback
+        // watches another, and an unchanged readback could then admit a
+        // keyboard fallback into the first.
+        None => readback.focused.as_ref().map(|el| {
+            let ptr = el.as_CFTypeRef() as AXUIElementRef;
+            unsafe { CFRetain(ptr as CFTypeRef) };
+            (ptr, /*owns=*/ true, None)
+        }),
     };
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
@@ -1404,7 +1426,7 @@ fn type_text_blocking(
         // implicit/web targets. Already-focused selections must stay intact.
         if element_ptr_and_idx.is_some()
             && window_id.is_some()
-            && matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed)
+            && prepare_native_text
             && matches!(
                 role.as_str(),
                 "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
@@ -1846,6 +1868,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             Some(7),
             BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
+            false,
         );
         match r {
             Ok(TypeTextDelivery::Refused(returned)) => assert_eq!(returned, refusal),
@@ -1870,6 +1893,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             Some(42),
             BackgroundKeyboardPolicy::Allowed,
+        true,
         )
         .expect("accepted AX write must retain an uncertain outcome");
         let TypeTextDelivery::Typed(outcome) = result else {
@@ -1892,6 +1916,7 @@ mod tests {
             super::super::DeliveryMode::Background,
             None,
             BackgroundKeyboardPolicy::Allowed,
+        true,
         )
         .expect("preflight refusal must not attempt the invalid pid");
         let TypeTextDelivery::SynthesisRefused {
