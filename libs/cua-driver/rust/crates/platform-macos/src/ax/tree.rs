@@ -344,7 +344,7 @@ pub fn walk_tree_budgeted(
         // Focus and selection are read once the whole tree is known, so the
         // focused element is matched by AX identity and a focus change during
         // the read discards the view.
-        super::text_state::enrich_focused_state(pid, &mut nodes);
+        super::text_state::enrich_focused_state(pid, &mut nodes, &budget);
         for (line, node) in lines.iter_mut().zip(&nodes) {
             if node.focused == Some(true) {
                 line.1 = format_node_line(node);

@@ -1,6 +1,7 @@
 //! Focused text observation: the focused text control's selection for
 //! snapshots and typing readback. Accessibility reports remain best-effort on
 //! web content.
+use cua_driver_core::walk_budget::WalkBudget;
 use super::{bindings::*, tree::AXNode};
 use cua_driver_contract::TextSelection;
 use core_foundation::base::{CFEqual, CFType, CFTypeRef, TCFType};
@@ -108,9 +109,9 @@ fn consistent_selection(
 /// Prefer app-level focus identity and read selection only on its matched node.
 /// Discard that view if focus changes. Missing or unstable app identity can use
 /// the separate best-effort web focus observation below.
-pub(crate) unsafe fn enrich_focused_state(pid: i32, nodes: &mut [AXNode]) {
+pub(crate) unsafe fn enrich_focused_state(pid: i32, nodes: &mut [AXNode], budget: &WalkBudget) {
     let Some(before) = focused(pid) else {
-        enrich_web_reported_focus(nodes);
+        enrich_web_reported_focus(nodes, budget);
         return;
     };
     for node in nodes.iter_mut().filter(|node| node.element_index.is_some()) {
@@ -124,7 +125,7 @@ pub(crate) unsafe fn enrich_focused_state(pid: i32, nodes: &mut [AXNode]) {
         focused(pid).is_some_and(|after| CFEqual(before.as_CFTypeRef(), after.as_CFTypeRef()) != 0);
     retain_stable_focus(nodes, unchanged);
     if !unchanged {
-        enrich_web_reported_focus(nodes);
+        enrich_web_reported_focus(nodes, budget);
     }
 }
 
@@ -156,8 +157,10 @@ fn stable_reported_selection(
 
 /// Background Electron can expose AXFocused on its editor while the app-level
 /// focused-element lookup is unavailable. This is reported web AX state only;
-/// native key confirmation must never use this fallback.
-unsafe fn enrich_web_reported_focus(nodes: &mut [AXNode]) {
+/// native key confirmation must never use this fallback. It reads AXFocused
+/// per web text control, so it stops at the walk's deadline and then leaves
+/// focus unknown: a partial read cannot show that exactly one control claims it.
+unsafe fn enrich_web_reported_focus(nodes: &mut [AXNode], budget: &WalkBudget) {
     let indices: Vec<_> = nodes
         .iter()
         .enumerate()
@@ -166,10 +169,17 @@ unsafe fn enrich_web_reported_focus(nodes: &mut [AXNode]) {
         })
         .map(|(index, _)| index)
         .collect();
-    let reported: Vec<_> = indices
-        .iter()
-        .map(|&index| copy_bool_attr(nodes[index].element_ptr as AXUIElementRef, "AXFocused"))
-        .collect();
+    let mut reported = Vec::with_capacity(indices.len());
+    for &index in &indices {
+        if budget.expired() {
+            for &index in &indices {
+                nodes[index].focused = None;
+                nodes[index].text_selection = None;
+            }
+            return;
+        }
+        reported.push(copy_bool_attr(nodes[index].element_ptr as AXUIElementRef, "AXFocused"));
+    }
     for (&index, value) in indices.iter().zip(&reported) {
         // Multiple claimed focuses remain unknown, not multiple active editors.
         nodes[index].focused = (*value == Some(false)).then_some(false);
@@ -212,6 +222,43 @@ pub(crate) unsafe fn focused_range(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn web_fallback_at_the_deadline_reads_nothing_and_leaves_focus_unknown() {
+        let mut budget = WalkBudget::new(0, 10);
+        let _ = budget.admit(); // starts the clock; a zero budget refuses at once
+        assert!(budget.expired());
+        // A null element would crash any AX read, so reaching the end proves
+        // none was made.
+        let mut nodes = vec![AXNode {
+            element_index: Some(0),
+            role: "AXTextArea".into(),
+            title: None,
+            value: None,
+            description: None,
+            identifier: None,
+            help: None,
+            actions: vec![],
+            element_ptr: 0,
+            depth: 0,
+            parent_element_index: None,
+            frame: None,
+            value_state: None,
+            value_description: None,
+            placeholder: None,
+            value_settable: None,
+            focused: Some(true),
+            text_selection: Some(TextSelection { text: None, range: checked_range(0, 0) }),
+            min_value: None,
+            max_value: None,
+            enabled: None,
+            selected: None,
+            in_web_content: true,
+        }];
+        unsafe { enrich_web_reported_focus(&mut nodes, &budget) };
+        assert_eq!(nodes[0].focused, None);
+        assert_eq!(nodes[0].text_selection, None);
+    }
+
     #[test]
     fn web_fallback_requires_one_stable_reported_text_focus() {
         assert_eq!(

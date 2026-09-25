@@ -43,10 +43,13 @@ fn signature(node: &AXNode) -> String {
     // row, and the structured frame's fractions matter to nobody clicking it.
     let frame = node.frame.map(|[x, y, w, h]| [x.round(), y.round(), w.round(), h.round()]);
     format!(
-        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}",
+        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}",
         format_node_line(node),
         node.value_state,
         node.value_settable,
+        // The line shows only focused=true; false and unknown differ too.
+        node.focused,
+        node.text_selection,
         node.selected,
         node.enabled,
         node.value_description,
@@ -303,6 +306,21 @@ mod tests {
         assert_ne!(signature(&a), signature(&b));
         b.value_settable = None;
         assert_ne!(signature(&a), signature(&b), "unknown is a change too");
+    }
+
+    #[test]
+    fn focus_change_marks_the_row_changed_even_when_its_line_is_identical() {
+        let mut a = node(Some(1), 0, None, "v", 1);
+        let mut b = node(Some(1), 0, None, "v", 1);
+        a.focused = Some(false);
+        b.focused = None;
+        assert_eq!(format_node_line(&a), format_node_line(&b));
+        assert_ne!(signature(&a), signature(&b), "false to unknown");
+        b.focused = Some(false);
+        assert_eq!(signature(&a), signature(&b));
+        a.focused = None;
+        b.focused = Some(false);
+        assert_ne!(signature(&a), signature(&b), "unknown to false");
     }
 
     #[test]
