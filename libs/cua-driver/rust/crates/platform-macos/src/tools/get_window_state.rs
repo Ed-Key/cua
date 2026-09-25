@@ -1081,12 +1081,13 @@ fn build_elements_array(
             // "1"/"0") — controls whose state was previously invisible here.
             // Falls back to `value` so the field never regresses for
             // string-valued elements.
-            // value_state may be "" for an empty text field; keep it.
-            if let Some(value) = node
-                .value_state
-                .clone()
-                .or_else(|| node.value.clone().filter(|v| !v.is_empty()))
-            {
+            // value_state may be "" for an empty text field; keep it. Text
+            // fields never fall back to `value`, which can hold the
+            // placeholder hint rather than content.
+            let fallback = (!crate::ax::tree::is_text_entry_role(&node.role))
+                .then(|| node.value.clone().filter(|v| !v.is_empty()))
+                .flatten();
+            if let Some(value) = node.value_state.clone().or(fallback) {
                 entry["value"] = serde_json::Value::String(value);
             }
             if let Some(desc) = node.value_description.clone() {
@@ -1446,6 +1447,8 @@ mod tests {
             vec![],
         )];
         nodes[0].value = Some("i love u".into());
+        // The tree reader sets a text field's content as value_state.
+        nodes[0].value_state = Some("i love u".into());
         let entry = &build_elements_array_with_token(&nodes, None)[0];
         assert_eq!(entry["label"], "Compose message", "label stays the title");
         assert_eq!(
@@ -1550,11 +1553,13 @@ mod tests {
 
     #[test]
     fn elements_value_state_falls_back_to_string_value() {
-        // String-valued elements keep their `value` even with no value_state.
-        let mut nodes = vec![node(Some(0), "AXComboBox", None, 0, None, None, vec![])];
-        nodes[0].value = Some("Search".into());
+        // Non-text string-valued elements keep their `value` even with no
+        // value_state. (Text fields do not: see
+        // empty_text_field_reports_empty_value_not_placeholder.)
+        let mut nodes = vec![node(Some(0), "AXPopUpButton", None, 0, None, None, vec![])];
+        nodes[0].value = Some("Medium".into());
         let entry = &build_elements_array_with_token(&nodes, None)[0];
-        assert_eq!(entry["value"], "Search");
+        assert_eq!(entry["value"], "Medium");
     }
 
     #[test]
@@ -1667,6 +1672,15 @@ mod tests {
             build_observation_elements_array(std::slice::from_ref(&field)),
         ] {
             assert_eq!(entries[0]["value"], "", "empty is a real text state");
+        }
+        // AXValue unreadable: no value (verification says unknown), never
+        // the placeholder.
+        field.value_state = None;
+        for entries in [
+            build_elements_array_with_token(std::slice::from_ref(&field), Some(1)),
+            build_observation_elements_array(std::slice::from_ref(&field)),
+        ] {
+            assert!(entries[0].get("value").is_none());
         }
     }
 

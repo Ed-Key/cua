@@ -116,6 +116,10 @@ where
     }
 }
 
+pub(crate) fn is_text_entry_role(role: &str) -> bool {
+    matches!(role, "AXTextField" | "AXTextArea" | "AXComboBox")
+}
+
 fn role_supports_value_addressing(role: &str) -> bool {
     matches!(
         role,
@@ -495,9 +499,9 @@ unsafe fn walk_element(
     // A text field's state is its content, and empty is a real state. Keep
     // "" (so value_equals:"" can be answered) and never report the
     // placeholder hint as content. Reuses the AXValue read above.
-    let text_content = matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXComboBox")
-        .then(|| copied_value.as_ref().map(|c| c.state_value.trim().to_owned()))
-        .flatten();
+    // An unreadable AXValue stays None (unknown), not the placeholder.
+    let text_entry = is_text_entry_role(&role);
+    let text_content = copied_value.as_ref().map(|c| c.state_value.trim().to_owned());
     let mut control_state = read_control_state_if_actionable(is_actionable, || ControlState {
         value_state: copied_value
             .map(|copied| copied.state_value)
@@ -513,7 +517,7 @@ unsafe fn walk_element(
         enabled,
         selected: copy_bool_attr(element, "AXSelected"),
     });
-    if text_content.is_some() {
+    if text_entry {
         control_state.value_state = text_content;
     }
     let node = if is_actionable {
