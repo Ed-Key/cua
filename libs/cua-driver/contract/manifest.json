@@ -3089,7 +3089,7 @@
     },
     {
       "name": "move_cursor",
-      "description": "Move the real OS pointer in get_desktop_state coordinates.",
+      "description": "Move a cursor to (x, y). Exact window targets use get_window_state screenshot pixels; explicit desktop targets use get_desktop_state screenshot pixels. On macOS, window moves affect the agent cursor overlay, desktop moves affect the real OS pointer, and legacy untargeted moves use screen points.",
       "platforms": [
         "macos",
         "windows",

@@ -520,14 +520,16 @@ than silently changing coordinate spaces.
 
 ### `move_cursor`
 
-Move a cursor to (x, y). In window scope (default), moves only the agent cursor overlay. With scope=desktop, moves the real OS pointer in native get_desktop_state screenshot coordinates.
+Move a cursor to (x, y). Exact window targets use get_window_state screenshot pixels; explicit desktop targets use get_desktop_state screenshot pixels. On macOS, window moves affect the agent cursor overlay, desktop moves affect the real OS pointer, and legacy untargeted moves use screen points.
 
 **Arguments:**
 
 - `cursor_id` (string, optional): Cursor instance to move. Default: 'default'.
+- `pid` (integer, optional): With window_id: aim at that window; x/y are its get_window_state screenshot pixels.
 - `scope` (string, optional): default: `"window"`
 - `session` (string, optional): For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
 - `target` (window target or desktop target, optional): Preferred per-call target. New callers should set this field.
+- `window_id` (integer, optional): With pid: the exact window whose screenshot x/y refer to.
 - `x` (number, required)
 - `y` (number, required)
 
