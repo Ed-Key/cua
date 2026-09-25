@@ -333,6 +333,65 @@ fn harness_appkit_sequence_counter_stops() {
     run_sequence_counter_case("sequence_counter_stops", true);
 }
 
+/// One act_and_read call: the click lands once and the returned read already
+/// shows its effect, with no second call.
+#[test]
+#[ignore = "signed local daemon and AppKit fixture required"]
+fn harness_appkit_act_and_read_click_shows_effect() {
+    run_background_case("act_and_read_click", DriverRoute::MacosAxAction, |pid, wid, driver| {
+        let before = snapshot_elements(driver, pid, wid);
+        assert!(before.tree_text().contains("counter=0"));
+        let token = element_token_by_id(&before, "btn-increment");
+        let response = driver.call(
+            "act_and_read",
+            serde_json::json!({"pid":pid,"window_id":wid,"action":"click","element_token":token}),
+        );
+        assert!(!response.is_error(), "{}", response.raw);
+        let output = response.structured();
+        println!("act_and_read timings={}", output["timings"]);
+        assert_ne!(output["action"]["isError"], true, "{}", response.raw);
+        let tree = output["observation"]["structuredContent"]["tree_markdown"]
+            .as_str()
+            .expect("observation tree");
+        assert!(tree.contains("counter=1"), "read must show the click: {tree}");
+        // Independent read: exactly one click landed.
+        assert!(snapshot_elements(driver, pid, wid).tree_text().contains("counter=1"));
+    });
+}
+
+/// A click that opens a window: the same response reports it as a surface
+/// note, so the agent can rebind without another read.
+#[test]
+#[ignore = "signed local daemon and AppKit fixture required"]
+fn harness_appkit_act_and_read_reports_new_window() {
+    run_background_case_with_env(
+        "act_and_read_new_window",
+        Targeting::Ax,
+        DriverRoute::MacosAxAction,
+        &[("CUA_APPKIT_OPENER", "1")],
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            let token = element_token_by_id(&before, "btn-open-window");
+            let response = driver.call(
+                "act_and_read",
+                serde_json::json!({"pid":pid,"window_id":wid,"action":"click","element_token":token}),
+            );
+            assert!(!response.is_error(), "{}", response.raw);
+            let output = response.structured();
+            let change = &output["observation"]["structuredContent"]["window_change"];
+            println!("act_and_read window_change={change}");
+            let titles: Vec<_> = change["new_windows"]
+                .as_array()
+                .unwrap_or_else(|| panic!("no window_change in the read: {}", response.raw))
+                .iter()
+                .filter_map(|w| w["title"].as_str())
+                .collect();
+            assert!(titles.contains(&"CuaTestHarness Opened"), "{titles:?}");
+            assert_eq!(change["rebind"]["title"], "CuaTestHarness Opened");
+        },
+    );
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_exact_activation_with_agent_cursor() {

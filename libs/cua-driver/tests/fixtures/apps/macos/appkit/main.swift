@@ -37,6 +37,9 @@ let kTextInputCommitAID = "lbl-input-commit"
 let kClickTargetAID = "btn-clicktarget"
 /// Present only when CUA_APPKIT_THIEF_DELAY_MS is set (focus-theft tests).
 let kStealButtonAID = "btn-steal"
+/// Present only when CUA_APPKIT_OPENER is set (act_and_read surface notes).
+let kOpenWindowButtonAID = "btn-open-window"
+let kOpenedWindowTitle = "CuaTestHarness Opened"
 let kLastActionAID = "lbl-last-action"
 let kClickCountAID = "lbl-click-count"
 let kSliderAID = "sld-value"
@@ -153,6 +156,8 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     private let thiefDelayMs = ProcessInfo.processInfo.environment["CUA_APPKIT_THIEF_DELAY_MS"]
         .flatMap { Int($0) }
     let window: NSWindow
+    /// Opened by btn-open-window; kept so it is not released while shown.
+    private var openedWindow: NSWindow?
     let counterLabel = NSTextField(labelWithString: "counter=0")
     var counterValue = 0
     let textInput = LaggingTextField(string: "")
@@ -242,6 +247,11 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             let steal = NSButton(title: "Steal focus", target: self, action: #selector(onSteal))
             steal.setAccessibilityIdentifier(kStealButtonAID)
             counterRow.addArrangedSubview(steal)
+        }
+        if ProcessInfo.processInfo.environment["CUA_APPKIT_OPENER"] != nil {
+            let open = NSButton(title: "Open window", target: self, action: #selector(onOpenWindow))
+            open.setAccessibilityIdentifier(kOpenWindowButtonAID)
+            counterRow.addArrangedSubview(open)
         }
         content.addArrangedSubview(counterRow)
 
@@ -496,6 +506,20 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         guard let raw = ProcessInfo.processInfo.environment[name],
               let ms = Double(raw), ms > 0 else { return 0 }
         return ms / 1000
+    }
+
+    /// Opens a second window without activating the app, like an app that
+    /// shows a panel in response to a click. Ordered behind so it cannot
+    /// cover the user's front window during background tests.
+    @objc private func onOpenWindow() {
+        let opened = NSWindow(
+            contentRect: NSRect(x: 80, y: 80, width: 320, height: 140),
+            styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        opened.title = kOpenedWindowTitle
+        opened.isReleasedWhenClosed = false
+        opened.contentView = NSTextField(labelWithString: "opened by btn-open-window")
+        opened.orderBack(nil)
+        openedWindow = opened
     }
 
     @objc private func onSteal() {
