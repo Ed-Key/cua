@@ -5051,11 +5051,132 @@ macro_rules! standalone_browser_test {
     };
 }
 
+/// A web page's file input opens the native Open panel, which WindowServer
+/// attributes to the browser while the Open and Save Panel Service hosts it.
+/// The driver must report it as a new window, read it without an output-schema
+/// error (directly, or after a structured refusal that names the real owner),
+/// and close it with Escape. Reported from a real Chrome Web Store upload.
+#[cfg(target_os = "macos")]
+fn run_native_file_picker(spec: &BrowserSpec) {
+    let scenario = format!("macos-{}-native-file-picker", spec.name);
+    let case = CaseSpec::delivered(
+        scenario.clone(),
+        spec.name.clone(),
+        "standalone-chromium-native-content",
+        "file_picker_open_read_close",
+        Targeting::Ax,
+        Delivery::Foreground,
+        Scope::Window,
+        DriverRoute::MacosAxAction,
+        vec![OracleKind::FixtureState],
+    );
+    execute_case(case, |evidence| {
+        let mut fixture =
+            launch_browser_with_html(spec, &scenario, standalone_browser_completeness_html());
+        *evidence = recording_evidence(fixture.driver.recording_dir());
+        let (pid, wid) = (fixture.pid, fixture.window_id);
+        let front = fixture
+            .driver
+            .call("bring_to_front", serde_json::json!({"pid":pid,"window_id":wid}));
+        assert!(!front.is_error(), "{}", front.raw);
+        let read = |driver: &mut McpDriver, pid: u32, wid: u64| {
+            driver.call(
+                "get_window_state",
+                serde_json::json!({"pid":pid,"window_id":wid,"include_screenshot":false,"diff":false}),
+            )
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let token = loop {
+            let state = read(&mut fixture.driver, pid, wid);
+            assert!(!state.is_error(), "{}", state.raw);
+            let found = state.structured()["elements"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["label"].as_str().is_some_and(|l| l.contains("standalone-upload")))
+                .and_then(|e| e["element_token"].as_str().map(str::to_owned));
+            if let Some(token) = found {
+                break token;
+            }
+            assert!(Instant::now() < deadline, "file input absent: {}", state.structured()["tree_markdown"]);
+            thread::sleep(Duration::from_millis(200));
+        };
+        let clicked = fixture.driver.call(
+            "click",
+            serde_json::json!({"pid":pid,"window_id":wid,"element_token":token,"delivery_mode":"background"}),
+        );
+        assert!(!clicked.is_error(), "{}", clicked.raw);
+
+        // 1. The panel is reported as a new window (with a rebind when unique).
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let panel = loop {
+            thread::sleep(Duration::from_millis(300));
+            let state = read(&mut fixture.driver, pid, wid);
+            let change = &state.structured()["window_change"];
+            if let Some(window) = change["rebind"]
+                .as_object()
+                .map(|_| change["rebind"].clone())
+                .or_else(|| change["new_windows"].as_array().and_then(|w| w.first().cloned()))
+            {
+                eprintln!("[file-picker] window_change={change}");
+                break window;
+            }
+            assert!(Instant::now() < deadline, "no window_change for the Open panel: {}", state.raw);
+        };
+        let panel_pid = panel["pid"].as_u64().unwrap() as u32;
+        let panel_wid = panel["window_id"].as_u64().unwrap();
+
+        // 2. Reading it never fails the output schema: either the tree, or a
+        // structured refusal that names the real owner, which then reads.
+        let mut state = read(&mut fixture.driver, panel_pid, panel_wid);
+        assert!(
+            !state.raw.to_string().contains("output schema"),
+            "schema mismatch reading the panel: {}",
+            state.raw
+        );
+        let mut owner_pid = panel_pid;
+        if state.is_error() {
+            let owner = state.structured()["owner_pid"].as_u64();
+            assert!(owner.is_some(), "refusal must name the real owner: {}", state.raw);
+            owner_pid = owner.unwrap() as u32;
+            state = read(&mut fixture.driver, owner_pid, panel_wid);
+        }
+        assert!(!state.is_error(), "{}", state.raw);
+        let tree = state.structured()["tree_markdown"].as_str().unwrap_or_default().to_owned();
+        eprintln!("[file-picker] owner_pid={owner_pid} tree_len={}", tree.len());
+        assert!(tree.contains("Cancel"), "panel tree lacks its Cancel button: {tree}");
+
+        // 3. Escape closes it.
+        let escaped = fixture.driver.call(
+            "press_key",
+            serde_json::json!({"pid":owner_pid,"window_id":panel_wid,"key":"escape","delivery_mode":"foreground"}),
+        );
+        assert!(!escaped.is_error(), "{}", escaped.raw);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let windows = fixture.driver.call("list_windows", serde_json::json!({}));
+            let open = windows.structured()["windows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|w| w["window_id"].as_u64() == Some(panel_wid) && w["is_on_screen"] == true);
+            if !open {
+                break;
+            }
+            assert!(Instant::now() < deadline, "Open panel still on screen after Escape");
+            thread::sleep(Duration::from_millis(200));
+        }
+        Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
+    });
+}
+
 #[cfg(target_os = "macos")]
 standalone_browser_test!(
     standalone_browser_native_named_groups,
     run_native_named_groups
 );
+#[cfg(target_os = "macos")]
+standalone_browser_test!(standalone_browser_native_file_picker, run_native_file_picker);
 standalone_browser_test!(standalone_browser_roundtrip, run_roundtrip);
 standalone_browser_test!(
     standalone_browser_trust_gated_dom_click,
