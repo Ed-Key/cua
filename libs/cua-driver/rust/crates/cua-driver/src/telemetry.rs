@@ -1557,18 +1557,37 @@ pub(crate) fn capture_bounded(
     properties: Map<String, Value>,
     transport: Transport,
 ) {
-    // A test build never creates an identity or posts to the live endpoint.
-    // Unrelated tests (an MCP session start, for one) reach this path, and a
-    // telemetry test may have pointed the home at a temp dir with telemetry
-    // on by default. Telemetry tests build payloads or inject a poster.
-    if cfg!(test) || !is_enabled() {
+    // A test build never posts to the live endpoint. Only a telemetry test
+    // that opted in on its own thread (with an isolated home) runs this
+    // path, and its payload lands in an in-memory sink. Unrelated tests (an
+    // MCP session start, for one) return here, before identity or network.
+    #[cfg(test)]
+    if TEST_CAPTURES.with(|captures| captures.borrow().is_none()) {
+        return;
+    }
+    if !is_enabled() {
         return;
     }
     let Some(identity) = get_or_create_install_id() else {
         return;
     };
     let payload = build_payload(event_name, &properties, &identity, transport);
+    #[cfg(test)]
+    TEST_CAPTURES.with(|captures| {
+        if let Some(captures) = captures.borrow_mut().as_mut() {
+            captures.push(payload);
+        }
+    });
+    #[cfg(not(test))]
     spawn_payload(event_name, payload);
+}
+
+/// Payloads captured by an opted-in telemetry test on this thread; `None`
+/// means capture is off for the thread, the default for every test.
+#[cfg(test)]
+thread_local! {
+    static TEST_CAPTURES: std::cell::RefCell<Option<Vec<Value>>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Record an explicit or freshness-bounded update check. A detached worker
@@ -2120,6 +2139,7 @@ fn build_payload(
     })
 }
 
+#[cfg_attr(test, allow(dead_code))]
 fn spawn_payload(event_name: &'static str, payload: Value) {
     PENDING_SENDS.fetch_add(1, Ordering::SeqCst);
     let task = move || {
@@ -2651,25 +2671,81 @@ mod tests {
     const TEST_CHILD_INDEX: &str = "CUA_DRIVER_TELEMETRY_TEST_CHILD_INDEX";
     const TEST_CHILD_CANDIDATE: &str = "CUA_DRIVER_TELEMETRY_TEST_CHILD_CANDIDATE";
 
+    /// Sets or removes one env var and restores its old value on drop, so
+    /// a panicking test cannot leave the process env changed.
+    struct EnvVar {
+        name: &'static str,
+        old: Option<std::ffi::OsString>,
+    }
+
+    fn set_env(name: &'static str, value: Option<&std::ffi::OsStr>) -> EnvVar {
+        let old = std::env::var_os(name);
+        unsafe {
+            match value {
+                Some(value) => std::env::set_var(name, value),
+                None => std::env::remove_var(name),
+            }
+        }
+        EnvVar { name, old }
+    }
+
+    impl Drop for EnvVar {
+        fn drop(&mut self) {
+            unsafe {
+                match self.old.take() {
+                    Some(value) => std::env::set_var(self.name, value),
+                    None => std::env::remove_var(self.name),
+                }
+            }
+        }
+    }
+
+    /// Turns on this thread's telemetry capture sink until dropped.
+    struct CaptureOn;
+
+    impl CaptureOn {
+        fn new() -> Self {
+            TEST_CAPTURES.with(|captures| *captures.borrow_mut() = Some(Vec::new()));
+            CaptureOn
+        }
+    }
+
+    impl Drop for CaptureOn {
+        fn drop(&mut self) {
+            TEST_CAPTURES.with(|captures| *captures.borrow_mut() = None);
+        }
+    }
+
+    fn take_captures() -> Vec<Value> {
+        TEST_CAPTURES.with(|captures| {
+            captures
+                .borrow_mut()
+                .as_mut()
+                .map(std::mem::take)
+                .unwrap_or_default()
+        })
+    }
+
+    struct RemoveDir(PathBuf);
+
+    impl Drop for RemoveDir {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    /// Runs `test` with a fresh telemetry home, telemetry env unset and this
+    /// thread's capture sink on. Everything is undone on drop, even on panic.
     fn with_isolated_home<R>(test: impl FnOnce(&Path) -> R) -> R {
         let root = std::env::temp_dir().join(format!("cua-telemetry-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&root).unwrap();
+        let _dir = RemoveDir(root.clone());
         let telemetry_home = root.join(HOME_SUBDIRECTORY);
-        let old_telemetry_home = std::env::var_os(ENV_TELEMETRY_HOME);
-        unsafe {
-            std::env::set_var(ENV_TELEMETRY_HOME, &telemetry_home);
-            std::env::remove_var(ENV_TELEMETRY_ENABLED);
-            std::env::remove_var(ENV_TELEMETRY_ENABLED_COMPAT);
-        }
-        let result = test(&root);
-        let _ = std::fs::remove_dir_all(&root);
-        unsafe {
-            match old_telemetry_home {
-                Some(value) => std::env::set_var(ENV_TELEMETRY_HOME, value),
-                None => std::env::remove_var(ENV_TELEMETRY_HOME),
-            }
-        }
-        result
+        let _home = set_env(ENV_TELEMETRY_HOME, Some(telemetry_home.as_os_str()));
+        let _enabled = set_env(ENV_TELEMETRY_ENABLED, None);
+        let _compat = set_env(ENV_TELEMETRY_ENABLED_COMPAT, None);
+        let _capture = CaptureOn::new();
+        test(&root)
     }
 
     fn wait_for_path(path: &Path, timeout: Duration) -> bool {
@@ -2897,13 +2973,8 @@ mod tests {
             assert_eq!(effective_enabled(), (true, "default"));
             set_enabled(false).unwrap();
             assert_eq!(effective_enabled(), (false, "persisted"));
-            unsafe {
-                std::env::set_var(ENV_TELEMETRY_ENABLED, "true");
-            }
+            let _env = set_env(ENV_TELEMETRY_ENABLED, Some("true".as_ref()));
             assert_eq!(effective_enabled(), (true, "environment"));
-            unsafe {
-                std::env::remove_var(ENV_TELEMETRY_ENABLED);
-            }
         });
     }
 
@@ -2920,12 +2991,9 @@ mod tests {
             .unwrap();
             assert_eq!(install_channel(), "install_script");
 
-            unsafe {
-                std::env::set_var(ENV_INSTALL_CHANNEL, "update_apply");
-            }
-            assert_eq!(install_channel(), "update_apply");
-            unsafe {
-                std::env::remove_var(ENV_INSTALL_CHANNEL);
+            {
+                let _channel = set_env(ENV_INSTALL_CHANNEL, Some("update_apply".as_ref()));
+                assert_eq!(install_channel(), "update_apply");
             }
 
             std::fs::write(home.join(TELEMETRY_INSTALL_CHANNEL_FILE_NAME), "invalid").unwrap();
@@ -2942,9 +3010,7 @@ mod tests {
             let id = uuid::Uuid::new_v4().to_string();
             std::fs::write(home.join(TELEMETRY_ID_FILE_NAME), &id).unwrap();
             set_enabled(false).unwrap();
-            unsafe {
-                std::env::set_var(ENV_TELEMETRY_ENABLED, "false");
-            }
+            let _env = set_env(ENV_TELEMETRY_ENABLED, Some("false".as_ref()));
             let mut calls = 0;
             capture_install_with_poster(|_| {
                 calls += 1;
@@ -2954,9 +3020,6 @@ mod tests {
             assert_eq!(read_install_id().as_deref(), Some(id.as_str()));
             assert!(!home.join(INSTALLATION_RECORDED_FILE_NAME).exists());
             assert!(!home.join(TELEMETRY_RETRY_AFTER_FILE_NAME).exists());
-            unsafe {
-                std::env::remove_var(ENV_TELEMETRY_ENABLED);
-            }
         });
     }
 
@@ -2976,6 +3039,21 @@ mod tests {
                 Duration::from_secs(3),
             );
             assert!(read_install_id().is_none());
+            assert!(take_captures().is_empty());
+        });
+    }
+
+    /// The counterpart: the same path with telemetry on creates an identity
+    /// and emits exactly one payload (into the test sink, never the network).
+    #[test]
+    fn enabled_permissions_event_creates_an_identity_and_one_payload() {
+        let _guard = env_lock();
+        with_isolated_home(|_| {
+            capture_permissions_gate_started(true, false);
+            let captured = take_captures();
+            assert_eq!(captured.len(), 1, "{captured:?}");
+            assert_eq!(captured[0]["event"], event::PERMISSIONS_GATE_STARTED);
+            assert!(read_install_id().is_some());
         });
     }
 
@@ -3152,109 +3230,107 @@ mod tests {
     #[test]
     fn synthetic_marker_is_explicit_and_common_to_all_events() {
         let _guard = env_lock();
-        let original = std::env::var_os(ENV_TELEMETRY_SYNTHETIC);
-        unsafe {
-            std::env::set_var(ENV_TELEMETRY_SYNTHETIC, "true");
-        }
-        let payload = inspect_event(event::MCP_TOOL_COMPLETED).unwrap();
-        assert_eq!(payload["properties"]["is_synthetic"], true);
-        unsafe {
-            match original {
-                Some(value) => std::env::set_var(ENV_TELEMETRY_SYNTHETIC, value),
-                None => std::env::remove_var(ENV_TELEMETRY_SYNTHETIC),
-            }
-        }
+        with_isolated_home(|_| {
+            let _env = set_env(ENV_TELEMETRY_SYNTHETIC, Some("true".as_ref()));
+            let payload = inspect_event(event::MCP_TOOL_COMPLETED).unwrap();
+            assert_eq!(payload["properties"]["is_synthetic"], true);
+        });
     }
 
     #[test]
     fn inspect_events_match_the_emitted_bounded_schema() {
-        let session = inspect_event(event::MCP_SESSION_STARTED).unwrap();
-        let session_properties = session["properties"].as_object().unwrap();
-        for field in [
-            "mcp_client",
-            "mcp_client_version_major",
-            "protocol_version",
-            "capability_tools",
-            "capability_roots",
-            "capability_sampling",
-            "capability_experimental",
-            "capability_elicitation_form",
-            "capability_elicitation_url",
-            "reported_provider",
-            "reported_model",
-            "reported_agent",
-            "reported_agent_version_major",
-            "execution_mode",
-        ] {
-            assert!(session_properties.contains_key(field), "missing {field}");
-        }
-
-        let tool = inspect_event(event::MCP_TOOL_COMPLETED).unwrap();
-        assert_eq!(tool["properties"]["duration_bucket"], "lt_10ms");
-        assert_eq!(tool["properties"]["operation"], "not_applicable");
-        assert_eq!(tool["properties"]["refusal_code"], "none");
-        assert_eq!(tool["properties"]["computer_action"], false);
-        assert!(matches!(
-            tool["properties"]["execution_mode"].as_str(),
-            Some("embedded" | "standalone")
-        ));
-        let mcp_start = inspect_event(event::MCP_STARTUP_COMPLETED).unwrap();
-        assert_eq!(mcp_start["properties"]["transport"], "mcp_stdio");
-        assert_eq!(mcp_start["properties"]["path"], "daemon_proxy");
-        assert_eq!(
-            mcp_start["properties"]["execution_mode"],
-            tool["properties"]["execution_mode"]
-        );
-        let permissions_started = inspect_event(event::PERMISSIONS_GATE_STARTED).unwrap();
-        assert_eq!(permissions_started["properties"]["transport"], "daemon");
-        assert_eq!(
-            permissions_started["properties"]["missing_accessibility"],
-            true
-        );
-        assert_eq!(
-            permissions_started["properties"]["missing_screen_recording"],
-            true
-        );
-        assert!(permissions_started["properties"]
-            .get("duration_bucket")
-            .is_none());
-        let permissions_dismissed = inspect_event(event::PERMISSIONS_GATE_DISMISSED).unwrap();
-        assert_eq!(permissions_dismissed["properties"]["transport"], "daemon");
-        assert_eq!(
-            permissions_dismissed["properties"]["duration_bucket"],
-            "2s_9_999ms"
-        );
-        let permissions = inspect_event(event::PERMISSIONS_GATE_COMPLETED).unwrap();
-        assert_eq!(permissions["properties"]["resolution"], "granted");
-        for payload in [permissions_started, permissions_dismissed, permissions] {
-            assert_eq!(payload["properties"]["telemetry_schema_version"], 3);
-            assert!(payload.get("timestamp").is_none());
-            let serialized = serde_json::to_string(&payload)
-                .unwrap()
-                .to_ascii_lowercase();
-            for forbidden in [
-                "prompt",
-                "arguments",
-                "result_text",
-                "typed_text",
-                "screenshot",
-                "accessibility_tree",
-                "window_title",
-                "application_name",
-                "file_path",
-                "socket",
-                "raw_error",
-                "stack_trace",
-                "$ip",
+        // execution_mode and identity come from process env and the telemetry
+        // home, which other tests change.
+        let _guard = env_lock();
+        with_isolated_home(|_| {
+            let session = inspect_event(event::MCP_SESSION_STARTED).unwrap();
+            let session_properties = session["properties"].as_object().unwrap();
+            for field in [
+                "mcp_client",
+                "mcp_client_version_major",
+                "protocol_version",
+                "capability_tools",
+                "capability_roots",
+                "capability_sampling",
+                "capability_experimental",
+                "capability_elicitation_form",
+                "capability_elicitation_url",
+                "reported_provider",
+                "reported_model",
+                "reported_agent",
+                "reported_agent_version_major",
+                "execution_mode",
             ] {
-                assert!(
-                    !serialized.contains(forbidden),
-                    "permissions payload contains {forbidden}: {serialized}"
-                );
+                assert!(session_properties.contains_key(field), "missing {field}");
             }
-        }
-        let serve_start = inspect_event(event::SERVE_START_LEGACY).unwrap();
-        assert_eq!(serve_start["properties"]["transport"], "daemon");
+
+            let tool = inspect_event(event::MCP_TOOL_COMPLETED).unwrap();
+            assert_eq!(tool["properties"]["duration_bucket"], "lt_10ms");
+            assert_eq!(tool["properties"]["operation"], "not_applicable");
+            assert_eq!(tool["properties"]["refusal_code"], "none");
+            assert_eq!(tool["properties"]["computer_action"], false);
+            assert!(matches!(
+                tool["properties"]["execution_mode"].as_str(),
+                Some("embedded" | "standalone")
+            ));
+            let mcp_start = inspect_event(event::MCP_STARTUP_COMPLETED).unwrap();
+            assert_eq!(mcp_start["properties"]["transport"], "mcp_stdio");
+            assert_eq!(mcp_start["properties"]["path"], "daemon_proxy");
+            assert_eq!(
+                mcp_start["properties"]["execution_mode"],
+                tool["properties"]["execution_mode"]
+            );
+            let permissions_started = inspect_event(event::PERMISSIONS_GATE_STARTED).unwrap();
+            assert_eq!(permissions_started["properties"]["transport"], "daemon");
+            assert_eq!(
+                permissions_started["properties"]["missing_accessibility"],
+                true
+            );
+            assert_eq!(
+                permissions_started["properties"]["missing_screen_recording"],
+                true
+            );
+            assert!(permissions_started["properties"]
+                .get("duration_bucket")
+                .is_none());
+            let permissions_dismissed = inspect_event(event::PERMISSIONS_GATE_DISMISSED).unwrap();
+            assert_eq!(permissions_dismissed["properties"]["transport"], "daemon");
+            assert_eq!(
+                permissions_dismissed["properties"]["duration_bucket"],
+                "2s_9_999ms"
+            );
+            let permissions = inspect_event(event::PERMISSIONS_GATE_COMPLETED).unwrap();
+            assert_eq!(permissions["properties"]["resolution"], "granted");
+            for payload in [permissions_started, permissions_dismissed, permissions] {
+                assert_eq!(payload["properties"]["telemetry_schema_version"], 3);
+                assert!(payload.get("timestamp").is_none());
+                let serialized = serde_json::to_string(&payload)
+                    .unwrap()
+                    .to_ascii_lowercase();
+                for forbidden in [
+                    "prompt",
+                    "arguments",
+                    "result_text",
+                    "typed_text",
+                    "screenshot",
+                    "accessibility_tree",
+                    "window_title",
+                    "application_name",
+                    "file_path",
+                    "socket",
+                    "raw_error",
+                    "stack_trace",
+                    "$ip",
+                ] {
+                    assert!(
+                        !serialized.contains(forbidden),
+                        "permissions payload contains {forbidden}: {serialized}"
+                    );
+                }
+            }
+            let serve_start = inspect_event(event::SERVE_START_LEGACY).unwrap();
+            assert_eq!(serve_start["properties"]["transport"], "daemon");
+        });
     }
 
     #[test]
@@ -3316,10 +3392,7 @@ mod tests {
     fn execution_mode_requires_the_exact_embedded_sentinel() {
         let _guard = env_lock();
         let name = cua_driver_core::EMBEDDED_ENV;
-        let original = std::env::var_os(name);
-        unsafe {
-            std::env::remove_var(name);
-        }
+        let _restore = set_env(name, None);
         assert_eq!(execution_mode(), "standalone");
         unsafe {
             std::env::set_var(name, "1");
@@ -3329,12 +3402,6 @@ mod tests {
             std::env::set_var(name, "true");
         }
         assert_eq!(execution_mode(), "standalone");
-        unsafe {
-            match original {
-                Some(value) => std::env::set_var(name, value),
-                None => std::env::remove_var(name),
-            }
-        }
     }
 
     #[test]
@@ -3856,21 +3923,12 @@ mod tests {
     #[test]
     fn release_version_is_bounded_and_safe_for_payloads_and_marker_paths() {
         let _guard = env_lock();
-        let previous = std::env::var_os(ENV_RELEASE_VERSION);
-        unsafe {
-            std::env::set_var(
-                ENV_RELEASE_VERSION,
-                "v1.2.3/../../private path?token=secret-and-more",
-            );
-        }
+        let _env = set_env(
+            ENV_RELEASE_VERSION,
+            Some("v1.2.3/../../private path?token=secret-and-more".as_ref()),
+        );
         assert_eq!(release_version(), current_product_version());
         assert!(!release_version().contains("secret"));
-        unsafe {
-            match previous {
-                Some(value) => std::env::set_var(ENV_RELEASE_VERSION, value),
-                None => std::env::remove_var(ENV_RELEASE_VERSION),
-            }
-        }
     }
 
     #[test]
