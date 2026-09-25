@@ -5385,6 +5385,14 @@ fn standalone_browser_first_native_snapshot_contains_page() {
                 1,
                 "the first native snapshot must include the ready page link"
             );
+            // The link's real destination (AXURL), resolved against the page,
+            // separate from its label.
+            let url = links[0]["url"].as_str().unwrap_or_default();
+            assert!(
+                url.starts_with("http") && url.ends_with("/fixture?tab=second"),
+                "link destination: {}",
+                links[0]
+            );
             let clicked = fixture.driver.call(
                 "click",
                 serde_json::json!({
