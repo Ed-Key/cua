@@ -3335,41 +3335,44 @@ mod tests {
 
     #[test]
     fn update_events_expose_only_bounded_funnel_properties() {
-        let checked = inspect_event(event::UPDATE_CHECKED).unwrap();
-        assert_eq!(checked["properties"]["source"], "cli");
-        assert_eq!(checked["properties"]["outcome"], "available");
-        assert_eq!(checked["properties"]["target_version"], "1.2.3");
-        assert_eq!(checked["properties"]["cache_hit"], false);
+        let _guard = env_lock();
+        with_isolated_home(|_| {
+            let checked = inspect_event(event::UPDATE_CHECKED).unwrap();
+            assert_eq!(checked["properties"]["source"], "cli");
+            assert_eq!(checked["properties"]["outcome"], "available");
+            assert_eq!(checked["properties"]["target_version"], "1.2.3");
+            assert_eq!(checked["properties"]["cache_hit"], false);
 
-        let started = inspect_event(event::UPDATE_APPLY_STARTED).unwrap();
-        assert_eq!(started["properties"]["target_version"], "1.2.3");
-        assert_eq!(started["properties"]["daemon_was_running"], false);
+            let started = inspect_event(event::UPDATE_APPLY_STARTED).unwrap();
+            assert_eq!(started["properties"]["target_version"], "1.2.3");
+            assert_eq!(started["properties"]["daemon_was_running"], false);
 
-        let completed = inspect_event(event::UPDATE_APPLY_COMPLETED).unwrap();
-        assert_eq!(completed["properties"]["outcome"], "installed");
-        assert_eq!(completed["properties"]["failure_class"], "none");
-        assert_eq!(completed["properties"]["duration_bucket"], "2s_9_999ms");
+            let completed = inspect_event(event::UPDATE_APPLY_COMPLETED).unwrap();
+            assert_eq!(completed["properties"]["outcome"], "installed");
+            assert_eq!(completed["properties"]["failure_class"], "none");
+            assert_eq!(completed["properties"]["duration_bucket"], "2s_9_999ms");
 
-        for payload in [checked, started, completed] {
-            let serialized = serde_json::to_string(&payload)
-                .unwrap()
-                .to_ascii_lowercase();
-            for forbidden in [
-                "raw_error",
-                "exit_code",
-                "install_command",
-                "release_notes_url",
-                "file_path",
-                "arguments",
-                "prompt",
-                "$ip",
-            ] {
-                assert!(
-                    !serialized.contains(forbidden),
-                    "update payload contains {forbidden}: {serialized}"
-                );
+            for payload in [checked, started, completed] {
+                let serialized = serde_json::to_string(&payload)
+                    .unwrap()
+                    .to_ascii_lowercase();
+                for forbidden in [
+                    "raw_error",
+                    "exit_code",
+                    "install_command",
+                    "release_notes_url",
+                    "file_path",
+                    "arguments",
+                    "prompt",
+                    "$ip",
+                ] {
+                    assert!(
+                        !serialized.contains(forbidden),
+                        "update payload contains {forbidden}: {serialized}"
+                    );
+                }
             }
-        }
+        });
     }
 
     #[test]
@@ -3729,30 +3732,33 @@ mod tests {
 
     #[test]
     fn agent_session_inspect_samples_expose_only_the_contract() {
-        for event_name in [event::AGENT_SESSION_STARTED, event::AGENT_SESSION_ENDED] {
-            let payload = inspect_event(event_name).unwrap();
-            assert_eq!(payload["properties"]["telemetry_schema_version"], 3);
-            let properties = payload["properties"].as_object().unwrap();
-            for forbidden_key in ["session", "session_id", "agent_session_id", "cursor_id"] {
-                assert!(!properties.contains_key(forbidden_key));
+        let _guard = env_lock();
+        with_isolated_home(|_| {
+            for event_name in [event::AGENT_SESSION_STARTED, event::AGENT_SESSION_ENDED] {
+                let payload = inspect_event(event_name).unwrap();
+                assert_eq!(payload["properties"]["telemetry_schema_version"], 3);
+                let properties = payload["properties"].as_object().unwrap();
+                for forbidden_key in ["session", "session_id", "agent_session_id", "cursor_id"] {
+                    assert!(!properties.contains_key(forbidden_key));
+                }
+                let serialized = serde_json::to_string(&payload)
+                    .unwrap()
+                    .to_ascii_lowercase();
+                for forbidden in [
+                    "arguments",
+                    "result_text",
+                    "file_path",
+                    "socket",
+                    "raw_error",
+                    "$ip",
+                ] {
+                    assert!(
+                        !serialized.contains(forbidden),
+                        "inspect payload contains {forbidden}: {serialized}"
+                    );
+                }
             }
-            let serialized = serde_json::to_string(&payload)
-                .unwrap()
-                .to_ascii_lowercase();
-            for forbidden in [
-                "arguments",
-                "result_text",
-                "file_path",
-                "socket",
-                "raw_error",
-                "$ip",
-            ] {
-                assert!(
-                    !serialized.contains(forbidden),
-                    "inspect payload contains {forbidden}: {serialized}"
-                );
-            }
-        }
+        });
     }
 
     #[test]
