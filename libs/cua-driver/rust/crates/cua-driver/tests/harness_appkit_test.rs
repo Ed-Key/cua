@@ -1004,6 +1004,57 @@ fn harness_appkit_click_on_a_text_role_focuses_it() {
     );
 }
 
+/// A key with no effect (shift alone) must stay unverifiable even when the
+/// foreground route's own activation and focus write move the field's
+/// selection: the oracle may bracket only the key.
+#[test]
+#[ignore]
+fn harness_appkit_foreground_no_op_key_stays_unverifiable() {
+    run_case(
+        native_foreground_case(
+            "appkit",
+            "press_key_no_op",
+            Targeting::Ax,
+            DriverRoute::MacosCgEventHid,
+        ),
+        |pid, wid, driver| {
+            let first = snapshot_elements(driver, pid, wid);
+            let field = element_token_by_id(&first, "txt-input");
+            let set = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid,
+                    "element_token": field, "value": "no-op-cua"
+                }),
+            );
+            assert!(!set.is_error(), "set_value failed: {}", set.text());
+            let before = snapshot_elements(driver, pid, wid);
+            let field = element_token_by_id(&before, "txt-input");
+            let pressed = driver.call(
+                "press_key",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid, "element_token": field,
+                    "key": "shift", "delivery_mode": "foreground"
+                }),
+            );
+            assert!(!pressed.is_error(), "press_key failed: {}", pressed.text());
+            let after = snapshot_elements(driver, pid, wid);
+            println!(
+                "no-op key selection before={:?} after={:?}",
+                before.tree_text().lines().find(|l| l.contains("selection_utf16")),
+                after.tree_text().lines().find(|l| l.contains("selection_utf16"))
+            );
+            assert_eq!(
+                pressed.action_effect(),
+                Some("unverifiable"),
+                "a key with no effect was confirmed: {}",
+                pressed.raw
+            );
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_element_foreground_press_key_commits_edit() {

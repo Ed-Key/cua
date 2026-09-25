@@ -93,6 +93,10 @@ fn read_ax_key_state(pid: i32, window_id: Option<u32>, element_ptr: usize) -> Op
         .then_some(state)
 }
 
+/// Time for a focus write's own selection change to publish before a key
+/// oracle takes its baseline.
+const FOCUS_SETTLE: std::time::Duration = std::time::Duration::from_millis(30);
+
 fn dispatch_with_ax_oracle(
     pid: i32,
     window_id: Option<u32>,
@@ -429,23 +433,32 @@ impl Tool for PressKeyTool {
                                 "delivery_mode=foreground requires window_id for press_key"
                             )
                         })?;
-                        return dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                            crate::input::skylight::with_foreground_hid_activation(
-                                pid as libc::pid_t,
-                                wid,
-                                || {
-                                    // Activation can change the first responder, so
-                                    // repeat the best-effort AX focus write inside
-                                    // the guarded foreground interval immediately
-                                    // before the physical key transition.
-                                    if let Some(element_ptr) = pre_focus_ptr {
-                                        let _ =
-                                            crate::input::ax_actions::focus_element(element_ptr);
-                                    }
+                        let mut confirmed = false;
+                        crate::input::skylight::with_foreground_hid_activation(
+                            pid as libc::pid_t,
+                            wid,
+                            || {
+                                // Activation can change the first responder, so
+                                // repeat the best-effort AX focus write inside
+                                // the guarded foreground interval immediately
+                                // before the physical key transition.
+                                if let Some(element_ptr) = pre_focus_ptr {
+                                    let _ = crate::input::ax_actions::focus_element(element_ptr);
+                                    // Focusing a text field selects its text on the
+                                    // next run-loop turn; let that land first.
+                                    std::thread::sleep(FOCUS_SETTLE);
+                                }
+                                // The oracle brackets only the key: its baseline
+                                // follows activation and the focus write, and its
+                                // readback precedes focus restoration, so neither
+                                // can pass for the key's effect.
+                                confirmed = dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
                                     crate::input::keyboard::press_key_bare_global(&key, &m)
-                                },
-                            )
-                        });
+                                })?;
+                                Ok(())
+                            },
+                        )?;
+                        return Ok(confirmed);
                     }
                     // background (default): auth-envelope post, no raise.
                     dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
