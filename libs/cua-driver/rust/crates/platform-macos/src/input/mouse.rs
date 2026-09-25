@@ -167,7 +167,7 @@ fn click_at_xy_desktop_inner(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
             );
-            down.post(CGEventTapLocation::HID);
+            crate::focus_steal::post_hid_mouse_event(&down);
             std::thread::sleep(std::time::Duration::from_millis(28));
             let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
@@ -176,7 +176,7 @@ fn click_at_xy_desktop_inner(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
                 (pair_index + 1) as i64,
             );
-            up.post(CGEventTapLocation::HID);
+            crate::focus_steal::post_hid_mouse_event(&up);
             if count > 1 {
                 std::thread::sleep(std::time::Duration::from_millis(80));
             }
@@ -1074,7 +1074,6 @@ where
     F: FnMut(f64, f64),
 {
     use core_graphics::display::CGDisplay;
-    use core_graphics::event::CGEventTapLocation;
 
     let (cg_button, down_type, dragged_type, up_type) = match button {
         DragButton::Left => (
@@ -1129,7 +1128,7 @@ where
                     anyhow::anyhow!("foreground drag {:?} event creation failed", spec.kind)
                 })?;
             event.set_flags(flags);
-            event.post(CGEventTapLocation::HID);
+            crate::focus_steal::post_hid_mouse_event(&event);
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {
@@ -1476,7 +1475,7 @@ fn post_mouse_event_with_mode(
             event.post_to_pid(pid as libc::pid_t);
         }
         MousePostMode::PublicOnly => event.post_to_pid(pid as libc::pid_t),
-        MousePostMode::HidOnly => event.post(core_graphics::event::CGEventTapLocation::HID),
+        MousePostMode::HidOnly => crate::focus_steal::post_hid_mouse_event(&event),
     }
 }
 

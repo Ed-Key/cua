@@ -156,7 +156,6 @@ impl FocusStealPreventer {
             released: false,
             config: LeaseConfig {
                 target_pid,
-                allowed_pid: None,
                 restore_to,
                 origin,
             },
@@ -183,7 +182,6 @@ impl FocusStealPreventer {
             released: false,
             config: LeaseConfig {
                 target_pid: None,
-                allowed_pid: Some(allowed_pid),
                 restore_to,
                 origin,
             },
@@ -240,7 +238,6 @@ pub struct SuppressionLease {
 #[derive(Clone, Copy, Debug)]
 struct LeaseConfig {
     target_pid: Option<i32>,
-    allowed_pid: Option<i32>,
     restore_to: i32,
     origin: &'static str,
 }
@@ -286,7 +283,8 @@ impl Drop for SuppressionLease {
     }
 }
 
-/// Mouse-button press counters: the signal that the user chose an app.
+/// Mouse-button press and release counters: the signal that the user chose
+/// an app (a Dock item activates on release, so releases count too).
 /// Moving the pointer or typing does not switch apps, and typing is exactly
 /// when a theft does the most harm (keystrokes land in the wrong app), so
 /// neither disarms a guard. Switching with Cmd+Tab inside a guard's short
@@ -294,8 +292,30 @@ impl Drop for SuppressionLease {
 /// An idle timer does not work at all: in a VM the virtual keyboard resets
 /// the key-down idle time continuously (measured 0.009s) while no event is
 /// ever counted. Counters only move on real events.
+/// The system counters include events cua posts itself through the HID tap
+/// (foreground clicks and drags), so cua's own count is recorded beside them
+/// and only presses beyond it are the user's.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct InputActivity([u32; 3]);
+pub(crate) struct InputActivity {
+    system: [u32; 6],
+    own: [u32; 6],
+}
+
+/// Counted button event types: left, right and other mouse down and up.
+const USER_CHOICE_EVENT_TYPES: [u32; 6] = [1, 2, 3, 4, 25, 26];
+
+static OWN_BUTTON_EVENTS: [std::sync::atomic::AtomicU32; 6] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 6];
+
+/// Post a mouse event to the global HID tap, noting button events cua itself
+/// generates so they are not mistaken for the user choosing an app.
+pub(crate) fn post_hid_mouse_event(event: &core_graphics::event::CGEvent) {
+    let kind = event.get_type() as u32;
+    if let Some(index) = USER_CHOICE_EVENT_TYPES.iter().position(|t| *t == kind) {
+        OWN_BUTTON_EVENTS[index].fetch_add(1, Ordering::SeqCst);
+    }
+    event.post(core_graphics::event::CGEventTapLocation::HID);
+}
 
 pub(crate) fn read_input_activity() -> InputActivity {
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -303,16 +323,25 @@ pub(crate) fn read_input_activity() -> InputActivity {
         fn CGEventSourceCounterForEventType(state_id: i32, event_type: u32) -> u32;
     }
     const COMBINED_SESSION_STATE: i32 = 0;
-    // left, right and other mouse-button down.
-    const TYPES: [u32; 3] = [1, 3, 25];
-    InputActivity(TYPES.map(|kind| unsafe {
+    // Own first: an own event posted between the two reads then shows up
+    // on the own side, never as user input.
+    let own = std::array::from_fn(|i| OWN_BUTTON_EVENTS[i].load(Ordering::SeqCst));
+    let system = USER_CHOICE_EVENT_TYPES.map(|kind| unsafe {
         CGEventSourceCounterForEventType(COMBINED_SESSION_STATE, kind)
-    }))
+    });
+    InputActivity { system, own }
 }
 
-/// True when the user pressed a mouse button since `baseline` was read.
+/// True when the user pressed or released a mouse button since `baseline`
+/// was read, beyond the button events cua posted itself.
 pub(crate) fn user_input_since(baseline: &InputActivity) -> bool {
-    read_input_activity() != *baseline
+    user_input_between(baseline, &read_input_activity())
+}
+
+fn user_input_between(baseline: &InputActivity, now: &InputActivity) -> bool {
+    (0..USER_CHOICE_EVENT_TYPES.len()).any(|i| {
+        now.system[i].wrapping_sub(baseline.system[i]) > now.own[i].wrapping_sub(baseline.own[i])
+    })
 }
 
 // ── Dispatcher ──────────────────────────────────────────────────────────────
@@ -437,7 +466,7 @@ impl Dispatcher {
     fn winner_for_activation(&self, activated_pid: i32) -> Option<(SuppressionHandle, i32)> {
         // Read the counters once, outside the entries lock.
         let now = read_input_activity();
-        self.winner_for_activation_with(activated_pid, &|baseline| *baseline != now)
+        self.winner_for_activation_with(activated_pid, &|baseline| user_input_between(baseline, &now))
     }
 
     /// The newest guard that applies to this app decides. If it lets the
@@ -754,7 +783,6 @@ mod tests {
             released: false,
             config: LeaseConfig {
                 target_pid: None,
-                allowed_pid: None,
                 restore_to: 7,
                 origin: "test.lease",
             },
@@ -944,6 +972,21 @@ mod tests {
         let _wild = d.add(None, 1, "test.wild");
         let _other = d.add(Some(77), 5, "test.other_pid");
         assert_eq!(d.snapshot_matches(9), vec![1], "a guard for another pid does not apply");
+    }
+
+    /// Only button events beyond cua's own count as the user choosing.
+    #[test]
+    fn own_button_events_are_not_user_choice() {
+        let base = InputActivity::default();
+        let mut now = base;
+        now.system[0] = 2;
+        now.own[0] = 2;
+        assert!(!user_input_between(&base, &now), "cua posted both presses");
+        now.system[0] = 3;
+        assert!(user_input_between(&base, &now), "one press beyond cua's own");
+        let mut release_only = base;
+        release_only.system[1] = 1;
+        assert!(user_input_between(&base, &release_only), "a release after the baseline counts");
     }
 
     fn winner_pid(d: &Dispatcher, activated_pid: i32) -> Option<i32> {

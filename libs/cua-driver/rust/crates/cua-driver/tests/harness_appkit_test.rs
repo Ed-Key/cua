@@ -2071,64 +2071,95 @@ fn run_background_case_with_env(
 }
 
 /// Focus theft: pressing btn-steal makes the fixture take focus `delay_ms`
-/// later, the way an app reacting to a click often does. The background
-/// oracles (the foreground sentinel must still be frontmost) run after this
-/// body returns, so the body waits past the theft first; otherwise a late
-/// theft would land after the check. The trace proves the theft was tried.
-fn run_focus_theft_case(delay_ms: u64, targeting: Targeting) {
-    let journal = tempfile::tempdir().unwrap();
-    let trace = journal.path().join("thief.jsonl");
-    let delay = delay_ms.to_string();
-    let route = if targeting == Targeting::Px { "px" } else { "ax" };
-    run_background_case_with_env(
-        &format!("focus_theft_{delay_ms}ms_{route}"),
-        targeting,
-        DriverRoute::MacosAxAction,
-        &[
-            ("CUA_APPKIT_THIEF_DELAY_MS", delay.as_str()),
-            ("CUA_APPKIT_THIEF_TRACE", trace.to_str().unwrap()),
-        ],
-        |pid, wid, driver| {
-            let response = if targeting == Targeting::Px {
-                let pre = driver.call(
-                    "get_window_state",
-                    serde_json::json!({"pid": pid as i64, "window_id": wid, "diff": false}),
-                );
-                let (x, y, width, height) = element_pixel_frame(&pre, "btn-steal");
-                driver.call(
-                    "click",
-                    serde_json::json!({
-                        "pid": pid as i64, "window_id": wid,
-                        "x": x + width / 2.0, "y": y + height / 2.0,
-                        "delivery_mode": "background"
-                    }),
-                )
-            } else {
-                let pre = snapshot_elements(driver, pid, wid);
-                let token = element_token_by_id(&pre, "btn-steal");
-                driver.call(
-                    "click",
-                    serde_json::json!({
-                        "pid": pid as i64, "window_id": wid,
-                        "element_token": token, "delivery_mode": "background"
-                    }),
-                )
-            };
-            assert!(!response.is_error(), "steal click: {}", response.raw);
-            std::thread::sleep(std::time::Duration::from_millis(delay_ms + 700));
-            let raw = std::fs::read_to_string(&trace)
-                .expect("the fixture never tried to take focus: the click did not land");
-            eprintln!("focus theft delay={delay_ms}ms route={route}; trace={raw}");
-        },
-    );
+/// later, the way an app reacting to a click often does. A reactive defense
+/// cannot promise the user's window never blurs (the thief acts first), so
+/// the bar is what "undone" means: the thief is no longer active 100ms after
+/// it took focus (its own trace) and the user's app is in front afterwards.
+/// The no-theft raw click keeps the strict never-blur sentinel.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TheftRoute {
+    /// AX press on btn-steal.
+    Ax,
+    /// Pixel click on btn-steal (resolves to an AX press at the point).
+    Px,
+    /// Pixel click on a plain view: real mouse events.
+    Raw,
 }
 
-/// Raw-event variant: the window is one plain view with no AX press, so the
-/// background pixel click travels as real mouse events (the route that lets
-/// the target become briefly active). The view's journal proves a mouse-down
-/// arrived; the trace proves the theft was tried.
+fn run_focus_theft_case(delay_ms: u64, targeting: TheftRoute) {
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("thief.jsonl");
+    let pointer = journal.path().join("pointer.jsonl");
+    std::fs::write(&pointer, "").unwrap();
+    let delay = delay_ms.to_string();
+    let raw = targeting == TheftRoute::Raw;
+    let mut env = vec![
+        ("CUA_APPKIT_THIEF_DELAY_MS", delay.as_str()),
+        ("CUA_APPKIT_THIEF_TRACE", trace.to_str().unwrap()),
+    ];
+    if raw {
+        env.push(("CUA_APPKIT_POINTER_ORACLE", pointer.to_str().unwrap()));
+    }
+    let mut driver = McpDriver::spawn_macos_daemon_proxy_named(&format!("appkit-focus-theft-{delay_ms}"))
+        .expect("start macOS daemon proxy");
+    let harness = Harness::launch_with_env(&env);
+    let (wid, _) = driver
+        .find_window(harness.pid as i64, "CuaTestHarness AppKit")
+        .expect("find harness window");
+    let _sentinel = cua_driver_testkit::sentinel::ForegroundSentinel::launch(&mut driver);
+    std::thread::sleep(Duration::from_millis(500));
+    let user_app = front_pid().expect("front app");
+    assert_ne!(user_app, harness.pid, "the user's app must start in front");
+    let response = if targeting == TheftRoute::Ax {
+        let pre = snapshot_elements(&mut driver, harness.pid, wid);
+        let token = element_token_by_id(&pre, "btn-steal");
+        driver.call(
+            "click",
+            serde_json::json!({
+                "pid": harness.pid as i64, "window_id": wid,
+                "element_token": token, "delivery_mode": "background"
+            }),
+        )
+    } else {
+        let pre = driver.call(
+            "get_window_state",
+            serde_json::json!({"pid": harness.pid as i64, "window_id": wid, "diff": false}),
+        );
+        let (x, y) = if raw {
+            (
+                pre.structured()["screenshot_width"].as_f64().expect("width") / 2.0,
+                pre.structured()["screenshot_height"].as_f64().expect("height") / 2.0,
+            )
+        } else {
+            let (x, y, width, height) = element_pixel_frame(&pre, "btn-steal");
+            (x + width / 2.0, y + height / 2.0)
+        };
+        driver.call(
+            "click",
+            serde_json::json!({
+                "pid": harness.pid as i64, "window_id": wid,
+                "x": x, "y": y, "delivery_mode": "background"
+            }),
+        )
+    };
+    assert!(!response.is_error(), "steal click: {}", response.raw);
+    std::thread::sleep(Duration::from_millis(delay_ms + 700));
+    if raw {
+        let events = std::fs::read_to_string(&pointer).unwrap();
+        assert!(events.contains("\"kind\":\"down\""), "not delivered as raw events: {events}");
+    }
+    let raw_trace = std::fs::read_to_string(&trace)
+        .expect("the fixture never tried to take focus: the click did not land");
+    eprintln!("focus theft delay={delay_ms}ms targeting={targeting:?}; trace={raw_trace}");
+    assert!(
+        raw_trace.contains("\"active_after_100ms\":false"),
+        "the thief still held focus 100ms after taking it: {raw_trace}"
+    );
+    assert_eq!(front_pid(), Some(user_app), "the user's app is not back in front");
+}
+
 fn run_raw_focus_theft_case(delay_ms: u64) {
-    run_raw_click_case(Some(delay_ms));
+    run_focus_theft_case(delay_ms, TheftRoute::Raw);
 }
 
 /// `None`: a raw background click with no theft at all, the baseline for
@@ -2239,6 +2270,11 @@ extern "C" {
         key: u16,
         down: bool,
     ) -> *mut std::ffi::c_void;
+    fn CGEventSourceCounterForEventType(state: i32, kind: u32) -> u32;
+}
+/// Key-down events the window server has seen (combined session state).
+fn key_down_count() -> u32 {
+    unsafe { CGEventSourceCounterForEventType(0, 10) }
 }
 /// Real pointer motion and typing: activity that does not choose an app.
 fn real_busy_user(around: CGPoint) {
@@ -2418,7 +2454,12 @@ fn harness_appkit_busy_user_does_not_disarm_the_guard() {
         }),
     );
     assert!(!click.is_error(), "steal click: {}", click.raw);
+    let keys_before = key_down_count();
     real_busy_user(CGPoint { x: 200.0, y: 200.0 }); // ~600ms of activity
+    assert!(
+        key_down_count().wrapping_sub(keys_before) >= 10,
+        "the busy-user input never reached the window server"
+    );
     std::thread::sleep(Duration::from_millis(1200));
     let raw = std::fs::read_to_string(&trace).expect("the fixture never tried to take focus");
     eprintln!("busy user; trace={raw}");
@@ -2525,12 +2566,12 @@ macro_rules! focus_theft_tests {
 }
 
 focus_theft_tests! {
-    harness_appkit_focus_theft_0ms_ax: 0, Targeting::Ax;
-    harness_appkit_focus_theft_300ms_ax: 300, Targeting::Ax;
-    harness_appkit_focus_theft_800ms_ax: 800, Targeting::Ax;
-    harness_appkit_focus_theft_0ms_px: 0, Targeting::Px;
-    harness_appkit_focus_theft_300ms_px: 300, Targeting::Px;
-    harness_appkit_focus_theft_800ms_px: 800, Targeting::Px;
+    harness_appkit_focus_theft_0ms_ax: 0, TheftRoute::Ax;
+    harness_appkit_focus_theft_300ms_ax: 300, TheftRoute::Ax;
+    harness_appkit_focus_theft_800ms_ax: 800, TheftRoute::Ax;
+    harness_appkit_focus_theft_0ms_px: 0, TheftRoute::Px;
+    harness_appkit_focus_theft_300ms_px: 300, TheftRoute::Px;
+    harness_appkit_focus_theft_800ms_px: 800, TheftRoute::Px;
 }
 
 fn run_editor_identity_case(mode: &str) {
