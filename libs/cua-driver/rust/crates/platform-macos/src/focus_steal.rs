@@ -56,11 +56,12 @@
 //! queue's own thread regardless of run-loop state.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 use objc2_app_kit::{
-    NSApplicationActivationOptions, NSRunningApplication, NSWorkspace, NSWorkspaceApplicationKey,
+    NSWorkspace, NSWorkspaceApplicationKey,
     NSWorkspaceDidActivateApplicationNotification,
 };
 use objc2_foundation::NSOperationQueue;
@@ -83,6 +84,8 @@ pub struct SuppressionHandle(Uuid);
 /// Dispatcher-internal entry shape.
 #[derive(Debug)]
 struct Entry {
+    /// Registration order, used to choose one restore destination on overlap.
+    sequence: u64,
     /// `Some(pid)` matches only that pid's activations. `None` is a
     /// wildcard — matches any activation whose pid != `restore_to`.
     /// The wildcard variant is used while a launch is in flight and the
@@ -100,10 +103,11 @@ struct Entry {
     /// Monotonic deadline. After this, the entry is pruned without
     /// firing.
     deadline: Instant,
-    /// Set once the action that armed this entry has returned. From then on
-    /// an activation is let through when real keyboard or mouse input
-    /// happened after this instant: that activation is the user's.
-    yields_to_user_after: Option<Instant>,
+    /// Set once the action that armed this entry has returned: the input
+    /// event counters at that moment. From then on an activation is let
+    /// through when any counter has moved, because real input happened and
+    /// the activation is the user's.
+    user_input_baseline: Option<InputActivity>,
     /// Provenance for tracing — e.g. `"LaunchAppTool.pre"`.
     #[allow(dead_code)]
     origin: &'static str,
@@ -253,7 +257,7 @@ impl SuppressionLease {
             self.config.restore_to,
             self.config.origin,
             until,
-            Some(Instant::now()),
+            Some(read_input_activity()),
         );
         SuppressionLease {
             handle,
@@ -279,18 +283,30 @@ impl Drop for SuppressionLease {
     }
 }
 
-#[link(name = "CoreGraphics", kind = "framework")]
-extern "C" {
-    fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
+/// Per-type input event counters. An idle timer is not enough: in a VM the
+/// virtual keyboard resets the key-down idle time continuously (measured
+/// 0.009s) while no event is ever counted, which made every post-result
+/// guard step aside. Counters only move on real events.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct InputActivity([u32; 16]);
+
+fn read_input_activity() -> InputActivity {
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventSourceCounterForEventType(state_id: i32, event_type: u32) -> u32;
+    }
+    const COMBINED_SESSION_STATE: i32 = 0;
+    // left/right mouse down+up, moved, left/right dragged, key down/up,
+    // flags changed, scroll, tablet pointer/proximity, other mouse down/up/drag.
+    const TYPES: [u32; 16] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 23, 24, 25, 26, 27];
+    InputActivity(TYPES.map(|kind| unsafe {
+        CGEventSourceCounterForEventType(COMBINED_SESSION_STATE, kind)
+    }))
 }
 
-/// True when real keyboard or mouse input reached the HID system after
-/// `since`. Events posted to a pid do not pass through the HID system.
-fn user_input_since(since: Instant) -> bool {
-    const HID_SYSTEM_STATE: i32 = 1;
-    const ANY_INPUT_EVENT: u32 = u32::MAX;
-    let idle = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, ANY_INPUT_EVENT) };
-    idle.is_finite() && idle < since.elapsed().as_secs_f64()
+/// True when real input happened since `baseline` was read.
+fn user_input_since(baseline: &InputActivity) -> bool {
+    read_input_activity() != *baseline
 }
 
 // ── Dispatcher ──────────────────────────────────────────────────────────────
@@ -303,6 +319,7 @@ fn user_input_since(since: Instant) -> bool {
 /// scan is fine.
 pub(crate) struct Dispatcher {
     entries: Mutex<HashMap<Uuid, Entry>>,
+    sequence: AtomicU64,
     /// `true` while the janitor task should keep running. The janitor
     /// loop watches for transitions to detect when to start/stop.
     janitor_active: tokio::sync::watch::Sender<bool>,
@@ -314,6 +331,7 @@ impl Dispatcher {
         let (tx, _rx) = tokio::sync::watch::channel(false);
         Self {
             entries: Mutex::new(HashMap::new()),
+            sequence: AtomicU64::new(0),
             janitor_active: tx,
             janitor_started: Mutex::new(false),
         }
@@ -370,15 +388,16 @@ impl Dispatcher {
         restore_to: i32,
         origin: &'static str,
         deadline: Instant,
-        yields_to_user_after: Option<Instant>,
+        user_input_baseline: Option<InputActivity>,
     ) -> SuppressionHandle {
         let id = Uuid::new_v4();
         let entry = Entry {
+            sequence: self.sequence.fetch_add(1, Ordering::Relaxed),
             target_pid,
             allowed_pid,
             restore_to,
             deadline,
-            yields_to_user_after,
+            user_input_baseline,
             origin,
         };
         {
@@ -406,30 +425,30 @@ impl Dispatcher {
         }
     }
 
-    /// Snapshot the entries (cloned to a small Vec) — used by tests
-    /// and the activation handler to evaluate matches without holding
-    /// the lock across the restore call.
-    fn snapshot_matches(&self, activated_pid: i32) -> Vec<i32> {
-        self.snapshot_matches_with(activated_pid, user_input_since)
+    /// The one entry that should act on this activation: the newest
+    /// matching registration. Overlapping guards restore one destination
+    /// once, not every destination in turn.
+    fn winner_for_activation(&self, activated_pid: i32) -> Option<(SuppressionHandle, i32)> {
+        self.winner_for_activation_with(activated_pid, &user_input_since)
     }
 
-    fn snapshot_matches_with(
+    fn winner_for_activation_with(
         &self,
         activated_pid: i32,
-        user_input_since: impl Fn(Instant) -> bool,
-    ) -> Vec<i32> {
+        user_input_since: &dyn Fn(&InputActivity) -> bool,
+    ) -> Option<(SuppressionHandle, i32)> {
         let mut guard = self.entries.lock().unwrap();
         // Reap expired entries first — keeps the dispatcher honest even
         // if the janitor hasn't ticked yet.
         let now = Instant::now();
         guard.retain(|_, e| e.deadline > now);
         guard
-            .values()
-            .filter(|e| {
+            .iter()
+            .filter(|(_, e)| {
                 if e.allowed_pid == Some(activated_pid) {
                     return false;
                 }
-                if e.yields_to_user_after.is_some_and(&user_input_since) {
+                if e.user_input_baseline.as_ref().is_some_and(user_input_since) {
                     return false;
                 }
                 match e.target_pid {
@@ -440,8 +459,62 @@ impl Dispatcher {
                     None => activated_pid != e.restore_to,
                 }
             })
-            .map(|e| e.restore_to)
+            .max_by_key(|(_, e)| e.sequence)
+            .map(|(id, e)| (SuppressionHandle(*id), e.restore_to))
+    }
+
+    /// Test view of the winner: at most one restore destination.
+    #[cfg(test)]
+    fn snapshot_matches(&self, activated_pid: i32) -> Vec<i32> {
+        self.snapshot_matches_with(activated_pid, |_| false)
+    }
+
+    #[cfg(test)]
+    fn snapshot_matches_with(
+        &self,
+        activated_pid: i32,
+        user_input_since: impl Fn(&InputActivity) -> bool,
+    ) -> Vec<i32> {
+        self.winner_for_activation_with(activated_pid, &user_input_since)
+            .map(|(_, pid)| pid)
+            .into_iter()
             .collect()
+    }
+
+    /// Notifications can wait on the observer queue while foreground state
+    /// changes. Only restore while the notified app is still foreground and
+    /// the chosen lease remains the current winner after the native read.
+    /// This is a best-effort freshness check, not proof of user intent or an
+    /// atomic compare-and-activate operation. Never hold the entries lock
+    /// across the native foreground read or activation.
+    fn dispatch_activation(
+        &self,
+        activated_pid: i32,
+        mut frontmost_pid: impl FnMut() -> Option<i32>,
+        mut restore: impl FnMut(i32, &mut dyn FnMut() -> bool),
+    ) {
+        let Some(winner) = self.winner_for_activation(activated_pid) else {
+            tracing::debug!(activated_pid, decision = "no_matching_lease", "focus activation dispatch");
+            return;
+        };
+        let current_front = frontmost_pid();
+        if current_front != Some(activated_pid) {
+            tracing::debug!(activated_pid, ?current_front, decision = "foreground_changed", "focus activation dispatch");
+            return;
+        }
+        // The foreground read can overlap cancellation, expiry, or another
+        // registration. Drop this dispatch if the choice changed; do not
+        // reinterpret an in-flight notification using a fallback lease.
+        if self.winner_for_activation(activated_pid) != Some(winner) {
+            tracing::debug!(activated_pid, decision = "lease_changed", "focus activation dispatch");
+            return;
+        }
+        tracing::debug!(activated_pid, restore_to = winner.1, decision = "restore", "focus activation dispatch");
+        restore(winner.1, &mut || {
+            self.winner_for_activation(activated_pid) == Some(winner)
+                && frontmost_pid() == Some(activated_pid)
+                && self.winner_for_activation(activated_pid) == Some(winner)
+        });
     }
 
     /// Number of entries (for tests).
@@ -608,22 +681,27 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
         pid as i32
     };
 
-    let restore_pids = dispatcher.snapshot_matches(activated_pid);
-    tracing::debug!(activated_pid, ?restore_pids, "focus steal: activation observed");
-    for pid in restore_pids {
-        restore_focus(pid);
-    }
+    tracing::debug!(activated_pid, "focus activation notification received");
+    dispatcher.dispatch_activation(
+        activated_pid,
+        || {
+            // WindowServer's foreground, not NSWorkspace's cached AppKit view.
+            let matches = crate::input::skylight::front_pid_matches(activated_pid);
+            tracing::debug!(activated_pid, ?matches, "WindowServer activation freshness");
+            matches.filter(|matches| *matches).map(|_| activated_pid)
+        },
+        restore_focus,
+    );
 }
 
-/// Re-activate `pid` if it's still running. Safe to call from any
-/// thread — Apple documents `activateWithOptions:` as thread-safe.
-fn restore_focus(pid: i32) {
-    unsafe {
-        if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
-            let accepted = app.activateWithOptions(NSApplicationActivationOptions(0));
-            tracing::debug!(pid, accepted, "focus steal: restore requested");
-        }
-    }
+/// Restore the guarded prior process through WindowServer. AppKit's
+/// `activateWithOptions` from a background daemon is a delayed request that
+/// current macOS may ignore (measured: ~1s to return, and focus stayed with
+/// the thief). The admit callback rechecks the lease and the foreground
+/// immediately before the mutation.
+fn restore_focus(pid: i32, admit: &mut dyn FnMut() -> bool) {
+    let accepted = crate::input::skylight::restore_front_pid(pid, admit);
+    tracing::debug!(restore_to = pid, accepted, "WindowServer focus restoration returned");
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -768,11 +846,12 @@ mod tests {
             guard.insert(
                 id,
                 Entry {
+                    sequence: 0,
                     target_pid: Some(42),
                     allowed_pid: None,
                     restore_to: 7,
                     deadline: Instant::now() - Duration::from_secs(1),
-                    yields_to_user_after: None,
+                    user_input_baseline: None,
                     origin: "test.leak",
                 },
             );
@@ -832,18 +911,244 @@ mod tests {
         d.remove(h1);
     }
 
-    /// Snapshot ordering doesn't matter, but the restore pid set
-    /// must contain every match. Multiple concurrent suppressions
-    /// targeting the same pid should both fire.
+    /// Overlapping guards for one pid restore a single destination, the
+    /// newest registration's, instead of switching focus once per guard
+    /// (measured: two restores a second apart, the second refused).
     #[test]
-    fn multiple_entries_match_independently() {
+    fn overlapping_entries_restore_only_the_newest_destination() {
         let d = Arc::new(Dispatcher::new());
         let _a = d.add(Some(42), 1, "test.m1");
         let _b = d.add(Some(42), 2, "test.m2");
-        let matches = d.snapshot_matches(42);
-        assert_eq!(matches.len(), 2);
-        // Set equality — order is HashMap-dependent.
-        assert!(matches.contains(&1));
-        assert!(matches.contains(&2));
+        assert_eq!(d.snapshot_matches(42), vec![2]);
+    }
+
+    fn winner_pid(d: &Dispatcher, activated_pid: i32) -> Option<i32> {
+        d.winner_for_activation(activated_pid).map(|(_, pid)| pid)
+    }
+
+    #[test]
+    fn lease_release_during_restore_lookup_prevents_native_mutation() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.lookup_release");
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || Some(42),
+            |pid, admit| {
+                // Native target resolution can outlive cancellation of the action.
+                d.remove(handle);
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert!(
+            restored.is_empty(),
+            "an expired operation must not restore later"
+        );
+    }
+
+    #[test]
+    fn newer_foreground_during_restore_lookup_prevents_native_mutation() {
+        let d = Arc::new(Dispatcher::new());
+        let _handle = d.add(Some(42), 7, "test.lookup_switch");
+        let front = std::cell::Cell::new(42);
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || Some(front.get()),
+            |pid, admit| {
+                front.set(99);
+                if admit() {
+                    restored.push(pid);
+                }
+            },
+        );
+        assert!(
+            restored.is_empty(),
+            "restoration must not undo a newer app switch"
+        );
+    }
+
+    #[test]
+    fn delayed_activation_does_not_restore_over_a_newer_foreground_app() {
+        let d = Arc::new(Dispatcher::new());
+        let _h = d.add(Some(42), 7, "test.delayed");
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || Some(99), |pid, _admit| restored.push(pid));
+        assert!(
+            restored.is_empty(),
+            "a queued notification must not undo a newer app switch"
+        );
+    }
+
+    #[test]
+    fn unknown_foreground_does_not_authorize_restoration() {
+        let d = Arc::new(Dispatcher::new());
+        let _h = d.add(Some(42), 7, "test.unknown");
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || None, |pid, _admit| restored.push(pid));
+        assert!(
+            restored.is_empty(),
+            "missing current state cannot authorize activation"
+        );
+    }
+
+    #[test]
+    fn current_matching_activation_still_restores_the_prior_app() {
+        let d = Arc::new(Dispatcher::new());
+        let _h = d.add(Some(42), 7, "test.current");
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+        assert_eq!(restored, vec![7]);
+    }
+
+    #[test]
+    fn overlapping_entries_dispatch_only_the_latest_matching_restore() {
+        let d = Arc::new(Dispatcher::new());
+        let _a = d.add(Some(42), 7, "test.first");
+        let _b = d.add(Some(42), 8, "test.second");
+        let mut restored = Vec::new();
+        d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+        assert_eq!(
+            restored,
+            vec![8],
+            "one notification must not activate competing destinations"
+        );
+    }
+
+    #[test]
+    fn wildcard_and_target_overlap_use_registration_order() {
+        for (older, newer) in [(None, Some(42)), (Some(42), None), (None, None)] {
+            let d = Arc::new(Dispatcher::new());
+            let _a = d.add(older, 7, "test.older");
+            let b = d.add(newer, 8, "test.newer");
+            let mut restored = Vec::new();
+            d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+            assert_eq!(restored, vec![8]);
+            d.remove(b);
+            restored.clear();
+            d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+            assert_eq!(
+                restored,
+                vec![7],
+                "a later notification can use the remaining entry"
+            );
+        }
+    }
+
+    #[test]
+    fn released_lease_cannot_restore_after_foreground_read() {
+        let d = Arc::new(Dispatcher::new());
+        let _older = d.add(Some(42), 6, "test.older");
+        let handle = d.add(Some(42), 7, "test.released");
+        let mut lease = Some(test_lease(handle, &d));
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || {
+                drop(lease.take());
+                Some(42)
+            },
+            |pid, _admit| restored.push(pid),
+        );
+        assert!(
+            restored.is_empty(),
+            "do not restore from a released snapshot or fall back mid-dispatch"
+        );
+    }
+
+    #[test]
+    fn expired_lease_cannot_restore_after_foreground_read() {
+        let d = Arc::new(Dispatcher::new());
+        let handle = d.add(Some(42), 7, "test.expired");
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || {
+                d.entries
+                    .lock()
+                    .unwrap()
+                    .get_mut(&handle.0)
+                    .unwrap()
+                    .deadline = Instant::now() - Duration::from_secs(1);
+                Some(42)
+            },
+            |pid, _admit| restored.push(pid),
+        );
+        assert!(
+            restored.is_empty(),
+            "expiry during the native read must invalidate restoration"
+        );
+    }
+
+    #[test]
+    fn newer_matching_entry_invalidates_the_in_flight_restore() {
+        // Equal destinations still belong to different action lifetimes.
+        for destination in [7, 8] {
+            let d = Arc::new(Dispatcher::new());
+            let _h = d.add(Some(42), 7, "test.old");
+            let mut restored = Vec::new();
+            d.dispatch_activation(
+                42,
+                || {
+                    d.add(Some(42), destination, "test.new");
+                    Some(42)
+                },
+                |pid, _admit| restored.push(pid),
+            );
+            assert!(
+                restored.is_empty(),
+                "an in-flight notification must not apply a superseded choice"
+            );
+        }
+    }
+
+    #[test]
+    fn unrelated_registration_during_read_does_not_block_current_restore() {
+        let d = Arc::new(Dispatcher::new());
+        let _h = d.add(Some(42), 7, "test.current");
+        let mut restored = Vec::new();
+        d.dispatch_activation(
+            42,
+            || {
+                d.add(Some(99), 8, "test.unrelated");
+                Some(42)
+            },
+            |pid, _admit| restored.push(pid),
+        );
+        assert_eq!(restored, vec![7]);
+    }
+
+    #[test]
+    fn dispatch_preserves_target_and_wildcard_matching_policy() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(Some(42), 7, "test.target");
+        let mut restored = Vec::new();
+        d.dispatch_activation(99, || Some(99), |pid, _admit| restored.push(pid));
+        assert!(restored.is_empty());
+        d.remove(h);
+
+        let _h = d.add_allowing(42, 7, "test.wildcard");
+        d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+        d.dispatch_activation(7, || Some(7), |pid, _admit| restored.push(pid));
+        assert!(restored.is_empty());
+        d.dispatch_activation(99, || Some(99), |pid, _admit| restored.push(pid));
+        assert_eq!(
+            restored,
+            vec![7],
+            "this fix does not redefine wildcard user-intent policy"
+        );
+    }
+
+    /// Dispatcher::add returns a handle, the entry is reachable by
+    /// match, and remove() drops it.
+    #[test]
+    fn latest_nonmatching_registration_does_not_change_the_winner() {
+        let d = Arc::new(Dispatcher::new());
+        let _a = d.add(Some(42), 1, "test.m1");
+        let _b = d.add(Some(99), 2, "test.m2");
+        assert_eq!(winner_pid(&d, 42), Some(1));
+        assert_eq!(winner_pid(&d, 99), Some(2));
     }
 }
