@@ -871,6 +871,7 @@ fn sdk_window_input(fixture: &Fixture) -> GetWindowStateInput {
         window_id: fixture.wid,
         session: None,
         query: None,
+        diff: None,
         include_accessibility_tree: Some(true),
         include_screenshot: Some(false),
         screenshot_out_file: None,

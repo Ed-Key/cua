@@ -3703,11 +3703,15 @@ class _UniffiFfiConverterTypeGetSessionStateInput(_UniffiConverterRustBuffer):
 
 @dataclass
 class GetWindowStateInput:
-    def __init__(self, *, pid:int, window_id:int, session:typing.Optional[str], query:typing.Optional[str], include_accessibility_tree:typing.Optional[bool], include_screenshot:typing.Optional[bool], screenshot_out_file:typing.Optional[str], max_elements:typing.Optional[int], max_depth:typing.Optional[int], max_dimension:typing.Optional[int], max_image_dimension:typing.Optional[int], timeout_ms:typing.Optional[int] = _DEFAULT):
+    def __init__(self, *, pid:int, window_id:int, session:typing.Optional[str], query:typing.Optional[str], diff:typing.Optional[bool] = _DEFAULT, include_accessibility_tree:typing.Optional[bool], include_screenshot:typing.Optional[bool], screenshot_out_file:typing.Optional[str], max_elements:typing.Optional[int], max_depth:typing.Optional[int], max_dimension:typing.Optional[int], max_image_dimension:typing.Optional[int], timeout_ms:typing.Optional[int] = _DEFAULT):
         self.pid = pid
         self.window_id = window_id
         self.session = session
         self.query = query
+        if diff is _DEFAULT:
+            self.diff = None
+        else:
+            self.diff = diff
         self.include_accessibility_tree = include_accessibility_tree
         self.include_screenshot = include_screenshot
         self.screenshot_out_file = screenshot_out_file
@@ -3724,7 +3728,7 @@ class GetWindowStateInput:
 
 
     def __str__(self):
-        return "GetWindowStateInput(pid={}, window_id={}, session={}, query={}, include_accessibility_tree={}, include_screenshot={}, screenshot_out_file={}, max_elements={}, max_depth={}, max_dimension={}, max_image_dimension={}, timeout_ms={})".format(self.pid, self.window_id, self.session, self.query, self.include_accessibility_tree, self.include_screenshot, self.screenshot_out_file, self.max_elements, self.max_depth, self.max_dimension, self.max_image_dimension, self.timeout_ms)
+        return "GetWindowStateInput(pid={}, window_id={}, session={}, query={}, diff={}, include_accessibility_tree={}, include_screenshot={}, screenshot_out_file={}, max_elements={}, max_depth={}, max_dimension={}, max_image_dimension={}, timeout_ms={})".format(self.pid, self.window_id, self.session, self.query, self.diff, self.include_accessibility_tree, self.include_screenshot, self.screenshot_out_file, self.max_elements, self.max_depth, self.max_dimension, self.max_image_dimension, self.timeout_ms)
     def __eq__(self, other):
         if self.pid != other.pid:
             return False
@@ -3733,6 +3737,8 @@ class GetWindowStateInput:
         if self.session != other.session:
             return False
         if self.query != other.query:
+            return False
+        if self.diff != other.diff:
             return False
         if self.include_accessibility_tree != other.include_accessibility_tree:
             return False
@@ -3760,6 +3766,7 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
             window_id=_UniffiFfiConverterUInt64.read(buf),
             session=_UniffiFfiConverterOptionalString.read(buf),
             query=_UniffiFfiConverterOptionalString.read(buf),
+            diff=_UniffiFfiConverterOptionalBoolean.read(buf),
             include_accessibility_tree=_UniffiFfiConverterOptionalBoolean.read(buf),
             include_screenshot=_UniffiFfiConverterOptionalBoolean.read(buf),
             screenshot_out_file=_UniffiFfiConverterOptionalString.read(buf),
@@ -3776,6 +3783,7 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt64.check_lower(value.window_id)
         _UniffiFfiConverterOptionalString.check_lower(value.session)
         _UniffiFfiConverterOptionalString.check_lower(value.query)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.diff)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.include_accessibility_tree)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.include_screenshot)
         _UniffiFfiConverterOptionalString.check_lower(value.screenshot_out_file)
@@ -3791,6 +3799,7 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt64.write(value.window_id, buf)
         _UniffiFfiConverterOptionalString.write(value.session, buf)
         _UniffiFfiConverterOptionalString.write(value.query, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.diff, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.include_accessibility_tree, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.include_screenshot, buf)
         _UniffiFfiConverterOptionalString.write(value.screenshot_out_file, buf)

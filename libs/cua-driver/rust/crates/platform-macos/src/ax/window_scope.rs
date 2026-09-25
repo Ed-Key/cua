@@ -77,18 +77,6 @@ impl TopLevelCandidate {
         self.identifier = Some(identifier.into());
         self
     }
-
-    fn is_dialog_like(&self) -> bool {
-        self.role == "AXSheet"
-            || self
-                .subrole
-                .as_deref()
-                .is_some_and(|s| matches!(s, "AXDialog" | "AXSystemDialog" | "AXSheet"))
-            || self
-                .identifier
-                .as_deref()
-                .is_some_and(|id| matches!(id, "open-panel" | "save-panel"))
-    }
 }
 
 /// The scope conclusion plus which candidates to walk at depth 0.
@@ -151,23 +139,19 @@ where
         };
     }
 
-    // Matched: walk the requested window plus the non-window top-level children.
+    // Matched: walk the requested window plus the non-window top-level children,
+    // except the application menu bar.
     //
-    // The menu bar is deliberately among them. MACOS.md documents a
-    // two-snapshot menu flow whose first step reads `AXMenuBarItem` rows
-    // straight out of this window-scoped tree, and `get_window_state` is the
-    // only tool that returns a subtree — dropping AXMenuBar here would remove
-    // menu navigation with no replacement path. Keeping other non-window
-    // children is also what `browser/consent_ui.rs` relies on to reach a
-    // top-level `AXSheet` consent prompt.
-    let dialog_scope = matched.iter().any(|&i| candidates[i].is_dialog_like());
+    // Menu navigation goes through `invoke_menu`, which reads the live
+    // `AXMenuBar` itself, and MACOS.md forbids driving `AXMenuBarItem` rows from
+    // a snapshot. Left in, the menu bar was more than half the nodes of a
+    // typical window snapshot and leaked Recent Items. Keeping other non-window
+    // children is what `browser/consent_ui.rs` relies on to reach a top-level
+    // `AXSheet` consent prompt.
     let walk = candidates
         .iter()
         .enumerate()
-        .filter(|(i, c)| {
-            (c.role != "AXWindow" || matched.contains(i))
-                && !(dialog_scope && c.role == "AXMenuBar")
-        })
+        .filter(|(i, c)| (c.role != "AXWindow" || matched.contains(i)) && c.role != "AXMenuBar")
         .map(|(i, _)| i)
         .collect();
     ScopeDecision {
@@ -191,19 +175,19 @@ mod tests {
         panic!("owner lookup must be skipped when a candidate claims the id");
     }
 
-    /// The MACOS.md contract: a resolved normal window keeps the menu bar in
-    /// its window-scoped tree, so the documented two-snapshot menu flow
-    /// (`AXMenuBarItem` → menu item) still works.
+    /// A resolved normal window walks only itself plus non-window, non-menu-bar
+    /// siblings (sheets, popovers). Menu navigation is `invoke_menu`'s job.
     #[test]
-    fn matched_window_walks_window_and_menu_bar() {
+    fn matched_window_walks_window_without_menu_bar() {
         let candidates = [
             TopLevelCandidate::new("AXMenuBar", None),
             TopLevelCandidate::new("AXWindow", Some(11)),
             TopLevelCandidate::new("AXWindow", Some(22)),
+            TopLevelCandidate::new("AXSheet", None),
         ];
         let d = decide_window_scope(&candidates, 22, never_called);
         assert_eq!(d.scope, WindowScope::Matched);
-        assert_eq!(d.walk, vec![0, 2], "menu bar + requested window only");
+        assert_eq!(d.walk, vec![2, 3], "requested window + sheet, no menu bar");
     }
 
     #[test]

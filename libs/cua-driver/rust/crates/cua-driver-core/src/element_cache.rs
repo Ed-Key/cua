@@ -284,6 +284,24 @@ impl<S: SnapshotPayload> ElementCacheCore<S> {
         Some(id)
     }
 
+    /// Read the latest published payload for `window_id` without retiring
+    /// it. `f` runs under the cache lock, so it should only copy out what a
+    /// later look needs.
+    pub fn with_latest_payload<R>(
+        &self,
+        pid: i32,
+        window_id: u64,
+        f: impl FnOnce(&S) -> R,
+    ) -> Option<R> {
+        let inner = self.inner.lock().unwrap();
+        inner
+            .snapshots
+            .get(&pid)?
+            .iter()
+            .find(|entry| entry.window_id == window_id)
+            .map(|entry| f(&entry.payload))
+    }
+
     /// Resolve the screenshot transform from the same authoritative latest
     /// snapshot used for element tokens.
     ///

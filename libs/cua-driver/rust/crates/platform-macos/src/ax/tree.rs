@@ -335,17 +335,7 @@ pub fn walk_tree_budgeted(
     }
 
     let walk = budget.outcome();
-    let raw_markdown = render_lines(&lines);
-    let mut tree_markdown = if let Some(q) = query {
-        filter_tree(&raw_markdown, q)
-    } else {
-        raw_markdown
-    };
-
-    if let Some(note) = walk.note() {
-        tree_markdown.push('\n');
-        tree_markdown.push_str(&note);
-    }
+    let tree_markdown = finish_outline(render_lines(&lines), query, &walk);
 
     TreeWalkResult {
         tree_markdown,
@@ -354,6 +344,27 @@ pub fn walk_tree_budgeted(
         walk,
         window_scope,
     }
+}
+
+fn finish_outline(raw_markdown: String, query: Option<&str>, walk: &WalkOutcome) -> String {
+    let mut tree_markdown = if let Some(q) = query {
+        filter_tree(&raw_markdown, q)
+    } else {
+        raw_markdown
+    };
+    if let Some(note) = walk.note() {
+        tree_markdown.push('\n');
+        tree_markdown.push_str(&note);
+    }
+    tree_markdown
+}
+
+/// Re-render `tree_markdown` from `nodes`, for callers that renumber rows
+/// after the walk. Produces exactly what `walk_tree_budgeted` rendered when
+/// the nodes are unchanged.
+pub(crate) fn render_outline(nodes: &[AXNode], query: Option<&str>, walk: &WalkOutcome) -> String {
+    let lines: Vec<(usize, String)> = nodes.iter().map(|n| (n.depth, format_node_line(n))).collect();
+    finish_outline(render_lines(&lines), query, walk)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -427,7 +438,10 @@ unsafe fn walk_element(
     let description = copy_string_attr(element, "AXDescription");
     let identifier = copy_string_attr(element, "AXIdentifier");
     let help = copy_string_attr(element, "AXHelp").filter(|h| !h.trim().is_empty());
-    let actions = copy_action_names(element);
+    let actions: Vec<String> = copy_action_names(element)
+        .into_iter()
+        .map(display_action_name)
+        .collect();
 
     let visible_title = title.as_deref().unwrap_or("").trim().to_owned();
     let visible_description = description.as_deref().unwrap_or("").trim().to_owned();
@@ -618,7 +632,38 @@ mod web_content_role_tests {
     }
 }
 
-fn format_node_line(node: &AXNode) -> String {
+/// UIKit/SwiftUI custom accessibility actions surface through
+/// AXUIElementCopyActionNames as the description of the action object, e.g.
+/// `Name:Heart\nTarget:0x0\nSelector:(null)`. Only the name carries meaning;
+/// the target and selector are always placeholders. Standard `AX*` names pass
+/// through unchanged.
+fn display_action_name(raw: String) -> String {
+    match raw.strip_prefix("Name:") {
+        Some(rest) => rest.split('\n').next().unwrap_or(rest).trim().to_owned(),
+        None => raw,
+    }
+}
+
+/// Action names for the markdown outline. Every element answers
+/// `AXScrollToVisible` and `AXShowMenu`, and every row inside a scroll view
+/// answers the page-scroll pair, whose presence flips with scroll position and
+/// would mark whole transcripts "changed" in a diff. The `scroll` and
+/// `right_click` tools already cover all four, so listing them per row is pure
+/// noise. Addressability and dispatch still use the full `AXNode::actions` list.
+fn rendered_action_names(actions: &[String]) -> Vec<String> {
+    actions
+        .iter()
+        .filter(|a| {
+            !matches!(
+                a.as_str(),
+                "AXScrollToVisible" | "AXShowMenu" | "AXScrollUpByPage" | "AXScrollDownByPage"
+            )
+        })
+        .map(|a| a.strip_prefix("AX").unwrap_or(a).to_lowercase())
+        .collect()
+}
+
+pub(crate) fn format_node_line(node: &AXNode) -> String {
     let mut parts = String::new();
 
     // Common prefix (with or without index).
@@ -651,13 +696,8 @@ fn format_node_line(node: &AXNode) -> String {
         if let Some(h) = &node.help {
             attrs.push(format!("help=\"{}\"", h));
         }
-        if !node.actions.is_empty() {
-            let action_str = node
-                .actions
-                .iter()
-                .map(|a| a.strip_prefix("AX").unwrap_or(a).to_lowercase())
-                .collect::<Vec<_>>()
-                .join(",");
+        let action_str = rendered_action_names(&node.actions).join(",");
+        if !action_str.is_empty() {
             attrs.push(format!("actions=[{}]", action_str));
         }
         if !attrs.is_empty() {
@@ -670,7 +710,7 @@ fn format_node_line(node: &AXNode) -> String {
     parts
 }
 
-fn render_lines(lines: &[(usize, String)]) -> String {
+pub(crate) fn render_lines(lines: &[(usize, String)]) -> String {
     let mut out = String::new();
     for (depth, line) in lines {
         for _ in 0..*depth {
@@ -790,5 +830,41 @@ mod tests {
         });
         assert_eq!(reads.get(), 1, "actionable nodes must read state once");
         assert_eq!(actionable.enabled, Some(true));
+    }
+}
+
+#[cfg(test)]
+mod outline_action_tests {
+    use super::{display_action_name, rendered_action_names};
+
+    #[test]
+    fn custom_action_names_keep_only_the_name() {
+        assert_eq!(
+            display_action_name("Name:Tapback Details…\nTarget:0x0\nSelector:(null)".into()),
+            "Tapback Details…"
+        );
+        assert_eq!(display_action_name("Name:Pin\nTarget:0x0\nSelector:(null)".into()), "Pin");
+        assert_eq!(display_action_name("AXPress".into()), "AXPress");
+        assert_eq!(display_action_name("Name:".into()), "");
+    }
+
+    #[test]
+    fn outline_hides_universal_actions_but_keeps_the_rest() {
+        let actions: Vec<String> = [
+            "AXPress",
+            "AXScrollToVisible",
+            "AXCancel",
+            "AXShowMenu",
+            "AXScrollUpByPage",
+            "AXScrollDownByPage",
+            "Heart",
+        ]
+        .map(str::to_owned)
+        .to_vec();
+        assert_eq!(rendered_action_names(&actions), ["press", "cancel", "heart"]);
+        let only_universal: Vec<String> = ["AXScrollToVisible", "AXShowMenu", "AXScrollDownByPage"]
+            .map(str::to_owned)
+            .to_vec();
+        assert!(rendered_action_names(&only_universal).is_empty());
     }
 }

@@ -33,7 +33,11 @@ fn def() -> &'static ToolDef {
             in the markdown and as `element_index` in the structured array — pass \
             those indices to click, type_text, press_key, etc.\n\n\
             INVARIANT: call get_window_state once per turn per (pid, window_id) before any \
-            element-indexed action. The index map is replaced by the next snapshot.\n\n\
+            element-indexed action. On macOS a row keeps its element_index across looks at \
+            the same window and a vanished row's number is never reused, so after the first \
+            look the response is a change-only diff by default (see `diff`); each look still \
+            mints a new snapshot_id, so pair an unchanged row's element_index with the latest \
+            snapshot_id.\n\n\
             PREFERRED CONSUMERS read `structuredContent.elements` (one entry per \
             indexed row with `element_index`, `role`, `label`, `value` (the \
             element's text/AXValue when present — use it to verify what a field \
@@ -96,6 +100,7 @@ fn def() -> &'static ToolDef {
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
                 "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching actionable rows plus their actionable ancestors without renumbering element_index values." },
+                "diff": { "type": "boolean", "description": "Default true. After the first look at a window, return only rows added, changed, or removed since this session's previous look (display-only text included); unchanged rows keep their element_index. The full outline is still sent for the first look, when it would be shorter, when a query is set, or when the previous look used different max_elements/max_depth. Pass false to force the full outline. macOS only." },
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_accessibility_tree": {
                     "type": "boolean",
@@ -314,27 +319,34 @@ impl Tool for GetWindowStateTool {
             .map(|v| v.max(1) as usize)
             .unwrap_or(crate::ax::tree::DEFAULT_MAX_DEPTH);
         let timeout_ms = cua_driver_core::tool_schema::resolve_timeout_ms(args.get("timeout_ms"));
+        // Change-only outline after the first look at a window (default on).
+        // A query always renders the full filtered outline: its rows are few
+        // and a filter is a fresh question, not a follow-up look. verify_state's
+        // internal observation evaluates the full outline.
+        let want_diff = match args.get("diff") {
+            None | Some(serde_json::Value::Bool(true)) => query.is_none() && !observation_only,
+            Some(serde_json::Value::Bool(false)) => false,
+            Some(_) => return ToolResult::error("diff must be a boolean"),
+        };
 
-        let (tree_result, prepared_snapshot) = if want_tree {
+        let mut tree_result = if want_tree {
             let q = query.clone();
             // `timeout_ms` bounds the walk itself: it returns the partial tree
             // when the budget runs out. The outer deadline is only a backstop
             // for an AX call that ignores the per-element messaging timeout
             // (dropping a spawn_blocking JoinHandle cannot cancel it).
             let walk_future = tokio::task::spawn_blocking(move || {
-                let tree = crate::ax::tree::walk_tree_budgeted(
+                crate::ax::tree::walk_tree_budgeted(
                     pid,
                     Some(window_id),
                     q.as_deref(),
                     max_depth,
                     cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
-                );
-                let payload = crate::ax::cache::CachedSnapshot::from_nodes(&tree.nodes);
-                (tree, payload)
+                )
             });
             let backstop = std::time::Duration::from_millis(timeout_ms) + AX_WALK_BACKSTOP_GRACE;
             match tokio::time::timeout(backstop, walk_future).await {
-                Ok(Ok((tree, payload))) => (Some(tree), Some(payload)),
+                Ok(Ok(tree)) => Some(tree),
                 Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
                 Err(_elapsed) => {
                     return ToolResult::error(format!(
@@ -347,7 +359,7 @@ impl Tool for GetWindowStateTool {
                 }
             }
         } else {
-            (None, None)
+            None
         };
 
         // The window can close, or its CGWindow can be re-parented onto another
@@ -366,6 +378,56 @@ impl Tool for GetWindowStateTool {
         if !scope_matched && !observation_only {
             self.state.element_cache.remove(pid, u64::from(window_id));
         }
+
+        // Number rows the way the previous look at this window did
+        // (`diff::assign_stable_indices`) and, after that first look, send only
+        // what changed (`diff::diff_outline`). The previous snapshot lends its
+        // element handles and rendered rows; the payload built here replaces
+        // it when published below and takes over the walk's element retains.
+        let mut outline_diff: Option<crate::ax::diff::OutlineDiff> = None;
+        let prepared_snapshot = tree_result.as_mut().map(|r| {
+            let bounds = (max_elements, max_depth);
+            let prior = self
+                .state
+                .element_cache
+                .with_latest_payload(pid, u64::from(window_id), |p| p.prior_look());
+            let mut next_id = prior.as_ref().map_or(0, |p| p.next_id);
+            match prior.as_ref() {
+                Some(p) => {
+                    let pairs = p.identity_pairs();
+                    // Safety: `p` retains every pointer in `pairs` and outlives
+                    // the matcher.
+                    let mut same = unsafe { crate::ax::diff::identity_matcher(&pairs) };
+                    crate::ax::diff::assign_stable_indices(&mut r.nodes, |ptr| same(ptr), &mut next_id);
+                }
+                None => crate::ax::diff::assign_stable_indices(&mut r.nodes, |_| None, &mut next_id),
+            }
+            // Numbers may have changed; re-render the full outline.
+            r.tree_markdown = crate::ax::tree::render_outline(&r.nodes, query.as_deref(), &r.walk);
+            // Diff only against a real previous look by this session with the
+            // same bounds. Another session never saw the outline the diff is
+            // relative to, and a different max_elements/max_depth would present
+            // bound differences as application changes.
+            let comparable = prior.as_ref().filter(|p| {
+                p.bounds == bounds
+                    && p.session == session_id
+                    && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
+            });
+            if let (true, Some(p)) = (want_diff, comparable) {
+                let title = r
+                    .nodes
+                    .iter()
+                    .find(|n| n.role == "AXWindow")
+                    .and_then(|n| n.title.clone())
+                    .unwrap_or_default();
+                let d = crate::ax::diff::diff_outline(&p.rows, &r.nodes, &title);
+                if d.markdown.len() < r.tree_markdown.len() {
+                    r.tree_markdown = d.markdown.clone();
+                    outline_diff = Some(d);
+                }
+            }
+            crate::ax::cache::CachedSnapshot::new(&r.nodes, next_id, bounds, session_id.clone())
+        });
 
         // Capture the screenshot and deliver it alongside the tree — the
         // grounding frame the agent cross-checks the (sometimes-lying) tree
@@ -599,6 +661,22 @@ impl Tool for GetWindowStateTool {
             }
             _ => elements_json,
         };
+        // In a diff response the structured side shrinks the same way as the
+        // outline: only added or changed rows.
+        let elements_json: Vec<serde_json::Value> = match outline_diff.as_ref() {
+            Some(d) => {
+                let touched = d.touched();
+                elements_json
+                    .into_iter()
+                    .filter(|e| {
+                        e.get("element_index")
+                            .and_then(|v| v.as_u64())
+                            .is_some_and(|i| touched.contains(&(i as usize)))
+                    })
+                    .collect()
+            }
+            None => elements_json,
+        };
         let filtered_element_count = elements_json.len();
         // The structured array intentionally contains only actionable nodes,
         // and AX child reads can fail independently of the element/depth caps.
@@ -625,6 +703,18 @@ impl Tool for GetWindowStateTool {
         }
         if let Some(r) = tree_result.as_ref() {
             r.walk.apply(&mut structured);
+        }
+        if let Some(d) = outline_diff.as_ref() {
+            structured["diff"] = serde_json::json!({
+                "added": d.added,
+                "changed": d.changed,
+                "removed": d.removed,
+                "note": "tree_markdown and elements list only rows added or changed since this \
+                    session's previous get_window_state of this window. Unchanged rows keep \
+                    their element_index; act on one by passing this response's snapshot_id \
+                    together with its element_index (or element_token \
+                    \"<snapshot_id>:<element_index>\"). Pass diff:false for the full outline."
+            });
         }
         // Surface 6: an opaque snapshot identifier consumers can log
         // alongside the per-element tokens for debug correlation. Same value

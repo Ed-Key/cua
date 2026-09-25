@@ -74,6 +74,13 @@ pub struct GetWindowStateInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "string_schema")]
     pub query: Option<String>,
+    /// macOS only. Default true: after the first look at a window, return only
+    /// rows added, changed, or removed since the previous look by this session.
+    /// False forces the full outline.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
+    pub diff: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
     pub include_accessibility_tree: Option<bool>,

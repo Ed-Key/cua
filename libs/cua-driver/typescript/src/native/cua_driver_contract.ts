@@ -2458,6 +2458,12 @@ export type GetWindowStateInput = {
     windowId: bigint,
     session?: string,
     query?: string,
+    /**
+     * macOS only. Default true: after the first look at a window, return only
+     * rows added, changed, or removed since the previous look by this session.
+     * False forces the full outline.
+     */
+    diff?: boolean,
     includeAccessibilityTree?: boolean,
     includeScreenshot?: boolean,
     screenshotOutFile?: string,
@@ -2482,6 +2488,7 @@ export type GetWindowStateInput = {
  */
 export const GetWindowStateInput = (() => {
     const defaults = () => ({
+        diff: undefined,
         timeoutMs: undefined
     });
     const create = (() => {
@@ -2503,6 +2510,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
                 windowId: FfiConverterUInt64.read(from),
                 session: FfiConverterOptionalString.read(from),
                 query: FfiConverterOptionalString.read(from),
+                diff: FfiConverterOptionalBoolean.read(from),
                 includeAccessibilityTree: FfiConverterOptionalBoolean.read(from),
                 includeScreenshot: FfiConverterOptionalBoolean.read(from),
                 screenshotOutFile: FfiConverterOptionalString.read(from),
@@ -2518,6 +2526,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
             FfiConverterUInt64.write(value.windowId, into);
             FfiConverterOptionalString.write(value.session, into);
             FfiConverterOptionalString.write(value.query, into);
+            FfiConverterOptionalBoolean.write(value.diff, into);
             FfiConverterOptionalBoolean.write(value.includeAccessibilityTree, into);
             FfiConverterOptionalBoolean.write(value.includeScreenshot, into);
             FfiConverterOptionalString.write(value.screenshotOutFile, into);
@@ -2532,6 +2541,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
              FfiConverterUInt64.allocationSize(value.windowId) +
              FfiConverterOptionalString.allocationSize(value.session) +
              FfiConverterOptionalString.allocationSize(value.query) +
+             FfiConverterOptionalBoolean.allocationSize(value.diff) +
              FfiConverterOptionalBoolean.allocationSize(value.includeAccessibilityTree) +
              FfiConverterOptionalBoolean.allocationSize(value.includeScreenshot) +
              FfiConverterOptionalString.allocationSize(value.screenshotOutFile) +

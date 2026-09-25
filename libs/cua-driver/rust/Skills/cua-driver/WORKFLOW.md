@@ -37,6 +37,8 @@ These objects are argument fragments for tools advertising `target`, not standal
 
 `get_window_state({pid, window_id})` requests the accessibility tree and a grounding screenshot by default. Check what actually came back: permission, backing-store, or surface-identity failures can leave usable tree data without an image. `screenshot_error` and `screenshot_frame_valid:false` are not empty-tree signals.
 
+On macOS a row keeps its `element_index` across looks at the same window, and a vanished row's number is never reused. After the first look, a session's next `get_window_state` of that window returns only rows added, changed, or removed (`diff` in the response lists their numbers; `tree_markdown` marks `+` added, `~` changed, `x` vanished text). Unchanged rows are omitted but still actionable: pair their `element_index` with the new response's `snapshot_id`. Pass `diff:false` when you need the full outline again, for example after a context reset. A `query`, a changed `max_elements`/`max_depth`, or a look by another session always returns the full outline.
+
 Prefer `structuredContent.elements` in MCP (the CLI prints structured fields directly) over parsing `tree_markdown`. Rows may contain `element_token`, role, label, value, actions, parent, depth, enabled/selected state, `frame` (screen coordinates, the space of `scope:"desktop"` actions), and `screenshot_frame` (pixels of the screenshot in the same response, the space of window-local pointer `x`/`y`). Missing fields are unknown.
 
 - Use `query` to project matching rows plus ancestors without renumbering their indices.
