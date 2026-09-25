@@ -3193,19 +3193,90 @@ class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
             raise InternalError("Unexpected flag byte for optional type")
 
 @dataclass
-class ElementPredicate:
-    def __init__(self, *, selector:ElementSelector, exists:typing.Optional[bool], value_equals:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool]):
-        self.selector = selector
-        self.exists = exists
-        self.value_equals = value_equals
-        self.enabled = enabled
-        self.selected = selected
+class TextSelectionPredicate:
+    """
+    Exact selection on the currently focused native text control, in UTF-16 units.
+"""
+    def __init__(self, *, location:int, length:int, text:typing.Optional[str]):
+        self.location = location
+        self.length = length
+        self.text = text
 
 
 
 
     def __str__(self):
-        return "ElementPredicate(selector={}, exists={}, value_equals={}, enabled={}, selected={})".format(self.selector, self.exists, self.value_equals, self.enabled, self.selected)
+        return "TextSelectionPredicate(location={}, length={}, text={})".format(self.location, self.length, self.text)
+    def __eq__(self, other):
+        if self.location != other.location:
+            return False
+        if self.length != other.length:
+            return False
+        if self.text != other.text:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeTextSelectionPredicate(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return TextSelectionPredicate(
+            location=_UniffiFfiConverterUInt64.read(buf),
+            length=_UniffiFfiConverterUInt64.read(buf),
+            text=_UniffiFfiConverterOptionalString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterUInt64.check_lower(value.location)
+        _UniffiFfiConverterUInt64.check_lower(value.length)
+        _UniffiFfiConverterOptionalString.check_lower(value.text)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterUInt64.write(value.location, buf)
+        _UniffiFfiConverterUInt64.write(value.length, buf)
+        _UniffiFfiConverterOptionalString.write(value.text, buf)
+
+class _UniffiFfiConverterOptionalTypeTextSelectionPredicate(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeTextSelectionPredicate.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeTextSelectionPredicate.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeTextSelectionPredicate.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class ElementPredicate:
+    def __init__(self, *, selector:ElementSelector, exists:typing.Optional[bool], value_equals:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], text_selection:typing.Optional[TextSelectionPredicate]):
+        self.selector = selector
+        self.exists = exists
+        self.value_equals = value_equals
+        self.enabled = enabled
+        self.selected = selected
+        self.text_selection = text_selection
+
+
+
+
+    def __str__(self):
+        return "ElementPredicate(selector={}, exists={}, value_equals={}, enabled={}, selected={}, text_selection={})".format(self.selector, self.exists, self.value_equals, self.enabled, self.selected, self.text_selection)
     def __eq__(self, other):
         if self.selector != other.selector:
             return False
@@ -3216,6 +3287,8 @@ class ElementPredicate:
         if self.enabled != other.enabled:
             return False
         if self.selected != other.selected:
+            return False
+        if self.text_selection != other.text_selection:
             return False
         return True
 
@@ -3228,6 +3301,7 @@ class _UniffiFfiConverterTypeElementPredicate(_UniffiConverterRustBuffer):
             value_equals=_UniffiFfiConverterOptionalString.read(buf),
             enabled=_UniffiFfiConverterOptionalBoolean.read(buf),
             selected=_UniffiFfiConverterOptionalBoolean.read(buf),
+            text_selection=_UniffiFfiConverterOptionalTypeTextSelectionPredicate.read(buf),
         )
 
     @staticmethod
@@ -3237,6 +3311,7 @@ class _UniffiFfiConverterTypeElementPredicate(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.value_equals)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.enabled)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.selected)
+        _UniffiFfiConverterOptionalTypeTextSelectionPredicate.check_lower(value.text_selection)
 
     @staticmethod
     def write(value, buf):
@@ -3245,6 +3320,7 @@ class _UniffiFfiConverterTypeElementPredicate(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.value_equals, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.enabled, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.selected, buf)
+        _UniffiFfiConverterOptionalTypeTextSelectionPredicate.write(value.text_selection, buf)
 
 @dataclass
 class EndSessionInput:
@@ -8902,6 +8978,7 @@ __all__ = [
     "DragInput",
     "ElementFrame",
     "ElementSelector",
+    "TextSelectionPredicate",
     "ElementPredicate",
     "EndSessionInput",
     "EndSessionOutput",

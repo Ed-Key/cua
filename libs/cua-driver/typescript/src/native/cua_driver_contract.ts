@@ -1884,6 +1884,62 @@ const FfiConverterTypeElementSelector = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * Exact selection on the currently focused native text control, in UTF-16 units.
+ */
+export type TextSelectionPredicate = {
+    location: bigint,
+    /**
+     * Zero length checks a caret position.
+     */
+    length: bigint,
+    /**
+     * When present, also require this exact readable selected text.
+     */
+    text?: string
+}
+
+/**
+ * Generated factory for {@link TextSelectionPredicate} record objects.
+ */
+export const TextSelectionPredicate = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<TextSelectionPredicate, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<TextSelectionPredicate>,
+    });
+})();
+
+const FfiConverterTypeTextSelectionPredicate = (() => {
+    type TypeName = TextSelectionPredicate;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                location: FfiConverterUInt64.read(from),
+                length: FfiConverterUInt64.read(from),
+                text: FfiConverterOptionalString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterUInt64.write(value.location, into);
+            FfiConverterUInt64.write(value.length, into);
+            FfiConverterOptionalString.write(value.text, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterUInt64.allocationSize(value.location) +
+             FfiConverterUInt64.allocationSize(value.length) +
+             FfiConverterOptionalString.allocationSize(value.text);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type ElementPredicate = {
     selector: ElementSelector,
     /**
@@ -1896,7 +1952,8 @@ export type ElementPredicate = {
     exists?: boolean,
     valueEquals?: string,
     enabled?: boolean,
-    selected?: boolean
+    selected?: boolean,
+    textSelection?: TextSelectionPredicate
 }
 
 /**
@@ -1924,7 +1981,8 @@ const FfiConverterTypeElementPredicate = (() => {
                 exists: FfiConverterOptionalBoolean.read(from),
                 valueEquals: FfiConverterOptionalString.read(from),
                 enabled: FfiConverterOptionalBoolean.read(from),
-                selected: FfiConverterOptionalBoolean.read(from)
+                selected: FfiConverterOptionalBoolean.read(from),
+                textSelection: FfiConverterOptionalTypeTextSelectionPredicate.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -1933,13 +1991,15 @@ const FfiConverterTypeElementPredicate = (() => {
             FfiConverterOptionalString.write(value.valueEquals, into);
             FfiConverterOptionalBoolean.write(value.enabled, into);
             FfiConverterOptionalBoolean.write(value.selected, into);
+            FfiConverterOptionalTypeTextSelectionPredicate.write(value.textSelection, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeElementSelector.allocationSize(value.selector) +
              FfiConverterOptionalBoolean.allocationSize(value.exists) +
              FfiConverterOptionalString.allocationSize(value.valueEquals) +
              FfiConverterOptionalBoolean.allocationSize(value.enabled) +
-             FfiConverterOptionalBoolean.allocationSize(value.selected);
+             FfiConverterOptionalBoolean.allocationSize(value.selected) +
+             FfiConverterOptionalTypeTextSelectionPredicate.allocationSize(value.textSelection);
 
         }
     };
@@ -6603,6 +6663,9 @@ const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverter
 // FfiConverter for boolean | undefined
 const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
 
+// FfiConverter for TextSelectionPredicate | undefined
+const FfiConverterOptionalTypeTextSelectionPredicate = new FfiConverterOptional(FfiConverterTypeTextSelectionPredicate);
+
 // FfiConverter for CursorPointOutput | undefined
 const FfiConverterOptionalTypeCursorPointOutput = new FfiConverterOptional(FfiConverterTypeCursorPointOutput);
 
@@ -6835,6 +6898,7 @@ export default Object.freeze({
     FfiConverterTypeStatePredicate,
     FfiConverterTypeSurfaceWindow,
     FfiConverterTypeTextSelection,
+    FfiConverterTypeTextSelectionPredicate,
     FfiConverterTypeTextSelectionRange,
     FfiConverterTypeTypeTextInput,
     FfiConverterTypeUnknownReason,
