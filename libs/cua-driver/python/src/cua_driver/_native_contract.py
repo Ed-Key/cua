@@ -6011,6 +6011,859 @@ class _UniffiFfiConverterTypePressKeyInput(_UniffiConverterRustBuffer):
 
 
 
+class SequenceTool(enum.Enum):
+
+    CLICK = 0
+
+    TYPE_TEXT = 1
+
+
+
+class _UniffiFfiConverterTypeSequenceTool(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return SequenceTool.CLICK
+        if variant == 2:
+            return SequenceTool.TYPE_TEXT
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == SequenceTool.CLICK:
+            return
+        if value == SequenceTool.TYPE_TEXT:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == SequenceTool.CLICK:
+            buf.write_i32(1)
+        if value == SequenceTool.TYPE_TEXT:
+            buf.write_i32(2)
+
+
+
+@dataclass
+class SequenceArguments:
+    def __init__(self, *, x:typing.Optional[float], y:typing.Optional[float], element_token:typing.Optional[str], text:typing.Optional[str]):
+        self.x = x
+        self.y = y
+        self.element_token = element_token
+        self.text = text
+
+
+
+
+    def __str__(self):
+        return "SequenceArguments(x={}, y={}, element_token={}, text={})".format(self.x, self.y, self.element_token, self.text)
+    def __eq__(self, other):
+        if self.x != other.x:
+            return False
+        if self.y != other.y:
+            return False
+        if self.element_token != other.element_token:
+            return False
+        if self.text != other.text:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeSequenceArguments(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return SequenceArguments(
+            x=_UniffiFfiConverterOptionalFloat64.read(buf),
+            y=_UniffiFfiConverterOptionalFloat64.read(buf),
+            element_token=_UniffiFfiConverterOptionalString.read(buf),
+            text=_UniffiFfiConverterOptionalString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterOptionalFloat64.check_lower(value.x)
+        _UniffiFfiConverterOptionalFloat64.check_lower(value.y)
+        _UniffiFfiConverterOptionalString.check_lower(value.element_token)
+        _UniffiFfiConverterOptionalString.check_lower(value.text)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterOptionalFloat64.write(value.x, buf)
+        _UniffiFfiConverterOptionalFloat64.write(value.y, buf)
+        _UniffiFfiConverterOptionalString.write(value.element_token, buf)
+        _UniffiFfiConverterOptionalString.write(value.text, buf)
+
+class _UniffiFfiConverterOptionalTypeBoundsExpectation(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeBoundsExpectation.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeBoundsExpectation.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeBoundsExpectation.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class WindowPredicate:
+    def __init__(self, *, exists:typing.Optional[bool], bounds:typing.Optional[BoundsExpectation]):
+        self.exists = exists
+        self.bounds = bounds
+
+
+
+
+    def __str__(self):
+        return "WindowPredicate(exists={}, bounds={})".format(self.exists, self.bounds)
+    def __eq__(self, other):
+        if self.exists != other.exists:
+            return False
+        if self.bounds != other.bounds:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeWindowPredicate(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return WindowPredicate(
+            exists=_UniffiFfiConverterOptionalBoolean.read(buf),
+            bounds=_UniffiFfiConverterOptionalTypeBoundsExpectation.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.exists)
+        _UniffiFfiConverterOptionalTypeBoundsExpectation.check_lower(value.bounds)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterOptionalBoolean.write(value.exists, buf)
+        _UniffiFfiConverterOptionalTypeBoundsExpectation.write(value.bounds, buf)
+
+class _UniffiFfiConverterOptionalTypeWindowPredicate(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeWindowPredicate.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeWindowPredicate.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeWindowPredicate.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterOptionalTypeElementPredicate(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeElementPredicate.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeElementPredicate.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeElementPredicate.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class StatePredicate:
+    def __init__(self, *, window:typing.Optional[WindowPredicate], element:typing.Optional[ElementPredicate]):
+        self.window = window
+        self.element = element
+
+
+
+
+    def __str__(self):
+        return "StatePredicate(window={}, element={})".format(self.window, self.element)
+    def __eq__(self, other):
+        if self.window != other.window:
+            return False
+        if self.element != other.element:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeStatePredicate(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return StatePredicate(
+            window=_UniffiFfiConverterOptionalTypeWindowPredicate.read(buf),
+            element=_UniffiFfiConverterOptionalTypeElementPredicate.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterOptionalTypeWindowPredicate.check_lower(value.window)
+        _UniffiFfiConverterOptionalTypeElementPredicate.check_lower(value.element)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterOptionalTypeWindowPredicate.write(value.window, buf)
+        _UniffiFfiConverterOptionalTypeElementPredicate.write(value.element, buf)
+
+class _UniffiFfiConverterSequenceTypeStatePredicate(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeStatePredicate.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeStatePredicate.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeStatePredicate.read(buf) for i in range(count)
+        ]
+
+@dataclass
+class SequenceStep:
+    def __init__(self, *, tool:SequenceTool, arguments:SequenceArguments, expect:typing.List[StatePredicate], timeout_ms:typing.Optional[int], stable_samples:typing.Optional[int]):
+        self.tool = tool
+        self.arguments = arguments
+        self.expect = expect
+        self.timeout_ms = timeout_ms
+        self.stable_samples = stable_samples
+
+
+
+
+    def __str__(self):
+        return "SequenceStep(tool={}, arguments={}, expect={}, timeout_ms={}, stable_samples={})".format(self.tool, self.arguments, self.expect, self.timeout_ms, self.stable_samples)
+    def __eq__(self, other):
+        if self.tool != other.tool:
+            return False
+        if self.arguments != other.arguments:
+            return False
+        if self.expect != other.expect:
+            return False
+        if self.timeout_ms != other.timeout_ms:
+            return False
+        if self.stable_samples != other.stable_samples:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeSequenceStep(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return SequenceStep(
+            tool=_UniffiFfiConverterTypeSequenceTool.read(buf),
+            arguments=_UniffiFfiConverterTypeSequenceArguments.read(buf),
+            expect=_UniffiFfiConverterSequenceTypeStatePredicate.read(buf),
+            timeout_ms=_UniffiFfiConverterOptionalUInt64.read(buf),
+            stable_samples=_UniffiFfiConverterOptionalUInt64.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeSequenceTool.check_lower(value.tool)
+        _UniffiFfiConverterTypeSequenceArguments.check_lower(value.arguments)
+        _UniffiFfiConverterSequenceTypeStatePredicate.check_lower(value.expect)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.timeout_ms)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.stable_samples)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeSequenceTool.write(value.tool, buf)
+        _UniffiFfiConverterTypeSequenceArguments.write(value.arguments, buf)
+        _UniffiFfiConverterSequenceTypeStatePredicate.write(value.expect, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.timeout_ms, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.stable_samples, buf)
+
+class _UniffiFfiConverterSequenceTypeSequenceStep(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeSequenceStep.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeSequenceStep.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeSequenceStep.read(buf) for i in range(count)
+        ]
+
+@dataclass
+class RunSequenceInput:
+    def __init__(self, *, pid:int, window_id:int, session:typing.Optional[str], steps:typing.List[SequenceStep]):
+        self.pid = pid
+        self.window_id = window_id
+        self.session = session
+        self.steps = steps
+
+
+
+
+    def __str__(self):
+        return "RunSequenceInput(pid={}, window_id={}, session={}, steps={})".format(self.pid, self.window_id, self.session, self.steps)
+    def __eq__(self, other):
+        if self.pid != other.pid:
+            return False
+        if self.window_id != other.window_id:
+            return False
+        if self.session != other.session:
+            return False
+        if self.steps != other.steps:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeRunSequenceInput(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return RunSequenceInput(
+            pid=_UniffiFfiConverterInt64.read(buf),
+            window_id=_UniffiFfiConverterUInt64.read(buf),
+            session=_UniffiFfiConverterOptionalString.read(buf),
+            steps=_UniffiFfiConverterSequenceTypeSequenceStep.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterInt64.check_lower(value.pid)
+        _UniffiFfiConverterUInt64.check_lower(value.window_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.session)
+        _UniffiFfiConverterSequenceTypeSequenceStep.check_lower(value.steps)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterInt64.write(value.pid, buf)
+        _UniffiFfiConverterUInt64.write(value.window_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.session, buf)
+        _UniffiFfiConverterSequenceTypeSequenceStep.write(value.steps, buf)
+
+
+
+
+
+
+class SequenceStatus(enum.Enum):
+
+    COMPLETED = 0
+
+    STOPPED = 1
+
+
+
+class _UniffiFfiConverterTypeSequenceStatus(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return SequenceStatus.COMPLETED
+        if variant == 2:
+            return SequenceStatus.STOPPED
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == SequenceStatus.COMPLETED:
+            return
+        if value == SequenceStatus.STOPPED:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == SequenceStatus.COMPLETED:
+            buf.write_i32(1)
+        if value == SequenceStatus.STOPPED:
+            buf.write_i32(2)
+
+
+
+
+
+
+
+
+class SequenceStopReason(enum.Enum):
+
+    UNSATISFIED = 0
+
+    UNKNOWN = 1
+
+    ACTION_ERROR = 2
+
+    VERIFICATION_ERROR = 3
+
+
+
+class _UniffiFfiConverterTypeSequenceStopReason(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return SequenceStopReason.UNSATISFIED
+        if variant == 2:
+            return SequenceStopReason.UNKNOWN
+        if variant == 3:
+            return SequenceStopReason.ACTION_ERROR
+        if variant == 4:
+            return SequenceStopReason.VERIFICATION_ERROR
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == SequenceStopReason.UNSATISFIED:
+            return
+        if value == SequenceStopReason.UNKNOWN:
+            return
+        if value == SequenceStopReason.ACTION_ERROR:
+            return
+        if value == SequenceStopReason.VERIFICATION_ERROR:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == SequenceStopReason.UNSATISFIED:
+            buf.write_i32(1)
+        if value == SequenceStopReason.UNKNOWN:
+            buf.write_i32(2)
+        if value == SequenceStopReason.ACTION_ERROR:
+            buf.write_i32(3)
+        if value == SequenceStopReason.VERIFICATION_ERROR:
+            buf.write_i32(4)
+
+
+
+class _UniffiFfiConverterOptionalTypeSequenceStopReason(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeSequenceStopReason.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeSequenceStopReason.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeSequenceStopReason.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterOptionalTypeActionResult(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeActionResult.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeActionResult.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeActionResult.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+class _UniffiFfiConverterSequenceTypePredicateOutcome(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypePredicateOutcome.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypePredicateOutcome.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypePredicateOutcome.read(buf) for i in range(count)
+        ]
+
+@dataclass
+class VerifyStateOutput:
+    def __init__(self, *, status:VerificationStatus, stable:bool, elapsed_ms:int, samples:int, predicates:typing.List[PredicateOutcome]):
+        self.status = status
+        self.stable = stable
+        self.elapsed_ms = elapsed_ms
+        self.samples = samples
+        self.predicates = predicates
+
+
+
+
+    def __str__(self):
+        return "VerifyStateOutput(status={}, stable={}, elapsed_ms={}, samples={}, predicates={})".format(self.status, self.stable, self.elapsed_ms, self.samples, self.predicates)
+    def __eq__(self, other):
+        if self.status != other.status:
+            return False
+        if self.stable != other.stable:
+            return False
+        if self.elapsed_ms != other.elapsed_ms:
+            return False
+        if self.samples != other.samples:
+            return False
+        if self.predicates != other.predicates:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeVerifyStateOutput(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return VerifyStateOutput(
+            status=_UniffiFfiConverterTypeVerificationStatus.read(buf),
+            stable=_UniffiFfiConverterBoolean.read(buf),
+            elapsed_ms=_UniffiFfiConverterUInt64.read(buf),
+            samples=_UniffiFfiConverterUInt64.read(buf),
+            predicates=_UniffiFfiConverterSequenceTypePredicateOutcome.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeVerificationStatus.check_lower(value.status)
+        _UniffiFfiConverterBoolean.check_lower(value.stable)
+        _UniffiFfiConverterUInt64.check_lower(value.elapsed_ms)
+        _UniffiFfiConverterUInt64.check_lower(value.samples)
+        _UniffiFfiConverterSequenceTypePredicateOutcome.check_lower(value.predicates)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeVerificationStatus.write(value.status, buf)
+        _UniffiFfiConverterBoolean.write(value.stable, buf)
+        _UniffiFfiConverterUInt64.write(value.elapsed_ms, buf)
+        _UniffiFfiConverterUInt64.write(value.samples, buf)
+        _UniffiFfiConverterSequenceTypePredicateOutcome.write(value.predicates, buf)
+
+class _UniffiFfiConverterOptionalTypeVerifyStateOutput(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeVerifyStateOutput.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeVerifyStateOutput.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeVerifyStateOutput.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class SequenceError:
+    def __init__(self, *, code:str, message:str):
+        self.code = code
+        self.message = message
+
+
+
+
+    def __str__(self):
+        return "SequenceError(code={}, message={})".format(self.code, self.message)
+    def __eq__(self, other):
+        if self.code != other.code:
+            return False
+        if self.message != other.message:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeSequenceError(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return SequenceError(
+            code=_UniffiFfiConverterString.read(buf),
+            message=_UniffiFfiConverterString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.code)
+        _UniffiFfiConverterString.check_lower(value.message)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.code, buf)
+        _UniffiFfiConverterString.write(value.message, buf)
+
+class _UniffiFfiConverterOptionalTypeSequenceError(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeSequenceError.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeSequenceError.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeSequenceError.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class SequenceStepOutput:
+    def __init__(self, *, index:int, tool:SequenceTool, action:typing.Optional[ActionResult], verification:typing.Optional[VerifyStateOutput], error:typing.Optional[SequenceError], dispatch_ms:int, verification_ms:int, observation_count:int, image_bytes_returned:int):
+        self.index = index
+        self.tool = tool
+        self.action = action
+        self.verification = verification
+        self.error = error
+        self.dispatch_ms = dispatch_ms
+        self.verification_ms = verification_ms
+        self.observation_count = observation_count
+        self.image_bytes_returned = image_bytes_returned
+
+
+
+
+    def __str__(self):
+        return "SequenceStepOutput(index={}, tool={}, action={}, verification={}, error={}, dispatch_ms={}, verification_ms={}, observation_count={}, image_bytes_returned={})".format(self.index, self.tool, self.action, self.verification, self.error, self.dispatch_ms, self.verification_ms, self.observation_count, self.image_bytes_returned)
+    def __eq__(self, other):
+        if self.index != other.index:
+            return False
+        if self.tool != other.tool:
+            return False
+        if self.action != other.action:
+            return False
+        if self.verification != other.verification:
+            return False
+        if self.error != other.error:
+            return False
+        if self.dispatch_ms != other.dispatch_ms:
+            return False
+        if self.verification_ms != other.verification_ms:
+            return False
+        if self.observation_count != other.observation_count:
+            return False
+        if self.image_bytes_returned != other.image_bytes_returned:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeSequenceStepOutput(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return SequenceStepOutput(
+            index=_UniffiFfiConverterUInt64.read(buf),
+            tool=_UniffiFfiConverterTypeSequenceTool.read(buf),
+            action=_UniffiFfiConverterOptionalTypeActionResult.read(buf),
+            verification=_UniffiFfiConverterOptionalTypeVerifyStateOutput.read(buf),
+            error=_UniffiFfiConverterOptionalTypeSequenceError.read(buf),
+            dispatch_ms=_UniffiFfiConverterUInt64.read(buf),
+            verification_ms=_UniffiFfiConverterUInt64.read(buf),
+            observation_count=_UniffiFfiConverterUInt64.read(buf),
+            image_bytes_returned=_UniffiFfiConverterUInt64.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterUInt64.check_lower(value.index)
+        _UniffiFfiConverterTypeSequenceTool.check_lower(value.tool)
+        _UniffiFfiConverterOptionalTypeActionResult.check_lower(value.action)
+        _UniffiFfiConverterOptionalTypeVerifyStateOutput.check_lower(value.verification)
+        _UniffiFfiConverterOptionalTypeSequenceError.check_lower(value.error)
+        _UniffiFfiConverterUInt64.check_lower(value.dispatch_ms)
+        _UniffiFfiConverterUInt64.check_lower(value.verification_ms)
+        _UniffiFfiConverterUInt64.check_lower(value.observation_count)
+        _UniffiFfiConverterUInt64.check_lower(value.image_bytes_returned)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterUInt64.write(value.index, buf)
+        _UniffiFfiConverterTypeSequenceTool.write(value.tool, buf)
+        _UniffiFfiConverterOptionalTypeActionResult.write(value.action, buf)
+        _UniffiFfiConverterOptionalTypeVerifyStateOutput.write(value.verification, buf)
+        _UniffiFfiConverterOptionalTypeSequenceError.write(value.error, buf)
+        _UniffiFfiConverterUInt64.write(value.dispatch_ms, buf)
+        _UniffiFfiConverterUInt64.write(value.verification_ms, buf)
+        _UniffiFfiConverterUInt64.write(value.observation_count, buf)
+        _UniffiFfiConverterUInt64.write(value.image_bytes_returned, buf)
+
+class _UniffiFfiConverterSequenceTypeSequenceStepOutput(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeSequenceStepOutput.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeSequenceStepOutput.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeSequenceStepOutput.read(buf) for i in range(count)
+        ]
+
+@dataclass
+class RunSequenceOutput:
+    def __init__(self, *, status:SequenceStatus, stopped_at:typing.Optional[int], stop_reason:typing.Optional[SequenceStopReason], elapsed_ms:int, executor_overhead_ms:int, steps:typing.List[SequenceStepOutput]):
+        self.status = status
+        self.stopped_at = stopped_at
+        self.stop_reason = stop_reason
+        self.elapsed_ms = elapsed_ms
+        self.executor_overhead_ms = executor_overhead_ms
+        self.steps = steps
+
+
+
+
+    def __str__(self):
+        return "RunSequenceOutput(status={}, stopped_at={}, stop_reason={}, elapsed_ms={}, executor_overhead_ms={}, steps={})".format(self.status, self.stopped_at, self.stop_reason, self.elapsed_ms, self.executor_overhead_ms, self.steps)
+    def __eq__(self, other):
+        if self.status != other.status:
+            return False
+        if self.stopped_at != other.stopped_at:
+            return False
+        if self.stop_reason != other.stop_reason:
+            return False
+        if self.elapsed_ms != other.elapsed_ms:
+            return False
+        if self.executor_overhead_ms != other.executor_overhead_ms:
+            return False
+        if self.steps != other.steps:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeRunSequenceOutput(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return RunSequenceOutput(
+            status=_UniffiFfiConverterTypeSequenceStatus.read(buf),
+            stopped_at=_UniffiFfiConverterOptionalUInt64.read(buf),
+            stop_reason=_UniffiFfiConverterOptionalTypeSequenceStopReason.read(buf),
+            elapsed_ms=_UniffiFfiConverterUInt64.read(buf),
+            executor_overhead_ms=_UniffiFfiConverterUInt64.read(buf),
+            steps=_UniffiFfiConverterSequenceTypeSequenceStepOutput.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeSequenceStatus.check_lower(value.status)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.stopped_at)
+        _UniffiFfiConverterOptionalTypeSequenceStopReason.check_lower(value.stop_reason)
+        _UniffiFfiConverterUInt64.check_lower(value.elapsed_ms)
+        _UniffiFfiConverterUInt64.check_lower(value.executor_overhead_ms)
+        _UniffiFfiConverterSequenceTypeSequenceStepOutput.check_lower(value.steps)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeSequenceStatus.write(value.status, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.stopped_at, buf)
+        _UniffiFfiConverterOptionalTypeSequenceStopReason.write(value.stop_reason, buf)
+        _UniffiFfiConverterUInt64.write(value.elapsed_ms, buf)
+        _UniffiFfiConverterUInt64.write(value.executor_overhead_ms, buf)
+        _UniffiFfiConverterSequenceTypeSequenceStepOutput.write(value.steps, buf)
+
+
+
+
+
+
 class ScrollDirection(enum.Enum):
 
     UP = 0
@@ -6890,153 +7743,6 @@ class _UniffiFfiConverterTypeStartSessionOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.active, buf)
         _UniffiFfiConverterBoolean.write(value.revived, buf)
 
-class _UniffiFfiConverterOptionalTypeBoundsExpectation(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterTypeBoundsExpectation.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterTypeBoundsExpectation.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterTypeBoundsExpectation.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-@dataclass
-class WindowPredicate:
-    def __init__(self, *, exists:typing.Optional[bool], bounds:typing.Optional[BoundsExpectation]):
-        self.exists = exists
-        self.bounds = bounds
-
-
-
-
-    def __str__(self):
-        return "WindowPredicate(exists={}, bounds={})".format(self.exists, self.bounds)
-    def __eq__(self, other):
-        if self.exists != other.exists:
-            return False
-        if self.bounds != other.bounds:
-            return False
-        return True
-
-class _UniffiFfiConverterTypeWindowPredicate(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        return WindowPredicate(
-            exists=_UniffiFfiConverterOptionalBoolean.read(buf),
-            bounds=_UniffiFfiConverterOptionalTypeBoundsExpectation.read(buf),
-        )
-
-    @staticmethod
-    def check_lower(value):
-        _UniffiFfiConverterOptionalBoolean.check_lower(value.exists)
-        _UniffiFfiConverterOptionalTypeBoundsExpectation.check_lower(value.bounds)
-
-    @staticmethod
-    def write(value, buf):
-        _UniffiFfiConverterOptionalBoolean.write(value.exists, buf)
-        _UniffiFfiConverterOptionalTypeBoundsExpectation.write(value.bounds, buf)
-
-class _UniffiFfiConverterOptionalTypeWindowPredicate(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterTypeWindowPredicate.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterTypeWindowPredicate.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterTypeWindowPredicate.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-class _UniffiFfiConverterOptionalTypeElementPredicate(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterTypeElementPredicate.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterTypeElementPredicate.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterTypeElementPredicate.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-@dataclass
-class StatePredicate:
-    def __init__(self, *, window:typing.Optional[WindowPredicate], element:typing.Optional[ElementPredicate]):
-        self.window = window
-        self.element = element
-
-
-
-
-    def __str__(self):
-        return "StatePredicate(window={}, element={})".format(self.window, self.element)
-    def __eq__(self, other):
-        if self.window != other.window:
-            return False
-        if self.element != other.element:
-            return False
-        return True
-
-class _UniffiFfiConverterTypeStatePredicate(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        return StatePredicate(
-            window=_UniffiFfiConverterOptionalTypeWindowPredicate.read(buf),
-            element=_UniffiFfiConverterOptionalTypeElementPredicate.read(buf),
-        )
-
-    @staticmethod
-    def check_lower(value):
-        _UniffiFfiConverterOptionalTypeWindowPredicate.check_lower(value.window)
-        _UniffiFfiConverterOptionalTypeElementPredicate.check_lower(value.element)
-
-    @staticmethod
-    def write(value, buf):
-        _UniffiFfiConverterOptionalTypeWindowPredicate.write(value.window, buf)
-        _UniffiFfiConverterOptionalTypeElementPredicate.write(value.element, buf)
-
 @dataclass
 class TypeTextInput:
     def __init__(self, *, text:str, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str]):
@@ -7084,29 +7790,6 @@ class _UniffiFfiConverterTypeTypeTextInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalTypeActionTarget.write(value.target, buf)
         _UniffiFfiConverterOptionalTypeDesktopScope.write(value.scope, buf)
         _UniffiFfiConverterOptionalString.write(value.session, buf)
-
-class _UniffiFfiConverterSequenceTypeStatePredicate(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        for item in value:
-            _UniffiFfiConverterTypeStatePredicate.check_lower(item)
-
-    @classmethod
-    def write(cls, value, buf):
-        items = len(value)
-        buf.write_i32(items)
-        for item in value:
-            _UniffiFfiConverterTypeStatePredicate.write(item, buf)
-
-    @classmethod
-    def read(cls, buf):
-        count = buf.read_i32()
-        if count < 0:
-            raise InternalError("Unexpected negative sequence length")
-
-        return [
-            _UniffiFfiConverterTypeStatePredicate.read(buf) for i in range(count)
-        ]
 
 @dataclass
 class VerifyStateInput:
@@ -7173,83 +7856,6 @@ class _UniffiFfiConverterTypeVerifyStateInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalUInt64.write(value.timeout_ms, buf)
         _UniffiFfiConverterOptionalUInt64.write(value.stable_samples, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.include_screenshot, buf)
-
-class _UniffiFfiConverterSequenceTypePredicateOutcome(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        for item in value:
-            _UniffiFfiConverterTypePredicateOutcome.check_lower(item)
-
-    @classmethod
-    def write(cls, value, buf):
-        items = len(value)
-        buf.write_i32(items)
-        for item in value:
-            _UniffiFfiConverterTypePredicateOutcome.write(item, buf)
-
-    @classmethod
-    def read(cls, buf):
-        count = buf.read_i32()
-        if count < 0:
-            raise InternalError("Unexpected negative sequence length")
-
-        return [
-            _UniffiFfiConverterTypePredicateOutcome.read(buf) for i in range(count)
-        ]
-
-@dataclass
-class VerifyStateOutput:
-    def __init__(self, *, status:VerificationStatus, stable:bool, elapsed_ms:int, samples:int, predicates:typing.List[PredicateOutcome]):
-        self.status = status
-        self.stable = stable
-        self.elapsed_ms = elapsed_ms
-        self.samples = samples
-        self.predicates = predicates
-
-
-
-
-    def __str__(self):
-        return "VerifyStateOutput(status={}, stable={}, elapsed_ms={}, samples={}, predicates={})".format(self.status, self.stable, self.elapsed_ms, self.samples, self.predicates)
-    def __eq__(self, other):
-        if self.status != other.status:
-            return False
-        if self.stable != other.stable:
-            return False
-        if self.elapsed_ms != other.elapsed_ms:
-            return False
-        if self.samples != other.samples:
-            return False
-        if self.predicates != other.predicates:
-            return False
-        return True
-
-class _UniffiFfiConverterTypeVerifyStateOutput(_UniffiConverterRustBuffer):
-    @staticmethod
-    def read(buf):
-        return VerifyStateOutput(
-            status=_UniffiFfiConverterTypeVerificationStatus.read(buf),
-            stable=_UniffiFfiConverterBoolean.read(buf),
-            elapsed_ms=_UniffiFfiConverterUInt64.read(buf),
-            samples=_UniffiFfiConverterUInt64.read(buf),
-            predicates=_UniffiFfiConverterSequenceTypePredicateOutcome.read(buf),
-        )
-
-    @staticmethod
-    def check_lower(value):
-        _UniffiFfiConverterTypeVerificationStatus.check_lower(value.status)
-        _UniffiFfiConverterBoolean.check_lower(value.stable)
-        _UniffiFfiConverterUInt64.check_lower(value.elapsed_ms)
-        _UniffiFfiConverterUInt64.check_lower(value.samples)
-        _UniffiFfiConverterSequenceTypePredicateOutcome.check_lower(value.predicates)
-
-    @staticmethod
-    def write(value, buf):
-        _UniffiFfiConverterTypeVerificationStatus.write(value.status, buf)
-        _UniffiFfiConverterBoolean.write(value.stable, buf)
-        _UniffiFfiConverterUInt64.write(value.elapsed_ms, buf)
-        _UniffiFfiConverterUInt64.write(value.samples, buf)
-        _UniffiFfiConverterSequenceTypePredicateOutcome.write(value.predicates, buf)
 
 
 
@@ -7942,6 +8548,9 @@ __all__ = [
     "VisualActionCoordinateSpace",
     "VerificationStatus",
     "UnknownReason",
+    "SequenceTool",
+    "SequenceStatus",
+    "SequenceStopReason",
     "ScrollDirection",
     "ScrollBy",
     "CaptureScope",
@@ -8004,6 +8613,15 @@ __all__ = [
     "ParseVisualRegionsOutput",
     "PredicateOutcome",
     "PressKeyInput",
+    "SequenceArguments",
+    "WindowPredicate",
+    "StatePredicate",
+    "SequenceStep",
+    "RunSequenceInput",
+    "VerifyStateOutput",
+    "SequenceError",
+    "SequenceStepOutput",
+    "RunSequenceOutput",
     "ScrollInput",
     "SessionStateOutput",
     "SetAgentCursorEnabledInput",
@@ -8016,11 +8634,8 @@ __all__ = [
     "SnapshotImage",
     "StartSessionInput",
     "StartSessionOutput",
-    "WindowPredicate",
-    "StatePredicate",
     "TypeTextInput",
     "VerifyStateInput",
-    "VerifyStateOutput",
     "VisualParseError",
     "WindowElement",
     "WindowStateOutput",
