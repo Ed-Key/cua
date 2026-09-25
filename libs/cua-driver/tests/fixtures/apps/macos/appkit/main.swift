@@ -55,13 +55,98 @@ let kSecondaryWindowTitle = "CuaTestHarness AppKit Secondary"
 let kSheetWindowTitle = "CuaTestHarness AppKit Sheet"
 let kFloatingWindowTitle = "CuaTestHarness AppKit Floating"
 
+// MARK: - Controls
+
+/// An `NSTextField` whose `AXValue` catches up with the text it holds only
+/// after `CUA_APPKIT_AX_VALUE_LAG_MS`, growing a character at a time.
+///
+/// AppKit rebuilds a field's editor around an insertion, so the value read
+/// microseconds after an `AXSelectedText` write is a prefix of what landed:
+/// measured in Contacts, "(408) " of "(408) 961-1560", complete ~20 ms later.
+/// Unset, the field behaves like a stock `NSTextField`.
+final class LaggingTextField: NSTextField {
+    private var reported = ""
+    private var changedAt: Date?
+
+    override func accessibilityValue() -> String? {
+        let actual = stringValue
+        let lag = HarnessWindowController.envSeconds("CUA_APPKIT_AX_VALUE_LAG_MS")
+        let unreadable = ProcessInfo.processInfo.environment["CUA_APPKIT_AX_VALUE_UNREADABLE"] == "1"
+        guard lag > 0 || unreadable else { return actual }
+        if actual != reported {
+            reported = actual
+            changedAt = Date()
+        }
+        guard let changedAt, !actual.isEmpty else { return actual }
+        let elapsed = Date().timeIntervalSince(changedAt)
+        let value: String?
+        if unreadable {
+            value = nil
+        } else {
+            let visible = max(1, Int(Double(actual.count) * elapsed / lag))
+            value = elapsed >= lag ? actual : String(actual.prefix(visible))
+        }
+        if let path = ProcessInfo.processInfo.environment["CUA_APPKIT_AX_VALUE_TRACE"],
+           let data = try? JSONSerialization.data(withJSONObject: ["actual": actual, "reported": value.map { $0 as Any } ?? NSNull(), "elapsed": elapsed]) {
+            let line = data + Data([10])
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(line)
+                handle.closeFile()
+            } else {
+                try? line.write(to: URL(fileURLWithPath: path))
+            }
+        }
+        return value
+    }
+}
+
+final class WindowDiscoveryApplication: NSApplication {
+    private var discoveryMode: String? {
+        ProcessInfo.processInfo.environment["CUA_HARNESS_AX_WINDOW_DISCOVERY"]
+    }
+
+    override func accessibilityWindows() -> [Any]? {
+        guard let mode = discoveryMode else { return super.accessibilityWindows() }
+        if mode == "listed-sibling" {
+            // AppKit can clear mainWindow when the sentinel takes focus. Keep
+            // the intended target absent from AXWindows throughout the test.
+            return super.accessibilityWindows()?.filter {
+                ($0 as? NSWindow)?.accessibilityIdentifier() != kWindowAID
+            }
+        }
+        return []
+    }
+
+    override func accessibilityChildren() -> [Any]? {
+        guard discoveryMode != nil else { return super.accessibilityChildren() }
+        return super.accessibilityChildren()?.filter { !($0 is NSWindow) }
+    }
+
+    override func accessibilityMainWindow() -> Any? {
+        switch discoveryMode {
+        case "focused", "none": return nil
+        case "invalid": return self
+        default: return super.accessibilityMainWindow()
+        }
+    }
+
+    override func accessibilityFocusedWindow() -> Any? {
+        switch discoveryMode {
+        case "main", "none", "invalid": return nil
+        default: return super.accessibilityFocusedWindow()
+        }
+    }
+}
+
 // MARK: - Controller
 
 final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
+    private var editorIdentity: EditorIdentityFixture?
     let window: NSWindow
     let counterLabel = NSTextField(labelWithString: "counter=0")
     var counterValue = 0
-    let textInput = NSTextField(string: "")
+    let textInput = LaggingTextField(string: "")
     let textInputMirror = NSTextField(labelWithString: "")
     let textInputCommit = NSTextField(labelWithString: "committed=none")
     let lastActionLabel = NSTextField(labelWithString: "last_action=none")
@@ -168,6 +253,11 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
             textInput.widthAnchor.constraint(equalToConstant: 240),
         ])
         content.addArrangedSubview(inputRow)
+
+        if let fixture = EditorIdentityFixture(environment: ProcessInfo.processInfo.environment) {
+            editorIdentity = fixture
+            content.addArrangedSubview(fixture.row)
+        }
 
         // click_target — a REAL NSButton so it is in the AX tree and addressable
         // by element_index (AppKit NSButton ignores synthetic pixel clicks, but
@@ -370,6 +460,13 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         counterLabel.stringValue = "counter=\(counterValue)"
     }
 
+    /// Milliseconds from `name`, as seconds. Absent or unparseable is 0.
+    static func envSeconds(_ name: String) -> TimeInterval {
+        guard let raw = ProcessInfo.processInfo.environment[name],
+              let ms = Double(raw), ms > 0 else { return 0 }
+        return ms / 1000
+    }
+
     @objc private func onReset() {
         counterValue = 0
         counterLabel.stringValue = "counter=0"
@@ -503,21 +600,52 @@ final class ClickTargetButton: NSButton {
 }
 
 // Opt-in windows for the persistent exact-window activation certification.
-// Ordinary harness launches remain byte-for-byte and behaviorally unchanged.
-final class BringToFrontMatrixWindows {
+// Ordinary harness launches keep the existing window layout and behavior.
+final class BringToFrontMatrixWindows: NSObject, NSTextFieldDelegate {
     let secondary: NSWindow
     var sheet: NSWindow?
     var floating: NSPanel?
+    private var editField: NSTextField?
+    private let editMirror = NSTextField(labelWithString: "")
+    private let editCommit = NSTextField(labelWithString: "committed=none")
 
     init(parent: NSWindow, mode: String) {
         secondary = NSWindow(
             contentRect: NSRect(x: 40, y: 40, width: 420, height: 240),
             styleMask: [.titled, .closable], backing: .buffered, defer: false)
+        super.init()
         secondary.title = kSecondaryWindowTitle
         secondary.isReleasedWhenClosed = false
         secondary.isRestorable = false
         secondary.contentView = NSTextField(labelWithString: "bring_to_front secondary ordinary window")
+        if mode == "editable" {
+            let content = NSView(frame: NSRect(x: 0, y: 0, width: 420, height: 240))
+            let field = NSTextField(string: "")
+            field.frame = NSRect(x: 20, y: 180, width: 380, height: 24)
+            field.setAccessibilityIdentifier("txt-sibling-input")
+            field.delegate = self
+            editField = field
+            editMirror.frame = NSRect(x: 20, y: 140, width: 380, height: 24)
+            editMirror.setAccessibilityIdentifier("lbl-sibling-mirror")
+            editCommit.frame = NSRect(x: 20, y: 100, width: 380, height: 24)
+            editCommit.setAccessibilityIdentifier("lbl-sibling-commit")
+            let endEdit = NSButton(title: "End sibling edit", target: self,
+                                   action: #selector(endSiblingEdit))
+            endEdit.frame = NSRect(x: 20, y: 40, width: 180, height: 32)
+            endEdit.setAccessibilityIdentifier("btn-sibling-end-edit")
+            for view in [field, editMirror, editCommit, endEdit] { content.addSubview(view) }
+            secondary.contentView = content
+        }
         secondary.orderFront(nil)
+        if mode == "editable",
+           let draft = ProcessInfo.processInfo.environment["CUA_HARNESS_SIBLING_DRAFT"],
+           let field = editField {
+            // Seed a real, uncommitted edit before agent observation begins.
+            // Let AppKit deliver its normal delegate callback to the mirror.
+            field.selectText(nil)
+            guard let editor = field.currentEditor() else { fatalError("missing sibling field editor") }
+            editor.insertText(draft)
+        }
 
         if mode == "sheet" {
             let candidate = NSWindow(
@@ -539,6 +667,21 @@ final class BringToFrontMatrixWindows {
             floating = candidate
         }
     }
+
+    func controlTextDidChange(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField, field === editField else { return }
+        editMirror.stringValue = field.stringValue
+    }
+
+    func controlTextDidEndEditing(_ notification: Notification) {
+        guard let field = notification.object as? NSTextField, field === editField else { return }
+        editCommit.stringValue = "committed=\(field.stringValue)"
+    }
+
+    @objc private func endSiblingEdit() {
+        secondary.makeFirstResponder(nil)
+    }
+
 }
 
 func writeBringToFrontWindowReport(
@@ -646,7 +789,7 @@ final class SingleClickReceiver: NSView {
 @main
 struct CuaAppKitHarness {
     static func main() {
-        let app = NSApplication.shared
+        let app = WindowDiscoveryApplication.shared
         app.setActivationPolicy(.regular)
         if let directory = ProcessInfo.processInfo.environment["CUA_APPKIT_SNAPSHOT_DIR"] {
             let fixture = SnapshotPublicationFixture(directory: URL(fileURLWithPath: directory))
@@ -680,6 +823,8 @@ struct CuaAppKitHarness {
         var matrixWindows: BringToFrontMatrixWindows?
         if let mode = ProcessInfo.processInfo.environment["CUA_HARNESS_BRING_TO_FRONT_MODE"] {
             matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: mode)
+        } else if ProcessInfo.processInfo.environment["CUA_HARNESS_AX_WINDOW_DISCOVERY"] == "listed-sibling" {
+            matrixWindows = BringToFrontMatrixWindows(parent: controller.window, mode: "normal")
         }
         app.activate(ignoringOtherApps: true)
         writeBringToFrontWindowReport(main: controller.window, matrix: matrixWindows)
