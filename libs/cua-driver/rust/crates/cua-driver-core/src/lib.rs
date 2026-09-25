@@ -88,6 +88,7 @@ pub mod session_tools;
 #[cfg(test)]
 pub(crate) mod snapshot_test_support;
 pub mod socket_io;
+pub mod text_insertion;
 pub mod text_sanitize;
 pub mod tool;
 pub mod tool_args;
