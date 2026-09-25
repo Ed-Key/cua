@@ -1067,12 +1067,7 @@ fn harness_appkit_element_foreground_press_key_commits_edit() {
                 "foreground press_key reported the wrong delivery: {}",
                 commit.raw
             );
-            assert_eq!(
-                commit.action_effect(),
-                Some("unverifiable"),
-                "press_key claimed more truth than the tool itself observed: {}",
-                commit.raw
-            );
+            assert_honest_return_effect(&commit);
 
             std::thread::sleep(Duration::from_millis(250));
             let post = snapshot_elements(driver, pid, wid);
@@ -1084,6 +1079,32 @@ fn harness_appkit_element_foreground_press_key_commits_edit() {
             Observation::delivered_with_fixture_state(Vec::new())
         },
     );
+}
+
+/// Return on a text field: `unverifiable` unless the tool itself saw the same
+/// native element change. Committing an AppKit field changes its selection,
+/// so `confirmed` with value_readback evidence is honest too. Each caller then
+/// proves the commit through the fixture, so a false `confirmed` still fails.
+#[track_caller]
+fn assert_honest_return_effect(result: &ToolResponse) {
+    match result.action_effect() {
+        Some("unverifiable") => {}
+        Some("confirmed") => {
+            let evidence = result.structured()["evidence"].clone();
+            let kinds: Vec<_> = evidence
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter_map(|e| e["kind"].as_str())
+                .collect();
+            assert!(
+                !kinds.is_empty() && kinds.iter().all(|k| *k == "value_readback"),
+                "confirmed needs the tool's own readback: {}",
+                result.raw
+            );
+        }
+        other => panic!("press_key claimed {other:?}: {}", result.raw),
+    }
 }
 
 #[test]
@@ -1154,7 +1175,7 @@ fn harness_appkit_px_background_press_key_reports_honest_delivery_truth() {
                 );
                 assert_eq!(pressed.action_route(), Some("synthetic_events"));
                 assert_eq!(pressed.action_delivery_mode(), Some("background"));
-                assert_eq!(pressed.action_effect(), Some("unverifiable"));
+                assert_honest_return_effect(&pressed);
                 assert!(
                     pressed.structured()["escalation"].is_null(),
                     "accepted post without a positive oracle must not claim delivery_failed: {}",
