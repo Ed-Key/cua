@@ -2071,11 +2071,12 @@ fn run_background_case_with_env(
 }
 
 /// Focus theft: pressing btn-steal makes the fixture take focus `delay_ms`
-/// later, the way an app reacting to a click often does. A reactive defense
-/// cannot promise the user's window never blurs (the thief acts first), so
-/// the bar is what "undone" means: the thief is no longer active 100ms after
-/// it took focus (its own trace) and the user's app is in front afterwards.
-/// The no-theft raw click keeps the strict never-blur sentinel.
+/// later, the way an app reacting to a click often does. All background
+/// oracles apply (cursor, stacking, leaked input, liveness), and focus with
+/// a 150ms recovery budget: a reactive defense acts after the thief, so the
+/// user's window may blur for an instant, but it must be back within the
+/// budget. The thief's own trace must also show it lost focus within 100ms.
+/// The body waits past the theft so a late one lands before the oracles run.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TheftRoute {
     /// AX press on btn-steal.
@@ -2086,13 +2087,13 @@ enum TheftRoute {
     Raw,
 }
 
-fn run_focus_theft_case(delay_ms: u64, targeting: TheftRoute) {
+fn run_focus_theft_case(delay_ms: u64, route: TheftRoute) {
     let journal = tempfile::tempdir().unwrap();
     let trace = journal.path().join("thief.jsonl");
     let pointer = journal.path().join("pointer.jsonl");
     std::fs::write(&pointer, "").unwrap();
     let delay = delay_ms.to_string();
-    let raw = targeting == TheftRoute::Raw;
+    let raw = route == TheftRoute::Raw;
     let mut env = vec![
         ("CUA_APPKIT_THIEF_DELAY_MS", delay.as_str()),
         ("CUA_APPKIT_THIEF_TRACE", trace.to_str().unwrap()),
@@ -2100,62 +2101,62 @@ fn run_focus_theft_case(delay_ms: u64, targeting: TheftRoute) {
     if raw {
         env.push(("CUA_APPKIT_POINTER_ORACLE", pointer.to_str().unwrap()));
     }
-    let mut driver = McpDriver::spawn_macos_daemon_proxy_named(&format!("appkit-focus-theft-{delay_ms}"))
-        .expect("start macOS daemon proxy");
-    let harness = Harness::launch_with_env(&env);
-    let (wid, _) = driver
-        .find_window(harness.pid as i64, "CuaTestHarness AppKit")
-        .expect("find harness window");
-    let _sentinel = cua_driver_testkit::sentinel::ForegroundSentinel::launch(&mut driver);
-    std::thread::sleep(Duration::from_millis(500));
-    let user_app = front_pid().expect("front app");
-    assert_ne!(user_app, harness.pid, "the user's app must start in front");
-    let response = if targeting == TheftRoute::Ax {
-        let pre = snapshot_elements(&mut driver, harness.pid, wid);
-        let token = element_token_by_id(&pre, "btn-steal");
-        driver.call(
-            "click",
-            serde_json::json!({
-                "pid": harness.pid as i64, "window_id": wid,
-                "element_token": token, "delivery_mode": "background"
-            }),
-        )
-    } else {
-        let pre = driver.call(
-            "get_window_state",
-            serde_json::json!({"pid": harness.pid as i64, "window_id": wid, "diff": false}),
-        );
-        let (x, y) = if raw {
-            (
-                pre.structured()["screenshot_width"].as_f64().expect("width") / 2.0,
-                pre.structured()["screenshot_height"].as_f64().expect("height") / 2.0,
-            )
-        } else {
-            let (x, y, width, height) = element_pixel_frame(&pre, "btn-steal");
-            (x + width / 2.0, y + height / 2.0)
-        };
-        driver.call(
-            "click",
-            serde_json::json!({
-                "pid": harness.pid as i64, "window_id": wid,
-                "x": x, "y": y, "delivery_mode": "background"
-            }),
-        )
-    };
-    assert!(!response.is_error(), "steal click: {}", response.raw);
-    std::thread::sleep(Duration::from_millis(delay_ms + 700));
-    if raw {
-        let events = std::fs::read_to_string(&pointer).unwrap();
-        assert!(events.contains("\"kind\":\"down\""), "not delivered as raw events: {events}");
-    }
-    let raw_trace = std::fs::read_to_string(&trace)
-        .expect("the fixture never tried to take focus: the click did not land");
-    eprintln!("focus theft delay={delay_ms}ms targeting={targeting:?}; trace={raw_trace}");
-    assert!(
-        raw_trace.contains("\"active_after_100ms\":false"),
-        "the thief still held focus 100ms after taking it: {raw_trace}"
+    cua_driver_testkit::sentinel::set_blur_recovery_budget(Some(Duration::from_millis(150)));
+    let name = format!("focus_theft_{delay_ms}ms_{route:?}").to_lowercase();
+    run_background_case_with_env(
+        &name,
+        if route == TheftRoute::Ax { Targeting::Ax } else { Targeting::Px },
+        if raw { DriverRoute::MacosCgEventPid } else { DriverRoute::MacosAxAction },
+        &env,
+        |pid, wid, driver| {
+            let response = if route == TheftRoute::Ax {
+                let pre = snapshot_elements(driver, pid, wid);
+                let token = element_token_by_id(&pre, "btn-steal");
+                driver.call(
+                    "click",
+                    serde_json::json!({
+                        "pid": pid as i64, "window_id": wid,
+                        "element_token": token, "delivery_mode": "background"
+                    }),
+                )
+            } else {
+                let pre = driver.call(
+                    "get_window_state",
+                    serde_json::json!({"pid": pid as i64, "window_id": wid, "diff": false}),
+                );
+                let (x, y) = if raw {
+                    (
+                        pre.structured()["screenshot_width"].as_f64().expect("width") / 2.0,
+                        pre.structured()["screenshot_height"].as_f64().expect("height") / 2.0,
+                    )
+                } else {
+                    let (x, y, width, height) = element_pixel_frame(&pre, "btn-steal");
+                    (x + width / 2.0, y + height / 2.0)
+                };
+                driver.call(
+                    "click",
+                    serde_json::json!({
+                        "pid": pid as i64, "window_id": wid,
+                        "x": x, "y": y, "delivery_mode": "background"
+                    }),
+                )
+            };
+            assert!(!response.is_error(), "steal click: {}", response.raw);
+            std::thread::sleep(Duration::from_millis(delay_ms + 700));
+            if raw {
+                let events = std::fs::read_to_string(&pointer).unwrap();
+                assert!(events.contains("\"kind\":\"down\""), "not delivered as raw events: {events}");
+            }
+            let raw_trace = std::fs::read_to_string(&trace)
+                .expect("the fixture never tried to take focus: the click did not land");
+            eprintln!("focus theft delay={delay_ms}ms route={route:?}; trace={raw_trace}");
+            assert!(
+                raw_trace.contains("\"active_after_100ms\":false"),
+                "the thief still held focus 100ms after taking it: {raw_trace}"
+            );
+        },
     );
-    assert_eq!(front_pid(), Some(user_app), "the user's app is not back in front");
+    cua_driver_testkit::sentinel::set_blur_recovery_budget(None);
 }
 
 fn run_raw_focus_theft_case(delay_ms: u64) {
@@ -2295,6 +2296,71 @@ fn real_busy_user(around: CGPoint) {
     }
 }
 
+/// Center of a Dock item, read through accessibility (Dock > AXList >
+/// item titled `title`). The way a person switches apps, and immune to
+/// desktop widgets or covering windows.
+fn dock_item_center(title: &str) -> Option<CGPoint> {
+    use core_foundation::array::CFArray;
+    use core_foundation::base::{CFType, TCFType};
+    use core_foundation::string::CFString;
+    type Element = *const std::ffi::c_void;
+    #[link(name = "ApplicationServices", kind = "framework")]
+    extern "C" {
+        fn AXUIElementCreateApplication(pid: i32) -> Element;
+        fn AXUIElementCopyAttributeValue(
+            element: Element,
+            attribute: core_foundation::string::CFStringRef,
+            value: *mut core_foundation::base::CFTypeRef,
+        ) -> i32;
+        fn AXValueGetValue(value: Element, kind: u32, out: *mut std::ffi::c_void) -> bool;
+    }
+    unsafe fn attribute(element: Element, name: &str) -> Option<CFType> {
+        let mut value: core_foundation::base::CFTypeRef = std::ptr::null();
+        let name = CFString::new(name);
+        (AXUIElementCopyAttributeValue(element, name.as_concrete_TypeRef(), &mut value) == 0
+            && !value.is_null())
+        .then(|| CFType::wrap_under_create_rule(value))
+    }
+    unsafe fn children(element: Element) -> Vec<CFType> {
+        attribute(element, "AXChildren")
+            .and_then(|value| value.downcast::<CFArray>())
+            .map(|array| {
+                array
+                    .iter()
+                    .map(|item| CFType::wrap_under_get_rule(*item as core_foundation::base::CFTypeRef))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+    let dock = Command::new("pgrep").args(["-x", "Dock"]).output().ok()?;
+    let dock: i32 = String::from_utf8_lossy(&dock.stdout).trim().parse().ok()?;
+    unsafe {
+        let app = AXUIElementCreateApplication(dock);
+        let app = CFType::wrap_under_create_rule(app as _);
+        for list in children(app.as_CFTypeRef() as Element) {
+            for item in children(list.as_CFTypeRef() as Element) {
+                let element = item.as_CFTypeRef() as Element;
+                let named = attribute(element, "AXTitle")
+                    .and_then(|value| value.downcast::<CFString>())
+                    .is_some_and(|name| name.to_string() == title);
+                if !named {
+                    continue;
+                }
+                let mut origin = CGPoint { x: 0.0, y: 0.0 };
+                let mut size = CGPoint { x: 0.0, y: 0.0 }; // CGSize has the same layout
+                let position = attribute(element, "AXPosition")?;
+                let extent = attribute(element, "AXSize")?;
+                if AXValueGetValue(position.as_CFTypeRef() as Element, 1, (&mut origin as *mut CGPoint).cast())
+                    && AXValueGetValue(extent.as_CFTypeRef() as Element, 2, (&mut size as *mut CGPoint).cast())
+                {
+                    return Some(CGPoint { x: origin.x + size.x / 2.0, y: origin.y + size.y / 2.0 });
+                }
+            }
+        }
+    }
+    None
+}
+
 fn real_click(at: CGPoint) {
     const HID_EVENT_TAP: u32 = 0;
     for kind in [1u32, 2] {
@@ -2327,7 +2393,7 @@ fn front_pid() -> Option<u32> {
 /// The user's own app switch during a lingering focus guard must stick.
 /// The theft cases prove cua undoes activations nobody asked for; this
 /// proves it does not undo the user's. A real HID click (as a person would
-/// make) on the desktop, right after a background cua click,
+/// make) on Finder in the Dock, right after a background cua click,
 /// must leave the app the user switched to in front.
 #[test]
 #[ignore]
@@ -2347,30 +2413,9 @@ fn harness_appkit_user_switch_during_linger_sticks() {
     let snapshot = snapshot_elements(&mut driver, harness.pid, wid);
     let token = element_token_by_id(&snapshot, "btn-increment");
     // The harness keeps the target fully covered by the user's app, so a
-    // person switching away clicks an empty patch of desktop, which brings
-    // Finder forward. Find a point no on-screen window covers.
-    let screen = driver.call("get_screen_size", serde_json::json!({}));
-    let (screen_w, screen_h) = (
-        screen.structured()["width"].as_f64().expect("screen width"),
-        screen.structured()["height"].as_f64().expect("screen height"),
-    );
-    let all = driver.call("list_windows", serde_json::json!({}));
-    let covered: Vec<(f64, f64, f64, f64)> = all.structured()["windows"]
-        .as_array()
-        .expect("windows")
-        .iter()
-        .filter(|w| w["is_on_screen"] == true)
-        .map(|w| {
-            let b = &w["bounds"];
-            (b["x"].as_f64().unwrap(), b["y"].as_f64().unwrap(),
-             b["width"].as_f64().unwrap(), b["height"].as_f64().unwrap())
-        })
-        .collect();
-    let title_bar = (1..20)
-        .flat_map(|i| (1..20).map(move |j| (screen_w * i as f64 / 20.0, screen_h * j as f64 / 20.0)))
-        .find(|(x, y)| !covered.iter().any(|(wx, wy, ww, wh)| x >= wx && *x < wx + ww && y >= wy && *y < wy + wh))
-        .map(|(x, y)| CGPoint { x, y })
-        .expect("an uncovered desktop point");
+    // person switching away clicks Finder in the Dock. (The only uncovered
+    // desktop is the widget block, and clicking a widget opens its app.)
+    let title_bar = dock_item_center("Finder").expect("Finder in the Dock");
     let finder = Command::new("pgrep").args(["-x", "Finder"]).output().expect("pgrep Finder");
     let finder: u32 = String::from_utf8_lossy(&finder.stdout).trim().parse().expect("Finder pid");
 
@@ -2499,8 +2544,10 @@ fn harness_appkit_user_choice_after_launch_sticks() {
              b["width"].as_f64().unwrap(), b["height"].as_f64().unwrap())
         })
         .collect();
-    let desktop = (2..18)
+    // Away from the desktop-widget block (see the linger test).
+    let desktop = (2..19)
         .flat_map(|i| (2..16).map(move |j| (screen_w * i as f64 / 20.0, screen_h * j as f64 / 20.0)))
+        .filter(|(x, y)| !(*x < screen_w * 0.4 && *y < screen_h * 0.5))
         .find(|(x, y)| !covered.iter().any(|(wx, wy, ww, wh)| x >= wx && *x < wx + ww && y >= wy && *y < wy + wh))
         .map(|(x, y)| CGPoint { x, y })
         .expect("an uncovered desktop point");

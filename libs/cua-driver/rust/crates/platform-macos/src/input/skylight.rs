@@ -551,33 +551,6 @@ fn focus_record(wid: u32) -> [u8; 0xF8] {
     buf
 }
 
-/// The CGWindowID of `pid`'s key window: its `AXFocusedWindow`, else its
-/// frontmost on-screen layer-0 window.
-fn key_window_of_pid(pid: pid_t) -> Option<u32> {
-    use crate::ax::bindings::{ax_get_window_id, copy_element_attr, AXUIElementCreateApplication};
-    let focused = unsafe {
-        let app = AXUIElementCreateApplication(pid);
-        if app.is_null() {
-            None
-        } else {
-            let window = copy_element_attr(app, "AXFocusedWindow");
-            core_foundation::base::CFRelease(app as _);
-            window.and_then(|window| {
-                let wid = ax_get_window_id(window);
-                core_foundation::base::CFRelease(window as _);
-                wid
-            })
-        }
-    };
-    focused.or_else(|| {
-        crate::windows::visible_windows()
-            .into_iter()
-            .filter(|w| w.pid == pid && w.layer == 0 && w.is_on_screen)
-            .max_by_key(|w| w.z_index)
-            .map(|w| w.window_id)
-    })
-}
-
 // ── NSMenu shortcut activation ────────────────────────────────────────────────
 
 /// Gets the PSN for the process that owns `window_id`.

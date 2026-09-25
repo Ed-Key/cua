@@ -311,11 +311,28 @@ static OWN_BUTTON_EVENTS: [std::sync::atomic::AtomicU32; 6] =
 /// generates so they are not mistaken for the user choosing an app.
 pub(crate) fn post_hid_mouse_event(event: &core_graphics::event::CGEvent) {
     let kind = event.get_type() as u32;
-    if let Some(index) = USER_CHOICE_EVENT_TYPES.iter().position(|t| *t == kind) {
-        OWN_BUTTON_EVENTS[index].fetch_add(1, Ordering::SeqCst);
-    }
+    let Some(index) = USER_CHOICE_EVENT_TYPES.iter().position(|t| *t == kind) else {
+        event.post(core_graphics::event::CGEventTapLocation::HID);
+        return;
+    };
+    // Count and post as one step, so a snapshot never sees one without the
+    // other, and remember when: the window server bumps its counters a
+    // moment after the post returns.
+    let mut last_post = own_posts().lock().unwrap_or_else(|p| p.into_inner());
+    OWN_BUTTON_EVENTS[index].fetch_add(1, Ordering::SeqCst);
     event.post(core_graphics::event::CGEventTapLocation::HID);
+    *last_post = Some(Instant::now());
 }
+
+/// Serializes own button posts with counter snapshots; holds the time of
+/// the last own post.
+fn own_posts() -> &'static Mutex<Option<Instant>> {
+    static OWN_POSTS: Mutex<Option<Instant>> = Mutex::new(None);
+    &OWN_POSTS
+}
+
+/// How long the window server may take to count an event cua posted.
+const OWN_POST_SETTLE: Duration = Duration::from_millis(50);
 
 pub(crate) fn read_input_activity() -> InputActivity {
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -323,12 +340,21 @@ pub(crate) fn read_input_activity() -> InputActivity {
         fn CGEventSourceCounterForEventType(state_id: i32, event_type: u32) -> u32;
     }
     const COMBINED_SESSION_STATE: i32 = 0;
-    // Own first: an own event posted between the two reads then shows up
-    // on the own side, never as user input.
+    // A coherent pair: no own post can land between the two reads, and an
+    // own post the window server may not have counted yet is waited out,
+    // so own and system counts describe the same events.
+    let last_post = own_posts().lock().unwrap_or_else(|p| p.into_inner());
+    if let Some(posted) = *last_post {
+        let settle = OWN_POST_SETTLE.saturating_sub(posted.elapsed());
+        if !settle.is_zero() {
+            std::thread::sleep(settle);
+        }
+    }
     let own = std::array::from_fn(|i| OWN_BUTTON_EVENTS[i].load(Ordering::SeqCst));
     let system = USER_CHOICE_EVENT_TYPES.map(|kind| unsafe {
         CGEventSourceCounterForEventType(COMBINED_SESSION_STATE, kind)
     });
+    drop(last_post);
     InputActivity { system, own }
 }
 

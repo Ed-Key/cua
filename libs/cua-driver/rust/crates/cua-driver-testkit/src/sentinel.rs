@@ -15,6 +15,37 @@ mod hyprland;
 
 /// A foreground Electron window that journals focus and leaked input while it
 /// fully occludes the background target.
+/// Opt-in tolerance for a momentary blur that recovers quickly. 0 = strict:
+/// any blur is focus loss. Focus-theft cases set it, because a reactive
+/// defense acts after the thief, so the user's window can blur for an
+/// instant before cua restores it. Every other case keeps the strict rule.
+static BLUR_RECOVERY_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Accept a blur only when the sentinel regains focus within `budget`.
+pub fn set_blur_recovery_budget(budget: Option<Duration>) {
+    BLUR_RECOVERY_BUDGET_MS.store(
+        budget.map_or(0, |b| b.as_millis() as u64),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+/// Longest blur-to-focus gap, or `None` when some blur never recovered.
+fn blur_recovery_ms(events: &[serde_json::Value]) -> Option<u64> {
+    let mut worst = 0;
+    for (index, event) in events.iter().enumerate() {
+        if event_kind(event) != Some("blur") {
+            continue;
+        }
+        let blurred_at = event["at_ms"].as_u64()?;
+        let recovered_at = events[index + 1..]
+            .iter()
+            .find(|later| event_kind(later) == Some("focus"))
+            .and_then(|later| later["at_ms"].as_u64())?;
+        worst = worst.max(recovered_at.saturating_sub(blurred_at));
+    }
+    Some(worst)
+}
+
 pub struct ForegroundSentinel {
     cursor_calibrated: bool,
     journal_path: std::path::PathBuf,
@@ -78,6 +109,15 @@ impl ForegroundSentinel {
             .env("CUA_ELECTRON_CDP_PORT", cdp_port.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
+        // Diagnostics: keep the sentinel's own output when asked to.
+        if let Some(path) = std::env::var_os("CUA_E2E_SENTINEL_LOG") {
+            if let Ok(file) = fs::OpenOptions::new().create(true).append(true).open(path) {
+                if let Ok(copy) = file.try_clone() {
+                    command.stdout(Stdio::from(copy));
+                }
+                command.stderr(Stdio::from(file));
+            }
+        }
         let child = spawn_in_job(&mut command)
             .map_err(|error| format!("launch foreground sentinel: {error}"))?;
         let launched_pid = child.id();
@@ -108,7 +148,23 @@ impl ForegroundSentinel {
                 break target;
             }
             if Instant::now() >= window_deadline {
-                return Err("foreground sentinel window did not appear".to_owned());
+                let journal = fs::read_to_string(&journal_path).unwrap_or_default();
+                let sentinel_windows: Vec<String> = windows.structured()["windows"]
+                    .as_array()
+                    .map(|all| {
+                        all.iter()
+                            .filter(|w| w["title"].as_str().is_some_and(|t| t.contains("Sentinel")))
+                            .map(|w| w["title"].to_string())
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                return Err(format!(
+                    "foreground sentinel window did not appear (expected {expected_title:?}; \
+                     sentinel-titled windows seen: {sentinel_windows:?}; list_windows error: {}; \
+                     journal: {})",
+                    windows.is_error(),
+                    journal.lines().take(3).collect::<Vec<_>>().join(" | ")
+                ));
             }
             std::thread::sleep(Duration::from_millis(100));
         };
@@ -186,11 +242,18 @@ impl ForegroundSentinel {
             violations.push("foreground sentinel heartbeat stopped".to_owned());
         }
         if !is_wayland_session() {
-            if events.iter().any(|event| {
-                event_kind(event) == Some("blur")
-                    || (event_kind(event) == Some("visibility")
-                        && event["state"].as_str() == Some("hidden"))
-            }) {
+            let hidden = events.iter().any(|event| {
+                event_kind(event) == Some("visibility") && event["state"].as_str() == Some("hidden")
+            });
+            let blurred = events.iter().any(|event| event_kind(event) == Some("blur"));
+            let budget = BLUR_RECOVERY_BUDGET_MS.load(std::sync::atomic::Ordering::SeqCst);
+            let recovered = blurred
+                && budget > 0
+                && blur_recovery_ms(&events).is_some_and(|worst| {
+                    eprintln!("[testkit] sentinel blur recovered in {worst}ms (budget {budget}ms)");
+                    worst <= budget
+                });
+            if hidden || (blurred && !recovered) {
                 violations.push("foreground sentinel lost focus".to_owned());
             } else {
                 passed.push(OracleKind::Focus);

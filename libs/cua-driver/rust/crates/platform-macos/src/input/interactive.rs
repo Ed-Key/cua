@@ -616,7 +616,7 @@ impl NativeInputState {
         click: bool,
     ) {
         if self.is_foreground() {
-            event.post(CGEventTapLocation::HID);
+            crate::focus_steal::post_hid_mouse_event(event);
         } else {
             super::mouse::post_mouse_event(
                 self.config.pid,
