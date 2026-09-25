@@ -2232,6 +2232,33 @@ extern "C" {
     fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
     fn CFRelease(value: *const std::ffi::c_void);
 }
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventCreateKeyboardEvent(
+        source: *const std::ffi::c_void,
+        key: u16,
+        down: bool,
+    ) -> *mut std::ffi::c_void;
+}
+/// Real pointer motion and typing: activity that does not choose an app.
+fn real_busy_user(around: CGPoint) {
+    const HID_EVENT_TAP: u32 = 0;
+    for step in 0..10 {
+        unsafe {
+            let at = CGPoint { x: around.x + step as f64 * 3.0, y: around.y };
+            let moved = CGEventCreateMouseEvent(std::ptr::null(), 5, at, 0);
+            CGEventPost(HID_EVENT_TAP, moved);
+            CFRelease(moved);
+            for down in [true, false] {
+                let key = CGEventCreateKeyboardEvent(std::ptr::null(), 0, down); // "a"
+                CGEventPost(HID_EVENT_TAP, key);
+                CFRelease(key);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(60));
+    }
+}
+
 fn real_click(at: CGPoint) {
     const HID_EVENT_TAP: u32 = 0;
     for kind in [1u32, 2] {
@@ -2355,9 +2382,50 @@ fn harness_appkit_background_launch_keeps_focus() {
     let (_, violations) = sentinel.observe();
     let _ = Command::new("kill").arg(pid.to_string()).status();
     assert!(
-        !violations.iter().any(|v| v.contains("lost focus")),
-        "background launch took the user's focus: {violations:?}; launch {}",
+        violations.is_empty(),
+        "background launch took the user's focus or the sentinel failed: {violations:?}; launch {}",
         launched.raw
+    );
+}
+
+/// A busy user (moving the pointer, typing in their own app) has not chosen
+/// another app, so a theft during that activity is still undone.
+#[test]
+#[ignore]
+fn harness_appkit_busy_user_does_not_disarm_the_guard() {
+    let mut driver = McpDriver::spawn_macos_daemon_proxy_named("appkit-busy-user-guard")
+        .expect("start macOS daemon proxy");
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("thief.jsonl");
+    let harness = Harness::launch_with_env(&[
+        ("CUA_APPKIT_THIEF_DELAY_MS", "800"),
+        ("CUA_APPKIT_THIEF_TRACE", trace.to_str().unwrap()),
+    ]);
+    let (wid, _) = driver
+        .find_window(harness.pid as i64, "CuaTestHarness AppKit")
+        .expect("find harness window");
+    let _sentinel = cua_driver_testkit::sentinel::ForegroundSentinel::launch(&mut driver);
+    std::thread::sleep(Duration::from_millis(500));
+    let user_app = front_pid().expect("front app");
+    assert_ne!(user_app, harness.pid);
+    let snapshot = snapshot_elements(&mut driver, harness.pid, wid);
+    let token = element_token_by_id(&snapshot, "btn-steal");
+    let click = driver.call(
+        "click",
+        serde_json::json!({
+            "pid": harness.pid as i64, "window_id": wid,
+            "element_token": token, "delivery_mode": "background"
+        }),
+    );
+    assert!(!click.is_error(), "steal click: {}", click.raw);
+    real_busy_user(CGPoint { x: 200.0, y: 200.0 }); // ~600ms of activity
+    std::thread::sleep(Duration::from_millis(1200));
+    let raw = std::fs::read_to_string(&trace).expect("the fixture never tried to take focus");
+    eprintln!("busy user; trace={raw}");
+    assert_eq!(
+        front_pid(),
+        Some(user_app),
+        "pointer motion or typing disarmed the guard and the theft stuck"
     );
 }
 
@@ -2421,11 +2489,12 @@ fn harness_appkit_user_choice_after_launch_sticks() {
         .expect("launched window on screen")
         .clone();
     let (tx, ty, tw, th) = bounds(&target);
-    let target_z = target["z_index"].as_u64().unwrap_or(u64::MAX);
+    let target_z = target["z_index"].as_u64().expect("launched window stacking order");
     // A visible point of the launched window: not under a window in front of it.
     let above: Vec<_> = windows
         .iter()
-        .filter(|w| w["is_on_screen"] == true && w["z_index"].as_u64().is_some_and(|z| z < target_z))
+        // Higher z_index is further in front.
+        .filter(|w| w["is_on_screen"] == true && w["z_index"].as_u64().is_some_and(|z| z > target_z))
         .map(bounds)
         .collect();
     // Aim along the title bar: list_windows omits the Dock and menu bar, so

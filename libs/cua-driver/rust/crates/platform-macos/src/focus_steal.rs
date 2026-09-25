@@ -286,12 +286,16 @@ impl Drop for SuppressionLease {
     }
 }
 
-/// Per-type input event counters. An idle timer is not enough: in a VM the
-/// virtual keyboard resets the key-down idle time continuously (measured
-/// 0.009s) while no event is ever counted, which made every post-result
-/// guard step aside. Counters only move on real events.
+/// Mouse-button press counters: the signal that the user chose an app.
+/// Moving the pointer or typing does not switch apps, and typing is exactly
+/// when a theft does the most harm (keystrokes land in the wrong app), so
+/// neither disarms a guard. Switching with Cmd+Tab inside a guard's short
+/// window is reverted once; that is the accepted trade.
+/// An idle timer does not work at all: in a VM the virtual keyboard resets
+/// the key-down idle time continuously (measured 0.009s) while no event is
+/// ever counted. Counters only move on real events.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
-pub(crate) struct InputActivity([u32; 16]);
+pub(crate) struct InputActivity([u32; 3]);
 
 pub(crate) fn read_input_activity() -> InputActivity {
     #[link(name = "CoreGraphics", kind = "framework")]
@@ -299,15 +303,14 @@ pub(crate) fn read_input_activity() -> InputActivity {
         fn CGEventSourceCounterForEventType(state_id: i32, event_type: u32) -> u32;
     }
     const COMBINED_SESSION_STATE: i32 = 0;
-    // left/right mouse down+up, moved, left/right dragged, key down/up,
-    // flags changed, scroll, tablet pointer/proximity, other mouse down/up/drag.
-    const TYPES: [u32; 16] = [1, 2, 3, 4, 5, 6, 7, 10, 11, 12, 22, 23, 24, 25, 26, 27];
+    // left, right and other mouse-button down.
+    const TYPES: [u32; 3] = [1, 3, 25];
     InputActivity(TYPES.map(|kind| unsafe {
         CGEventSourceCounterForEventType(COMBINED_SESSION_STATE, kind)
     }))
 }
 
-/// True when real input happened since `baseline` was read.
+/// True when the user pressed a mouse button since `baseline` was read.
 pub(crate) fn user_input_since(baseline: &InputActivity) -> bool {
     read_input_activity() != *baseline
 }
