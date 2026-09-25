@@ -25,10 +25,8 @@ use cua_driver_core::tool::{ProtectedResourceOwnership, Tool, ToolDef};
 use serde_json::Value;
 
 use crate::ax::bindings::{
-    ax_get_window_id_checked, copy_element_array_attr_checked, copy_geometry_attr_checked,
-    copy_string_attr_checked, kAXErrorAttributeUnsupported as AX_ATTRIBUTE_UNSUPPORTED,
-    kAXErrorFailure, kAXErrorNoValue as AX_NO_VALUE, kAXErrorSuccess, kAXValueCGPointType,
-    kAXValueCGSizeType, AXError, AXUIElementCreateApplication, AXUIElementRef,
+    ax_get_window_id_checked, copy_element_array_attr_checked, copy_string_attr_checked, kAXErrorAttributeUnsupported as AX_ATTRIBUTE_UNSUPPORTED,
+    kAXErrorFailure, kAXErrorNoValue as AX_NO_VALUE, kAXErrorSuccess, AXError, AXUIElementCreateApplication, AXUIElementRef,
     AXUIElementSetMessagingTimeout,
 };
 
@@ -47,17 +45,21 @@ enum RootKey {
         role: String,
         subrole: String,
     },
+    /// No window id of its own. Identified by the AX element itself
+    /// (`CFHash`, consistent with `CFEqual`), so a retitled or moved
+    /// existing surface is not mistaken for a new one.
     Transient {
         parent_window_id: Option<u32>,
         role: String,
         subrole: String,
-        title: String,
-        frame: Option<[i64; 4]>,
+        element_hash: u64,
     },
 }
 
 #[derive(Clone, Debug, PartialEq)]
 struct Root {
+    /// The address `get_window_state` can read: a top-level window's own id,
+    /// or the parent window for a sheet, dialog or popover inside it.
     window_id: Option<u32>,
     title: String,
 }
@@ -66,8 +68,13 @@ type RootSnapshot = HashMap<RootKey, Root>;
 
 
 struct Pending {
+    /// Roots already known to the agent: the baseline plus anything reported.
     roots: RootSnapshot,
     recorded: Instant,
+    /// Bumped whenever a read changes this entry. A read only reports if the
+    /// generation it started from is still current, so two concurrent reads
+    /// cannot both report the same window.
+    generation: u64,
     /// A read already found nothing new against this baseline. The next action
     /// starts a fresh baseline instead of reporting stale windows later.
     read_since: bool,
@@ -82,9 +89,12 @@ fn pending() -> std::sync::MutexGuard<'static, HashMap<PendingKey, Pending>> {
     PENDING.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
+/// The runtime session id the element cache also uses; the public label is
+/// only a fallback (implicit sessions carry `_session_id` alone).
 fn session_of(args: &Value) -> String {
-    args.get("session")
-        .and_then(Value::as_str)
+    ["_session_id", "session"]
+        .iter()
+        .find_map(|key| args.get(*key).and_then(Value::as_str))
         .unwrap_or_default()
         .to_owned()
 }
@@ -119,59 +129,134 @@ fn record_before_action(session: &str, pid: i32) {
             map.remove(&oldest);
         }
     }
+    let generation = map.get(&key).map_or(0, |entry| entry.generation + 1);
     map.insert(
         key,
         Pending {
             roots,
             recorded: Instant::now(),
+            generation,
             read_since: false,
         },
     );
 }
 
-/// Blocking. Windows that appeared since the recorded baseline, reported once.
+/// One appeared root after ownership resolution.
+enum Outcome {
+    /// Addressable window with a known owner: reported now.
+    Reported(SurfaceWindow),
+    /// Has an address but WindowServer does not know its owner yet: kept for
+    /// a later read, and blocks any rebind now.
+    Unresolved,
+    /// No address at all: nothing to report, ever.
+    Unaddressable,
+}
+
+/// Blocking. Windows that appeared since the recorded baseline, each reported
+/// once.
 fn take_window_change(session: &str, pid: i32) -> Option<WindowChange> {
     let key = (session.to_owned(), pid);
-    let before = pending().get(&key)?.roots.clone();
+    let (before, generation) = {
+        let map = pending();
+        let entry = map.get(&key)?;
+        (entry.roots.clone(), entry.generation)
+    };
     // An unreadable tree is unknown: keep the baseline for a later read.
     let after = snapshot_roots(pid)?;
     let appeared = appeared_roots(&before, &after);
-    let change = window_change(pid, &appeared);
+    let outcomes = resolve_outcomes(pid, &appeared);
+    finish_take(&key, generation, appeared, outcomes)
+}
+
+/// Apply one read's findings to the pending entry and build its report.
+fn finish_take(
+    key: &PendingKey,
+    generation: u64,
+    appeared: Vec<(RootKey, Root)>,
+    outcomes: Vec<Outcome>,
+) -> Option<WindowChange> {
+    let pid = key.1;
     let mut map = pending();
-    if change.is_some() {
-        map.remove(&key);
-    } else if let Some(entry) = map.get_mut(&key) {
-        entry.read_since = true;
+    let entry = map.get_mut(key)?;
+    if entry.generation != generation {
+        return None; // another read or a new baseline got here first
     }
-    change
+    entry.generation += 1;
+    let mut reported = Vec::new();
+    let mut unresolved = false;
+    for ((root_key, root), outcome) in appeared.into_iter().zip(outcomes) {
+        match outcome {
+            Outcome::Reported(window) => {
+                entry.roots.insert(root_key, root);
+                reported.push(window);
+            }
+            Outcome::Unaddressable => {
+                entry.roots.insert(root_key, root);
+            }
+            Outcome::Unresolved => unresolved = true,
+        }
+    }
+    if !unresolved {
+        if reported.is_empty() {
+            entry.read_since = true;
+        } else {
+            map.remove(key);
+        }
+    }
+    change_from(reported, unresolved, pid)
 }
 
 pub(crate) fn retire_session(session: &str) {
     pending().retain(|(owner, _), _| owner != session);
 }
 
-fn window_change(pid: i32, appeared: &[Root]) -> Option<WindowChange> {
+fn resolve_outcomes(pid: i32, appeared: &[(RootKey, Root)]) -> Vec<Outcome> {
     if appeared.is_empty() {
-        return None;
+        return Vec::new();
     }
     let app_name = crate::apps::get_app_name_for_pid(pid).unwrap_or_default();
-    let mut resolved =
-        resolve_candidates(pid, &app_name, appeared, &crate::windows::all_windows());
-    for _ in 0..OWNER_CATCH_UP_ATTEMPTS {
-        if resolved.len() == appeared.len() {
+    let mut outcomes = Vec::new();
+    for attempt in 0..=OWNER_CATCH_UP_ATTEMPTS {
+        if attempt > 0 {
+            std::thread::sleep(OWNER_CATCH_UP_INTERVAL);
+        }
+        let windows = crate::windows::all_windows_any_layer();
+        outcomes = appeared
+            .iter()
+            .map(|(_, root)| outcome_for(pid, &app_name, root, &windows))
+            .collect();
+        if !outcomes.iter().any(|outcome| matches!(outcome, Outcome::Unresolved)) {
             break;
         }
-        std::thread::sleep(OWNER_CATCH_UP_INTERVAL);
-        resolved = resolve_candidates(pid, &app_name, appeared, &crate::windows::all_windows());
     }
-    change_from(resolved, appeared.len())
+    outcomes
+}
+
+fn outcome_for(
+    pid: i32,
+    app_name: &str,
+    root: &Root,
+    windows: &[crate::windows::WindowInfo],
+) -> Outcome {
+    let Some(window_id) = root.window_id else {
+        return Outcome::Unaddressable;
+    };
+    match surface_owner(windows, pid, window_id, app_name) {
+        Some((owner_pid, owner_app_name)) => Outcome::Reported(SurfaceWindow {
+            pid: i64::from(owner_pid),
+            window_id: u64::from(window_id),
+            app_name: owner_app_name,
+            title: root.title.clone(),
+        }),
+        None => Outcome::Unresolved,
+    }
 }
 
 /// Several roots can share one address (a sheet reports its parent window),
-/// so dedupe by address. Rebind only when every root resolved to an owner and
-/// exactly one address remains; otherwise the caller picks.
-fn change_from(candidates: Vec<SurfaceWindow>, root_count: usize) -> Option<WindowChange> {
-    let complete = candidates.len() == root_count;
+/// so dedupe by address. Rebind only when nothing is unresolved, exactly one
+/// address remains, and the acted-on app owns it: a window owned by another
+/// process is listed but not offered as a readable target.
+fn change_from(candidates: Vec<SurfaceWindow>, unresolved: bool, pid: i32) -> Option<WindowChange> {
     let mut seen = HashSet::new();
     let new_windows: Vec<SurfaceWindow> = candidates
         .into_iter()
@@ -180,39 +265,19 @@ fn change_from(candidates: Vec<SurfaceWindow>, root_count: usize) -> Option<Wind
     if new_windows.is_empty() {
         return None;
     }
-    let rebind = (complete && new_windows.len() == 1).then(|| new_windows[0].clone());
+    let rebind = (!unresolved && new_windows.len() == 1 && new_windows[0].pid == i64::from(pid))
+        .then(|| new_windows[0].clone());
     Some(WindowChange {
         new_windows,
         rebind,
     })
 }
 
-fn appeared_roots(before: &RootSnapshot, after: &RootSnapshot) -> Vec<Root> {
+fn appeared_roots(before: &RootSnapshot, after: &RootSnapshot) -> Vec<(RootKey, Root)> {
     after
         .iter()
         .filter(|(key, _)| !before.contains_key(*key))
-        .map(|(_, root)| root.clone())
-        .collect()
-}
-
-fn resolve_candidates(
-    pid: i32,
-    app_name: &str,
-    roots: &[Root],
-    windows: &[crate::windows::WindowInfo],
-) -> Vec<SurfaceWindow> {
-    roots
-        .iter()
-        .filter_map(|root| {
-            let window_id = root.window_id?;
-            let (owner_pid, owner_app_name) = surface_owner(windows, pid, window_id, app_name)?;
-            Some(SurfaceWindow {
-                pid: i64::from(owner_pid),
-                window_id: u64::from(window_id),
-                app_name: owner_app_name,
-                title: root.title.clone(),
-            })
-        })
+        .map(|(key, root)| (key.clone(), root.clone()))
         .collect()
 }
 
@@ -438,32 +503,6 @@ impl SnapshotReader {
             result => result,
         }
     }
-
-    unsafe fn frame(&self, element: AXUIElementRef) -> Result<Option<[i64; 4]>, SnapshotReadError> {
-        let position = self.read(element, || {
-            copy_geometry_attr_checked(element, "AXPosition", kAXValueCGPointType)
-        });
-        let position = match position {
-            Err(SnapshotReadError::Attribute(AX_NO_VALUE | AX_ATTRIBUTE_UNSUPPORTED)) => {
-                return Ok(None)
-            }
-            result => result?,
-        };
-        let size = match self.read(element, || {
-            copy_geometry_attr_checked(element, "AXSize", kAXValueCGSizeType)
-        }) {
-            Err(SnapshotReadError::Attribute(AX_NO_VALUE | AX_ATTRIBUTE_UNSUPPORTED)) => {
-                return Ok(None)
-            }
-            result => result?,
-        };
-        if size[0] < 1.0 || size[1] < 1.0 {
-            return Ok(None);
-        }
-        Ok(Some(
-            [position[0], position[1], size[0], size[1]].map(|value| value.round() as i64),
-        ))
-    }
 }
 
 fn snapshot_roots(pid: i32) -> Option<RootSnapshot> {
@@ -481,13 +520,13 @@ fn snapshot_roots(pid: i32) -> Option<RootSnapshot> {
         let mut roots = HashMap::new();
         for window in windows {
             let parent_window_id = reader.read(window.0, || ax_get_window_id_checked(window.0))?;
-            insert_root(&reader, &mut roots, window.0, parent_window_id)?;
+            insert_root(&reader, &mut roots, window.0, parent_window_id, true)?;
             for attribute in ["AXSheets", "AXChildren"] {
                 for child in reader.elements(window.0, attribute)? {
                     let role =
                         reader.read(child.0, || copy_string_attr_checked(child.0, "AXRole"))?;
                     if matches!(role.as_str(), "AXSheet" | "AXDialog" | "AXPopover") {
-                        insert_root(&reader, &mut roots, child.0, parent_window_id)?;
+                        insert_root(&reader, &mut roots, child.0, parent_window_id, false)?;
                     }
                 }
             }
@@ -514,12 +553,19 @@ unsafe fn insert_root(
     roots: &mut RootSnapshot,
     element: AXUIElementRef,
     parent_window_id: Option<u32>,
+    top_level: bool,
 ) -> Result<(), SnapshotReadError> {
     let role = reader.read(element, || copy_string_attr_checked(element, "AXRole"))?;
     let subrole = reader.optional_string(element, "AXSubrole")?;
     let title = reader.optional_string(element, "AXTitle")?;
     let own_window_id = reader.read(element, || ax_get_window_id_checked(element))?;
-    let effective_window_id = own_window_id.or(parent_window_id);
+    // get_window_state reads top-level AX windows; a child surface is read
+    // through its parent even when WindowServer gives it its own id.
+    let effective_window_id = if top_level {
+        own_window_id.or(parent_window_id)
+    } else {
+        parent_window_id.or(own_window_id)
+    };
     let key = match own_window_id {
         Some(window_id) => RootKey::Native {
             window_id,
@@ -530,8 +576,7 @@ unsafe fn insert_root(
             parent_window_id,
             role,
             subrole,
-            title: title.clone(),
-            frame: reader.frame(element)?,
+            element_hash: core_foundation::base::CFHash(element as CFTypeRef) as u64,
         },
     };
     roots.insert(
@@ -613,6 +658,21 @@ mod tests {
         }
     }
 
+    /// Seed a pending baseline under a key unique to one test.
+    fn seed(session: &str, pid: i32) -> (PendingKey, u64) {
+        let key = (session.to_owned(), pid);
+        pending().insert(
+            key.clone(),
+            Pending {
+                roots: RootSnapshot::new(),
+                recorded: Instant::now(),
+                generation: 7,
+                read_since: false,
+            },
+        );
+        (key, 7)
+    }
+
     #[test]
     fn root_diff_ignores_metadata_changes_and_reports_an_appeared_modal() {
         let parent = native(7, "AXWindow");
@@ -620,71 +680,135 @@ mod tests {
         let mut after = RootSnapshot::from([(parent, root(7, "Draft - Edited"))]);
         assert!(appeared_roots(&before, &after).is_empty());
         after.insert(native(8, "AXSheet"), root(8, "Open"));
-        assert_eq!(appeared_roots(&before, &after), vec![root(8, "Open")]);
+        assert_eq!(
+            appeared_roots(&before, &after),
+            vec![(native(8, "AXSheet"), root(8, "Open"))]
+        );
     }
 
     #[test]
-    fn one_new_window_is_a_rebind_target() {
-        let change = change_from(vec![surface(42, 8)], 1).expect("change");
+    fn one_new_window_of_the_app_is_a_rebind_target() {
+        let change = change_from(vec![surface(42, 8)], false, 42).expect("change");
         assert_eq!(change.rebind, Some(surface(42, 8)));
-        assert_eq!(change.new_windows, vec![surface(42, 8)]);
     }
 
     #[test]
     fn roots_sharing_one_address_are_one_rebind_target() {
-        let change = change_from(vec![surface(42, 8), surface(42, 8)], 2).expect("change");
+        let change = change_from(vec![surface(42, 8), surface(42, 8)], false, 42).unwrap();
+        assert_eq!(change.new_windows.len(), 1);
         assert_eq!(change.rebind, Some(surface(42, 8)));
     }
 
     #[test]
     fn several_new_windows_are_listed_without_a_guess() {
-        let change = change_from(vec![surface(42, 8), surface(42, 9)], 2).expect("change");
+        let change = change_from(vec![surface(42, 8), surface(42, 9)], false, 42).unwrap();
         assert_eq!(change.rebind, None);
         assert_eq!(change.new_windows.len(), 2);
     }
 
     #[test]
     fn an_unresolved_owner_blocks_the_rebind() {
-        let change = change_from(vec![surface(42, 8)], 2).expect("change");
-        assert_eq!(change.rebind, None, "one of two roots had no known owner");
+        let change = change_from(vec![surface(42, 8)], true, 42).unwrap();
+        assert_eq!(change.rebind, None);
     }
 
     #[test]
-    fn nothing_new_is_no_change() {
-        assert_eq!(change_from(Vec::new(), 0), None);
+    fn a_window_owned_by_another_process_is_listed_not_rebound() {
+        let change = change_from(vec![surface(99, 8)], false, 42).unwrap();
+        assert_eq!(change.rebind, None);
+        assert_eq!(change.new_windows, vec![surface(99, 8)]);
     }
 
     #[test]
-    fn owner_resolution_can_follow_an_ax_root_without_guessing() {
-        let roots = vec![root(8, "Open")];
-        assert!(resolve_candidates(42, "TextEdit", &roots, &[]).is_empty());
-        let windows = vec![window(8, 99, "Open and Save Panel Service")];
-        let candidates = resolve_candidates(42, "TextEdit", &roots, &windows);
-        assert_eq!(candidates.len(), 1);
-        assert_eq!(candidates[0].pid, 99);
+    fn owner_lookup_follows_an_ax_root_without_guessing() {
+        let open = root(8, "Open");
+        assert!(matches!(outcome_for(42, "TextEdit", &open, &[]), Outcome::Unresolved));
+        let foreign = [window(8, 99, "Open and Save Panel Service")];
+        assert!(matches!(
+            outcome_for(42, "TextEdit", &open, &foreign),
+            Outcome::Reported(SurfaceWindow { pid: 99, window_id: 8, .. })
+        ));
+        let proxy = [window(8, 42, "TextEdit"), window(9, 99, "Open and Save Panel Service")];
+        assert!(matches!(
+            outcome_for(42, "TextEdit", &open, &proxy),
+            Outcome::Reported(SurfaceWindow { pid: 42, window_id: 8, .. })
+        ));
+        let no_address = Root { window_id: None, title: String::new() };
+        assert!(matches!(outcome_for(42, "TextEdit", &no_address, &[]), Outcome::Unaddressable));
     }
 
     #[test]
-    fn owner_resolution_preserves_an_addressable_same_pid_proxy() {
-        let roots = vec![root(8, "Open")];
-        let windows = vec![
-            window(8, 42, "TextEdit"),
-            window(9, 99, "Open and Save Panel Service"),
+    fn a_report_is_delivered_once_and_ends_the_baseline() {
+        let (key, generation) = seed("report-once", 4101);
+        let appeared = vec![(native(8, "AXWindow"), root(8, "Open"))];
+        let change = finish_take(&key, generation, appeared.clone(), vec![Outcome::Reported(surface(4101, 8))]);
+        assert_eq!(change.unwrap().rebind, Some(surface(4101, 8)));
+        assert!(!pending().contains_key(&key), "reported baseline is consumed");
+        assert_eq!(
+            finish_take(&key, generation, appeared, vec![Outcome::Reported(surface(4101, 8))]),
+            None
+        );
+    }
+
+    #[test]
+    fn a_read_that_lost_the_race_reports_nothing() {
+        let (key, generation) = seed("race", 4102);
+        let appeared = vec![(native(8, "AXWindow"), root(8, "Open"))];
+        assert!(finish_take(&key, generation, appeared.clone(), vec![Outcome::Reported(surface(4102, 8))]).is_some());
+        let (key, generation) = seed("race-2", 4102);
+        pending().get_mut(&key).unwrap().generation += 1; // a concurrent read won
+        assert_eq!(
+            finish_take(&key, generation, appeared, vec![Outcome::Reported(surface(4102, 8))]),
+            None
+        );
+    }
+
+    #[test]
+    fn unresolved_windows_stay_pending_for_a_later_read() {
+        let (key, generation) = seed("partial", 4103);
+        let appeared = vec![
+            (native(8, "AXWindow"), root(8, "Open")),
+            (native(9, "AXWindow"), root(9, "Other")),
         ];
-        let candidates = resolve_candidates(42, "TextEdit", &roots, &windows);
-        assert_eq!(candidates, vec![surface(42, 8)]);
+        let change = finish_take(
+            &key,
+            generation,
+            appeared,
+            vec![Outcome::Reported(surface(4103, 8)), Outcome::Unresolved],
+        )
+        .unwrap();
+        assert_eq!(change.new_windows, vec![surface(4103, 8)]);
+        assert_eq!(change.rebind, None, "an unresolved sibling blocks the rebind");
+        let map = pending();
+        let entry = map.get(&key).expect("unresolved root keeps the baseline");
+        assert!(entry.roots.contains_key(&native(8, "AXWindow")), "reported root is now known");
+        assert!(!entry.roots.contains_key(&native(9, "AXWindow")), "unresolved root can still be reported");
+    }
+
+    #[test]
+    fn nothing_new_marks_the_baseline_for_refresh() {
+        let (key, generation) = seed("nothing", 4104);
+        assert_eq!(finish_take(&key, generation, Vec::new(), Vec::new()), None);
+        assert!(pending().get(&key).unwrap().read_since);
+    }
+
+    #[test]
+    fn implicit_sessions_are_keyed_by_runtime_session_id() {
+        let args = serde_json::json!({"_session_id": "runtime/a", "session": "label"});
+        assert_eq!(session_of(&args), "runtime/a");
+        assert_eq!(session_of(&serde_json::json!({"session": "label"})), "label");
     }
 
     #[test]
     fn note_text_names_the_rebind_call() {
-        let change = change_from(vec![surface(42, 8)], 1).unwrap();
+        let change = change_from(vec![surface(42, 8)], false, 42).unwrap();
         assert!(note_text(&change).contains("get_window_state(pid: 42, window_id: 8)"));
     }
 
     #[test]
     fn attach_adds_typed_change_and_a_text_note() {
         let mut result = ToolResult::text("state").with_structured(serde_json::json!({"pid": 42}));
-        attach(&mut result, &change_from(vec![surface(42, 8)], 1).unwrap());
+        attach(&mut result, &change_from(vec![surface(42, 8)], false, 42).unwrap());
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["window_change"]["rebind"]["window_id"], 8);
         assert_eq!(result.content.len(), 2);

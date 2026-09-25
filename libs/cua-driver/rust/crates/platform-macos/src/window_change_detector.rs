@@ -6,8 +6,9 @@
 //! action. `detect()` returns immediately after the action: it reports a
 //! foreground change it can already see, and hands the lease to a background
 //! timer that keeps protecting focus until the observation bound elapses or
-//! the next action ends it (`end_lingering_focus_guards`). The tool result
-//! never waits for that window.
+//! the next action ends it (`end_lingering_focus_guards`). While lingering it
+//! yields to real user input, so the user's own app switch is never undone.
+//! The tool result never waits for that window.
 //!
 //! New windows are not detected here any more. Waiting to prove that no window
 //! will open cost every action its full timeout; `surface_observer` instead
@@ -31,11 +32,10 @@ use crate::apps;
 use crate::focus_steal::{self, SuppressionLease};
 
 /// State captured immediately before the action fires: the caller's
-/// frontmost pid, when the action started, and the wildcard suppression lease
+/// frontmost pid and the wildcard suppression lease
 /// (`None` when suppression was not requested or nothing was frontmost).
 pub struct Snapshot {
     front_pid: Option<i32>,
-    started: Instant,
     _lease: Option<SuppressionLease>,
 }
 
@@ -184,8 +184,6 @@ impl WindowChangeDetector {
         suppress_focus: bool,
         allowed_pid: Option<i32>,
     ) -> Snapshot {
-        let started = Instant::now();
-
         // Arm wildcard suppression — covers snapshot → detect window.
         // restore_to = caller-captured frontmost; target = wildcard
         // (any other pid). If there's no frontmost (rare — screensaver,
@@ -208,7 +206,6 @@ impl WindowChangeDetector {
 
         Snapshot {
             front_pid: prior_front,
-            started,
             _lease: lease,
         }
     }
@@ -223,7 +220,8 @@ impl Snapshot {
     /// Report what is already visible and return at once. The suppression
     /// lease keeps protecting focus in the background until the host
     /// observation bound (`CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS`, default
-    /// 1000ms from snapshot time) elapses or the next action ends it.
+    /// 1000ms after this call) elapses or the next action ends it. From
+    /// here on it lets through activations that follow real user input.
     pub fn detect(self) -> Changes {
         self.detect_bounded(host_observation_bounds())
     }
@@ -236,7 +234,10 @@ impl Snapshot {
         );
         if let Some(lease) = self._lease.take() {
             if !bounds.skips_observation() {
-                linger(Box::new(lease), self.started + bounds.timeout);
+                // Timed from the result, not the snapshot, so a long action
+                // keeps the full protection window after it finishes.
+                lease.yield_to_user_input();
+                linger(Box::new(lease), Instant::now() + bounds.timeout);
             }
         }
         Changes { foreground_changed }

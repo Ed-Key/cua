@@ -100,6 +100,10 @@ struct Entry {
     /// Monotonic deadline. After this, the entry is pruned without
     /// firing.
     deadline: Instant,
+    /// Set once the action that armed this entry has returned. From then on
+    /// an activation is let through when real keyboard or mouse input
+    /// happened after this instant: that activation is the user's.
+    yields_to_user_after: Option<Instant>,
     /// Provenance for tracing — e.g. `"LaunchAppTool.pre"`.
     #[allow(dead_code)]
     origin: &'static str,
@@ -215,6 +219,12 @@ pub struct SuppressionLease {
 }
 
 impl SuppressionLease {
+    /// Keep suppressing, but let through activations that follow real user
+    /// input from now on. Used once the armed action's result has returned.
+    pub fn yield_to_user_input(&self) {
+        self.dispatcher.yield_to_user_input(self.handle);
+    }
+
     /// Explicit release. Useful if the caller wants to drop the lease
     /// before its scope ends without taking the `Drop` path.
     pub fn release(mut self) {
@@ -229,6 +239,20 @@ impl Drop for SuppressionLease {
             self.dispatcher.remove(self.handle);
         }
     }
+}
+
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventSourceSecondsSinceLastEventType(state_id: i32, event_type: u32) -> f64;
+}
+
+/// True when real keyboard or mouse input reached the HID system after
+/// `since`. Events posted to a pid do not pass through the HID system.
+fn user_input_since(since: Instant) -> bool {
+    const HID_SYSTEM_STATE: i32 = 1;
+    const ANY_INPUT_EVENT: u32 = u32::MAX;
+    let idle = unsafe { CGEventSourceSecondsSinceLastEventType(HID_SYSTEM_STATE, ANY_INPUT_EVENT) };
+    idle.is_finite() && idle < since.elapsed().as_secs_f64()
 }
 
 // ── Dispatcher ──────────────────────────────────────────────────────────────
@@ -297,6 +321,7 @@ impl Dispatcher {
             allowed_pid,
             restore_to,
             deadline: Instant::now() + ENTRY_DEADLINE,
+            yields_to_user_after: None,
             origin,
         };
         {
@@ -327,7 +352,21 @@ impl Dispatcher {
     /// Snapshot the entries (cloned to a small Vec) — used by tests
     /// and the activation handler to evaluate matches without holding
     /// the lock across the restore call.
+    fn yield_to_user_input(&self, handle: SuppressionHandle) {
+        if let Some(entry) = self.entries.lock().unwrap().get_mut(&handle.0) {
+            entry.yields_to_user_after = Some(Instant::now());
+        }
+    }
+
     fn snapshot_matches(&self, activated_pid: i32) -> Vec<i32> {
+        self.snapshot_matches_with(activated_pid, user_input_since)
+    }
+
+    fn snapshot_matches_with(
+        &self,
+        activated_pid: i32,
+        user_input_since: impl Fn(Instant) -> bool,
+    ) -> Vec<i32> {
         let mut guard = self.entries.lock().unwrap();
         // Reap expired entries first — keeps the dispatcher honest even
         // if the janitor hasn't ticked yet.
@@ -337,6 +376,9 @@ impl Dispatcher {
             .values()
             .filter(|e| {
                 if e.allowed_pid == Some(activated_pid) {
+                    return false;
+                }
+                if e.yields_to_user_after.is_some_and(&user_input_since) {
                     return false;
                 }
                 match e.target_pid {
@@ -572,6 +614,27 @@ mod tests {
     /// A background pixel click intentionally makes its target AppKit-active
     /// without raising it. The wildcard guard must allow that one pid while
     /// continuing to suppress unrelated cross-app activations.
+    /// After the action returns, the user's own activation wins: input
+    /// after the yield point lets the activation through; without input the
+    /// wildcard still restores.
+    #[test]
+    fn yielded_entry_lets_user_activations_through() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(None, 7, "test.yield");
+        d.yield_to_user_input(h);
+        assert_eq!(d.snapshot_matches_with(42, |_| false), vec![7]);
+        assert!(d.snapshot_matches_with(42, |_| true).is_empty());
+        d.remove(h);
+
+        let h = d.add(None, 7, "test.no_yield");
+        assert_eq!(
+            d.snapshot_matches_with(42, |_| true),
+            vec![7],
+            "an entry that has not yielded ignores user input"
+        );
+        d.remove(h);
+    }
+
     #[test]
     fn wildcard_can_allow_intentional_target_activation() {
         let d = Arc::new(Dispatcher::new());
@@ -638,6 +701,7 @@ mod tests {
                     allowed_pid: None,
                     restore_to: 7,
                     deadline: Instant::now() - Duration::from_secs(1),
+                    yields_to_user_after: None,
                     origin: "test.leak",
                 },
             );
