@@ -274,9 +274,9 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         // Opt-in read-only text field (CUA_APPKIT_READONLY_FIELD=1): an
         // AXTextField whose AXValue is not settable, for set_value refusal.
         if ProcessInfo.processInfo.environment["CUA_APPKIT_READONLY_FIELD"] == "1" {
-            let readOnly = NSTextField(string: "fixed text")
-            readOnly.isEditable = false
-            readOnly.isSelectable = true
+            // Stays an AXTextField (a non-editable NSTextField would report
+            // AXStaticText) but refuses the AX value setter.
+            let readOnly = AXValueLockedTextField(string: "fixed text")
             readOnly.setAccessibilityIdentifier("txt-readonly")
             inputRow.addArrangedSubview(readOnly)
         }
@@ -801,6 +801,32 @@ func stealFocus(after delay: Int, window: NSWindow?) {
                 FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
             }
         }
+    }
+}
+
+/// An accessibility text field whose AXValue is not settable, like a field
+/// an app has locked. NSTextField always reports its value settable, so this
+/// view describes itself to accessibility directly.
+final class AXValueLockedTextField: NSView {
+    private let text: String
+    init(string: String) {
+        text = string
+        super.init(frame: NSRect(x: 0, y: 0, width: 120, height: 24))
+        wantsLayer = true
+        layer?.borderWidth = 1
+        layer?.borderColor = NSColor.gray.cgColor
+    }
+    required init?(coder: NSCoder) { fatalError("init(coder:) is unsupported") }
+    override var intrinsicContentSize: NSSize { NSSize(width: 120, height: 24) }
+    override func isAccessibilityElement() -> Bool { true }
+    override func accessibilityRole() -> NSAccessibility.Role? { .textField }
+    override func accessibilityValue() -> Any? { text }
+    override func accessibilityPerformPress() -> Bool { true }
+    override func isAccessibilitySelectorAllowed(_ selector: Selector) -> Bool {
+        if selector == NSSelectorFromString("setAccessibilityValue:") {
+            return false
+        }
+        return super.isAccessibilitySelectorAllowed(selector)
     }
 }
 
