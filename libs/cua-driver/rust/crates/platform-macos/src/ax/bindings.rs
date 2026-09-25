@@ -166,6 +166,20 @@ pub unsafe fn is_attribute_settable(element: AXUIElementRef, attr_name: &str) ->
         && settable != 0
 }
 
+/// Whether an AX attribute is writable: `Some(true/false)` as reported, or
+/// `None` when the query itself failed (unknown, not "read-only").
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn attribute_settable(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
+    let attr = CFStr::new(attr_name);
+    let mut settable = 0_u8;
+    (AXUIElementIsAttributeSettable(element, attr.as_concrete_TypeRef(), &mut settable)
+        == kAXErrorSuccess)
+        .then_some(settable != 0)
+}
+
 /// Copy a string attribute from an AX element. Returns `None` on any error.
 ///
 /// # Safety

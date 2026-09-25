@@ -229,6 +229,17 @@ impl Tool for SetValueTool {
             || async move {
                 tokio::task::spawn_blocking(move || {
                     let element_ptr = element_guard.as_ptr();
+                    // Refuse before any side effect (no focusing) when a text
+                    // control reports its AXValue as read-only. Unknown still
+                    // attempts the write.
+                    let element = element_ptr as crate::ax::bindings::AXUIElementRef;
+                    let role = unsafe { crate::ax::bindings::copy_string_attr(element, "AXRole") }
+                        .unwrap_or_default();
+                    if text_value_not_settable(&role, || unsafe {
+                        crate::ax::bindings::attribute_settable(element, "AXValue")
+                    }) {
+                        return Ok(SetValueAttempt::Refused);
+                    }
                     if prepare_native_text
                         && !crate::input::ax_actions::is_element_focused(pid, element_ptr)
                     {
@@ -237,6 +248,7 @@ impl Tool for SetValueTool {
                     // Preparation is best effort, not evidence of delivery.
                     // Keep target-bound readback.
                     set_value_blocking(element_ptr, element_index, pid, &value)
+                        .map(SetValueAttempt::Applied)
                 })
                 .await
             },
@@ -246,7 +258,8 @@ impl Tool for SetValueTool {
         let changes = snapshot.detect_async().await;
 
         match result {
-            Ok(Ok(mut outcome)) => {
+            Ok(Ok(SetValueAttempt::Refused)) => nonsettable_text_refusal(),
+            Ok(Ok(SetValueAttempt::Applied(mut outcome))) => {
                 apply_surface_trust(&mut outcome, ax_echo_surface);
                 apply_verification_label(&mut outcome);
                 let mut msg = outcome.detail;
@@ -271,6 +284,29 @@ impl Tool for SetValueTool {
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+enum SetValueAttempt {
+    Refused,
+    Applied(SetValueOutcome),
+}
+
+/// A text control that says its AXValue is read-only is not written. This
+/// is about AXValue writability, not whether the keyboard could edit it.
+fn text_value_not_settable(role: &str, read_settable: impl FnOnce() -> Option<bool>) -> bool {
+    matches!(role, "AXTextField" | "AXTextArea") && read_settable() == Some(false)
+}
+
+fn nonsettable_text_refusal() -> ToolResult {
+    ToolResult::error(
+        "Cannot set AXValue: the text control currently reports that its value is not settable. \
+         No value write was attempted. This describes AXValue writability, not keyboard editability.",
+    )
+    .with_structured(serde_json::json!({
+        "code": "AX_VALUE_NOT_SETTABLE",
+        "effect": "refused",
+        "path": "ax",
+    }))
 }
 
 // ── Blocking implementation (runs on spawn_blocking thread) ─────────────────
@@ -696,6 +732,15 @@ fn hex_digit(n: u8) -> char {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_a_text_control_reported_read_only_is_refused() {
+        assert!(super::text_value_not_settable("AXTextField", || Some(false)));
+        assert!(super::text_value_not_settable("AXTextArea", || Some(false)));
+        assert!(!super::text_value_not_settable("AXTextField", || None), "unknown still writes");
+        assert!(!super::text_value_not_settable("AXTextField", || Some(true)));
+        assert!(!super::text_value_not_settable("AXSlider", || Some(false)), "other roles keep their paths");
+    }
+
     use super::{apply_surface_trust, apply_verification_label, classify_write, SetValueOutcome};
 
     #[test]

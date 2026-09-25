@@ -1727,6 +1727,8 @@ mod tests {
             frame: None,
             value_state: None,
             value_description: None,
+            placeholder: None,
+            value_settable: None,
             min_value: None,
             max_value: None,
             enabled: None,

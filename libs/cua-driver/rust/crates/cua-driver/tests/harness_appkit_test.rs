@@ -2601,6 +2601,64 @@ fn harness_appkit_user_choice_after_launch_sticks() {
     assert_eq!(front, Some(pid), "the launch watchdog demoted the app the user clicked");
 }
 
+/// A text field's placeholder is reported as `placeholder`, never as its
+/// value, both in structured elements and in the outline; its writability
+/// is reported; and set_value refuses a text field that reports its value
+/// read-only, without changing it.
+#[test]
+#[ignore]
+fn harness_appkit_placeholder_value_and_writability() {
+    run_background_case_with_env(
+        "placeholder_value_writability",
+        Targeting::Ax,
+        DriverRoute::MacosAxAction,
+        &[("CUA_APPKIT_READONLY_FIELD", "1")],
+        |pid, wid, driver| {
+            let snapshot = snapshot_elements(driver, pid, wid);
+            let elements = snapshot.structured()["elements"].as_array().expect("elements").clone();
+            let by_id = |id: &str| {
+                let index = element_index_by_id(snapshot.tree_text(), id)
+                    .unwrap_or_else(|| panic!("{id} not in tree"));
+                elements
+                    .iter()
+                    .find(|e| e["element_index"].as_u64() == Some(index))
+                    .cloned()
+                    .unwrap_or_else(|| panic!("{id} element"))
+            };
+            let input = by_id("txt-input");
+            eprintln!("txt-input element: {input}");
+            assert_eq!(input["value"], "", "the empty field's content, not its hint");
+            assert_eq!(input["placeholder"], "Type here…");
+            assert_eq!(input["value_settable"], true);
+            assert!(
+                snapshot.tree_text().contains("[placeholder=\"Type here…\"]"),
+                "outline shows the hint as a hint: {}",
+                snapshot.tree_text()
+            );
+            assert!(
+                !snapshot.tree_text().contains("= \"Type here…\""),
+                "outline must not show the hint as the value"
+            );
+
+            let readonly = by_id("txt-readonly");
+            eprintln!("txt-readonly element: {readonly}");
+            assert_eq!(readonly["value_settable"], false);
+            let refused = driver.call(
+                "set_value",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid,
+                    "element_token": readonly["element_token"], "value": "changed"
+                }),
+            );
+            eprintln!("set_value on read-only: {}", refused.raw);
+            assert_eq!(refused.structured()["code"], "AX_VALUE_NOT_SETTABLE");
+            let after = snapshot_elements(driver, pid, wid);
+            assert!(after.tree_text().contains("fixed text"), "value unchanged");
+            assert!(!after.tree_text().contains("changed"));
+        },
+    );
+}
+
 macro_rules! focus_theft_tests {
     ($($name:ident: $delay:expr, $targeting:expr;)*) => {$(
         #[test]

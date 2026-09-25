@@ -271,6 +271,15 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         inputRow.addArrangedSubview(textInput)
         inputRow.addArrangedSubview(textInputMirror)
         inputRow.addArrangedSubview(textInputCommit)
+        // Opt-in read-only text field (CUA_APPKIT_READONLY_FIELD=1): an
+        // AXTextField whose AXValue is not settable, for set_value refusal.
+        if ProcessInfo.processInfo.environment["CUA_APPKIT_READONLY_FIELD"] == "1" {
+            let readOnly = NSTextField(string: "fixed text")
+            readOnly.isEditable = false
+            readOnly.isSelectable = true
+            readOnly.setAccessibilityIdentifier("txt-readonly")
+            inputRow.addArrangedSubview(readOnly)
+        }
         NSLayoutConstraint.activate([
             textInput.widthAnchor.constraint(equalToConstant: 240),
         ])

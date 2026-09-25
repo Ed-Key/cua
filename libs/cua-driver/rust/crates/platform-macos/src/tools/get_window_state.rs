@@ -1022,6 +1022,22 @@ pub(crate) fn build_elements_array_with_token(
 
 /// Verification observes display-only state without creating action tokens or
 /// changing the public actionable projection and its existing snapshot cache.
+/// A row's human-readable name: title, then description, then a non-blank
+/// value, then the placeholder hint, then the identifier, trimmed.
+fn derive_label(node: &crate::ax::tree::AXNode) -> Option<String> {
+    let nonblank = |text: &Option<String>| {
+        text.as_deref()
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .map(str::to_owned)
+    };
+    nonblank(&node.title)
+        .or_else(|| nonblank(&node.description))
+        .or_else(|| nonblank(&node.value))
+        .or_else(|| nonblank(&node.placeholder))
+        .or_else(|| nonblank(&node.identifier))
+}
+
 fn build_observation_elements_array(nodes: &[crate::ax::tree::AXNode]) -> Vec<serde_json::Value> {
     build_elements_array(nodes, None, true)
 }
@@ -1040,12 +1056,7 @@ fn build_elements_array(
             // `label` is a best-effort human-readable string: title first,
             // then description, then value, then identifier. Mirrors what
             // a human reading the markdown row would call this element.
-            let label = node
-                .title
-                .clone()
-                .or_else(|| node.description.clone())
-                .or_else(|| node.value.clone())
-                .or_else(|| node.identifier.clone());
+            let label = derive_label(node);
             let frame = node
                 .frame
                 .map(|[x, y, w, h]| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
@@ -1089,6 +1100,12 @@ fn build_elements_array(
                 .flatten();
             if let Some(value) = node.value_state.clone().or(fallback) {
                 entry["value"] = serde_json::Value::String(value);
+            }
+            if let Some(placeholder) = &node.placeholder {
+                entry["placeholder"] = serde_json::Value::String(placeholder.clone());
+            }
+            if let Some(settable) = node.value_settable {
+                entry["value_settable"] = serde_json::Value::Bool(settable);
             }
             if let Some(desc) = node.value_description.clone() {
                 entry["value_description"] = serde_json::Value::String(desc);
@@ -1350,6 +1367,8 @@ mod tests {
             frame,
             value_state: None,
             value_description: None,
+            placeholder: None,
+            value_settable: None,
             min_value: None,
             max_value: None,
             enabled: None,
@@ -1567,6 +1586,8 @@ mod tests {
         for index in [None, Some(0)] {
             let mut field = node(index, "AXTextField", Some("Draft"), 0, None, None, vec![]);
             field.value = Some(String::new());
+            // The tree reader carries a text field's content in value_state.
+            field.value_state = Some(String::new());
             let nodes = [field];
             let observed = build_observation_elements_array(&nodes);
             assert_eq!(observed[0]["value"], "");
@@ -1581,14 +1602,42 @@ mod tests {
     }
 
     #[test]
-    fn verification_recognizes_an_empty_native_field_value() {
-        let mut field = node(Some(0), "AXTextField", Some("Draft"), 0, None, None, vec![]);
+    fn placeholder_and_writability_are_reported_separately_from_value() {
+        let mut field = node(Some(0), "AXTextField", None, 0, None, None, vec![]);
         field.value_state = Some(String::new());
-        let result = verify_observed_nodes(
-            &[field],
-            json!({"selector": {"role": "AXTextField", "label_contains": "Draft"}, "value_equals": ""}),
-        );
-        assert_eq!(result[0]["status"], "satisfied");
+        field.placeholder = Some("Search".into());
+        field.value_settable = Some(false);
+        let entry = &build_elements_array_with_token(&[field], None)[0];
+        assert_eq!(entry["value"], "", "the empty content, not the hint");
+        assert_eq!(entry["placeholder"], "Search");
+        assert_eq!(entry["value_settable"], false);
+        assert_eq!(entry["label"], "Search", "an empty field is named by its hint");
+    }
+
+    #[test]
+    fn unknown_writability_is_omitted() {
+        let entry = &build_elements_array_with_token(
+            &[node(Some(0), "AXTextField", None, 0, None, None, vec![])],
+            None,
+        )[0];
+        assert!(entry.get("value_settable").is_none());
+    }
+
+    #[test]
+    fn label_prefers_title_then_description_then_value_then_placeholder() {
+        let mut n = node(Some(0), "AXTextField", None, 0, None, None, vec![]);
+        n.identifier = Some("txt-id".into());
+        assert_eq!(derive_label(&n).as_deref(), Some("txt-id"));
+        n.placeholder = Some("  Hint ".into());
+        assert_eq!(derive_label(&n).as_deref(), Some("Hint"));
+        n.value = Some("   ".into());
+        assert_eq!(derive_label(&n).as_deref(), Some("Hint"), "a blank value does not name it");
+        n.value = Some(" typed ".into());
+        assert_eq!(derive_label(&n).as_deref(), Some("typed"));
+        n.description = Some("Desc".into());
+        assert_eq!(derive_label(&n).as_deref(), Some("Desc"));
+        n.title = Some("Title".into());
+        assert_eq!(derive_label(&n).as_deref(), Some("Title"));
     }
 
     #[test]

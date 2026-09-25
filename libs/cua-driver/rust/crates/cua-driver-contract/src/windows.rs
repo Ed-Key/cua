@@ -252,6 +252,12 @@ pub struct WindowElement {
     pub label: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value: Option<String>,
+    /// The hint an empty field shows (`AXPlaceholderValue`); never content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub placeholder: Option<String>,
+    /// Whether the value can be written; absent when unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub value_settable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_description: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
