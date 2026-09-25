@@ -43,9 +43,10 @@ fn signature(node: &AXNode) -> String {
     // row, and the structured frame's fractions matter to nobody clicking it.
     let frame = node.frame.map(|[x, y, w, h]| [x.round(), y.round(), w.round(), h.round()]);
     format!(
-        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}",
+        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}",
         format_node_line(node),
         node.value_state,
+        node.value_settable,
         node.selected,
         node.enabled,
         node.value_description,
@@ -289,6 +290,17 @@ mod tests {
             selected: None,
             in_web_content: false,
         }
+    }
+
+    #[test]
+    fn writability_change_marks_the_row_changed() {
+        let mut a = node(Some(1), 0, None, "v", 1);
+        let mut b = node(Some(1), 0, None, "v", 1);
+        a.value_settable = Some(true);
+        b.value_settable = Some(false);
+        assert_ne!(signature(&a), signature(&b));
+        b.value_settable = None;
+        assert_ne!(signature(&a), signature(&b), "unknown is a change too");
     }
 
     #[test]

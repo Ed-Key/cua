@@ -760,6 +760,14 @@ pub(crate) fn render_lines(lines: &[(usize, String)]) -> String {
 }
 
 /// Filter the tree markdown to lines matching `query` plus their ancestor chain.
+/// Undo the JSON escapes used when rendering values, for matching only.
+fn unescape_rendered(line: &str) -> String {
+    line.replace("\\\"", "\"")
+        .replace("\\n", "\n")
+        .replace("\\t", "\t")
+        .replace("\\\\", "\\")
+}
+
 fn filter_tree(markdown: &str, query: &str) -> String {
     let needle = query.to_lowercase();
     let lines: Vec<&str> = markdown.lines().collect();
@@ -780,7 +788,11 @@ fn filter_tree(markdown: &str, query: &str) -> String {
         }
         current_ancestor[depth] = line;
 
-        if line.to_lowercase().contains(&needle) {
+        // Values render JSON-escaped; also match the decoded text, so a
+        // query for `Say "hello"` still finds that value.
+        if line.to_lowercase().contains(&needle)
+            || unescape_rendered(line).to_lowercase().contains(&needle)
+        {
             for ancestor_depth in 0..depth {
                 let ancestor = current_ancestor[ancestor_depth];
                 if ancestor.is_empty() {
@@ -819,6 +831,12 @@ fn leading_indent_depth(line: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn query_matches_values_with_rendered_escapes() {
+        let tree = "- AXWindow \"W\"\n  - AXStaticText = \"Say \\\"hello\\\"\"\n";
+        assert!(filter_tree(tree, r#"Say "hello""#).contains("AXStaticText"));
+    }
+
     #[test]
     fn rendered_values_are_quoted_and_cannot_add_rows() {
         let mut node = AXNode {

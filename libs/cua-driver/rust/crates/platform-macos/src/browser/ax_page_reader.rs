@@ -148,6 +148,13 @@ fn parse_ax_line(line: &str) -> Option<AXElement> {
         }
     }
 
+    // The placeholder hint, if any, sits between the value and the
+    // description: `[placeholder="..."]`. It is not content; skip it.
+    if let Some(after) = pos.strip_prefix("[placeholder=") {
+        let (_, remaining) = parse_quoted_string(after.trim_start());
+        pos = remaining.trim_start().strip_prefix(']').unwrap_or(remaining).trim_start();
+    }
+
     // Description: `(...)`.
     if pos.starts_with('(') {
         if let Some(close) = pos.find(')') {
@@ -165,10 +172,23 @@ fn parse_ax_line(line: &str) -> Option<AXElement> {
 }
 
 /// Parse a double-quoted string starting at the beginning of `s`.
-/// Returns (content, remainder_after_closing_quote).
+/// Returns (content, remainder_after_closing_quote). Values are rendered as
+/// JSON strings, so a JSON-decodable token is decoded exactly (`\t` is a
+/// tab, not `t`); anything else falls back to dropping backslashes.
 fn parse_quoted_string(s: &str) -> (String, &str) {
     if !s.starts_with('"') {
         return (String::new(), s);
+    }
+    let mut escaped = false;
+    let end = s[1..].char_indices().find_map(|(i, c)| {
+        let close = !escaped && c == '"';
+        escaped = !escaped && c == '\\';
+        close.then_some(i + 1)
+    });
+    if let Some(end) = end {
+        if let Ok(decoded) = serde_json::from_str::<String>(&s[..=end]) {
+            return (decoded, &s[end + 1..]);
+        }
     }
     let s = &s[1..]; // skip opening quote
     let mut result = String::new();
@@ -220,3 +240,17 @@ fn css_selector_to_ax_roles(selector: &str) -> Vec<&'static str> {
         _ => vec![],
     }
 }
+
+#[cfg(test)]
+mod rendered_value_tests {
+    use super::*;
+
+    #[test]
+    fn json_escaped_values_decode_and_placeholders_do_not_hide_descriptions() {
+        let el = parse_ax_line(r#"- [3] AXTextField = "left\tright \"q\"" [placeholder="Name"] (Full name)"#)
+            .expect("row");
+        assert_eq!(el.value, "left\tright \"q\"");
+        assert_eq!(el.description, "Full name");
+    }
+}
+
