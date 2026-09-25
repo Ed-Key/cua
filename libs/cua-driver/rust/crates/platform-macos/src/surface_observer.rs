@@ -37,6 +37,66 @@ const OWNER_CATCH_UP_INTERVAL: Duration = Duration::from_millis(80);
 /// ponytail: bounded map, oldest entry evicted; a session that acts on many
 /// apps without reading them loses its oldest unreported note.
 const MAX_PENDING: usize = 64;
+/// Reads after which a root whose owner never resolves stops blocking.
+const MAX_UNRESOLVED_READS: u32 = 3;
+
+/// Unique across every baseline ever created, so a read that started
+/// against a baseline that was since removed and recreated cannot match it.
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn next_generation() -> u64 {
+    NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+}
+
+/// An AX element as an identity: retained, hashed with `CFHash`, compared
+/// with `CFEqual` (equal hashes alone do not prove the same element).
+struct AxIdentity(AXUIElementRef);
+
+impl AxIdentity {
+    /// # Safety
+    /// `element` must be a live `AXUIElementRef`.
+    unsafe fn retain(element: AXUIElementRef) -> Self {
+        core_foundation::base::CFRetain(element as CFTypeRef);
+        Self(element)
+    }
+}
+
+impl Clone for AxIdentity {
+    fn clone(&self) -> Self {
+        unsafe { Self::retain(self.0) }
+    }
+}
+
+impl Drop for AxIdentity {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0 as CFTypeRef) };
+    }
+}
+
+impl PartialEq for AxIdentity {
+    fn eq(&self, other: &Self) -> bool {
+        unsafe { core_foundation::base::CFEqual(self.0 as CFTypeRef, other.0 as CFTypeRef) != 0 }
+    }
+}
+
+impl Eq for AxIdentity {}
+
+impl std::hash::Hash for AxIdentity {
+    fn hash<H: std::hash::Hasher>(&self, state: &mut H) {
+        unsafe { core_foundation::base::CFHash(self.0 as CFTypeRef) }.hash(state);
+    }
+}
+
+impl std::fmt::Debug for AxIdentity {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "AxIdentity({:p})", self.0)
+    }
+}
+
+// SAFETY: CF retain/release/equal/hash are thread-safe, and the element is
+// only used through those calls.
+unsafe impl Send for AxIdentity {}
+unsafe impl Sync for AxIdentity {}
 
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 enum RootKey {
@@ -45,14 +105,13 @@ enum RootKey {
         role: String,
         subrole: String,
     },
-    /// No window id of its own. Identified by the AX element itself
-    /// (`CFHash`, consistent with `CFEqual`), so a retitled or moved
-    /// existing surface is not mistaken for a new one.
+    /// No window id of its own. Identified by the AX element itself, so a
+    /// retitled or moved existing surface is not mistaken for a new one.
     Transient {
         parent_window_id: Option<u32>,
         role: String,
         subrole: String,
-        element_hash: u64,
+        element: AxIdentity,
     },
 }
 
@@ -78,6 +137,8 @@ struct Pending {
     /// A read already found nothing new against this baseline. The next action
     /// starts a fresh baseline instead of reporting stale windows later.
     read_since: bool,
+    /// Consecutive reads that found a root whose owner was still unknown.
+    unresolved_reads: u32,
 }
 
 type PendingKey = (String, i32);
@@ -129,14 +190,14 @@ fn record_before_action(session: &str, pid: i32) {
             map.remove(&oldest);
         }
     }
-    let generation = map.get(&key).map_or(0, |entry| entry.generation + 1);
     map.insert(
         key,
         Pending {
             roots,
             recorded: Instant::now(),
-            generation,
+            generation: next_generation(),
             read_since: false,
+            unresolved_reads: 0,
         },
     );
 }
@@ -181,7 +242,9 @@ fn finish_take(
     if entry.generation != generation {
         return None; // another read or a new baseline got here first
     }
-    entry.generation += 1;
+    entry.generation = next_generation();
+    // A root whose owner never resolves stops blocking after a few reads.
+    let give_up = entry.unresolved_reads + 1 >= MAX_UNRESOLVED_READS;
     let mut reported = Vec::new();
     let mut unresolved = false;
     for ((root_key, root), outcome) in appeared.into_iter().zip(outcomes) {
@@ -190,18 +253,22 @@ fn finish_take(
                 entry.roots.insert(root_key, root);
                 reported.push(window);
             }
-            Outcome::Unaddressable => {
+            Outcome::Unresolved if !give_up => unresolved = true,
+            Outcome::Unaddressable | Outcome::Unresolved => {
                 entry.roots.insert(root_key, root);
             }
-            Outcome::Unresolved => unresolved = true,
         }
     }
-    if !unresolved {
-        if reported.is_empty() {
-            entry.read_since = true;
-        } else {
-            map.remove(key);
-        }
+    if unresolved {
+        // Keep this baseline across the next action so the root can still
+        // be reported once its owner resolves.
+        entry.read_since = false;
+        entry.unresolved_reads += 1;
+    } else if reported.is_empty() {
+        entry.read_since = true;
+        entry.unresolved_reads = 0;
+    } else {
+        map.remove(key);
     }
     change_from(reported, unresolved, pid)
 }
@@ -560,11 +627,11 @@ unsafe fn insert_root(
     let title = reader.optional_string(element, "AXTitle")?;
     let own_window_id = reader.read(element, || ax_get_window_id_checked(element))?;
     // get_window_state reads top-level AX windows; a child surface is read
-    // through its parent even when WindowServer gives it its own id.
+    // only through its parent, even when WindowServer gives it its own id.
     let effective_window_id = if top_level {
-        own_window_id.or(parent_window_id)
+        own_window_id
     } else {
-        parent_window_id.or(own_window_id)
+        parent_window_id
     };
     let key = match own_window_id {
         Some(window_id) => RootKey::Native {
@@ -576,7 +643,7 @@ unsafe fn insert_root(
             parent_window_id,
             role,
             subrole,
-            element_hash: core_foundation::base::CFHash(element as CFTypeRef) as u64,
+            element: AxIdentity::retain(element),
         },
     };
     roots.insert(
@@ -668,6 +735,7 @@ mod tests {
                 recorded: Instant::now(),
                 generation: 7,
                 read_since: false,
+                unresolved_reads: 0,
             },
         );
         (key, 7)
@@ -783,6 +851,35 @@ mod tests {
         let entry = map.get(&key).expect("unresolved root keeps the baseline");
         assert!(entry.roots.contains_key(&native(8, "AXWindow")), "reported root is now known");
         assert!(!entry.roots.contains_key(&native(9, "AXWindow")), "unresolved root can still be reported");
+    }
+
+    #[test]
+    fn an_unresolved_root_clears_an_earlier_refresh_mark() {
+        let (key, generation) = seed("unresolved-after-empty", 4105);
+        pending().get_mut(&key).unwrap().read_since = true;
+        let appeared = vec![(native(9, "AXWindow"), root(9, "Late"))];
+        assert_eq!(finish_take(&key, generation, appeared, vec![Outcome::Unresolved]), None);
+        assert!(!pending().get(&key).unwrap().read_since, "the next action must keep this baseline");
+    }
+
+    #[test]
+    fn a_root_that_never_resolves_stops_blocking() {
+        let (key, _) = seed("never-resolves", 4106);
+        let appeared = vec![(native(9, "AXWindow"), root(9, "Ghost"))];
+        for _ in 0..MAX_UNRESOLVED_READS {
+            let generation = pending().get(&key).unwrap().generation;
+            finish_take(&key, generation, appeared.clone(), vec![Outcome::Unresolved]);
+        }
+        let map = pending();
+        let entry = map.get(&key).unwrap();
+        assert!(entry.roots.contains_key(&native(9, "AXWindow")), "given up and treated as known");
+        assert!(entry.read_since);
+    }
+
+    #[test]
+    fn generations_are_unique_across_recreated_baselines() {
+        let first = next_generation();
+        assert_ne!(first, next_generation());
     }
 
     #[test]

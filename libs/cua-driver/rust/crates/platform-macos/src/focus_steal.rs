@@ -354,7 +354,11 @@ impl Dispatcher {
     /// the lock across the restore call.
     fn yield_to_user_input(&self, handle: SuppressionHandle) {
         if let Some(entry) = self.entries.lock().unwrap().get_mut(&handle.0) {
-            entry.yields_to_user_after = Some(Instant::now());
+            let now = Instant::now();
+            entry.yields_to_user_after = Some(now);
+            // The post-result phase gets its own safety deadline, so a long
+            // action does not arrive here with its entry about to expire.
+            entry.deadline = entry.deadline.max(now + ENTRY_DEADLINE);
         }
     }
 
