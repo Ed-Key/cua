@@ -2661,8 +2661,10 @@ mod tests {
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
-    /// Serializes tests that change process env or the telemetry home. A
-    /// panic in one of them must fail that test only, not poison the rest.
+    /// Every test in this module takes this first: many read process env
+    /// (execution mode, synthetic flag) or the telemetry home that others
+    /// change, and together they run in well under a second. A panic in one
+    /// must fail that test only, not poison the rest.
     fn env_lock() -> std::sync::MutexGuard<'static, ()> {
         ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
     }
@@ -2809,6 +2811,7 @@ mod tests {
 
     #[test]
     fn identity_process_child() {
+        let _guard = env_lock();
         if std::env::var(TEST_CHILD_KIND).ok().as_deref() != Some("identity") {
             return;
         }
@@ -2824,6 +2827,7 @@ mod tests {
 
     #[test]
     fn lifecycle_process_child() {
+        let _guard = env_lock();
         let Ok(kind) = std::env::var(TEST_CHILD_KIND) else {
             return;
         };
@@ -3059,6 +3063,7 @@ mod tests {
 
     #[test]
     fn permissions_resolution_covers_grant_dismissal_recovery_and_timeout() {
+        let _guard = env_lock();
         assert_eq!(permissions_gate_resolution(false, false), "granted");
         assert_eq!(
             permissions_gate_resolution(false, true),
@@ -3377,6 +3382,7 @@ mod tests {
 
     #[test]
     fn session_observation_keys_are_bounded_by_transport_and_client_category() {
+        let _guard = env_lock();
         assert_eq!(
             mcp_session_observation_key(Transport::McpStdio, "claude_code"),
             "mcp_stdio"
@@ -3409,6 +3415,7 @@ mod tests {
 
     #[test]
     fn agent_session_aggregate_is_bounded_content_free_and_multi_transport() {
+        let _guard = env_lock();
         use cua_driver_core::server::{
             DurationBucket, OutputSizeBucket, OutputType, ToolCompletionObservation, ToolErrorClass,
         };
@@ -3523,6 +3530,7 @@ mod tests {
 
     #[test]
     fn history_reads_do_not_change_tool_or_agent_session_telemetry() {
+        let _guard = env_lock();
         use cua_driver_core::server::{
             DurationBucket, OutputSizeBucket, OutputType, ToolCompletionObservation, ToolErrorClass,
         };
@@ -3559,6 +3567,7 @@ mod tests {
 
     #[test]
     fn failed_or_non_auto_escalation_is_not_counted() {
+        let _guard = env_lock();
         use cua_driver_core::server::{
             DurationBucket, OutputSizeBucket, OutputType, ToolCompletionObservation,
             ToolErrorClass, ToolOperation, ToolRefusalCode,
@@ -3615,6 +3624,7 @@ mod tests {
 
     #[test]
     fn browser_refusal_is_bounded_and_not_a_completed_computer_action() {
+        let _guard = env_lock();
         use cua_driver_core::server::{
             DurationBucket, OutputSizeBucket, OutputType, ToolCompletionObservation,
             ToolErrorClass, ToolOperation, ToolRefusalCode,
@@ -3658,6 +3668,7 @@ mod tests {
 
     #[test]
     fn every_browser_tool_marks_the_session_without_retaining_arguments() {
+        let _guard = env_lock();
         use cua_driver_core::server::{
             DurationBucket, OutputSizeBucket, OutputType, ToolCompletionObservation,
             ToolErrorClass, ToolOperation, ToolRefusalCode,
@@ -3713,6 +3724,7 @@ mod tests {
 
     #[test]
     fn agent_session_buckets_have_fixed_boundaries() {
+        let _guard = env_lock();
         for (count, expected) in [
             (0, "0"),
             (1, "1_4"),
@@ -3763,6 +3775,7 @@ mod tests {
 
     #[test]
     fn disabled_agent_session_observation_creates_no_state_or_identity() {
+        let _guard = env_lock();
         use cua_driver_core::server::{
             DurationBucket, OutputSizeBucket, OutputType, ToolCompletionObservation,
             ToolErrorClass, ToolOperation, ToolRefusalCode,
@@ -3771,7 +3784,6 @@ mod tests {
             SessionDeclaration, SessionObserver, SessionStartObservation, SessionTransport,
         };
 
-        let _guard = env_lock();
         with_isolated_home(|_| {
             set_enabled(false).unwrap();
             let session_id = "private-disabled-session-telemetry-test";
@@ -3810,6 +3822,7 @@ mod tests {
 
     #[test]
     fn tool_completion_rate_limit_resets_after_one_hour() {
+        let _guard = env_lock();
         let started = Instant::now();
         let mut limit = ToolTelemetryRateLimit::new(started);
 
@@ -3824,6 +3837,7 @@ mod tests {
 
     #[test]
     fn http_tool_completion_reaches_the_final_payload_as_mcp_http() {
+        let _guard = env_lock();
         use cua_driver_core::server::{
             DurationBucket, OutputSizeBucket, OutputType, ToolCompletionObservation, ToolErrorClass,
         };
@@ -3858,6 +3872,7 @@ mod tests {
 
     #[test]
     fn compound_tool_operation_reaches_payload_as_a_fixed_value() {
+        let _guard = env_lock();
         use cua_driver_core::server::{
             DurationBucket, OutputSizeBucket, OutputType, ToolCompletionObservation,
             ToolErrorClass, ToolOperation,
@@ -3883,6 +3898,7 @@ mod tests {
 
     #[test]
     fn cli_tool_names_are_fixed_and_content_free() {
+        let _guard = env_lock();
         assert_eq!(fixed_tool_name("click"), "click");
         assert_eq!(fixed_tool_name("type_text_chars"), "type_text");
         assert_eq!(fixed_tool_name("../../private/secret"), "other");
@@ -3891,6 +3907,7 @@ mod tests {
 
     #[test]
     fn cli_operations_and_client_kinds_are_revalidated_in_the_worker() {
+        let _guard = env_lock();
         assert_eq!(fixed_cli_operation("recording", "start"), "start");
         assert_eq!(fixed_cli_operation("recording", "/private/path"), "other");
         assert_eq!(fixed_cli_command("history"), "history");
@@ -3939,6 +3956,7 @@ mod tests {
 
     #[test]
     fn cli_duration_buckets_have_fixed_boundaries() {
+        let _guard = env_lock();
         assert_eq!(duration_bucket(Duration::from_millis(99)), "lt_100ms");
         assert_eq!(duration_bucket(Duration::from_millis(100)), "100_499ms");
         assert_eq!(duration_bucket(Duration::from_millis(500)), "500ms_1_999ms");
@@ -3948,6 +3966,7 @@ mod tests {
 
     #[test]
     fn release_versions_accept_strict_semver_and_drop_leading_v() {
+        let _guard = env_lock();
         assert_eq!(strict_release_version("v1.2.3"), Some("1.2.3".into()));
         assert_eq!(
             strict_release_version("1.2.3-rc.1"),
@@ -3959,6 +3978,7 @@ mod tests {
 
     #[test]
     fn reported_models_are_coarse_fixed_categories() {
+        let _guard = env_lock();
         assert_eq!(normalize_model(Some("claude-opus-4-1")), "claude_opus");
         assert_eq!(normalize_model(Some("gpt-5.2-codex")), "gpt_5");
         assert_eq!(normalize_model(Some("gpt-private_secret")), "custom");
@@ -3980,6 +4000,7 @@ mod tests {
 
     #[test]
     fn cli_command_values_are_fixed() {
+        let _guard = env_lock();
         assert_eq!(fixed_cli_command("call"), "call");
         assert_eq!(fixed_cli_command("private-customer-command"), "other");
     }
