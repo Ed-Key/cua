@@ -16,10 +16,10 @@ use std::collections::HashMap;
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
-use core_foundation::base::{CFRelease, CFTypeRef};
+use core_foundation::base::{CFEqual, CFRelease, CFTypeRef};
 
 use super::bindings::{
-    copy_ax_windows, AXUIElementSetMessagingTimeout,
+    copy_ax_windows, AXUIElementCreateApplication, AXUIElementSetMessagingTimeout,
     copy_children, copy_string_attr, enable_chromium_accessibility, AXUIElementRef,
     AccessibilityOptIn,
 };
@@ -165,26 +165,66 @@ unsafe fn has_web_area(
         if !found && depth > 0 && *visits > 0 && bound_by(child, deadline) {
             *visits -= 1;
             found = copy_string_attr(child, "AXRole").as_deref() == Some(WEB_AREA_ROLE)
-                || has_web_area(copy_children(child), depth - 1, visits, deadline);
+                || (bound_by(child, deadline)
+                    && has_web_area(copy_children(child), depth - 1, visits, deadline));
         }
         CFRelease(child as CFTypeRef);
     }
     found
 }
 
+/// A throwaway application reference for probing: messaging timeouts are
+/// per reference and persistent, so the walker's reference is never touched.
+struct ProbeApp(AXUIElementRef);
+
+impl ProbeApp {
+    unsafe fn new(pid: i32) -> Option<Self> {
+        let app = AXUIElementCreateApplication(pid);
+        (!app.is_null()).then_some(Self(app))
+    }
+}
+
+impl Drop for ProbeApp {
+    fn drop(&mut self) {
+        unsafe { CFRelease(self.0 as CFTypeRef) };
+    }
+}
+
 /// Probe the same roots the tree walker reads: AXChildren and AXWindows (a
-/// background window can be absent from the first).
-unsafe fn probe_web_content(app_element: AXUIElementRef, deadline: Instant) -> WebContent {
-    if !bound_by(app_element, deadline) {
+/// background window can be absent from the first), without duplicates, so
+/// a window listed in both does not spend the node budget twice.
+unsafe fn probe_web_content(pid: i32, deadline: Instant) -> WebContent {
+    let Some(app) = ProbeApp::new(pid) else {
+        return WebContent::Absent;
+    };
+    if !bound_by(app.0, deadline) {
         return WebContent::Absent;
     }
+    let mut roots = copy_children(app.0);
+    if bound_by(app.0, deadline) {
+        for window in copy_ax_windows(app.0) {
+            if roots.iter().any(|&root| CFEqual(root as CFTypeRef, window as CFTypeRef) != 0) {
+                CFRelease(window as CFTypeRef);
+            } else {
+                roots.push(window);
+            }
+        }
+    }
     let mut visits = WEB_AREA_PROBE_NODES;
-    let mut roots = copy_children(app_element);
-    roots.extend(copy_ax_windows(app_element));
     if has_web_area(roots, WEB_AREA_MAX_DEPTH, &mut visits, deadline) {
         WebContent::Present
     } else {
         WebContent::Absent
+    }
+}
+
+/// Re-assert the Chromium opt-in within the deadline, on a throwaway
+/// reference so the caller's timeout is unchanged.
+unsafe fn reassert_within(pid: i32, deadline: Instant) {
+    if let Some(app) = ProbeApp::new(pid) {
+        if bound_by(app.0, deadline) {
+            enable_chromium_accessibility(app.0);
+        }
     }
 }
 
@@ -213,7 +253,7 @@ fn pump_bounded(seconds: f64, mut pump: impl FnMut(f64)) {
 /// is cut to the time left. `now` is injectable so tests run on logical time.
 fn await_web_content(
     mut probe: impl FnMut(Instant) -> WebContent,
-    mut reassert: impl FnMut(),
+    mut reassert: impl FnMut(Instant),
     mut settle: impl FnMut(f64),
     now: impl Fn() -> Instant,
 ) -> bool {
@@ -223,7 +263,7 @@ fn await_web_content(
     let mut reasserted = false;
     loop {
         if let WebContent::Present = probe(deadline) {
-            reassert();
+            reassert(deadline);
             let left = deadline.saturating_duration_since(now()).as_secs_f64();
             settle(CHROMIUM_SETTLE_SECONDS.min(left.max(0.0)));
             return true;
@@ -233,10 +273,14 @@ fn await_web_content(
             return false;
         }
         if !reasserted && at >= reassert_at {
-            reassert();
+            reassert(deadline);
             reasserted = true;
         }
-        let left = deadline.saturating_duration_since(at).as_secs_f64();
+        // Recomputed after reassertion, which also spends budget.
+        let left = deadline.saturating_duration_since(now()).as_secs_f64();
+        if left <= 0.0 {
+            return false;
+        }
         settle(MATERIALIZE_POLL_SECONDS.min(left));
     }
 }
@@ -273,12 +317,12 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
     );
     let outcome = wait_outcome(opt_in, known_chromium, prior_timeouts, attempted_at, || {
         await_web_content(
-            |deadline| probe_web_content(app_element, deadline),
-            || {
+            |deadline| probe_web_content(pid, deadline),
+            |deadline| {
                 // Repeated legacy requests restart Chromium's debounce
                 // timer. Only the modern Electron path needs reassertion.
                 if opt_in == AccessibilityOptIn::ManualAccessibility {
-                    enable_chromium_accessibility(app_element);
+                    reassert_within(pid, deadline);
                 }
             },
             pump_for,
@@ -310,7 +354,7 @@ mod tests {
                 elapsed.set(elapsed.get() + Duration::from_secs(1));
                 WebContent::Absent
             },
-            || {},
+            |_| {},
             |seconds| elapsed.set(elapsed.get() + Duration::from_secs_f64(seconds)),
             || origin + elapsed.get(),
         );
@@ -331,7 +375,7 @@ mod tests {
                 log.borrow_mut().push(format!("probe:{next:?}"));
                 next
             },
-            || log.borrow_mut().push("reassert".to_string()),
+            |_| log.borrow_mut().push("reassert".to_string()),
             |seconds| {
                 elapsed.set(elapsed.get() + Duration::from_secs_f64(seconds));
                 log.borrow_mut().push(format!("settle:{seconds}"));
