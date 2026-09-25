@@ -150,7 +150,9 @@ unsafe fn bound_by(element: AXUIElementRef, deadline: Instant) -> bool {
     if remaining < Duration::from_millis(1) {
         return false;
     }
-    AXUIElementSetMessagingTimeout(element, remaining.min(Duration::from_millis(250)).as_secs_f32());
+    // Only the deadline bounds a call: a starting Electron app can take longer
+    // than a short fixed cap to answer while it builds its tree.
+    AXUIElementSetMessagingTimeout(element, remaining.as_secs_f32());
     true
 }
 
@@ -251,6 +253,12 @@ fn pump_bounded(seconds: f64, mut pump: impl FnMut(f64)) {
 
 /// One absolute deadline covers probes, reassertion and sleeps; every sleep
 /// is cut to the time left. `now` is injectable so tests run on logical time.
+///
+/// The opt-in is re-asserted only once content is present, never while
+/// waiting: re-asserting restarts Chromium's debounce, and on a starting
+/// Electron app (content at about 2.1s) a mid-budget re-assertion pushed
+/// materialization past the deadline. A timed-out app is retried by the
+/// next walk anyway.
 fn await_web_content(
     mut probe: impl FnMut(Instant) -> WebContent,
     mut reassert: impl FnMut(Instant),
@@ -259,8 +267,6 @@ fn await_web_content(
 ) -> bool {
     let start = now();
     let deadline = start + Duration::from_secs_f64(MATERIALIZE_TIMEOUT_SECONDS);
-    let reassert_at = start + Duration::from_secs_f64(MATERIALIZE_TIMEOUT_SECONDS / 2.0);
-    let mut reasserted = false;
     loop {
         if let WebContent::Present = probe(deadline) {
             reassert(deadline);
@@ -268,15 +274,6 @@ fn await_web_content(
             settle(CHROMIUM_SETTLE_SECONDS.min(left.max(0.0)));
             return true;
         }
-        let at = now();
-        if at >= deadline {
-            return false;
-        }
-        if !reasserted && at >= reassert_at {
-            reassert(deadline);
-            reasserted = true;
-        }
-        // Recomputed after reassertion, which also spends budget.
         let left = deadline.saturating_duration_since(now()).as_secs_f64();
         if left <= 0.0 {
             return false;
@@ -600,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn nothing_appearing_re_asserts_once_midway_and_gives_up_on_budget() {
+    fn nothing_appearing_never_re_asserts_and_gives_up_on_budget() {
         let (materialized, log) = drive(vec![]);
         assert!(!materialized, "a timeout must not claim enablement");
 
@@ -610,7 +607,7 @@ mod tests {
             .filter(|e| *e == &format!("settle:{MATERIALIZE_POLL_SECONDS}"))
             .count();
         let reasserts = log.iter().filter(|e| *e == "reassert").count();
-        assert_eq!(reasserts, 1, "exactly one mid-budget re-assertion");
+        assert_eq!(reasserts, 0, "re-asserting while waiting restarts Chromium's debounce");
         assert_eq!(probes, polls + 1, "every wait is followed by a probe");
         assert_eq!(
             polls as f64 * MATERIALIZE_POLL_SECONDS,
