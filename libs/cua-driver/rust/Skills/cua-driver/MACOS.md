@@ -432,6 +432,10 @@ postcondition, so re-snapshot or use `list_windows`/`verify_state` afterward.
 For geometry commands, prefer `set_window_frame` because its independent frame
 readback is stronger and avoids menu state entirely.
 
+Window-scoped `get_window_state` reads do not include the application menu
+bar, so menu items never appear as rows there; `invoke_menu` is the only menu
+path.
+
 Do not manually reproduce the old open → snapshot → reuse-index sequence.
 Menu expansion mutates the accessibility tree, and closed AppKit submenus may
 remain present in `AXChildren`; disabled descendants are now non-addressable,
@@ -500,5 +504,5 @@ starting point for new browser workflows.
 3. Done.
 
 If the user instead asks to navigate _within_ an already-open Finder
-window, use the menu-bar flow from "Navigating native menu bars"
-above (click Go → pick a menu item → re-snapshot → click it).
+window, use `invoke_menu` with the Go menu path (see "Navigating native
+menu bars" above), for example `path:["Go","Downloads"]`.

@@ -143,6 +143,9 @@ final class WindowDiscoveryApplication: NSApplication {
 
 final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewDataSource, NSTableViewDelegate, NSMenuItemValidation {
     private var editorIdentity: EditorIdentityFixture?
+    /// True while show() clears AppKit's automatic first responder, so ending
+    /// that edit does not record a commit the test never made.
+    private var clearingLaunchFocus = false
     let window: NSWindow
     let counterLabel = NSTextField(labelWithString: "counter=0")
     var counterValue = 0
@@ -195,6 +198,14 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     func show() {
         window.makeKeyAndOrderFront(nil)
         window.center()
+        // AppKit makes the first text field the window's first responder when
+        // the window becomes key, so every run would start with txt-input
+        // already focused. Start with no focused control instead: tests that
+        // exercise focus preparation and change notifications need a field
+        // that is not yet being edited, and tests that need focus set it.
+        clearingLaunchFocus = true
+        window.makeFirstResponder(nil)
+        clearingLaunchFocus = false
     }
 
     // MARK: - Layout
@@ -536,7 +547,7 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     }
 
     func controlTextDidEndEditing(_ obj: Notification) {
-        guard let field = obj.object as? NSTextField else { return }
+        guard !clearingLaunchFocus, let field = obj.object as? NSTextField else { return }
         if field === textInput {
             textInputCommit.stringValue = "committed=\(field.stringValue)"
             runControlledCommand(field.stringValue)

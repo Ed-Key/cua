@@ -549,9 +549,11 @@ fn harness_appkit_smoke() {
             // AXStaticText nodes — assert on their starting text instead of ids.
             assert!(text.contains("counter=0"), "counter label missing");
             assert!(text.contains("clicks=0"), "click_count label missing");
+            // Window-scoped reads exclude the application menu bar; menus are
+            // reached through invoke_menu, which reads the live menu bar.
             assert!(
-                text.contains("Harness Test Item"),
-                "AppKit menu item title missing"
+                !text.contains("Harness Test Item"),
+                "a window read must not include application menu items"
             );
             assert!(
                 text.contains("last_action=none"),
@@ -1236,11 +1238,16 @@ fn harness_appkit_type_text_does_not_replay_an_unreadable_ax_write() {
                     "at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
                 })
             );
+            // Focus through the element (AXFocused on a text role), not a
+            // pixel click: a background pixel click into a text field
+            // activates the fixture and fails the foreground-sentinel check,
+            // which is a click-route question, not the readback under test.
+            let _ = (x, y, w, h);
             let focused = driver.call(
                 "click",
                 serde_json::json!({
                     "pid": pid as i64, "window_id": wid,
-                    "x": x + w / 2.0, "y": y + h / 2.0,
+                    "element_token": element_token_by_id(&pre, "txt-input"),
                     "delivery_mode": "background"
                 }),
             );
@@ -2802,11 +2809,16 @@ fn harness_appkit_type_text_waits_for_a_lagging_value_readback() {
             // NSTextField can reject that attribute and silently exercise the
             // already-drained keyboard route instead of this regression.
             let (x, y, w, h) = element_pixel_frame(&snap_pre, "txt-input");
+            // Focus through the element (AXFocused on a text role), not a
+            // pixel click: a background pixel click into a text field
+            // activates the fixture and fails the foreground-sentinel check,
+            // which is a click-route question, not the readback under test.
+            let _ = (x, y, w, h);
             let focused = driver.call(
                 "click",
                 serde_json::json!({
                     "pid": pid as i64, "window_id": wid,
-                    "x": x + w / 2.0, "y": y + h / 2.0,
+                    "element_token": element_token_by_id(&snap_pre, "txt-input"),
                     "delivery_mode": "background"
                 }),
             );

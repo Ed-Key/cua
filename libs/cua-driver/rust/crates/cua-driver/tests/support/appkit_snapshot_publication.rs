@@ -319,10 +319,16 @@ fn harness_appkit_pending_snapshot_cannot_retarget_token() {
             second.text()
         );
         assert_ne!(first.snapshot_id(), second.snapshot_id());
-        assert_eq!(
-            element_index_by_id(second.tree_text(), "snapshot-replacement"),
+        // Rows keep stable numbers across looks and a replaced element takes a
+        // fresh, never-reused number, so the replacement cannot inherit the
+        // old token's index. The old token must still be refused below: its
+        // snapshot was replaced even though no other row now owns its number.
+        let replacement_index = element_index_by_id(second.tree_text(), "snapshot-replacement");
+        assert!(replacement_index.is_some(), "replacement row present");
+        assert_ne!(
+            replacement_index,
             Some(original_index),
-            "fixture must replace the exact index addressed by the old token"
+            "a replaced element must not reuse the old row number"
         );
         let fresh = element_token_by_id(&second, "snapshot-replacement");
         let recovered = driver.call(
