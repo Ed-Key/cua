@@ -206,17 +206,51 @@ fn record_before_action(session: &str, pid: i32) {
 /// One (session, app) runs one of these at a time: an action from recording
 /// its baseline until it has finished, or a read consuming the note. So a
 /// read cannot consume a baseline while the action it belongs to is still
-/// running, and a stale snapshot cannot overwrite a newer outcome. Striped so
-/// the lock set never grows; unrelated keys sharing a stripe only queue.
-/// No wrapped tool calls another wrapped tool for the same key while holding
-/// it (focus_by_pixel uses an unwrapped click; run_sequence is not wrapped).
-async fn key_guard(session: &str, pid: i32) -> tokio::sync::MutexGuard<'static, ()> {
-    use std::hash::{Hash, Hasher};
-    static STRIPES: [tokio::sync::Mutex<()>; 16] =
-        [const { tokio::sync::Mutex::const_new(()) }; 16];
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    (session, pid).hash(&mut hasher);
-    STRIPES[(hasher.finish() % 16) as usize].lock().await
+/// running, and a stale snapshot cannot overwrite a newer outcome. One lock
+/// per key, reclaimed once unused (as in `background_mutation`), so other
+/// apps and sessions never wait on it. No wrapped tool calls another wrapped
+/// tool for the same key while holding it (focus_by_pixel uses an unwrapped
+/// click; run_sequence is not wrapped).
+async fn key_guard(session: &str, pid: i32) -> tokio::sync::OwnedMutexGuard<()> {
+    use std::sync::{Arc, OnceLock, Weak};
+    type Locks = Mutex<HashMap<PendingKey, Weak<tokio::sync::Mutex<()>>>>;
+    static LOCKS: OnceLock<Locks> = OnceLock::new();
+    let lock = {
+        let mut locks = LOCKS
+            .get_or_init(|| Mutex::new(HashMap::new()))
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        locks.retain(|_, lock| lock.strong_count() > 0);
+        let key = (session.to_owned(), pid);
+        match locks.get(&key).and_then(Weak::upgrade) {
+            Some(lock) => lock,
+            None => {
+                let lock = Arc::new(tokio::sync::Mutex::new(()));
+                locks.insert(key, Arc::downgrade(&lock));
+                lock
+            }
+        }
+    };
+    lock.lock_owned().await
+}
+
+/// Drops the baseline if the action is cancelled before it finishes: native
+/// work may still be running, so a later read could not trust the diff. A
+/// missed note is the safe failure.
+struct InvalidateOnCancel(Option<PendingKey>);
+
+impl InvalidateOnCancel {
+    fn finished(mut self) {
+        self.0 = None;
+    }
+}
+
+impl Drop for InvalidateOnCancel {
+    fn drop(&mut self) {
+        if let Some(key) = self.0.take() {
+            pending().remove(&key);
+        }
+    }
 }
 
 /// One appeared root after ownership resolution.
@@ -473,24 +507,36 @@ impl Tool for SurfaceNoted {
         match self.role {
             Role::Activates => self.inner.invoke(args).await,
             Role::Action => {
-                let _guard = key_guard(&session, pid).await;
+                let guard = key_guard(&session, pid).await;
                 let recording_session = session.clone();
-                let _ = tokio::task::spawn_blocking(move || {
-                    record_before_action(&recording_session, pid)
+                // The guard rides with the blocking snapshot, so cancelling
+                // this call cannot release it while the snapshot still runs.
+                let guard = tokio::task::spawn_blocking(move || {
+                    record_before_action(&recording_session, pid);
+                    guard
                 })
-                .await;
-                self.inner.invoke(args).await
+                .await
+                .ok();
+                let cancelled = InvalidateOnCancel(Some((session, pid)));
+                let result = self.inner.invoke(args).await;
+                cancelled.finished();
+                drop(guard);
+                result
             }
             Role::Read => {
                 let mut result = self.inner.invoke(args).await;
                 if result.is_error == Some(true) {
                     return result;
                 }
-                let _guard = key_guard(&session, pid).await;
-                let change = tokio::task::spawn_blocking(move || take_window_change(&session, pid))
-                    .await
-                    .ok()
-                    .flatten();
+                let guard = key_guard(&session, pid).await;
+                let change = tokio::task::spawn_blocking(move || {
+                    let change = take_window_change(&session, pid);
+                    drop(guard);
+                    change
+                })
+                .await
+                .ok()
+                .flatten();
                 if let Some(change) = change {
                     attach(&mut result, &change);
                 }
@@ -1007,6 +1053,34 @@ mod tests {
             .await
             .expect("read completes once the action finished")
             .unwrap();
+    }
+
+    /// Different apps never wait on each other's guard.
+    #[tokio::test]
+    async fn guards_for_different_apps_are_independent() {
+        let _held = key_guard("independent", 1).await;
+        for pid in 2..40 {
+            tokio::time::timeout(Duration::from_millis(200), key_guard("independent", pid))
+                .await
+                .expect("another app's guard must be free");
+        }
+    }
+
+    /// A cancelled action leaves no baseline behind: its native work may
+    /// still be running, so a later diff could not be trusted.
+    #[tokio::test]
+    async fn a_cancelled_action_drops_its_baseline() {
+        let (key, _) = seed("ordering-cancel", 999_902);
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (click, click_started) = probe("click", Some(gate));
+        let click = action(click);
+        let args = serde_json::json!({"pid": 999_902, "_session_id": "ordering-cancel"});
+        let acting = tokio::spawn(async move { click.invoke(args).await });
+        click_started.notified().await;
+        assert!(pending().contains_key(&key), "unread baseline kept while acting");
+        acting.abort();
+        let _ = acting.await;
+        assert!(!pending().contains_key(&key), "cancellation must drop the baseline");
     }
 
     #[test]
