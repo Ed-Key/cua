@@ -794,8 +794,10 @@ fn unescape_rendered(line: &str) -> String {
                 rest = after;
             }
             None => {
-                out.push_str(&rest[start + prefix..]);
-                return out;
+                // Not a JSON token (a raw title can contain `= "`): keep
+                // the quote and scan on for the real value.
+                out.push('"');
+                rest = &rest[start + prefix + 1..];
             }
         }
     }
@@ -866,6 +868,12 @@ fn leading_indent_depth(line: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_title_containing_an_equals_quote_does_not_hide_the_value() {
+        let line = format!(r#"- [1] AXTextField "Regex = "\d+"" = {}"#, serde_json::json!(r#"Say "hello""#));
+        assert!(filter_tree(&format!("{line}\n"), r#"Say "hello""#).contains("AXTextField"));
+    }
+
     #[test]
     fn query_decoding_keeps_backslash_sequences_intact() {
         let line = format!("- AXTextField = {}", serde_json::json!(r"C:\new"));
