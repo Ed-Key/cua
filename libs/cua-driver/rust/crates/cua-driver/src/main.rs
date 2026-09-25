@@ -735,6 +735,10 @@ fn main() {
                 platform_macos::cursor::overlay::run_on_main_thread();
                 let _ = serve_handle.join();
             } else {
+                // No overlay: still run a main run loop, or macOS never
+                // delivers the activation notices focus protection needs.
+                // The serve thread exits the process when it finishes.
+                platform_macos::run_main_run_loop();
                 let _ = serve_handle.join();
             }
         }

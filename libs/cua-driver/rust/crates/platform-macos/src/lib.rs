@@ -51,6 +51,38 @@ pub mod windows;
 
 use cua_driver_core::tool::ToolRegistry;
 
+/// Park the calling (main) thread in a Core Foundation run loop.
+///
+/// macOS delivers NSWorkspace notifications, including the app-activation
+/// notices the focus-steal preventer depends on, through the main run loop.
+/// A daemon without the cursor overlay used to block main in a thread join,
+/// so no notice ever arrived and background actions had no focus protection.
+/// A run loop with no sources returns at once, so a far-off repeating no-op
+/// timer keeps it parked. Returns only if the run loop is stopped.
+#[cfg(target_os = "macos")]
+pub fn run_main_run_loop() {
+    use core_foundation::date::CFAbsoluteTimeGetCurrent;
+    use core_foundation::runloop::{kCFRunLoopDefaultMode, CFRunLoop, CFRunLoopTimer};
+
+    extern "C" fn keep_alive(
+        _timer: core_foundation::runloop::CFRunLoopTimerRef,
+        _info: *mut std::ffi::c_void,
+    ) {
+    }
+    const DAY: f64 = 86_400.0;
+    let timer = CFRunLoopTimer::new(
+        unsafe { CFAbsoluteTimeGetCurrent() } + DAY,
+        DAY,
+        0,
+        0,
+        keep_alive,
+        std::ptr::null_mut(),
+    );
+    let run_loop = CFRunLoop::get_current();
+    unsafe { run_loop.add_timer(&timer, kCFRunLoopDefaultMode) };
+    CFRunLoop::run_current();
+}
+
 /// Register all macOS tools.  For programs that don't restructure `main`
 /// (e.g. test harnesses), the overlay is skipped.
 pub fn register_tools() -> ToolRegistry {
