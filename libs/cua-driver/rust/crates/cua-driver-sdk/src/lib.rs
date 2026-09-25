@@ -6,12 +6,12 @@
 //! MCP and daemon transports are downstream adapters rather than peer contracts.
 
 use cua_driver_contract::{
-    ActionResult, ClickInput, ClipboardReadInput, ClipboardWriteInput, DragInput, EndSessionInput,
+    ActAndReadInput, ActionResult, ClickInput, ClipboardReadInput, ClipboardWriteInput, DragInput, EndSessionInput,
     EndSessionOutput, EscalateSessionInput, GetAgentCursorStateInput, GetCursorPositionInput,
     GetDesktopStateInput, GetScreenSizeInput, GetSessionInput, GetSessionStateInput,
     GetWindowStateInput, HotkeyInput, InvokeMenuInput, ListAppsInput, ListAppsOutput,
     ListSessionsInput, ListSessionsOutput, ListWindowsInput, ListWindowsOutput, MoveCursorInput,
-    ParseVisualRegionsInput, PressKeyInput, ScrollInput, SessionOutput, SessionStateOutput,
+    ParseVisualRegionsInput, PressKeyInput, RunSequenceInput, ScrollInput, SessionOutput, SessionStateOutput,
     SetAgentCursorEnabledInput, SetAgentCursorMotionInput, SetAgentCursorThemeInput,
     SetWindowFrameInput, SnapshotImage, StartSessionInput, StartSessionOutput, ToolInput,
     ToolOutput, TypeTextInput, VerifyStateInput, VerifyStateOutput, WindowStateOutput,
@@ -659,6 +659,8 @@ macro_rules! desktop_tool_methods {
             get_screen_size: GetScreenSizeInput,
             get_cursor_position: GetCursorPositionInput,
             verify_state: VerifyStateInput,
+            run_sequence: RunSequenceInput,
+            act_and_read: ActAndReadInput,
             parse_visual_regions: ParseVisualRegionsInput,
             move_cursor: MoveCursorInput,
             set_window_frame: SetWindowFrameInput,

@@ -41,7 +41,7 @@ fn amount(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":"integer","minimum":1,"maximum":50})
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
 #[serde(rename_all = "snake_case")]
 pub enum ActionReadAction {
     Click,
@@ -58,10 +58,11 @@ impl ActionReadAction {
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionReadObservation {
     #[serde(default)]
+    #[uniffi(default = false)]
     pub include_screenshot: bool,
     #[serde(
         default,
@@ -69,13 +70,18 @@ pub struct ActionReadObservation {
         deserialize_with = "present"
     )]
     #[schemars(schema_with = "string")]
+    #[uniffi(default = None)]
     pub query: Option<String>,
+    #[serde(default)]
+    #[uniffi(default = false)]
+    pub query_context: bool,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
     #[schemars(schema_with = "elements")]
+    #[uniffi(default = None)]
     pub max_elements: Option<u32>,
     #[serde(
         default,
@@ -83,10 +89,11 @@ pub struct ActionReadObservation {
         deserialize_with = "present"
     )]
     #[schemars(schema_with = "depth")]
+    #[uniffi(default = None)]
     pub max_depth: Option<u32>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActAndReadInput {
     #[schemars(schema_with = "pid")]
@@ -101,6 +108,7 @@ pub struct ActAndReadInput {
         deserialize_with = "present"
     )]
     #[schemars(schema_with = "string")]
+    #[uniffi(default = None)]
     pub value: Option<String>,
     /// Required only for scroll. Uses the existing background scroll route.
     #[serde(
@@ -109,6 +117,7 @@ pub struct ActAndReadInput {
         deserialize_with = "present"
     )]
     #[schemars(schema_with = "direction")]
+    #[uniffi(default = None)]
     pub direction: Option<ScrollDirection>,
     /// Scroll only. Omit to retain the scroll tool's line default.
     #[serde(
@@ -117,6 +126,7 @@ pub struct ActAndReadInput {
         deserialize_with = "present"
     )]
     #[schemars(schema_with = "granularity")]
+    #[uniffi(default = None)]
     pub by: Option<ScrollBy>,
     /// Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.
     #[serde(
@@ -125,6 +135,7 @@ pub struct ActAndReadInput {
         deserialize_with = "present"
     )]
     #[schemars(schema_with = "amount")]
+    #[uniffi(default = None)]
     pub amount: Option<u32>,
     #[serde(
         default,
@@ -132,8 +143,10 @@ pub struct ActAndReadInput {
         deserialize_with = "present"
     )]
     #[schemars(schema_with = "string")]
+    #[uniffi(default = None)]
     pub session: Option<String>,
     #[serde(default)]
+    #[uniffi(default)]
     pub observe: ActionReadObservation,
 }
 impl ToolInput for ActAndReadInput {
@@ -158,6 +171,15 @@ impl ToolInput for ActAndReadInput {
         }
         if self.amount.is_some_and(|n| !(1..=50).contains(&n)) {
             return Err("scroll amount must be between 1 and 50".into());
+        }
+        if self.observe.query_context
+            && self
+                .observe
+                .query
+                .as_ref()
+                .is_none_or(|s| s.trim().is_empty())
+        {
+            return Err("query_context requires a nonblank query".into());
         }
         if self
             .observe

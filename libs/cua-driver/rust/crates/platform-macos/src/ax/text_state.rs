@@ -264,6 +264,7 @@ mod tests {
             element_ptr: 0,
             depth: 0,
             parent_element_index: None,
+            parent_position: None,
             frame: None,
             value_state: None,
             value_description: None,

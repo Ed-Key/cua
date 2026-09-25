@@ -19,6 +19,273 @@ const uniffiIsDebug =
 
 // Public interface members begin here.
 
+export enum ActionReadAction {
+    Click,
+    SetValue,
+    Scroll
+}
+
+const FfiConverterTypeActionReadAction = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ActionReadAction;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ActionReadAction.Click;
+                case 2: return ActionReadAction.SetValue;
+                case 3: return ActionReadAction.Scroll;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ActionReadAction.Click: return ordinalConverter.write(1, into);
+                case ActionReadAction.SetValue: return ordinalConverter.write(2, into);
+                case ActionReadAction.Scroll: return ordinalConverter.write(3, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+const stringConverter = (() => {
+    const encoder = new TextEncoder();
+    const decoder = new TextDecoder();
+    return {
+        stringToBytes: (s: string) => encoder.encode(s),
+        bytesToString: (ab: UniffiByteArray) => decoder.decode(ab),
+        stringByteLength: (s: string) => encoder.encode(s).byteLength,
+        writeStringIntoBuffer: (s: string, buf: any, offset: number): number => {
+            const view = new Uint8Array(
+                buf.arrayBuffer,
+                offset,
+                buf.arrayBuffer.byteLength - offset,
+            );
+            return encoder.encodeInto(s, view).written;
+        },
+        readStringFromBuffer: (buf: any, offset: number, length: number): string =>
+            decoder.decode(new Uint8Array(buf.arrayBuffer, offset, length)),
+    };
+})();
+const FfiConverterString = uniffiCreateFfiConverterString(stringConverter);
+
+export enum ScrollDirection {
+    Up,
+    Down,
+    Left,
+    Right
+}
+
+const FfiConverterTypeScrollDirection = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ScrollDirection;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ScrollDirection.Up;
+                case 2: return ScrollDirection.Down;
+                case 3: return ScrollDirection.Left;
+                case 4: return ScrollDirection.Right;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ScrollDirection.Up: return ordinalConverter.write(1, into);
+                case ScrollDirection.Down: return ordinalConverter.write(2, into);
+                case ScrollDirection.Left: return ordinalConverter.write(3, into);
+                case ScrollDirection.Right: return ordinalConverter.write(4, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export enum ScrollBy {
+    Line,
+    Page
+}
+
+const FfiConverterTypeScrollBy = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ScrollBy;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ScrollBy.Line;
+                case 2: return ScrollBy.Page;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ScrollBy.Line: return ordinalConverter.write(1, into);
+                case ScrollBy.Page: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export type ActionReadObservation = {
+    includeScreenshot: boolean,
+    query?: string,
+    queryContext: boolean,
+    maxElements?: number,
+    maxDepth?: number
+}
+
+/**
+ * Generated factory for {@link ActionReadObservation} record objects.
+ */
+export const ActionReadObservation = (() => {
+    const defaults = () => ({
+        includeScreenshot: false,
+        query: undefined,
+        queryContext: false,
+        maxElements: undefined,
+        maxDepth: undefined
+    });
+    const create = (() => {
+        return uniffiCreateRecord<ActionReadObservation, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<ActionReadObservation>,
+    });
+})();
+
+const FfiConverterTypeActionReadObservation = (() => {
+    type TypeName = ActionReadObservation;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                includeScreenshot: FfiConverterBool.read(from),
+                query: FfiConverterOptionalString.read(from),
+                queryContext: FfiConverterBool.read(from),
+                maxElements: FfiConverterOptionalUInt32.read(from),
+                maxDepth: FfiConverterOptionalUInt32.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterBool.write(value.includeScreenshot, into);
+            FfiConverterOptionalString.write(value.query, into);
+            FfiConverterBool.write(value.queryContext, into);
+            FfiConverterOptionalUInt32.write(value.maxElements, into);
+            FfiConverterOptionalUInt32.write(value.maxDepth, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterBool.allocationSize(value.includeScreenshot) +
+             FfiConverterOptionalString.allocationSize(value.query) +
+             FfiConverterBool.allocationSize(value.queryContext) +
+             FfiConverterOptionalUInt32.allocationSize(value.maxElements) +
+             FfiConverterOptionalUInt32.allocationSize(value.maxDepth);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+export type ActAndReadInput = {
+    pid: number,
+    windowId: number,
+    action: ActionReadAction,
+    elementToken: string,
+    value?: string,
+    /**
+     * Required only for scroll. Uses the existing background scroll route.
+     */
+    direction?: ScrollDirection,
+    /**
+     * Scroll only. Omit to retain the scroll tool's line default.
+     */
+    by?: ScrollBy,
+    /**
+     * Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.
+     */
+    amount?: number,
+    session?: string,
+    observe: ActionReadObservation
+}
+
+/**
+ * Generated factory for {@link ActAndReadInput} record objects.
+ */
+export const ActAndReadInput = (() => {
+    const defaults = () => ({
+        value: undefined,
+        direction: undefined,
+        by: undefined,
+        amount: undefined,
+        session: undefined,
+        observe: ActionReadObservation.create({})
+    });
+    const create = (() => {
+        return uniffiCreateRecord<ActAndReadInput, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<ActAndReadInput>,
+    });
+})();
+
+const FfiConverterTypeActAndReadInput = (() => {
+    type TypeName = ActAndReadInput;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                pid: FfiConverterUInt32.read(from),
+                windowId: FfiConverterUInt32.read(from),
+                action: FfiConverterTypeActionReadAction.read(from),
+                elementToken: FfiConverterString.read(from),
+                value: FfiConverterOptionalString.read(from),
+                direction: FfiConverterOptionalTypeScrollDirection.read(from),
+                by: FfiConverterOptionalTypeScrollBy.read(from),
+                amount: FfiConverterOptionalUInt32.read(from),
+                session: FfiConverterOptionalString.read(from),
+                observe: FfiConverterTypeActionReadObservation.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterUInt32.write(value.pid, into);
+            FfiConverterUInt32.write(value.windowId, into);
+            FfiConverterTypeActionReadAction.write(value.action, into);
+            FfiConverterString.write(value.elementToken, into);
+            FfiConverterOptionalString.write(value.value, into);
+            FfiConverterOptionalTypeScrollDirection.write(value.direction, into);
+            FfiConverterOptionalTypeScrollBy.write(value.by, into);
+            FfiConverterOptionalUInt32.write(value.amount, into);
+            FfiConverterOptionalString.write(value.session, into);
+            FfiConverterTypeActionReadObservation.write(value.observe, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterUInt32.allocationSize(value.pid) +
+             FfiConverterUInt32.allocationSize(value.windowId) +
+             FfiConverterTypeActionReadAction.allocationSize(value.action) +
+             FfiConverterString.allocationSize(value.elementToken) +
+             FfiConverterOptionalString.allocationSize(value.value) +
+             FfiConverterOptionalTypeScrollDirection.allocationSize(value.direction) +
+             FfiConverterOptionalTypeScrollBy.allocationSize(value.by) +
+             FfiConverterOptionalUInt32.allocationSize(value.amount) +
+             FfiConverterOptionalString.allocationSize(value.session) +
+             FfiConverterTypeActionReadObservation.allocationSize(value.observe);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export enum ActionDeliveryMode {
     Background,
     Foreground,
@@ -96,27 +363,6 @@ const FfiConverterTypeActionDelivery = (() => {
     };
     return new FFIConverter();
 })();
-
-const stringConverter = (() => {
-    const encoder = new TextEncoder();
-    const decoder = new TextDecoder();
-    return {
-        stringToBytes: (s: string) => encoder.encode(s),
-        bytesToString: (ab: UniffiByteArray) => decoder.decode(ab),
-        stringByteLength: (s: string) => encoder.encode(s).byteLength,
-        writeStringIntoBuffer: (s: string, buf: any, offset: number): number => {
-            const view = new Uint8Array(
-                buf.arrayBuffer,
-                offset,
-                buf.arrayBuffer.byteLength - offset,
-            );
-            return encoder.encodeInto(s, view).written;
-        },
-        readStringFromBuffer: (buf: any, offset: number, length: number): string =>
-            decoder.decode(new Uint8Array(buf.arrayBuffer, offset, length)),
-    };
-})();
-const FfiConverterString = uniffiCreateFfiConverterString(stringConverter);
 
 /**
  * Why a `refused` action sent no input, and what to do instead.
@@ -2521,6 +2767,11 @@ export type GetWindowStateInput = {
     session?: string,
     query?: string,
     /**
+     * macOS only. Default false. With a nonblank query, also keep every row
+     * collected under each match, not only its ancestors.
+     */
+    queryContext?: boolean,
+    /**
      * macOS only. Default true: after the first look at a window, return only
      * rows added, changed, or removed since the previous look by this session.
      * False forces the full outline.
@@ -2550,6 +2801,7 @@ export type GetWindowStateInput = {
  */
 export const GetWindowStateInput = (() => {
     const defaults = () => ({
+        queryContext: undefined,
         diff: undefined,
         timeoutMs: undefined
     });
@@ -2572,6 +2824,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
                 windowId: FfiConverterUInt64.read(from),
                 session: FfiConverterOptionalString.read(from),
                 query: FfiConverterOptionalString.read(from),
+                queryContext: FfiConverterOptionalBoolean.read(from),
                 diff: FfiConverterOptionalBoolean.read(from),
                 includeAccessibilityTree: FfiConverterOptionalBoolean.read(from),
                 includeScreenshot: FfiConverterOptionalBoolean.read(from),
@@ -2588,6 +2841,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
             FfiConverterUInt64.write(value.windowId, into);
             FfiConverterOptionalString.write(value.session, into);
             FfiConverterOptionalString.write(value.query, into);
+            FfiConverterOptionalBoolean.write(value.queryContext, into);
             FfiConverterOptionalBoolean.write(value.diff, into);
             FfiConverterOptionalBoolean.write(value.includeAccessibilityTree, into);
             FfiConverterOptionalBoolean.write(value.includeScreenshot, into);
@@ -2603,6 +2857,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
              FfiConverterUInt64.allocationSize(value.windowId) +
              FfiConverterOptionalString.allocationSize(value.session) +
              FfiConverterOptionalString.allocationSize(value.query) +
+             FfiConverterOptionalBoolean.allocationSize(value.queryContext) +
              FfiConverterOptionalBoolean.allocationSize(value.diff) +
              FfiConverterOptionalBoolean.allocationSize(value.includeAccessibilityTree) +
              FfiConverterOptionalBoolean.allocationSize(value.includeScreenshot) +
@@ -5066,70 +5321,6 @@ const FfiConverterTypeRunSequenceOutput = (() => {
     return new FFIConverter();
 })();
 
-export enum ScrollDirection {
-    Up,
-    Down,
-    Left,
-    Right
-}
-
-const FfiConverterTypeScrollDirection = (() => {
-    const ordinalConverter = FfiConverterInt32;
-    type TypeName = ScrollDirection;
-    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
-        read(from: RustBuffer): TypeName {
-            switch (ordinalConverter.read(from)) {
-                case 1: return ScrollDirection.Up;
-                case 2: return ScrollDirection.Down;
-                case 3: return ScrollDirection.Left;
-                case 4: return ScrollDirection.Right;
-                default: throw new UniffiInternalError.UnexpectedEnumCase();
-            }
-        }
-        write(value: TypeName, into: RustBuffer): void {
-            switch (value) {
-                case ScrollDirection.Up: return ordinalConverter.write(1, into);
-                case ScrollDirection.Down: return ordinalConverter.write(2, into);
-                case ScrollDirection.Left: return ordinalConverter.write(3, into);
-                case ScrollDirection.Right: return ordinalConverter.write(4, into);
-            }
-        }
-        allocationSize(value: TypeName): number {
-            return ordinalConverter.allocationSize(0);
-        }
-    }
-    return new FFIConverter();
-})();
-
-export enum ScrollBy {
-    Line,
-    Page
-}
-
-const FfiConverterTypeScrollBy = (() => {
-    const ordinalConverter = FfiConverterInt32;
-    type TypeName = ScrollBy;
-    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
-        read(from: RustBuffer): TypeName {
-            switch (ordinalConverter.read(from)) {
-                case 1: return ScrollBy.Line;
-                case 2: return ScrollBy.Page;
-                default: throw new UniffiInternalError.UnexpectedEnumCase();
-            }
-        }
-        write(value: TypeName, into: RustBuffer): void {
-            switch (value) {
-                case ScrollBy.Line: return ordinalConverter.write(1, into);
-                case ScrollBy.Page: return ordinalConverter.write(2, into);
-            }
-        }
-        allocationSize(value: TypeName): number {
-            return ordinalConverter.allocationSize(0);
-        }
-    }
-    return new FFIConverter();
-})();
-
 export type ScrollInput = {
     x: number,
     y: number,
@@ -6625,11 +6816,17 @@ const FfiConverterTypePlatform = (() => {
     return new FFIConverter();
 })();
 
-// FfiConverter for number | undefined
-const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
-
 // FfiConverter for string | undefined
 const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
+
+// FfiConverter for ScrollDirection | undefined
+const FfiConverterOptionalTypeScrollDirection = new FfiConverterOptional(FfiConverterTypeScrollDirection);
+
+// FfiConverter for ScrollBy | undefined
+const FfiConverterOptionalTypeScrollBy = new FfiConverterOptional(FfiConverterTypeScrollBy);
+
+// FfiConverter for number | undefined
+const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
 
 // FfiConverter for ActionDelivery | undefined
 const FfiConverterOptionalTypeActionDelivery = new FfiConverterOptional(FfiConverterTypeActionDelivery);
@@ -6745,9 +6942,6 @@ const FfiConverterOptionalTypeSequenceError = new FfiConverterOptional(FfiConver
 // FfiConverter for Array<SequenceStepOutput>
 const FfiConverterSequenceTypeSequenceStepOutput = new FfiConverterArray(FfiConverterTypeSequenceStepOutput);
 
-// FfiConverter for ScrollBy | undefined
-const FfiConverterOptionalTypeScrollBy = new FfiConverterOptional(FfiConverterTypeScrollBy);
-
 // FfiConverter for EscalationReason | undefined
 const FfiConverterOptionalTypeEscalationReason = new FfiConverterOptional(FfiConverterTypeEscalationReason);
 
@@ -6812,6 +7006,7 @@ function uniffiEnsureInitialized() {
 export default Object.freeze({
   initialize: uniffiEnsureInitialized,
   converters: {
+    FfiConverterTypeActAndReadInput,
     FfiConverterTypeActionDelivery,
     FfiConverterTypeActionDeliveryMode,
     FfiConverterTypeActionEffect,
@@ -6821,6 +7016,8 @@ export default Object.freeze({
     FfiConverterTypeActionEscalationTarget,
     FfiConverterTypeActionEvidence,
     FfiConverterTypeActionEvidenceKind,
+    FfiConverterTypeActionReadAction,
+    FfiConverterTypeActionReadObservation,
     FfiConverterTypeActionResult,
     FfiConverterTypeActionRoute,
     FfiConverterTypeActionTarget,

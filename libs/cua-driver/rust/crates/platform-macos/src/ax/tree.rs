@@ -82,6 +82,10 @@ pub struct AXNode {
     /// `element_index` of the nearest actionable ancestor, if any. Walks the
     /// rendered tree (so it skips collapsed layout containers).
     pub parent_element_index: Option<usize>,
+    /// Position in the walk's node list of the nearest kept ancestor, display
+    /// rows included. Exact where indentation is not: the children of a
+    /// dropped empty container render one level deeper than their real parent.
+    pub parent_position: Option<usize>,
     /// Screen-coordinate bounding rect `[x, y, width, height]` captured at
     /// walk time. `None` when AX didn't report a usable position+size.
     pub frame: Option<[f64; 4]>,
@@ -180,7 +184,7 @@ pub struct TreeWalkResult {
 ///
 /// # Safety
 /// Calls macOS AX API. Must be called on a thread that has a CF run loop.
-pub fn walk_tree(pid: i32, window_id: Option<u32>, query: Option<&str>) -> TreeWalkResult {
+pub fn walk_tree(pid: i32, window_id: Option<u32>, query: Option<Query>) -> TreeWalkResult {
     walk_tree_bounded(
         pid,
         window_id,
@@ -201,7 +205,7 @@ pub fn walk_tree(pid: i32, window_id: Option<u32>, query: Option<&str>) -> TreeW
 pub fn walk_tree_bounded(
     pid: i32,
     window_id: Option<u32>,
-    query: Option<&str>,
+    query: Option<Query>,
     max_elements: usize,
     max_depth: usize,
 ) -> TreeWalkResult {
@@ -221,12 +225,11 @@ pub fn walk_tree_bounded(
 pub fn walk_tree_budgeted(
     pid: i32,
     window_id: Option<u32>,
-    query: Option<&str>,
+    query: Option<Query>,
     max_depth: usize,
     mut budget: WalkBudget,
 ) -> TreeWalkResult {
     let mut nodes: Vec<AXNode> = Vec::new();
-    let mut lines: Vec<(usize, String)> = Vec::new(); // (depth, line)
     let mut index_counter = 0usize;
     let mut window_scope: Option<WindowScope> = None;
 
@@ -332,9 +335,9 @@ pub fn walk_tree_budgeted(
                 child,
                 0,
                 None,
+                None,
                 false,
                 &mut nodes,
-                &mut lines,
                 &mut index_counter,
                 &mut budget,
                 max_depth,
@@ -345,11 +348,6 @@ pub fn walk_tree_budgeted(
         // focused element is matched by AX identity and a focus change during
         // the read discards the view.
         super::text_state::enrich_focused_state(pid, &mut nodes, &budget);
-        for (line, node) in lines.iter_mut().zip(&nodes) {
-            if node.focused == Some(true) {
-                line.1 = format_node_line(node);
-            }
-        }
 
         // Release all top-level elements (copy_children / copy_ax_windows both retain).
         for child in top_level {
@@ -360,7 +358,7 @@ pub fn walk_tree_budgeted(
     }
 
     let walk = budget.outcome();
-    let tree_markdown = finish_outline(render_lines(&lines), query, &walk);
+    let tree_markdown = render_outline(&nodes, query, &walk);
 
     TreeWalkResult {
         tree_markdown,
@@ -371,25 +369,45 @@ pub fn walk_tree_budgeted(
     }
 }
 
-fn finish_outline(raw_markdown: String, query: Option<&str>, walk: &WalkOutcome) -> String {
-    let mut tree_markdown = if let Some(q) = query {
-        filter_tree(&raw_markdown, q)
-    } else {
-        raw_markdown
+/// A query on a window read: the text to match, and whether to keep each
+/// match's collected descendants as well as its ancestors.
+#[derive(Clone, Copy)]
+pub struct Query<'a> {
+    pub text: &'a str,
+    pub context: bool,
+}
+
+/// Positions in `nodes` a query keeps: every row whose rendered line matches,
+/// its real ancestors (from the walker's parent edges, never indentation) and,
+/// with context, every row under a match.
+pub(crate) fn query_positions(nodes: &[AXNode], query: Query) -> Vec<usize> {
+    let needle = query.text.to_lowercase();
+    cua_driver_core::element_query::select_parented_rows(
+        nodes
+            .iter()
+            .map(|n| (n.parent_position, row_matches(&format_node_line(n), &needle))),
+        query.context,
+    )
+}
+
+/// Render `tree_markdown` from `nodes`: the whole outline, or only the rows a
+/// query keeps, at their own depths. Callers that renumber rows after the
+/// walk re-render with this.
+pub(crate) fn render_outline(nodes: &[AXNode], query: Option<Query>, walk: &WalkOutcome) -> String {
+    let positions: Vec<usize> = match query {
+        Some(q) => query_positions(nodes, q),
+        None => (0..nodes.len()).collect(),
     };
+    let lines: Vec<(usize, String)> = positions
+        .into_iter()
+        .map(|p| (nodes[p].depth, format_node_line(&nodes[p])))
+        .collect();
+    let mut tree_markdown = render_lines(&lines);
     if let Some(note) = walk.note() {
         tree_markdown.push('\n');
         tree_markdown.push_str(&note);
     }
     tree_markdown
-}
-
-/// Re-render `tree_markdown` from `nodes`, for callers that renumber rows
-/// after the walk. Produces exactly what `walk_tree_budgeted` rendered when
-/// the nodes are unchanged.
-pub(crate) fn render_outline(nodes: &[AXNode], query: Option<&str>, walk: &WalkOutcome) -> String {
-    let lines: Vec<(usize, String)> = nodes.iter().map(|n| (n.depth, format_node_line(n))).collect();
-    finish_outline(render_lines(&lines), query, walk)
 }
 
 /// Keep named sections in the rendered hierarchy. Action names alone do not
@@ -406,9 +424,9 @@ unsafe fn walk_element(
     element: AXUIElementRef,
     depth: usize,
     parent_index: Option<usize>,
+    parent_position: Option<usize>,
     in_web_content: bool,
     nodes: &mut Vec<AXNode>,
-    lines: &mut Vec<(usize, String)>,
     counter: &mut usize,
     budget: &mut WalkBudget,
     max_depth: usize,
@@ -444,10 +462,10 @@ unsafe fn walk_element(
                 child,
                 depth,
                 parent_index,
+                parent_position,
                 in_web_content,
                 nodes,
-                lines,
-                counter,
+                    counter,
                 budget,
                 max_depth,
             );
@@ -518,10 +536,10 @@ unsafe fn walk_element(
                 child,
                 depth + 1,
                 parent_index,
+                parent_position,
                 in_web_content,
                 nodes,
-                lines,
-                counter,
+                    counter,
                 budget,
                 max_depth,
             );
@@ -589,6 +607,7 @@ unsafe fn walk_element(
             element_ptr,
             depth,
             parent_element_index: parent_index,
+            parent_position,
             frame,
             value_state: control_state.value_state.clone(),
             value_description: control_state.value_description.clone(),
@@ -623,6 +642,7 @@ unsafe fn walk_element(
             element_ptr,
             depth,
             parent_element_index: parent_index,
+            parent_position,
             frame,
             value_state: control_state.value_state.clone(),
             value_description: control_state.value_description.clone(),
@@ -639,8 +659,7 @@ unsafe fn walk_element(
     // indexed rows are addressable in click(element_index=N)).
     let next_parent = node.element_index.or(parent_index);
 
-    let line = format_node_line(&node);
-    lines.push((depth, line));
+    let position = nodes.len();
     nodes.push(node);
 
     let children = copy_children(element);
@@ -649,9 +668,9 @@ unsafe fn walk_element(
             child,
             depth + 1,
             next_parent,
+            Some(position),
             in_web_content,
             nodes,
-            lines,
             counter,
             budget,
             max_depth,
@@ -789,7 +808,6 @@ pub(crate) fn render_lines(lines: &[(usize, String)]) -> String {
     out
 }
 
-/// Filter the tree markdown to lines matching `query` plus their ancestor chain.
 /// Decode the JSON string token at the start of `s` (as rendered for values
 /// and placeholders). Returns the text and the rest after the token.
 pub(crate) fn decode_json_token(s: &str) -> Option<(String, &str)> {
@@ -835,65 +853,11 @@ fn unescape_rendered(line: &str) -> String {
     out
 }
 
-fn filter_tree(markdown: &str, query: &str) -> String {
-    let needle = query.to_lowercase();
-    let lines: Vec<&str> = markdown.lines().collect();
-
-    let mut current_ancestor: Vec<&str> = Vec::new();
-    let mut last_emitted_at: Vec<Option<&str>> = Vec::new();
-    let mut output: Vec<&str> = Vec::new();
-
-    for line in &lines {
-        let depth = leading_indent_depth(line);
-
-        while current_ancestor.len() <= depth {
-            current_ancestor.push("");
-            last_emitted_at.push(None);
-        }
-        for emitted_at in last_emitted_at.iter_mut().skip(depth + 1) {
-            *emitted_at = None;
-        }
-        current_ancestor[depth] = line;
-
-        // Values render JSON-escaped; also match the decoded text, so a
-        // query for `Say "hello"` still finds that value.
-        if line.to_lowercase().contains(&needle)
-            || unescape_rendered(line).to_lowercase().contains(&needle)
-        {
-            for ancestor_depth in 0..depth {
-                let ancestor = current_ancestor[ancestor_depth];
-                if ancestor.is_empty() {
-                    continue;
-                }
-                if last_emitted_at[ancestor_depth] == Some(ancestor) {
-                    continue;
-                }
-                last_emitted_at[ancestor_depth] = Some(ancestor);
-                output.push(ancestor);
-            }
-            last_emitted_at[depth] = Some(line);
-            output.push(line);
-        }
-    }
-
-    if output.is_empty() {
-        return String::new();
-    }
-    let mut result = output.join("\n");
-    result.push('\n');
-    result
-}
-
-fn leading_indent_depth(line: &str) -> usize {
-    let mut count = 0;
-    for ch in line.chars() {
-        if ch == ' ' {
-            count += 1;
-        } else {
-            break;
-        }
-    }
-    count / 2
+/// Whether a rendered row matches a lowercased query. Values render
+/// JSON-escaped, so the decoded text is matched too: a query for
+/// `Say "hello"` still finds that value.
+fn row_matches(line: &str, needle: &str) -> bool {
+    line.to_lowercase().contains(needle) || unescape_rendered(line).to_lowercase().contains(needle)
 }
 
 #[cfg(test)]
@@ -901,20 +865,20 @@ mod tests {
     #[test]
     fn a_title_containing_an_equals_quote_does_not_hide_the_value() {
         let line = format!(r#"- [1] AXTextField "Regex = "\d+"" = {}"#, serde_json::json!(r#"Say "hello""#));
-        assert!(filter_tree(&format!("{line}\n"), r#"Say "hello""#).contains("AXTextField"));
+        assert!(row_matches(&line, &r#"Say "hello""#.to_lowercase()));
     }
 
     #[test]
     fn query_decoding_keeps_backslash_sequences_intact() {
         let line = format!("- AXTextField = {}", serde_json::json!(r"C:\new"));
         assert_eq!(unescape_rendered(&line), r"- AXTextField = C:\new");
-        assert!(filter_tree(&format!("{line}\n"), r"C:\new").contains("AXTextField"));
+        assert!(row_matches(&line, &r"C:\new".to_lowercase()));
     }
 
     #[test]
     fn query_matches_values_with_rendered_escapes() {
-        let tree = "- AXWindow \"W\"\n  - AXStaticText = \"Say \\\"hello\\\"\"\n";
-        assert!(filter_tree(tree, r#"Say "hello""#).contains("AXStaticText"));
+        let line = "- AXStaticText = \"Say \\\"hello\\\"\"";
+        assert!(row_matches(line, &r#"Say "hello""#.to_lowercase()));
     }
 
     #[test]
@@ -935,6 +899,7 @@ mod tests {
             element_ptr: 0,
             depth: 0,
             parent_element_index: None,
+            parent_position: None,
             frame: None,
             value_state: None,
             value_description: None,
@@ -971,10 +936,88 @@ mod tests {
         assert!(!collapse_layout_container("AXWebArea", None, None));
     }
 
+    /// One display or actionable row for query tests.
+    fn row(index: Option<usize>, role: &str, title: &str, depth: usize, parent: Option<usize>) -> AXNode {
+        AXNode {
+            element_index: index,
+            role: role.into(),
+            title: (!title.is_empty()).then(|| title.into()),
+            value: None,
+            placeholder: None,
+            value_settable: None,
+            focused: None,
+            text_selection: None,
+            description: None,
+            identifier: None,
+            help: None,
+            actions: vec![],
+            element_ptr: 0,
+            depth,
+            parent_element_index: None,
+            parent_position: parent,
+            frame: None,
+            value_state: None,
+            value_description: None,
+            min_value: None,
+            max_value: None,
+            enabled: None,
+            selected: None,
+            in_web_content: false,
+        }
+    }
+
+    fn outline(nodes: &[AXNode], text: &str, context: bool) -> String {
+        let walk = cua_driver_core::walk_budget::WalkBudget::nodes_only(1000).outcome();
+        render_outline(nodes, Some(Query { text, context }), &walk)
+    }
+
     #[test]
     fn save_query_retains_each_named_group_with_its_own_button() {
-        let tree = "- [0] AXWebArea\n  - [1] AXGroup \"Profile\"\n    - [2] AXButton \"Save\"\n    - AXStaticText = \"Unrelated\"\n  - [3] AXGroup (Billing)\n    - [4] AXButton \"Save\"\n";
-        assert_eq!(filter_tree(tree, "Save"), "- [0] AXWebArea\n  - [1] AXGroup \"Profile\"\n    - [2] AXButton \"Save\"\n  - [3] AXGroup (Billing)\n    - [4] AXButton \"Save\"\n");
+        let nodes = [
+            row(Some(0), "AXWebArea", "", 0, None),
+            row(Some(1), "AXGroup", "Profile", 1, Some(0)),
+            row(Some(2), "AXButton", "Save", 2, Some(1)),
+            row(None, "AXStaticText", "Unrelated", 2, Some(1)),
+            row(Some(3), "AXGroup", "Billing", 1, Some(0)),
+            row(Some(4), "AXButton", "Save", 2, Some(4)),
+        ];
+        assert_eq!(
+            outline(&nodes, "save", false),
+            "- [0] AXWebArea\n  - [1] AXGroup \"Profile\"\n    - [2] AXButton \"Save\"\n  - [3] AXGroup \"Billing\"\n    - [4] AXButton \"Save\"\n"
+        );
+    }
+
+    /// A message heading with its body: context keeps the body (display
+    /// text) under the match, never the sibling message.
+    #[test]
+    fn context_keeps_a_matched_rows_descendants_only() {
+        let nodes = [
+            row(None, "AXWindow", "Chat", 0, None),
+            row(None, "AXGroup", "From Ada", 1, Some(0)),
+            row(None, "AXStaticText", "Lunch at noon?", 2, Some(1)),
+            row(None, "AXGroup", "From Bob", 1, Some(0)),
+            row(None, "AXStaticText", "Running late", 2, Some(3)),
+        ];
+        let plain = outline(&nodes, "from ada", false);
+        assert!(!plain.contains("Lunch"), "{plain}");
+        let context = outline(&nodes, "from ada", true);
+        assert!(context.contains("Lunch at noon?"), "{context}");
+        assert!(!context.contains("Bob") && !context.contains("Running"), "{context}");
+    }
+
+    /// The walker dropped an empty container, so "Save" renders at the depth
+    /// of Profile's children although its real parent is the window. The old
+    /// text filter, reading indentation, pulled "Profile" in as its parent.
+    #[test]
+    fn a_dropped_container_does_not_pull_in_a_false_parent() {
+        let nodes = [
+            row(None, "AXWindow", "W", 0, None),
+            row(None, "AXGroup", "Profile", 1, Some(0)),
+            row(Some(0), "AXButton", "Save", 2, Some(0)),
+        ];
+        let text = outline(&nodes, "save", false);
+        assert!(!text.contains("Profile"), "{text}");
+        assert!(text.contains("AXButton \"Save\""), "{text}");
     }
 
     #[test]

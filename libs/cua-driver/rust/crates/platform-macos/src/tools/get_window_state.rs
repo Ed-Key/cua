@@ -86,7 +86,11 @@ fn def() -> &'static ToolDef {
             matching lines plus their ancestor chain (case-insensitive substring). The \
             element_index values are unchanged, the complete snapshot remains actionable, \
             and `element_count` continues to report its total size; \
-            `filtered_element_count` reports the projected response size.\n\n\
+            `filtered_element_count` reports the projected response size. Ancestors \
+            come from the real AX hierarchy, not indentation. With `query_context:true` \
+            each match also keeps everything collected under it (for example a \
+            message heading with its body text and links), still without sibling \
+            branches.\n\n\
             Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
             context-window blow-up on Electron / Obsidian / large web apps that \
             produce 10k+ element trees. When applied, BOTH the markdown \
@@ -99,7 +103,8 @@ fn def() -> &'static ToolDef {
                 "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
-                "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching actionable rows plus their actionable ancestors without renumbering element_index values." },
+                "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching rows plus their ancestors without renumbering element_index values." },
+                "query_context": { "type": "boolean", "description": "Default false. With a nonblank query, also keep every row collected under each match (display text included), not only its ancestors. Uses the same walk; no extra reads." },
                 "diff": { "type": "boolean", "description": "Default true. After the first look at a window, return only rows added, changed, or removed since this session's previous look (display-only text included); unchanged rows keep their element_index. The full outline is still sent for the first look, when it would be shorter, when a query is set, or when the previous look used different max_elements/max_depth. Pass false to force the full outline. macOS only." },
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_accessibility_tree": {
@@ -238,6 +243,14 @@ impl Tool for GetWindowStateTool {
         }
 
         let query = args.opt_str("query");
+        let query_context = match args.get("query_context") {
+            None | Some(serde_json::Value::Bool(false)) => false,
+            Some(serde_json::Value::Bool(true)) => true,
+            Some(_) => return ToolResult::error("query_context must be a boolean"),
+        };
+        if query_context && query.as_deref().is_none_or(|q| q.trim().is_empty()) {
+            return ToolResult::error("query_context requires a nonblank query");
+        }
         let screenshot_out_file = args.opt_str("screenshot_out_file").map(|s| {
             // Expand ~ prefix.
             if let Some(relative) = s.strip_prefix("~/") {
@@ -344,7 +357,7 @@ impl Tool for GetWindowStateTool {
                 let tree = crate::ax::tree::walk_tree_budgeted(
                     pid,
                     Some(window_id),
-                    q.as_deref(),
+                    tree_query(q.as_deref(), query_context),
                     max_depth,
                     cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
                 );
@@ -555,7 +568,7 @@ impl Tool for GetWindowStateTool {
                 None => crate::ax::diff::assign_stable_indices(&mut r.nodes, |_| None, &mut next_id),
             }
             // Numbers may have changed; re-render the full outline.
-            r.tree_markdown = crate::ax::tree::render_outline(&r.nodes, query.as_deref(), &r.walk);
+            r.tree_markdown = crate::ax::tree::render_outline(&r.nodes, tree_query(query.as_deref(), query_context), &r.walk);
             // Diff only against a previous look this session actually received
             // in full, taken with the same bounds. Another session never saw
             // the outline the diff is relative to; a query look delivered only
@@ -696,11 +709,25 @@ impl Tool for GetWindowStateTool {
             (None, Some(r)) if scope_matched => build_elements_array_with_token(&r.nodes, None),
             _ => Vec::new(),
         };
-        let elements_json = cua_driver_core::element_query::project_elements_for_query(
-            elements_json,
-            query.as_deref(),
-            &tree_md,
-        );
+        // The same selection as the outline, from the walker's parent edges,
+        // never re-parsed from the rendered text.
+        let elements_json = match (tree_query(query.as_deref(), query_context), tree_result.as_ref()) {
+            (Some(q), Some(r)) => {
+                let kept: std::collections::HashSet<usize> = crate::ax::tree::query_positions(&r.nodes, q)
+                    .into_iter()
+                    .filter_map(|p| r.nodes[p].element_index)
+                    .collect();
+                elements_json
+                    .into_iter()
+                    .filter(|e| {
+                        e.get("element_index")
+                            .and_then(|v| v.as_u64())
+                            .is_some_and(|i| kept.contains(&(i as usize)))
+                    })
+                    .collect()
+            }
+            _ => elements_json,
+        };
         // Screenshot pixels of the delivered capture: window origin in screen
         // points, delivered pixels per point (backing scale x downsizing).
         let elements_json = match (screenshot_frame.as_ref(), screenshot_dims) {
@@ -1160,13 +1187,10 @@ fn build_elements_array(
         .collect()
 }
 
-/// Keep the structured response aligned with a query-filtered markdown tree.
-///
-/// The AX walker deliberately keeps the complete node/cache snapshot so the
-/// original element indices remain valid. The rendered markdown already holds
-/// the exact matching rows and ancestor chain, so use its indices as the
-/// projection source of truth instead of duplicating query matching over the
-/// structured fields.
+fn tree_query(text: Option<&str>, context: bool) -> Option<crate::ax::tree::Query<'_>> {
+    text.map(|text| crate::ax::tree::Query { text, context })
+}
+
 #[cfg(test)]
 mod window_scope_contract_tests {
     use super::*;
@@ -1370,6 +1394,7 @@ mod tests {
             element_ptr: 0,
             depth,
             parent_element_index: parent,
+            parent_position: None,
             frame,
             value_state: None,
             value_description: None,

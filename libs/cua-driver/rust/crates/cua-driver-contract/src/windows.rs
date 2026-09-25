@@ -74,6 +74,12 @@ pub struct GetWindowStateInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "string_schema")]
     pub query: Option<String>,
+    /// macOS only. Default false. With a nonblank query, also keep every row
+    /// collected under each match, not only its ancestors.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
+    pub query_context: Option<bool>,
     /// macOS only. Default true: after the first look at a window, return only
     /// rows added, changed, or removed since the previous look by this session.
     /// False forces the full outline.
@@ -134,6 +140,11 @@ impl ToolInput for GetWindowStateInput {
         }
         if [self.max_elements, self.max_depth, self.max_dimension].contains(&Some(0)) {
             return Err("window observation limits must be positive".into());
+        }
+        if self.query_context == Some(true)
+            && self.query.as_deref().is_none_or(|q| q.trim().is_empty())
+        {
+            return Err("query_context requires a nonblank query".into());
         }
         if self
             .timeout_ms
