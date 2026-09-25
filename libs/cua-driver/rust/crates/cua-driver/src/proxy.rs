@@ -1305,6 +1305,10 @@ mod tests {
             .unwrap();
         let path = directory.path().join("daemon.sock");
         let listener = UnixListener::bind(&path).unwrap();
+        // The proxy refuses a daemon schema that differs from its own contract.
+        let output_schema =
+            cua_driver_contract::advertised_tool_output_schema("get_window_state").unwrap();
+        let expected_schema = output_schema.clone();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             stream
@@ -1318,7 +1322,7 @@ mod tests {
             assert_eq!(request["method"], "list");
             let response = DaemonResponse::ok(serde_json::json!({"tools": [
                 {"name":"get_window_state", "input_schema":{"type":"object"},
-                 "output_schema":{"type":"object"},
+                 "output_schema":output_schema,
                  "_meta":{"anthropic/maxResultSizeChars":250000,"example.org/hint":{"nested":true}}},
                 {"name":"get_window_state", "input_schema":{"type":"object"}}
             ]}));
@@ -1327,7 +1331,8 @@ mod tests {
         let (tools, _) =
             fetch_tools_list_from_daemon(path.to_str().unwrap(), "metadata-test").unwrap();
         server.join().unwrap();
-        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"tools/list\"}\n";
+        // A legacy session: initialize, then list.
+        let input = b"{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\"}\n{\"jsonrpc\":\"2.0\",\"id\":2,\"method\":\"tools/list\"}\n";
         let mut output = Vec::new();
         run_proxy_io(
             BufReader::new(&input[..]),
@@ -1339,7 +1344,8 @@ mod tests {
         )
         .await
         .unwrap();
-        let response: serde_json::Value = serde_json::from_slice(&output).unwrap();
+        let list = output.split(|b| *b == b'\n').filter(|l| !l.is_empty()).nth(1).unwrap();
+        let response: serde_json::Value = serde_json::from_slice(list).unwrap();
         let tools = &response["result"]["tools"];
         assert_eq!(
             tools[0]["_meta"],
@@ -1349,10 +1355,7 @@ mod tests {
             tools[0]["inputSchema"],
             serde_json::json!({"type":"object"})
         );
-        assert_eq!(
-            tools[0]["outputSchema"],
-            serde_json::json!({"type":"object"})
-        );
+        assert_eq!(tools[0]["outputSchema"], expected_schema);
         // A newer proxy must not invent a hint for an older daemon, even for
         // the same tool name. The executing daemon owns its advertised policy.
         assert!(tools[1].get("_meta").is_none());

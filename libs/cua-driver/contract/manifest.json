@@ -64,8 +64,7 @@
           "observe": {
             "additionalProperties": false,
             "default": {
-              "include_screenshot": false,
-              "query_context": false
+              "include_screenshot": false
             },
             "properties": {
               "include_screenshot": {
@@ -84,10 +83,6 @@
               },
               "query": {
                 "type": "string"
-              },
-              "query_context": {
-                "default": false,
-                "type": "boolean"
               }
             },
             "required": [],
@@ -1741,6 +1736,10 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "diff": {
+            "description": "macOS only. Default true: after the first look at a window, return only\nrows added, changed, or removed since the previous look by this session.\nFalse forces the full outline.",
+            "type": "boolean"
+          },
           "include_accessibility_tree": {
             "type": "boolean"
           },
@@ -1922,6 +1921,12 @@
                     "null"
                   ]
                 },
+                "placeholder": {
+                  "type": [
+                    "string",
+                    "null"
+                  ]
+                },
                 "role": {
                   "type": "string"
                 },
@@ -1940,6 +1945,12 @@
                 "value_description": {
                   "type": [
                     "string",
+                    "null"
+                  ]
+                },
+                "value_settable": {
+                  "type": [
+                    "boolean",
                     "null"
                   ]
                 }
@@ -2080,6 +2091,72 @@
               "y",
               "width",
               "height"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
+          "window_change": {
+            "additionalProperties": false,
+            "properties": {
+              "new_windows": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "app_name": {
+                      "type": "string"
+                    },
+                    "pid": {
+                      "format": "int64",
+                      "type": "integer"
+                    },
+                    "window_id": {
+                      "format": "uint64",
+                      "minimum": 0,
+                      "type": "integer"
+                    }
+                  },
+                  "required": [
+                    "pid",
+                    "window_id",
+                    "app_name",
+                    "title"
+                  ],
+                  "type": "object"
+                },
+                "type": "array"
+              },
+              "rebind": {
+                "additionalProperties": false,
+                "properties": {
+                  "app_name": {
+                    "type": "string"
+                  },
+                  "pid": {
+                    "format": "int64",
+                    "type": "integer"
+                  },
+                  "window_id": {
+                    "format": "uint64",
+                    "minimum": 0,
+                    "type": "integer"
+                  }
+                },
+                "required": [
+                  "pid",
+                  "window_id",
+                  "app_name",
+                  "title"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "new_windows"
             ],
             "type": [
               "object",
@@ -3941,6 +4018,598 @@
         "required": [
           "effect",
           "route"
+        ],
+        "type": "object"
+      }
+    },
+    {
+      "name": "run_sequence",
+      "description": "Run one to eight ordered click/type_text actions against one exact window with background delivery. Each action is followed by the existing verify_state predicates; continue only when satisfied and stable. Stop on unknown, unsatisfied, action refusal, partial delivery or error. Unattempted steps are omitted. No retries, rollback or screenshots. This is not a transaction; a satisfied postcondition does not prove causation. Typed and existing verification request-validation errors reject the whole request before any child. Predicate shapes the verifier classifies unknown remain normal stopped outcomes.",
+      "platforms": [
+        "macos",
+        "windows",
+        "linux"
+      ],
+      "capabilities": [
+        "sequence.run"
+      ],
+      "annotations": {
+        "read_only": false,
+        "destructive": true,
+        "idempotent": false,
+        "open_world": false
+      },
+      "schema_mode": "portable_subset",
+      "input_schema": {
+        "additionalProperties": false,
+        "properties": {
+          "pid": {
+            "minimum": 1,
+            "type": "integer"
+          },
+          "session": {
+            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "arguments": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "element_token": {
+                      "type": "string"
+                    },
+                    "text": {
+                      "type": "string"
+                    },
+                    "x": {
+                      "type": "number"
+                    },
+                    "y": {
+                      "type": "number"
+                    }
+                  },
+                  "required": [],
+                  "type": "object"
+                },
+                "expect": {
+                  "items": {
+                    "additionalProperties": false,
+                    "properties": {
+                      "element": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "enabled": {
+                            "type": [
+                              "boolean",
+                              "null"
+                            ]
+                          },
+                          "exists": {
+                            "description": "Assert that at least one trusted element matches the selector.\n\nElement walks are not yet exhaustive on every platform, so absence\ncannot be proven. `false` is rejected instead of returning an\nindefinitely-unknown predicate.",
+                            "enum": [
+                              true
+                            ],
+                            "type": "boolean"
+                          },
+                          "selected": {
+                            "type": [
+                              "boolean",
+                              "null"
+                            ]
+                          },
+                          "selector": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "label_contains": {
+                                "minLength": 1,
+                                "type": "string"
+                              },
+                              "role": {
+                                "minLength": 1,
+                                "type": "string"
+                              }
+                            },
+                            "required": [],
+                            "type": "object"
+                          },
+                          "value_equals": {
+                            "type": [
+                              "string",
+                              "null"
+                            ]
+                          }
+                        },
+                        "required": [
+                          "selector"
+                        ],
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      },
+                      "window": {
+                        "additionalProperties": false,
+                        "properties": {
+                          "bounds": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "height": {
+                                "type": "number"
+                              },
+                              "tolerance_px": {
+                                "maximum": 100,
+                                "minimum": 0,
+                                "type": "number"
+                              },
+                              "width": {
+                                "type": "number"
+                              },
+                              "x": {
+                                "type": "number"
+                              },
+                              "y": {
+                                "type": "number"
+                              }
+                            },
+                            "required": [
+                              "x",
+                              "y",
+                              "width",
+                              "height"
+                            ],
+                            "type": [
+                              "object",
+                              "null"
+                            ]
+                          },
+                          "exists": {
+                            "type": [
+                              "boolean",
+                              "null"
+                            ]
+                          }
+                        },
+                        "type": [
+                          "object",
+                          "null"
+                        ]
+                      }
+                    },
+                    "required": [],
+                    "type": "object"
+                  },
+                  "maxItems": 8,
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "stable_samples": {
+                  "default": 2,
+                  "maximum": 5,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "timeout_ms": {
+                  "default": 1000,
+                  "description": "Zero performs one sample, using one stable sample when stability is omitted.",
+                  "maximum": 10000,
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tool": {
+                  "enum": [
+                    "click",
+                    "type_text"
+                  ],
+                  "type": "string"
+                }
+              },
+              "required": [
+                "tool",
+                "arguments",
+                "expect"
+              ],
+              "type": "object"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
+          "window_id": {
+            "minimum": 1,
+            "type": "integer"
+          }
+        },
+        "required": [
+          "pid",
+          "window_id",
+          "steps"
+        ],
+        "type": "object"
+      },
+      "success_output_schema": {
+        "additionalProperties": true,
+        "properties": {
+          "elapsed_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "executor_overhead_ms": {
+            "format": "uint64",
+            "minimum": 0,
+            "type": "integer"
+          },
+          "status": {
+            "enum": [
+              "completed",
+              "stopped"
+            ],
+            "type": "string"
+          },
+          "steps": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "action": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "delivery": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "delivered_count": {
+                              "format": "uint32",
+                              "minimum": 0,
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "mode": {
+                              "enum": [
+                                "background",
+                                "foreground",
+                                "not_applicable",
+                                "unknown"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "mode"
+                          ],
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
+                        "effect": {
+                          "enum": [
+                            "confirmed",
+                            "partial",
+                            "unverifiable",
+                            "suspected_noop",
+                            "refused"
+                          ],
+                          "type": "string"
+                        },
+                        "error": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "code": {
+                              "type": "string"
+                            },
+                            "hint": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "code"
+                          ],
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
+                        "escalation": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "reason": {
+                              "enum": [
+                                "route_unavailable",
+                                "delivery_failed",
+                                "effect_unconfirmed",
+                                "suspected_noop",
+                                "permission_required"
+                              ],
+                              "type": "string"
+                            },
+                            "target": {
+                              "enum": [
+                                "pixel",
+                                "foreground",
+                                "page",
+                                "session"
+                              ],
+                              "type": "string"
+                            }
+                          },
+                          "required": [
+                            "target",
+                            "reason"
+                          ],
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
+                        "evidence": {
+                          "items": {
+                            "additionalProperties": false,
+                            "properties": {
+                              "detail": {
+                                "type": [
+                                  "string",
+                                  "null"
+                                ]
+                              },
+                              "kind": {
+                                "enum": [
+                                  "value_readback",
+                                  "window_change"
+                                ],
+                                "type": "string"
+                              }
+                            },
+                            "required": [
+                              "kind"
+                            ],
+                            "type": "object"
+                          },
+                          "type": [
+                            "array",
+                            "null"
+                          ]
+                        },
+                        "route": {
+                          "enum": [
+                            "accessibility",
+                            "synthetic_events",
+                            "global_input",
+                            "system_api",
+                            "dom",
+                            "trusted_input"
+                          ],
+                          "type": "string"
+                        },
+                        "summary": {
+                          "type": [
+                            "string",
+                            "null"
+                          ]
+                        }
+                      },
+                      "required": [
+                        "effect",
+                        "route"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "dispatch_ms": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "error": {
+                  "anyOf": [
+                    {
+                      "additionalProperties": false,
+                      "properties": {
+                        "code": {
+                          "type": "string"
+                        },
+                        "message": {
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "code",
+                        "message"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "image_bytes_returned": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "index": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "observation_count": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                },
+                "tool": {
+                  "enum": [
+                    "click",
+                    "type_text"
+                  ],
+                  "type": "string"
+                },
+                "verification": {
+                  "anyOf": [
+                    {
+                      "properties": {
+                        "elapsed_ms": {
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "predicates": {
+                          "items": {
+                            "properties": {
+                              "index": {
+                                "format": "uint64",
+                                "minimum": 0,
+                                "type": "integer"
+                              },
+                              "observed_json": {
+                                "anyOf": [
+                                  {
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              },
+                              "status": {
+                                "enum": [
+                                  "satisfied",
+                                  "unsatisfied",
+                                  "unknown"
+                                ],
+                                "type": "string"
+                              },
+                              "unknown_reason": {
+                                "anyOf": [
+                                  {
+                                    "enum": [
+                                      "invalid_predicate",
+                                      "unsupported_predicate",
+                                      "untrusted_source",
+                                      "multi_match",
+                                      "target_missing",
+                                      "observation_unavailable",
+                                      "stability_unproven"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  {
+                                    "type": "null"
+                                  }
+                                ]
+                              }
+                            },
+                            "required": [
+                              "index",
+                              "status",
+                              "unknown_reason",
+                              "observed_json"
+                            ],
+                            "type": "object"
+                          },
+                          "type": "array"
+                        },
+                        "samples": {
+                          "format": "uint64",
+                          "minimum": 0,
+                          "type": "integer"
+                        },
+                        "stable": {
+                          "type": "boolean"
+                        },
+                        "status": {
+                          "enum": [
+                            "satisfied",
+                            "unsatisfied",
+                            "unknown"
+                          ],
+                          "type": "string"
+                        }
+                      },
+                      "required": [
+                        "status",
+                        "stable",
+                        "elapsed_ms",
+                        "samples",
+                        "predicates"
+                      ],
+                      "type": "object"
+                    },
+                    {
+                      "type": "null"
+                    }
+                  ]
+                },
+                "verification_ms": {
+                  "format": "uint64",
+                  "minimum": 0,
+                  "type": "integer"
+                }
+              },
+              "required": [
+                "index",
+                "tool",
+                "action",
+                "verification",
+                "error",
+                "dispatch_ms",
+                "verification_ms",
+                "observation_count",
+                "image_bytes_returned"
+              ],
+              "type": "object"
+            },
+            "type": "array"
+          },
+          "stop_reason": {
+            "anyOf": [
+              {
+                "enum": [
+                  "unsatisfied",
+                  "unknown",
+                  "action_error",
+                  "verification_error"
+                ],
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "stopped_at": {
+            "anyOf": [
+              {
+                "format": "uint64",
+                "minimum": 0,
+                "type": "integer"
+              },
+              {
+                "type": "null"
+              }
+            ]
+          }
+        },
+        "required": [
+          "status",
+          "stopped_at",
+          "stop_reason",
+          "elapsed_ms",
+          "executor_overhead_ms",
+          "steps"
         ],
         "type": "object"
       }

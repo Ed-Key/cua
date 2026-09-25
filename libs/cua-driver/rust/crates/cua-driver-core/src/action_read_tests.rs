@@ -111,7 +111,7 @@ fn registry_with_action(observation_error: bool, action_error: bool) -> (Arc<Too
 }
 fn input() -> Value {
     json!({"pid":42,"window_id":7,"action":"click","element_token":"fresh-token",
-    "observe":{"query":"AXWindow","query_context":true,"include_screenshot":true}})
+    "observe":{"query":"AXWindow","include_screenshot":true}})
 }
 
 #[tokio::test]
@@ -127,7 +127,7 @@ async fn action_read_preserves_failed_action_and_fresh_observation_without_repla
         ["click", "get_window_state"]
     );
     assert_eq!(calls[0].1["delivery_mode"], "background");
-    assert_eq!(calls[1].1["query_context"], true);
+    assert_eq!(calls[1].1["query"], "AXWindow");
     assert_eq!(calls[1].1["pid"], 42);
     assert_eq!(calls[1].1["window_id"], 7);
     assert_eq!(result.is_error, Some(true));

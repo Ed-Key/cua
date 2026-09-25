@@ -70,8 +70,6 @@ pub struct ActionReadObservation {
     )]
     #[schemars(schema_with = "string")]
     pub query: Option<String>,
-    #[serde(default)]
-    pub query_context: bool,
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -161,15 +159,6 @@ impl ToolInput for ActAndReadInput {
         if self.amount.is_some_and(|n| !(1..=50).contains(&n)) {
             return Err("scroll amount must be between 1 and 50".into());
         }
-        if self.observe.query_context
-            && self
-                .observe
-                .query
-                .as_ref()
-                .is_none_or(|s| s.trim().is_empty())
-        {
-            return Err("query_context requires a nonblank query".into());
-        }
         if self
             .observe
             .max_elements
@@ -223,7 +212,7 @@ pub fn contracts() -> Vec<ToolContract> {
         platforms:vec![Platform::Macos], aliases:vec![], capabilities:vec!["action.read".into()],
         annotations:ToolAnnotations { read_only:false,destructive:true,idempotent:false,open_world:false },
         schema_mode:SchemaMode::CanonicalRuntime,cursor_semantics:None,
-        input_schema:ActAndReadInput::input_schema(),success_output_schema:Some(ActAndReadOutput::output_schema()),
+        input_schema:ActAndReadInput::input_schema(),success_output_schema:Some(ActAndReadOutput::output_schema()),error_output_schema:None,
         output_validator:crate::validate_typed_output::<ActAndReadOutput>,
     }]
 }
