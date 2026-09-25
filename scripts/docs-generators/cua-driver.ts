@@ -919,6 +919,14 @@ function syntheticExampleValue(name: string, prop: MCPPropertyDoc): unknown {
       if (name === 'keys') return ['cmd', 'c'];
       if (name === 'modifiers') return ['cmd'];
       if (name === 'expect') return [{ window: { exists: true } }];
+      if (name === 'steps')
+        return [
+          {
+            tool: 'click',
+            arguments: { element_token: 's0000002a:4' },
+            expect: [{ element: { selector: { label_contains: 'Saved' }, exists: true } }],
+          },
+        ];
       if (name === 'files' || (prop.minItems ?? 0) > 0) return ['example'];
       return [];
     case 'string':

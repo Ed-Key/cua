@@ -102,6 +102,7 @@
             "type": "string"
           },
           "value": {
+            "description": "Required for action set_value; not allowed for other actions.",
             "type": "string"
           },
           "window_id": {
@@ -1777,7 +1778,7 @@
             "type": "string"
           },
           "query_context": {
-            "description": "macOS only. Default false. With a nonblank query, also keep every row\ncollected under each match, not only its ancestors.",
+            "description": "macOS only. Default false. With a nonblank query, also keep every row\ncollected under each match, not only its ancestors. Display-only rows\nappear in tree_markdown; structured elements hold only actionable rows.",
             "type": "boolean"
           },
           "screenshot_out_file": {

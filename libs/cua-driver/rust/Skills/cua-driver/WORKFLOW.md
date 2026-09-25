@@ -37,7 +37,7 @@ These objects are argument fragments for tools advertising `target`, not standal
 
 `get_window_state({pid, window_id})` requests the accessibility tree and a grounding screenshot by default. Check what actually came back: permission, backing-store, or surface-identity failures can leave usable tree data without an image. `screenshot_error` and `screenshot_frame_valid:false` are not empty-tree signals.
 
-On macOS a row keeps its `element_index` across looks at the same window, and a vanished row's number is never reused. After the first look, a session's next `get_window_state` of that window returns only rows added, changed, or removed (`diff` in the response lists their numbers; `tree_markdown` marks `+` added, `~` changed, `x` vanished text). Unchanged rows are omitted but still actionable: pair their `element_index` with the new response's `snapshot_id`. Pass `diff:false` when you need the full outline again, for example after a context reset. A `query`, a changed `max_elements`/`max_depth`, or a look by another session always returns the full outline.
+On macOS a row keeps its `element_index` across looks at the same window, and a vanished row's number is not reused while the session keeps that window's numbering. After that history is evicted, a full look restarts at 0; do not carry old indices across it. After the first look, a session's next `get_window_state` of that window returns only rows added, changed, or removed (`diff` in the response lists their numbers; `tree_markdown` marks `+` added, `~` changed, `x` vanished text). Unchanged rows are omitted but still actionable: pair their `element_index` with the new response's `snapshot_id`. Pass `diff:false` when you need the full outline again, for example after a context reset. A `query`, a changed `max_elements`/`max_depth`, or a look by another session always returns the full outline.
 
 Actions return without waiting to see whether a window opens. On macOS, the first `get_window_state` of that app after an action reports windows, sheets, or dialogs the app opened since, as `window_change` (once). When exactly one appeared, `window_change.rebind` gives its `pid` and `window_id`: read and act there next. Its `pid` can differ from the app's (file panels run in a separate process). With several candidates, pick from `new_windows` yourself.
 
@@ -46,11 +46,11 @@ Prefer `structuredContent.elements` in MCP (the CLI prints structured fields dir
 On macOS a row can also carry:
 
 - `placeholder`: the hint an empty field shows. It is never the field's content; an empty text field reports `value:""`.
-- `value_settable`: whether the field reports its value writable. `false` means `set_value` will be refused; use typing or another route.
-- `focused` and `text_selection`: the focused text control, with its caret or selection as a UTF-16 `range` (`location`, `length`) and the selected `text`. The outline marks that row `focused selection_utf16=location:length`. Password fields are never read.
+- `value_settable`: whether the field reports its value writable. For a text field or text area, `false` means `set_value` will be refused; type instead. Numeric controls can still move through increment/decrement.
+- `focused` and `text_selection`: the focused text control, with its caret or selection as a UTF-16 `range` (`location`, `length`) and the selected `text`. The outline marks that row `focused selection_utf16=location:length`. The selection of a password field is never read.
 - `url`: a link's destination, kept apart from its label.
 
-- Use `query` to project matching rows plus their real ancestors without renumbering their indices. On macOS, add `query_context:true` to also keep everything under each match (a message heading with its body and links), without sibling branches. A query locates; it does not prove absence.
+- Use `query` to project matching rows plus their real ancestors without renumbering their indices. On macOS, add `query_context:true` to also keep everything under each match (a message heading with its body and links), without sibling branches. Display-only rows (message text) appear in `tree_markdown`; structured `elements` hold only actionable rows. A query locates; it does not prove absence.
 - Use `max_elements` / `max_depth` to bound the walk, and compare returned/total counts. Truncation does not prove absence.
 - Use `include_screenshot:false` only when tree-only observation is enough; it cannot ground a pixel action.
 - Where advertised, `include_accessibility_tree:false` requests capture without a tree walk. Check the installed schema first.
@@ -117,7 +117,7 @@ For an expressible exact-window postcondition, use `verify_state` with bounded p
 cua-driver verify_state '{"pid":844,"window_id":10725,"expect":[{"element":{"selector":{"label_contains":"Saved"},"exists":true}}],"include_screenshot":true,"session":"run-1"}'
 ```
 
-To check a caret or selection on the focused native text control, use an element predicate with `text_selection` (`location`, `length`, optional exact `text`, UTF-16 units). Web and Electron selections stay `unknown`.
+To check a caret or selection on the focused native text control, use an element predicate with `text_selection` (`location`, `length`, optional exact `text`, UTF-16 units). A selection inside web content (including an Electron app's web views) stays `unknown`; native controls are checked.
 
 This example proves a matching trusted element exists, not that every application has a meaningful “Saved” indicator. Choose predicates that establish this task. Use fresh `get_window_state` for outcomes the predicate language cannot express, and fresh `get_desktop_state` for desktop proof. `verify_state` remains an exact-window tool; a previous desktop action does not disable it.
 

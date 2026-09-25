@@ -34,7 +34,7 @@ fn def() -> &'static ToolDef {
             those indices to click, type_text, press_key, etc.\n\n\
             INVARIANT: call get_window_state once per turn per (pid, window_id) before any \
             element-indexed action. On macOS a row keeps its element_index across looks at \
-            the same window and a vanished row's number is never reused, so after the first \
+            the same window and a vanished row's number is not reused while this session keeps the window's numbering (after eviction a full look restarts at 0), so after the first \
             look the response is a change-only diff by default (see `diff`); each look still \
             mints a new snapshot_id, so pair an unchanged row's element_index with the latest \
             snapshot_id.\n\n\
@@ -104,7 +104,7 @@ fn def() -> &'static ToolDef {
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
                 "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching rows plus their ancestors without renumbering element_index values." },
-                "query_context": { "type": "boolean", "description": "Default false. With a nonblank query, also keep every row collected under each match (display text included), not only its ancestors. Uses the same walk; no extra reads." },
+                "query_context": { "type": "boolean", "description": "Default false. With a nonblank query, also keep every row collected under each match (display text included), not only its ancestors. Uses the same walk; no extra reads. Display-only rows appear in tree_markdown; structured elements still hold only actionable rows." },
                 "diff": { "type": "boolean", "description": "Default true. After the first look at a window, return only rows added, changed, or removed since this session's previous look (display-only text included); unchanged rows keep their element_index. The full outline is still sent for the first look, when it would be shorter, when a query is set, or when the previous look used different max_elements/max_depth. Pass false to force the full outline. macOS only." },
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_accessibility_tree": {

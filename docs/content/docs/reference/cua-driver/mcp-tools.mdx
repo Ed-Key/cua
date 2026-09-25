@@ -63,7 +63,7 @@ Per-record fields: window_id, pid, app_name, title, bounds (x/y/width/height, to
 
 Walk a running app's AX tree and return BOTH a structured `elements` array (preferred) AND a Markdown rendering of the same tree (back-compat). Every actionable element is tagged with [element_index N] in the markdown and as `element_index` in the structured array — pass those indices to click, type_text, press_key, etc.
 
-INVARIANT: call get_window_state once per turn per (pid, window_id) before any element-indexed action. On macOS a row keeps its element_index across looks at the same window and a vanished row's number is never reused, so after the first look the response is a change-only diff by default (see `diff`); each look still mints a new snapshot_id, so pair an unchanged row's element_index with the latest snapshot_id.
+INVARIANT: call get_window_state once per turn per (pid, window_id) before any element-indexed action. On macOS a row keeps its element_index across looks at the same window and a vanished row's number is not reused while this session keeps the window's numbering (after eviction a full look restarts at 0), so after the first look the response is a change-only diff by default (see `diff`); each look still mints a new snapshot_id, so pair an unchanged row's element_index with the latest snapshot_id.
 
 PREFERRED CONSUMERS read `structuredContent.elements` (one entry per indexed row with `element_index`, `role`, `label`, `value` (the element's text/AXValue when present — use it to verify what a field holds), `actions` (names of AX actions exposed by the element, omitted when empty), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown `tree_markdown` stays available and unchanged in shape for existing text-parsing callers — but new fields will only be added to the structured side.
 
@@ -89,7 +89,7 @@ Optional `max_elements` / `max_depth` bound the AX walk to mitigate context-wind
 - `max_image_dimension` (integer, optional): Per-call override for the returned screenshot's long edge in pixels. An explicit value wins over the session/global setting; 0 returns native resolution. Omit to preserve configured behavior. range: 0–unbounded
 - `pid` (integer, required): Target process ID.
 - `query` (string, optional): Case-insensitive filter for tree_markdown and structured elements. Returns matching rows plus their ancestors without renumbering element_index values.
-- `query_context` (boolean, optional): Default false. With a nonblank query, also keep every row collected under each match (display text included), not only its ancestors. Uses the same walk; no extra reads.
+- `query_context` (boolean, optional): Default false. With a nonblank query, also keep every row collected under each match (display text included), not only its ancestors. Uses the same walk; no extra reads. Display-only rows appear in tree_markdown; structured elements still hold only actionable rows.
 - `screenshot_out_file` (string, optional): When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead.
 - `session` (string, optional): For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
 - `timeout_ms` (integer, optional): Wall-clock budget in milliseconds for the accessibility-tree walk (default 1000, min 100, max 120000). Bounds the WHOLE walk. When the budget runs out the tool returns the PARTIAL tree it has, flagged with `truncated: true`, `truncation_reason`, `nodes_visited`, `nodes_pending` and `elements_complete: false`; retry with a larger value (e.g. 5000) or narrow with `query` / `max_depth`. default: `1000`; range: 100–120000
@@ -1086,7 +1086,7 @@ accepts it. Omit it to use the authenticated transport's implicit lifecycle sess
 - `window_id` (integer, required): range: 1–unbounded
 
 ```json
-{"pid":844,"steps":["example"],"window_id":10725}
+{"pid":844,"steps":[{"tool":"click","arguments":{"element_token":"s0000002a:4"},"expect":[{"element":{"selector":{"label_contains":"Saved"},"exists":true}}]}],"window_id":10725}
 ```
 
 ### `act_and_read`
@@ -1103,7 +1103,7 @@ macOS: run one token-targeted background click, set_value or scroll, then read t
 - `observe` (object, optional): default: `{"include_screenshot":false,"query_context":false}`
 - `pid` (integer, required): range: 1–2147483647
 - `session` (string, optional)
-- `value` (string, optional)
+- `value` (string, optional): Required for action set_value; not allowed for other actions.
 - `window_id` (integer, required): range: 1–4294967295
 
 ```json

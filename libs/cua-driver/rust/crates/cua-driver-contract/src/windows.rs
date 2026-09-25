@@ -75,7 +75,8 @@ pub struct GetWindowStateInput {
     #[schemars(schema_with = "string_schema")]
     pub query: Option<String>,
     /// macOS only. Default false. With a nonblank query, also keep every row
-    /// collected under each match, not only its ancestors.
+    /// collected under each match, not only its ancestors. Display-only rows
+    /// appear in tree_markdown; structured elements hold only actionable rows.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
     #[uniffi(default = None)]

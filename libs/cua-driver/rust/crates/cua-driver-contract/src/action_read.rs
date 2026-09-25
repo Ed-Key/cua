@@ -107,6 +107,7 @@ pub struct ActAndReadInput {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
+    /// Required for action set_value; not allowed for other actions.
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub value: Option<String>,
