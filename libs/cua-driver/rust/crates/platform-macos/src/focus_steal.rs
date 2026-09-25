@@ -609,6 +609,7 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
     };
 
     let restore_pids = dispatcher.snapshot_matches(activated_pid);
+    tracing::debug!(activated_pid, ?restore_pids, "focus steal: activation observed");
     for pid in restore_pids {
         restore_focus(pid);
     }
@@ -619,7 +620,8 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
 fn restore_focus(pid: i32) {
     unsafe {
         if let Some(app) = NSRunningApplication::runningApplicationWithProcessIdentifier(pid) {
-            let _ = app.activateWithOptions(NSApplicationActivationOptions(0));
+            let accepted = app.activateWithOptions(NSApplicationActivationOptions(0));
+            tracing::debug!(pid, accepted, "focus steal: restore requested");
         }
     }
 }

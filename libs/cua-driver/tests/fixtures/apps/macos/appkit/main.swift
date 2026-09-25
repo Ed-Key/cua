@@ -35,6 +35,8 @@ let kTextInputAID = "txt-input"
 let kTextInputMirrorAID = "lbl-input-mirror"
 let kTextInputCommitAID = "lbl-input-commit"
 let kClickTargetAID = "btn-clicktarget"
+/// Present only when CUA_APPKIT_THIEF_DELAY_MS is set (focus-theft tests).
+let kStealButtonAID = "btn-steal"
 let kLastActionAID = "lbl-last-action"
 let kClickCountAID = "lbl-click-count"
 let kSliderAID = "sld-value"
@@ -146,6 +148,10 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
     /// True while show() clears AppKit's automatic first responder, so ending
     /// that edit does not record a commit the test never made.
     private var clearingLaunchFocus = false
+    /// Focus-theft fixture: pressing btn-steal makes this app take focus
+    /// after this delay, the way an app reacting to a click often does.
+    private let thiefDelayMs = ProcessInfo.processInfo.environment["CUA_APPKIT_THIEF_DELAY_MS"]
+        .flatMap { Int($0) }
     let window: NSWindow
     let counterLabel = NSTextField(labelWithString: "counter=0")
     var counterValue = 0
@@ -232,6 +238,11 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         counterRow.addArrangedSubview(inc)
         counterRow.addArrangedSubview(reset)
         counterRow.addArrangedSubview(counterLabel)
+        if thiefDelayMs != nil {
+            let steal = NSButton(title: "Steal focus", target: self, action: #selector(onSteal))
+            steal.setAccessibilityIdentifier(kStealButtonAID)
+            counterRow.addArrangedSubview(steal)
+        }
         content.addArrangedSubview(counterRow)
 
         // text_body
@@ -476,6 +487,28 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         guard let raw = ProcessInfo.processInfo.environment[name],
               let ms = Double(raw), ms > 0 else { return 0 }
         return ms / 1000
+    }
+
+    /// Take focus after the configured delay and record the attempt, so a test
+    /// can prove the theft was actually tried (CUA_APPKIT_THIEF_TRACE).
+    @objc private func onSteal() {
+        let delay = thiefDelayMs ?? 0
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
+            NSApp.activate(ignoringOtherApps: true)
+            self?.window.makeKeyAndOrderFront(nil)
+            let attempted = Date().timeIntervalSince1970
+            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) {
+                guard let path = ProcessInfo.processInfo.environment["CUA_APPKIT_THIEF_TRACE"] else { return }
+                let line = "{\"delay_ms\":\(delay),\"attempted_at\":\(attempted),\"active_after_100ms\":\(NSApp.isActive)}\n"
+                if let handle = FileHandle(forWritingAtPath: path) {
+                    handle.seekToEndOfFile()
+                    handle.write(Data(line.utf8))
+                    handle.closeFile()
+                } else {
+                    FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+                }
+            }
+        }
     }
 
     @objc private func onReset() {

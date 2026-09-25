@@ -2070,6 +2070,78 @@ fn run_background_case_with_env(
     );
 }
 
+/// Focus theft: pressing btn-steal makes the fixture take focus `delay_ms`
+/// later, the way an app reacting to a click often does. The background
+/// oracles (the foreground sentinel must still be frontmost) run after this
+/// body returns, so the body waits past the theft first; otherwise a late
+/// theft would land after the check. The trace proves the theft was tried.
+fn run_focus_theft_case(delay_ms: u64, targeting: Targeting) {
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("thief.jsonl");
+    let delay = delay_ms.to_string();
+    let route = if targeting == Targeting::Px { "px" } else { "ax" };
+    run_background_case_with_env(
+        &format!("focus_theft_{delay_ms}ms_{route}"),
+        targeting,
+        DriverRoute::MacosAxAction,
+        &[
+            ("CUA_APPKIT_THIEF_DELAY_MS", delay.as_str()),
+            ("CUA_APPKIT_THIEF_TRACE", trace.to_str().unwrap()),
+        ],
+        |pid, wid, driver| {
+            let response = if targeting == Targeting::Px {
+                let pre = driver.call(
+                    "get_window_state",
+                    serde_json::json!({"pid": pid as i64, "window_id": wid, "diff": false}),
+                );
+                let (x, y, width, height) = element_pixel_frame(&pre, "btn-steal");
+                driver.call(
+                    "click",
+                    serde_json::json!({
+                        "pid": pid as i64, "window_id": wid,
+                        "x": x + width / 2.0, "y": y + height / 2.0,
+                        "delivery_mode": "background"
+                    }),
+                )
+            } else {
+                let pre = snapshot_elements(driver, pid, wid);
+                let token = element_token_by_id(&pre, "btn-steal");
+                driver.call(
+                    "click",
+                    serde_json::json!({
+                        "pid": pid as i64, "window_id": wid,
+                        "element_token": token, "delivery_mode": "background"
+                    }),
+                )
+            };
+            assert!(!response.is_error(), "steal click: {}", response.raw);
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms + 700));
+            let raw = std::fs::read_to_string(&trace)
+                .expect("the fixture never tried to take focus: the click did not land");
+            eprintln!("focus theft delay={delay_ms}ms route={route}; trace={raw}");
+        },
+    );
+}
+
+macro_rules! focus_theft_tests {
+    ($($name:ident: $delay:expr, $targeting:expr;)*) => {$(
+        #[test]
+        #[ignore]
+        fn $name() {
+            run_focus_theft_case($delay, $targeting);
+        }
+    )*};
+}
+
+focus_theft_tests! {
+    harness_appkit_focus_theft_0ms_ax: 0, Targeting::Ax;
+    harness_appkit_focus_theft_300ms_ax: 300, Targeting::Ax;
+    harness_appkit_focus_theft_800ms_ax: 800, Targeting::Ax;
+    harness_appkit_focus_theft_0ms_px: 0, Targeting::Px;
+    harness_appkit_focus_theft_300ms_px: 300, Targeting::Px;
+    harness_appkit_focus_theft_800ms_px: 800, Targeting::Px;
+}
+
 fn run_editor_identity_case(mode: &str) {
     let journal = tempfile::tempdir().unwrap();
     let trace = journal.path().join("editor-identity.jsonl");
