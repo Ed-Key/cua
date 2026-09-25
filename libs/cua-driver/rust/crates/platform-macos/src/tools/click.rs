@@ -45,6 +45,34 @@ impl ClickTool {
     }
 }
 
+/// Chromium answers a background AXPress from its cached hit-test tree, which
+/// it updates asynchronously; right after launch or a layout change the press
+/// can land on a stale node. One native hit test at the element's centre asks
+/// Chromium to refresh, and 20 ms gives its renderer lookup a scheduling
+/// interval (macOS offers no completion signal). Chromium only; best effort,
+/// so a failed hit test changes nothing. Adapted from d6d09344d.
+async fn prime_chromium_hit_test(pid: i32, x: f64, y: f64) {
+    let primed = tokio::task::spawn_blocking(move || {
+        let name = apps::get_app_name_for_pid(pid).unwrap_or_default();
+        let bundle = apps::bundle_id_for_pid(pid).unwrap_or_default();
+        if !crate::browser::platform::is_chromium(&name, &bundle) {
+            return false;
+        }
+        match unsafe { element_at_screen_position(pid, x, y) } {
+            Some(element) => {
+                unsafe { CFRelease(element as CFTypeRef) };
+                true
+            }
+            None => false,
+        }
+    })
+    .await
+    .unwrap_or(false);
+    if primed {
+        tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    }
+}
+
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
 /// Focus posture for the raw pixel transport after AX hit-testing has failed.
@@ -678,6 +706,12 @@ impl Tool for ClickTool {
             }
 
             // ── Focus-suppression wrap (Swift WindowChangeDetector + FocusGuard) ──
+            if !delivery_mode.is_foreground() && effective_action == "press" && button_str == "left" {
+                if let Some((x, y)) = center {
+                    prime_chromium_hit_test(pid, x, y).await;
+                }
+            }
+
             // Capture prior frontmost, arm the wildcard suppressor in the
             // snapshot, then arm a targeted suppressor across the AX action
             // itself via FocusGuard. After the action returns, detect any
