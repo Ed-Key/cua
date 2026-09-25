@@ -5309,9 +5309,10 @@ fn standalone_browser_first_native_snapshot_contains_page() {
             let started = Instant::now();
             let snapshot = fixture.driver.call(
                 "get_window_state",
+                // No query: this checks the unfiltered first observation.
                 serde_json::json!({
-                    "pid":fixture.pid,"window_id":fixture.window_id,"query":"AXWindow",
-                    "query_context":true,"include_screenshot":false,"max_elements":1000
+                    "pid":fixture.pid,"window_id":fixture.window_id,
+                    "include_screenshot":false,"max_elements":1000,"diff":false
                 }),
             );
             assert!(!snapshot.is_error());

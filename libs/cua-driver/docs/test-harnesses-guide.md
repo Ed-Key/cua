@@ -86,20 +86,6 @@ repo-local matrix. For browser-facing changes or browser-use release
 certification on Windows and Linux, also run
 `.github/workflows/e2e-rust-standalone-browsers.yml`.
 
-The macOS `standalone_browser_pixel_ax_focus_recovery` row is a focused
-recovery regression. It uses the existing standalone browser fixture and
-foreground sentinel, verifies coordinate-addressed AX delivery and a new
-destination tab, then checks the foreground app at click completion. It does
-not award the uninterrupted `Focus` oracle: brief activation remains a separate
-failure in strict background tests. This row enables renderer accessibility
-for its own browser launch to isolate recovery from AX cold-start readiness.
-Run it through the authorized guest Terminal environment, selecting only:
-
-```sh
-cargo test -p cua-driver --test standalone_browser_behavior_test \
-  standalone_browser_pixel_ax_focus_recovery -- --exact --ignored --nocapture --test-threads=1
-```
-
 The macOS `standalone_browser_first_native_snapshot_contains_page` row checks
 cold native accessibility without a forced renderer-accessibility launch flag.
 After the fixture's own load marker and foreground setup, it performs one

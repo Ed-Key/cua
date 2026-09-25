@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 use core_foundation::base::{CFRelease, CFTypeRef};
 
 use super::bindings::{
+    copy_ax_windows, AXUIElementSetMessagingTimeout,
     copy_children, copy_string_attr, enable_chromium_accessibility, AXUIElementRef,
     AccessibilityOptIn,
 };
@@ -142,25 +143,45 @@ fn wait_outcome(
     }
 }
 
-unsafe fn has_web_area(element: AXUIElementRef, depth: u32, visits: &mut u32) -> bool {
-    if depth == 0 {
+/// Bound every AX message by the time left, so a slow or hung app cannot
+/// stretch the probe past the readiness deadline.
+unsafe fn bound_by(element: AXUIElementRef, deadline: Instant) -> bool {
+    let remaining = deadline.saturating_duration_since(Instant::now());
+    if remaining < Duration::from_millis(1) {
         return false;
     }
+    AXUIElementSetMessagingTimeout(element, remaining.min(Duration::from_millis(250)).as_secs_f32());
+    true
+}
+
+unsafe fn has_web_area(
+    children: Vec<AXUIElementRef>,
+    depth: u32,
+    visits: &mut u32,
+    deadline: Instant,
+) -> bool {
     let mut found = false;
-    for child in copy_children(element) {
-        if !found && *visits > 0 {
+    for child in children {
+        if !found && depth > 0 && *visits > 0 && bound_by(child, deadline) {
             *visits -= 1;
             found = copy_string_attr(child, "AXRole").as_deref() == Some(WEB_AREA_ROLE)
-                || has_web_area(child, depth - 1, visits);
+                || has_web_area(copy_children(child), depth - 1, visits, deadline);
         }
         CFRelease(child as CFTypeRef);
     }
     found
 }
 
-unsafe fn probe_web_content(app_element: AXUIElementRef) -> WebContent {
+/// Probe the same roots the tree walker reads: AXChildren and AXWindows (a
+/// background window can be absent from the first).
+unsafe fn probe_web_content(app_element: AXUIElementRef, deadline: Instant) -> WebContent {
+    if !bound_by(app_element, deadline) {
+        return WebContent::Absent;
+    }
     let mut visits = WEB_AREA_PROBE_NODES;
-    if has_web_area(app_element, WEB_AREA_MAX_DEPTH, &mut visits) {
+    let mut roots = copy_children(app_element);
+    roots.extend(copy_ax_windows(app_element));
+    if has_web_area(roots, WEB_AREA_MAX_DEPTH, &mut visits, deadline) {
         WebContent::Present
     } else {
         WebContent::Absent
@@ -188,30 +209,36 @@ fn pump_bounded(seconds: f64, mut pump: impl FnMut(f64)) {
     }
 }
 
+/// One absolute deadline covers probes, reassertion and sleeps; every sleep
+/// is cut to the time left. `now` is injectable so tests run on logical time.
 fn await_web_content(
-    mut probe: impl FnMut() -> WebContent,
+    mut probe: impl FnMut(Instant) -> WebContent,
     mut reassert: impl FnMut(),
     mut settle: impl FnMut(f64),
+    now: impl Fn() -> Instant,
 ) -> bool {
-    let steps = (MATERIALIZE_TIMEOUT_SECONDS / MATERIALIZE_POLL_SECONDS).round() as u32;
-    let reassert_step = steps / 2;
-    for step in 0..=steps {
-        match probe() {
-            WebContent::Present => {
-                reassert();
-                settle(CHROMIUM_SETTLE_SECONDS);
-                return true;
-            }
-            WebContent::Absent => {}
-        }
-        if step == reassert_step {
+    let start = now();
+    let deadline = start + Duration::from_secs_f64(MATERIALIZE_TIMEOUT_SECONDS);
+    let reassert_at = start + Duration::from_secs_f64(MATERIALIZE_TIMEOUT_SECONDS / 2.0);
+    let mut reasserted = false;
+    loop {
+        if let WebContent::Present = probe(deadline) {
             reassert();
+            let left = deadline.saturating_duration_since(now()).as_secs_f64();
+            settle(CHROMIUM_SETTLE_SECONDS.min(left.max(0.0)));
+            return true;
         }
-        if step < steps {
-            settle(MATERIALIZE_POLL_SECONDS);
+        let at = now();
+        if at >= deadline {
+            return false;
         }
+        if !reasserted && at >= reassert_at {
+            reassert();
+            reasserted = true;
+        }
+        let left = deadline.saturating_duration_since(at).as_secs_f64();
+        settle(MATERIALIZE_POLL_SECONDS.min(left));
     }
-    false
 }
 
 /// # Safety
@@ -246,7 +273,7 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
     );
     let outcome = wait_outcome(opt_in, known_chromium, prior_timeouts, attempted_at, || {
         await_web_content(
-            || probe_web_content(app_element),
+            |deadline| probe_web_content(app_element, deadline),
             || {
                 // Repeated legacy requests restart Chromium's debounce
                 // timer. Only the modern Electron path needs reassertion.
@@ -255,6 +282,7 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
                 }
             },
             pump_for,
+            Instant::now,
         )
     });
     if let (Some(stamp), Some(wait)) = (stamp, outcome) {
@@ -269,17 +297,46 @@ mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
 
+    /// A slow app (each probe costs a second) still ends at the deadline:
+    /// probe time counts against the budget, not only the sleeps.
+    #[test]
+    fn slow_probes_count_against_the_deadline() {
+        let origin = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
+        let probes = Cell::new(0u32);
+        let materialized = await_web_content(
+            |_| {
+                probes.set(probes.get() + 1);
+                elapsed.set(elapsed.get() + Duration::from_secs(1));
+                WebContent::Absent
+            },
+            || {},
+            |seconds| elapsed.set(elapsed.get() + Duration::from_secs_f64(seconds)),
+            || origin + elapsed.get(),
+        );
+        assert!(!materialized);
+        assert!(probes.get() <= 4, "{} probes for a 4s budget", probes.get());
+        assert!(elapsed.get() <= Duration::from_secs_f64(MATERIALIZE_TIMEOUT_SECONDS + 1.0));
+    }
+
     fn drive(script: Vec<WebContent>) -> (bool, Vec<String>) {
         let log = RefCell::new(Vec::new());
         let mut remaining = script.into_iter();
+        // Logical time: it only moves when the wait settles.
+        let origin = Instant::now();
+        let elapsed = Cell::new(Duration::ZERO);
         let materialized = await_web_content(
-            || {
+            |_| {
                 let next = remaining.next().unwrap_or(WebContent::Absent);
                 log.borrow_mut().push(format!("probe:{next:?}"));
                 next
             },
             || log.borrow_mut().push("reassert".to_string()),
-            |seconds| log.borrow_mut().push(format!("settle:{seconds}")),
+            |seconds| {
+                elapsed.set(elapsed.get() + Duration::from_secs_f64(seconds));
+                log.borrow_mut().push(format!("settle:{seconds}"));
+            },
+            || origin + elapsed.get(),
         );
         (materialized, log.into_inner())
     }
