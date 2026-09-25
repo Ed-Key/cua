@@ -64,7 +64,8 @@
           "observe": {
             "additionalProperties": false,
             "default": {
-              "include_screenshot": false
+              "include_screenshot": false,
+              "query_context": false
             },
             "properties": {
               "include_screenshot": {
@@ -83,6 +84,10 @@
               },
               "query": {
                 "type": "string"
+              },
+              "query_context": {
+                "default": false,
+                "type": "boolean"
               }
             },
             "required": [],
@@ -1770,6 +1775,10 @@
           },
           "query": {
             "type": "string"
+          },
+          "query_context": {
+            "description": "macOS only. Default false. With a nonblank query, also keep every row\ncollected under each match, not only its ancestors.",
+            "type": "boolean"
           },
           "screenshot_out_file": {
             "type": "string"
