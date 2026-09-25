@@ -2214,6 +2214,121 @@ fn harness_appkit_focus_theft_800ms_raw() {
     run_raw_focus_theft_case(800);
 }
 
+/// The user's own app switch during a lingering focus guard must stick.
+/// The theft cases prove cua undoes activations nobody asked for; this
+/// proves it does not undo the user's. A real HID click (as a person would
+/// make) on the desktop, right after a background cua click,
+/// must leave the app the user switched to in front.
+#[test]
+#[ignore]
+fn harness_appkit_user_switch_during_linger_sticks() {
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    struct CGPoint {
+        x: f64,
+        y: f64,
+    }
+    #[link(name = "CoreGraphics", kind = "framework")]
+    extern "C" {
+        fn CGEventCreateMouseEvent(
+            source: *const std::ffi::c_void,
+            kind: u32,
+            at: CGPoint,
+            button: u32,
+        ) -> *mut std::ffi::c_void;
+        fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+        fn CFRelease(value: *const std::ffi::c_void);
+    }
+    fn real_click(at: CGPoint) {
+        const HID_EVENT_TAP: u32 = 0;
+        for kind in [1u32, 2] {
+            unsafe {
+                let event = CGEventCreateMouseEvent(std::ptr::null(), kind, at, 0);
+                assert!(!event.is_null(), "create HID mouse event");
+                CGEventPost(HID_EVENT_TAP, event);
+                CFRelease(event);
+            }
+            std::thread::sleep(Duration::from_millis(30));
+        }
+    }
+    /// WindowServer's front app via lsappinfo, not a cached AppKit view.
+    fn front_pid() -> Option<u32> {
+        let asn = Command::new("lsappinfo").arg("front").output().ok()?;
+        let asn = String::from_utf8_lossy(&asn.stdout).trim().to_owned();
+        let info = Command::new("lsappinfo")
+            .args(["info", "-only", "pid", &asn])
+            .output()
+            .ok()?;
+        String::from_utf8_lossy(&info.stdout)
+            .rsplit('=')
+            .next()?
+            .trim()
+            .parse()
+            .ok()
+    }
+
+    let mut driver = McpDriver::spawn_macos_daemon_proxy_named("appkit-user-switch-linger")
+        .expect("start macOS daemon proxy");
+    let harness = Harness::launch();
+    let (wid, _) = driver
+        .find_window(harness.pid as i64, "CuaTestHarness AppKit")
+        .expect("find harness window");
+    let sentinel = cua_driver_testkit::sentinel::ForegroundSentinel::launch(&mut driver);
+    std::thread::sleep(Duration::from_millis(500));
+    let user_app = front_pid().expect("front app");
+    assert_ne!(user_app, harness.pid, "the user's app must start in front");
+    eprintln!("user app pid={user_app}, sentinel target={:?}", sentinel.target().pid);
+
+    let snapshot = snapshot_elements(&mut driver, harness.pid, wid);
+    let token = element_token_by_id(&snapshot, "btn-increment");
+    // The harness keeps the target fully covered by the user's app, so a
+    // person switching away clicks an empty patch of desktop, which brings
+    // Finder forward. Find a point no on-screen window covers.
+    let screen = driver.call("get_screen_size", serde_json::json!({}));
+    let (screen_w, screen_h) = (
+        screen.structured()["width"].as_f64().expect("screen width"),
+        screen.structured()["height"].as_f64().expect("screen height"),
+    );
+    let all = driver.call("list_windows", serde_json::json!({}));
+    let covered: Vec<(f64, f64, f64, f64)> = all.structured()["windows"]
+        .as_array()
+        .expect("windows")
+        .iter()
+        .filter(|w| w["is_on_screen"] == true)
+        .map(|w| {
+            let b = &w["bounds"];
+            (b["x"].as_f64().unwrap(), b["y"].as_f64().unwrap(),
+             b["width"].as_f64().unwrap(), b["height"].as_f64().unwrap())
+        })
+        .collect();
+    let title_bar = (1..20)
+        .flat_map(|i| (1..20).map(move |j| (screen_w * i as f64 / 20.0, screen_h * j as f64 / 20.0)))
+        .find(|(x, y)| !covered.iter().any(|(wx, wy, ww, wh)| x >= wx && *x < wx + ww && y >= wy && *y < wy + wh))
+        .map(|(x, y)| CGPoint { x, y })
+        .expect("an uncovered desktop point");
+    let finder = Command::new("pgrep").args(["-x", "Finder"]).output().expect("pgrep Finder");
+    let finder: u32 = String::from_utf8_lossy(&finder.stdout).trim().parse().expect("Finder pid");
+
+    let click = driver.call(
+        "click",
+        serde_json::json!({
+            "pid": harness.pid as i64, "window_id": wid,
+            "element_token": token, "delivery_mode": "background"
+        }),
+    );
+    assert!(!click.is_error(), "background click: {}", click.raw);
+    // Inside the ~1s lingering guard: the user clicks the target app.
+    std::thread::sleep(Duration::from_millis(150));
+    real_click(title_bar);
+    eprintln!("real click at ({:.0}, {:.0})", title_bar.x, title_bar.y);
+    std::thread::sleep(Duration::from_millis(1300));
+    assert_eq!(
+        front_pid(),
+        Some(finder),
+        "the user's switch to Finder was undone by the lingering focus guard"
+    );
+}
+
 macro_rules! focus_theft_tests {
     ($($name:ident: $delay:expr, $targeting:expr;)*) => {$(
         #[test]
