@@ -219,6 +219,31 @@ fn run_native_named_groups(spec: &BrowserSpec) {
                 serde_json::json!({"Billing": fixture.server.text("saved-Billing"), "Profile": fixture.server.text("saved-Profile")}),
                 clicked.action_route()
             );
+            // After the click: these reads replace the snapshot it used.
+            // query_context: a query for the group alone keeps no Save; with
+            // context it keeps the group's own Save and not the sibling's.
+            let saves_under_billing = |driver: &mut McpDriver, context: bool| {
+                let read = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid": fixture.pid, "window_id": fixture.window_id,
+                        "include_screenshot": false, "diff": false,
+                        "query": "Billing", "query_context": context,
+                    }),
+                );
+                assert!(!read.is_error(), "{}", read.raw);
+                read.structured()["elements"]
+                    .as_array()
+                    .expect("elements")
+                    .iter()
+                    .filter(|n| n["role"] == "AXButton" && n["label"] == "Save")
+                    .map(|n| n["element_index"].as_u64().unwrap())
+                    .collect::<Vec<_>>()
+            };
+            assert!(saves_under_billing(&mut fixture.driver, false).is_empty());
+            let billing_saves = saves_under_billing(&mut fixture.driver, true);
+            eprintln!("[native-named-groups] query_context Save={billing_saves:?}");
+            assert_eq!(billing_saves.len(), 1, "context keeps only Billing's Save");
             Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
         });
     }
@@ -5156,11 +5181,21 @@ document.addEventListener('click', e => backgroundClickEvents.push({
                 {
                     break snapshot;
                 }
-                assert!(
-                    Instant::now() < deadline,
-                    "Billing absent: {}",
-                    snapshot.structured()["tree_markdown"]
-                );
+                if Instant::now() >= deadline {
+                    // Show what the window held, not only the empty filter.
+                    let full = fixture.driver.call(
+                        "get_window_state",
+                        serde_json::json!({
+                            "pid":fixture.pid,"window_id":fixture.window_id,
+                            "include_screenshot":false,"diff":false
+                        }),
+                    );
+                    panic!(
+                        "Billing absent: {}\nunfiltered: {}",
+                        snapshot.structured()["tree_markdown"],
+                        full.structured()["tree_markdown"]
+                    );
+                }
                 thread::sleep(Duration::from_millis(100));
             };
             let data = snapshot.structured();
