@@ -222,7 +222,8 @@ fn run_native_named_groups(spec: &BrowserSpec) {
             // After the click: these reads replace the snapshot it used.
             // query_context: a query for the group alone keeps no Save; with
             // context it keeps the group's own Save and not the sibling's.
-            let saves_under_billing = |driver: &mut McpDriver, context: bool| {
+            // Returns (Billing group index, each Save's parent index).
+            let billing_read = |driver: &mut McpDriver, context: bool| {
                 let read = driver.call(
                     "get_window_state",
                     serde_json::json!({
@@ -232,18 +233,26 @@ fn run_native_named_groups(spec: &BrowserSpec) {
                     }),
                 );
                 assert!(!read.is_error(), "{}", read.raw);
-                read.structured()["elements"]
-                    .as_array()
-                    .expect("elements")
+                let data = read.structured();
+                let elements = data["elements"].as_array().expect("elements");
+                let groups: Vec<_> = elements
+                    .iter()
+                    .filter(|n| n["role"] == "AXGroup" && n["label"] == "Billing")
+                    .map(|n| n["element_index"].clone())
+                    .collect();
+                assert_eq!(groups.len(), 1, "one Billing group: {data}");
+                let save_parents: Vec<_> = elements
                     .iter()
                     .filter(|n| n["role"] == "AXButton" && n["label"] == "Save")
-                    .map(|n| n["element_index"].as_u64().unwrap())
-                    .collect::<Vec<_>>()
+                    .map(|n| n["parent_index"].clone())
+                    .collect();
+                (groups[0].clone(), save_parents)
             };
-            assert!(saves_under_billing(&mut fixture.driver, false).is_empty());
-            let billing_saves = saves_under_billing(&mut fixture.driver, true);
-            eprintln!("[native-named-groups] query_context Save={billing_saves:?}");
-            assert_eq!(billing_saves.len(), 1, "context keeps only Billing's Save");
+            let (_, plain) = billing_read(&mut fixture.driver, false);
+            assert!(plain.is_empty(), "no context keeps no Save: {plain:?}");
+            let (billing, save_parents) = billing_read(&mut fixture.driver, true);
+            eprintln!("[native-named-groups] query_context Billing={billing} Save parents={save_parents:?}");
+            assert_eq!(save_parents, vec![billing], "context keeps only Billing's own Save");
             Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
         });
     }
