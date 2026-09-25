@@ -1557,7 +1557,11 @@ pub(crate) fn capture_bounded(
     properties: Map<String, Value>,
     transport: Transport,
 ) {
-    if !is_enabled() {
+    // A test build never creates an identity or posts to the live endpoint.
+    // Unrelated tests (an MCP session start, for one) reach this path, and a
+    // telemetry test may have pointed the home at a temp dir with telemetry
+    // on by default. Telemetry tests build payloads or inject a poster.
+    if cfg!(test) || !is_enabled() {
         return;
     }
     let Some(identity) = get_or_create_install_id() else {
@@ -2636,6 +2640,12 @@ mod tests {
     use std::time::Instant;
 
     static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Serializes tests that change process env or the telemetry home. A
+    /// panic in one of them must fail that test only, not poison the rest.
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
     const TEST_CHILD_KIND: &str = "CUA_DRIVER_TELEMETRY_TEST_CHILD_KIND";
     const TEST_CHILD_ROOT: &str = "CUA_DRIVER_TELEMETRY_TEST_CHILD_ROOT";
     const TEST_CHILD_INDEX: &str = "CUA_DRIVER_TELEMETRY_TEST_CHILD_INDEX";
@@ -2771,7 +2781,7 @@ mod tests {
 
     #[test]
     fn installation_identity_creation_is_atomic_across_processes() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|root| {
             const CHILDREN: usize = 8;
             let mut children: Vec<_> = (0..CHILDREN)
@@ -2807,7 +2817,7 @@ mod tests {
 
     #[test]
     fn lifecycle_registration_is_single_writer_and_non_blocking_across_processes() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|root| {
             let mut winner = spawn_test_child("lifecycle-winner", root, 0);
             assert!(wait_for_path(
@@ -2882,7 +2892,7 @@ mod tests {
 
     #[test]
     fn precedence_is_environment_then_persisted_then_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|_| {
             assert_eq!(effective_enabled(), (true, "default"));
             set_enabled(false).unwrap();
@@ -2899,7 +2909,7 @@ mod tests {
 
     #[test]
     fn persisted_install_channel_prevents_first_run_attribution_race() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|root| {
             let home = root.join(HOME_SUBDIRECTORY);
             std::fs::create_dir_all(&home).unwrap();
@@ -2925,7 +2935,7 @@ mod tests {
 
     #[test]
     fn disabled_install_makes_no_request_or_marker_and_keeps_existing_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|root| {
             let home = root.join(HOME_SUBDIRECTORY);
             std::fs::create_dir_all(&home).unwrap();
@@ -2952,7 +2962,7 @@ mod tests {
 
     #[test]
     fn disabled_permissions_events_do_not_create_an_installation_id() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|_| {
             set_enabled(false).unwrap();
             capture_permissions_gate_started(true, false);
@@ -2982,7 +2992,7 @@ mod tests {
 
     #[test]
     fn lifecycle_markers_are_written_only_after_each_2xx() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|root| {
             let home = root.join(HOME_SUBDIRECTORY);
             let mut calls = 0;
@@ -3009,7 +3019,7 @@ mod tests {
 
     #[test]
     fn failed_lifecycle_delivery_defers_retries_without_marking_success() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|root| {
             let home = root.join(HOME_SUBDIRECTORY);
             let mut calls = 0;
@@ -3034,7 +3044,7 @@ mod tests {
 
     #[test]
     fn reset_erases_identity_and_markers_but_preserves_preference() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|root| {
             set_enabled(false).unwrap();
             let home = root.join(HOME_SUBDIRECTORY);
@@ -3054,7 +3064,7 @@ mod tests {
 
     #[test]
     fn reset_erases_legacy_identity_before_migration_can_restore_it() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let root =
             std::env::temp_dir().join(format!("cua-telemetry-reset-{}", uuid::Uuid::new_v4()));
         let current = root.join(HOME_SUBDIRECTORY);
@@ -3073,7 +3083,7 @@ mod tests {
 
     #[test]
     fn v3_payload_allows_server_geoip_without_sending_an_ip_or_client_timestamp() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let identity = InstallationIdentity {
             id: "test-id".into(),
             persisted: true,
@@ -3141,7 +3151,7 @@ mod tests {
 
     #[test]
     fn synthetic_marker_is_explicit_and_common_to_all_events() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let original = std::env::var_os(ENV_TELEMETRY_SYNTHETIC);
         unsafe {
             std::env::set_var(ENV_TELEMETRY_SYNTHETIC, "true");
@@ -3304,7 +3314,7 @@ mod tests {
 
     #[test]
     fn execution_mode_requires_the_exact_embedded_sentinel() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let name = cua_driver_core::EMBEDDED_ENV;
         let original = std::env::var_os(name);
         unsafe {
@@ -3688,7 +3698,7 @@ mod tests {
             SessionDeclaration, SessionObserver, SessionStartObservation, SessionTransport,
         };
 
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|_| {
             set_enabled(false).unwrap();
             let session_id = "private-disabled-session-telemetry-test";
@@ -3830,7 +3840,7 @@ mod tests {
 
     #[test]
     fn process_session_id_is_stable_and_not_written_to_disk() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         with_isolated_home(|root| {
             assert_eq!(process_session_id(), process_session_id());
             let on_disk = std::fs::read_dir(root.join(HOME_SUBDIRECTORY))
@@ -3845,7 +3855,7 @@ mod tests {
 
     #[test]
     fn release_version_is_bounded_and_safe_for_payloads_and_marker_paths() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         let previous = std::env::var_os(ENV_RELEASE_VERSION);
         unsafe {
             std::env::set_var(
@@ -3893,7 +3903,7 @@ mod tests {
 
     #[test]
     fn pending_send_flush_waits_for_bounded_delivery() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = env_lock();
         assert_eq!(PENDING_SENDS.load(Ordering::SeqCst), 0);
         PENDING_SENDS.fetch_add(1, Ordering::SeqCst);
         std::thread::spawn(|| {
