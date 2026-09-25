@@ -283,15 +283,16 @@ impl Tool for TypeTextTool {
             };
         // Preparing an unfocused native field (an AXFocused write on the exact
         // addressed element) is an exact-window mutation like set_value's, not
-        // a keyboard rung. Authorize it through the same lease re-gate, so a
-        // competing sibling window that makes typing semantic-only still gets
-        // its field editor installed before the AX write.
+        // a keyboard rung. The WindowPointer gate proves a visible exact target
+        // without the same-pid keyboard ambiguity check, so a competing sibling
+        // window that makes typing semantic-only still gets its field editor
+        // installed before the AX write; keyboard fallback stays refused.
         let prepare_native_text = match (_mutation_lease.as_ref(), element_guard.as_ref(), window_id) {
             (Some(lease), Some((guard, _)), Some(wid)) => lease
                 .gate_again(
                     wid,
                     Some(guard.as_ptr() as usize),
-                    cua_driver_core::background_input::BackgroundAction::InsertText,
+                    cua_driver_core::background_input::BackgroundAction::WindowPointer,
                 )
                 .await
                 .is_ok(),
