@@ -5344,6 +5344,8 @@ mod capability_tests {
         "recording.state",
         "recording.replay",
         "recording.install_dependency",
+        // bounded action composites
+        "sequence.run",
         "extension.install",
         "visual.regions.parse",
         // page
