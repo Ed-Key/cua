@@ -210,6 +210,13 @@ pub struct TelemetryStatus {
 }
 
 pub fn is_enabled() -> bool {
+    // In a test build every telemetry entry point is off unless this test
+    // thread opted in with an isolated home, so no test reads the real
+    // config or home. Opted-in threads run the real precedence rules.
+    #[cfg(test)]
+    if TEST_CAPTURES.with(|captures| captures.borrow().is_none()) {
+        return false;
+    }
     effective_enabled().0
 }
 
@@ -1557,14 +1564,9 @@ pub(crate) fn capture_bounded(
     properties: Map<String, Value>,
     transport: Transport,
 ) {
-    // A test build never posts to the live endpoint. Only a telemetry test
-    // that opted in on its own thread (with an isolated home) runs this
-    // path, and its payload lands in an in-memory sink. Unrelated tests (an
-    // MCP session start, for one) return here, before identity or network.
-    #[cfg(test)]
-    if TEST_CAPTURES.with(|captures| captures.borrow().is_none()) {
-        return;
-    }
+    // In a test build is_enabled() is false unless this thread opted in
+    // (with an isolated home), and the payload lands in an in-memory sink,
+    // never the live endpoint.
     if !is_enabled() {
         return;
     }
@@ -2836,6 +2838,8 @@ mod tests {
         }
         let root = PathBuf::from(std::env::var_os(TEST_CHILD_ROOT).expect("test child root"));
         let index = std::env::var(TEST_CHILD_INDEX).expect("test child index");
+        // The parent runs this child inside its isolated home; opt in here.
+        let _capture = CaptureOn::new();
         let mut call = 0usize;
         capture_install_with_poster(|payload| {
             call += 1;
