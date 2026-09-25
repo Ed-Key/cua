@@ -5273,10 +5273,6 @@ standalone_browser_test!(
     run_native_background_first_click
 );
 
-#[cfg(target_os = "macos")]
-#[path = "support/macos_electron_scroll.rs"]
-mod macos_electron_scroll;
-
 /// A ready renderer must be represented in the first native observation.
 /// No launch flag, AX polling helper or semantic-browser snapshot may prime it.
 #[cfg(target_os = "macos")]
