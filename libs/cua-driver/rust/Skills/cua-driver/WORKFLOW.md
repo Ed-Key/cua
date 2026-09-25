@@ -43,7 +43,14 @@ Actions return without waiting to see whether a window opens. On macOS, the firs
 
 Prefer `structuredContent.elements` in MCP (the CLI prints structured fields directly) over parsing `tree_markdown`. Rows may contain `element_token`, role, label, value, actions, parent, depth, enabled/selected state, `frame` (screen coordinates, the space of `scope:"desktop"` actions), and `screenshot_frame` (pixels of the screenshot in the same response, the space of window-local pointer `x`/`y`). Missing fields are unknown.
 
-- Use `query` to project matching rows plus ancestors without renumbering their indices.
+On macOS a row can also carry:
+
+- `placeholder`: the hint an empty field shows. It is never the field's content; an empty text field reports `value:""`.
+- `value_settable`: whether the field reports its value writable. `false` means `set_value` will be refused; use typing or another route.
+- `focused` and `text_selection`: the focused text control, with its caret or selection as a UTF-16 `range` (`location`, `length`) and the selected `text`. The outline marks that row `focused selection_utf16=location:length`. Password fields are never read.
+- `url`: a link's destination, kept apart from its label.
+
+- Use `query` to project matching rows plus their real ancestors without renumbering their indices. On macOS, add `query_context:true` to also keep everything under each match (a message heading with its body and links), without sibling branches. A query locates; it does not prove absence.
 - Use `max_elements` / `max_depth` to bound the walk, and compare returned/total counts. Truncation does not prove absence.
 - Use `include_screenshot:false` only when tree-only observation is enough; it cannot ground a pixel action.
 - Where advertised, `include_accessibility_tree:false` requests capture without a tree walk. Check the installed schema first.
@@ -110,7 +117,40 @@ For an expressible exact-window postcondition, use `verify_state` with bounded p
 cua-driver verify_state '{"pid":844,"window_id":10725,"expect":[{"element":{"selector":{"label_contains":"Saved"},"exists":true}}],"include_screenshot":true,"session":"run-1"}'
 ```
 
+To check a caret or selection on the focused native text control, use an element predicate with `text_selection` (`location`, `length`, optional exact `text`, UTF-16 units). Web and Electron selections stay `unknown`.
+
 This example proves a matching trusted element exists, not that every application has a meaningful “Saved” indicator. Choose predicates that establish this task. Use fresh `get_window_state` for outcomes the predicate language cannot express, and fresh `get_desktop_state` for desktop proof. `verify_state` remains an exact-window tool; a previous desktop action does not disable it.
+
+### Verified sequences on one window
+
+When `run_sequence` is advertised, it runs one to eight `click` or `type_text` steps on one exact `(pid, window_id)` in the background, checking each step's `expect` predicates (the `verify_state` language) before the next. Start from a fresh snapshot. A click step takes an `element_token` or `x` and `y`; a typing step takes only `text` and writes into the already focused field.
+
+```json
+{
+  "pid": 844,
+  "window_id": 10725,
+  "steps": [
+    {
+      "tool": "type_text",
+      "arguments": {"text": "Draft title"},
+      "expect": [{"element": {
+        "selector": {"role": "AXTextField", "label_contains": "Title"},
+        "value_equals": "Draft title"
+      }}]
+    },
+    {
+      "tool": "click",
+      "arguments": {"element_token": "s0000002a:4"},
+      "expect": [{"element": {
+        "selector": {"role": "AXStaticText", "label_contains": "Status"},
+        "value_equals": "Status: Ready"
+      }}]
+    }
+  ]
+}
+```
+
+Batch only targets you have already observed. If a step replaces the controls or a later target must be discovered, end the batch there and reobserve. Read `status`, `stopped_at` and `stop_reason`: an unknown, unsatisfied, refused or partial step stops the sequence, earlier steps stay applied, and nothing is retried or rolled back. Reobserve before deciding what remains rather than replaying the whole sequence.
 
 Action facts are not task outcomes:
 

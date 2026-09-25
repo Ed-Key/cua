@@ -16,7 +16,7 @@ This reference describes the **macOS** native tool registry.
 Other platforms: [Linux MCP tools](/reference/cua-driver/mcp-tools-linux), [Windows MCP tools](/reference/cua-driver/mcp-tools-windows).
 See [MCP tool notes](/reference/cua-driver/mcp-tool-notes) for shared guidance.
 
-`cua-driver` exposes 58 MCP tools through a single stdio server (`cua-driver mcp`). Every tool is also callable from the shell as `cua-driver <name> '<JSON-args>'`.
+`cua-driver` exposes 60 MCP tools through a single stdio server (`cua-driver mcp`). Every tool is also callable from the shell as `cua-driver <name> '<JSON-args>'`.
 
 Tool names are `snake_case`. Responses are MCP `CallTool.Result` envelopes: a text content block prefixed with a `✅` summary (or the error reason on failure), plus optional image or structured-content blocks on tools that produce them. See the [CLI reference](/reference/cua-driver/cli-reference) for CLI-specific options like `--socket` and `--screenshot-out-file`.
 
@@ -63,7 +63,7 @@ Per-record fields: window_id, pid, app_name, title, bounds (x/y/width/height, to
 
 Walk a running app's AX tree and return BOTH a structured `elements` array (preferred) AND a Markdown rendering of the same tree (back-compat). Every actionable element is tagged with [element_index N] in the markdown and as `element_index` in the structured array — pass those indices to click, type_text, press_key, etc.
 
-INVARIANT: call get_window_state once per turn per (pid, window_id) before any element-indexed action. The index map is replaced by the next snapshot.
+INVARIANT: call get_window_state once per turn per (pid, window_id) before any element-indexed action. On macOS a row keeps its element_index across looks at the same window and a vanished row's number is never reused, so after the first look the response is a change-only diff by default (see `diff`); each look still mints a new snapshot_id, so pair an unchanged row's element_index with the latest snapshot_id.
 
 PREFERRED CONSUMERS read `structuredContent.elements` (one entry per indexed row with `element_index`, `role`, `label`, `value` (the element's text/AXValue when present — use it to verify what a field holds), `actions` (names of AX actions exposed by the element, omitted when empty), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown `tree_markdown` stays available and unchanged in shape for existing text-parsing callers — but new fields will only be added to the structured side.
 
@@ -73,13 +73,14 @@ The mirror image: pass `include_accessibility_tree:false` to SKIP the AX walk en
 
 The snapshot is SCOPED to `window_id`: a window_id that no longer exists is refused with `window_id_not_found`, and one owned by another process is refused with `window_owner_pid_mismatch` naming the real `owner_pid` to retry with (macOS hosts a sandboxed app's Open/Save panel out-of-process, so its window belongs to the panel service, not the app). If the window is live under this pid but its accessibility surface can't be resolved, the tree comes back EMPTY with `degraded_reason: ax_window_unresolved` and the screenshot of the requested window; background input is refused until it resolves, so re-snapshot or act with `delivery_mode:"foreground"`. A window on another Space still resolves by its exact CGWindowID. This tool never returns another surface's elements under your window_id. Before exposing a screenshot, its raw dimensions are validated as a coherent 1x/2x representation of the requested WindowServer bounds. `px_frame_mismatch` or `px_capture_unavailable` omits an unprovable screenshot/pixel frame instead of guessing a transform; the truthful AX payload remains available.
 
-Optional `query` projects both tree_markdown and structured `elements` to matching lines plus their ancestor chain (case-insensitive substring). The element_index values are unchanged, the complete snapshot remains actionable, and `element_count` continues to report its total size; `filtered_element_count` reports the projected response size.
+Optional `query` projects both tree_markdown and structured `elements` to matching lines plus their ancestor chain (case-insensitive substring). The element_index values are unchanged, the complete snapshot remains actionable, and `element_count` continues to report its total size; `filtered_element_count` reports the projected response size. Ancestors come from the real AX hierarchy, not indentation. With `query_context:true` each match also keeps everything collected under it (for example a message heading with its body text and links), still without sibling branches.
 
 Optional `max_elements` / `max_depth` bound the AX walk to mitigate context-window blow-up on Electron / Obsidian / large web apps that produce 10k+ element trees. When applied, BOTH the markdown and the structured elements are truncated identically. Omit both for current default behaviour (≤2 000 elements, depth ≤25).
 
 **Arguments:**
 
 - `capture_mode` (string, optional): DEPRECATED and ignored. get_window_state always returns BOTH the element tree and a screenshot — ground on both. The modality is chosen at action time by how you address the target: an element ax action (element_index/element_token) or an element px action (x,y). Any value (including the old "som"/"screenshot" aliases) is accepted but has no effect.
+- `diff` (boolean, optional): Default true. After the first look at a window, return only rows added, changed, or removed since this session's previous look (display-only text included); unchanged rows keep their element_index. The full outline is still sent for the first look, when it would be shorter, when a query is set, or when the previous look used different max_elements/max_depth. Pass false to force the full outline. macOS only.
 - `include_accessibility_tree` (boolean, optional): Default true — walk the AX tree and return `elements` + `tree_markdown` alongside the screenshot. Set false to SKIP the AX walk entirely (the expensive part, bounded by timeout_ms) and return just the screenshot plus window metadata (bounds, scale, app_name, window_title) — the capture-only path for rendering a live window preview / picture-in-picture. Mirrors include_screenshot. Setting BOTH include_accessibility_tree:false AND include_screenshot:false is an error (nothing to return).
 - `include_screenshot` (boolean, optional): Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return the tree only (the cheap path when you're just re-indexing before an element ax action; saves the image tokens + screen-grab latency). screenshot_out_file still forces a capture to disk.
 - `max_depth` (integer, optional): Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (25). Lower this for deep menu/Electron trees. range: 1–unbounded
@@ -87,7 +88,8 @@ Optional `max_elements` / `max_depth` bound the AX walk to mitigate context-wind
 - `max_elements` (integer, optional): Cap on the total number of AX nodes walked. Truncates depth-first; markdown and structured elements truncate together. Omit for the default (2 000). Lower this for Electron / Obsidian / large web apps that produce 10k+ element trees and blow context windows. range: 1–unbounded
 - `max_image_dimension` (integer, optional): Per-call override for the returned screenshot's long edge in pixels. An explicit value wins over the session/global setting; 0 returns native resolution. Omit to preserve configured behavior. range: 0–unbounded
 - `pid` (integer, required): Target process ID.
-- `query` (string, optional): Case-insensitive filter for tree_markdown and structured elements. Returns matching actionable rows plus their actionable ancestors without renumbering element_index values.
+- `query` (string, optional): Case-insensitive filter for tree_markdown and structured elements. Returns matching rows plus their ancestors without renumbering element_index values.
+- `query_context` (boolean, optional): Default false. With a nonblank query, also keep every row collected under each match (display text included), not only its ancestors. Uses the same walk; no extra reads.
 - `screenshot_out_file` (string, optional): When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead.
 - `session` (string, optional): For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
 - `timeout_ms` (integer, optional): Wall-clock budget in milliseconds for the accessibility-tree walk (default 1000, min 100, max 120000). Bounds the WHOLE walk. When the budget runs out the tool returns the PARTIAL tree it has, flagged with `truncated: true`, `truncation_reason`, `nodes_visited`, `nodes_pending` and `elements_complete: false`; retry with a larger value (e.g. 5000) or narrow with `query` / `max_depth`. default: `1000`; range: 100–120000
@@ -236,7 +238,7 @@ Click against a target pid. **Prefer `element_token` over pixel coordinates** �
 
 Two addressing modes:
 
-- element_token, or element_index + snapshot_id (from get_window_state): AX action path. Works on backgrounded/hidden windows. No cursor move, no focus steal. The snapshot cache is scoped per (pid, window_id) and is replaced by the next snapshot of the same window — re-snapshot every turn before clicking.
+- element_token, or element_index + snapshot_id (from get_window_state): AX action path. Works on backgrounded/hidden windows without moving the real mouse pointer or stealing focus. The visible agent cursor follows the configured motion policy automatically. The snapshot cache is scoped per (pid, window_id) and is replaced by the next snapshot of the same window — re-snapshot every turn before clicking.
 
 - x, y (window-local screenshot pixels, top-left origin of the PNG returned by get_window_state): CGEvent path. Synthesizes mouse events and posts to pid. Use modifier for cmd/shift/option/ctrl. Needs a visible on-screen window to anchor the conversion.
 
@@ -364,7 +366,7 @@ Insert text into the target pid via `AXSetAttribute(kAXSelectedText)`. Works for
 
 Optional `element_index` + `window_id` (from the last `get_window_state` snapshot) directs the write to a specific field. Without `element_index`, the write goes to the pid's currently focused element.
 
-WEB CONTENT (Chromium/WebKit/Electron — browser tabs, Slack, VS Code, X's compose box): AXValue is not independent proof that the renderer/DOM observed an AX write or synthesized keystrokes. The driver detects this at the element level (an AXWebArea ancestor) and refuses to trust AXValue-only read-back there. Electron AX targets that are web content or cannot be proven native refuse background delivery before mutation because the AX route cannot establish exact renderer focus; use the px form or explicit foreground delivery. Other web-content paths return effect:"unverifiable" + escalation, never a false "confirmed" (a browser's own native address bar/toolbar stays trusted). For a browser TAB the reliable path is the `page` tool (drives the DOM via CDP); for an embedded web view use this tool's px form: pass x,y (no element_index) to pixel-click the field then type, in one call. NOTE: a px focus-click won't reliably open+focus a CLOSED control; AX-press to open/activate it first (works in the background), then px-type. Always confirm via the screenshot; if px-background still drops, escalate to delivery_mode:"foreground".
+WEB CONTENT (Chromium/WebKit/Electron — browser tabs, Slack, VS Code, X's compose box): AXValue is not independent proof that the renderer/DOM observed an AX write or synthesized keystrokes. The driver detects this at the element level (an AXWebArea ancestor) and refuses to trust AXValue-only read-back there. Electron AX targets that are web content or cannot be proven native refuse background delivery before mutation because the AX route cannot establish exact renderer focus; use the px form or explicit foreground delivery. Other web-content paths return effect:"unverifiable" + escalation, never a false "confirmed" (a browser's own native address bar/toolbar stays trusted). For a browser TAB the reliable path is the `page` tool (drives the DOM via CDP); for an embedded web view use this tool's px form: pass x,y (no element_index) to pixel-click the field then type, in one call. NOTE: a px focus-click won't reliably open+focus a CLOSED control; AX-press to open/activate it first (works in the background), then px-type. After an unverifiable result, read the current target state before typing again: the text may already be present and repeating it can duplicate the edit. Request a screenshot when accessibility cannot establish the result; the typing response contains no screenshot. Foreground delivery requires explicit authorization.
 
 **Arguments:**
 
@@ -488,6 +490,8 @@ Scroll the target pid. Two paths, picked by how you address the scroll:
 • **Keystroke path (focused region)** — when you pass NO target (just pid + direction): synthesizes PageDown/PageUp (by='page') or Down/Up arrows (by='line'); horizontal uses Left/Right arrows. Drives the focused / page scroller only.
 
 Mapping: by='page' → larger step; by='line' → smaller step; amount = number of wheel notches (targeted path) or keystroke repetitions (keystroke path).
+
+On macOS Electron, background element scrolling reads the current element rectangle and sends wheel events without AXScrollToVisible or keyboard focus. The rectangle must be usable and contained in the exact window; clipped, offscreen or placeholder targets are refused. Use fresh screenshot coordinates when the element cannot provide that geometry. Untargeted background keyboard scrolling remains unavailable. Delivery does not prove that content moved; verify the resulting state.
 
 **Arguments:**
 
@@ -1068,6 +1072,43 @@ Deprecated compatibility alias that reads a live legacy session's capture policy
 
 - `session` (string, optional): Optional public label. When omitted, inspect the caller's attached
 implicit session.
+
+### `run_sequence`
+
+Run one to eight ordered click/type_text actions against one exact window with background delivery. Each action is followed by the existing verify_state predicates; continue only when satisfied and stable. Stop on unknown, unsatisfied, action refusal, partial delivery or error. Unattempted steps are omitted. No retries, rollback or screenshots. This is not a transaction; a satisfied postcondition does not prove causation. Typed and existing verification request-validation errors reject the whole request before any child. Predicate shapes the verifier classifies unknown remain normal stopped outcomes.
+
+**Arguments:**
+
+- `pid` (integer, required): range: 1–unbounded
+- `session` (string, optional): For multi-call work, prefer a short public session label and repeat it on every call that
+accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+- `steps` (array of object, required): items: 1–8
+- `window_id` (integer, required): range: 1–unbounded
+
+```json
+{"pid":844,"steps":["example"],"window_id":10725}
+```
+
+### `act_and_read`
+
+macOS: run one token-targeted background click, set_value or scroll, then read the same window's fresh accessibility state. Use when you already intend to act and inspect. Scroll requires direction, accepts optional by and amount, and uses the existing scroll tool defaults. Tree-only by default; observe selects query/context and optional screenshot. Returns both child results separately, including action errors. No retries or semantic verification: a fresh read does not prove the action succeeded. Not a transaction against other clients or user input. Windows and Linux are not yet supported.
+
+**Arguments:**
+
+- `action` (string, required)
+- `amount` (integer, optional): Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3. range: 1–50
+- `by` (string, optional): Scroll only. Omit to retain the scroll tool's line default.
+- `direction` (string, optional): Required only for scroll. Uses the existing background scroll route.
+- `element_token` (string, required)
+- `observe` (object, optional): default: `{"include_screenshot":false,"query_context":false}`
+- `pid` (integer, required): range: 1–2147483647
+- `session` (string, optional)
+- `value` (string, optional)
+- `window_id` (integer, required): range: 1–4294967295
+
+```json
+{"action":"click","element_token":"example","pid":844,"window_id":10725}
+```
 
 ### `install_extension`
 
