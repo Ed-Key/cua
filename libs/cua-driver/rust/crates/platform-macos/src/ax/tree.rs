@@ -760,12 +760,47 @@ pub(crate) fn render_lines(lines: &[(usize, String)]) -> String {
 }
 
 /// Filter the tree markdown to lines matching `query` plus their ancestor chain.
-/// Undo the JSON escapes used when rendering values, for matching only.
+/// Decode the JSON string token at the start of `s` (as rendered for values
+/// and placeholders). Returns the text and the rest after the token.
+pub(crate) fn decode_json_token(s: &str) -> Option<(String, &str)> {
+    if !s.starts_with('"') {
+        return None;
+    }
+    let mut escaped = false;
+    let end = s[1..].char_indices().find_map(|(i, c)| {
+        let close = !escaped && c == '"';
+        escaped = !escaped && c == '\\';
+        close.then_some(i + 1)
+    })?;
+    let text = serde_json::from_str::<String>(&s[..=end]).ok()?;
+    Some((text, &s[end + 1..]))
+}
+
+/// A rendered line with its value and placeholder tokens JSON-decoded and
+/// titles left as they are, for matching only.
 fn unescape_rendered(line: &str) -> String {
-    line.replace("\\\"", "\"")
-        .replace("\\n", "\n")
-        .replace("\\t", "\t")
-        .replace("\\\\", "\\")
+    let mut out = String::new();
+    let mut rest = line;
+    while let Some(at) = ["= \"", "[placeholder=\""]
+        .iter()
+        .filter_map(|marker| rest.find(marker).map(|i| (i, marker.len() - 1)))
+        .min()
+    {
+        let (start, prefix) = at;
+        out.push_str(&rest[..start + prefix]);
+        match decode_json_token(&rest[start + prefix..]) {
+            Some((text, after)) => {
+                out.push_str(&text);
+                rest = after;
+            }
+            None => {
+                out.push_str(&rest[start + prefix..]);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 fn filter_tree(markdown: &str, query: &str) -> String {
@@ -831,6 +866,13 @@ fn leading_indent_depth(line: &str) -> usize {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn query_decoding_keeps_backslash_sequences_intact() {
+        let line = format!("- AXTextField = {}", serde_json::json!(r"C:\new"));
+        assert_eq!(unescape_rendered(&line), r"- AXTextField = C:\new");
+        assert!(filter_tree(&format!("{line}\n"), r"C:\new").contains("AXTextField"));
+    }
+
     #[test]
     fn query_matches_values_with_rendered_escapes() {
         let tree = "- AXWindow \"W\"\n  - AXStaticText = \"Say \\\"hello\\\"\"\n";

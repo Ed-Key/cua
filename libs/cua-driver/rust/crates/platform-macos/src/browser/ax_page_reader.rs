@@ -131,7 +131,7 @@ fn parse_ax_line(line: &str) -> Option<AXElement> {
     if let Some(after_eq) = pos.strip_prefix("= ") {
         let p = after_eq.trim_start();
         if p.starts_with('"') {
-            let (v, remaining) = parse_quoted_string(p);
+            let (v, remaining) = parse_json_string(p);
             value = v;
             pos = remaining.trim_start();
         } else {
@@ -140,7 +140,7 @@ fn parse_ax_line(line: &str) -> Option<AXElement> {
     } else if let Some(after_eq) = pos.strip_prefix('=') {
         let p = after_eq.trim_start();
         if p.starts_with('"') {
-            let (v, remaining) = parse_quoted_string(p);
+            let (v, remaining) = parse_json_string(p);
             value = v;
             pos = remaining.trim_start();
         } else {
@@ -151,7 +151,7 @@ fn parse_ax_line(line: &str) -> Option<AXElement> {
     // The placeholder hint, if any, sits between the value and the
     // description: `[placeholder="..."]`. It is not content; skip it.
     if let Some(after) = pos.strip_prefix("[placeholder=") {
-        let (_, remaining) = parse_quoted_string(after.trim_start());
+        let (_, remaining) = parse_json_string(after.trim_start());
         pos = remaining.trim_start().strip_prefix(']').unwrap_or(remaining).trim_start();
     }
 
@@ -171,24 +171,17 @@ fn parse_ax_line(line: &str) -> Option<AXElement> {
     })
 }
 
-/// Parse a double-quoted string starting at the beginning of `s`.
-/// Returns (content, remainder_after_closing_quote). Values are rendered as
-/// JSON strings, so a JSON-decodable token is decoded exactly (`\t` is a
-/// tab, not `t`); anything else falls back to dropping backslashes.
+/// Values and placeholders render as JSON strings: decode them exactly (a
+/// tab stays a tab). Falls back to the raw rule if a token does not decode.
+fn parse_json_string(s: &str) -> (String, &str) {
+    crate::ax::tree::decode_json_token(s).unwrap_or_else(|| parse_quoted_string(s))
+}
+
+/// Parse a double-quoted string starting at the beginning of `s` as raw text
+/// (titles are not JSON-escaped). Returns (content, remainder).
 fn parse_quoted_string(s: &str) -> (String, &str) {
     if !s.starts_with('"') {
         return (String::new(), s);
-    }
-    let mut escaped = false;
-    let end = s[1..].char_indices().find_map(|(i, c)| {
-        let close = !escaped && c == '"';
-        escaped = !escaped && c == '\\';
-        close.then_some(i + 1)
-    });
-    if let Some(end) = end {
-        if let Ok(decoded) = serde_json::from_str::<String>(&s[..=end]) {
-            return (decoded, &s[end + 1..]);
-        }
     }
     let s = &s[1..]; // skip opening quote
     let mut result = String::new();
@@ -244,6 +237,13 @@ fn css_selector_to_ax_roles(selector: &str) -> Vec<&'static str> {
 #[cfg(test)]
 mod rendered_value_tests {
     use super::*;
+
+    #[test]
+    fn titles_stay_raw_while_values_decode() {
+        let el = parse_ax_line(r#"- [1] AXButton "Release \u0041" = "C:\\new""#).expect("row");
+        assert_eq!(el.title, r"Release u0041", "raw title rule (backslashes dropped as before)");
+        assert_eq!(el.value, r"C:\new");
+    }
 
     #[test]
     fn json_escaped_values_decode_and_placeholders_do_not_hide_descriptions() {
