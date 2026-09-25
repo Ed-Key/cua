@@ -2317,7 +2317,9 @@ impl BrowserEngine {
                 result.extend(frame_document);
             }
         }
-        result.title = title;
+        // The snapshot title when it is provably this root document's; else
+        // the main frame's accessibility root name. Never the tab's cached one.
+        result.title = title.or_else(|| result.document_title().map(str::to_owned));
         Ok(result)
     }
 
@@ -2629,8 +2631,10 @@ impl BrowserEngine {
             .collect_semantic_session(&conn, &cdp_session, &document, local_tree.as_ref(), None)
             .await?;
         semantic.complete &= document_complete;
-        // A missing current title must not revive an earlier document's title.
-        let title = semantic.document_title().unwrap_or_default().to_owned();
+        // The title collected with this document. An unprovable title marks
+        // the snapshot incomplete below; it never revives the tab's cached
+        // title from an earlier document.
+        let title = semantic.title.clone().unwrap_or_default();
 
         let oopif = if local_tree.is_some() {
             match self.attached_iframe_children(&conn, &cdp_session).await {

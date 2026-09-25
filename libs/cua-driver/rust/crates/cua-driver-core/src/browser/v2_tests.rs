@@ -42,6 +42,16 @@ use super::types::{
 /// Mutable knobs + a call log, shared between the mock handler and the
 /// test body. Tests flip loaders/capabilities mid-run to simulate
 /// navigations, frame removal, and capability regression.
+/// A page has one document.title, published both in the DOM snapshot and as
+/// the main accessibility root's name. None makes it unavailable in both.
+fn set_page_title(st: &mut FixtureState, title: Option<&str>) {
+    st.omit_snapshot_title = title.is_none();
+    st.semantic_title = title.map(str::to_owned);
+    if let Some(title) = title {
+        st.main_title = title.to_owned();
+    }
+}
+
 #[derive(Debug)]
 struct FixtureState {
     oopif_supported: bool,
@@ -88,7 +98,7 @@ impl Default for FixtureState {
             fail_key_down_after: None,
             completed_key_pairs: 0,
             semantic_large_page: false,
-            semantic_title: Some("Fixture inbox".into()),
+            semantic_title: Some("Current fixture title".into()),
             semantic_main_root_present: true,
             semantic_full_dom_fails: false,
             semantic_full_dom_times_out: false,
@@ -380,6 +390,13 @@ fn large_semantic_ax_tree(frame_id: &str) -> Value {
     json!({"nodes": nodes})
 }
 
+/// The document as DOM.getDocument reports it: the fixture's current URL, so
+/// the layout snapshot describes the same root document.
+fn with_url(mut document: Value, url: &str) -> Value {
+    document["root"]["documentURL"] = json!(url);
+    document
+}
+
 fn semantic_layout_snapshot(
     backends: &[i64],
     bounds: &[[f64; 4]],
@@ -559,11 +576,16 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     semantic_layout_snapshot(
                         &backends,
                         &bounds,
-                        &large_semantic_document(),
+                        &with_url(large_semantic_document(), &st.main_url),
                         &st.main_title,
                     )
                 } else {
-                    semantic_layout_snapshot(&[], &[], &main_document(), &st.main_title)
+                    semantic_layout_snapshot(
+                        &[],
+                        &[],
+                        &with_url(main_document(), &st.main_url),
+                        &st.main_title,
+                    )
                 };
                 if st.omit_snapshot_title {
                     snapshot["documents"][0]
@@ -1502,14 +1524,14 @@ async fn semantic_snapshot_refreshes_bind_time_title_from_main_document() {
     let snap = semantic_snapshot(&f, &target, &tab).await;
 
     assert_eq!(snap["status"], "ok", "{snap}");
-    assert_eq!(snap["page"]["title"], "Fixture inbox", "{snap}");
+    assert_eq!(snap["page"]["title"], "Current fixture title", "{snap}");
 }
 
 #[tokio::test]
 async fn semantic_page_title_tracks_navigation_and_continuations() {
     let f = fixture_with(|st| {
         st.semantic_large_page = true;
-        st.semantic_title = Some("First page".into());
+        set_page_title(st, Some("First page"));
     })
     .await;
     let (target, tab) = bind(&f).await;
@@ -1527,7 +1549,7 @@ async fn semantic_page_title_tracks_navigation_and_continuations() {
         let mut state = f.state.lock().unwrap();
         state.main_url = destination.into();
         state.main_loader = "L_MAIN_2".into();
-        state.semantic_title = Some("Second page".into());
+        set_page_title(&mut state, Some("Second page"));
     }
     let second = semantic_snapshot(&f, &target, &tab).await;
     assert_eq!(second["page"]["url"], destination);
@@ -1545,8 +1567,8 @@ async fn semantic_page_title_clears_previous_title_when_empty_or_unavailable() {
         let f = fixture_with(|st| st.semantic_large_page = true).await;
         let (target, tab) = bind(&f).await;
         let first = semantic_snapshot(&f, &target, &tab).await;
-        assert_eq!(first["page"]["title"], "Fixture inbox");
-        f.state.lock().unwrap().semantic_title = next_title;
+        assert_eq!(first["page"]["title"], "Current fixture title");
+        set_page_title(&mut f.state.lock().unwrap(), next_title.as_deref());
         let fresh = semantic_snapshot(&f, &target, &tab).await;
         assert_eq!(fresh["page"]["title"], "");
         let token = fresh["snapshot"]["continuation"].as_str().unwrap();
@@ -1561,6 +1583,8 @@ async fn semantic_page_title_does_not_borrow_an_embedded_frame_title() {
     let f = fixture_with(|st| {
         st.semantic_large_page = true;
         st.semantic_main_root_present = false;
+        // Hide the main title too, so the embedded frame's is the only one.
+        st.omit_snapshot_title = true;
     })
     .await;
     let (target, tab) = bind(&f).await;
@@ -1819,7 +1843,7 @@ async fn semantic_continuation_is_opaque_single_use_and_reaches_offscreen_conten
     let continued = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
     assert_eq!(continued["status"], "ok", "{continued}");
     assert_eq!(continued["snapshot"]["scope"], "continuation");
-    assert_eq!(continued["page"]["title"], "Fixture inbox", "{continued}");
+    assert_eq!(continued["page"]["title"], "Current fixture title", "{continued}");
     assert!(
         continued["refs"]
             .as_array()
