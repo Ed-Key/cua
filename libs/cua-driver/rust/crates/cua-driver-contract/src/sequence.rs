@@ -166,14 +166,16 @@ impl RunSequenceInput {
                         }
                 }
                 SequenceTool::TypeText => {
-                    args.text.is_some()
+                    // Empty text would still dispatch, and an empty
+                    // selected-text write deletes the selection.
+                    args.text.as_deref().is_some_and(|text| !text.is_empty())
                         && args.x.is_none()
                         && args.y.is_none()
                         && args.element_token.is_none()
                 }
             };
             if !valid {
-                return Err(format!("run_sequence step {index}: click requires exactly a nonempty element_token or finite x and y; type_text requires exactly text"));
+                return Err(format!("run_sequence step {index}: click requires exactly a nonempty element_token or finite x and y; type_text requires exactly nonempty text"));
             }
             step.verification_input(self)
                 .validate()
@@ -267,6 +269,14 @@ mod tests {
         let mut request = input();
         request.window_id = 0;
         assert!(request.validate().is_err());
+        let mut request = input();
+        request.steps[0].tool = SequenceTool::TypeText;
+        request.steps[0].arguments.x = None;
+        request.steps[0].arguments.y = None;
+        request.steps[0].arguments.text = Some(String::new());
+        assert!(request.validate().is_err(), "empty text must not dispatch");
+        request.steps[0].arguments.text = Some("a".into());
+        assert!(request.validate().is_ok());
     }
     #[test]
     fn sequence_defaults_and_zero_timeout_share_verifier_validation() {

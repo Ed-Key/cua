@@ -492,7 +492,13 @@ unsafe fn walk_element(
     let frame = element_screen_rect(element);
     // Structured `elements` only contains actionable nodes. Keep all new AX
     // round-trips behind that same gate so display-only rows pay no cost.
-    let control_state = read_control_state_if_actionable(is_actionable, || ControlState {
+    // A text field's state is its content, and empty is a real state. Keep
+    // "" (so value_equals:"" can be answered) and never report the
+    // placeholder hint as content. Reuses the AXValue read above.
+    let text_content = matches!(role.as_str(), "AXTextField" | "AXTextArea" | "AXComboBox")
+        .then(|| copied_value.as_ref().map(|c| c.state_value.trim().to_owned()))
+        .flatten();
+    let mut control_state = read_control_state_if_actionable(is_actionable, || ControlState {
         value_state: copied_value
             .map(|copied| copied.state_value)
             .filter(|v| !v.trim().is_empty())
@@ -507,6 +513,9 @@ unsafe fn walk_element(
         enabled,
         selected: copy_bool_attr(element, "AXSelected"),
     });
+    if text_content.is_some() {
+        control_state.value_state = text_content;
+    }
     let node = if is_actionable {
         let idx = *counter;
         *counter += 1;

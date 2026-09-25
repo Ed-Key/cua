@@ -1081,11 +1081,11 @@ fn build_elements_array(
             // "1"/"0") — controls whose state was previously invisible here.
             // Falls back to `value` so the field never regresses for
             // string-valued elements.
+            // value_state may be "" for an empty text field; keep it.
             if let Some(value) = node
                 .value_state
                 .clone()
-                .or_else(|| node.value.clone())
-                .filter(|v| !v.is_empty())
+                .or_else(|| node.value.clone().filter(|v| !v.is_empty()))
             {
                 entry["value"] = serde_json::Value::String(value);
             }
@@ -1653,6 +1653,21 @@ mod tests {
         assert!(observed
             .iter()
             .all(|entry| entry.get("element_token").is_none()));
+    }
+
+    #[test]
+    fn empty_text_field_reports_empty_value_not_placeholder() {
+        let mut field = node(Some(0), "AXTextField", None, 0, None, None, vec![]);
+        // The tree reader keeps the placeholder in `value` for markdown, and
+        // the real (empty) content in `value_state`.
+        field.value = Some("Search".into());
+        field.value_state = Some(String::new());
+        for entries in [
+            build_elements_array_with_token(std::slice::from_ref(&field), Some(1)),
+            build_observation_elements_array(std::slice::from_ref(&field)),
+        ] {
+            assert_eq!(entries[0]["value"], "", "empty is a real text state");
+        }
     }
 
     #[test]
