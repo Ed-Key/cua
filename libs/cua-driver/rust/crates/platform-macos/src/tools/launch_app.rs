@@ -398,24 +398,30 @@ impl Tool for LaunchAppTool {
                     // - CPU: the observer fires per activation event,
                     //   not per poll; the 250ms tick is just for the
                     //   manual belt-and-braces demote. Cheap.
-                    // - If a legitimate user click activates Code while
-                    //   the watchdog is alive, we'll demote them. Worst
-                    //   case ~10s of "I clicked Code and it didn't come
-                    //   forward" — acceptable trade for an automation
-                    //   scenario where the agent just launched it.
+                    // - A user click on the launched app ends the watchdog:
+                    //   real input moves the event counters, the loop stops,
+                    //   and its guard lets user activations through. (It
+                    //   used to demote the user for up to ~10s.)
                     if slow_launch_path {
                         let launched_pid = *pid;
                         let prior_pid = prior;
                         tokio::spawn(async move {
+                            let baseline = crate::focus_steal::read_input_activity();
                             let _lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
                                 Some(launched_pid),
                                 prior_pid,
                                 "LaunchAppTool.watchdog",
+                            )
+                            .linger_until(
+                                std::time::Instant::now() + std::time::Duration::from_secs(9),
                             );
                             let mut late_activations = 0u32;
                             for _ in 0..32 {
                                 // 32 × 250ms = 8s
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                                if crate::focus_steal::user_input_since(&baseline) {
+                                    break; // the user is acting; their choice wins
+                                }
                                 if crate::apps::frontmost_pid() == Some(launched_pid) {
                                     late_activations += 1;
                                     let _ = crate::apps::restore_prior_app(prior_pid);

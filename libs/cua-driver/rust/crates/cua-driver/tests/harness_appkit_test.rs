@@ -2214,6 +2214,53 @@ fn harness_appkit_focus_theft_800ms_raw() {
     run_raw_focus_theft_case(800);
 }
 
+// Real (HID) input and WindowServer's front app, for user-intent tests.
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct CGPoint {
+    x: f64,
+    y: f64,
+}
+#[link(name = "CoreGraphics", kind = "framework")]
+extern "C" {
+    fn CGEventCreateMouseEvent(
+        source: *const std::ffi::c_void,
+        kind: u32,
+        at: CGPoint,
+        button: u32,
+    ) -> *mut std::ffi::c_void;
+    fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
+    fn CFRelease(value: *const std::ffi::c_void);
+}
+fn real_click(at: CGPoint) {
+    const HID_EVENT_TAP: u32 = 0;
+    for kind in [1u32, 2] {
+        unsafe {
+            let event = CGEventCreateMouseEvent(std::ptr::null(), kind, at, 0);
+            assert!(!event.is_null(), "create HID mouse event");
+            CGEventPost(HID_EVENT_TAP, event);
+            CFRelease(event);
+        }
+        std::thread::sleep(Duration::from_millis(30));
+    }
+}
+/// WindowServer's front app via lsappinfo, not a cached AppKit view.
+fn front_pid() -> Option<u32> {
+    let asn = Command::new("lsappinfo").arg("front").output().ok()?;
+    let asn = String::from_utf8_lossy(&asn.stdout).trim().to_owned();
+    let info = Command::new("lsappinfo")
+        .args(["info", "-only", "pid", &asn])
+        .output()
+        .ok()?;
+    String::from_utf8_lossy(&info.stdout)
+        .rsplit('=')
+        .next()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+
 /// The user's own app switch during a lingering focus guard must stick.
 /// The theft cases prove cua undoes activations nobody asked for; this
 /// proves it does not undo the user's. A real HID click (as a person would
@@ -2222,51 +2269,6 @@ fn harness_appkit_focus_theft_800ms_raw() {
 #[test]
 #[ignore]
 fn harness_appkit_user_switch_during_linger_sticks() {
-    #[repr(C)]
-    #[derive(Clone, Copy)]
-    struct CGPoint {
-        x: f64,
-        y: f64,
-    }
-    #[link(name = "CoreGraphics", kind = "framework")]
-    extern "C" {
-        fn CGEventCreateMouseEvent(
-            source: *const std::ffi::c_void,
-            kind: u32,
-            at: CGPoint,
-            button: u32,
-        ) -> *mut std::ffi::c_void;
-        fn CGEventPost(tap: u32, event: *mut std::ffi::c_void);
-        fn CFRelease(value: *const std::ffi::c_void);
-    }
-    fn real_click(at: CGPoint) {
-        const HID_EVENT_TAP: u32 = 0;
-        for kind in [1u32, 2] {
-            unsafe {
-                let event = CGEventCreateMouseEvent(std::ptr::null(), kind, at, 0);
-                assert!(!event.is_null(), "create HID mouse event");
-                CGEventPost(HID_EVENT_TAP, event);
-                CFRelease(event);
-            }
-            std::thread::sleep(Duration::from_millis(30));
-        }
-    }
-    /// WindowServer's front app via lsappinfo, not a cached AppKit view.
-    fn front_pid() -> Option<u32> {
-        let asn = Command::new("lsappinfo").arg("front").output().ok()?;
-        let asn = String::from_utf8_lossy(&asn.stdout).trim().to_owned();
-        let info = Command::new("lsappinfo")
-            .args(["info", "-only", "pid", &asn])
-            .output()
-            .ok()?;
-        String::from_utf8_lossy(&info.stdout)
-            .rsplit('=')
-            .next()?
-            .trim()
-            .parse()
-            .ok()
-    }
-
     let mut driver = McpDriver::spawn_macos_daemon_proxy_named("appkit-user-switch-linger")
         .expect("start macOS daemon proxy");
     let harness = Harness::launch();
@@ -2327,6 +2329,120 @@ fn harness_appkit_user_switch_during_linger_sticks() {
         Some(finder),
         "the user's switch to Finder was undone by the lingering focus guard"
     );
+}
+
+/// Launching an app in the background must not let it take focus. The
+/// AppKit fixture activates itself as it finishes launching (as Chrome and
+/// Electron apps do), so this is a launch-time theft.
+#[test]
+#[ignore]
+fn harness_appkit_background_launch_keeps_focus() {
+    let mut driver = McpDriver::spawn_macos_daemon_proxy_named("appkit-background-launch-focus")
+        .expect("start macOS daemon proxy");
+    let sentinel = cua_driver_testkit::sentinel::ForegroundSentinel::launch(&mut driver);
+    std::thread::sleep(Duration::from_millis(500));
+    let launched = driver.call(
+        "launch_app",
+        serde_json::json!({
+            "bundle_id": "com.trycua.harness.appkit",
+            "creates_new_application_instance": true
+        }),
+    );
+    eprintln!("launch result: {}", launched.raw);
+    assert!(!launched.is_error(), "launch_app: {}", launched.raw);
+    let pid = launched.structured()["pid"].as_i64().expect("launched pid");
+    std::thread::sleep(Duration::from_millis(2000));
+    let (_, violations) = sentinel.observe();
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    assert!(
+        !violations.iter().any(|v| v.contains("lost focus")),
+        "background launch took the user's focus: {violations:?}; launch {}",
+        launched.raw
+    );
+}
+
+/// After a background launch, the user clicking the launched app must win.
+/// The launch watchdog keeps demoting the launched app for several seconds
+/// in case it activates itself late; it must stop as soon as real input
+/// shows the user chose it.
+#[test]
+#[ignore]
+fn harness_appkit_user_choice_after_launch_sticks() {
+    let mut driver = McpDriver::spawn_macos_daemon_proxy_named("appkit-launch-user-choice")
+        .expect("start macOS daemon proxy");
+    // The user's app is Finder, brought forward by a real desktop click (the
+    // foreground sentinel would cover the launched window, so nobody could
+    // click it).
+    let screen = driver.call("get_screen_size", serde_json::json!({}));
+    let (screen_w, screen_h) = (
+        screen.structured()["width"].as_f64().expect("screen width"),
+        screen.structured()["height"].as_f64().expect("screen height"),
+    );
+    let open_windows = driver.call("list_windows", serde_json::json!({}));
+    let covered: Vec<(f64, f64, f64, f64)> = open_windows.structured()["windows"]
+        .as_array()
+        .expect("windows")
+        .iter()
+        .filter(|w| w["is_on_screen"] == true)
+        .map(|w| {
+            let b = &w["bounds"];
+            (b["x"].as_f64().unwrap(), b["y"].as_f64().unwrap(),
+             b["width"].as_f64().unwrap(), b["height"].as_f64().unwrap())
+        })
+        .collect();
+    let desktop = (2..18)
+        .flat_map(|i| (2..16).map(move |j| (screen_w * i as f64 / 20.0, screen_h * j as f64 / 20.0)))
+        .find(|(x, y)| !covered.iter().any(|(wx, wy, ww, wh)| x >= wx && *x < wx + ww && y >= wy && *y < wy + wh))
+        .map(|(x, y)| CGPoint { x, y })
+        .expect("an uncovered desktop point");
+    real_click(desktop);
+    std::thread::sleep(Duration::from_millis(500));
+    let finder = front_pid().expect("front app after desktop click");
+    let launched = driver.call(
+        "launch_app",
+        serde_json::json!({
+            "bundle_id": "com.trycua.harness.appkit",
+            "creates_new_application_instance": true
+        }),
+    );
+    assert!(!launched.is_error(), "launch_app: {}", launched.raw);
+    let pid = launched.structured()["pid"].as_i64().expect("launched pid") as u32;
+    std::thread::sleep(Duration::from_millis(1000));
+    let all = driver.call("list_windows", serde_json::json!({}));
+    let windows = all.structured()["windows"].as_array().expect("windows").clone();
+    let bounds = |w: &serde_json::Value| {
+        let b = &w["bounds"];
+        (b["x"].as_f64().unwrap(), b["y"].as_f64().unwrap(),
+         b["width"].as_f64().unwrap(), b["height"].as_f64().unwrap())
+    };
+    let target = windows
+        .iter()
+        .find(|w| w["pid"].as_u64() == Some(pid as u64) && w["is_on_screen"] == true && w["layer"] == 0)
+        .expect("launched window on screen")
+        .clone();
+    let (tx, ty, tw, th) = bounds(&target);
+    let target_z = target["z_index"].as_u64().unwrap_or(u64::MAX);
+    // A visible point of the launched window: not under a window in front of it.
+    let above: Vec<_> = windows
+        .iter()
+        .filter(|w| w["is_on_screen"] == true && w["z_index"].as_u64().is_some_and(|z| z < target_z))
+        .map(bounds)
+        .collect();
+    // Aim along the title bar: list_windows omits the Dock and menu bar, so
+    // a point low in the window can land on the Dock (it once hit FaceTime).
+    let _ = th;
+    let point = (1..10)
+        .map(|i| (tx + tw * i as f64 / 10.0, ty + 12.0))
+        .find(|(x, y)| !above.iter().any(|(wx, wy, ww, wh)| x >= wx && *x < wx + ww && y >= wy && *y < wy + wh))
+        .map(|(x, y)| CGPoint { x, y })
+        .expect("a visible point on the launched window's title bar");
+    eprintln!("launched pid={pid}; real click at ({:.0}, {:.0})", point.x, point.y);
+    real_click(point);
+    std::thread::sleep(Duration::from_millis(2000));
+    let front = front_pid();
+    let _ = Command::new("kill").arg(pid.to_string()).status();
+    assert_ne!(finder, pid);
+    assert_eq!(front, Some(pid), "the launch watchdog demoted the app the user clicked");
 }
 
 macro_rules! focus_theft_tests {

@@ -293,7 +293,7 @@ impl Drop for SuppressionLease {
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub(crate) struct InputActivity([u32; 16]);
 
-fn read_input_activity() -> InputActivity {
+pub(crate) fn read_input_activity() -> InputActivity {
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGEventSourceCounterForEventType(state_id: i32, event_type: u32) -> u32;
@@ -308,7 +308,7 @@ fn read_input_activity() -> InputActivity {
 }
 
 /// True when real input happened since `baseline` was read.
-fn user_input_since(baseline: &InputActivity) -> bool {
+pub(crate) fn user_input_since(baseline: &InputActivity) -> bool {
     read_input_activity() != *baseline
 }
 
