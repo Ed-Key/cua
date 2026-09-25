@@ -37,7 +37,16 @@ impl MoveCursorTool {
             Ok(target) => target,
             Err(refusal) => return refusal,
         };
-        let ratio = target.and_then(|(pid, wid)| self.state.resize_registry.ratio(pid, Some(wid)));
+        // The same downscale ratio a pixel click uses for this session's last
+        // delivered screenshot of the window (refuses when none was delivered
+        // at a known scale, rather than guessing).
+        let ratio = match target {
+            Some((pid, wid)) => match super::screenshot_scale(&self.state, &args, pid, Some(wid)) {
+                Ok(ratio) => Some(ratio),
+                Err(refusal) => return refusal,
+            },
+            None => None,
+        };
         let (x, y, window_id) = match resolve_overlay_target(&args, ratio, resolve_frame).await {
             Ok(target) => target,
             Err(refusal) => return refusal,
@@ -262,17 +271,14 @@ mod tests {
         for (x, y, scale, ratio, origin, expected) in [
             (30.0, 40.0, 1.0, None, (100.0, 580.0), (130.0, 620.0)),
             (60.0, 80.0, 2.0, None, (100.0, 580.0), (130.0, 620.0)),
-            (30.0, 40.0, 2.0, Some(2.0), (100.0, 580.0), (130.0, 620.0)),
             (60.0, 80.0, 2.0, None, (500.0, 100.0), (530.0, 140.0)),
             (60.0, 80.0, 2.0, None, (-1440.0, -900.0), (-1410.0, -860.0)),
-            (3.0, 5.0, 2.0, Some(1.5), (-10.0, 20.0), (-7.75, 23.75)),
         ] {
+            // No delivered screenshot: the shared lookup (the one pixel
+            // clicks use) keeps native pixels. The downscale ratio math is
+            // covered by geometry::screenshot_to_screen.
+            assert_eq!(ratio, None::<f64>);
             let tool = tool();
-            // A sibling's ratio must never be used, including when the target has none.
-            tool.state.resize_registry.set_ratio(800, 22, 8.0);
-            if let Some(ratio) = ratio {
-                tool.state.resize_registry.set_ratio(800, 11, ratio);
-            }
             let commands = RefCell::new(Vec::new());
             let result = tool.invoke_overlay(
                 json!({"x": x, "y": y, "scope": "window", "pid": 800, "window_id": 11, "session": "slice-a-move"}),
@@ -420,21 +426,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn invalid_scale_ratio_or_output_refuses_before_publication() {
+    async fn invalid_scale_or_output_refuses_before_publication() {
         for (scale, ratio, origin, x) in [
             (0.0, 1.0, 100.0, 60.0),
             (-2.0, 1.0, 100.0, 60.0),
             (f64::NAN, 1.0, 100.0, 60.0),
             (f64::INFINITY, 1.0, 100.0, 60.0),
-            (2.0, 0.0, 100.0, 60.0),
-            (2.0, -1.0, 100.0, 60.0),
-            (2.0, f64::NAN, 100.0, 60.0),
-            (2.0, f64::INFINITY, 100.0, 60.0),
             (2.0, 1.0, f64::INFINITY, 60.0),
-            (1.0, 2.0, 100.0, f64::MAX),
         ] {
+            assert_eq!(ratio, 1.0, "ratios come from the shared screenshot lookup");
             let tool = tool();
-            tool.state.resize_registry.set_ratio(800, 11, ratio);
             let commands = RefCell::new(Vec::new());
             let result = tool
                 .invoke_overlay(
