@@ -5791,6 +5791,62 @@ const FfiConverterTypeStartSessionOutput = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * One window an app opened after an action, addressable with
+ * `get_window_state(pid, window_id)`. `pid` is the window's real owner, which
+ * can differ from the acted-on app for out-of-process panels.
+ */
+export type SurfaceWindow = {
+    pid: bigint,
+    windowId: bigint,
+    appName: string,
+    title: string
+}
+
+/**
+ * Generated factory for {@link SurfaceWindow} record objects.
+ */
+export const SurfaceWindow = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<SurfaceWindow, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<SurfaceWindow>,
+    });
+})();
+
+const FfiConverterTypeSurfaceWindow = (() => {
+    type TypeName = SurfaceWindow;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                pid: FfiConverterInt64.read(from),
+                windowId: FfiConverterUInt64.read(from),
+                appName: FfiConverterString.read(from),
+                title: FfiConverterString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterInt64.write(value.pid, into);
+            FfiConverterUInt64.write(value.windowId, into);
+            FfiConverterString.write(value.appName, into);
+            FfiConverterString.write(value.title, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterInt64.allocationSize(value.pid) +
+             FfiConverterUInt64.allocationSize(value.windowId) +
+             FfiConverterString.allocationSize(value.appName) +
+             FfiConverterString.allocationSize(value.title);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type TypeTextInput = {
     text: string,
     target?: ActionTarget,
@@ -6061,6 +6117,54 @@ const FfiConverterTypeVisualParseError = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * New windows reported on the first read after an action. `rebind` is set
+ * only when exactly one new window appeared and every candidate's owner was
+ * resolved; otherwise the caller chooses from `new_windows` itself.
+ */
+export type WindowChange = {
+    newWindows: Array<SurfaceWindow>,
+    rebind?: SurfaceWindow
+}
+
+/**
+ * Generated factory for {@link WindowChange} record objects.
+ */
+export const WindowChange = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<WindowChange, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<WindowChange>,
+    });
+})();
+
+const FfiConverterTypeWindowChange = (() => {
+    type TypeName = WindowChange;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                newWindows: FfiConverterSequenceTypeSurfaceWindow.read(from),
+                rebind: FfiConverterOptionalTypeSurfaceWindow.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterSequenceTypeSurfaceWindow.write(value.newWindows, into);
+            FfiConverterOptionalTypeSurfaceWindow.write(value.rebind, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterSequenceTypeSurfaceWindow.allocationSize(value.newWindows) +
+             FfiConverterOptionalTypeSurfaceWindow.allocationSize(value.rebind);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type WindowElement = {
     elementIndex: bigint,
     role: string,
@@ -6181,6 +6285,11 @@ export type WindowStateOutput = {
     screenshotFrameValid?: boolean,
     windowBounds?: WindowBounds,
     /**
+     * Windows the target app opened since the last action on it that has
+     * not been reported yet. Present only when something new appeared.
+     */
+    windowChange?: WindowChange,
+    /**
      * Image content belongs to the MCP envelope, never structuredContent.
      */
     images: Array<SnapshotImage>
@@ -6230,6 +6339,7 @@ const FfiConverterTypeWindowStateOutput = (() => {
                 screenshotFilePath: FfiConverterOptionalString.read(from),
                 screenshotFrameValid: FfiConverterOptionalBoolean.read(from),
                 windowBounds: FfiConverterOptionalTypeWindowBounds.read(from),
+                windowChange: FfiConverterOptionalTypeWindowChange.read(from),
                 images: FfiConverterSequenceTypeSnapshotImage.read(from)
             };
         }
@@ -6257,6 +6367,7 @@ const FfiConverterTypeWindowStateOutput = (() => {
             FfiConverterOptionalString.write(value.screenshotFilePath, into);
             FfiConverterOptionalBoolean.write(value.screenshotFrameValid, into);
             FfiConverterOptionalTypeWindowBounds.write(value.windowBounds, into);
+            FfiConverterOptionalTypeWindowChange.write(value.windowChange, into);
             FfiConverterSequenceTypeSnapshotImage.write(value.images, into);
         }
         allocationSize(value: TypeName): number {
@@ -6283,6 +6394,7 @@ const FfiConverterTypeWindowStateOutput = (() => {
              FfiConverterOptionalString.allocationSize(value.screenshotFilePath) +
              FfiConverterOptionalBoolean.allocationSize(value.screenshotFrameValid) +
              FfiConverterOptionalTypeWindowBounds.allocationSize(value.windowBounds) +
+             FfiConverterOptionalTypeWindowChange.allocationSize(value.windowChange) +
              FfiConverterSequenceTypeSnapshotImage.allocationSize(value.images);
 
         }
@@ -6451,6 +6563,12 @@ const FfiConverterOptionalTypeCaptureScope = new FfiConverterOptional(FfiConvert
 // FfiConverter for CursorThemeSelection | undefined
 const FfiConverterOptionalTypeCursorThemeSelection = new FfiConverterOptional(FfiConverterTypeCursorThemeSelection);
 
+// FfiConverter for Array<SurfaceWindow>
+const FfiConverterSequenceTypeSurfaceWindow = new FfiConverterArray(FfiConverterTypeSurfaceWindow);
+
+// FfiConverter for SurfaceWindow | undefined
+const FfiConverterOptionalTypeSurfaceWindow = new FfiConverterOptional(FfiConverterTypeSurfaceWindow);
+
 // FfiConverter for ElementFrame | undefined
 const FfiConverterOptionalTypeElementFrame = new FfiConverterOptional(FfiConverterTypeElementFrame);
 
@@ -6462,6 +6580,9 @@ const FfiConverterOptionalSequenceTypeWindowElement = new FfiConverterOptional(F
 
 // FfiConverter for WindowBounds | undefined
 const FfiConverterOptionalTypeWindowBounds = new FfiConverterOptional(FfiConverterTypeWindowBounds);
+
+// FfiConverter for WindowChange | undefined
+const FfiConverterOptionalTypeWindowChange = new FfiConverterOptional(FfiConverterTypeWindowChange);
 
 // FfiConverter for Array<SnapshotImage>
 const FfiConverterSequenceTypeSnapshotImage = new FfiConverterArray(FfiConverterTypeSnapshotImage);
@@ -6582,6 +6703,7 @@ export default Object.freeze({
     FfiConverterTypeStartSessionInput,
     FfiConverterTypeStartSessionOutput,
     FfiConverterTypeStatePredicate,
+    FfiConverterTypeSurfaceWindow,
     FfiConverterTypeTypeTextInput,
     FfiConverterTypeUnknownReason,
     FfiConverterTypeVerificationStatus,
@@ -6600,6 +6722,7 @@ export default Object.freeze({
     FfiConverterTypeVisualRegionKind,
     FfiConverterTypeVisualScreenshotReference,
     FfiConverterTypeWindowBounds,
+    FfiConverterTypeWindowChange,
     FfiConverterTypeWindowElement,
     FfiConverterTypeWindowInfo,
     FfiConverterTypeWindowPredicate,

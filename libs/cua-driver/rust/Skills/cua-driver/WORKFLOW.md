@@ -39,6 +39,8 @@ These objects are argument fragments for tools advertising `target`, not standal
 
 On macOS a row keeps its `element_index` across looks at the same window, and a vanished row's number is never reused. After the first look, a session's next `get_window_state` of that window returns only rows added, changed, or removed (`diff` in the response lists their numbers; `tree_markdown` marks `+` added, `~` changed, `x` vanished text). Unchanged rows are omitted but still actionable: pair their `element_index` with the new response's `snapshot_id`. Pass `diff:false` when you need the full outline again, for example after a context reset. A `query`, a changed `max_elements`/`max_depth`, or a look by another session always returns the full outline.
 
+Actions return without waiting to see whether a window opens. On macOS, the first `get_window_state` of that app after an action reports windows, sheets, or dialogs the app opened since, as `window_change` (once). When exactly one appeared, `window_change.rebind` gives its `pid` and `window_id`: read and act there next. Its `pid` can differ from the app's (file panels run in a separate process). With several candidates, pick from `new_windows` yourself.
+
 Prefer `structuredContent.elements` in MCP (the CLI prints structured fields directly) over parsing `tree_markdown`. Rows may contain `element_token`, role, label, value, actions, parent, depth, enabled/selected state, `frame` (screen coordinates, the space of `scope:"desktop"` actions), and `screenshot_frame` (pixels of the screenshot in the same response, the space of window-local pointer `x`/`y`). Missing fields are unknown.
 
 - Use `query` to project matching rows plus ancestors without renumbering their indices.

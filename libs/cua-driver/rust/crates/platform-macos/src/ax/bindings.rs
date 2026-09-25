@@ -82,6 +82,7 @@ extern "C" {
         timeout_in_seconds: f32,
     ) -> AXError;
     pub fn AXUIElementGetTypeID() -> CFTypeID;
+    pub fn AXValueGetTypeID() -> CFTypeID;
     pub fn AXIsProcessTrusted() -> bool;
     /// `AXIsProcessTrustedWithOptions(options)` — when called with
     /// `{kAXTrustedCheckOptionPrompt: true}` raises the system Accessibility
@@ -752,14 +753,24 @@ pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> bool
 ///
 /// `element` must be a valid, live window `AXUIElementRef`.
 pub unsafe fn ax_get_window_id(element: AXUIElementRef) -> Option<u32> {
+    ax_get_window_id_checked(element).ok().flatten()
+}
+
+pub(crate) unsafe fn ax_get_window_id_checked(
+    element: AXUIElementRef,
+) -> Result<Option<u32>, AXError> {
     let mut wid: u32 = 0;
     let err = _AXUIElementGetWindow(element, &mut wid);
-    if err == kAXErrorSuccess && wid != 0 {
-        Some(wid)
-    } else {
-        None
-    }
+    checked_window_id(err, wid)
 }
+
+fn checked_window_id(error: AXError, window_id: u32) -> Result<Option<u32>, AXError> {
+    if error != kAXErrorSuccess {
+        return Err(error);
+    }
+    Ok((window_id != 0).then_some(window_id))
+}
+
 
 /// Read the `AXWindows` attribute of an application element.
 /// Unlike `AXChildren`, this returns the window list regardless of whether
@@ -793,6 +804,102 @@ pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
             }
         })
         .collect()
+}
+
+/// Copy an attribute without conflating an AX failure with an absent value.
+/// The returned Core Foundation object owns the reference from the AX copy.
+pub(crate) unsafe fn copy_attribute_checked(
+    element: AXUIElementRef,
+    attribute: &str,
+) -> Result<core_foundation::base::CFType, AXError> {
+    let attr = CFStr::new(attribute);
+    let mut value: CFTypeRef = std::ptr::null();
+    let error = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    let value =
+        (!value.is_null()).then(|| core_foundation::base::CFType::wrap_under_create_rule(value));
+    checked_attribute_value(error, value)
+}
+
+fn checked_attribute_value(
+    error: AXError,
+    value: Option<core_foundation::base::CFType>,
+) -> Result<core_foundation::base::CFType, AXError> {
+    if error != kAXErrorSuccess {
+        return Err(error);
+    }
+    value.ok_or(kAXErrorFailure)
+}
+
+pub(crate) unsafe fn copy_string_attr_checked(
+    element: AXUIElementRef,
+    attribute: &str,
+) -> Result<String, AXError> {
+    let value = copy_attribute_checked(element, attribute)?;
+    if value.type_of() != CFStr::type_id() {
+        return Err(kAXErrorFailure);
+    }
+    Ok(CFStr::wrap_under_get_rule(value.as_CFTypeRef() as _).to_string())
+}
+
+pub(crate) unsafe fn copy_geometry_attr_checked(
+    element: AXUIElementRef,
+    attribute: &str,
+    value_type: AXValueType,
+) -> Result<[f64; 2], AXError> {
+    let value = copy_attribute_checked(element, attribute)?;
+    if value.type_of() != AXValueGetTypeID()
+        || !matches!(value_type, kAXValueCGPointType | kAXValueCGSizeType)
+    {
+        return Err(kAXErrorFailure);
+    }
+    let mut pair = [0.0_f64; 2];
+    if !AXValueGetValue(
+        value.as_CFTypeRef() as AXValueRef,
+        value_type,
+        pair.as_mut_ptr() as _,
+    ) || !pair.iter().all(|value| value.is_finite())
+    {
+        return Err(kAXErrorFailure);
+    }
+    Ok(pair)
+}
+
+/// Strict bounded array read for observation. Unlike the legacy projection,
+/// malformed members make the entire read unknown instead of silently hiding
+/// a possible second surface. Every successful returned element is retained.
+pub(crate) unsafe fn copy_element_array_attr_checked(
+    element: AXUIElementRef,
+    attribute: &str,
+    limit: usize,
+) -> Result<Vec<AXUIElementRef>, AXError> {
+    checked_element_array(copy_attribute_checked(element, attribute)?, limit)
+}
+
+unsafe fn checked_element_array(
+    value: core_foundation::base::CFType,
+    limit: usize,
+) -> Result<Vec<AXUIElementRef>, AXError> {
+    if value.type_of() != CFArray::<CFTypeRef>::type_id() {
+        return Err(kAXErrorFailure);
+    }
+    let array = CFArray::<CFTypeRef>::wrap_under_get_rule(value.as_CFTypeRef() as _);
+    if array.len() as usize > limit {
+        return Err(kAXErrorFailure);
+    }
+    let ax_type_id = AXUIElementGetTypeID();
+    for i in 0..array.len() {
+        let item = *array.get(i).ok_or(kAXErrorFailure)?;
+        if item.is_null() || core_foundation::base::CFGetTypeID(item) != ax_type_id {
+            return Err(kAXErrorFailure);
+        }
+    }
+    Ok((0..array.len())
+        .map(|i| {
+            let item = *array.get(i).expect("validated array member");
+            CFRetain(item);
+            item as AXUIElementRef
+        })
+        .collect())
 }
 
 /// Highest AX element id probed when looking for an off-Space window.

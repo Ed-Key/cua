@@ -278,6 +278,29 @@ pub struct SnapshotImage {
     pub data_base64: String,
 }
 
+/// One window an app opened after an action, addressable with
+/// `get_window_state(pid, window_id)`. `pid` is the window's real owner, which
+/// can differ from the acted-on app for out-of-process panels.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct SurfaceWindow {
+    pub pid: i64,
+    pub window_id: u64,
+    pub app_name: String,
+    pub title: String,
+}
+
+/// New windows reported on the first read after an action. `rebind` is set
+/// only when exactly one new window appeared and every candidate's owner was
+/// resolved; otherwise the caller chooses from `new_windows` itself.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct WindowChange {
+    pub new_windows: Vec<SurfaceWindow>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rebind: Option<SurfaceWindow>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 pub struct WindowStateOutput {
     pub pid: u32,
@@ -324,6 +347,10 @@ pub struct WindowStateOutput {
     pub screenshot_frame_valid: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window_bounds: Option<WindowBounds>,
+    /// Windows the target app opened since the last action on it that has
+    /// not been reported yet. Present only when something new appeared.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub window_change: Option<WindowChange>,
     /// Image content belongs to the MCP envelope, never structuredContent.
     #[serde(skip)]
     #[schemars(skip)]
@@ -332,6 +359,16 @@ pub struct WindowStateOutput {
 
 impl ToolOutput for WindowStateOutput {
     fn validate(&self) -> Result<(), String> {
+        if let Some(change) = &self.window_change {
+            if change.new_windows.is_empty() {
+                return Err("window_change must list at least one new window".into());
+            }
+            if let Some(rebind) = &change.rebind {
+                if change.new_windows.len() != 1 || change.new_windows[0] != *rebind {
+                    return Err("window_change.rebind must be the only new window".into());
+                }
+            }
+        }
         match (self.screenshot_width, self.screenshot_height) {
             (None, None) => {}
             (Some(width), Some(height)) if width > 0 && height > 0 => {}

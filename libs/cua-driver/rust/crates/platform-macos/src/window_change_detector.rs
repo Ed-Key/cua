@@ -1,151 +1,115 @@
-//! Window-change detector — Rust port of Swift's
-//! `WindowChangeDetector` (`libs/cua-driver/Sources/CuaDriverServer/Tools/WindowChangeDetector.swift`).
+//! Post-action focus protection and foreground-change reporting.
 //!
-//! ## What this does
+//! Action tools (click, type_text, hotkey, ...) on a backgrounded app can make
+//! another app activate: a link hands off to Safari, a helper app pops up.
+//! `snapshot()` arms a **wildcard** focus-steal suppression lease before the
+//! action. `detect()` returns immediately after the action: it reports a
+//! foreground change it can already see, and hands the lease to a background
+//! timer that keeps protecting focus until the observation bound elapses or
+//! the next action ends it (`end_lingering_focus_guards`). The tool result
+//! never waits for that window.
 //!
-//! Action tools (click, type_text, hotkey, …) on a backgrounded app can
-//! trigger window/foreground side-effects: a "Sign In" button opens a
-//! modal sheet, a Safari link spawns a new tab, an autocomplete dropdown
-//! pops a helper window. The Rust port mirrors Swift's
-//! snapshot → action → detect cycle so tool results can:
-//!
-//! 1. Surface the side-effect to the agent (one-line suffix on the
-//!    tool result, matching Swift verbatim).
-//! 2. Arm a **wildcard** focus-steal suppression entry that covers the
-//!    full snapshot→detect window. Wildcards (`target_pid = None`)
-//!    catch any activation other than the prior frontmost — so even an
-//!    app we didn't know about (Safari activating because a UTM Gallery
-//!    link routed to it) is suppressed before the first compositor
-//!    frame.
-//!
-//! ## Usage
+//! New windows are not detected here any more. Waiting to prove that no window
+//! will open cost every action its full timeout; `surface_observer` instead
+//! reports new windows on the agent's next read.
 //!
 //! ```ignore
-//! // Callers capture frontmost BEFORE the snapshot so the wildcard
-//! // suppressor and the snapshot's recorded frontmost agree on the
-//! // pid to restore to — avoids a race where another app activates
-//! // between the caller's `frontmost_pid()` and the detector's own.
 //! let prior_front = apps::frontmost_pid();
 //! let snapshot = WindowChangeDetector::snapshot(prior_front);
-//! // … perform action …
+//! // ... perform action ...
 //! let changes = snapshot.detect();
-//! // changes.result_suffix() — append to ToolResult text.
+//! // changes.result_suffix() -- append to ToolResult text.
 //! ```
-//!
-//! Dropping the `Snapshot` ends the suppression lease (RAII). `detect()`
-//! also drops the lease before returning — the lease's `Drop` is
-//! idempotent so explicit-detect + later-drop is safe.
 
-use std::collections::HashSet;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use cua_driver_core::window_observation::WindowObservationBounds;
 
 use crate::apps;
 use crate::focus_steal::{self, SuppressionLease};
-use crate::windows::{self, WindowInfo};
 
-/// One window that appeared between `snapshot()` and `detect()`.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WindowEvent {
-    pub window_id: u32,
-    pub pid: i32,
-    pub app_name: String,
-    pub title: String,
-}
-
-/// State captured immediately before the action fires.
-///
-/// Holds:
-/// - `window_ids` — the set of visible layer-0 window IDs at snapshot
-///   time. `detect()` diffs against this.
-/// - `front_pid` — the OS frontmost pid at snapshot time. `detect()`
-///   reports whether a *different* pid became frontmost. The wildcard
-///   suppressor in `focus_steal` will normally restore the original
-///   front before `detect()`'s poll loop observes the change, so this
-///   field is best-effort.
-/// - `_lease` — the wildcard suppression lease. Dropping the snapshot
-///   ends suppression. Held inside `Option` so `detect()` can take it
-///   and drop early.
+/// State captured immediately before the action fires: the caller's
+/// frontmost pid, when the action started, and the wildcard suppression lease
+/// (`None` when suppression was not requested or nothing was frontmost).
 pub struct Snapshot {
-    window_ids: HashSet<u32>,
     front_pid: Option<i32>,
+    started: Instant,
     _lease: Option<SuppressionLease>,
 }
 
-/// Result of `detect()` — what changed during the action window.
+/// Result of `detect()`: a foreground change already visible when the
+/// action returned.
 #[derive(Debug, Clone)]
 pub struct Changes {
-    pub new_windows: Vec<WindowEvent>,
     pub foreground_changed: bool,
 }
 
 impl Changes {
     pub fn no_change() -> Self {
         Self {
-            new_windows: Vec::new(),
             foreground_changed: false,
         }
     }
 
-    /// True when we found evidence that the action triggered a cross-app
-    /// side-effect that required (or would have required) a foreground
-    /// restore. Matches Swift's `Changes.needsRestore`.
-    pub fn needs_restore(&self) -> bool {
-        self.foreground_changed || !self.new_windows.is_empty()
-    }
-
     /// One-liner summary to append to a tool result, or empty string
     /// when nothing interesting happened.
-    ///
-    /// Format mirrors Swift `WindowChangeDetector.Changes.resultSuffix`
-    /// **verbatim** so MCP callers that key off the suffix wording
-    /// don't need a per-binary special case.
     pub fn result_suffix(&self) -> String {
-        if !self.needs_restore() {
-            return String::new();
-        }
-
-        if !self.new_windows.is_empty() {
-            // Group by app name (stable order), join titles per app.
-            let mut by_app: std::collections::BTreeMap<&str, Vec<&str>> =
-                std::collections::BTreeMap::new();
-            for w in &self.new_windows {
-                by_app.entry(&w.app_name).or_default().push(&w.title);
-            }
-            let summaries: Vec<String> = by_app
-                .into_iter()
-                .map(|(app, titles)| {
-                    let titles: Vec<String> = titles
-                        .into_iter()
-                        .filter(|t| !t.is_empty())
-                        .map(|t| format!("\"{t}\""))
-                        .collect();
-                    if titles.is_empty() {
-                        app.to_string()
-                    } else {
-                        format!("{app} ({})", titles.join(", "))
-                    }
-                })
-                .collect();
-            format!(
-                "\n\n🪟 Action opened new window(s): {}.",
-                summaries.join("; ")
-            )
-        } else {
+        if self.foreground_changed {
             "\n\n🔀 Action caused a different app to become frontmost.".to_string()
+        } else {
+            String::new()
         }
     }
 }
 
-/// Default poll deadline — new windows triggered by a click typically
-/// appear within ~200ms on macOS; 1.0s gives the wildcard suppressor
-/// time to fire and settle.
+/// Leases handed to background timers, ended early by the next action.
+static LINGERING: LazyLock<Mutex<Vec<(u64, Box<dyn Send>)>>> =
+    LazyLock::new(|| Mutex::new(Vec::new()));
+static NEXT_LINGER_ID: AtomicU64 = AtomicU64::new(0);
+
+fn lingering() -> std::sync::MutexGuard<'static, Vec<(u64, Box<dyn Send>)>> {
+    LINGERING.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// Keep `guard` alive until `until` without blocking the caller.
+fn linger(guard: Box<dyn Send>, until: Instant) {
+    let remaining = until.saturating_duration_since(Instant::now());
+    if remaining.is_zero() {
+        return;
+    }
+    let id = NEXT_LINGER_ID.fetch_add(1, Ordering::Relaxed);
+    lingering().push((id, guard));
+    std::thread::spawn(move || {
+        std::thread::sleep(remaining);
+        let expired = {
+            let mut guards = lingering();
+            guards
+                .iter()
+                .position(|(held, _)| *held == id)
+                .map(|index| guards.swap_remove(index))
+        };
+        // Dropped outside the lock: ending a lease can call into focus_steal.
+        drop(expired);
+    });
+}
+
+/// End every lingering post-action focus guard. Called before the next action
+/// so a guard from the previous one cannot fight an intentional activation.
+pub(crate) fn end_lingering_focus_guards() {
+    let ended: Vec<_> = lingering().drain(..).collect();
+    drop(ended);
+}
+
+/// How long the wildcard focus guard keeps protecting after an action
+/// starts. It runs in the background; results never wait for it.
 const DEFAULT_TIMEOUT: Duration = Duration::from_millis(1000);
 
-/// Default inter-poll interval. Matches Swift's 50ms.
+/// Poll setting kept for the shared host bounds; nothing polls here now.
 const DEFAULT_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
+#[cfg(test)]
 /// Resolve the post-action observation bounds from raw host values against
 /// the macOS defaults. Pure; `cua_driver_core::window_observation` owns the
 /// parsing and clamping rules shared with the Linux adapter.
@@ -220,11 +184,7 @@ impl WindowChangeDetector {
         suppress_focus: bool,
         allowed_pid: Option<i32>,
     ) -> Snapshot {
-        let window_ids: HashSet<u32> = windows::visible_windows()
-            .into_iter()
-            .filter(|w| w.layer == 0)
-            .map(|w| w.window_id)
-            .collect();
+        let started = Instant::now();
 
         // Arm wildcard suppression — covers snapshot → detect window.
         // restore_to = caller-captured frontmost; target = wildcard
@@ -247,8 +207,8 @@ impl WindowChangeDetector {
             });
 
         Snapshot {
-            window_ids,
             front_pid: prior_front,
+            started,
             _lease: lease,
         }
     }
@@ -260,85 +220,31 @@ impl Snapshot {
         self.front_pid
     }
 
-    /// Poll for up to `DEFAULT_TIMEOUT` for new windows or a
-    /// foreground-app change. Returns as soon as a change is detected
-    /// or the timeout elapses.
-    ///
-    /// An embedding host that already observes the target continuously
-    /// can bound this window through `CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS` /
-    /// `CUA_DRIVER_WINDOW_CHANGE_POLL_MS` on the daemon's environment.
-    /// Unset or unparsable values keep the defaults, so public callers see
-    /// no behavior change.
-    ///
-    /// Consumes the snapshot — the wildcard suppression lease is
-    /// dropped when this returns (covers the full action + detection
-    /// window). A shorter timeout therefore also shortens the wildcard
-    /// focus-steal protection, and a zero timeout releases it as soon as
-    /// the action returns and reports no change.
+    /// Report what is already visible and return at once. The suppression
+    /// lease keeps protecting focus in the background until the host
+    /// observation bound (`CUA_DRIVER_WINDOW_CHANGE_TIMEOUT_MS`, default
+    /// 1000ms from snapshot time) elapses or the next action ends it.
     pub fn detect(self) -> Changes {
         self.detect_bounded(host_observation_bounds())
     }
 
-    /// `detect()` with explicit bounds. A zero timeout drops the snapshot
-    /// (and its wildcard suppression lease) immediately without reading
-    /// the window list again.
-    pub(crate) fn detect_bounded(self, bounds: WindowObservationBounds) -> Changes {
-        if bounds.skips_observation() {
-            drop(self);
-            return Changes::no_change();
+    /// `detect()` with explicit bounds. A zero timeout ends the lease now.
+    pub(crate) fn detect_bounded(mut self, bounds: WindowObservationBounds) -> Changes {
+        let foreground_changed = matches!(
+            (self.front_pid, apps::frontmost_pid()),
+            (Some(before), Some(now)) if before != now
+        );
+        if let Some(lease) = self._lease.take() {
+            if !bounds.skips_observation() {
+                linger(Box::new(lease), self.started + bounds.timeout);
+            }
         }
-        self.detect_with(bounds.timeout, bounds.poll)
+        Changes { foreground_changed }
     }
 
-    /// Async wrapper around `detect()` — runs the synchronous poll
-    /// loop on a `spawn_blocking` thread so it doesn't stall the
-    /// tokio runtime. Most action-tool call sites should prefer this
-    /// over the blocking `detect()`.
+    /// Kept async for existing call sites; it no longer waits.
     pub async fn detect_async(self) -> Changes {
-        // Move the Snapshot (and its embedded lease) onto the blocking
-        // thread; the lease's Drop runs there when detect_with returns.
-        tokio::task::spawn_blocking(move || self.detect())
-            .await
-            .unwrap_or_else(|_| Changes::no_change())
-    }
-
-    /// Same as `detect()` but with configurable timing.
-    fn detect_with(self, timeout: Duration, poll_interval: Duration) -> Changes {
-        let deadline = Instant::now() + timeout;
-        loop {
-            std::thread::sleep(poll_interval);
-
-            let current: Vec<WindowInfo> = windows::visible_windows()
-                .into_iter()
-                .filter(|w| w.layer == 0)
-                .collect();
-
-            let new_windows: Vec<WindowEvent> = current
-                .iter()
-                .filter(|w| !self.window_ids.contains(&w.window_id))
-                .map(|w| WindowEvent {
-                    window_id: w.window_id,
-                    pid: w.pid,
-                    app_name: w.app_name.clone(),
-                    title: w.title.clone(),
-                })
-                .collect();
-            let current_front = apps::frontmost_pid();
-            let foreground_changed = match (self.front_pid, current_front) {
-                (Some(orig), Some(cur)) => orig != cur,
-                _ => false,
-            };
-
-            if !new_windows.is_empty() || foreground_changed {
-                return Changes {
-                    new_windows,
-                    foreground_changed,
-                };
-            }
-            if Instant::now() >= deadline {
-                return Changes::no_change();
-            }
-        }
+        self.detect()
     }
 }
 
@@ -352,88 +258,16 @@ mod tests {
     fn changes_result_suffix_no_change_is_empty() {
         let c = Changes::no_change();
         assert_eq!(c.result_suffix(), "");
-        assert!(!c.needs_restore());
-    }
-
-    #[test]
-    fn changes_result_suffix_single_new_window_with_title() {
-        let c = Changes {
-            new_windows: vec![WindowEvent {
-                window_id: 99,
-                pid: 100,
-                app_name: "Chrome".into(),
-                title: "New Tab".into(),
-            }],
-            foreground_changed: false,
-        };
-        assert!(c.needs_restore());
-        assert_eq!(
-            c.result_suffix(),
-            "\n\n🪟 Action opened new window(s): Chrome (\"New Tab\")."
-        );
-    }
-
-    #[test]
-    fn changes_result_suffix_groups_windows_by_app() {
-        let c = Changes {
-            new_windows: vec![
-                WindowEvent {
-                    window_id: 1,
-                    pid: 100,
-                    app_name: "Chrome".into(),
-                    title: "Tab A".into(),
-                },
-                WindowEvent {
-                    window_id: 2,
-                    pid: 100,
-                    app_name: "Chrome".into(),
-                    title: "Tab B".into(),
-                },
-                WindowEvent {
-                    window_id: 3,
-                    pid: 101,
-                    app_name: "Mail".into(),
-                    title: "".into(),
-                },
-            ],
-            foreground_changed: true,
-        };
-        let suffix = c.result_suffix();
-        // BTreeMap sort order is alphabetical by app name → Chrome before Mail.
-        assert_eq!(
-            suffix,
-            "\n\n🪟 Action opened new window(s): Chrome (\"Tab A\", \"Tab B\"); Mail."
-        );
     }
 
     #[test]
     fn changes_result_suffix_foreground_change_only() {
         let c = Changes {
-            new_windows: vec![],
             foreground_changed: true,
         };
-        assert!(c.needs_restore());
         assert_eq!(
             c.result_suffix(),
             "\n\n🔀 Action caused a different app to become frontmost."
-        );
-    }
-
-    #[test]
-    fn changes_result_suffix_empty_title_is_dropped() {
-        let c = Changes {
-            new_windows: vec![WindowEvent {
-                window_id: 1,
-                pid: 100,
-                app_name: "Finder".into(),
-                title: "".into(),
-            }],
-            foreground_changed: false,
-        };
-        // No title → just the app name, no parentheses.
-        assert_eq!(
-            c.result_suffix(),
-            "\n\n🪟 Action opened new window(s): Finder."
         );
     }
 
@@ -487,7 +321,6 @@ mod tests {
         let started = Instant::now();
         let changes = snap.detect_bounded(observation_bounds_from(Some("0"), None));
         assert!(started.elapsed() < DEFAULT_POLL_INTERVAL);
-        assert!(!changes.needs_restore());
         assert_eq!(changes.result_suffix(), "");
     }
 
@@ -506,5 +339,46 @@ mod tests {
         // panicking (no frontmost to restore to).
         let snap_none = WindowChangeDetector::snapshot(None);
         assert_eq!(snap_none.front_pid(), None);
+    }
+
+    struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);
+    impl Drop for DropFlag {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+
+    fn flag() -> (DropFlag, std::sync::Arc<std::sync::atomic::AtomicBool>) {
+        let dropped = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        (DropFlag(dropped.clone()), dropped)
+    }
+
+    /// The guard outlives the call that armed it, then ends on its own.
+    /// One test: the lingering list is process-global.
+    #[test]
+    fn lingering_guard_expires_or_ends_at_the_next_action() {
+        let (guard, dropped) = flag();
+        linger(Box::new(guard), Instant::now() + Duration::from_millis(80));
+        assert!(!dropped.load(Ordering::SeqCst), "must not end before its bound");
+        std::thread::sleep(Duration::from_millis(300));
+        assert!(dropped.load(Ordering::SeqCst), "must end once its bound elapses");
+
+        let (guard, dropped) = flag();
+        linger(Box::new(guard), Instant::now() + Duration::from_secs(30));
+        end_lingering_focus_guards();
+        assert!(dropped.load(Ordering::SeqCst), "the next action must end it early");
+
+        let (guard, dropped) = flag();
+        linger(Box::new(guard), Instant::now());
+        assert!(dropped.load(Ordering::SeqCst), "an elapsed bound ends it at once");
+    }
+
+    /// detect() must not wait for the observation bound.
+    #[test]
+    fn detect_returns_before_the_observation_bound() {
+        let snap = WindowChangeDetector::snapshot(None);
+        let started = Instant::now();
+        snap.detect_bounded(observation_bounds_from(Some("1000"), None));
+        assert!(started.elapsed() < Duration::from_millis(100));
     }
 }

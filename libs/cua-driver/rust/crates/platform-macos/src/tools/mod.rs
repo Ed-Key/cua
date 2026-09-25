@@ -825,6 +825,7 @@ pub fn register_all(
                 zoom_registry.retire_session(session_id);
                 element_cache.retire_session_screenshots(session_id);
                 capture_bindings.retire_session(session_id);
+                crate::surface_observer::retire_session(session_id);
                 // Per-session agent cursor: the session_id is the cursor key when
                 // the caller gave no explicit cursor_id, so dropping it here both
                 // prunes the metadata registry and stops the overlay painting that
@@ -844,8 +845,10 @@ pub fn register_all(
 
     registry.register(Box::new(list_apps::ListAppsTool));
     registry.register(Box::new(list_windows::ListWindowsTool));
-    registry.register(Box::new(get_window_state::GetWindowStateTool::new(
-        state.clone(),
+    // verify_state below keeps its own unwrapped reader: a check is not the
+    // agent's look, so it must not consume the new-window note.
+    registry.register(crate::surface_observer::read(Box::new(
+        get_window_state::GetWindowStateTool::new(state.clone()),
     )));
     registry.register(Box::new(
         cua_driver_core::expectation::VerifyStateTool::new(Arc::new(
@@ -855,51 +858,55 @@ pub fn register_all(
             ),
         )),
     ));
-    registry.register(Box::new(launch_app::LaunchAppTool));
+    registry.register(crate::surface_observer::activates(Box::new(
+        launch_app::LaunchAppTool,
+    )));
     registry.register(Box::new(kill_app::KillAppTool));
     let pid_window_candidates: WindowTargetCandidates = Arc::new(pid_window_target_candidates);
-    registry.register(pid_window_guarded(
+    registry.register(crate::surface_observer::activates(pid_window_guarded(
         bring_to_front::BringToFrontTool,
         &pid_window_candidates,
-    ));
+    )));
     registry.register(Box::new(set_window_frame::SetWindowFrameTool));
-    registry.register(Box::new(invoke_menu::InvokeMenuTool));
-    registry.register(pid_window_guarded(
+    registry.register(crate::surface_observer::action(Box::new(
+        invoke_menu::InvokeMenuTool,
+    )));
+    registry.register(crate::surface_observer::action(pid_window_guarded(
         click::ClickTool::new(state.clone()),
         &pid_window_candidates,
-    ));
-    registry.register(pid_window_guarded(
+    )));
+    registry.register(crate::surface_observer::action(pid_window_guarded(
         double_click::DoubleClickTool::new(state.clone()),
         &pid_window_candidates,
-    ));
-    registry.register(pid_window_guarded(
+    )));
+    registry.register(crate::surface_observer::action(pid_window_guarded(
         right_click::RightClickTool::new(state.clone()),
         &pid_window_candidates,
-    ));
-    registry.register(pid_window_guarded(
+    )));
+    registry.register(crate::surface_observer::action(pid_window_guarded(
         drag::DragTool::new(state.clone()),
         &pid_window_candidates,
-    ));
-    registry.register(pid_window_guarded(
+    )));
+    registry.register(crate::surface_observer::action(pid_window_guarded(
         type_text::TypeTextTool::new(state.clone()),
         &pid_window_candidates,
-    ));
-    registry.register(pid_window_guarded(
+    )));
+    registry.register(crate::surface_observer::action(pid_window_guarded(
         press_key::PressKeyTool::new(state.clone()),
         &pid_window_candidates,
-    ));
-    registry.register(pid_window_guarded(
+    )));
+    registry.register(crate::surface_observer::action(pid_window_guarded(
         hotkey::HotkeyTool::new(state.clone()),
         &pid_window_candidates,
-    ));
-    registry.register(pid_window_guarded(
+    )));
+    registry.register(crate::surface_observer::action(pid_window_guarded(
         set_value::SetValueTool::new(state.clone()),
         &pid_window_candidates,
-    ));
-    registry.register(pid_window_guarded(
+    )));
+    registry.register(crate::surface_observer::action(pid_window_guarded(
         scroll::ScrollTool::new(state.clone()),
         &pid_window_candidates,
-    ));
+    )));
     cua_driver_core::clipboard::register_clipboard_tools(
         registry,
         Arc::new(clipboard::MacosClipboard::new()),

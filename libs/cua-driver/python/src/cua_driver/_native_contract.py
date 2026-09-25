@@ -7744,6 +7744,59 @@ class _UniffiFfiConverterTypeStartSessionOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.revived, buf)
 
 @dataclass
+class SurfaceWindow:
+    """
+    One window an app opened after an action, addressable with
+    `get_window_state(pid, window_id)`. `pid` is the window's real owner, which
+    can differ from the acted-on app for out-of-process panels.
+"""
+    def __init__(self, *, pid:int, window_id:int, app_name:str, title:str):
+        self.pid = pid
+        self.window_id = window_id
+        self.app_name = app_name
+        self.title = title
+
+
+
+
+    def __str__(self):
+        return "SurfaceWindow(pid={}, window_id={}, app_name={}, title={})".format(self.pid, self.window_id, self.app_name, self.title)
+    def __eq__(self, other):
+        if self.pid != other.pid:
+            return False
+        if self.window_id != other.window_id:
+            return False
+        if self.app_name != other.app_name:
+            return False
+        if self.title != other.title:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeSurfaceWindow(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return SurfaceWindow(
+            pid=_UniffiFfiConverterInt64.read(buf),
+            window_id=_UniffiFfiConverterUInt64.read(buf),
+            app_name=_UniffiFfiConverterString.read(buf),
+            title=_UniffiFfiConverterString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterInt64.check_lower(value.pid)
+        _UniffiFfiConverterUInt64.check_lower(value.window_id)
+        _UniffiFfiConverterString.check_lower(value.app_name)
+        _UniffiFfiConverterString.check_lower(value.title)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterInt64.write(value.pid, buf)
+        _UniffiFfiConverterUInt64.write(value.window_id, buf)
+        _UniffiFfiConverterString.write(value.app_name, buf)
+        _UniffiFfiConverterString.write(value.title, buf)
+
+@dataclass
 class TypeTextInput:
     def __init__(self, *, text:str, target:typing.Optional[ActionTarget], scope:typing.Optional[DesktopScope], session:typing.Optional[str]):
         self.text = text
@@ -8060,6 +8113,95 @@ class _UniffiFfiConverterTypeVisualParseError(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.retryable, buf)
         _UniffiFfiConverterOptionalString.write(value.detail, buf)
 
+class _UniffiFfiConverterSequenceTypeSurfaceWindow(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeSurfaceWindow.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeSurfaceWindow.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeSurfaceWindow.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalTypeSurfaceWindow(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeSurfaceWindow.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeSurfaceWindow.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeSurfaceWindow.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class WindowChange:
+    """
+    New windows reported on the first read after an action. `rebind` is set
+    only when exactly one new window appeared and every candidate's owner was
+    resolved; otherwise the caller chooses from `new_windows` itself.
+"""
+    def __init__(self, *, new_windows:typing.List[SurfaceWindow], rebind:typing.Optional[SurfaceWindow]):
+        self.new_windows = new_windows
+        self.rebind = rebind
+
+
+
+
+    def __str__(self):
+        return "WindowChange(new_windows={}, rebind={})".format(self.new_windows, self.rebind)
+    def __eq__(self, other):
+        if self.new_windows != other.new_windows:
+            return False
+        if self.rebind != other.rebind:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeWindowChange(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return WindowChange(
+            new_windows=_UniffiFfiConverterSequenceTypeSurfaceWindow.read(buf),
+            rebind=_UniffiFfiConverterOptionalTypeSurfaceWindow.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterSequenceTypeSurfaceWindow.check_lower(value.new_windows)
+        _UniffiFfiConverterOptionalTypeSurfaceWindow.check_lower(value.rebind)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterSequenceTypeSurfaceWindow.write(value.new_windows, buf)
+        _UniffiFfiConverterOptionalTypeSurfaceWindow.write(value.rebind, buf)
+
 class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -8272,6 +8414,31 @@ class _UniffiFfiConverterOptionalTypeWindowBounds(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+class _UniffiFfiConverterOptionalTypeWindowChange(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeWindowChange.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeWindowChange.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeWindowChange.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterSequenceTypeSnapshotImage(_UniffiConverterRustBuffer):
     @classmethod
     def check_lower(cls, value):
@@ -8297,7 +8464,7 @@ class _UniffiFfiConverterSequenceTypeSnapshotImage(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowStateOutput:
-    def __init__(self, *, pid:int, window_id:int, snapshot_id:typing.Optional[str], app_name:typing.Optional[str], window_title:typing.Optional[str], tree_markdown:typing.Optional[str], elements:typing.Optional[typing.List[WindowElement]], element_count:typing.Optional[int], total_element_count:typing.Optional[int], returned_element_count:typing.Optional[int], filtered_element_count:typing.Optional[int], elements_complete:typing.Optional[bool], degraded:typing.Optional[bool], degraded_reason:typing.Optional[str], truncated:typing.Optional[bool], truncation_reason:typing.Optional[str], screenshot_width:typing.Optional[int], screenshot_height:typing.Optional[int], screenshot_scale:typing.Optional[float], screenshot_mime_type:typing.Optional[str], screenshot_file_path:typing.Optional[str], screenshot_frame_valid:typing.Optional[bool], window_bounds:typing.Optional[WindowBounds], images:typing.List[SnapshotImage]):
+    def __init__(self, *, pid:int, window_id:int, snapshot_id:typing.Optional[str], app_name:typing.Optional[str], window_title:typing.Optional[str], tree_markdown:typing.Optional[str], elements:typing.Optional[typing.List[WindowElement]], element_count:typing.Optional[int], total_element_count:typing.Optional[int], returned_element_count:typing.Optional[int], filtered_element_count:typing.Optional[int], elements_complete:typing.Optional[bool], degraded:typing.Optional[bool], degraded_reason:typing.Optional[str], truncated:typing.Optional[bool], truncation_reason:typing.Optional[str], screenshot_width:typing.Optional[int], screenshot_height:typing.Optional[int], screenshot_scale:typing.Optional[float], screenshot_mime_type:typing.Optional[str], screenshot_file_path:typing.Optional[str], screenshot_frame_valid:typing.Optional[bool], window_bounds:typing.Optional[WindowBounds], window_change:typing.Optional[WindowChange], images:typing.List[SnapshotImage]):
         self.pid = pid
         self.window_id = window_id
         self.snapshot_id = snapshot_id
@@ -8321,13 +8488,14 @@ class WindowStateOutput:
         self.screenshot_file_path = screenshot_file_path
         self.screenshot_frame_valid = screenshot_frame_valid
         self.window_bounds = window_bounds
+        self.window_change = window_change
         self.images = images
 
 
 
 
     def __str__(self):
-        return "WindowStateOutput(pid={}, window_id={}, snapshot_id={}, app_name={}, window_title={}, tree_markdown={}, elements={}, element_count={}, total_element_count={}, returned_element_count={}, filtered_element_count={}, elements_complete={}, degraded={}, degraded_reason={}, truncated={}, truncation_reason={}, screenshot_width={}, screenshot_height={}, screenshot_scale={}, screenshot_mime_type={}, screenshot_file_path={}, screenshot_frame_valid={}, window_bounds={}, images={})".format(self.pid, self.window_id, self.snapshot_id, self.app_name, self.window_title, self.tree_markdown, self.elements, self.element_count, self.total_element_count, self.returned_element_count, self.filtered_element_count, self.elements_complete, self.degraded, self.degraded_reason, self.truncated, self.truncation_reason, self.screenshot_width, self.screenshot_height, self.screenshot_scale, self.screenshot_mime_type, self.screenshot_file_path, self.screenshot_frame_valid, self.window_bounds, self.images)
+        return "WindowStateOutput(pid={}, window_id={}, snapshot_id={}, app_name={}, window_title={}, tree_markdown={}, elements={}, element_count={}, total_element_count={}, returned_element_count={}, filtered_element_count={}, elements_complete={}, degraded={}, degraded_reason={}, truncated={}, truncation_reason={}, screenshot_width={}, screenshot_height={}, screenshot_scale={}, screenshot_mime_type={}, screenshot_file_path={}, screenshot_frame_valid={}, window_bounds={}, window_change={}, images={})".format(self.pid, self.window_id, self.snapshot_id, self.app_name, self.window_title, self.tree_markdown, self.elements, self.element_count, self.total_element_count, self.returned_element_count, self.filtered_element_count, self.elements_complete, self.degraded, self.degraded_reason, self.truncated, self.truncation_reason, self.screenshot_width, self.screenshot_height, self.screenshot_scale, self.screenshot_mime_type, self.screenshot_file_path, self.screenshot_frame_valid, self.window_bounds, self.window_change, self.images)
     def __eq__(self, other):
         if self.pid != other.pid:
             return False
@@ -8375,6 +8543,8 @@ class WindowStateOutput:
             return False
         if self.window_bounds != other.window_bounds:
             return False
+        if self.window_change != other.window_change:
+            return False
         if self.images != other.images:
             return False
         return True
@@ -8406,6 +8576,7 @@ class _UniffiFfiConverterTypeWindowStateOutput(_UniffiConverterRustBuffer):
             screenshot_file_path=_UniffiFfiConverterOptionalString.read(buf),
             screenshot_frame_valid=_UniffiFfiConverterOptionalBoolean.read(buf),
             window_bounds=_UniffiFfiConverterOptionalTypeWindowBounds.read(buf),
+            window_change=_UniffiFfiConverterOptionalTypeWindowChange.read(buf),
             images=_UniffiFfiConverterSequenceTypeSnapshotImage.read(buf),
         )
 
@@ -8434,6 +8605,7 @@ class _UniffiFfiConverterTypeWindowStateOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.screenshot_file_path)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.screenshot_frame_valid)
         _UniffiFfiConverterOptionalTypeWindowBounds.check_lower(value.window_bounds)
+        _UniffiFfiConverterOptionalTypeWindowChange.check_lower(value.window_change)
         _UniffiFfiConverterSequenceTypeSnapshotImage.check_lower(value.images)
 
     @staticmethod
@@ -8461,6 +8633,7 @@ class _UniffiFfiConverterTypeWindowStateOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.screenshot_file_path, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.screenshot_frame_valid, buf)
         _UniffiFfiConverterOptionalTypeWindowBounds.write(value.window_bounds, buf)
+        _UniffiFfiConverterOptionalTypeWindowChange.write(value.window_change, buf)
         _UniffiFfiConverterSequenceTypeSnapshotImage.write(value.images, buf)
 
 
@@ -8634,9 +8807,11 @@ __all__ = [
     "SnapshotImage",
     "StartSessionInput",
     "StartSessionOutput",
+    "SurfaceWindow",
     "TypeTextInput",
     "VerifyStateInput",
     "VisualParseError",
+    "WindowChange",
     "WindowElement",
     "WindowStateOutput",
 ]
