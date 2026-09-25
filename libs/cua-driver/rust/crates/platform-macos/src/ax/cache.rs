@@ -40,19 +40,36 @@ impl Drop for RetainedElement {
     }
 }
 
+/// The mapping from a row's screen frame to its `screenshot_frame` in the
+/// delivered image: window origin in screen points and delivered pixels per
+/// point. Stored at fixed precision so two looks compare exactly.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ScreenshotTransform {
+    pub origin: (i64, i64),
+    /// Pixels per point times 10,000, rounded.
+    pub pixels_per_point_e4: u32,
+}
+
+impl ScreenshotTransform {
+    pub fn new(origin: (f64, f64), pixels_per_point: f64) -> Self {
+        Self {
+            origin: (origin.0.round() as i64, origin.1.round() as i64),
+            pixels_per_point_e4: (pixels_per_point * 10_000.0).round() as u32,
+        }
+    }
+}
+
 /// Everything about a look that changes what its rows mean without the app
-/// changing: the walk bounds, and the screenshot delivery that decides each
-/// row's `screenshot_frame`. A diff is only offered between looks with equal
-/// bounds, so a consumer never keeps coordinates for a differently scaled
-/// image.
+/// changing: the walk bounds, and the screenshot transform actually
+/// delivered (None when no screenshot came back), which decides each row's
+/// `screenshot_frame`. A diff is only offered between looks with equal
+/// bounds, so a consumer never keeps coordinates for a differently scaled or
+/// differently placed image, or misses frames that only now exist.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LookBounds {
     pub max_elements: usize,
     pub max_depth: usize,
-    pub with_screenshot: bool,
-    pub max_dimension: Option<u32>,
-    pub max_image_dimension: Option<u32>,
-    pub effective_max_image_dimension: u32,
+    pub screenshot: Option<ScreenshotTransform>,
 }
 
 /// The latest look at one window. Besides owning the element handles that

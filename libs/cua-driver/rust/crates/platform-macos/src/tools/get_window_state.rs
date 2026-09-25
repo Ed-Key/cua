@@ -389,81 +389,6 @@ impl Tool for GetWindowStateTool {
             self.state.element_cache.remove(pid, u64::from(window_id));
         }
 
-        // Number rows the way the previous look at this window did
-        // (`diff::assign_stable_indices`) and, after that first look, send only
-        // what changed (`diff::diff_outline`). The previous snapshot lends its
-        // element handles and rendered rows; the walk owner is renumbered in
-        // place and replaces it when published below.
-        //
-        // The per-window lock stays held until that publication: two
-        // overlapping looks must not both hand `next_id` to different new rows.
-        let look_lock = self.state.look_lock(pid, u64::from(window_id));
-        let _look_guard = look_lock.lock().await;
-        let prior = self
-            .state
-            .element_cache
-            .with_latest_payload(pid, u64::from(window_id), |p| p.prior_look());
-        let mut outline_diff: Option<crate::ax::diff::OutlineDiff> = None;
-        let prepared_snapshot = tree_result.as_mut().map(|r| {
-            let bounds = crate::ax::cache::LookBounds {
-                max_elements,
-                max_depth,
-                with_screenshot: should_capture,
-                max_dimension,
-                max_image_dimension,
-                effective_max_image_dimension: effective_max_dim,
-            };
-            let mut next_id = prior.as_ref().map_or(0, |p| p.next_id);
-            match prior.as_ref() {
-                Some(p) => {
-                    let pairs = p.identity_pairs();
-                    // Safety: `p` retains every pointer in `pairs` and outlives
-                    // the matcher.
-                    let mut same = unsafe { crate::ax::diff::identity_matcher(&pairs) };
-                    crate::ax::diff::assign_stable_indices(&mut r.nodes, |ptr| same(ptr), &mut next_id);
-                }
-                None => crate::ax::diff::assign_stable_indices(&mut r.nodes, |_| None, &mut next_id),
-            }
-            // Numbers may have changed; re-render the full outline.
-            r.tree_markdown = crate::ax::tree::render_outline(&r.nodes, query.as_deref(), &r.walk);
-            // Diff only against a previous look this session actually received
-            // in full, taken with the same bounds. Another session never saw
-            // the outline the diff is relative to; a query look delivered only
-            // its matches; different walk bounds would present bound
-            // differences as application changes; a different screenshot
-            // delivery would leave omitted rows with frames for another image.
-            //
-            // ponytail: numbering history lives in the snapshot payload, so the
-            // per-pid LRU (8 windows) or session retirement drops it; the next
-            // look is then a fresh full outline numbered from 0, which the
-            // caller sees whole. Keep a separate history map if agents start
-            // juggling more windows per app than that.
-            let comparable = prior.as_ref().filter(|p| {
-                p.full_delivered
-                    && p.bounds == bounds
-                    && p.session == session_id
-                    && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
-            });
-            if let (true, Some(p)) = (want_diff, comparable) {
-                let title = r
-                    .nodes
-                    .iter()
-                    .find(|n| n.role == "AXWindow")
-                    .and_then(|n| n.title.clone())
-                    .unwrap_or_default();
-                let d = crate::ax::diff::diff_outline(&p.rows, &r.nodes, &title);
-                if d.markdown.len() < r.tree_markdown.len() {
-                    r.tree_markdown = d.markdown.clone();
-                    outline_diff = Some(d);
-                }
-            }
-            let mut owner = walk_owner
-                .take()
-                .expect("walk owner accompanies every tree result");
-            owner.renumber(&r.nodes, next_id, bounds, session_id.clone(), query.is_none());
-            owner
-        });
-
         // Capture the screenshot and deliver it alongside the tree — the
         // grounding frame the agent cross-checks the (sometimes-lying) tree
         // against. Skipped only when `include_screenshot:false` (and no
@@ -583,6 +508,91 @@ impl Tool for GetWindowStateTool {
         let screenshot_frame = screenshot
             .as_ref()
             .map(|(_, _, _, _, _, _, bounds, scale)| (bounds.clone(), *scale));
+
+        // Number rows the way the previous look at this window did
+        // (`diff::assign_stable_indices`) and, after that first look, send only
+        // what changed (`diff::diff_outline`). The previous snapshot lends its
+        // element handles and rendered rows; the walk owner is renumbered in
+        // place and replaces it when published below.
+        //
+        // This runs after the capture on purpose: whether a diff is safe
+        // depends on the screenshot transform actually delivered, not the one
+        // requested, since omitted rows keep their previous screenshot_frame.
+        //
+        // The per-window lock stays held until that publication: two
+        // overlapping looks must not both hand `next_id` to different new rows.
+        let look_lock = self.state.look_lock(pid, u64::from(window_id));
+        let _look_guard = look_lock.lock().await;
+        let prior = self
+            .state
+            .element_cache
+            .with_latest_payload(pid, u64::from(window_id), |p| p.prior_look());
+        let mut outline_diff: Option<crate::ax::diff::OutlineDiff> = None;
+        let prepared_snapshot = tree_result.as_mut().map(|r| {
+            let screenshot_transform = match (screenshot_frame.as_ref(), screenshot_dims) {
+                (Some((bounds, _)), Some((width, _))) if bounds.width > 0.0 => {
+                    Some(crate::ax::cache::ScreenshotTransform::new(
+                        (bounds.x, bounds.y),
+                        f64::from(width) / bounds.width,
+                    ))
+                }
+                _ => None,
+            };
+            let bounds = crate::ax::cache::LookBounds {
+                max_elements,
+                max_depth,
+                screenshot: screenshot_transform,
+            };
+            let mut next_id = prior.as_ref().map_or(0, |p| p.next_id);
+            match prior.as_ref() {
+                Some(p) => {
+                    let pairs = p.identity_pairs();
+                    // Safety: `p` retains every pointer in `pairs` and outlives
+                    // the matcher.
+                    let mut same = unsafe { crate::ax::diff::identity_matcher(&pairs) };
+                    crate::ax::diff::assign_stable_indices(&mut r.nodes, |ptr| same(ptr), &mut next_id);
+                }
+                None => crate::ax::diff::assign_stable_indices(&mut r.nodes, |_| None, &mut next_id),
+            }
+            // Numbers may have changed; re-render the full outline.
+            r.tree_markdown = crate::ax::tree::render_outline(&r.nodes, query.as_deref(), &r.walk);
+            // Diff only against a previous look this session actually received
+            // in full, taken with the same bounds. Another session never saw
+            // the outline the diff is relative to; a query look delivered only
+            // its matches; different walk bounds would present bound
+            // differences as application changes; a different screenshot
+            // transform would leave omitted rows with frames for another image.
+            //
+            // ponytail: numbering history lives in the snapshot payload, so the
+            // per-pid LRU (8 windows) or session retirement drops it; the next
+            // look is then a fresh full outline numbered from 0, which the
+            // caller sees whole. Keep a separate history map if agents start
+            // juggling more windows per app than that.
+            let comparable = prior.as_ref().filter(|p| {
+                p.full_delivered
+                    && p.bounds == bounds
+                    && p.session == session_id
+                    && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
+            });
+            if let (true, Some(p)) = (want_diff, comparable) {
+                let title = r
+                    .nodes
+                    .iter()
+                    .find(|n| n.role == "AXWindow")
+                    .and_then(|n| n.title.clone())
+                    .unwrap_or_default();
+                let d = crate::ax::diff::diff_outline(&p.rows, &r.nodes, &title);
+                if d.markdown.len() < r.tree_markdown.len() {
+                    r.tree_markdown = d.markdown.clone();
+                    outline_diff = Some(d);
+                }
+            }
+            let mut owner = walk_owner
+                .take()
+                .expect("walk owner accompanies every tree result");
+            owner.renumber(&r.nodes, next_id, bounds, session_id.clone(), query.is_none());
+            owner
+        });
 
         // Build response.
         let mut content: Vec<Content> = Vec::new();
