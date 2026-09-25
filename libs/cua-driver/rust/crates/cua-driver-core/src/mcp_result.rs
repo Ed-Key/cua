@@ -208,6 +208,20 @@ mod tests {
     /// Advertises no `outputSchema` at all.
     const UNSCHEMED_TOOL: &str = "no_such_tool";
 
+    /// A field named `title` is data, not a schema annotation: a read that
+    /// reports a newly opened window must pass a strict client.
+    #[test]
+    fn a_window_note_with_titles_conforms_to_the_advertised_schema() {
+        let window = serde_json::json!({
+            "pid": 42, "window_id": 7, "app_name": "App", "title": "Opened"
+        });
+        let result = serde_json::json!({"structuredContent": {
+            "pid": 42, "window_id": 3,
+            "window_change": {"new_windows": [window], "rebind": window}
+        }});
+        assert_conforms("get_window_state", &result);
+    }
+
     #[track_caller]
     fn assert_conforms(tool: &str, result: &Value) {
         let schema = advertised_tool_output_schema(tool).expect("tool advertises a schema");

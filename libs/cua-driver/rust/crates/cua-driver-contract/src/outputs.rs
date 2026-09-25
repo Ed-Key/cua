@@ -136,8 +136,15 @@ fn strip_schema_titles(value: &mut Value) {
         Value::Object(object) => {
             object.remove("title");
             object.remove("description");
-            for child in object.values_mut() {
-                strip_schema_titles(child);
+            for (key, child) in object.iter_mut() {
+                match (key.as_str(), child) {
+                    // Keys here are field names, not keywords: a field named
+                    // `title` must survive. Strip inside each field's schema.
+                    ("properties" | "$defs" | "definitions" | "patternProperties", Value::Object(fields)) => {
+                        fields.values_mut().for_each(strip_schema_titles)
+                    }
+                    (_, child) => strip_schema_titles(child),
+                }
             }
         }
         Value::Array(values) => values.iter_mut().for_each(strip_schema_titles),

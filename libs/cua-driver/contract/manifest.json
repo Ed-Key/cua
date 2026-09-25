@@ -2111,6 +2111,9 @@
                       "format": "int64",
                       "type": "integer"
                     },
+                    "title": {
+                      "type": "string"
+                    },
                     "window_id": {
                       "format": "uint64",
                       "minimum": 0,
@@ -2136,6 +2139,9 @@
                   "pid": {
                     "format": "int64",
                     "type": "integer"
+                  },
+                  "title": {
+                    "type": "string"
                   },
                   "window_id": {
                     "format": "uint64",
@@ -2986,6 +2992,9 @@
                     "array",
                     "null"
                   ]
+                },
+                "title": {
+                  "type": "string"
                 },
                 "window_id": {
                   "format": "uint64",
