@@ -172,7 +172,6 @@ fn pid_of(args: &Value) -> Option<i32> {
 /// first of them.
 fn record_before_action(session: &str, pid: i32) {
     let key = (session.to_owned(), pid);
-    let _serial = key_lock(&key);
     if pending().get(&key).is_some_and(|entry| !entry.read_since) {
         return;
     }
@@ -204,18 +203,20 @@ fn record_before_action(session: &str, pid: i32) {
     );
 }
 
-/// Recording a baseline and consuming it both snapshot the app and then
-/// update the entry; for one (session, app) they must not interleave, or a
-/// stale snapshot could overwrite a newer outcome. Striped so the lock set
-/// never grows; unrelated keys that share a stripe only queue briefly.
-fn key_lock(key: &PendingKey) -> std::sync::MutexGuard<'static, ()> {
+/// One (session, app) runs one of these at a time: an action from recording
+/// its baseline until it has finished, or a read consuming the note. So a
+/// read cannot consume a baseline while the action it belongs to is still
+/// running, and a stale snapshot cannot overwrite a newer outcome. Striped so
+/// the lock set never grows; unrelated keys sharing a stripe only queue.
+/// No wrapped tool calls another wrapped tool for the same key while holding
+/// it (focus_by_pixel uses an unwrapped click; run_sequence is not wrapped).
+async fn key_guard(session: &str, pid: i32) -> tokio::sync::MutexGuard<'static, ()> {
     use std::hash::{Hash, Hasher};
-    static STRIPES: [Mutex<()>; 16] = [const { Mutex::new(()) }; 16];
+    static STRIPES: [tokio::sync::Mutex<()>; 16] =
+        [const { tokio::sync::Mutex::const_new(()) }; 16];
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    key.hash(&mut hasher);
-    STRIPES[(hasher.finish() % 16) as usize]
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+    (session, pid).hash(&mut hasher);
+    STRIPES[(hasher.finish() % 16) as usize].lock().await
 }
 
 /// One appeared root after ownership resolution.
@@ -233,7 +234,6 @@ enum Outcome {
 /// once.
 fn take_window_change(session: &str, pid: i32) -> Option<WindowChange> {
     let key = (session.to_owned(), pid);
-    let _serial = key_lock(&key);
     let (before, generation) = {
         let map = pending();
         let entry = map.get(&key)?;
@@ -473,6 +473,7 @@ impl Tool for SurfaceNoted {
         match self.role {
             Role::Activates => self.inner.invoke(args).await,
             Role::Action => {
+                let _guard = key_guard(&session, pid).await;
                 let recording_session = session.clone();
                 let _ = tokio::task::spawn_blocking(move || {
                     record_before_action(&recording_session, pid)
@@ -485,6 +486,7 @@ impl Tool for SurfaceNoted {
                 if result.is_error == Some(true) {
                     return result;
                 }
+                let _guard = key_guard(&session, pid).await;
                 let change = tokio::task::spawn_blocking(move || take_window_change(&session, pid))
                     .await
                     .ok()
@@ -941,6 +943,70 @@ mod tests {
         let args = serde_json::json!({"_session_id": "runtime/a", "session": "label"});
         assert_eq!(session_of(&args), "runtime/a");
         assert_eq!(session_of(&serde_json::json!({"session": "label"})), "label");
+    }
+
+    struct Probe {
+        def: ToolDef,
+        gate: Option<std::sync::Arc<tokio::sync::Notify>>,
+        started: std::sync::Arc<tokio::sync::Notify>,
+    }
+
+    #[async_trait]
+    impl Tool for Probe {
+        fn def(&self) -> &ToolDef {
+            &self.def
+        }
+        async fn invoke(&self, _args: Value) -> ToolResult {
+            self.started.notify_one();
+            if let Some(gate) = &self.gate {
+                gate.notified().await;
+            }
+            ToolResult::text("done").with_structured(serde_json::json!({}))
+        }
+    }
+
+    fn probe(name: &str, gate: Option<std::sync::Arc<tokio::sync::Notify>>) -> (Box<dyn Tool>, std::sync::Arc<tokio::sync::Notify>) {
+        let started = std::sync::Arc::new(tokio::sync::Notify::new());
+        let tool = Probe {
+            def: ToolDef {
+                name: name.into(),
+                description: "surface note ordering probe".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            gate,
+            started: started.clone(),
+        };
+        (Box::new(tool), started)
+    }
+
+    /// A read of the same app must not consume the note while an action on
+    /// it is still running.
+    #[tokio::test]
+    async fn a_read_waits_for_the_in_flight_action_on_the_same_app() {
+        let gate = std::sync::Arc::new(tokio::sync::Notify::new());
+        let (click, click_started) = probe("click", Some(gate.clone()));
+        let (look, look_started) = probe("get_window_state", None);
+        let click = action(click);
+        let look = read(look);
+        let args = serde_json::json!({"pid": 999_901, "_session_id": "ordering"});
+
+        let click_args = args.clone();
+        let acting = tokio::spawn(async move { click.invoke(click_args).await });
+        click_started.notified().await;
+        let reading = tokio::spawn(async move { look.invoke(args).await });
+        look_started.notified().await; // the read's own state call may run
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(!reading.is_finished(), "the note must wait for the action");
+        gate.notify_one();
+        acting.await.unwrap();
+        tokio::time::timeout(Duration::from_secs(5), reading)
+            .await
+            .expect("read completes once the action finished")
+            .unwrap();
     }
 
     #[test]
