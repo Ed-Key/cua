@@ -1296,6 +1296,23 @@ mod tests {
     use super::is_focus_loss_event;
 
     #[test]
+    fn a_native_blur_recovers_only_with_a_native_focus() {
+        use super::blur_recovery_ms;
+        use serde_json::json;
+        let native = [
+            json!({"kind": "native-window-blur", "at_ms": 100}),
+            json!({"kind": "focus", "at_ms": 110}),
+            json!({"kind": "native-window-focus", "at_ms": 190}),
+        ];
+        assert_eq!(blur_recovery_ms(&native), Some(90), "paired with its own kind");
+        let unrecovered = [
+            json!({"kind": "native-window-blur", "at_ms": 100}),
+            json!({"kind": "focus", "at_ms": 110}),
+        ];
+        assert_eq!(blur_recovery_ms(&unrecovered), None, "a DOM focus does not end it");
+    }
+
+    #[test]
     fn native_window_blur_is_a_focus_loss_even_without_dom_blur() {
         assert!(is_focus_loss_event(
             &serde_json::json!({"kind": "native-window-blur"})
