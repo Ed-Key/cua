@@ -109,7 +109,15 @@ fn consistent_selection(
 /// Prefer app-level focus identity and read selection only on its matched node.
 /// Discard that view if focus changes. Missing or unstable app identity can use
 /// the separate best-effort web focus observation below.
+///
+/// Like the walk, this overruns its deadline by at most one AX read: every
+/// read checks the budget first, and a confirmation that cannot finish leaves
+/// focus and selection unknown.
 pub(crate) unsafe fn enrich_focused_state(pid: i32, nodes: &mut [AXNode], budget: &WalkBudget) {
+    if budget.expired() {
+        retain_stable_focus(nodes, false);
+        return;
+    }
     let Some(before) = focused(pid) else {
         enrich_web_reported_focus(nodes, budget);
         return;
@@ -118,25 +126,35 @@ pub(crate) unsafe fn enrich_focused_state(pid: i32, nodes: &mut [AXNode], budget
         let same = CFEqual(before.as_CFTypeRef(), node.element_ptr as CFTypeRef) != 0;
         node.focused = (same || is_text_role(&node.role)).then_some(same);
         node.text_selection = read_selection_if_focused(&node.role, same, || {
-            read_selection(node.element_ptr as AXUIElementRef)
+            read_selection(node.element_ptr as AXUIElementRef, budget)
         });
     }
-    let unchanged =
-        focused(pid).is_some_and(|after| CFEqual(before.as_CFTypeRef(), after.as_CFTypeRef()) != 0);
+    let unchanged = !budget.expired()
+        && focused(pid).is_some_and(|after| CFEqual(before.as_CFTypeRef(), after.as_CFTypeRef()) != 0);
     retain_stable_focus(nodes, unchanged);
     if !unchanged {
         enrich_web_reported_focus(nodes, budget);
     }
 }
 
-unsafe fn read_selection(element: AXUIElementRef) -> Option<TextSelection> {
-    if copy_string_attr(element, "AXSubrole").as_deref() == Some("AXSecureTextField") {
+/// None when the deadline passes before every read is done: a partial
+/// selection could pair a range with text from different moments.
+unsafe fn read_selection(element: AXUIElementRef, budget: &WalkBudget) -> Option<TextSelection> {
+    if budget.expired()
+        || copy_string_attr(element, "AXSubrole").as_deref() == Some("AXSecureTextField")
+    {
         return None;
     }
-    consistent_selection(
-        || read_range(element),
-        || copy_string_attr(element, "AXSelectedText"),
-    )
+    let cut = std::cell::Cell::new(false);
+    let expired = || {
+        cut.set(cut.get() || budget.expired());
+        cut.get()
+    };
+    let selection = consistent_selection(
+        || if expired() { None } else { read_range(element) },
+        || if expired() { None } else { copy_string_attr(element, "AXSelectedText") },
+    );
+    (!cut.get()).then_some(selection).flatten()
 }
 
 fn unique_reported_focus(reported: &[Option<bool>]) -> Option<usize> {
@@ -190,7 +208,12 @@ unsafe fn enrich_web_reported_focus(nodes: &mut [AXNode], budget: &WalkBudget) {
     };
     let node = &mut nodes[indices[position]];
     let element = node.element_ptr as AXUIElementRef;
-    let selection = read_selection(element);
+    let selection = read_selection(element, budget);
+    if budget.expired() {
+        node.focused = None;
+        node.text_selection = None;
+        return;
+    }
     let after = copy_bool_attr(element, "AXFocused");
     node.focused = (after == Some(true)).then_some(true);
     node.text_selection = stable_reported_selection(selection, after);
