@@ -223,7 +223,7 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                 "get_window_state",
                 serde_json::json!({
                     "pid":fixture.pid,"window_id":fixture.window_id,
-                    "include_screenshot":false
+                    "include_screenshot":false,"diff":false
                 }),
             );
             assert!(!snapshot.is_error(), "{}", snapshot.raw);
@@ -240,7 +240,7 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                 "get_window_state",
                 serde_json::json!({
                     "pid":fixture.pid,"window_id":fixture.window_id,
-                    "include_screenshot":false
+                    "include_screenshot":false,"diff":false
                 }),
             );
             assert!(!refreshed.is_error(), "{}", refreshed.raw);
@@ -311,9 +311,25 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
         assert_eq!(response.action_effect(), Some("unverifiable"));
         assert_eq!(response.action_route(), Some("synthetic_events"));
         let deadline = Instant::now() + Duration::from_secs(2);
+        // Rows load into a buffer before smooth scrolling brings them into
+        // view, so wait for a newly rendered row to be visible, not only loaded.
+        let shows_new_row = |state: &serde_json::Value| {
+            state["visible_rows"].as_array().is_some_and(|rows| {
+                rows.iter().filter_map(|row| row.as_str()).any(|row| {
+                    row.strip_prefix("Message ")
+                        .and_then(|index| index.parse::<u64>().ok())
+                        .is_some_and(|index| index > before["last"].as_u64().unwrap())
+                })
+            })
+        };
         let after = loop {
             let state = read();
-            if state["last"].as_u64() > before["last"].as_u64() || Instant::now() >= deadline {
+            let done = if covered {
+                state["last"].as_u64() > before["last"].as_u64()
+            } else {
+                shows_new_row(&state)
+            };
+            if done || Instant::now() >= deadline {
                 break state;
             }
             thread::sleep(Duration::from_millis(50));
@@ -343,30 +359,49 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                         .and_then(|index| index.parse::<u64>().ok())
                         .is_some_and(|index| index > before["last"].as_u64().unwrap())
                 })
-                .expect("scroll must reveal a newly rendered message inside the viewport");
+                .unwrap_or_else(|| {
+                    panic!("scroll must reveal a newly rendered message inside the viewport: before={before} after={after}")
+                });
+            // Chromium updates its AX tree after the DOM, so the agent may
+            // need a second look. Bound it and record how many reads it took.
             let read_started = Instant::now();
-            let snapshot = fixture.driver.call(
-                "get_window_state",
-                serde_json::json!({
-                    "pid":fixture.pid,"window_id":fixture.window_id,"capture_mode":"ax"
-                }),
-            );
-            let read_elapsed = read_started.elapsed();
-            assert!(!snapshot.is_error(), "{}", snapshot.raw);
-            assert!(
-                snapshot.structured()["elements"]
+            let ax_deadline = read_started + Duration::from_millis(1500);
+            let mut reads = 0;
+            let outline = loop {
+                reads += 1;
+                let snapshot = fixture.driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":fixture.pid,"window_id":fixture.window_id,"capture_mode":"ax",
+                        "diff":false
+                    }),
+                );
+                assert!(!snapshot.is_error(), "{}", snapshot.raw);
+                // A message row is display text: the outline carries it, while
+                // structured elements hold only actionable rows.
+                let state = snapshot.structured();
+                let in_elements = state["elements"]
                     .as_array()
                     .expect("structured accessibility elements")
                     .iter()
-                    .any(|element| element["label"] == new_row || element["value"] == new_row),
-                "fresh AX read omitted newly visible {new_row}: {}",
-                snapshot.text()
+                    .any(|element| element["label"] == new_row || element["value"] == new_row);
+                let outline = state["tree_markdown"].as_str().unwrap_or_default().to_owned();
+                if in_elements || outline.contains(new_row) || Instant::now() >= ax_deadline {
+                    break outline;
+                }
+                thread::sleep(Duration::from_millis(100));
+            };
+            let read_elapsed = read_started.elapsed();
+            assert!(
+                outline.contains(new_row),
+                "AX reads omitted newly visible {new_row} for 1.5s: {outline}"
             );
             eprintln!(
                 "[electron-scroll-timing] {}",
                 serde_json::json!({
                     "scroll_call_ms":scroll_elapsed.as_secs_f64()*1000.0,
                     "following_ax_read_ms":read_elapsed.as_secs_f64()*1000.0,
+                    "ax_reads":reads,
                     "new_row":new_row
                 })
             );
