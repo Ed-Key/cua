@@ -34,16 +34,22 @@ pub struct Rows {
     pub display: HashMap<DisplayKey, usize>,
 }
 
-/// The rendered line plus control state the line does not print. A change in
-/// any of these marks the row `~`.
+/// The rendered line plus the structured state the line does not print:
+/// control state, place in the tree, and whole-point geometry. A change in
+/// any of these marks the row `~`, so a consumer of a diff never keeps a
+/// stale frame or parent for a row it was not shown again.
 fn signature(node: &AXNode) -> String {
+    let frame = node.frame.map(|[x, y, w, h]| [x.round(), y.round(), w.round(), h.round()]);
     format!(
-        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}",
+        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}",
         format_node_line(node),
         node.value_state,
         node.selected,
         node.enabled,
-        node.value_description
+        node.value_description,
+        node.parent_element_index,
+        node.depth,
+        frame
     )
 }
 

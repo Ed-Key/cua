@@ -329,6 +329,11 @@ impl Tool for GetWindowStateTool {
             Some(_) => return ToolResult::error("diff must be a boolean"),
         };
 
+        // The walk leaves one retain on every actionable element. The owner
+        // built inside the blocking task takes them over immediately, so a walk
+        // abandoned by the backstop timeout still releases them when the task
+        // drops its result.
+        let mut walk_owner: Option<crate::ax::cache::CachedSnapshot> = None;
         let mut tree_result = if want_tree {
             let q = query.clone();
             // `timeout_ms` bounds the walk itself: it returns the partial tree
@@ -336,17 +341,22 @@ impl Tool for GetWindowStateTool {
             // for an AX call that ignores the per-element messaging timeout
             // (dropping a spawn_blocking JoinHandle cannot cancel it).
             let walk_future = tokio::task::spawn_blocking(move || {
-                crate::ax::tree::walk_tree_budgeted(
+                let tree = crate::ax::tree::walk_tree_budgeted(
                     pid,
                     Some(window_id),
                     q.as_deref(),
                     max_depth,
                     cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
-                )
+                );
+                let owner = crate::ax::cache::CachedSnapshot::from_nodes(&tree.nodes);
+                (tree, owner)
             });
             let backstop = std::time::Duration::from_millis(timeout_ms) + AX_WALK_BACKSTOP_GRACE;
             match tokio::time::timeout(backstop, walk_future).await {
-                Ok(Ok(tree)) => Some(tree),
+                Ok(Ok((tree, owner))) => {
+                    walk_owner = Some(owner);
+                    Some(tree)
+                }
                 Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
                 Err(_elapsed) => {
                     return ToolResult::error(format!(
@@ -382,15 +392,20 @@ impl Tool for GetWindowStateTool {
         // Number rows the way the previous look at this window did
         // (`diff::assign_stable_indices`) and, after that first look, send only
         // what changed (`diff::diff_outline`). The previous snapshot lends its
-        // element handles and rendered rows; the payload built here replaces
-        // it when published below and takes over the walk's element retains.
+        // element handles and rendered rows; the walk owner is renumbered in
+        // place and replaces it when published below.
+        //
+        // The per-window lock stays held until that publication: two
+        // overlapping looks must not both hand `next_id` to different new rows.
+        let look_lock = self.state.look_lock(pid, u64::from(window_id));
+        let _look_guard = look_lock.lock().await;
+        let prior = self
+            .state
+            .element_cache
+            .with_latest_payload(pid, u64::from(window_id), |p| p.prior_look());
         let mut outline_diff: Option<crate::ax::diff::OutlineDiff> = None;
         let prepared_snapshot = tree_result.as_mut().map(|r| {
             let bounds = (max_elements, max_depth);
-            let prior = self
-                .state
-                .element_cache
-                .with_latest_payload(pid, u64::from(window_id), |p| p.prior_look());
             let mut next_id = prior.as_ref().map_or(0, |p| p.next_id);
             match prior.as_ref() {
                 Some(p) => {
@@ -404,12 +419,14 @@ impl Tool for GetWindowStateTool {
             }
             // Numbers may have changed; re-render the full outline.
             r.tree_markdown = crate::ax::tree::render_outline(&r.nodes, query.as_deref(), &r.walk);
-            // Diff only against a real previous look by this session with the
-            // same bounds. Another session never saw the outline the diff is
-            // relative to, and a different max_elements/max_depth would present
+            // Diff only against a previous look this session actually received
+            // in full, taken with the same bounds. Another session never saw
+            // the outline the diff is relative to; a query look delivered only
+            // its matches; a different max_elements/max_depth would present
             // bound differences as application changes.
             let comparable = prior.as_ref().filter(|p| {
-                p.bounds == bounds
+                p.full_delivered
+                    && p.bounds == bounds
                     && p.session == session_id
                     && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
             });
@@ -426,7 +443,11 @@ impl Tool for GetWindowStateTool {
                     outline_diff = Some(d);
                 }
             }
-            crate::ax::cache::CachedSnapshot::new(&r.nodes, next_id, bounds, session_id.clone())
+            let mut owner = walk_owner
+                .take()
+                .expect("walk owner accompanies every tree result");
+            owner.renumber(&r.nodes, next_id, bounds, session_id.clone(), query.is_none());
+            owner
         });
 
         // Capture the screenshot and deliver it alongside the tree — the
@@ -595,10 +616,14 @@ impl Tool for GetWindowStateTool {
             .map(|r| r.tree_markdown.clone())
             .unwrap_or_default();
 
+        // A screenshot-only look publishes no actionable rows, but it must not
+        // erase the window's numbering history: the next tree look would start
+        // at zero and hand a vanished row's number to another control.
         let snapshot_payload = prepared_snapshot.or_else(|| {
-            screenshot_resize_scale
-                .is_some()
-                .then(|| crate::ax::cache::CachedSnapshot::from_nodes(&[]))
+            screenshot_resize_scale.is_some().then(|| match prior {
+                Some(p) => p.into_history_payload(),
+                None => crate::ax::cache::CachedSnapshot::from_nodes(&[]),
+            })
         });
         let snapshot_id = snapshot_payload
             .filter(|_| scope_matched && !observation_only)

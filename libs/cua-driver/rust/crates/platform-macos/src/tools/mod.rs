@@ -633,6 +633,18 @@ pub struct ToolState {
     pub host_owns_permission_ux: bool,
     /// Advisory host identity for permission diagnostics only.
     pub host_bundle_id: Option<String>,
+    /// One lock per (pid, window_id), held by `get_window_state` from reading
+    /// the previous look to publishing the new one, so two overlapping looks
+    /// cannot both number a new row from the same `next_id`.
+    look_locks: std::sync::Mutex<HashMap<(i32, u64), Arc<tokio::sync::Mutex<()>>>>,
+}
+
+impl ToolState {
+    pub(crate) fn look_lock(&self, pid: i32, window_id: u64) -> Arc<tokio::sync::Mutex<()>> {
+        let mut locks = self.look_locks.lock().unwrap();
+        // ponytail: never pruned; one Arc per window ever observed in this daemon.
+        Arc::clone(locks.entry((pid, window_id)).or_default())
+    }
 }
 
 impl Default for ToolState {
@@ -674,6 +686,7 @@ impl ToolState {
             cursor_overlay_available,
             host_owns_permission_ux,
             host_bundle_id,
+            look_locks: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }

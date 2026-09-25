@@ -17,6 +17,13 @@ impl RetainedElement {
         }
         Self(ptr)
     }
+
+    /// Give up the retain to the caller, who becomes responsible for it.
+    fn into_raw(self) -> usize {
+        let ptr = self.0;
+        std::mem::forget(self);
+        ptr
+    }
 }
 
 impl Clone for RetainedElement {
@@ -50,6 +57,12 @@ pub struct CachedSnapshot {
     /// Session that took this look. A diff is only offered to the same one,
     /// since another session never saw the outline the diff is relative to.
     pub session: Option<String>,
+    /// Whether the session received every row (no query filter), so a later
+    /// diff against these rows describes changes it can follow.
+    pub full_delivered: bool,
+    /// False for a screenshot-only look, which carries the previous rows for
+    /// numbering continuity but must not resolve tokens the caller never saw.
+    pub actionable: bool,
 }
 
 /// What a new look borrows from the previous one, retained independently so
@@ -60,6 +73,7 @@ pub struct PriorLook {
     pub next_id: usize,
     pub bounds: (usize, usize),
     pub session: Option<String>,
+    pub full_delivered: bool,
 }
 
 impl PriorLook {
@@ -68,31 +82,66 @@ impl PriorLook {
     pub fn identity_pairs(&self) -> Vec<(usize, usize)> {
         self.elements.iter().map(|(i, e)| (*i, e.as_ptr())).collect()
     }
+
+    /// A payload that keeps this look's numbering history alive across a
+    /// screenshot-only look without exposing its rows to token resolution.
+    pub fn into_history_payload(self) -> CachedSnapshot {
+        CachedSnapshot {
+            elements: self.elements.into_iter().map(|(i, e)| (i, e.into_raw())).collect(),
+            rows: self.rows,
+            next_id: self.next_id,
+            bounds: self.bounds,
+            session: self.session,
+            full_delivered: self.full_delivered,
+            actionable: false,
+        }
+    }
 }
 
 impl CachedSnapshot {
     /// Takes ownership of the +1 retain the walk left on every actionable
     /// `element_ptr`.
     pub fn from_nodes(nodes: &[AXNode]) -> Self {
-        Self::new(nodes, 0, (0, 0), None)
-    }
-
-    pub fn new(
-        nodes: &[AXNode],
-        next_id: usize,
-        bounds: (usize, usize),
-        session: Option<String>,
-    ) -> Self {
         Self {
             elements: nodes
                 .iter()
                 .filter_map(|node| node.element_index.map(|i| (i, node.element_ptr)))
                 .collect(),
             rows: super::diff::rows_of(nodes),
-            next_id,
-            bounds,
-            session,
+            next_id: 0,
+            bounds: (0, 0),
+            session: None,
+            full_delivered: true,
+            actionable: true,
         }
+    }
+
+    /// Rebuild the row bookkeeping after `nodes` were renumbered. The set of
+    /// actionable elements is unchanged, so the retains carry over one to one.
+    pub fn renumber(
+        &mut self,
+        nodes: &[AXNode],
+        next_id: usize,
+        bounds: (usize, usize),
+        session: Option<String>,
+        full_delivered: bool,
+    ) {
+        let elements: Vec<(usize, usize)> = nodes
+            .iter()
+            .filter_map(|node| node.element_index.map(|i| (i, node.element_ptr)))
+            .collect();
+        debug_assert_eq!(
+            sorted_ptrs(&elements),
+            sorted_ptrs(&self.elements),
+            "renumber must keep exactly the elements the walk retained"
+        );
+        self.elements = elements;
+        self.rows = super::diff::rows_of(nodes);
+        self.next_id = next_id;
+        self.bounds = bounds;
+        self.session = session;
+        self.full_delivered = full_delivered;
+        self.actionable = true;
     }
 
     pub fn prior_look(&self) -> PriorLook {
@@ -106,16 +155,30 @@ impl CachedSnapshot {
             next_id: self.next_id,
             bounds: self.bounds,
             session: self.session.clone(),
+            full_delivered: self.full_delivered,
         }
     }
+}
+
+fn sorted_ptrs(elements: &[(usize, usize)]) -> Vec<usize> {
+    let mut ptrs: Vec<usize> = elements.iter().map(|(_, p)| *p).collect();
+    ptrs.sort_unstable();
+    ptrs
 }
 
 impl SnapshotPayload for CachedSnapshot {
     type Element = RetainedElement;
     fn len(&self) -> usize {
-        self.elements.len()
+        if self.actionable {
+            self.elements.len()
+        } else {
+            0
+        }
     }
     fn retain(&self, index: usize) -> Option<RetainedElement> {
+        if !self.actionable {
+            return None;
+        }
         self.elements
             .iter()
             .find(|(i, _)| *i == index)
@@ -167,6 +230,36 @@ mod tests {
             next_id: index + 1,
             bounds: (0, 0),
             session: None,
+            full_delivered: true,
+            actionable: true,
+        }
+    }
+
+    fn retain_count(ptr: usize) -> isize {
+        unsafe { CFGetRetainCount(ptr as CFTypeRef) }
+    }
+
+    fn button(index: Option<usize>, ptr: usize) -> AXNode {
+        AXNode {
+            element_index: index,
+            role: "AXButton".into(),
+            title: Some("Increment".into()),
+            value: None,
+            description: None,
+            identifier: None,
+            help: None,
+            actions: vec!["AXPress".into()],
+            element_ptr: ptr,
+            depth: 0,
+            parent_element_index: None,
+            frame: None,
+            value_state: None,
+            value_description: None,
+            min_value: None,
+            max_value: None,
+            enabled: None,
+            selected: None,
+            in_web_content: false,
         }
     }
 
@@ -174,24 +267,24 @@ mod tests {
     fn retained_element_survives_concurrent_snapshot_replace() {
         let value = CFString::new("cua-driver-uaf-test-element-placeholder");
         let ptr = value.as_concrete_TypeRef() as usize;
-        let base = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+        let base = retain_count(ptr);
         let cache = ElementCache::new();
         let snapshot = cache.publish(1, 2, payload(0, ptr));
-        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 1);
+        assert_eq!(retain_count(ptr), base + 1);
         let guard = resolve(&cache, snapshot, 0).unwrap();
-        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 2);
+        assert_eq!(retain_count(ptr), base + 2);
         cache.publish(1, 2, CachedSnapshot::from_nodes(&[]));
-        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 1);
+        assert_eq!(retain_count(ptr), base + 1);
         assert!(resolve(&cache, snapshot, 0).is_none());
         drop(guard);
-        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base);
+        assert_eq!(retain_count(ptr), base);
     }
 
     #[test]
     fn admitted_element_survives_cache_destruction_until_native_work_finishes() {
         let value = CFString::new("cua-driver-invariant-admitted-native-work");
         let ptr = value.as_concrete_TypeRef() as usize;
-        let base = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+        let base = retain_count(ptr);
         let cache = ElementCache::new();
         let snapshot = cache.publish(1, 2, payload(0, ptr));
         let guard = resolve(&cache, snapshot, 0).unwrap();
@@ -202,11 +295,11 @@ mod tests {
             drop(guard);
         });
         drop(cache);
-        let retained = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+        let retained = retain_count(ptr);
         finish_tx.send(()).unwrap();
         worker.join().unwrap();
         assert_eq!(retained, base + 1);
-        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base);
+        assert_eq!(retain_count(ptr), base);
     }
 
     #[test]
@@ -234,7 +327,7 @@ mod tests {
     fn prior_look_keeps_elements_alive_after_the_snapshot_is_replaced() {
         let value = CFString::new("cua-driver-prior-look-element");
         let ptr = value.as_concrete_TypeRef() as usize;
-        let base = unsafe { CFGetRetainCount(ptr as CFTypeRef) };
+        let base = retain_count(ptr);
         let cache = ElementCache::new();
         cache.publish(1, 2, payload(3, ptr));
         let prior = cache
@@ -243,9 +336,53 @@ mod tests {
         assert_eq!(prior.identity_pairs(), vec![(3, ptr)]);
         assert_eq!(prior.next_id, 4);
         cache.publish(1, 2, CachedSnapshot::from_nodes(&[]));
-        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base + 1);
+        assert_eq!(retain_count(ptr), base + 1);
         drop(prior);
-        assert_eq!(unsafe { CFGetRetainCount(ptr as CFTypeRef) }, base);
+        assert_eq!(retain_count(ptr), base);
+    }
+
+    #[test]
+    fn history_payload_keeps_numbering_but_resolves_nothing() {
+        // A screenshot-only look republishes the previous rows as history:
+        // the next tree look continues numbering from 4, but a token for row
+        // 3 minted against this snapshot must not resolve.
+        let value = CFString::new("cua-driver-history-payload-element");
+        let ptr = value.as_concrete_TypeRef() as usize;
+        let base = retain_count(ptr);
+        let cache = ElementCache::new();
+        cache.publish(1, 2, payload(3, ptr));
+        let prior = cache
+            .with_latest_payload(1, 2, |p| p.prior_look())
+            .unwrap();
+        let snapshot = cache.publish(1, 2, prior.into_history_payload());
+        assert_eq!(retain_count(ptr), base + 1, "history holds exactly one retain");
+        assert!(resolve(&cache, snapshot, 3).is_none());
+        let again = cache
+            .with_latest_payload(1, 2, |p| p.prior_look())
+            .unwrap();
+        assert_eq!(again.next_id, 4);
+        assert_eq!(again.identity_pairs(), vec![(3, ptr)]);
+        drop(again);
+        cache.publish(1, 2, CachedSnapshot::from_nodes(&[]));
+        assert_eq!(retain_count(ptr), base);
+    }
+
+    #[test]
+    fn renumber_keeps_one_retain_per_element() {
+        let value = CFString::new("cua-driver-renumber-element");
+        let ptr = value.as_concrete_TypeRef() as usize;
+        let base = retain_count(ptr);
+        let mut node = button(Some(0), ptr);
+        unsafe { CFRetain(ptr as CFTypeRef) }; // what the walk would have left
+        let mut owner = CachedSnapshot::from_nodes(std::slice::from_ref(&node));
+        node.element_index = Some(9);
+        owner.renumber(std::slice::from_ref(&node), 10, (1, 1), Some("s".into()), false);
+        assert_eq!(owner.elements, vec![(9, ptr)]);
+        assert_eq!(retain_count(ptr), base + 1);
+        assert!(owner.retain(9).is_some());
+        assert!(!owner.full_delivered);
+        drop(owner);
+        assert_eq!(retain_count(ptr), base);
     }
 
     #[test]
@@ -254,16 +391,13 @@ mod tests {
         let replacement = CFString::new("cua-driver-abandoned-prepared-native-work");
         let original_ptr = original.as_concrete_TypeRef() as usize;
         let replacement_ptr = replacement.as_concrete_TypeRef() as usize;
-        let base = unsafe { CFGetRetainCount(replacement_ptr as CFTypeRef) };
+        let base = retain_count(replacement_ptr);
         let cache = ElementCache::new();
         let snapshot = cache.publish(1, 2, payload(0, original_ptr));
         let prepared = payload(0, replacement_ptr);
         assert_eq!(resolve(&cache, snapshot, 0).unwrap().as_ptr(), original_ptr);
         drop(prepared);
-        assert_eq!(
-            unsafe { CFGetRetainCount(replacement_ptr as CFTypeRef) },
-            base
-        );
+        assert_eq!(retain_count(replacement_ptr), base);
         assert_eq!(resolve(&cache, snapshot, 0).unwrap().as_ptr(), original_ptr);
     }
 }
