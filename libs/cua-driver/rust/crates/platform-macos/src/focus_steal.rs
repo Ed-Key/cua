@@ -150,6 +150,12 @@ impl FocusStealPreventer {
             handle,
             dispatcher: Arc::clone(&shared.dispatcher),
             released: false,
+            config: LeaseConfig {
+                target_pid,
+                allowed_pid: None,
+                restore_to,
+                origin,
+            },
         }
     }
 
@@ -171,6 +177,12 @@ impl FocusStealPreventer {
             handle,
             dispatcher: Arc::clone(&shared.dispatcher),
             released: false,
+            config: LeaseConfig {
+                target_pid: None,
+                allowed_pid: Some(allowed_pid),
+                restore_to,
+                origin,
+            },
         }
     }
 
@@ -216,13 +228,39 @@ pub struct SuppressionLease {
     handle: SuppressionHandle,
     dispatcher: Arc<Dispatcher>,
     released: bool,
+    /// How this lease was armed, so it can be re-armed for lingering even if
+    /// its entry was already reaped.
+    config: LeaseConfig,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct LeaseConfig {
+    target_pid: Option<i32>,
+    allowed_pid: Option<i32>,
+    restore_to: i32,
+    origin: &'static str,
 }
 
 impl SuppressionLease {
-    /// Keep suppressing, but let through activations that follow real user
-    /// input from now on. Used once the armed action's result has returned.
-    pub fn yield_to_user_input(&self) {
-        self.dispatcher.yield_to_user_input(self.handle);
+    /// Re-arm this lease for the post-result phase: same targets, deadline
+    /// `until`, and activations that follow real user input are let through.
+    /// Works even when the original entry was already reaped (a long action).
+    /// The new entry exists before the old one is removed, leaving no gap.
+    pub fn linger_until(self, until: Instant) -> SuppressionLease {
+        let handle = self.dispatcher.add_entry_with(
+            self.config.target_pid,
+            self.config.allowed_pid,
+            self.config.restore_to,
+            self.config.origin,
+            until,
+            Some(Instant::now()),
+        );
+        SuppressionLease {
+            handle,
+            dispatcher: Arc::clone(&self.dispatcher),
+            released: false,
+            config: self.config,
+        }
     }
 
     /// Explicit release. Useful if the caller wants to drop the lease
@@ -315,13 +353,32 @@ impl Dispatcher {
         restore_to: i32,
         origin: &'static str,
     ) -> SuppressionHandle {
+        self.add_entry_with(
+            target_pid,
+            allowed_pid,
+            restore_to,
+            origin,
+            Instant::now() + ENTRY_DEADLINE,
+            None,
+        )
+    }
+
+    fn add_entry_with(
+        self: &Arc<Self>,
+        target_pid: Option<i32>,
+        allowed_pid: Option<i32>,
+        restore_to: i32,
+        origin: &'static str,
+        deadline: Instant,
+        yields_to_user_after: Option<Instant>,
+    ) -> SuppressionHandle {
         let id = Uuid::new_v4();
         let entry = Entry {
             target_pid,
             allowed_pid,
             restore_to,
-            deadline: Instant::now() + ENTRY_DEADLINE,
-            yields_to_user_after: None,
+            deadline,
+            yields_to_user_after,
             origin,
         };
         {
@@ -352,16 +409,6 @@ impl Dispatcher {
     /// Snapshot the entries (cloned to a small Vec) — used by tests
     /// and the activation handler to evaluate matches without holding
     /// the lock across the restore call.
-    fn yield_to_user_input(&self, handle: SuppressionHandle) {
-        if let Some(entry) = self.entries.lock().unwrap().get_mut(&handle.0) {
-            let now = Instant::now();
-            entry.yields_to_user_after = Some(now);
-            // The post-result phase gets its own safety deadline, so a long
-            // action does not arrive here with its entry about to expire.
-            entry.deadline = entry.deadline.max(now + ENTRY_DEADLINE);
-        }
-    }
-
     fn snapshot_matches(&self, activated_pid: i32) -> Vec<i32> {
         self.snapshot_matches_with(activated_pid, user_input_since)
     }
@@ -618,25 +665,51 @@ mod tests {
     /// A background pixel click intentionally makes its target AppKit-active
     /// without raising it. The wildcard guard must allow that one pid while
     /// continuing to suppress unrelated cross-app activations.
-    /// After the action returns, the user's own activation wins: input
-    /// after the yield point lets the activation through; without input the
-    /// wildcard still restores.
-    #[test]
-    fn yielded_entry_lets_user_activations_through() {
-        let d = Arc::new(Dispatcher::new());
-        let h = d.add(None, 7, "test.yield");
-        d.yield_to_user_input(h);
-        assert_eq!(d.snapshot_matches_with(42, |_| false), vec![7]);
-        assert!(d.snapshot_matches_with(42, |_| true).is_empty());
-        d.remove(h);
+    fn test_lease(handle: SuppressionHandle, d: &Arc<Dispatcher>) -> SuppressionLease {
+        SuppressionLease {
+            handle,
+            dispatcher: Arc::clone(d),
+            released: false,
+            config: LeaseConfig {
+                target_pid: None,
+                allowed_pid: None,
+                restore_to: 7,
+                origin: "test.lease",
+            },
+        }
+    }
 
+    /// After the action returns, the user's own activation wins: input
+    /// after the linger point lets the activation through; without input
+    /// the wildcard still restores.
+    #[test]
+    fn lingering_lease_lets_user_activations_through() {
+        let d = Arc::new(Dispatcher::new());
         let h = d.add(None, 7, "test.no_yield");
         assert_eq!(
             d.snapshot_matches_with(42, |_| true),
             vec![7],
-            "an entry that has not yielded ignores user input"
+            "an in-action entry ignores user input"
         );
-        d.remove(h);
+        let lingering = test_lease(h, &d).linger_until(Instant::now() + Duration::from_secs(1));
+        assert_eq!(d.len(), 1, "the re-armed entry replaces the original");
+        assert_eq!(d.snapshot_matches_with(42, |_| false), vec![7]);
+        assert!(d.snapshot_matches_with(42, |_| true).is_empty());
+        drop(lingering);
+        assert_eq!(d.len(), 0);
+    }
+
+    /// A long action's entry can be reaped before its result returns; the
+    /// linger re-arm must still protect for the full bound.
+    #[test]
+    fn linger_rearms_after_the_original_entry_was_reaped() {
+        let d = Arc::new(Dispatcher::new());
+        let h = d.add(None, 7, "test.long");
+        d.entries.lock().unwrap().get_mut(&h.0).unwrap().deadline =
+            Instant::now() - Duration::from_secs(1);
+        assert_eq!(d.reap_expired(), 1);
+        let _lingering = test_lease(h, &d).linger_until(Instant::now() + Duration::from_secs(10));
+        assert_eq!(d.snapshot_matches_with(42, |_| false), vec![7]);
     }
 
     #[test]
@@ -665,11 +738,7 @@ mod tests {
         // Use a private dispatcher to avoid singleton coupling.
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(1), 2, "test.lease");
-        let lease = SuppressionLease {
-            handle: h,
-            dispatcher: Arc::clone(&d),
-            released: false,
-        };
+        let lease = test_lease(h, &d);
         assert_eq!(d.len(), 1);
         drop(lease);
         assert_eq!(d.len(), 0);
@@ -680,11 +749,7 @@ mod tests {
     fn lease_release_removes_entry() {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(1), 2, "test.lease");
-        let lease = SuppressionLease {
-            handle: h,
-            dispatcher: Arc::clone(&d),
-            released: false,
-        };
+        let lease = test_lease(h, &d);
         lease.release();
         assert_eq!(d.len(), 0);
     }

@@ -236,8 +236,8 @@ impl Snapshot {
             if !bounds.skips_observation() {
                 // Timed from the result, not the snapshot, so a long action
                 // keeps the full protection window after it finishes.
-                lease.yield_to_user_input();
-                linger(Box::new(lease), Instant::now() + bounds.timeout);
+                let until = Instant::now() + bounds.timeout;
+                linger(Box::new(lease.linger_until(until)), until);
             }
         }
         Changes { foreground_changed }

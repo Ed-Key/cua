@@ -37,7 +37,7 @@ const OWNER_CATCH_UP_INTERVAL: Duration = Duration::from_millis(80);
 /// ponytail: bounded map, oldest entry evicted; a session that acts on many
 /// apps without reading them loses its oldest unreported note.
 const MAX_PENDING: usize = 64;
-/// Reads after which a root whose owner never resolves stops blocking.
+/// Reads after which one root whose owner never resolves stops blocking.
 const MAX_UNRESOLVED_READS: u32 = 3;
 
 /// Unique across every baseline ever created, so a read that started
@@ -137,8 +137,8 @@ struct Pending {
     /// A read already found nothing new against this baseline. The next action
     /// starts a fresh baseline instead of reporting stale windows later.
     read_since: bool,
-    /// Consecutive reads that found a root whose owner was still unknown.
-    unresolved_reads: u32,
+    /// Per root: reads so far that found its owner still unknown.
+    unresolved_reads: HashMap<RootKey, u32>,
 }
 
 type PendingKey = (String, i32);
@@ -172,15 +172,30 @@ fn pid_of(args: &Value) -> Option<i32> {
 /// first of them.
 fn record_before_action(session: &str, pid: i32) {
     let key = (session.to_owned(), pid);
-    if pending().get(&key).is_some_and(|entry| !entry.read_since) {
+    let observed = match pending().get(&key) {
+        Some(entry) if !entry.read_since => return,
+        Some(entry) => Some(entry.generation),
+        None => None,
+    };
+    let roots = snapshot_roots(pid);
+    let mut map = pending();
+    // Replace only what was seen before the snapshot started. A read that
+    // finished meanwhile (for example one that kept an unresolved root
+    // pending) or another action's baseline wins.
+    let current = map.get(&key).map(|entry| (entry.generation, entry.read_since));
+    let unchanged = match (observed, current) {
+        (None, None) => true,
+        (Some(seen), Some((generation, true))) => seen == generation,
+        _ => false,
+    };
+    if !unchanged {
         return;
     }
     // An unknown baseline must not make existing windows look new later.
-    let Some(roots) = snapshot_roots(pid) else {
-        pending().remove(&key);
+    let Some(roots) = roots else {
+        map.remove(&key);
         return;
     };
-    let mut map = pending();
     if map.len() >= MAX_PENDING && !map.contains_key(&key) {
         if let Some(oldest) = map
             .iter()
@@ -197,7 +212,7 @@ fn record_before_action(session: &str, pid: i32) {
             recorded: Instant::now(),
             generation: next_generation(),
             read_since: false,
-            unresolved_reads: 0,
+            unresolved_reads: HashMap::new(),
         },
     );
 }
@@ -243,30 +258,37 @@ fn finish_take(
         return None; // another read or a new baseline got here first
     }
     entry.generation = next_generation();
-    // A root whose owner never resolves stops blocking after a few reads.
-    let give_up = entry.unresolved_reads + 1 >= MAX_UNRESOLVED_READS;
     let mut reported = Vec::new();
-    let mut unresolved = false;
+    let mut still_unresolved = HashMap::new();
     for ((root_key, root), outcome) in appeared.into_iter().zip(outcomes) {
         match outcome {
             Outcome::Reported(window) => {
                 entry.roots.insert(root_key, root);
                 reported.push(window);
             }
-            Outcome::Unresolved if !give_up => unresolved = true,
-            Outcome::Unaddressable | Outcome::Unresolved => {
+            Outcome::Unresolved => {
+                // Each root has its own budget; one that never resolves
+                // stops blocking without taking newer roots with it.
+                let tries = entry.unresolved_reads.get(&root_key).copied().unwrap_or(0) + 1;
+                if tries >= MAX_UNRESOLVED_READS {
+                    entry.roots.insert(root_key, root);
+                } else {
+                    still_unresolved.insert(root_key, tries);
+                }
+            }
+            Outcome::Unaddressable => {
                 entry.roots.insert(root_key, root);
             }
         }
     }
+    let unresolved = !still_unresolved.is_empty();
+    entry.unresolved_reads = still_unresolved;
     if unresolved {
         // Keep this baseline across the next action so the root can still
         // be reported once its owner resolves.
         entry.read_since = false;
-        entry.unresolved_reads += 1;
     } else if reported.is_empty() {
         entry.read_since = true;
-        entry.unresolved_reads = 0;
     } else {
         map.remove(key);
     }
@@ -735,7 +757,7 @@ mod tests {
                 recorded: Instant::now(),
                 generation: 7,
                 read_since: false,
-                unresolved_reads: 0,
+                unresolved_reads: HashMap::new(),
             },
         );
         (key, 7)
@@ -874,6 +896,29 @@ mod tests {
         let entry = map.get(&key).unwrap();
         assert!(entry.roots.contains_key(&native(9, "AXWindow")), "given up and treated as known");
         assert!(entry.read_since);
+    }
+
+    #[test]
+    fn each_root_has_its_own_retry_budget() {
+        let (key, _) = seed("per-root-budget", 4107);
+        let old = (native(9, "AXWindow"), root(9, "Ghost"));
+        let new = (native(10, "AXWindow"), root(10, "Late"));
+        for _ in 0..MAX_UNRESOLVED_READS - 1 {
+            let generation = pending().get(&key).unwrap().generation;
+            finish_take(&key, generation, vec![old.clone()], vec![Outcome::Unresolved]);
+        }
+        let generation = pending().get(&key).unwrap().generation;
+        finish_take(
+            &key,
+            generation,
+            vec![old.clone(), new.clone()],
+            vec![Outcome::Unresolved, Outcome::Unresolved],
+        );
+        let map = pending();
+        let entry = map.get(&key).unwrap();
+        assert!(entry.roots.contains_key(&old.0), "exhausted root is given up");
+        assert!(!entry.roots.contains_key(&new.0), "a newer root keeps its own retries");
+        assert_eq!(entry.unresolved_reads.get(&new.0), Some(&1));
     }
 
     #[test]
