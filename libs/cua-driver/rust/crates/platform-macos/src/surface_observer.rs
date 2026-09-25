@@ -172,25 +172,12 @@ fn pid_of(args: &Value) -> Option<i32> {
 /// first of them.
 fn record_before_action(session: &str, pid: i32) {
     let key = (session.to_owned(), pid);
-    let observed = match pending().get(&key) {
-        Some(entry) if !entry.read_since => return,
-        Some(entry) => Some(entry.generation),
-        None => None,
-    };
-    let roots = snapshot_roots(pid);
-    let mut map = pending();
-    // Replace only what was seen before the snapshot started. A read that
-    // finished meanwhile (for example one that kept an unresolved root
-    // pending) or another action's baseline wins.
-    let current = map.get(&key).map(|entry| (entry.generation, entry.read_since));
-    let unchanged = match (observed, current) {
-        (None, None) => true,
-        (Some(seen), Some((generation, true))) => seen == generation,
-        _ => false,
-    };
-    if !unchanged {
+    let _serial = key_lock(&key);
+    if pending().get(&key).is_some_and(|entry| !entry.read_since) {
         return;
     }
+    let roots = snapshot_roots(pid);
+    let mut map = pending();
     // An unknown baseline must not make existing windows look new later.
     let Some(roots) = roots else {
         map.remove(&key);
@@ -217,6 +204,20 @@ fn record_before_action(session: &str, pid: i32) {
     );
 }
 
+/// Recording a baseline and consuming it both snapshot the app and then
+/// update the entry; for one (session, app) they must not interleave, or a
+/// stale snapshot could overwrite a newer outcome. Striped so the lock set
+/// never grows; unrelated keys that share a stripe only queue briefly.
+fn key_lock(key: &PendingKey) -> std::sync::MutexGuard<'static, ()> {
+    use std::hash::{Hash, Hasher};
+    static STRIPES: [Mutex<()>; 16] = [const { Mutex::new(()) }; 16];
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    key.hash(&mut hasher);
+    STRIPES[(hasher.finish() % 16) as usize]
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 /// One appeared root after ownership resolution.
 enum Outcome {
     /// Addressable window with a known owner: reported now.
@@ -232,6 +233,7 @@ enum Outcome {
 /// once.
 fn take_window_change(session: &str, pid: i32) -> Option<WindowChange> {
     let key = (session.to_owned(), pid);
+    let _serial = key_lock(&key);
     let (before, generation) = {
         let map = pending();
         let entry = map.get(&key)?;
