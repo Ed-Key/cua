@@ -31,12 +31,15 @@ def load_ours(args):
     if args.ours:
         data = json.load(open(args.ours))
     else:
-        req = {"pid": args.pid, "window_id": args.window_id, "include_screenshot": False}
+        # Always the full outline: a same-session earlier look would otherwise turn this into a diff.
+        req = {"pid": args.pid, "window_id": args.window_id, "include_screenshot": False, "diff": False}
         out = subprocess.run([CUA, "call", "get_window_state", json.dumps(req)], capture_output=True, text=True, check=True).stdout
         data = json.loads(out)
         if args.save_ours:
             open(args.save_ours, "w").write(out)
     sc = data.get("structuredContent") or data
+    if "diff" in sc:
+        sys.exit("saved response is a change-only diff, not a full outline; re-capture with diff:false")
     nodes = []
     for el in sc.get("elements", []):
         # Label already carries the value for most Cocoa rows; prefer one to avoid double counting.

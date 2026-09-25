@@ -40,6 +40,21 @@ impl Drop for RetainedElement {
     }
 }
 
+/// Everything about a look that changes what its rows mean without the app
+/// changing: the walk bounds, and the screenshot delivery that decides each
+/// row's `screenshot_frame`. A diff is only offered between looks with equal
+/// bounds, so a consumer never keeps coordinates for a differently scaled
+/// image.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct LookBounds {
+    pub max_elements: usize,
+    pub max_depth: usize,
+    pub with_screenshot: bool,
+    pub max_dimension: Option<u32>,
+    pub max_image_dimension: Option<u32>,
+    pub effective_max_image_dimension: u32,
+}
+
 /// The latest look at one window. Besides owning the element handles that
 /// tokens resolve to, it keeps what the next look needs to number rows the
 /// same way (`diff::assign_stable_indices`) and to send only what changed
@@ -52,8 +67,7 @@ pub struct CachedSnapshot {
     pub rows: Rows,
     /// Next never-used `element_index` for this window.
     pub next_id: usize,
-    /// `(max_elements, max_depth)` the walk was bounded by.
-    pub bounds: (usize, usize),
+    pub bounds: LookBounds,
     /// Session that took this look. A diff is only offered to the same one,
     /// since another session never saw the outline the diff is relative to.
     pub session: Option<String>,
@@ -71,7 +85,7 @@ pub struct PriorLook {
     pub elements: Vec<(usize, RetainedElement)>,
     pub rows: Rows,
     pub next_id: usize,
-    pub bounds: (usize, usize),
+    pub bounds: LookBounds,
     pub session: Option<String>,
     pub full_delivered: bool,
 }
@@ -109,7 +123,7 @@ impl CachedSnapshot {
                 .collect(),
             rows: super::diff::rows_of(nodes),
             next_id: 0,
-            bounds: (0, 0),
+            bounds: LookBounds::default(),
             session: None,
             full_delivered: true,
             actionable: true,
@@ -122,7 +136,7 @@ impl CachedSnapshot {
         &mut self,
         nodes: &[AXNode],
         next_id: usize,
-        bounds: (usize, usize),
+        bounds: LookBounds,
         session: Option<String>,
         full_delivered: bool,
     ) {
@@ -228,7 +242,7 @@ mod tests {
             elements: vec![(index, ptr)],
             rows: Rows::default(),
             next_id: index + 1,
-            bounds: (0, 0),
+            bounds: LookBounds::default(),
             session: None,
             full_delivered: true,
             actionable: true,
@@ -376,7 +390,9 @@ mod tests {
         unsafe { CFRetain(ptr as CFTypeRef) }; // what the walk would have left
         let mut owner = CachedSnapshot::from_nodes(std::slice::from_ref(&node));
         node.element_index = Some(9);
-        owner.renumber(std::slice::from_ref(&node), 10, (1, 1), Some("s".into()), false);
+        let bounds = LookBounds { max_elements: 1, ..LookBounds::default() };
+        owner.renumber(std::slice::from_ref(&node), 10, bounds, Some("s".into()), false);
+        assert_eq!(owner.bounds, bounds);
         assert_eq!(owner.elements, vec![(9, ptr)]);
         assert_eq!(retain_count(ptr), base + 1);
         assert!(owner.retain(9).is_some());

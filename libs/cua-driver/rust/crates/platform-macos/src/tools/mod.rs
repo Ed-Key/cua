@@ -642,7 +642,12 @@ pub struct ToolState {
 impl ToolState {
     pub(crate) fn look_lock(&self, pid: i32, window_id: u64) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.look_locks.lock().unwrap();
-        // ponytail: never pruned; one Arc per window ever observed in this daemon.
+        // A lock only matters while someone holds or waits on it (strong
+        // count above the map's own). Drop the idle ones once the map grows,
+        // so window churn does not accumulate entries for closed windows.
+        if locks.len() >= 64 {
+            locks.retain(|_, lock| Arc::strong_count(lock) > 1);
+        }
         Arc::clone(locks.entry((pid, window_id)).or_default())
     }
 }

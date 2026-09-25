@@ -39,9 +39,11 @@ pub struct Rows {
 /// any of these marks the row `~`, so a consumer of a diff never keeps a
 /// stale frame or parent for a row it was not shown again.
 fn signature(node: &AXNode) -> String {
+    // Whole points: sub-point jitter from animation is not a change worth a
+    // row, and the structured frame's fractions matter to nobody clicking it.
     let frame = node.frame.map(|[x, y, w, h]| [x.round(), y.round(), w.round(), h.round()]);
     format!(
-        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}",
+        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}",
         format_node_line(node),
         node.value_state,
         node.selected,
@@ -49,7 +51,11 @@ fn signature(node: &AXNode) -> String {
         node.value_description,
         node.parent_element_index,
         node.depth,
-        frame
+        frame,
+        node.min_value,
+        node.max_value,
+        node.in_web_content,
+        node.actions
     )
 }
 

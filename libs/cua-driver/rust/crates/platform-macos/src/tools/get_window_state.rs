@@ -405,7 +405,14 @@ impl Tool for GetWindowStateTool {
             .with_latest_payload(pid, u64::from(window_id), |p| p.prior_look());
         let mut outline_diff: Option<crate::ax::diff::OutlineDiff> = None;
         let prepared_snapshot = tree_result.as_mut().map(|r| {
-            let bounds = (max_elements, max_depth);
+            let bounds = crate::ax::cache::LookBounds {
+                max_elements,
+                max_depth,
+                with_screenshot: should_capture,
+                max_dimension,
+                max_image_dimension,
+                effective_max_image_dimension: effective_max_dim,
+            };
             let mut next_id = prior.as_ref().map_or(0, |p| p.next_id);
             match prior.as_ref() {
                 Some(p) => {
@@ -422,8 +429,15 @@ impl Tool for GetWindowStateTool {
             // Diff only against a previous look this session actually received
             // in full, taken with the same bounds. Another session never saw
             // the outline the diff is relative to; a query look delivered only
-            // its matches; a different max_elements/max_depth would present
-            // bound differences as application changes.
+            // its matches; different walk bounds would present bound
+            // differences as application changes; a different screenshot
+            // delivery would leave omitted rows with frames for another image.
+            //
+            // ponytail: numbering history lives in the snapshot payload, so the
+            // per-pid LRU (8 windows) or session retirement drops it; the next
+            // look is then a fresh full outline numbered from 0, which the
+            // caller sees whole. Keep a separate history map if agents start
+            // juggling more windows per app than that.
             let comparable = prior.as_ref().filter(|p| {
                 p.full_delivered
                     && p.bounds == bounds
