@@ -5155,10 +5155,11 @@ fn run_native_file_picker(spec: &BrowserSpec) {
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             let windows = fixture.driver.call("list_windows", serde_json::json!({}));
+            assert!(!windows.is_error(), "{}", windows.raw);
             let open = windows.structured()["windows"]
                 .as_array()
-                .into_iter()
-                .flatten()
+                .expect("list_windows returns a windows array")
+                .iter()
                 .any(|w| w["window_id"].as_u64() == Some(panel_wid) && w["is_on_screen"] == true);
             if !open {
                 break;
