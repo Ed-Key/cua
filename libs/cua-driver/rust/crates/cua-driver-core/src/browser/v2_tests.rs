@@ -1832,6 +1832,21 @@ async fn semantic_missing_title_is_incomplete_instead_of_using_the_cached_tab_ti
     assert_eq!(snapshot["snapshot"]["complete"], false, "{snapshot}");
 }
 
+/// With the snapshot title unavailable, an empty main-root title reaches
+/// the page as "" (unit coverage: document_title_keeps_the_root_name_exactly).
+#[tokio::test]
+async fn semantic_empty_accessibility_title_fallback_is_valid() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.omit_snapshot_title = true;
+        st.semantic_title = Some(String::new());
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snapshot = semantic_snapshot(&f, &target, &tab).await;
+    assert_eq!(snapshot["page"]["title"], "", "{snapshot}");
+}
+
 #[tokio::test]
 async fn semantic_empty_document_title_is_valid() {
     let f = fixture_with(|st| st.main_title.clear()).await;

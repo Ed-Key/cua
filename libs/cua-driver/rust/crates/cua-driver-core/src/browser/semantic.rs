@@ -118,6 +118,9 @@ pub(crate) struct SemanticNode {
     pub(crate) backend_node_id: Option<i64>,
     pub(crate) role: String,
     pub(crate) name: Option<String>,
+    /// A web-area root's name exactly as reported, for the page title:
+    /// cleanup would turn an empty title into "missing" and rewrite others.
+    pub(crate) root_title: Option<String>,
     pub(crate) value: Option<String>,
     pub(crate) url: Option<String>,
     pub(crate) states: BTreeMap<String, Value>,
@@ -181,7 +184,7 @@ impl SemanticDocument {
                     && node.parent_ax_id.is_none()
                     && matches!(node.role.as_str(), "rootwebarea" | "webarea")
             })
-            .and_then(|node| node.name.as_deref())
+            .and_then(|node| node.root_title.as_deref())
     }
 
     pub(crate) fn extend(&mut self, mut other: Self) {
@@ -580,6 +583,9 @@ pub(crate) fn compose_accessibility_tree(
         let states = ax_states(ax);
         let visibility = classify_visibility(dom_meta, layout_meta, viewport);
         let actions = action_kinds(&role, dom_meta, &states, layout_meta);
+        let root_title = matches!(role.as_str(), "rootwebarea" | "webarea")
+            .then(|| ax_value_string(ax.get("name")))
+            .flatten();
         let name = ax_value_string(ax.get("name")).and_then(clean_semantic_text);
         let value = ax_value_string(ax.get("value")).and_then(clean_semantic_text);
         let document_order = dom_meta.map_or(fallback_order, |meta| meta.order);
@@ -603,6 +609,7 @@ pub(crate) fn compose_accessibility_tree(
             url: link_destination(&role, Some(ax), dom_meta),
             role,
             name,
+            root_title,
             value,
             states,
             frame: frame.clone(),
@@ -743,6 +750,7 @@ fn supplement_dom_actions(
             url: link_destination(&role, None, Some(meta)),
             role,
             name,
+            root_title: None,
             value: meta
                 .attrs
                 .get("value")
@@ -778,14 +786,13 @@ fn link_destination(role: &str, ax: Option<&Value>, dom: Option<&DomMeta>) -> Op
         return None;
     }
     let href = dom.attrs.get("href")?;
-    if url::Url::parse(href).is_ok() {
-        return Some(href.clone());
+    // Resolve against the containing document's base as a browser does: a
+    // same-scheme reference such as "https:book" is relative, not absolute.
+    // Only without a base does the href stand alone.
+    match dom.base_url.as_deref().and_then(|base| url::Url::parse(base).ok()) {
+        Some(base) => base.join(href).ok().map(Into::into),
+        None => url::Url::parse(href).ok().map(Into::into),
     }
-    url::Url::parse(dom.base_url.as_deref()?)
-        .ok()?
-        .join(href)
-        .ok()
-        .map(Into::into)
 }
 
 fn attributes(node: &Value) -> HashMap<String, String> {
@@ -1330,6 +1337,23 @@ mod tests {
             Some("https://inner.test/custom/book")
         );
         assert!(link_destination("link", None, dom.nodes.get(&3)).is_none());
+        let scheme_relative = json!({"nodeType":9,"baseURL":"https://example.test/base/page",
+            "children":[{"nodeType":1,"nodeName":"A","backendNodeId":4,"attributes":["href","https:book"]}]});
+        let dom = build_dom_index(&scheme_relative);
+        assert_eq!(
+            link_destination("link", None, dom.nodes.get(&4)).as_deref(),
+            Some("https://example.test/base/book"),
+            "same-scheme reference resolves against the base"
+        );
+        let no_base = json!({"nodeType":9,
+            "children":[{"nodeType":1,"nodeName":"A","backendNodeId":5,"attributes":["href","HTTPS://Example.test/a b"]}]});
+        let dom = build_dom_index(&no_base);
+        assert_eq!(
+            link_destination("link", None, dom.nodes.get(&5)).as_deref(),
+            Some("https://example.test/a%20b"),
+            "without a base, the parsed URL is serialized"
+        );
+        let dom = build_dom_index(&root);
         let long_url = format!("https://resolved.test/?q={}%2F#slot", "x".repeat(1200));
         let ax = json!({"properties":[{"name":"url","value":{"type":"string","value":long_url}}]});
         assert_eq!(
@@ -1356,6 +1380,24 @@ mod tests {
                 link_destination("link", None, dom.nodes.get(&1)).as_deref(),
                 Some(expected)
             );
+        }
+    }
+
+    /// The title fallback reads the main root's name as reported: an empty
+    /// title stays "" (the page has none), and text cleanup never rewrites it.
+    #[test]
+    fn document_title_keeps_the_root_name_exactly() {
+        for (reported, expected) in [("", ""), ("  Two  spaces \u{a0}", "  Two  spaces \u{a0}")] {
+            let ax = json!({"nodes":[{"nodeId":"root","role":{"value":"RootWebArea"},
+                "name":{"value":reported}}]});
+            let doc = compose_accessibility_tree(
+                &ax,
+                &DomIndex::default(),
+                &LayoutIndex::default(),
+                &Viewport::default(),
+                frame(),
+            );
+            assert_eq!(doc.document_title(), Some(expected), "{reported:?}");
         }
     }
 

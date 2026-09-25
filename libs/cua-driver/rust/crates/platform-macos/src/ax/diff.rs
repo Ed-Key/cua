@@ -43,13 +43,15 @@ fn signature(node: &AXNode) -> String {
     // row, and the structured frame's fractions matter to nobody clicking it.
     let frame = node.frame.map(|[x, y, w, h]| [x.round(), y.round(), w.round(), h.round()]);
     format!(
-        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}",
+        "{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}\u{1}{:?}\u{1}{:?}\u{1}{}\u{1}{:?}",
         format_node_line(node),
         node.value_state,
         node.value_settable,
         // The line shows only focused=true; false and unknown differ too.
         node.focused,
         node.text_selection,
+        // A link's destination is not in the line; a changed URL is a change.
+        node.url,
         node.selected,
         node.enabled,
         node.value_description,
@@ -308,6 +310,18 @@ mod tests {
         assert_ne!(signature(&a), signature(&b));
         b.value_settable = None;
         assert_ne!(signature(&a), signature(&b), "unknown is a change too");
+    }
+
+    #[test]
+    fn link_destination_change_or_removal_marks_the_row_changed() {
+        let mut a = node(Some(1), 0, None, "v", 1);
+        let mut b = node(Some(1), 0, None, "v", 1);
+        a.url = Some("https://example.test/a".into());
+        b.url = Some("https://example.test/b".into());
+        assert_eq!(format_node_line(&a), format_node_line(&b));
+        assert_ne!(signature(&a), signature(&b), "changed destination");
+        b.url = None;
+        assert_ne!(signature(&a), signature(&b), "removed destination");
     }
 
     #[test]
