@@ -489,26 +489,8 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         return ms / 1000
     }
 
-    /// Take focus after the configured delay and record the attempt, so a test
-    /// can prove the theft was actually tried (CUA_APPKIT_THIEF_TRACE).
     @objc private func onSteal() {
-        let delay = thiefDelayMs ?? 0
-        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) { [weak self] in
-            NSApp.activate(ignoringOtherApps: true)
-            self?.window.makeKeyAndOrderFront(nil)
-            let attempted = Date().timeIntervalSince1970
-            DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) {
-                guard let path = ProcessInfo.processInfo.environment["CUA_APPKIT_THIEF_TRACE"] else { return }
-                let line = "{\"delay_ms\":\(delay),\"attempted_at\":\(attempted),\"active_after_100ms\":\(NSApp.isActive)}\n"
-                if let handle = FileHandle(forWritingAtPath: path) {
-                    handle.seekToEndOfFile()
-                    handle.write(Data(line.utf8))
-                    handle.closeFile()
-                } else {
-                    FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
-                }
-            }
-        }
+        stealFocus(after: thiefDelayMs ?? 0, window: window)
     }
 
     @objc private func onReset() {
@@ -791,6 +773,28 @@ func installMenuBar(target: HarnessWindowController) {
 
 // MARK: - Entry
 
+/// Take focus after `delay` ms, the way an app reacting to a click often
+/// does, and record the attempt (CUA_APPKIT_THIEF_TRACE) so a test can prove
+/// the theft was actually tried.
+func stealFocus(after delay: Int, window: NSWindow?) {
+    DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(delay)) {
+        NSApp.activate(ignoringOtherApps: true)
+        window?.makeKeyAndOrderFront(nil)
+        let attempted = Date().timeIntervalSince1970
+        DispatchQueue.main.asyncAfter(deadline: .now() + .milliseconds(100)) {
+            guard let path = ProcessInfo.processInfo.environment["CUA_APPKIT_THIEF_TRACE"] else { return }
+            let line = "{\"delay_ms\":\(delay),\"attempted_at\":\(attempted),\"active_after_100ms\":\(NSApp.isActive)}\n"
+            if let handle = FileHandle(forWritingAtPath: path) {
+                handle.seekToEndOfFile()
+                handle.write(Data(line.utf8))
+                handle.closeFile()
+            } else {
+                FileManager.default.createFile(atPath: path, contents: Data(line.utf8))
+            }
+        }
+    }
+}
+
 final class SingleClickReceiver: NSView {
     let journal: URL
 
@@ -826,7 +830,14 @@ final class SingleClickReceiver: NSView {
         ])
     }
 
-    override func mouseDown(with event: NSEvent) { record("down", event) }
+    override func mouseDown(with event: NSEvent) {
+        record("down", event)
+        // Raw-event focus-theft cases: this view has no AX press, so a click
+        // on it must travel as real mouse events.
+        if let ms = ProcessInfo.processInfo.environment["CUA_APPKIT_THIEF_DELAY_MS"].flatMap({ Int($0) }) {
+            stealFocus(after: ms, window: window)
+        }
+    }
     override func mouseUp(with event: NSEvent) { record("up", event) }
 }
 

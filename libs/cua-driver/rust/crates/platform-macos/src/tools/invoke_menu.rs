@@ -415,7 +415,7 @@ impl Tool for InvokeMenuTool {
                         focus_exact_window(prior_pid, prior_window_id).is_ok()
                     });
                     if needs_activation && !restored_exact {
-                        let _ = crate::apps::activate_pid(prior_pid);
+                        let _ = crate::apps::restore_prior_app(prior_pid);
                     }
                 }
             }

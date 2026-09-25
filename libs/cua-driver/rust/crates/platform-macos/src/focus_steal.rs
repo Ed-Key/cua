@@ -248,12 +248,15 @@ struct LeaseConfig {
 impl SuppressionLease {
     /// Re-arm this lease for the post-result phase: same targets, deadline
     /// `until`, and activations that follow real user input are let through.
+    /// An allowed pid is not carried over: it exists so the click itself can
+    /// make its target active, and after the result the target taking focus
+    /// on its own is exactly the theft to undo.
     /// Works even when the original entry was already reaped (a long action).
     /// The new entry exists before the old one is removed, leaving no gap.
     pub fn linger_until(self, until: Instant) -> SuppressionLease {
         let handle = self.dispatcher.add_entry_with(
             self.config.target_pid,
-            self.config.allowed_pid,
+            None,
             self.config.restore_to,
             self.config.origin,
             until,
@@ -429,9 +432,15 @@ impl Dispatcher {
     /// matching registration. Overlapping guards restore one destination
     /// once, not every destination in turn.
     fn winner_for_activation(&self, activated_pid: i32) -> Option<(SuppressionHandle, i32)> {
-        self.winner_for_activation_with(activated_pid, &user_input_since)
+        // Read the counters once, outside the entries lock.
+        let now = read_input_activity();
+        self.winner_for_activation_with(activated_pid, &|baseline| *baseline != now)
     }
 
+    /// The newest guard that applies to this app decides. If it lets the
+    /// activation through (our own restore, its allowed target, or real user
+    /// input), that stands: an older guard must not overrule it, or two
+    /// guards can ping-pong focus between their destinations.
     fn winner_for_activation_with(
         &self,
         activated_pid: i32,
@@ -442,25 +451,15 @@ impl Dispatcher {
         // if the janitor hasn't ticked yet.
         let now = Instant::now();
         guard.retain(|_, e| e.deadline > now);
-        guard
+        let (id, e) = guard
             .iter()
-            .filter(|(_, e)| {
-                if e.allowed_pid == Some(activated_pid) {
-                    return false;
-                }
-                if e.user_input_baseline.as_ref().is_some_and(user_input_since) {
-                    return false;
-                }
-                match e.target_pid {
-                    Some(p) => p == activated_pid,
-                    // Wildcard: match any activation except the restore_to
-                    // pid (don't fight ourselves when we re-activate the
-                    // prior frontmost).
-                    None => activated_pid != e.restore_to,
-                }
-            })
-            .max_by_key(|(_, e)| e.sequence)
-            .map(|(id, e)| (SuppressionHandle(*id), e.restore_to))
+            // A guard scoped to another pid does not apply; wildcards do.
+            .filter(|(_, e)| e.target_pid.is_none_or(|p| p == activated_pid))
+            .max_by_key(|(_, e)| e.sequence)?;
+        let lets_through = activated_pid == e.restore_to
+            || e.allowed_pid == Some(activated_pid)
+            || e.user_input_baseline.as_ref().is_some_and(user_input_since);
+        (!lets_through).then(|| (SuppressionHandle(*id), e.restore_to))
     }
 
     /// Test view of the winner: at most one restore destination.
@@ -922,6 +921,28 @@ mod tests {
         assert_eq!(d.snapshot_matches(42), vec![2]);
     }
 
+    /// The newest applicable guard's "let it through" is final. Falling back
+    /// to an older guard made two wildcards ping-pong focus between their
+    /// destinations, and let an older guard undo an allowed activation.
+    #[test]
+    fn newest_guard_letting_an_activation_through_is_final() {
+        let d = Arc::new(Dispatcher::new());
+        let _older = d.add(None, 1, "test.older");
+        let _newer = d.add(None, 2, "test.newer");
+        assert_eq!(d.snapshot_matches(2), Vec::<i32>::new(), "our own restore of 2");
+        assert_eq!(d.snapshot_matches(9), vec![2]);
+
+        let d = Arc::new(Dispatcher::new());
+        let _older = d.add(None, 1, "test.older");
+        let _allowing = d.add_allowing(9, 1, "test.allowing");
+        assert!(d.snapshot_matches(9).is_empty(), "allowed target stays allowed");
+
+        let d = Arc::new(Dispatcher::new());
+        let _wild = d.add(None, 1, "test.wild");
+        let _other = d.add(Some(77), 5, "test.other_pid");
+        assert_eq!(d.snapshot_matches(9), vec![1], "a guard for another pid does not apply");
+    }
+
     fn winner_pid(d: &Dispatcher, activated_pid: i32) -> Option<i32> {
         d.winner_for_activation(activated_pid).map(|(_, pid)| pid)
     }
@@ -975,7 +996,11 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(Some(42), 7, "test.delayed");
         let mut restored = Vec::new();
-        d.dispatch_activation(42, || Some(99), |pid, _admit| restored.push(pid));
+        d.dispatch_activation(42, || Some(99), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
         assert!(
             restored.is_empty(),
             "a queued notification must not undo a newer app switch"
@@ -987,7 +1012,11 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(Some(42), 7, "test.unknown");
         let mut restored = Vec::new();
-        d.dispatch_activation(42, || None, |pid, _admit| restored.push(pid));
+        d.dispatch_activation(42, || None, |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
         assert!(
             restored.is_empty(),
             "missing current state cannot authorize activation"
@@ -999,7 +1028,11 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let _h = d.add(Some(42), 7, "test.current");
         let mut restored = Vec::new();
-        d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+        d.dispatch_activation(42, || Some(42), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
         assert_eq!(restored, vec![7]);
     }
 
@@ -1009,7 +1042,11 @@ mod tests {
         let _a = d.add(Some(42), 7, "test.first");
         let _b = d.add(Some(42), 8, "test.second");
         let mut restored = Vec::new();
-        d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+        d.dispatch_activation(42, || Some(42), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
         assert_eq!(
             restored,
             vec![8],
@@ -1024,11 +1061,19 @@ mod tests {
             let _a = d.add(older, 7, "test.older");
             let b = d.add(newer, 8, "test.newer");
             let mut restored = Vec::new();
-            d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+            d.dispatch_activation(42, || Some(42), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
             assert_eq!(restored, vec![8]);
             d.remove(b);
             restored.clear();
-            d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
+            d.dispatch_activation(42, || Some(42), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
             assert_eq!(
                 restored,
                 vec![7],
@@ -1050,7 +1095,11 @@ mod tests {
                 drop(lease.take());
                 Some(42)
             },
-            |pid, _admit| restored.push(pid),
+            |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            },
         );
         assert!(
             restored.is_empty(),
@@ -1074,7 +1123,11 @@ mod tests {
                     .deadline = Instant::now() - Duration::from_secs(1);
                 Some(42)
             },
-            |pid, _admit| restored.push(pid),
+            |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            },
         );
         assert!(
             restored.is_empty(),
@@ -1095,7 +1148,11 @@ mod tests {
                     d.add(Some(42), destination, "test.new");
                     Some(42)
                 },
-                |pid, _admit| restored.push(pid),
+                |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            },
             );
             assert!(
                 restored.is_empty(),
@@ -1115,7 +1172,11 @@ mod tests {
                 d.add(Some(99), 8, "test.unrelated");
                 Some(42)
             },
-            |pid, _admit| restored.push(pid),
+            |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            },
         );
         assert_eq!(restored, vec![7]);
     }
@@ -1125,15 +1186,31 @@ mod tests {
         let d = Arc::new(Dispatcher::new());
         let h = d.add(Some(42), 7, "test.target");
         let mut restored = Vec::new();
-        d.dispatch_activation(99, || Some(99), |pid, _admit| restored.push(pid));
+        d.dispatch_activation(99, || Some(99), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
         assert!(restored.is_empty());
         d.remove(h);
 
         let _h = d.add_allowing(42, 7, "test.wildcard");
-        d.dispatch_activation(42, || Some(42), |pid, _admit| restored.push(pid));
-        d.dispatch_activation(7, || Some(7), |pid, _admit| restored.push(pid));
+        d.dispatch_activation(42, || Some(42), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
+        d.dispatch_activation(7, || Some(7), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
         assert!(restored.is_empty());
-        d.dispatch_activation(99, || Some(99), |pid, _admit| restored.push(pid));
+        d.dispatch_activation(99, || Some(99), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
         assert_eq!(
             restored,
             vec![7],

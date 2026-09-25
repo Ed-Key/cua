@@ -340,7 +340,7 @@ impl Tool for LaunchAppTool {
                             // Not frontmost — nothing to do this tick.
                             continue;
                         }
-                        let activated = crate::apps::activate_pid(prior);
+                        let activated = crate::apps::restore_prior_app(prior);
                         let still_frontmost = crate::apps::frontmost_pid() == Some(*pid);
                         if still_frontmost {
                             tracing::warn!(
@@ -418,7 +418,7 @@ impl Tool for LaunchAppTool {
                                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
                                 if crate::apps::frontmost_pid() == Some(launched_pid) {
                                     late_activations += 1;
-                                    let _ = crate::apps::activate_pid(prior_pid);
+                                    let _ = crate::apps::restore_prior_app(prior_pid);
                                 }
                             }
                             if late_activations > 0 {

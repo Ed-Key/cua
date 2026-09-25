@@ -1026,6 +1026,11 @@ impl Tool for ClickTool {
             {
                 let focus_only = action == "focus";
                 let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
+                // An AX press needs no activation, so guard it like the AX
+                // element path: this route used to return with no focus
+                // protection at all (measured: every delayed self-activation
+                // of the pressed app kept focus).
+                let snapshot = WindowChangeDetector::snapshot(apps::frontmost_pid());
                 let ax_result = tokio::task::spawn_blocking(move || unsafe {
                     let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                         return Ok::<bool, anyhow::Error>(false);
@@ -1052,6 +1057,7 @@ impl Tool for ClickTool {
                 .await;
                 match ax_result {
                     Ok(Ok(true)) => {
+                        let changes = super::finish_window_observation(snapshot).await;
                         crate::cursor::overlay::send_command(
                             cursor_key.clone(),
                             cursor_overlay::OverlayCommand::ClickPulse {
@@ -1061,7 +1067,8 @@ impl Tool for ClickTool {
                         );
                         let label = if focus_only { "focused" } else { "pressed" };
                         return ToolResult::text(format!(
-                            "✅ PX hit-test {label} the background element via AX."
+                            "✅ PX hit-test {label} the background element via AX.{}",
+                            changes.result_suffix()
                         ))
                         .with_structured(serde_json::json!({
                             "path": "ax",
@@ -1253,24 +1260,27 @@ impl Tool for ClickTool {
                 && prior_front != Some(pid)
             {
                 tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                // WindowServer's foreground, not NSWorkspace's cached view.
+                let observed_front =
+                    if crate::input::skylight::front_pid_matches(pid) == Some(true) {
+                        Some(pid)
+                    } else {
+                        apps::frontmost_pid()
+                    };
                 if let Some(previous_pid) = background_pixel_restore_pid(
                     activation_policy,
                     prior_front,
                     pid,
-                    apps::frontmost_pid(),
+                    observed_front,
                 ) {
-                    let _ = apps::activate_pid(previous_pid);
+                    let _ = apps::restore_prior_app(previous_pid);
                 } else if let (Some(previous_pid), Some(wid)) = (prior_front, window_id) {
                     // The prior app is still frontmost, but the no-raise
                     // recipe posted it a defocus record: hand its key window
                     // focus back so the user's typing keeps landing there.
                     if focus_without_raise && apps::frontmost_pid() == Some(previous_pid) {
                         let _ = tokio::task::spawn_blocking(move || {
-                            crate::input::skylight::restore_focus_after_without_raise(
-                                previous_pid,
-                                pid,
-                                wid,
-                            )
+                            crate::input::skylight::restore_focus_after_without_raise(pid, wid)
                         })
                         .await;
                     }

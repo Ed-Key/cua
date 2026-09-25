@@ -637,9 +637,17 @@ pub fn frontmost_pid() -> Option<i32> {
 
 /// Re-activate the app with `pid` via
 /// `NSRunningApplication.runningApplicationWithProcessIdentifier(pid)?.activateWithOptions([])`.
+/// Put the user's previous app back in front after cua's target took focus.
+/// Goes through WindowServer: AppKit activation requested by a background
+/// daemon took ~1s to return and did not stick on current macOS (measured
+/// with the focus-theft fixture). AppKit is only the fallback when the
+/// private call is unavailable.
+pub fn restore_prior_app(pid: i32) -> bool {
+    crate::input::skylight::restore_front_pid(pid, &mut || true) || activate_pid(pid)
+}
+
 /// Returns `true` if the app was found and activate was attempted.
-/// Used as the belt-and-braces step in `LaunchAppTool` when the target
-/// has self-activated despite the focus-steal observer.
+/// For restoring the user's app prefer [`restore_prior_app`].
 pub fn activate_pid(pid: i32) -> bool {
     use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
     unsafe {

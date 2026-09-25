@@ -494,98 +494,51 @@ impl SpaceQuery {
 /// or triggering Space-follow. Ported from yabai's
 /// `window_manager_focus_window_without_raise`.
 ///
-/// Recipe:
-/// 1. `_SLPSGetFrontProcess` → capture current front PSN.
-/// 2. `SLSGetWindowOwner + SLSGetConnectionPSN` → target PSN, with
+/// Recipe (target-only):
+/// 1. `SLSGetWindowOwner + SLSGetConnectionPSN` → target PSN, with
 ///    `GetProcessForPID(target_pid)` as an older-system fallback.
-/// 3. Post 248-byte defocus record to front PSN (`bytes[0x8a] = 0x02`).
-/// 4. Post 248-byte focus record to target PSN (`bytes[0x8a] = 0x01`,
+/// 2. Post 248-byte focus record to target PSN (`bytes[0x8a] = 0x01`,
 ///    `bytes[0x3c..0x3f]` = `target_wid` little-endian).
+///
+/// The upstream recipe also posted a defocus record to the user's front
+/// process; that blurred the user's window on every raw background click.
 ///
 /// Deliberately skips `SLPSSetFrontProcessWithOptions` — see the Swift
 /// reference `FocusWithoutRaise.swift` for why omitting it keeps
 /// Chromium's user-activation gate open.
 ///
-/// Returns `true` when all SPIs resolved and both posts succeeded.
+/// Returns `true` when the SPIs resolved and the post succeeded.
 pub fn activate_without_raise(target_pid: pid_t, target_wid: u32) -> bool {
-    let post_fn = match post_event_record_to_fn() {
-        Some(f) => f,
-        None => return false,
-    };
-    let get_front = match get_front_process_fn() {
-        Some(f) => f,
-        None => return false,
-    };
-    // 8-byte PSN buffers (two UInt32s).
-    let mut prev_psn = [0u8; 8];
-    let mut target_psn = [0u8; 8];
-
-    let ok_prev = unsafe { get_front(prev_psn.as_mut_ptr() as *mut c_void) } == 0;
-    if !ok_prev {
-        return false;
-    }
-
-    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
-        return false;
-    }
-
-    // Build the 248-byte event buffer.
-    let mut buf = [0u8; 0xF8];
-    buf[0x04] = 0xF8;
-    buf[0x08] = 0x0D;
-    // Stamp target window id in little-endian at bytes 0x3c–0x3f.
-    buf[0x3C] = (target_wid & 0xFF) as u8;
-    buf[0x3D] = ((target_wid >> 8) & 0xFF) as u8;
-    buf[0x3E] = ((target_wid >> 16) & 0xFF) as u8;
-    buf[0x3F] = ((target_wid >> 24) & 0xFF) as u8;
-
-    // Step 3: defocus previous front.
-    buf[0x8A] = 0x02;
-    let defocus_ok = unsafe { post_fn(prev_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 };
-
-    // Step 4: focus target.
-    buf[0x8A] = 0x01;
-    let focus_ok = unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 };
-
-    defocus_ok && focus_ok
-}
-
-/// Reverse [`activate_without_raise`] once a background click is delivered:
-/// defocus `target_wid` and hand key focus back to `previous_pid`'s key window.
-///
-/// The no-raise recipe posts a defocus record to the user's front process.
-/// That process stays frontmost as far as NSWorkspace reports, but its key
-/// window stops receiving keyboard input until the user clicks it again, so
-/// the activation-based restore never fires. Returns `true` when both posts
-/// succeeded.
-pub fn restore_focus_after_without_raise(
-    previous_pid: pid_t,
-    target_pid: pid_t,
-    target_wid: u32,
-) -> bool {
     let Some(post_fn) = post_event_record_to_fn() else {
         return false;
     };
-    let Some(previous_wid) = key_window_of_pid(previous_pid) else {
-        return false;
-    };
-    let mut previous_psn = [0u8; 8];
     let mut target_psn = [0u8; 8];
-    if !get_process_psn_for_window(previous_wid, previous_pid, &mut previous_psn)
-        || !get_process_psn_for_window(target_wid, target_pid, &mut target_psn)
-    {
+    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
         return false;
     }
+    // Target-only: the user's front app is never sent a defocus record. That
+    // record blurred the user's window on every raw background click, even
+    // when nothing else happened (measured with the foreground sentinel).
+    let mut buf = focus_record(target_wid);
+    buf[0x8A] = 0x01;
+    unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 }
+}
 
+/// Reverse [`activate_without_raise`] once a background click is delivered:
+/// take the synthetic focus back from `target_wid`. The user's app was never
+/// defocused, so nothing is handed back to it. Returns `true` when the post
+/// succeeded.
+pub fn restore_focus_after_without_raise(target_pid: pid_t, target_wid: u32) -> bool {
+    let Some(post_fn) = post_event_record_to_fn() else {
+        return false;
+    };
+    let mut target_psn = [0u8; 8];
+    if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
+        return false;
+    }
     let mut buf = focus_record(target_wid);
     buf[0x8A] = 0x02;
-    let defocus_ok = unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 };
-
-    let mut buf = focus_record(previous_wid);
-    buf[0x8A] = 0x01;
-    let focus_ok = unsafe { post_fn(previous_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 };
-
-    defocus_ok && focus_ok
+    unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 }
 }
 
 /// The 248-byte focus/defocus event record with `wid` stamped little-endian at

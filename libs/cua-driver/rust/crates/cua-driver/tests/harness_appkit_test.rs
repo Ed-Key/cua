@@ -2123,6 +2123,97 @@ fn run_focus_theft_case(delay_ms: u64, targeting: Targeting) {
     );
 }
 
+/// Raw-event variant: the window is one plain view with no AX press, so the
+/// background pixel click travels as real mouse events (the route that lets
+/// the target become briefly active). The view's journal proves a mouse-down
+/// arrived; the trace proves the theft was tried.
+fn run_raw_focus_theft_case(delay_ms: u64) {
+    run_raw_click_case(Some(delay_ms));
+}
+
+/// `None`: a raw background click with no theft at all, the baseline for
+/// whether the raw route itself disturbs the user's focus.
+fn run_raw_click_case(thief_delay_ms: Option<u64>) {
+    let journal = tempfile::tempdir().unwrap();
+    let trace = journal.path().join("thief.jsonl");
+    let pointer = journal.path().join("pointer.jsonl");
+    std::fs::write(&pointer, "").unwrap();
+    let delay_ms = thief_delay_ms.unwrap_or(0);
+    let delay = delay_ms.to_string();
+    let mut env = vec![
+        ("CUA_APPKIT_THIEF_TRACE", trace.to_str().unwrap()),
+        ("CUA_APPKIT_POINTER_ORACLE", pointer.to_str().unwrap()),
+    ];
+    if thief_delay_ms.is_some() {
+        env.push(("CUA_APPKIT_THIEF_DELAY_MS", delay.as_str()));
+    }
+    let name = match thief_delay_ms {
+        Some(ms) => format!("focus_theft_{ms}ms_raw"),
+        None => "raw_pixel_click_keeps_focus".to_owned(),
+    };
+    run_background_case_with_env(
+        &name,
+        Targeting::Px,
+        DriverRoute::MacosCgEventPid,
+        &env,
+        |pid, wid, driver| {
+            let pre = driver.call(
+                "get_window_state",
+                serde_json::json!({"pid": pid as i64, "window_id": wid, "diff": false}),
+            );
+            let width = pre.structured()["screenshot_width"].as_f64().expect("screenshot width");
+            let height = pre.structured()["screenshot_height"].as_f64().expect("screenshot height");
+            let response = driver.call(
+                "click",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid,
+                    "x": width / 2.0, "y": height / 2.0,
+                    "delivery_mode": "background"
+                }),
+            );
+            assert!(!response.is_error(), "raw steal click: {}", response.raw);
+            std::thread::sleep(std::time::Duration::from_millis(delay_ms + 700));
+            let events = std::fs::read_to_string(&pointer).unwrap();
+            assert!(
+                events.contains("\"kind\":\"down\""),
+                "the click did not arrive as raw mouse events: {events}; response {}",
+                response.raw
+            );
+            if thief_delay_ms.is_some() {
+                let raw = std::fs::read_to_string(&trace)
+                    .expect("the fixture never tried to take focus");
+                eprintln!("raw focus theft delay={delay_ms}ms; trace={raw}");
+            }
+        },
+    );
+}
+
+/// A raw background pixel click must not disturb the user's focus even when
+/// the target never tries to take it.
+#[test]
+#[ignore]
+fn harness_appkit_raw_pixel_click_keeps_focus() {
+    run_raw_click_case(None);
+}
+
+// No 0ms raw case: an app that activates itself at the instant of a raw
+// click is indistinguishable from the activation the click needs (Chromium's
+// user-activation gate and remote-HID proxies require the target to become
+// AppKit-active during delivery). cua reverts it ~50ms later, but the user's
+// window sees a brief blur. Known limitation, recorded in the triage tracker.
+
+#[test]
+#[ignore]
+fn harness_appkit_focus_theft_300ms_raw() {
+    run_raw_focus_theft_case(300);
+}
+
+#[test]
+#[ignore]
+fn harness_appkit_focus_theft_800ms_raw() {
+    run_raw_focus_theft_case(800);
+}
+
 macro_rules! focus_theft_tests {
     ($($name:ident: $delay:expr, $targeting:expr;)*) => {$(
         #[test]
