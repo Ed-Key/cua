@@ -2101,7 +2101,7 @@ fn run_focus_theft_case(delay_ms: u64, route: TheftRoute) {
     if raw {
         env.push(("CUA_APPKIT_POINTER_ORACLE", pointer.to_str().unwrap()));
     }
-    cua_driver_testkit::sentinel::set_blur_recovery_budget(Some(Duration::from_millis(150)));
+    let _budget = cua_driver_testkit::sentinel::blur_recovery_budget(Duration::from_millis(150));
     let name = format!("focus_theft_{delay_ms}ms_{route:?}").to_lowercase();
     run_background_case_with_env(
         &name,
@@ -2156,7 +2156,6 @@ fn run_focus_theft_case(delay_ms: u64, route: TheftRoute) {
             );
         },
     );
-    cua_driver_testkit::sentinel::set_blur_recovery_budget(None);
 }
 
 fn run_raw_focus_theft_case(delay_ms: u64) {

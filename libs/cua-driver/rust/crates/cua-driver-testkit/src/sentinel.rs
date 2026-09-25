@@ -21,12 +21,27 @@ mod hyprland;
 /// instant before cua restores it. Every other case keeps the strict rule.
 static BLUR_RECOVERY_BUDGET_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
-/// Accept a blur only when the sentinel regains focus within `budget`.
-pub fn set_blur_recovery_budget(budget: Option<Duration>) {
-    BLUR_RECOVERY_BUDGET_MS.store(
-        budget.map_or(0, |b| b.as_millis() as u64),
+/// Accept a blur only when the sentinel regains focus within `budget`, for
+/// as long as the returned guard lives. The previous budget comes back when
+/// it drops, including when a failing test unwinds, so a strict case run
+/// later in the same process never inherits the tolerance.
+#[must_use = "the budget ends when this guard drops"]
+pub fn blur_recovery_budget(budget: Duration) -> BlurRecoveryBudget {
+    let previous = BLUR_RECOVERY_BUDGET_MS.swap(
+        budget.as_millis() as u64,
         std::sync::atomic::Ordering::SeqCst,
     );
+    BlurRecoveryBudget { previous }
+}
+
+pub struct BlurRecoveryBudget {
+    previous: u64,
+}
+
+impl Drop for BlurRecoveryBudget {
+    fn drop(&mut self) {
+        BLUR_RECOVERY_BUDGET_MS.store(self.previous, std::sync::atomic::Ordering::SeqCst);
+    }
 }
 
 /// Longest blur-to-focus gap, or `None` when some blur never recovered.
