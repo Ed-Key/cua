@@ -76,6 +76,8 @@ fn def() -> &'static ToolDef {
                 "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
                 "x": { "type": "number" },
                 "y": { "type": "number" },
+                "pid": { "type": "integer", "description": "With window_id: aim at that window; x/y are its get_window_state screenshot pixels." },
+                "window_id": { "type": "integer", "description": "With pid: the exact window whose screenshot x/y refer to." },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window" },
                 "cursor_id": { "type": "string", "description": "Cursor instance to move. Default: 'default'." }
             },

@@ -310,7 +310,6 @@ mod tests {
             json!({"target":{"kind":"window","pid":800,"window_id":0}}),
             json!({"target":{"kind":"window","pid":800,"window_id":11},"pid":800}),
             json!({"target":{"kind":"desktop","display_id":"primary"},"scope":"desktop"}),
-            json!({"scope":"desktop","window_id":11}),
         ] {
             let refusal = normalize_action_target("move_cursor", &mut args).unwrap_err();
             assert_eq!(refusal.is_error, Some(true));
@@ -319,6 +318,19 @@ mod tests {
                 "invalid_action_target"
             );
         }
+    }
+
+    /// A desktop move with a window id is contradictory on macOS; Linux
+    /// adapters accept it, so this case is platform-specific.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn move_cursor_rejects_a_desktop_move_with_a_window_id_on_macos() {
+        let mut args = json!({"scope":"desktop","window_id":11});
+        let refusal = normalize_action_target("move_cursor", &mut args).unwrap_err();
+        assert_eq!(
+            refusal.structured_content.unwrap()["code"],
+            "invalid_action_target"
+        );
     }
 
     #[test]
