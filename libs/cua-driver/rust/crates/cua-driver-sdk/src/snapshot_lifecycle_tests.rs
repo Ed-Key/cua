@@ -314,7 +314,13 @@ mod native {
                     731_348,
                     u64::from(window),
                     CachedSnapshot {
-                        elements: vec![*ptr],
+                        elements: vec![(0, *ptr)],
+                        rows: Default::default(),
+                        next_id: 1,
+                        bounds: Default::default(),
+                        session: None,
+                        full_delivered: true,
+                        actionable: true,
                     },
                 );
                 if window == 0 {
