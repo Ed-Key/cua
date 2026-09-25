@@ -6172,6 +6172,14 @@ export type WindowElement = {
     elementToken?: string,
     label?: string,
     value?: string,
+    /**
+     * The hint an empty field shows (`AXPlaceholderValue`); never content.
+     */
+    placeholder?: string,
+    /**
+     * Whether the value can be written; absent when unknown.
+     */
+    valueSettable?: boolean,
     valueDescription?: string,
     enabled?: boolean,
     selected?: boolean,
@@ -6210,6 +6218,8 @@ const FfiConverterTypeWindowElement = (() => {
                 elementToken: FfiConverterOptionalString.read(from),
                 label: FfiConverterOptionalString.read(from),
                 value: FfiConverterOptionalString.read(from),
+                placeholder: FfiConverterOptionalString.read(from),
+                valueSettable: FfiConverterOptionalBoolean.read(from),
                 valueDescription: FfiConverterOptionalString.read(from),
                 enabled: FfiConverterOptionalBoolean.read(from),
                 selected: FfiConverterOptionalBoolean.read(from),
@@ -6228,6 +6238,8 @@ const FfiConverterTypeWindowElement = (() => {
             FfiConverterOptionalString.write(value.elementToken, into);
             FfiConverterOptionalString.write(value.label, into);
             FfiConverterOptionalString.write(value.value, into);
+            FfiConverterOptionalString.write(value.placeholder, into);
+            FfiConverterOptionalBoolean.write(value.valueSettable, into);
             FfiConverterOptionalString.write(value.valueDescription, into);
             FfiConverterOptionalBoolean.write(value.enabled, into);
             FfiConverterOptionalBoolean.write(value.selected, into);
@@ -6245,6 +6257,8 @@ const FfiConverterTypeWindowElement = (() => {
              FfiConverterOptionalString.allocationSize(value.elementToken) +
              FfiConverterOptionalString.allocationSize(value.label) +
              FfiConverterOptionalString.allocationSize(value.value) +
+             FfiConverterOptionalString.allocationSize(value.placeholder) +
+             FfiConverterOptionalBoolean.allocationSize(value.valueSettable) +
              FfiConverterOptionalString.allocationSize(value.valueDescription) +
              FfiConverterOptionalBoolean.allocationSize(value.enabled) +
              FfiConverterOptionalBoolean.allocationSize(value.selected) +
