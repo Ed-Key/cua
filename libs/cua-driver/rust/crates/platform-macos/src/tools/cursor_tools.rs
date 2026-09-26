@@ -63,17 +63,9 @@ impl Tool for SetAgentCursorEnabledTool {
         };
         let session = resolve_cursor_key(&args);
         self.state.cursor_registry.set_enabled(&session, enabled);
-        // Turning it off wins over a tab-switch hide; turning it on does not
-        // show a cursor whose browser tab is in the background.
-        if !enabled {
-            crate::cursor::overlay::forget_tab_hidden(&session);
-        }
-        crate::cursor::overlay::send_command(
-            session.clone(),
-            cursor_overlay::OverlayCommand::SetEnabled(
-                enabled && !crate::cursor::overlay::is_tab_hidden(&session),
-            ),
-        );
+        // Turning it on does not show a cursor whose browser tab is in the
+        // background.
+        crate::cursor::overlay::set_user_enabled(session.clone(), enabled);
         ToolResult::text(format!(
             "Agent cursor for session '{session}' {}.",
             if enabled { "enabled" } else { "disabled" }

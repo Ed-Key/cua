@@ -424,6 +424,12 @@ async function reportWindow(windowId) {
   post({ jsonrpc: "2.0", method: "tabs.activated", params: { targetId: selected, windowId, windowTargets } });
 }
 chrome.tabs.onActivated.addListener(({ windowId }) => void reportWindow(windowId));
+// A closed window has no selected tab: report it empty so its cursors hide,
+// and outdate any report for it still being assembled.
+chrome.windows.onRemoved.addListener((windowId) => {
+  activationReports.set(windowId, (activationReports.get(windowId) ?? 0) + 1);
+  post({ jsonrpc: "2.0", method: "tabs.activated", params: { targetId: null, windowId, windowTargets: [] } });
+});
 // A tab dragged to another window changes both windows' tab lists.
 chrome.tabs.onDetached.addListener((_, { oldWindowId }) => void reportWindow(oldWindowId));
 chrome.tabs.onAttached.addListener((_, { newWindowId }) => void reportWindow(newWindowId));

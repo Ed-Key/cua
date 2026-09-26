@@ -236,16 +236,10 @@ struct BrowserCursorTracker {
     /// report listing an action's tab decides visibility instead of the
     /// action's own activity probe, which may predate a later tab switch.
     reports: HashMap<(u64, i64), TabSwitchReport>,
-    /// Where a browser action last sent each session's cursor. An unplaced
+    /// Sessions whose cursor a browser action has sent on screen. An unplaced
     /// cursor sits at the overlay's off-screen origin, so it stays hidden
-    /// until its first action places it. Set when that move starts, not when
-    /// its animation ends, so another action meanwhile cannot hide it.
-    placed: HashMap<String, (f64, f64)>,
-    /// Sessions whose browser move is still animating, with that move's
-    /// number: an older move of the same session, released early when a newer
-    /// one replaces its animation, must not record its stale position.
-    moving: HashMap<String, u64>,
-    next_move: u64,
+    /// until its first action places it. Set when that move starts.
+    placed: std::collections::HashSet<String>,
 }
 
 impl BrowserCursorTracker {
@@ -327,14 +321,6 @@ impl BrowserCursorTracker {
             .collect()
     }
 
-    /// Whether the session's cursor is still the one a browser action placed:
-    /// mid-move, or where that move left it. A cursor since moved by a native
-    /// action belongs to that app, and tab switches must not hide it.
-    fn browser_owns(&self, session: &str, position: Option<(f64, f64)>) -> bool {
-        self.moving.contains_key(session)
-            || self.placed.get(session).is_some_and(|placed| position == Some(*placed))
-    }
-
     fn visibility_in(&self, window_id: u64, selected: &str) -> Vec<(String, bool)> {
         self.bindings
             .iter()
@@ -344,10 +330,11 @@ impl BrowserCursorTracker {
     }
 }
 
-/// Show or hide session cursors; a cursor its session turned off stays off,
-/// and one never placed (first used in a background tab) waits for its first
-/// action. Callers hold the tracker lock, so a decision and its commands reach
-/// the overlay before any later decision's.
+/// Show or hide session cursors by their tabs' selection; the overlay combines
+/// that with the user's setting and native ownership. A cursor never placed
+/// (first used in a background tab) waits for its first action. Callers hold
+/// the tracker lock, so a decision and its commands reach the overlay before
+/// any later decision's.
 fn apply_cursor_visibility(
     registry: &crate::cursor::CursorRegistry,
     tracker: &BrowserCursorTracker,
@@ -355,7 +342,7 @@ fn apply_cursor_visibility(
 ) {
     for (key, visible) in updates {
         let Some(state) = registry.get(key) else { continue };
-        if !tracker.browser_owns(key, state.position.map(|position| (position.x, position.y))) {
+        if !tracker.placed.contains(key) {
             continue;
         }
         crate::cursor::overlay::set_tab_hidden(key.clone(), !visible, state.config.enabled);
@@ -977,7 +964,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             .get_or_create(&action.session)
             .config
             .enabled;
-        let (shown, move_number) = {
+        let shown = {
             let mut tracker = self.browser_cursors.lock().unwrap();
             let updates = tracker.update(
                 &action.session,
@@ -990,17 +977,11 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 && cursor_enabled
                 && action.screen_x.is_some_and(f64::is_finite)
                 && action.screen_y.is_some_and(f64::is_finite);
-            let mut move_number = None;
             if placing {
-                let at = (action.screen_x.unwrap_or_default(), action.screen_y.unwrap_or_default());
-                tracker.next_move += 1;
-                let number = tracker.next_move;
-                move_number = Some(number);
-                tracker.placed.insert(action.session.clone(), at);
-                tracker.moving.insert(action.session.clone(), number);
+                tracker.placed.insert(action.session.clone());
             }
             apply_cursor_visibility(&self.cursor_registry, &tracker, &updates);
-            (shown, move_number)
+            shown
         };
         if !shown || !cursor_enabled {
             return;
@@ -1017,14 +998,8 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             cursor_overlay::OverlayCommand::PinAbove(action.window_id),
         );
         crate::cursor::overlay::animate_browser_cursor_to(action.session.clone(), screen_x, screen_y).await;
-        {
-            let mut tracker = self.browser_cursors.lock().unwrap();
-            if move_number.is_some() && tracker.moving.get(&action.session) == move_number.as_ref() {
-                self.cursor_registry
-                    .update_position(&action.session, screen_x, screen_y);
-                tracker.moving.remove(&action.session);
-            }
-        }
+        self.cursor_registry
+            .update_position(&action.session, screen_x, screen_y);
 
         if matches!(
             action.kind,
@@ -2025,12 +2000,13 @@ mod tests {
         assert_eq!(after_move.get("session-t"), Some(&false));
         assert_eq!(after_move.get("session-u"), Some(&true));
 
-        // A cursor a native action moved elsewhere is no longer the browser's.
-        split.placed.insert("session-s".to_owned(), (100.0, 200.0));
-        assert!(split.browser_owns("session-s", Some((100.0, 200.0))));
-        assert!(!split.browser_owns("session-s", Some((640.0, 90.0))));
-        split.moving.insert("session-s".to_owned(), 1);
-        assert!(split.browser_owns("session-s", Some((640.0, 90.0))), "mid-move it is still the browser's");
+
+        // A closed Chrome window reports no tabs: its cursors hide.
+        let closed = split
+            .activate((4, 1), None, Vec::new())
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(closed.get("session-s"), Some(&false));
 
         // Without the link's reports, the action's own probe decides again.
         tracker.forget_link(1);

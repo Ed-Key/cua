@@ -75,11 +75,22 @@ static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<OverlayMsg>> = OnceLock::new
 // Single-consumer slot; receiver is moved into run_on_main_thread().
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayMsg>>> = Mutex::new(None);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
-/// Session cursors a browser tab switch hid because their tab is not the
-/// selected one. Kept apart from the user's enable setting so neither
-/// overrides the other; a native action takes the cursor out of the browser
-/// and clears it.
-static TAB_HIDDEN: Mutex<Option<std::collections::HashSet<CursorKey>>> = Mutex::new(None);
+/// What decides whether a session cursor shows, for sessions that have used a
+/// browser tab: shown = `user_enabled && !tab_hidden`. `native` is set while
+/// a native (non-browser) action owns the cursor; tab switches then leave it
+/// alone, and a browser action takes it back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VisibilityInputs {
+    user_enabled: bool,
+    tab_hidden: bool,
+    native: bool,
+}
+
+static VISIBILITY: Mutex<Option<HashMap<CursorKey, VisibilityInputs>>> = Mutex::new(None);
+
+fn with_visibility<T>(f: impl FnOnce(&mut HashMap<CursorKey, VisibilityInputs>) -> T) -> T {
+    f(VISIBILITY.lock().unwrap().get_or_insert_with(HashMap::new))
+}
 static OVERLAY_WINDOW_ID: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn is_overlay_window(window_id: u32) -> bool {
@@ -271,6 +282,7 @@ pub fn remove_cursor(key: CursorKey) {
     if key.is_empty() {
         return;
     }
+    with_visibility(|map| map.remove(&key));
     if let Some(tx) = CMD_TX.get() {
         let _ = tx.try_send(OverlayMsg::Remove(key));
     }
@@ -398,45 +410,69 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
 /// seeded on-screen via [`seed_start_if_sentinel`] so its FIRST action glides
 /// in (it previously snapped silently via `ClickPulse`, invisible on a pure-AX
 /// run).
-/// Hide or show a session cursor for its browser tab's selection. Shown only
-/// when `user_enabled` too.
+/// Hide or show a session cursor for its browser tab's selection
+/// (`user_enabled` is the session's current setting). Ignored while a native
+/// action owns the cursor: it is over another app, not the tab.
 pub fn set_tab_hidden(key: CursorKey, hidden: bool, user_enabled: bool) {
-    {
-        let mut guard = TAB_HIDDEN.lock().unwrap();
-        let set = guard.get_or_insert_with(Default::default);
-        if hidden {
-            set.insert(key.clone());
-        } else {
-            set.remove(&key);
+    let shown = with_visibility(|map| {
+        let inputs = map.entry(key.clone()).or_insert(VisibilityInputs {
+            user_enabled,
+            tab_hidden: false,
+            native: false,
+        });
+        inputs.user_enabled = user_enabled;
+        if inputs.native {
+            return None;
         }
-    }
-    send_command(key, OverlayCommand::SetEnabled(user_enabled && !hidden));
-}
-
-/// Whether a tab switch currently hides this cursor.
-pub fn is_tab_hidden(key: &str) -> bool {
-    TAB_HIDDEN.lock().unwrap().as_ref().is_some_and(|set| set.contains(key))
-}
-
-/// Drop a tab-switch hide (the user turned the cursor off, which wins).
-pub fn forget_tab_hidden(key: &str) {
-    if let Some(set) = TAB_HIDDEN.lock().unwrap().as_mut() {
-        set.remove(key);
+        inputs.tab_hidden = hidden;
+        Some(user_enabled && !hidden)
+    });
+    if let Some(shown) = shown {
+        send_command(key, OverlayCommand::SetEnabled(shown));
     }
 }
 
-/// Move a session cursor for a native action. A cursor hidden by a browser
-/// tab switch is shown again: it has left the browser.
+/// The user turned a session cursor on or off. A tab-switch hide persists
+/// either way, so turning it on does not show it over another tab.
+pub fn set_user_enabled(key: CursorKey, enabled: bool) {
+    let shown = with_visibility(|map| match map.get_mut(&key) {
+        Some(inputs) => {
+            inputs.user_enabled = enabled;
+            enabled && !inputs.tab_hidden
+        }
+        None => enabled,
+    });
+    send_command(key, OverlayCommand::SetEnabled(shown));
+}
+
+/// Move a session cursor for a native action. The action owns the cursor from
+/// now on (tab switches leave it alone), and a tab-switch hide is dropped:
+/// the cursor has left the browser.
 pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
-    animate(key, x, y, false).await;
+    let reveal = with_visibility(|map| {
+        let inputs = map.get_mut(&key)?;
+        inputs.native = true;
+        let was_hidden = std::mem::replace(&mut inputs.tab_hidden, false);
+        was_hidden.then_some(inputs.user_enabled)
+    });
+    if let Some(user_enabled) = reveal {
+        send_command(key.clone(), OverlayCommand::SetEnabled(user_enabled));
+    }
+    animate(key, x, y).await;
 }
 
-/// Move a session cursor for a browser action, keeping any tab-switch hide.
+/// Move a session cursor for a browser action, which takes the cursor back
+/// from any native action.
 pub async fn animate_browser_cursor_to(key: CursorKey, x: f64, y: f64) {
-    animate(key, x, y, true).await;
+    with_visibility(|map| {
+        if let Some(inputs) = map.get_mut(&key) {
+            inputs.native = false;
+        }
+    });
+    animate(key, x, y).await;
 }
 
-async fn animate(key: CursorKey, x: f64, y: f64, from_browser: bool) {
+async fn animate(key: CursorKey, x: f64, y: f64) {
     // Empty key is the explicit no-cursor sentinel → nothing to animate.
     if key.is_empty() {
         return;
@@ -457,11 +493,6 @@ async fn animate(key: CursorKey, x: f64, y: f64, from_browser: bool) {
     };
     if !should_animate {
         return;
-    }
-    let was_tab_hidden = !from_browser
-        && TAB_HIDDEN.lock().unwrap().as_mut().is_some_and(|set| set.remove(&key));
-    if was_tab_hidden {
-        send_command(key.clone(), OverlayCommand::SetEnabled(true));
     }
 
     // Create a one-shot channel; store the sender (keyed) so the render thread
@@ -1632,15 +1663,33 @@ mod tests {
 }
 
 #[cfg(test)]
-mod tab_hidden_tests {
-    #[test]
-    fn a_tab_switch_hide_is_separate_from_the_user_setting() {
-        super::set_tab_hidden("tab-hidden-test".to_owned(), true, true);
-        assert!(super::is_tab_hidden("tab-hidden-test"));
-        super::set_tab_hidden("tab-hidden-test".to_owned(), false, true);
-        assert!(!super::is_tab_hidden("tab-hidden-test"));
-        super::set_tab_hidden("tab-hidden-test".to_owned(), true, true);
-        super::forget_tab_hidden("tab-hidden-test");
-        assert!(!super::is_tab_hidden("tab-hidden-test"), "turning the cursor off drops the hide");
+mod visibility_tests {
+    use super::*;
+
+    fn inputs(key: &str) -> VisibilityInputs {
+        with_visibility(|map| map[key])
+    }
+
+    #[tokio::test]
+    async fn tab_hiding_the_user_setting_and_native_ownership_stay_separate() {
+        let key = "visibility-test".to_owned();
+        set_tab_hidden(key.clone(), true, true);
+        // Off then on again: still hidden by its background tab.
+        set_user_enabled(key.clone(), false);
+        set_user_enabled(key.clone(), true);
+        assert!(inputs(&key).tab_hidden);
+
+        // A native action owns it: the hide drops, the user setting stays,
+        // and tab switches meanwhile leave it alone.
+        set_user_enabled(key.clone(), false);
+        animate_cursor_to(key.clone(), 10.0, 10.0).await;
+        assert_eq!(inputs(&key), VisibilityInputs { user_enabled: false, tab_hidden: false, native: true });
+        set_tab_hidden(key.clone(), true, false);
+        assert!(!inputs(&key).tab_hidden, "a tab switch cannot hide a cursor a native action owns");
+
+        // A browser action takes it back; tab switches apply again.
+        animate_browser_cursor_to(key.clone(), 10.0, 10.0).await;
+        set_tab_hidden(key.clone(), true, true);
+        assert!(inputs(&key).tab_hidden);
     }
 }
