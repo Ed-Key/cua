@@ -5225,10 +5225,10 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             assert!(Instant::now() < deadline, "Open panel did not reopen");
             thread::sleep(Duration::from_millis(200));
         }
-        // Listed before it is key: let the sheet finish presenting. While it
-        // presents, the parent is still focused, so the driver's exact-window
-        // check cannot tell a key would miss the sheet; an agent reads the
-        // panel first, which gives it this time.
+        // Listed before it is key: let the sheet finish presenting. AX already
+        // reports the sheet as the focused window while it animates in, so the
+        // driver cannot tell a key would miss it; an agent reads the panel
+        // first, which gives it this time.
         thread::sleep(Duration::from_millis(700));
         eprintln!(
             "[file-picker] before escape: focused(folded)={:?}",

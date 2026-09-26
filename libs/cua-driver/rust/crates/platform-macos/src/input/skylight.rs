@@ -772,6 +772,7 @@ pub fn with_foreground_assist(
     // write in the body has no responder chain to attach to.
     make_exact_window_key(target_pid, target_wid);
     await_window_focused(target_pid, target_wid);
+    settle_attached_sheet(target_pid, target_wid);
 
     let result = body();
 
@@ -818,6 +819,19 @@ fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
             return false;
         }
         std::thread::sleep(ACTIVATION_POLL_INTERVAL);
+    }
+}
+
+/// Give an attached sheet (an Open panel) time to take key status once its
+/// parent is key. AppKit hands it over after the parent becomes key, and AX
+/// reports the sheet focused throughout, so the hand-off is unobservable; a key
+/// posted before it lands reaches the parent window instead. On the VM a
+/// foreground Escape from behind another app missed 2 of 18 times without this
+/// and 0 of 20 with it.
+// ponytail: fixed settle; replace with a real signal if one turns up.
+fn settle_attached_sheet(pid: libc::pid_t, window_id: u32) {
+    if crate::ax::bindings::attached_sheet_of_window(pid, window_id).is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(150));
     }
 }
 
@@ -873,6 +887,7 @@ pub fn with_foreground_hid_activation(
         }
         anyhow::bail!("exact target window did not become focused for foreground HID delivery");
     }
+    settle_attached_sheet(target_pid, target_wid);
 
     let result = action();
     std::thread::sleep(std::time::Duration::from_millis(40));
