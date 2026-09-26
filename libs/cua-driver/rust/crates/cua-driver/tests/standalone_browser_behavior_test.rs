@@ -5051,11 +5051,271 @@ macro_rules! standalone_browser_test {
     };
 }
 
+/// A web page's file input opens the native Open panel, which WindowServer
+/// attributes to the browser while the Open and Save Panel Service hosts it.
+/// The driver must report it as a new window, read it without an output-schema
+/// error (directly, or after a structured refusal that names the real owner),
+/// and close it with Escape. Reported from a real Chrome Web Store upload.
+#[cfg(target_os = "macos")]
+fn run_native_file_picker(spec: &BrowserSpec) {
+    let scenario = format!("macos-{}-native-file-picker", spec.name);
+    let case = CaseSpec::delivered(
+        scenario.clone(),
+        spec.name.clone(),
+        "standalone-chromium-native-content",
+        "file_picker_open_read_close",
+        Targeting::Ax,
+        Delivery::Foreground,
+        Scope::Window,
+        DriverRoute::MacosAxAction,
+        vec![OracleKind::FixtureState],
+    );
+    execute_case(case, |evidence| {
+        let mut fixture =
+            launch_browser_with_html(spec, &scenario, standalone_browser_completeness_html());
+        *evidence = recording_evidence(fixture.driver.recording_dir());
+        let (pid, wid) = (fixture.pid, fixture.window_id);
+        let front = fixture
+            .driver
+            .call("bring_to_front", serde_json::json!({"pid":pid,"window_id":wid}));
+        assert!(!front.is_error(), "{}", front.raw);
+        let read = |driver: &mut McpDriver, pid: u32, wid: u64| {
+            driver.call(
+                "get_window_state",
+                // The sheet is walked after the whole page; allow the walk time.
+                serde_json::json!({"pid":pid,"window_id":wid,"include_screenshot":false,"diff":false,"timeout_ms":5000}),
+            )
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let token = loop {
+            let state = read(&mut fixture.driver, pid, wid);
+            assert!(!state.is_error(), "{}", state.raw);
+            let found = state.structured()["elements"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|e| e["label"].as_str().is_some_and(|l| l.contains("standalone-upload")))
+                .and_then(|e| e["element_token"].as_str().map(str::to_owned));
+            if let Some(token) = found {
+                break token;
+            }
+            assert!(Instant::now() < deadline, "file input absent: {}", state.structured()["tree_markdown"]);
+            thread::sleep(Duration::from_millis(200));
+        };
+        let clicked = fixture.driver.call(
+            "click",
+            serde_json::json!({"pid":pid,"window_id":wid,"element_token":token,"delivery_mode":"background"}),
+        );
+        assert!(!clicked.is_error(), "{}", clicked.raw);
+
+        // 1. The panel is reported as a new window (with a rebind when unique).
+        let deadline = Instant::now() + Duration::from_secs(8);
+        let panel = loop {
+            thread::sleep(Duration::from_millis(300));
+            let state = read(&mut fixture.driver, pid, wid);
+            let change = &state.structured()["window_change"];
+            if let Some(window) = change["rebind"]
+                .as_object()
+                .map(|_| change["rebind"].clone())
+                .or_else(|| change["new_windows"].as_array().and_then(|w| w.first().cloned()))
+            {
+                eprintln!("[file-picker] window_change={change}");
+                break window;
+            }
+            assert!(Instant::now() < deadline, "no window_change for the Open panel: {}", state.raw);
+        };
+        let panel_pid = panel["pid"].as_u64().unwrap() as u32;
+        let panel_wid = panel["window_id"].as_u64().unwrap();
+        // WindowServer gives the sheet its own id (listed as "Open"); reads
+        // and actions address it through its parent window.
+        let sheet_wid = |driver: &mut McpDriver| {
+            let windows = driver.call("list_windows", serde_json::json!({}));
+            assert!(!windows.is_error(), "{}", windows.raw);
+            windows.structured()["windows"]
+                .as_array()
+                .expect("list_windows returns a windows array")
+                .iter()
+                .find(|w| w["pid"].as_u64() == Some(u64::from(pid)) && w["title"] == "Open" && w["is_on_screen"] == true)
+                .and_then(|w| w["window_id"].as_u64())
+        };
+        let wait_closed = |driver: &mut McpDriver| {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            while Instant::now() < deadline {
+                if sheet_wid(driver).is_none() {
+                    return true;
+                }
+                thread::sleep(Duration::from_millis(200));
+            }
+            false
+        };
+        let own_id = sheet_wid(&mut fixture.driver).expect("Open panel listed by WindowServer");
+        eprintln!("[file-picker] rebind pid={panel_pid} wid={panel_wid}; sheet own id={own_id}");
+
+        // 2. The parent's read includes the sheet and its Cancel button (its
+        // controls can reach the AX tree a while after the window appears).
+        let deadline = Instant::now() + Duration::from_secs(6);
+        let state = loop {
+            let state = read(&mut fixture.driver, panel_pid, panel_wid);
+            assert!(!state.is_error(), "{}", state.raw);
+            let ready = state.structured()["elements"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|e| e["role"] == "AXButton" && e["label"] == "Cancel");
+            if ready || Instant::now() >= deadline {
+                break state;
+            }
+            thread::sleep(Duration::from_millis(200));
+        };
+        let tree = state.structured()["tree_markdown"].as_str().unwrap_or_default().to_owned();
+        assert!(tree.contains("AXSheet"), "parent read lacks the sheet: {tree}");
+        let cancel = state.structured()["elements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["role"] == "AXButton" && e["label"] == "Cancel")
+            .and_then(|e| e["element_token"].as_str().map(str::to_owned))
+            .expect("the sheet's Cancel button is actionable");
+        // Diagnostic: what a direct read of the sheet's own id answers.
+        let direct = read(&mut fixture.driver, panel_pid, own_id);
+        eprintln!(
+            "[file-picker] direct read of {own_id}: error={} {}",
+            direct.is_error(),
+            direct.raw.to_string().chars().take(300).collect::<String>()
+        );
+        assert!(
+            !direct.raw.to_string().contains("output schema"),
+            "schema mismatch reading the sheet id: {}",
+            direct.raw
+        );
+
+        // bring_to_front of the parent counts its attached sheet as part of it
+        // (the sheet is the frontmost ordinary window, with its own id).
+        let fronted = fixture.driver.call(
+            "bring_to_front",
+            serde_json::json!({"pid":panel_pid,"window_id":panel_wid}),
+        );
+        assert!(!fronted.is_error(), "bring_to_front with a sheet attached: {}", fronted.raw);
+        assert_eq!(fronted.structured()["activated"], true, "{}", fronted.raw);
+
+        // 3. Cancel, addressed through the parent window, closes it.
+        let clicked = fixture.driver.call(
+            "click",
+            serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"element_token":cancel,"delivery_mode":"background"}),
+        );
+        assert!(!clicked.is_error(), "Cancel click: {}", clicked.raw);
+        assert!(wait_closed(&mut fixture.driver), "Cancel did not close the Open panel");
+
+        // 4. Reopen; a foreground Escape aimed at the parent closes it.
+        let state = read(&mut fixture.driver, pid, wid);
+        let token = state.structured()["elements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["label"].as_str().is_some_and(|l| l.contains("standalone-upload")))
+            .and_then(|e| e["element_token"].as_str().map(str::to_owned))
+            .expect("file input still present");
+        let reopened = fixture.driver.call(
+            "click",
+            serde_json::json!({"pid":pid,"window_id":wid,"element_token":token,"delivery_mode":"background"}),
+        );
+        assert!(!reopened.is_error(), "{}", reopened.raw);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sheet_wid(&mut fixture.driver).is_none() {
+            assert!(Instant::now() < deadline, "Open panel did not reopen");
+            thread::sleep(Duration::from_millis(200));
+        }
+        // Listed before it is key: let the sheet finish presenting. AX already
+        // reports the sheet as the focused window while it animates in, so the
+        // driver cannot tell a key would miss it; an agent reads the panel
+        // first, which gives it this time.
+        thread::sleep(Duration::from_millis(700));
+        eprintln!(
+            "[file-picker] before escape: focused(folded)={:?}",
+            platform_macos::ax::bindings::focused_window_id_of_pid(panel_pid as i32)
+        );
+        let escaped = fixture.driver.call(
+            "press_key",
+            serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"key":"escape","delivery_mode":"foreground"}),
+        );
+        eprintln!("[file-picker] escape result: {}", escaped.raw.to_string().chars().take(300).collect::<String>());
+        assert!(!escaped.is_error(), "foreground Escape: {}", escaped.raw);
+        assert!(wait_closed(&mut fixture.driver), "foreground Escape did not close the Open panel");
+
+        // 5. Another app in front (the reported case): reopen, bring the
+        // sentinel app forward, then a foreground Escape must still reach the
+        // sheet, not the parent window.
+        let state = read(&mut fixture.driver, pid, wid);
+        let token = state.structured()["elements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["label"].as_str().is_some_and(|l| l.contains("standalone-upload")))
+            .and_then(|e| e["element_token"].as_str().map(str::to_owned))
+            .expect("file input still present");
+        let reopened = fixture.driver.call(
+            "click",
+            serde_json::json!({"pid":pid,"window_id":wid,"element_token":token,"delivery_mode":"background"}),
+        );
+        assert!(!reopened.is_error(), "{}", reopened.raw);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while sheet_wid(&mut fixture.driver).is_none() {
+            assert!(Instant::now() < deadline, "Open panel did not reopen");
+            thread::sleep(Duration::from_millis(200));
+        }
+        thread::sleep(Duration::from_millis(700));
+        // An ordinary window of another app in front (the reported case had
+        // a chat app in front). The full-screen sentinel sits in its own
+        // Space, where a no-Space-switch activation cannot take the front.
+        let launched = fixture.driver.call("launch_app", serde_json::json!({"bundle_id":"com.apple.finder"}));
+        assert!(!launched.is_error(), "{}", launched.raw);
+        let windows = fixture.driver.call("list_windows", serde_json::json!({}));
+        let finder = windows.structured()["windows"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|w| w["app_name"] == "Finder" && w["is_on_screen"] == true && w["layer"] == 0)
+            .cloned()
+            .expect("an on-screen Finder window");
+        let fronted = fixture.driver.call(
+            "bring_to_front",
+            serde_json::json!({"pid":finder["pid"],"window_id":finder["window_id"]}),
+        );
+        assert_eq!(fronted.structured()["activated"], true, "Finder in front: {}", fronted.raw);
+        let finder_pid = finder["pid"].as_i64().unwrap() as i32;
+        assert_eq!(
+            platform_macos::input::skylight::front_pid_matches(finder_pid),
+            Some(true),
+            "Finder must be frontmost before the Escape"
+        );
+        let escaped = fixture.driver.call(
+            "press_key",
+            serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"key":"escape","delivery_mode":"foreground"}),
+        );
+        eprintln!("[file-picker] escape from behind: {}", escaped.raw.to_string().chars().take(300).collect::<String>());
+        assert!(!escaped.is_error(), "foreground Escape from behind: {}", escaped.raw);
+        assert!(wait_closed(&mut fixture.driver), "foreground Escape from behind did not close the Open panel");
+        // The user's app comes back, and stays back through the window in
+        // which a late self-activation of the target would be reverted.
+        for delay in [Duration::from_millis(300), Duration::from_millis(1200)] {
+            thread::sleep(delay);
+            assert_eq!(
+                platform_macos::input::skylight::front_pid_matches(finder_pid),
+                Some(true),
+                "Finder must be restored after the foreground Escape"
+            );
+        }
+        Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
+    });
+}
+
 #[cfg(target_os = "macos")]
 standalone_browser_test!(
     standalone_browser_native_named_groups,
     run_native_named_groups
 );
+#[cfg(target_os = "macos")]
+standalone_browser_test!(standalone_browser_native_file_picker, run_native_file_picker);
 standalone_browser_test!(standalone_browser_roundtrip, run_roundtrip);
 standalone_browser_test!(
     standalone_browser_trust_gated_dom_click,

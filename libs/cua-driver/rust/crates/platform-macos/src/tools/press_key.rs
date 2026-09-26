@@ -410,7 +410,10 @@ impl Tool for PressKeyTool {
             || async move {
                 // Pre-focus the element under suppression so its
                 // side-effects are captured by the snapshot + lease.
-                if let Some(guard) = pre_focus_guard.clone() {
+                // Foreground delivery repeats this focus write inside its
+                // activation interval; doing it here first could activate the
+                // target before that interval records the user's app.
+                if let Some(guard) = pre_focus_guard.clone().filter(|_| !fg) {
                     let _ = tokio::task::spawn_blocking(move || {
                         crate::input::ax_actions::focus_element(guard.as_ptr())
                     })

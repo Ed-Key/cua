@@ -125,10 +125,17 @@ fn observe_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
     let target_visible_ordinary = windows
         .iter()
         .any(|window| window.pid == pid && window.window_id == window_id && window.layer == 0);
-    let frontmost_ordinary_window_id = windows
+    let mut frontmost_ordinary_window_id = windows
         .iter()
         .max_by_key(|window| window.z_index)
         .map(|window| window.window_id);
+    // A sheet attached to the target (an Open panel) sits above it and has
+    // its own id, but it is part of the target window.
+    if let Some(sheet) = crate::ax::bindings::attached_sheet_of_window(pid, window_id) {
+        if frontmost_ordinary_window_id == Some(sheet) {
+            frontmost_ordinary_window_id = Some(window_id);
+        }
+    }
     ExactWindowObservation {
         workspace_frontmost_pid: crate::apps::frontmost_pid(),
         front_process_matches_target: crate::input::skylight::front_process_matches(pid, window_id),

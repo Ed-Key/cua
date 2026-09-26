@@ -763,6 +763,7 @@ pub fn with_foreground_assist(
         return Ok(false);
     }
 
+    let _intentional = crate::focus_steal::allow_intentional_activation(target_pid);
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     // `set_front` moves WindowServer's front process but does not make the
     // target's NSWindow key, and AppKit installs a first responder only for a
@@ -771,6 +772,7 @@ pub fn with_foreground_assist(
     // write in the body has no responder chain to attach to.
     make_exact_window_key(target_pid, target_wid);
     await_window_focused(target_pid, target_wid);
+    settle_attached_sheet(target_pid, target_wid);
 
     let result = body();
 
@@ -820,6 +822,19 @@ fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
     }
 }
 
+/// Give an attached sheet (an Open panel) time to take key status once its
+/// parent is key. AppKit hands it over after the parent becomes key, and AX
+/// reports the sheet focused throughout, so the hand-off is unobservable; a key
+/// posted before it lands reaches the parent window instead. On the VM a
+/// foreground Escape from behind another app missed 2 of 18 times without this
+/// and 0 of 20 with it.
+// ponytail: fixed settle; replace with a real signal if one turns up.
+fn settle_attached_sheet(pid: libc::pid_t, window_id: u32) {
+    if crate::ax::bindings::attached_sheet_of_window(pid, window_id).is_some() {
+        std::thread::sleep(std::time::Duration::from_millis(150));
+    }
+}
+
 /// Activate an exact target window for a global HID keyboard action.
 ///
 /// Unlike [`with_menu_shortcut_activation`], this helper must not run `action`
@@ -856,6 +871,10 @@ pub fn with_foreground_hid_activation(
         return action();
     }
 
+    // This activation is the point of the call: the action's suppression
+    // leases must not revert it. The allowance ends when this returns, after
+    // the user's app is restored, so a later self-activation is still caught.
+    let _intentional = crate::focus_steal::allow_intentional_activation(target_pid);
     let activated = unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     if activated != 0 {
         anyhow::bail!("WindowServer rejected foreground HID activation");
@@ -868,6 +887,7 @@ pub fn with_foreground_hid_activation(
         }
         anyhow::bail!("exact target window did not become focused for foreground HID delivery");
     }
+    settle_attached_sheet(target_pid, target_wid);
 
     let result = action();
     std::thread::sleep(std::time::Duration::from_millis(40));
@@ -928,6 +948,8 @@ pub fn with_menu_shortcut_activation(
     }
 
     // Make target WindowServer-frontmost (kCPSNoWindows = 0x400).
+    // Intended activation of the target; see with_foreground_hid_activation.
+    let _intentional = crate::focus_steal::allow_intentional_activation(target_pid);
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
 
     // Run action then restore — even if action fails.
