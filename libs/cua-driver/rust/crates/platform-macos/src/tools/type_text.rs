@@ -1018,15 +1018,27 @@ pub(super) fn target_in_web_area(
     ))
 }
 
-/// Positively classified web content. Unlike [`target_in_web_area`], an
-/// unreadable window focus does not count: that is reason to distrust a
-/// readback, not permission to change the window's focus.
+/// Whether a background key may prepare this target's window as web content.
+/// Positively classified web content qualifies. An unreadable window focus
+/// qualifies only in a Chromium-family process: a background Electron window
+/// often cannot report its focused element, but a native window with that gap
+/// must not receive synthetic focus changes.
 pub(super) fn target_is_web_content(
     pid: i32,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
 ) -> bool {
-    classify_target_web_area(pid, element_ptr_and_idx, window_id) == WebAreaClassification::WebContent
+    match classify_target_web_area(pid, element_ptr_and_idx, window_id) {
+        WebAreaClassification::WebContent => true,
+        WebAreaClassification::WindowFocusUnavailable => {
+            crate::browser::electron_js::ElectronJs::is_electron(pid)
+                || crate::browser::platform::is_chromium(
+                    &crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
+                    &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
+                )
+        }
+        WebAreaClassification::NonWebContent | WebAreaClassification::Incomplete => false,
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
