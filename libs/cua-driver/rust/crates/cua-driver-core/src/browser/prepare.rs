@@ -1109,9 +1109,13 @@ impl BrowserEngine {
         let (claimed, displayed_consent_prompt) = {
             let ws_url = endpoint.ws_url.clone();
             let mut claim = Box::pin(self.pool.claim_existing(&ws_url, grant.generation));
+            // The extension route never raises Chrome's remote-debugging prompt,
+            // so a slow claim there must not press Allow on some other client's.
+            let prompt_possible =
+                endpoint.transport != super::types::EndpointTransport::ExtensionRelay;
             let initial = tokio::select! {
                 result = &mut claim => Some(result),
-                _ = tokio::time::sleep(Duration::from_millis(500)) => None,
+                _ = tokio::time::sleep(Duration::from_millis(500)), if prompt_possible => None,
             };
             if let Some(result) = initial {
                 (result, false)

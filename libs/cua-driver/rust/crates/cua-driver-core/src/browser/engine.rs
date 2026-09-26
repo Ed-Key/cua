@@ -926,7 +926,9 @@ impl BrowserEngine {
             ));
             let reconnected = tokio::select! {
                 result = &mut reconnect => result,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(500)) => {
+                // As in prepare: no Chrome prompt exists on the extension route.
+                _ = tokio::time::sleep(std::time::Duration::from_millis(500)),
+                    if endpoint.transport != super::types::EndpointTransport::ExtensionRelay => {
                     match self.platform.handle_existing_profile_consent(BrowserConsentRequest {
                         pid,
                         window_id: grant.window_id,

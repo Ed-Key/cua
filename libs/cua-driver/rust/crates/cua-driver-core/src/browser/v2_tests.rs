@@ -846,7 +846,7 @@ impl BrowserPlatform for FixturePlatform {
         Ok(Some(OwnedEndpoint {
             ws_url: self.ws_url.clone(),
             http_port: None,
-            transport: EndpointTransport::LegacyJsonVersion,
+            transport: self.existing_transport,
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::ListeningSocketPid,
                 owner_pid: pid,
@@ -1170,6 +1170,65 @@ async fn approved_existing_profile_attach_claims_then_binds_one_generation() {
     crate::session::fire_session_end("transport-v2-attach");
 }
 
+/// Forwards WebSocket connections to the mock endpoint after a delay, so a
+/// claim outlasts the 500 ms prompt window; `cut` drops every open link.
+struct SlowProxy {
+    ws_url: String,
+    links: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl SlowProxy {
+    async fn start(target_ws_url: &str, delay: std::time::Duration) -> Self {
+        let target = target_ws_url
+            .trim_start_matches("ws://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let links = Arc::new(StdMutex::new(Vec::new()));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (task_links, task_accepted) = (links.clone(), accepted.clone());
+        let accept_task = tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                task_accepted.fetch_add(1, Ordering::SeqCst);
+                let target = target.clone();
+                task_links.lock().unwrap().push(tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let mut outbound = tokio::net::TcpStream::connect(target).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }));
+            }
+        });
+        Self {
+            ws_url: format!("ws://127.0.0.1:{port}/devtools/browser/mock"),
+            links,
+            accepted,
+            accept_task,
+        }
+    }
+
+    fn cut(&self) {
+        for link in self.links.lock().unwrap().drain(..) {
+            link.abort();
+        }
+    }
+
+    fn connections(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SlowProxy {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+        self.cut();
+    }
+}
+
 fn standard_mode_platform(ws_url: String, transport: EndpointTransport) -> FixturePlatform {
     FixturePlatform {
         ws_url,
@@ -1215,6 +1274,37 @@ async fn connected_extension_is_consent_for_its_own_chrome_only() {
     assert_eq!(attached["status"], "ok", "{attached}");
     assert_eq!(attached["action"], "attached_existing_profile");
     crate::session::fire_session_end("transport-extension-consent");
+
+    // A slow extension link, on attach and on reconnect, must never reach
+    // Chrome's remote-debugging prompt handler (the fixture's refuses).
+    let proxy = SlowProxy::start(&server.ws_url(), std::time::Duration::from_millis(700)).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        proxy.ws_url.clone(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    let slow = BrowserPrepareTool::new(engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": "transport-extension-slow",
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    assert_eq!(structured(&slow)["status"], "ok", "{}", structured(&slow));
+    proxy.cut();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let rebound = GetBrowserStateTool::new(engine)
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": "transport-extension-slow"
+        }))
+        .await;
+    assert_eq!(structured(&rebound)["status"], "ok", "{}", structured(&rebound));
+    assert!(proxy.connections() >= 2, "the bind must have reconnected");
+    crate::session::fire_session_end("transport-extension-slow");
 
     // The same Chrome reachable only through its own debugging port is not consent.
     let refused = prepare(
