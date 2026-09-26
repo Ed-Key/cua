@@ -215,9 +215,10 @@ struct BrowserCursorTracker {
 
 impl BrowserCursorTracker {
     /// Record the session-to-tab binding and return the exact overlay
-    /// visibility changes needed for this action. An active tab owns the sole
-    /// visible browser cursor in its native window. An inactive tab hides only
-    /// its own cursor and never disturbs the cursor for the selected tab.
+    /// visibility changes needed for this action. In a native window, the
+    /// cursors of every session working in the selected tab are visible (two
+    /// agents in one tab show two cursors) and all others are hidden. An
+    /// inactive tab hides only its own cursor and never disturbs the rest.
     fn update(
         &mut self,
         session: &str,
@@ -240,21 +241,73 @@ impl BrowserCursorTracker {
         self.bindings
             .iter()
             .filter(|(_, binding)| binding.window_id == window_id)
-            .map(|(key, binding)| {
-                (
-                    key.clone(),
-                    key == session && binding.cdp_target_id == cdp_target_id,
-                )
-            })
+            .map(|(key, binding)| (key.clone(), binding.cdp_target_id == cdp_target_id))
+            .collect()
+    }
+
+    /// A tab became the selected one (the user or Cua switched tabs): in each
+    /// native window holding that tab, show exactly the cursors of sessions
+    /// working in it and hide the others.
+    fn activate(&self, cdp_target_id: &str) -> Vec<(String, bool)> {
+        let windows: Vec<u64> = self
+            .bindings
+            .values()
+            .filter(|binding| binding.cdp_target_id == cdp_target_id)
+            .map(|binding| binding.window_id)
+            .collect();
+        self.bindings
+            .iter()
+            .filter(|(_, binding)| windows.contains(&binding.window_id))
+            .map(|(key, binding)| (key.clone(), binding.cdp_target_id == cdp_target_id))
             .collect()
     }
 }
 
+/// Show or hide session cursors; a cursor its session turned off stays off.
+fn apply_cursor_visibility(
+    registry: &crate::cursor::CursorRegistry,
+    updates: Vec<(String, bool)>,
+) {
+    for (key, visible) in updates {
+        let enabled = visible && registry.get(&key).is_some_and(|state| state.config.enabled);
+        crate::cursor::overlay::send_command(key, cursor_overlay::OverlayCommand::SetEnabled(enabled));
+    }
+}
+
+/// Follow tab switches reported by the Chrome extension, so a session's cursor
+/// is visible only while its tab is the selected one.
+fn follow_extension_tab_switches(
+    registry: Arc<crate::cursor::CursorRegistry>,
+    tracker: Arc<Mutex<BrowserCursorTracker>>,
+) {
+    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let mut events = cua_driver_core::browser::extension_bridge::global().subscribe();
+    runtime.spawn(async move {
+        loop {
+            match events.recv().await {
+                Ok(event) if event.method == "tabs.activated" => {
+                    let Some(target) = event.params.get("targetId").and_then(|v| v.as_str()) else {
+                        continue;
+                    };
+                    let updates = tracker.lock().unwrap().activate(target);
+                    apply_cursor_visibility(&registry, updates);
+                }
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
+            }
+        }
+    });
+}
+
 impl MacOsBrowserPlatform {
     pub fn new(cursor_registry: Arc<crate::cursor::CursorRegistry>) -> Self {
+        let browser_cursors = Arc::new(Mutex::new(BrowserCursorTracker::default()));
+        follow_extension_tab_switches(cursor_registry.clone(), browser_cursors.clone());
         Self {
             cursor_registry,
-            browser_cursors: Arc::new(Mutex::new(BrowserCursorTracker::default())),
+            browser_cursors,
         }
     }
 }
@@ -796,21 +849,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             .get_or_create(&action.session)
             .config
             .enabled;
-        for (key, visible) in visibility_updates {
-            let enabled = if key == action.session {
-                visible && cursor_enabled
-            } else {
-                visible
-                    && self
-                        .cursor_registry
-                        .get(&key)
-                        .is_some_and(|state| state.config.enabled)
-            };
-            crate::cursor::overlay::send_command(
-                key,
-                cursor_overlay::OverlayCommand::SetEnabled(enabled),
-            );
-        }
+        apply_cursor_visibility(&self.cursor_registry, visibility_updates);
         if !action.tab_is_active || !cursor_enabled {
             return;
         }
@@ -1687,6 +1726,22 @@ mod tests {
             vec![("session-green".to_owned(), true)],
             "an active tab in another native window must not hide this window"
         );
+
+        // Switching back to tab A (no action by either session) swaps them,
+        // and leaves the other window alone.
+        let switched = tracker.activate("tab-A").into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(switched.get("session-red"), Some(&true));
+        assert_eq!(switched.get("session-blue"), Some(&false));
+        assert_eq!(switched.get("session-green"), None);
+        assert!(tracker.activate("tab-unknown").is_empty(), "a tab no session works in changes nothing");
+
+        // Two sessions in one tab both keep their cursors.
+        let together = tracker
+            .update("session-blue", 77, "tab-A", true)
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(together.get("session-red"), Some(&true));
+        assert_eq!(together.get("session-blue"), Some(&true));
     }
 
     #[test]

@@ -395,6 +395,13 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   post({ jsonrpc: "2.0", method: "debugger.detached", params: { source, reason } });
 });
 
+// The daemon shows each session's cursor only over the tab it works in, so it
+// hears when the selected tab changes, whether the user or Cua switched it.
+chrome.tabs.onActivated.addListener(async ({ tabId }) => {
+  const target = (await chrome.debugger.getTargets()).find((candidate) => candidate.tabId === tabId);
+  if (target) post({ jsonrpc: "2.0", method: "tabs.activated", params: { targetId: target.id } });
+});
+
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type === "cua-stop" && sender.tab?.id !== undefined) void stopTab(sender.tab.id);
 });
