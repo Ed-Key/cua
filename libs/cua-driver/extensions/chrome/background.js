@@ -92,8 +92,12 @@ async function refuseIfNotLoaded(tabId) {
   if (tab.status === "unloaded" || tab.discarded) throw new Error(NOT_LOADED_MESSAGE);
 }
 
+// Stop hooks for loads in flight, by tab.
+const loadCancels = new Map();
+
 // Reload a sleeping tab in place and wait for its page. One settle path
-// clears the timer and both listeners on success, failure, timeout, or close.
+// clears the timer, both listeners, and the Stop hook on success, failure,
+// timeout, close, or Stop.
 function loadTab(tabId) {
   return new Promise((resolve, reject) => {
     let timer;
@@ -101,9 +105,11 @@ function loadTab(tabId) {
       clearTimeout(timer);
       chrome.tabs.onUpdated.removeListener(onUpdated);
       chrome.tabs.onRemoved.removeListener(onRemoved);
+      loadCancels.delete(tabId);
       if (error) reject(error);
       else resolve();
     };
+    loadCancels.set(tabId, () => settle(new Error(STOPPED_MESSAGE)));
     const onUpdated = (id, change) => {
       if (id === tabId && change.status === "complete") settle();
     };
@@ -323,6 +329,12 @@ function tabsOf(method, params) {
 
 async function stopTab(tabId) {
   stopped.add(tabId);
+  const cancelLoad = loadCancels.get(tabId);
+  if (cancelLoad) {
+    cancelLoad();
+    // Put the page back to sleep; Chrome keeps the active tab loaded.
+    await chrome.tabs.discard(tabId).catch(() => {});
+  }
   await saveStopped();
   clearActive(tabId);
   await releaseDebugger(tabId, "stopped_by_user");
