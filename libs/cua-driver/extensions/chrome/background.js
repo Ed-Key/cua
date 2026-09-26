@@ -92,20 +92,24 @@ async function refuseIfNotLoaded(tabId) {
   if (tab.status === "unloaded" || tab.discarded) throw new Error(NOT_LOADED_MESSAGE);
 }
 
-// Stop hooks for loads in flight, by tab.
+// One load in flight per tab (a second request joins it), and its Stop hook.
+const loadsInFlight = new Map();
 const loadCancels = new Map();
 
 // Reload a sleeping tab in place and wait for its page. One settle path
 // clears the timer, both listeners, and the Stop hook on success, failure,
 // timeout, close, or Stop.
 function loadTab(tabId) {
-  return new Promise((resolve, reject) => {
+  const inFlight = loadsInFlight.get(tabId);
+  if (inFlight) return inFlight;
+  const load = new Promise((resolve, reject) => {
     let timer;
     const settle = (error) => {
       clearTimeout(timer);
       chrome.tabs.onUpdated.removeListener(onUpdated);
       chrome.tabs.onRemoved.removeListener(onRemoved);
       loadCancels.delete(tabId);
+      loadsInFlight.delete(tabId);
       if (error) reject(error);
       else resolve();
     };
@@ -121,6 +125,8 @@ function loadTab(tabId) {
     timer = setTimeout(() => settle(new Error("the tab did not finish loading in time")), LOAD_TIMEOUT_MS);
     chrome.tabs.reload(tabId).catch(settle);
   });
+  loadsInFlight.set(tabId, load);
+  return load;
 }
 
 function ensureAttached(tabId) {
