@@ -200,10 +200,18 @@ where
 pub struct MacOsBrowserPlatform {
     cursor_registry: Arc<crate::cursor::CursorRegistry>,
     browser_cursors: Arc<Mutex<BrowserCursorTracker>>,
-    /// Whether this platform follows the Chrome extension's tab switches yet.
-    /// Started on the first browser action, which always runs on the serving
-    /// runtime; the platform itself is built before that runtime exists.
-    following_tab_switches: Arc<std::sync::atomic::AtomicBool>,
+    /// The task following the Chrome extension's tab switches, started from
+    /// the first async call (the platform is built before the serving runtime
+    /// exists) and stopped when the last clone of this platform drops.
+    tab_switch_listener: Arc<std::sync::OnceLock<ListenerGuard>>,
+}
+
+struct ListenerGuard(tokio::task::JoinHandle<()>);
+
+impl Drop for ListenerGuard {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -274,10 +282,15 @@ impl BrowserCursorTracker {
         window_targets: Vec<String>,
     ) -> Vec<(String, bool)> {
         let selected = selected.unwrap_or_default().to_owned();
+        // The previous report still lists a tab that just closed, so its
+        // cursor is found (and hidden) even when no bound tab remains.
+        let previous = self.reports.get(&window).map(|report| report.targets.clone()).unwrap_or_default();
         let mut windows: Vec<u64> = self
             .bindings
             .values()
-            .filter(|binding| window_targets.contains(&binding.cdp_target_id))
+            .filter(|binding| {
+                window_targets.contains(&binding.cdp_target_id) || previous.contains(&binding.cdp_target_id)
+            })
             .map(|binding| binding.window_id)
             .collect();
         windows.sort_unstable();
@@ -310,15 +323,21 @@ impl BrowserCursorTracker {
     }
 }
 
-/// Show or hide session cursors; a cursor its session turned off stays off.
-/// Callers hold the tracker lock, so a decision and its commands reach the
-/// overlay before any later decision's.
+/// Show or hide session cursors; a cursor its session turned off stays off,
+/// and one never placed (first used in a background tab) waits for its first
+/// action instead of appearing at the overlay's off-screen origin. `acting`
+/// is about to be placed. Callers hold the tracker lock, so a decision and its
+/// commands reach the overlay before any later decision's.
 fn apply_cursor_visibility(
     registry: &crate::cursor::CursorRegistry,
     updates: &[(String, bool)],
+    acting: Option<&str>,
 ) {
     for (key, visible) in updates {
-        let enabled = *visible && registry.get(key).is_some_and(|state| state.config.enabled);
+        let enabled = *visible
+            && registry.get(key).is_some_and(|state| {
+                state.config.enabled && (state.position.is_some() || acting == Some(key.as_str()))
+            });
         crate::cursor::overlay::send_command(
             key.clone(),
             cursor_overlay::OverlayCommand::SetEnabled(enabled),
@@ -331,52 +350,65 @@ impl MacOsBrowserPlatform {
         Self {
             cursor_registry,
             browser_cursors: Arc::new(Mutex::new(BrowserCursorTracker::default())),
-            following_tab_switches: Arc::default(),
+            tab_switch_listener: Arc::default(),
         }
     }
 
     /// Follow tab switches reported by the Chrome extension. The task holds
-    /// only weak references and ends once this platform is gone.
+    /// only weak references; its guard aborts it with the last platform clone.
     fn follow_tab_switches(&self) {
-        use std::sync::atomic::Ordering;
-        if self.following_tab_switches.swap(true, Ordering::SeqCst) {
+        if tokio::runtime::Handle::try_current().is_err() {
             return;
         }
-        let registry = Arc::downgrade(&self.cursor_registry);
-        let tracker = Arc::downgrade(&self.browser_cursors);
-        let mut events = cua_driver_core::browser::extension_bridge::global().subscribe();
-        tokio::spawn(async move {
-            use tokio::sync::broadcast::error::RecvError;
-            loop {
-                let event = match events.recv().await {
-                    Ok(event) => event,
-                    Err(RecvError::Lagged(_)) => continue,
-                    Err(RecvError::Closed) => return,
-                };
-                let (Some(registry), Some(tracker)) = (registry.upgrade(), tracker.upgrade()) else {
-                    return;
-                };
-                let mut tracker = tracker.lock().unwrap();
-                match event.method.as_str() {
-                    "tabs.activated" => {
-                        let selected = event.params.get("targetId").and_then(|value| value.as_str());
-                        let chrome_window = event.params.get("windowId").and_then(|value| value.as_i64()).unwrap_or(-1);
-                        let window_targets: Vec<String> = event
-                            .params
-                            .get("windowTargets")
-                            .and_then(|value| value.as_array())
-                            .into_iter()
-                            .flatten()
-                            .filter_map(|value| value.as_str().map(str::to_owned))
-                            .collect();
-                        let updates = tracker.activate((event.link, chrome_window), selected, window_targets);
-                        apply_cursor_visibility(&registry, &updates);
-                    }
-                    "link.closed" => tracker.forget_link(event.link),
-                    _ => {}
-                }
-            }
+        self.tab_switch_listener.get_or_init(|| {
+            let registry = Arc::downgrade(&self.cursor_registry);
+            let tracker = Arc::downgrade(&self.browser_cursors);
+            let events = cua_driver_core::browser::extension_bridge::global().subscribe();
+            ListenerGuard(tokio::spawn(follow_reports(events, registry, tracker)))
         });
+    }
+}
+
+async fn follow_reports(
+    mut events: tokio::sync::broadcast::Receiver<cua_driver_core::browser::extension_bridge::ExtensionEvent>,
+    registry: std::sync::Weak<crate::cursor::CursorRegistry>,
+    tracker: std::sync::Weak<Mutex<BrowserCursorTracker>>,
+) {
+    use tokio::sync::broadcast::error::RecvError;
+    loop {
+        let event = match events.recv().await {
+            Ok(event) => Some(event),
+            // A dropped report would leave a stale selection deciding
+            // visibility: forget them all and let actions probe again.
+            Err(RecvError::Lagged(_)) => None,
+            Err(RecvError::Closed) => return,
+        };
+        let (Some(registry), Some(tracker)) = (registry.upgrade(), tracker.upgrade()) else {
+            return;
+        };
+        let mut tracker = tracker.lock().unwrap();
+        let Some(event) = event else {
+            tracker.reports.clear();
+            continue;
+        };
+        match event.method.as_str() {
+            "tabs.activated" => {
+                let selected = event.params.get("targetId").and_then(|value| value.as_str());
+                let chrome_window = event.params.get("windowId").and_then(|value| value.as_i64()).unwrap_or(-1);
+                let window_targets: Vec<String> = event
+                    .params
+                    .get("windowTargets")
+                    .and_then(|value| value.as_array())
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|value| value.as_str().map(str::to_owned))
+                    .collect();
+                let updates = tracker.activate((event.link, chrome_window), selected, window_targets);
+                apply_cursor_visibility(&registry, &updates, None);
+            }
+            "link.closed" => tracker.forget_link(event.link),
+            _ => {}
+        }
     }
 }
 
@@ -920,7 +952,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 &action.cdp_target_id,
                 action.tab_is_active,
             );
-            apply_cursor_visibility(&self.cursor_registry, &updates);
+            apply_cursor_visibility(&self.cursor_registry, &updates, Some(&action.session));
             updates.contains(&(action.session.clone(), true))
         };
         if !shown || !cursor_enabled {
@@ -960,6 +992,8 @@ impl BrowserPlatform for MacOsBrowserPlatform {
     }
 
     async fn classify_browser(&self, pid: i64) -> Result<BrowserClassification, BrowserRefusal> {
+        // Before any probe an action could base its visibility on.
+        self.follow_tab_switches();
         let (app, fallback_name, fallback_bundle_id) = tokio::task::spawn_blocking(move || {
             let app = crate::apps::list_running_apps()
                 .into_iter()
@@ -1886,6 +1920,16 @@ mod tests {
         let fresh = tracker.update("session-blue", 77, "tab-N", false).into_iter().collect::<HashMap<_, _>>();
         assert_eq!(fresh.get("session-red"), Some(&true));
         assert_eq!(fresh.get("session-blue"), Some(&true));
+
+        // Closing the only tab with a cursor selects an untracked tab; the
+        // previous report still finds the closed tab's cursor to hide it.
+        let mut lone = BrowserCursorTracker::default();
+        lone.activate((2, 9), Some("tab-L"), vec!["tab-L".to_owned()]);
+        lone.update("session-lone", 99, "tab-L", true);
+        assert_eq!(
+            lone.activate((2, 9), Some("tab-M"), vec!["tab-M".to_owned()]),
+            vec![("session-lone".to_owned(), false)]
+        );
 
         // Without the link's reports, the action's own probe decides again.
         tracker.forget_link(1);

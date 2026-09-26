@@ -399,9 +399,15 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // hears when the selected tab changes, whether the user or Cua switched it.
 // With every tab of the window, so the daemon finds the window even when no
 // session works in the new tab (and hides the others' cursors).
+// Numbered per window: a slow report superseded by a later switch is dropped
+// so it cannot arrive last and win.
+const activationReports = new Map();
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+  const report = (activationReports.get(windowId) ?? 0) + 1;
+  activationReports.set(windowId, report);
   // Page targets only, as the relay reports them: a tab can list other kinds.
   const [all, tabs] = await Promise.all([chrome.debugger.getTargets(), chrome.tabs.query({ windowId })]);
+  if (activationReports.get(windowId) !== report) return;
   const targets = all.filter((target) => target.type === "page");
   const inWindow = new Set(tabs.map((tab) => tab.id));
   const windowTargets = targets.filter((target) => inWindow.has(target.tabId)).map((target) => target.id);
