@@ -754,6 +754,9 @@ struct FixturePlatform {
     setup_aborted: Arc<AtomicBool>,
     stall_consent: bool,
     existing_transport: EndpointTransport,
+    /// Scripted results for successive existing-profile discoveries (`None`
+    /// = no endpoint); once empty, discovery uses `existing_transport`.
+    route_script: Arc<StdMutex<std::collections::VecDeque<Option<EndpointTransport>>>>,
 }
 
 #[async_trait]
@@ -822,10 +825,15 @@ impl BrowserPlatform for FixturePlatform {
         if !self.existing_endpoint_visible.load(Ordering::SeqCst) {
             return Ok(None);
         }
+        let transport = match self.route_script.lock().unwrap().pop_front() {
+            Some(None) => return Ok(None),
+            Some(Some(transport)) => transport,
+            None => self.existing_transport,
+        };
         Ok(Some(OwnedEndpoint {
             ws_url: self.ws_url.clone(),
             http_port: None,
-            transport: self.existing_transport,
+            transport,
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::ListeningSocketPid,
                 owner_pid: pid,
@@ -970,6 +978,7 @@ async fn fixture_with_platform(
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
         existing_transport: EndpointTransport::LegacyJsonVersion,
+        route_script: Default::default(),
     }));
     Fixture {
         state,
@@ -1024,6 +1033,7 @@ async fn protected_existing_profile_fixture() -> (Fixture, Arc<FixtureProtectedP
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
             existing_transport: EndpointTransport::LegacyJsonVersion,
+            route_script: Default::default(),
         }),
         Some(provider.clone()),
     );
@@ -1054,6 +1064,7 @@ async fn existing_profile_setup_fixture() -> (Fixture, Arc<AtomicBool>) {
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
             existing_transport: EndpointTransport::LegacyJsonVersion,
+            route_script: Default::default(),
         }),
         Some(Arc::new(FixtureProtectedProvider {
             consent_seen: AtomicBool::new(false),
@@ -1109,6 +1120,7 @@ async fn standalone_consumer_bind_without_grant_refuses_before_endpoint_discover
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
         existing_transport: EndpointTransport::LegacyJsonVersion,
+        route_script: Default::default(),
     }));
 
     let result = GetBrowserStateTool::new(engine)
@@ -1241,11 +1253,12 @@ fn standard_mode_platform(ws_url: String, transport: EndpointTransport) -> Fixtu
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
         existing_transport: transport,
+        route_script: Default::default(),
     }
 }
 
 #[tokio::test]
-async fn connected_extension_is_consent_for_its_own_chrome_only() {
+async fn connected_extension_is_consent_for_the_extension_route_only() {
     let state = Arc::new(StdMutex::new(FixtureState::default()));
     let server = MockCdpServer::start(fixture_handler(state)).await;
     let prepare = |platform: FixturePlatform, transport: &'static str| {
@@ -1314,6 +1327,20 @@ async fn connected_extension_is_consent_for_its_own_chrome_only() {
     .await;
     assert_eq!(refused["status"], "refused", "{refused}");
     assert_eq!(refused["refusal"]["code"], "browser_consent_required");
+
+    // The extension disconnects, or Chrome's debugging port appears instead,
+    // between the consent check and attachment: refused, no setup page.
+    for after_consent in [None, Some(EndpointTransport::LegacyJsonVersion)] {
+        let platform = standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay);
+        platform
+            .route_script
+            .lock()
+            .unwrap()
+            .extend([Some(EndpointTransport::ExtensionRelay), after_consent]);
+        let changed = prepare(platform, "transport-extension-changed").await;
+        assert_eq!(changed["status"], "refused", "{changed}");
+        assert_eq!(changed["refusal"]["code"], "browser_consent_required");
+    }
 }
 
 #[tokio::test]
@@ -1502,6 +1529,7 @@ async fn refused_consent_cancels_stalled_claim_before_revoking_grant() {
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
             existing_transport: EndpointTransport::LegacyJsonVersion,
+            route_script: Default::default(),
         }),
         Some(Arc::new(FixtureProtectedProvider {
             consent_seen: AtomicBool::new(false),
@@ -1547,6 +1575,7 @@ async fn cancelled_prepare_aborts_the_exact_pending_setup() {
             setup_aborted: setup_aborted.clone(),
             stall_consent: true,
             existing_transport: EndpointTransport::LegacyJsonVersion,
+            route_script: Default::default(),
         }),
         Some(Arc::new(FixtureProtectedProvider {
             consent_seen: AtomicBool::new(false),
