@@ -5152,8 +5152,8 @@ fn run_native_file_picker(spec: &BrowserSpec) {
         eprintln!("[file-picker] rebind pid={panel_pid} wid={panel_wid}; sheet own id={own_id}");
 
         // 2. The parent's read includes the sheet and its Cancel button (its
-        // controls can reach the AX tree a moment after the window appears).
-        let deadline = Instant::now() + Duration::from_secs(3);
+        // controls can reach the AX tree a while after the window appears).
+        let deadline = Instant::now() + Duration::from_secs(6);
         let state = loop {
             let state = read(&mut fixture.driver, panel_pid, panel_wid);
             assert!(!state.is_error(), "{}", state.raw);
