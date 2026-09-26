@@ -212,14 +212,22 @@ struct BrowserCursorBinding {
     cdp_target_id: String,
 }
 
+/// The Chrome extension's last report for one Chrome window: all its tab
+/// targets and the selected one (empty when the selected tab has none).
+#[derive(Debug, Clone)]
+struct TabSwitchReport {
+    targets: Vec<String>,
+    selected: String,
+}
+
 #[derive(Debug, Default)]
 struct BrowserCursorTracker {
     bindings: HashMap<String, BrowserCursorBinding>,
-    /// The selected tab of each native window, as the Chrome extension last
-    /// reported it (empty: a tab no session works in). Where known, it decides
-    /// visibility instead of an action's own activity probe, which may have
-    /// been taken before a later tab switch.
-    selected: HashMap<u64, String>,
+    /// Reports per (extension link, Chrome window id). Kept apart from the
+    /// bindings, which may still name a closed tab when a report arrives. A
+    /// report listing an action's tab decides visibility instead of the
+    /// action's own activity probe, which may predate a later tab switch.
+    reports: HashMap<(u64, i64), TabSwitchReport>,
 }
 
 impl BrowserCursorTracker {
@@ -242,19 +250,30 @@ impl BrowserCursorTracker {
                 cdp_target_id: cdp_target_id.to_owned(),
             },
         );
-        let selected = match self.selected.get(&window_id) {
-            Some(selected) => selected.clone(),
+        let reported = self
+            .reports
+            .values()
+            .find(|report| report.targets.iter().any(|target| target == cdp_target_id))
+            .map(|report| report.selected.clone());
+        let selected = match reported {
+            Some(selected) => selected,
             None if tab_is_active => cdp_target_id.to_owned(),
             None => return vec![(session.to_owned(), false)],
         };
         self.visibility_in(window_id, &selected)
     }
 
-    /// The selected tab changed (the user or Cua switched tabs). `selected` is
-    /// the new tab's target, `None` when it has none (chrome:// pages);
-    /// `window_targets` are all tabs of that Chrome window, which locate the
-    /// native windows even when no session works in the new tab.
-    fn activate(&mut self, selected: Option<&str>, window_targets: &[String]) -> Vec<(String, bool)> {
+    /// The selected tab of a Chrome window changed (the user or Cua switched
+    /// tabs). `selected` is the new tab's target, `None` when it has none
+    /// (chrome:// pages); `window_targets` are all tabs of that window, which
+    /// locate the native windows even when no session works in the new tab.
+    fn activate(
+        &mut self,
+        window: (u64, i64),
+        selected: Option<&str>,
+        window_targets: Vec<String>,
+    ) -> Vec<(String, bool)> {
+        let selected = selected.unwrap_or_default().to_owned();
         let mut windows: Vec<u64> = self
             .bindings
             .values()
@@ -263,20 +282,23 @@ impl BrowserCursorTracker {
             .collect();
         windows.sort_unstable();
         windows.dedup();
-        let selected = selected.unwrap_or_default();
+        self.reports.insert(
+            window,
+            TabSwitchReport {
+                targets: window_targets,
+                selected: selected.clone(),
+            },
+        );
         windows
             .into_iter()
-            .flat_map(|window_id| {
-                self.selected.insert(window_id, selected.to_owned());
-                self.visibility_in(window_id, selected)
-            })
+            .flat_map(|window_id| self.visibility_in(window_id, &selected))
             .collect()
     }
 
-    /// The extension link went away: its reported selections may go stale, so
-    /// actions fall back to their own probes until the next report.
-    fn forget_selections(&mut self) {
-        self.selected.clear();
+    /// An extension link went away: its reports may go stale, so actions in
+    /// its windows fall back to their own probes until the next report.
+    fn forget_link(&mut self, link: u64) {
+        self.reports.retain(|(report_link, _), _| *report_link != link);
     }
 
     fn visibility_in(&self, window_id: u64, selected: &str) -> Vec<(String, bool)> {
@@ -338,6 +360,7 @@ impl MacOsBrowserPlatform {
                 match event.method.as_str() {
                     "tabs.activated" => {
                         let selected = event.params.get("targetId").and_then(|value| value.as_str());
+                        let chrome_window = event.params.get("windowId").and_then(|value| value.as_i64()).unwrap_or(-1);
                         let window_targets: Vec<String> = event
                             .params
                             .get("windowTargets")
@@ -346,10 +369,10 @@ impl MacOsBrowserPlatform {
                             .flatten()
                             .filter_map(|value| value.as_str().map(str::to_owned))
                             .collect();
-                        let updates = tracker.activate(selected, &window_targets);
+                        let updates = tracker.activate((event.link, chrome_window), selected, window_targets);
                         apply_cursor_visibility(&registry, &updates);
                     }
-                    "link.closed" => tracker.forget_selections(),
+                    "link.closed" => tracker.forget_link(event.link),
                     _ => {}
                 }
             }
@@ -1781,13 +1804,13 @@ mod tests {
             platform.visualize_browser_action(action("follow-red", "tab-A")).await;
             platform.visualize_browser_action(action("follow-blue", "tab-B")).await;
             let switch = serde_json::json!({"jsonrpc": "2.0", "method": "tabs.activated",
-                "params": {"targetId": "tab-A", "windowTargets": ["tab-A", "tab-B"]}});
+                "params": {"targetId": "tab-A", "windowId": 500, "windowTargets": ["tab-A", "tab-B"]}});
             extension
                 .write_all(&cua_driver_core::browser::extension_bridge::frame(&switch))
                 .await
                 .unwrap();
             let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
-            while platform.browser_cursors.lock().unwrap().selected.get(&77).map(String::as_str) != Some("tab-A") {
+            while !platform.browser_cursors.lock().unwrap().reports.values().any(|report| report.selected == "tab-A") {
                 assert!(tokio::time::Instant::now() < deadline, "the tab switch never reached the tracker");
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
@@ -1823,15 +1846,22 @@ mod tests {
         );
 
         let window_77: Vec<String> = ["tab-A", "tab-B", "tab-X"].map(str::to_owned).to_vec();
+        let chrome_window = (1, 500);
         // Switching back to tab A (no action by either session) swaps them,
         // and leaves the other window alone.
-        let switched = tracker.activate(Some("tab-A"), &window_77).into_iter().collect::<HashMap<_, _>>();
+        let switched = tracker
+            .activate(chrome_window, Some("tab-A"), window_77.clone())
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         assert_eq!(switched.get("session-red"), Some(&true));
         assert_eq!(switched.get("session-blue"), Some(&false));
         assert_eq!(switched.get("session-green"), None);
 
         // A tab no session works in hides every cursor of that window only.
-        let untouched = tracker.activate(Some("tab-X"), &window_77).into_iter().collect::<HashMap<_, _>>();
+        let untouched = tracker
+            .activate(chrome_window, Some("tab-X"), window_77.clone())
+            .into_iter()
+            .collect::<HashMap<_, _>>();
         assert_eq!(untouched.get("session-red"), Some(&false));
         assert_eq!(untouched.get("session-blue"), Some(&false));
         assert_eq!(untouched.get("session-green"), None);
@@ -1841,7 +1871,7 @@ mod tests {
         assert_eq!(stale.get("session-red"), Some(&false));
 
         // Two sessions in one selected tab both keep their cursors.
-        tracker.activate(Some("tab-A"), &window_77);
+        tracker.activate(chrome_window, Some("tab-A"), window_77.clone());
         let together = tracker
             .update("session-blue", 77, "tab-A", false)
             .into_iter()
@@ -1849,8 +1879,16 @@ mod tests {
         assert_eq!(together.get("session-red"), Some(&true));
         assert_eq!(together.get("session-blue"), Some(&true));
 
-        // Without the extension's reports, the action's own probe decides again.
-        tracker.forget_selections();
+        // A new tab selected while the sessions' bindings still name closed
+        // tabs: the report is kept, and their first actions there show them.
+        tracker.activate(chrome_window, Some("tab-N"), vec!["tab-N".to_owned()]);
+        tracker.update("session-red", 77, "tab-N", false);
+        let fresh = tracker.update("session-blue", 77, "tab-N", false).into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(fresh.get("session-red"), Some(&true));
+        assert_eq!(fresh.get("session-blue"), Some(&true));
+
+        // Without the link's reports, the action's own probe decides again.
+        tracker.forget_link(1);
         assert_eq!(
             tracker.update("session-blue", 77, "tab-B", false),
             vec![("session-blue".to_owned(), false)]

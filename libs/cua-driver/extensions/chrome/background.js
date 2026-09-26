@@ -400,11 +400,13 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 // With every tab of the window, so the daemon finds the window even when no
 // session works in the new tab (and hides the others' cursors).
 chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
-  const [targets, tabs] = await Promise.all([chrome.debugger.getTargets(), chrome.tabs.query({ windowId })]);
+  // Page targets only, as the relay reports them: a tab can list other kinds.
+  const [all, tabs] = await Promise.all([chrome.debugger.getTargets(), chrome.tabs.query({ windowId })]);
+  const targets = all.filter((target) => target.type === "page");
   const inWindow = new Set(tabs.map((tab) => tab.id));
   const windowTargets = targets.filter((target) => inWindow.has(target.tabId)).map((target) => target.id);
   const selected = targets.find((target) => target.tabId === tabId)?.id ?? null;
-  post({ jsonrpc: "2.0", method: "tabs.activated", params: { targetId: selected, windowTargets } });
+  post({ jsonrpc: "2.0", method: "tabs.activated", params: { targetId: selected, windowId, windowTargets } });
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
