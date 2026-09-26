@@ -259,7 +259,9 @@ const handlers = {
 
   "tabs.load": async ({ tabId }) => {
     const tab = await chrome.tabs.get(tabId);
-    if (tab.status === "unloaded" || tab.discarded) {
+    // A load already under way reports "loading": join it rather than
+    // returning before the page is there.
+    if (tab.status === "unloaded" || tab.discarded || loadsInFlight.has(tabId)) {
       refuseIfStopped(tabId);
       await loadTab(tabId);
     }
