@@ -170,6 +170,27 @@ pub struct TreeWalkResult {
     /// [`WindowScope::Matched`] comes with an EMPTY walk, so `nodes` never
     /// describes a window other than the requested one.
     pub window_scope: Option<WindowScope>,
+    /// What the walk saw that its output alone cannot show.
+    pub sightings: WalkSightings,
+}
+
+/// Facts from a walk that pruning or unrecorded limits would otherwise hide.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct WalkSightings {
+    /// A web-content element was reached, even if it was not emitted as a node.
+    pub web_content: bool,
+    /// Some subtree was cut by the depth limit.
+    pub depth_cut: bool,
+    /// Reading some element's children failed.
+    pub child_read_failed: bool,
+}
+
+impl WalkSightings {
+    /// Whether an absence in this walk means anything: no budget stop, no
+    /// depth cut, and no failed child read.
+    pub fn complete(&self, walk: &WalkOutcome) -> bool {
+        !walk.truncated() && !self.depth_cut && !self.child_read_failed
+    }
 }
 
 /// Walk the AX tree of `pid`, optionally filtered to a specific window.
@@ -234,6 +255,7 @@ pub fn walk_tree_budgeted(
     let mut nodes: Vec<AXNode> = Vec::new();
     let mut index_counter = 0usize;
     let mut window_scope: Option<WindowScope> = None;
+    let mut sightings = WalkSightings::default();
 
     unsafe {
         let app_elem = AXUIElementCreateApplication(pid);
@@ -246,6 +268,7 @@ pub fn walk_tree_budgeted(
                 // No application AX element at all, so a requested window
                 // certainly did not resolve.
                 window_scope: window_id.map(|_| WindowScope::AxUnresolved { ax_window_count: 0 }),
+                sightings,
             };
         }
         set_messaging_timeout(app_elem);
@@ -342,6 +365,7 @@ pub fn walk_tree_budgeted(
                 &mut nodes,
                 &mut index_counter,
                 &mut budget,
+                &mut sightings,
                 max_depth,
             );
         }
@@ -368,6 +392,7 @@ pub fn walk_tree_budgeted(
         truncated: walk.truncated(),
         walk,
         window_scope,
+        sightings,
     }
 }
 
@@ -431,9 +456,11 @@ unsafe fn walk_element(
     nodes: &mut Vec<AXNode>,
     counter: &mut usize,
     budget: &mut WalkBudget,
+    sightings: &mut WalkSightings,
     max_depth: usize,
 ) {
     if depth > max_depth {
+        sightings.depth_cut = true;
         return;
     }
     // Node and time budget: a refused node is counted as discovered but not
@@ -449,6 +476,7 @@ unsafe fn walk_element(
     let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
 
     let in_web_content = in_web_content || is_web_content_role(&role);
+    sightings.web_content |= in_web_content;
 
     // Read names before deciding whether a group is only a layout wrapper.
     // Reuse these reads below for retained nodes.
@@ -458,7 +486,8 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let children = copy_children(element);
+        let (children, failed) = copy_children_reporting(element);
+        sightings.child_read_failed |= failed;
         for child in children {
             walk_element(
                 child,
@@ -469,6 +498,7 @@ unsafe fn walk_element(
                 nodes,
                     counter,
                 budget,
+                sightings,
                 max_depth,
             );
             CFRelease(child as CFTypeRef);
@@ -532,7 +562,8 @@ unsafe fn walk_element(
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let children = copy_children(element);
+        let (children, failed) = copy_children_reporting(element);
+        sightings.child_read_failed |= failed;
         for child in children {
             walk_element(
                 child,
@@ -543,6 +574,7 @@ unsafe fn walk_element(
                 nodes,
                     counter,
                 budget,
+                sightings,
                 max_depth,
             );
             CFRelease(child as CFTypeRef);
@@ -674,7 +706,8 @@ unsafe fn walk_element(
     let position = nodes.len();
     nodes.push(node);
 
-    let children = copy_children(element);
+    let (children, failed) = copy_children_reporting(element);
+    sightings.child_read_failed |= failed;
     for child in children {
         walk_element(
             child,
@@ -685,6 +718,7 @@ unsafe fn walk_element(
             nodes,
             counter,
             budget,
+            sightings,
             max_depth,
         );
         CFRelease(child as CFTypeRef);
