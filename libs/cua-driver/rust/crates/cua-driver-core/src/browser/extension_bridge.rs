@@ -257,6 +257,11 @@ impl ExtensionBridge {
             .lock()
             .unwrap()
             .retain(|other| !Arc::ptr_eq(other, &link));
+        let _ = self.events.send(ExtensionEvent {
+            link: link.id,
+            method: "link.closed".to_owned(),
+            params: Value::Null,
+        });
     }
 }
 

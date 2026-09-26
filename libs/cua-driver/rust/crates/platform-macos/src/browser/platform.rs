@@ -200,6 +200,10 @@ where
 pub struct MacOsBrowserPlatform {
     cursor_registry: Arc<crate::cursor::CursorRegistry>,
     browser_cursors: Arc<Mutex<BrowserCursorTracker>>,
+    /// Whether this platform follows the Chrome extension's tab switches yet.
+    /// Started on the first browser action, which always runs on the serving
+    /// runtime; the platform itself is built before that runtime exists.
+    following_tab_switches: Arc<std::sync::atomic::AtomicBool>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -211,14 +215,19 @@ struct BrowserCursorBinding {
 #[derive(Debug, Default)]
 struct BrowserCursorTracker {
     bindings: HashMap<String, BrowserCursorBinding>,
+    /// The selected tab of each native window, as the Chrome extension last
+    /// reported it (empty: a tab no session works in). Where known, it decides
+    /// visibility instead of an action's own activity probe, which may have
+    /// been taken before a later tab switch.
+    selected: HashMap<u64, String>,
 }
 
 impl BrowserCursorTracker {
-    /// Record the session-to-tab binding and return the exact overlay
-    /// visibility changes needed for this action. In a native window, the
-    /// cursors of every session working in the selected tab are visible (two
-    /// agents in one tab show two cursors) and all others are hidden. An
-    /// inactive tab hides only its own cursor and never disturbs the rest.
+    /// Record the session-to-tab binding and return the overlay visibility for
+    /// every cursor in its native window: the cursors of all sessions working
+    /// in the selected tab show (two agents in one tab, two cursors), the rest
+    /// hide. Without a reported selection, an action whose tab is inactive
+    /// hides only its own cursor and never disturbs the rest.
     fn update(
         &mut self,
         session: &str,
@@ -233,82 +242,118 @@ impl BrowserCursorTracker {
                 cdp_target_id: cdp_target_id.to_owned(),
             },
         );
+        let selected = match self.selected.get(&window_id) {
+            Some(selected) => selected.clone(),
+            None if tab_is_active => cdp_target_id.to_owned(),
+            None => return vec![(session.to_owned(), false)],
+        };
+        self.visibility_in(window_id, &selected)
+    }
 
-        if !tab_is_active {
-            return vec![(session.to_owned(), false)];
-        }
-
-        self.bindings
-            .iter()
-            .filter(|(_, binding)| binding.window_id == window_id)
-            .map(|(key, binding)| (key.clone(), binding.cdp_target_id == cdp_target_id))
+    /// The selected tab changed (the user or Cua switched tabs). `selected` is
+    /// the new tab's target, `None` when it has none (chrome:// pages);
+    /// `window_targets` are all tabs of that Chrome window, which locate the
+    /// native windows even when no session works in the new tab.
+    fn activate(&mut self, selected: Option<&str>, window_targets: &[String]) -> Vec<(String, bool)> {
+        let mut windows: Vec<u64> = self
+            .bindings
+            .values()
+            .filter(|binding| window_targets.contains(&binding.cdp_target_id))
+            .map(|binding| binding.window_id)
+            .collect();
+        windows.sort_unstable();
+        windows.dedup();
+        let selected = selected.unwrap_or_default();
+        windows
+            .into_iter()
+            .flat_map(|window_id| {
+                self.selected.insert(window_id, selected.to_owned());
+                self.visibility_in(window_id, selected)
+            })
             .collect()
     }
 
-    /// A tab became the selected one (the user or Cua switched tabs): in each
-    /// native window holding that tab, show exactly the cursors of sessions
-    /// working in it and hide the others.
-    fn activate(&self, cdp_target_id: &str) -> Vec<(String, bool)> {
-        let windows: Vec<u64> = self
-            .bindings
-            .values()
-            .filter(|binding| binding.cdp_target_id == cdp_target_id)
-            .map(|binding| binding.window_id)
-            .collect();
+    /// The extension link went away: its reported selections may go stale, so
+    /// actions fall back to their own probes until the next report.
+    fn forget_selections(&mut self) {
+        self.selected.clear();
+    }
+
+    fn visibility_in(&self, window_id: u64, selected: &str) -> Vec<(String, bool)> {
         self.bindings
             .iter()
-            .filter(|(_, binding)| windows.contains(&binding.window_id))
-            .map(|(key, binding)| (key.clone(), binding.cdp_target_id == cdp_target_id))
+            .filter(|(_, binding)| binding.window_id == window_id)
+            .map(|(key, binding)| (key.clone(), binding.cdp_target_id == selected))
             .collect()
     }
 }
 
 /// Show or hide session cursors; a cursor its session turned off stays off.
+/// Callers hold the tracker lock, so a decision and its commands reach the
+/// overlay before any later decision's.
 fn apply_cursor_visibility(
     registry: &crate::cursor::CursorRegistry,
-    updates: Vec<(String, bool)>,
+    updates: &[(String, bool)],
 ) {
     for (key, visible) in updates {
-        let enabled = visible && registry.get(&key).is_some_and(|state| state.config.enabled);
-        crate::cursor::overlay::send_command(key, cursor_overlay::OverlayCommand::SetEnabled(enabled));
+        let enabled = *visible && registry.get(key).is_some_and(|state| state.config.enabled);
+        crate::cursor::overlay::send_command(
+            key.clone(),
+            cursor_overlay::OverlayCommand::SetEnabled(enabled),
+        );
     }
-}
-
-/// Follow tab switches reported by the Chrome extension, so a session's cursor
-/// is visible only while its tab is the selected one.
-fn follow_extension_tab_switches(
-    registry: Arc<crate::cursor::CursorRegistry>,
-    tracker: Arc<Mutex<BrowserCursorTracker>>,
-) {
-    let Ok(runtime) = tokio::runtime::Handle::try_current() else {
-        return;
-    };
-    let mut events = cua_driver_core::browser::extension_bridge::global().subscribe();
-    runtime.spawn(async move {
-        loop {
-            match events.recv().await {
-                Ok(event) if event.method == "tabs.activated" => {
-                    let Some(target) = event.params.get("targetId").and_then(|v| v.as_str()) else {
-                        continue;
-                    };
-                    let updates = tracker.lock().unwrap().activate(target);
-                    apply_cursor_visibility(&registry, updates);
-                }
-                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {}
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => break,
-            }
-        }
-    });
 }
 
 impl MacOsBrowserPlatform {
     pub fn new(cursor_registry: Arc<crate::cursor::CursorRegistry>) -> Self {
-        let browser_cursors = Arc::new(Mutex::new(BrowserCursorTracker::default()));
-        follow_extension_tab_switches(cursor_registry.clone(), browser_cursors.clone());
         Self {
             cursor_registry,
-            browser_cursors,
+            browser_cursors: Arc::new(Mutex::new(BrowserCursorTracker::default())),
+            following_tab_switches: Arc::default(),
         }
+    }
+
+    /// Follow tab switches reported by the Chrome extension. The task holds
+    /// only weak references and ends once this platform is gone.
+    fn follow_tab_switches(&self) {
+        use std::sync::atomic::Ordering;
+        if self.following_tab_switches.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let registry = Arc::downgrade(&self.cursor_registry);
+        let tracker = Arc::downgrade(&self.browser_cursors);
+        let mut events = cua_driver_core::browser::extension_bridge::global().subscribe();
+        tokio::spawn(async move {
+            use tokio::sync::broadcast::error::RecvError;
+            loop {
+                let event = match events.recv().await {
+                    Ok(event) => event,
+                    Err(RecvError::Lagged(_)) => continue,
+                    Err(RecvError::Closed) => return,
+                };
+                let (Some(registry), Some(tracker)) = (registry.upgrade(), tracker.upgrade()) else {
+                    return;
+                };
+                let mut tracker = tracker.lock().unwrap();
+                match event.method.as_str() {
+                    "tabs.activated" => {
+                        let selected = event.params.get("targetId").and_then(|value| value.as_str());
+                        let window_targets: Vec<String> = event
+                            .params
+                            .get("windowTargets")
+                            .and_then(|value| value.as_array())
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|value| value.as_str().map(str::to_owned))
+                            .collect();
+                        let updates = tracker.activate(selected, &window_targets);
+                        apply_cursor_visibility(&registry, &updates);
+                    }
+                    "link.closed" => tracker.forget_selections(),
+                    _ => {}
+                }
+            }
+        });
     }
 }
 
@@ -838,19 +883,24 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             return;
         }
 
-        let visibility_updates = self.browser_cursors.lock().unwrap().update(
-            &action.session,
-            action.window_id,
-            &action.cdp_target_id,
-            action.tab_is_active,
-        );
+        self.follow_tab_switches();
         let cursor_enabled = self
             .cursor_registry
             .get_or_create(&action.session)
             .config
             .enabled;
-        apply_cursor_visibility(&self.cursor_registry, visibility_updates);
-        if !action.tab_is_active || !cursor_enabled {
+        let shown = {
+            let mut tracker = self.browser_cursors.lock().unwrap();
+            let updates = tracker.update(
+                &action.session,
+                action.window_id,
+                &action.cdp_target_id,
+                action.tab_is_active,
+            );
+            apply_cursor_visibility(&self.cursor_registry, &updates);
+            updates.contains(&(action.session.clone(), true))
+        };
+        if !shown || !cursor_enabled {
             return;
         }
         let (Some(screen_x), Some(screen_y)) = (action.screen_x, action.screen_y) else {
@@ -1703,6 +1753,51 @@ mod tests {
     }
 
     #[test]
+    fn tab_switches_are_followed_although_the_platform_predates_the_runtime() {
+        use tokio::io::AsyncWriteExt;
+        // The daemon builds its platform before the serving runtime exists.
+        let platform = MacOsBrowserPlatform::new(Arc::new(crate::cursor::CursorRegistry::new()));
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("bridge.sock");
+            let bridge = cua_driver_core::browser::extension_bridge::global().clone();
+            tokio::spawn(bridge.serve(path.to_str().unwrap().to_owned()));
+            let mut extension = loop {
+                match tokio::net::UnixStream::connect(&path).await {
+                    Ok(stream) => break stream,
+                    Err(_) => tokio::time::sleep(std::time::Duration::from_millis(10)).await,
+                }
+            };
+            let action = |session: &str, tab: &str| BrowserVisualAction {
+                session: session.to_owned(),
+                window_id: 77,
+                cdp_target_id: tab.to_owned(),
+                tab_is_active: true,
+                screen_x: None,
+                screen_y: None,
+                kind: BrowserVisualActionKind::Click,
+            };
+            platform.visualize_browser_action(action("follow-red", "tab-A")).await;
+            platform.visualize_browser_action(action("follow-blue", "tab-B")).await;
+            let switch = serde_json::json!({"jsonrpc": "2.0", "method": "tabs.activated",
+                "params": {"targetId": "tab-A", "windowTargets": ["tab-A", "tab-B"]}});
+            extension
+                .write_all(&cua_driver_core::browser::extension_bridge::frame(&switch))
+                .await
+                .unwrap();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(2);
+            while platform.browser_cursors.lock().unwrap().selected.get(&77).map(String::as_str) != Some("tab-A") {
+                assert!(tokio::time::Instant::now() < deadline, "the tab switch never reached the tracker");
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            let visible = platform.browser_cursors.lock().unwrap().visibility_in(77, "tab-A");
+            assert!(visible.contains(&("follow-red".to_owned(), true)));
+            assert!(visible.contains(&("follow-blue".to_owned(), false)));
+        });
+    }
+
+    #[test]
     fn browser_cursor_tracker_shows_only_the_active_tabs_session_per_window() {
         let mut tracker = BrowserCursorTracker::default();
         assert_eq!(
@@ -1727,21 +1822,39 @@ mod tests {
             "an active tab in another native window must not hide this window"
         );
 
+        let window_77: Vec<String> = ["tab-A", "tab-B", "tab-X"].map(str::to_owned).to_vec();
         // Switching back to tab A (no action by either session) swaps them,
         // and leaves the other window alone.
-        let switched = tracker.activate("tab-A").into_iter().collect::<HashMap<_, _>>();
+        let switched = tracker.activate(Some("tab-A"), &window_77).into_iter().collect::<HashMap<_, _>>();
         assert_eq!(switched.get("session-red"), Some(&true));
         assert_eq!(switched.get("session-blue"), Some(&false));
         assert_eq!(switched.get("session-green"), None);
-        assert!(tracker.activate("tab-unknown").is_empty(), "a tab no session works in changes nothing");
 
-        // Two sessions in one tab both keep their cursors.
+        // A tab no session works in hides every cursor of that window only.
+        let untouched = tracker.activate(Some("tab-X"), &window_77).into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(untouched.get("session-red"), Some(&false));
+        assert_eq!(untouched.get("session-blue"), Some(&false));
+        assert_eq!(untouched.get("session-green"), None);
+
+        // An action probe taken before that switch cannot bring red back.
+        let stale = tracker.update("session-red", 77, "tab-A", true).into_iter().collect::<HashMap<_, _>>();
+        assert_eq!(stale.get("session-red"), Some(&false));
+
+        // Two sessions in one selected tab both keep their cursors.
+        tracker.activate(Some("tab-A"), &window_77);
         let together = tracker
-            .update("session-blue", 77, "tab-A", true)
+            .update("session-blue", 77, "tab-A", false)
             .into_iter()
             .collect::<HashMap<_, _>>();
         assert_eq!(together.get("session-red"), Some(&true));
         assert_eq!(together.get("session-blue"), Some(&true));
+
+        // Without the extension's reports, the action's own probe decides again.
+        tracker.forget_selections();
+        assert_eq!(
+            tracker.update("session-blue", 77, "tab-B", false),
+            vec![("session-blue".to_owned(), false)]
+        );
     }
 
     #[test]

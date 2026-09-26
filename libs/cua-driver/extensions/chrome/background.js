@@ -397,9 +397,14 @@ chrome.debugger.onDetach.addListener((source, reason) => {
 
 // The daemon shows each session's cursor only over the tab it works in, so it
 // hears when the selected tab changes, whether the user or Cua switched it.
-chrome.tabs.onActivated.addListener(async ({ tabId }) => {
-  const target = (await chrome.debugger.getTargets()).find((candidate) => candidate.tabId === tabId);
-  if (target) post({ jsonrpc: "2.0", method: "tabs.activated", params: { targetId: target.id } });
+// With every tab of the window, so the daemon finds the window even when no
+// session works in the new tab (and hides the others' cursors).
+chrome.tabs.onActivated.addListener(async ({ tabId, windowId }) => {
+  const [targets, tabs] = await Promise.all([chrome.debugger.getTargets(), chrome.tabs.query({ windowId })]);
+  const inWindow = new Set(tabs.map((tab) => tab.id));
+  const windowTargets = targets.filter((target) => inWindow.has(target.tabId)).map((target) => target.id);
+  const selected = targets.find((target) => target.tabId === tabId)?.id ?? null;
+  post({ jsonrpc: "2.0", method: "tabs.activated", params: { targetId: selected, windowTargets } });
 });
 
 chrome.runtime.onMessage.addListener((message, sender) => {
