@@ -1344,6 +1344,54 @@ async fn connected_extension_is_consent_for_the_extension_route_only() {
 }
 
 #[tokio::test]
+async fn relay_tab_attach_carries_the_session_cursor_color() {
+    const TRANSPORT: &str = "transport-session-color";
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state.clone())).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        server.ws_url(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    let args = |extra: Value| {
+        let mut args = json!({ "session": SESSION, "_transport_session_id": TRANSPORT });
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args
+    };
+    let prepared = BrowserPrepareTool::new(engine.clone())
+        .invoke(args(json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } })))
+        .await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let bound = GetBrowserStateTool::new(engine.clone())
+        .invoke(args(json!({ "pid": 1, "window_id": 7 })))
+        .await;
+    let bound = structured(&bound).clone();
+    let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
+    GetBrowserStateTool::new(engine)
+        .invoke(args(json!({ "target_id": bound["target_id"], "tab_id": tab })))
+        .await;
+    let attaches: Vec<Value> = state
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|(_, method, _)| method == "Target.attachToTarget")
+        .map(|(_, _, params)| params.clone())
+        .collect();
+    assert!(!attaches.is_empty());
+    let color = cua_driver_contract::cursor::session_fill_hex(SESSION);
+    assert!(attaches.iter().all(|params| params["cuaSessionColor"] == json!(color)), "{attaches:?}");
+    crate::session::fire_session_end(TRANSPORT);
+
+    // A real DevTools endpoint never receives the relay-only field.
+    let f = fixture().await;
+    let (target_id, tab_id) = bind(&f).await;
+    snapshot(&f, &target_id, &tab_id).await;
+    let attaches = recorded_calls(&f, "Target.attachToTarget");
+    assert!(!attaches.is_empty());
+    assert!(attaches.iter().all(|(_, params)| params.get("cuaSessionColor").is_none()));
+}
+
+#[tokio::test]
 async fn approved_existing_profile_tools_stay_within_the_reviewed_cdp_surface() {
     const TRANSPORT: &str = "transport-v2-method-policy";
     let (f, _) = protected_existing_profile_fixture().await;
