@@ -985,9 +985,15 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             .config
             .enabled;
         // Whatever this action decides below, the browser owns the cursor again.
-        crate::cursor::overlay::claim_for_browser(&action.session, action.window_id, cursor_enabled);
+        // Back from a native app, its position is that app's: it is placed
+        // again by this action if it has a position, and stays hidden if not.
+        let from_native =
+            crate::cursor::overlay::claim_for_browser(&action.session, action.window_id, cursor_enabled);
         let shown = {
             let mut tracker = self.browser_cursors.lock().unwrap();
+            if from_native {
+                tracker.placed.remove(&action.session);
+            }
             let updates = tracker.update(
                 &action.session,
                 action.window_id,

@@ -462,8 +462,9 @@ pub fn set_user_enabled(key: CursorKey, enabled: bool) {
 
 /// A browser action in native window `window` takes a session cursor back
 /// from any native action; the caller then applies its tab's selection.
-/// `user_enabled` only seeds a cursor seen here for the first time.
-pub fn claim_for_browser(key: &str, window: u64, user_enabled: bool) {
+/// `user_enabled` only seeds a cursor seen here for the first time. Returns
+/// whether a native action owned it (its position is then that app's).
+pub fn claim_for_browser(key: &str, window: u64, user_enabled: bool) -> bool {
     with_visibility(|map| {
         let inputs = map.entry(key.to_owned()).or_insert(VisibilityInputs {
             user_enabled,
@@ -471,9 +472,9 @@ pub fn claim_for_browser(key: &str, window: u64, user_enabled: bool) {
             native: false,
             browser_window: None,
         });
-        inputs.native = false;
         inputs.browser_window = Some(window);
-    });
+        std::mem::replace(&mut inputs.native, false)
+    })
 }
 
 /// Move a session cursor for a native action targeting `window`. A native
@@ -926,16 +927,15 @@ fn render_loop(
                             hover_changed |= rs.core.update_session_badge_hover(pointer);
                         }
                     }
-                    let pinned = last_key
+                    // Only a visible cursor chooses where the shared overlay is
+                    // stacked: hiding one (a background tab's cursor, say) must
+                    // not move the overlay behind the cursors still shown.
+                    let stacking = last_key
                         .as_ref()
                         .and_then(|k| map.cursors.get(k))
-                        .map(|rs| rs.core.pinned_wid)
-                        .unwrap_or(last_pinned);
-                    let raise_unpinned = last_key
-                        .as_ref()
-                        .and_then(|k| map.cursors.get(k))
-                        .is_some_and(cursor_is_externally_visible)
-                        && pinned.is_none();
+                        .filter(|rs| cursor_is_externally_visible(rs));
+                    let pinned = stacking.map(|rs| rs.core.pinned_wid).unwrap_or(last_pinned);
+                    let raise_unpinned = stacking.is_some() && pinned.is_none();
                     let next_frame_tick_needed = render_map_needs_frame_tick(map);
                     let next_hover_poll_needed = map
                         .cursors
@@ -1740,7 +1740,8 @@ mod visibility_tests {
         // A browser action takes it back; a report's sampled setting never
         // overrides the user's current one.
         set_user_enabled(key.clone(), false);
-        claim_for_browser(&key, 77, true);
+        assert!(claim_for_browser(&key, 77, true), "it was a native app's: the browser re-places it");
+        assert!(!claim_for_browser(&key, 77, true));
         set_tab_hidden(key.clone(), true, true);
         assert!(!inputs(&key).user_enabled, "the user turned it off; a stale report says on");
     }
