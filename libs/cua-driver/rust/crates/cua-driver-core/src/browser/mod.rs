@@ -39,6 +39,9 @@ pub mod binding;
 pub mod cdp_ws;
 pub mod download;
 pub mod engine;
+pub mod extension_bridge;
+pub mod extension_relay;
+pub mod tabs_tool;
 mod grant;
 #[cfg(test)]
 pub(crate) mod mock_cdp;

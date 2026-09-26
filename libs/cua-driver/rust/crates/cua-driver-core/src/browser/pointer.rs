@@ -365,7 +365,13 @@ impl BrowserPointerTool {
     }
 
     fn trusted_background_refusal(&self, validated: &ValidatedTab) -> Option<ToolResult> {
-        if validated.record.cdp_window_id.is_some() {
+        // The activation limitation describes the remote-debugging route. Input
+        // through the extension's chrome.debugger does not activate Chrome: on
+        // the lane VM, trusted typing and clicks landed with Finder in front
+        // and with Chrome fully covered (8 of 8), and Finder stayed frontmost.
+        if validated.record.cdp_window_id.is_some()
+            && validated.record.endpoint_transport != super::types::EndpointTransport::ExtensionRelay
+        {
             if let Some(limitation) = self
                 .engine
                 .platform

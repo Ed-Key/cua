@@ -20,6 +20,7 @@
 mod autostart;
 mod bundle;
 mod check_update_tool;
+mod chrome_native_host;
 mod cli;
 mod doctor;
 mod driver_service_http;
@@ -465,6 +466,10 @@ mod mcp_runtime_selection_tests {
 
 #[cfg(target_os = "macos")]
 fn main() {
+    // First: in native-host mode stdout carries Chrome's frames only.
+    if let Some(code) = chrome_native_host::run_if_requested() {
+        std::process::exit(code);
+    }
     cua_driver_sdk::configure_perception_client_provider(extension_manager::perception_client);
     if let Some(code) = platform_macos::permissions::gate::run_permission_probe_if_requested() {
         std::process::exit(code);
@@ -901,6 +906,10 @@ fn main() {
 
 #[cfg(not(target_os = "macos"))]
 fn main() -> anyhow::Result<()> {
+    // First: in native-host mode stdout carries Chrome's frames only.
+    if let Some(code) = chrome_native_host::run_if_requested() {
+        std::process::exit(code);
+    }
     cua_driver_sdk::configure_perception_client_provider(extension_manager::perception_client);
     if let Some(code) = history_runtime::run_offline_purge_if_requested() {
         std::process::exit(code);

@@ -169,6 +169,9 @@ pub enum EndpointTransport {
     #[default]
     LegacyJsonVersion,
     EmbeddedDescendant,
+    /// The daemon's loopback relay to the Cua Driver Chrome extension
+    /// (`extension_relay`), inside the user's own profile.
+    ExtensionRelay,
 }
 
 /// Core's authorization verdict for a bound endpoint.

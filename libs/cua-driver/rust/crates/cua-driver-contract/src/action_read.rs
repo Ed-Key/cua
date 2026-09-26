@@ -138,6 +138,8 @@ pub struct ActAndReadInput {
     #[schemars(schema_with = "amount")]
     #[uniffi(default = None)]
     pub amount: Option<u32>,
+    /// For multi-call work, prefer a short public session label and repeat it on every call that
+    /// accepts it. Unnamed calls use the transport's implicit session.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

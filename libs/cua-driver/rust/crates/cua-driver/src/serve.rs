@@ -990,6 +990,18 @@ pub async fn run_serve(
 
     eprintln!("Cua Driver daemon listening on {socket_path}");
 
+    // The Chrome extension's native host connects here. Embedded daemons
+    // serve a host application's endpoint only and skip it.
+    if !embedded {
+        let bridge_path = crate::chrome_native_host::bridge_socket_path_for(socket_path);
+        tokio::spawn(async move {
+            let bridge = cua_driver_core::browser::extension_bridge::global().clone();
+            if let Err(error) = bridge.serve(bridge_path).await {
+                eprintln!("Chrome extension bridge unavailable: {error}");
+            }
+        });
+    }
+
     // Write PID file.
     if let Some(pid_path) = pid_file_path {
         if let Some(dir) = std::path::Path::new(pid_path).parent() {

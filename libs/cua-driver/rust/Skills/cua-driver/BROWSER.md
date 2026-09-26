@@ -234,6 +234,31 @@ Never:
 - copy a personal profile into a driver-owned directory;
 - terminate or restart the user's browser as a hidden setup step.
 
+### Through the Cua Driver Chrome extension (macOS)
+
+When the Cua Driver extension is installed in that Chrome and connected,
+`browser_prepare` with `strategy.kind: "existing_profile"` attaches through the
+extension: no remote-debugging port and no setup page. The result reports
+`endpoint_transport: "extension_relay"`. The same approval rules apply, and the
+driver still allows only the existing-profile command set. The link's Chrome is
+proven by the operating system (the extension's native host is this driver's
+own executable, started by that Chrome).
+
+Through the extension, trusted typing and clicks do not bring Chrome forward:
+they land with another app in front, with the window fully covered, and with it
+minimized. The user sees Chrome's debugging banner and, in the tab Cua works
+in, a "Cua is working in this tab" pill with Stop. After Stop, commands for that
+tab are refused with a message saying so: ask the user before continuing; the
+extension's toolbar button re-allows Cua in every tab where the user pressed
+Stop. `chrome://` pages and the Web
+Store cannot be debugged by any extension.
+
+`browser_tabs` lists and organizes the user's tabs through the same extension:
+`list` returns windows, tabs (title, URL), and groups, each with the Chrome
+`pid`; every change (`open`, `activate`, `close`, `move`, `group`, `ungroup`,
+`update_group`) must pass that `pid`. Tabs Cua opens start in the background and
+join the window's cyan "Cua" group unless `group: false`.
+
 ## 3. Snapshot the selected tab
 
 Choose a returned `tab_id`, then request the page snapshot. `active` is
@@ -471,7 +496,7 @@ capabilities, or existing-profile consent.
 | Surface                                    | Typed state and mutation                                                 | Important boundary                                              |
 | ------------------------------------------ | ------------------------------------------------------------------------ | --------------------------------------------------------------- |
 | Chrome / Edge on Windows                   | Exact binding, refs, navigation, typing, trusted or explicit DOM click   | Must run in an interactive user session, not Session 0          |
-| Chrome / Edge on macOS                     | Exact binding, refs, navigation, typing, explicit DOM click              | Trusted standalone click refuses to preserve background posture |
+| Chrome / Edge on macOS                     | Exact binding, refs, navigation, typing, explicit DOM click              | Over a debugging port, trusted click refuses to keep the background; through the Cua Driver extension it stays in the background |
 | Chrome / Chromium on Linux X11             | Exact binding, refs, navigation, typing, explicit DOM click              | Trusted standalone click refuses to preserve background posture |
 | Chromium on validated Wayland setups       | Exact binding only when compositor identity is provable                  | Generic/ambiguous compositor identity refuses mutation          |
 | Electron                                   | Exact single-page routes where endpoint and host relationship are proven | Do not infer support for arbitrary embedded webviews            |

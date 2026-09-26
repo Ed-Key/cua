@@ -413,6 +413,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "browser_set_input_files" => &["browser.input.files"],
         "browser_download" => &["browser.download"],
         "browser_pointer" => &["browser.input.pointer"],
+        "browser_tabs" => &["browser.tabs"],
 
         // ── driver self-service ──────────────────────────────────────
         "check_for_update" => &["driver.update_check"],
@@ -1371,6 +1372,11 @@ impl ToolRegistry {
                 != ProtectedResourceOwnership::DriverOwned
                 || context.capability_manifest().is_some())
         {
+            let summary = if tool.def().name == "browser_tabs" {
+                crate::browser::tabs_tool::consent_summary(&public_args)
+            } else {
+                "Allow Cua to resolve this exact page-owned browser dialog".to_owned()
+            };
             let approved_scope = match self
                 .authorize_attested_resource(
                     tool.as_ref(),
@@ -1379,7 +1385,7 @@ impl ToolRegistry {
                     &public_args,
                     context,
                     runtime_session.as_deref(),
-                    "Allow Cua to resolve this exact page-owned browser dialog",
+                    &summary,
                     Duration::from_secs(5 * 60),
                     Duration::from_secs(30 * 60),
                 )
