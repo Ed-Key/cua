@@ -753,6 +753,10 @@ struct FixturePlatform {
     setup_invoked: Arc<AtomicBool>,
     setup_aborted: Arc<AtomicBool>,
     stall_consent: bool,
+    existing_transport: EndpointTransport,
+    /// Scripted results for successive existing-profile discoveries (`None`
+    /// = no endpoint); once empty, discovery uses `existing_transport`.
+    route_script: Arc<StdMutex<std::collections::VecDeque<Option<EndpointTransport>>>>,
 }
 
 #[async_trait]
@@ -821,10 +825,15 @@ impl BrowserPlatform for FixturePlatform {
         if !self.existing_endpoint_visible.load(Ordering::SeqCst) {
             return Ok(None);
         }
+        let transport = match self.route_script.lock().unwrap().pop_front() {
+            Some(None) => return Ok(None),
+            Some(Some(transport)) => transport,
+            None => self.existing_transport,
+        };
         Ok(Some(OwnedEndpoint {
             ws_url: self.ws_url.clone(),
             http_port: None,
-            transport: EndpointTransport::LegacyJsonVersion,
+            transport,
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::ListeningSocketPid,
                 owner_pid: pid,
@@ -845,7 +854,7 @@ impl BrowserPlatform for FixturePlatform {
         Ok(Some(OwnedEndpoint {
             ws_url: self.ws_url.clone(),
             http_port: None,
-            transport: EndpointTransport::LegacyJsonVersion,
+            transport: self.existing_transport,
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::ListeningSocketPid,
                 owner_pid: pid,
@@ -968,6 +977,8 @@ async fn fixture_with_platform(
         setup_invoked: setup_invoked.clone(),
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
+        existing_transport: EndpointTransport::LegacyJsonVersion,
+        route_script: Default::default(),
     }));
     Fixture {
         state,
@@ -1021,6 +1032,8 @@ async fn protected_existing_profile_fixture() -> (Fixture, Arc<FixtureProtectedP
             setup_invoked: setup_invoked.clone(),
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
+            existing_transport: EndpointTransport::LegacyJsonVersion,
+            route_script: Default::default(),
         }),
         Some(provider.clone()),
     );
@@ -1050,6 +1063,8 @@ async fn existing_profile_setup_fixture() -> (Fixture, Arc<AtomicBool>) {
             setup_invoked: setup_invoked.clone(),
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
+            existing_transport: EndpointTransport::LegacyJsonVersion,
+            route_script: Default::default(),
         }),
         Some(Arc::new(FixtureProtectedProvider {
             consent_seen: AtomicBool::new(false),
@@ -1104,6 +1119,8 @@ async fn standalone_consumer_bind_without_grant_refuses_before_endpoint_discover
         setup_invoked: setup_invoked.clone(),
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
+        existing_transport: EndpointTransport::LegacyJsonVersion,
+        route_script: Default::default(),
     }));
 
     let result = GetBrowserStateTool::new(engine)
@@ -1163,6 +1180,167 @@ async fn approved_existing_profile_attach_claims_then_binds_one_generation() {
         .await;
     assert_eq!(structured(&state)["status"], "ok", "{}", structured(&state));
     crate::session::fire_session_end("transport-v2-attach");
+}
+
+/// Forwards WebSocket connections to the mock endpoint after a delay, so a
+/// claim outlasts the 500 ms prompt window; `cut` drops every open link.
+struct SlowProxy {
+    ws_url: String,
+    links: Arc<StdMutex<Vec<tokio::task::JoinHandle<()>>>>,
+    accepted: Arc<std::sync::atomic::AtomicUsize>,
+    accept_task: tokio::task::JoinHandle<()>,
+}
+
+impl SlowProxy {
+    async fn start(target_ws_url: &str, delay: std::time::Duration) -> Self {
+        let target = target_ws_url
+            .trim_start_matches("ws://")
+            .split('/')
+            .next()
+            .unwrap()
+            .to_owned();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let links = Arc::new(StdMutex::new(Vec::new()));
+        let accepted = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (task_links, task_accepted) = (links.clone(), accepted.clone());
+        let accept_task = tokio::spawn(async move {
+            while let Ok((mut inbound, _)) = listener.accept().await {
+                task_accepted.fetch_add(1, Ordering::SeqCst);
+                let target = target.clone();
+                task_links.lock().unwrap().push(tokio::spawn(async move {
+                    tokio::time::sleep(delay).await;
+                    let mut outbound = tokio::net::TcpStream::connect(target).await.unwrap();
+                    let _ = tokio::io::copy_bidirectional(&mut inbound, &mut outbound).await;
+                }));
+            }
+        });
+        Self {
+            ws_url: format!("ws://127.0.0.1:{port}/devtools/browser/mock"),
+            links,
+            accepted,
+            accept_task,
+        }
+    }
+
+    fn cut(&self) {
+        for link in self.links.lock().unwrap().drain(..) {
+            link.abort();
+        }
+    }
+
+    fn connections(&self) -> usize {
+        self.accepted.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for SlowProxy {
+    fn drop(&mut self) {
+        self.accept_task.abort();
+        self.cut();
+    }
+}
+
+fn standard_mode_platform(ws_url: String, transport: EndpointTransport) -> FixturePlatform {
+    FixturePlatform {
+        ws_url,
+        trusted_input_limited: false,
+        managed_endpoint_visible: false,
+        process_role: BrowserProcessRole::StandaloneConsumer,
+        managed_discovery_invoked: Arc::new(AtomicBool::new(false)),
+        existing_endpoint_visible: Arc::new(AtomicBool::new(true)),
+        setup_invoked: Arc::new(AtomicBool::new(false)),
+        setup_aborted: Arc::new(AtomicBool::new(false)),
+        stall_consent: false,
+        existing_transport: transport,
+        route_script: Default::default(),
+    }
+}
+
+#[tokio::test]
+async fn connected_extension_is_consent_for_the_extension_route_only() {
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    let prepare = |platform: FixturePlatform, transport: &'static str| {
+        let setup_invoked = platform.setup_invoked.clone();
+        async move {
+            let result = BrowserPrepareTool::new(BrowserEngine::new(Arc::new(platform)))
+                .invoke(json!({
+                    "pid": 1,
+                    "window_id": 7,
+                    "session": SESSION,
+                    "_transport_session_id": transport,
+                    "strategy": { "kind": "existing_profile" }
+                }))
+                .await;
+            assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+            structured(&result).clone()
+        }
+    };
+
+    // Standard mode, no --grant, no approval host: the extension link is the consent.
+    let attached = prepare(
+        standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay),
+        "transport-extension-consent",
+    )
+    .await;
+    assert_eq!(attached["status"], "ok", "{attached}");
+    assert_eq!(attached["action"], "attached_existing_profile");
+    crate::session::fire_session_end("transport-extension-consent");
+
+    // A slow extension link, on attach and on reconnect, must never reach
+    // Chrome's remote-debugging prompt handler (the fixture's refuses).
+    let proxy = SlowProxy::start(&server.ws_url(), std::time::Duration::from_millis(700)).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        proxy.ws_url.clone(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    let slow = BrowserPrepareTool::new(engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": "transport-extension-slow",
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    assert_eq!(structured(&slow)["status"], "ok", "{}", structured(&slow));
+    proxy.cut();
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    let rebound = GetBrowserStateTool::new(engine)
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": "transport-extension-slow"
+        }))
+        .await;
+    assert_eq!(structured(&rebound)["status"], "ok", "{}", structured(&rebound));
+    assert!(proxy.connections() >= 2, "the bind must have reconnected");
+    crate::session::fire_session_end("transport-extension-slow");
+
+    // The same Chrome reachable only through its own debugging port is not consent.
+    let refused = prepare(
+        standard_mode_platform(server.ws_url(), EndpointTransport::LegacyJsonVersion),
+        "transport-extension-absent",
+    )
+    .await;
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(refused["refusal"]["code"], "browser_consent_required");
+
+    // The extension disconnects, or Chrome's debugging port appears instead,
+    // between the consent check and attachment: refused, no setup page.
+    for after_consent in [None, Some(EndpointTransport::LegacyJsonVersion)] {
+        let platform = standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay);
+        platform
+            .route_script
+            .lock()
+            .unwrap()
+            .extend([Some(EndpointTransport::ExtensionRelay), after_consent]);
+        let changed = prepare(platform, "transport-extension-changed").await;
+        assert_eq!(changed["status"], "refused", "{changed}");
+        assert_eq!(changed["refusal"]["code"], "browser_consent_required");
+    }
 }
 
 #[tokio::test]
@@ -1350,6 +1528,8 @@ async fn refused_consent_cancels_stalled_claim_before_revoking_grant() {
             setup_invoked: Arc::new(AtomicBool::new(false)),
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
+            existing_transport: EndpointTransport::LegacyJsonVersion,
+            route_script: Default::default(),
         }),
         Some(Arc::new(FixtureProtectedProvider {
             consent_seen: AtomicBool::new(false),
@@ -1394,6 +1574,8 @@ async fn cancelled_prepare_aborts_the_exact_pending_setup() {
             setup_invoked: Arc::new(AtomicBool::new(false)),
             setup_aborted: setup_aborted.clone(),
             stall_consent: true,
+            existing_transport: EndpointTransport::LegacyJsonVersion,
+            route_script: Default::default(),
         }),
         Some(Arc::new(FixtureProtectedProvider {
             consent_seen: AtomicBool::new(false),

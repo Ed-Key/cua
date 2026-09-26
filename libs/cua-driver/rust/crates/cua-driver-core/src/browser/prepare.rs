@@ -794,11 +794,16 @@ impl BrowserEngine {
         &self,
         request: PrepareRequest,
     ) -> Result<PrepareOutcome, BrowserRefusal> {
+        #[derive(PartialEq)]
         enum ConsentPath {
             Protected,
             BoundedManifest,
             LaunchGrant,
             Unrestricted,
+            /// The user installed the Cua Driver extension in this Chrome and it
+            /// is connected: an OS-proven link from their own profile. Installing
+            /// it is the consent, as it is for comparable browser agents.
+            ExtensionInstalled,
         }
 
         let pid = request.pid.ok_or_else(|| {
@@ -853,10 +858,16 @@ impl BrowserEngine {
             ConsentPath::LaunchGrant
         } else if self.approval_broker.provider_id().is_some() {
             ConsentPath::Protected
+        } else if matches!(
+            self.platform.discover_existing_profile_endpoint(pid).await,
+            Ok(Some(ref endpoint))
+                if endpoint.transport == super::types::EndpointTransport::ExtensionRelay
+        ) {
+            ConsentPath::ExtensionInstalled
         } else {
             return Err(refusal(
                 BrowserRefusalCode::BrowserConsentRequired,
-                "existing-profile attachment in standard mode requires --grant existing-profile or an embedding authorization host; bounded mode requires a matching manifest",
+                "existing-profile attachment in standard mode requires the Cua Driver Chrome extension in that Chrome, --grant existing-profile, or an embedding authorization host; bounded mode requires a matching manifest",
             )
             .with_detail(serde_json::json!({
                 "permission_mode": mode.as_str(),
@@ -892,6 +903,19 @@ impl BrowserEngine {
             .platform
             .discover_existing_profile_endpoint(pid)
             .await?;
+        // Consent through the extension covers the extension route only: never
+        // the setup page that enables Chrome's remote debugging, and never a
+        // different endpoint that appeared meanwhile.
+        if consent_path == ConsentPath::ExtensionInstalled
+            && !endpoint
+                .as_ref()
+                .is_some_and(|endpoint| endpoint.transport == super::types::EndpointTransport::ExtensionRelay)
+        {
+            return Err(refusal(
+                BrowserRefusalCode::BrowserConsentRequired,
+                "the Cua Driver extension link for this Chrome is no longer connected",
+            ));
+        }
         if endpoint.is_none() {
             setup = self
                 .platform
@@ -1085,9 +1109,13 @@ impl BrowserEngine {
         let (claimed, displayed_consent_prompt) = {
             let ws_url = endpoint.ws_url.clone();
             let mut claim = Box::pin(self.pool.claim_existing(&ws_url, grant.generation));
+            // The extension route never raises Chrome's remote-debugging prompt,
+            // so a slow claim there must not press Allow on some other client's.
+            let prompt_possible =
+                endpoint.transport != super::types::EndpointTransport::ExtensionRelay;
             let initial = tokio::select! {
                 result = &mut claim => Some(result),
-                _ = tokio::time::sleep(Duration::from_millis(500)) => None,
+                _ = tokio::time::sleep(Duration::from_millis(500)), if prompt_possible => None,
             };
             if let Some(result) = initial {
                 (result, false)

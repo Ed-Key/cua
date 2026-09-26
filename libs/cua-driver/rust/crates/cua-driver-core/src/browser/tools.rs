@@ -600,8 +600,9 @@ impl BrowserPrepareTool {
                 platform-attested system Chrome/Edge installation (or a root-owned package \
                 payload on Linux) is eligible; redirects and user-controlled locations fail closed. Existing-profile \
                 attachment is explicit and follows the runtime's immutable permission mode: \
-                standard requires an explicit --grant existing-profile launch grant or an \
-                embedding authorization host, bounded requires a launch-approved exact resource \
+                standard requires an explicit --grant existing-profile launch grant, an \
+                embedding authorization host, or the Cua Driver Chrome extension connected in \
+                that Chrome (its installation is the user's consent), bounded requires a launch-approved exact resource \
                 manifest, and unrestricted requires explicit trusted startup risk acceptance. \
                 Ordinary MCP transport approval never proves profile authorization. On proven platforms, an \
                 authorized request also permits one bounded exact-window setup: \
