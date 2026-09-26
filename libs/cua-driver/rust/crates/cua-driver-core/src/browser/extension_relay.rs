@@ -305,7 +305,8 @@ impl Session {
             "Target.getTargets" => Ok(json!({ "targetInfos": self.targets().await? })),
             "Target.attachToTarget" => {
                 let tab = self.tab_of_target(target_id()).await?;
-                self.request("debugger.attach", json!({ "tabId": tab })).await?;
+                let color = params.get("cuaSessionColor").cloned().unwrap_or(Value::Null);
+                self.request("debugger.attach", json!({ "tabId": tab, "color": color })).await?;
                 let session = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
                 self.routes.lock().unwrap().sessions.insert(session.clone(), tab);
                 Ok(json!({ "sessionId": session }))
