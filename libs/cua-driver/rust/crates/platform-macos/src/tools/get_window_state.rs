@@ -785,7 +785,7 @@ impl Tool for GetWindowStateTool {
             r.walk.apply(&mut structured);
             let bounded = args.get("max_depth").is_some() || args.get("max_elements").is_some();
             if !bounded {
-                if let Some(unexposed) = unexposed_web_content(pid, &r.nodes) {
+                if let Some(unexposed) = unexposed_web_content(pid, &r.nodes, r.walk.truncated()) {
                     structured["web_content"] = unexposed;
                 }
             }
@@ -1381,22 +1381,36 @@ mod window_scope_contract_tests {
 /// covered window had no AXWebArea after 10 s, and disabling Chromium's
 /// occlusion tracking did not change that; a first read while visible kept the
 /// page after the window was covered). The walk then shows browser controls
-/// only, which reads like an empty page. When the driver's own web-content wait
-/// for this process timed out and this window has no page, say so and how to
-/// recover, instead of returning a silently partial tree.
-fn unexposed_web_content(pid: i32, nodes: &[crate::ax::tree::AXNode]) -> Option<Value> {
-    if nodes.iter().any(|node| node.role == "AXWebArea")
+/// only, which reads like an empty page. Report it when the driver's own
+/// web-content wait for this process timed out and a complete, non-empty walk
+/// of this window found no web content; an incomplete walk proves nothing.
+// ponytail: the wait is tracked per process, so once any window of the process
+// exposes a page, a different covered window gets no note. Track readiness per
+// window if that case shows up.
+fn unexposed_web_content(
+    pid: i32,
+    nodes: &[crate::ax::tree::AXNode],
+    walk_truncated: bool,
+) -> Option<Value> {
+    let found_web_content = nodes
+        .iter()
+        .any(|node| node.role == "AXWebArea" || node.in_web_content);
+    if walk_truncated
+        || nodes.is_empty()
+        || found_web_content
         || !crate::ax::enablement::web_content_wait_timed_out(pid)
     {
         return None;
     }
     Some(serde_json::json!({
         "exposed": false,
-        "reason": "The browser did not expose this page to accessibility when the driver \
-            asked. Chromium can withhold a page from a window that is fully covered at that \
-            moment. Elements and tree_markdown show browser controls only, not the page.",
-        "next": "Use the browser_* tools for page content, or bring_to_front this window once \
-            and read it again; the page stays exposed after it is covered again."
+        "reason": "No page content was found in this browser window, and the browser did not \
+            expose page content when the driver enabled accessibility for it. If this window \
+            should show a page, the browser may be withholding it from accessibility; this has \
+            been seen when the window was fully covered at that moment.",
+        "next": "Use the browser_* tools for page content, or bring_to_front this window and \
+            read it again (in testing, the page then appeared and stayed exposed after the \
+            window was covered again)."
     }))
 }
 
