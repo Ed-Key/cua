@@ -5284,8 +5284,8 @@ fn run_native_file_picker(spec: &BrowserSpec) {
         assert_eq!(fronted.structured()["activated"], true, "Finder in front: {}", fronted.raw);
         let finder_pid = finder["pid"].as_i64().unwrap() as i32;
         assert_eq!(
-            platform_macos::apps::frontmost_pid(),
-            Some(finder_pid),
+            platform_macos::input::skylight::front_pid_matches(finder_pid),
+            Some(true),
             "Finder must be frontmost before the Escape"
         );
         let escaped = fixture.driver.call(
@@ -5300,8 +5300,8 @@ fn run_native_file_picker(spec: &BrowserSpec) {
         for delay in [Duration::from_millis(300), Duration::from_millis(1200)] {
             thread::sleep(delay);
             assert_eq!(
-                platform_macos::apps::frontmost_pid(),
-                Some(finder_pid),
+                platform_macos::input::skylight::front_pid_matches(finder_pid),
+                Some(true),
                 "Finder must be restored after the foreground Escape"
             );
         }

@@ -1055,6 +1055,86 @@ fn harness_appkit_foreground_no_op_key_stays_unverifiable() {
     );
 }
 
+/// Foreground type_text while another app is in front: the driver's own
+/// activation of the target must not be reverted as a focus steal, and the
+/// user's app must be back in front afterward (and stay there).
+#[test]
+#[ignore]
+fn harness_appkit_foreground_type_text_from_behind_restores_front() {
+    run_case(
+        native_foreground_case(
+            "appkit",
+            "type_text_from_behind",
+            Targeting::Ax,
+            DriverRoute::MacosCgEventHid,
+        ),
+        |pid, wid, driver| {
+            let launched = driver.call(
+                "launch_app",
+                serde_json::json!({"bundle_id":"com.apple.finder"}),
+            );
+            assert!(!launched.is_error(), "{}", launched.text());
+            let windows = driver.call("list_windows", serde_json::json!({}));
+            let finder = windows.structured()["windows"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .find(|w| {
+                    w["app_name"] == "Finder" && w["is_on_screen"] == true && w["layer"] == 0
+                })
+                .cloned()
+                .expect("an on-screen Finder window");
+            let fronted = driver.call(
+                "bring_to_front",
+                serde_json::json!({"pid":finder["pid"],"window_id":finder["window_id"]}),
+            );
+            assert_eq!(
+                fronted.structured()["activated"],
+                true,
+                "Finder in front: {}",
+                fronted.raw
+            );
+            // WindowServer's front process, not NSWorkspace's cached view.
+            let finder_pid = finder["pid"].as_i64().unwrap() as i32;
+            assert_eq!(
+                platform_macos::input::skylight::front_pid_matches(finder_pid),
+                Some(true),
+                "Finder must be frontmost before typing"
+            );
+
+            let snap = snapshot_elements(driver, pid, wid);
+            let typed = driver.call(
+                "type_text",
+                serde_json::json!({
+                    "pid": pid as i64, "window_id": wid,
+                    "element_token": element_token_by_id(&snap, "txt-input"),
+                    "text": "behind-cua", "delivery_mode": "foreground"
+                }),
+            );
+            assert!(
+                !typed.is_error(),
+                "foreground type_text from behind: {}",
+                typed.text()
+            );
+            for delay in [Duration::from_millis(300), Duration::from_millis(1200)] {
+                std::thread::sleep(delay);
+                assert_eq!(
+                    platform_macos::input::skylight::front_pid_matches(finder_pid),
+                    Some(true),
+                    "Finder must be restored after foreground type_text"
+                );
+            }
+            let post = snapshot_elements(driver, pid, wid);
+            assert!(
+                post.tree_text().contains("behind-cua"),
+                "typing did not land in the target field:\n{}",
+                post.tree_text()
+            );
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_element_foreground_press_key_commits_edit() {

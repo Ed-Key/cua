@@ -763,6 +763,7 @@ pub fn with_foreground_assist(
         return Ok(false);
     }
 
+    let _intentional = crate::focus_steal::allow_intentional_activation(target_pid);
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     // `set_front` moves WindowServer's front process but does not make the
     // target's NSWindow key, and AppKit installs a first responder only for a
