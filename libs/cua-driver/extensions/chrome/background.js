@@ -61,7 +61,12 @@ function releaseDebugger(tabId, reason) {
     }
     clearTimeout(debuggerIdle.get(tabId));
     debuggerIdle.delete(tabId);
-    if (reason !== "idle") pageEnabled.delete(tabId);
+    // After a deliberate detach nothing is known about the tab's dialogs;
+    // Chrome sends no event for detaches the extension makes itself.
+    if (reason !== "idle") {
+      pageEnabled.delete(tabId);
+      dialogOpen.delete(tabId);
+    }
     if (!attached.delete(tabId)) return;
     await chrome.debugger.detach({ tabId }).catch(() => {});
     // Chrome reports only detaches it caused; tell the daemon about this one.
