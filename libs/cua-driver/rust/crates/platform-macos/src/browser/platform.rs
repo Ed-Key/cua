@@ -644,6 +644,24 @@ async fn loopback_ports_for_pid(pid: i64) -> Result<Vec<u16>, BrowserRefusal> {
     )))
 }
 
+/// The extension relay's endpoint for Chrome process `pid`, when the Cua Driver
+/// extension in that Chrome is connected. The native host is Chrome's child and
+/// reports its parent, which the relay matches against `pid`.
+async fn extension_relay_endpoint(pid: i64) -> Option<OwnedEndpoint> {
+    let ws_url = cua_driver_core::browser::extension_relay::endpoint_for_pid(pid).await?;
+    Some(OwnedEndpoint {
+        ws_url,
+        http_port: None,
+        transport: EndpointTransport::ExtensionRelay,
+        ownership: EndpointOwnershipProof {
+            method: EndpointOwnershipMethod::PlatformAttested,
+            owner_pid: pid,
+            listener_pid: None,
+            detail: Some("Cua Driver extension link whose native host is this Chrome's child".to_owned()),
+        },
+    })
+}
+
 async fn active_port_endpoint(
     pid: i64,
     product: BrowserProduct,
@@ -1002,6 +1020,10 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         &self,
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        // The installed extension is the route into the user's own profile.
+        if let Some(endpoint) = extension_relay_endpoint(pid).await {
+            return Ok(Some(endpoint));
+        }
         let classification = self.classify_browser(pid).await?;
         if let Some(endpoint) = active_port_endpoint(pid, classification.product_kind).await? {
             return Ok(Some(endpoint));
@@ -1045,6 +1067,13 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         pid: i64,
         expected_ws_url: &str,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
+        // The relay's port belongs to the daemon, not Chrome; its proof is the
+        // live extension link of this exact Chrome process.
+        if cua_driver_core::browser::extension_relay::is_relay_url(expected_ws_url) {
+            return Ok(extension_relay_endpoint(pid)
+                .await
+                .filter(|endpoint| endpoint.ws_url == expected_ws_url));
+        }
         let Some(port) = loopback_websocket_port(expected_ws_url) else {
             return Err(refusal(
                 BrowserRefusalCode::BrowserEndpointOwnerMismatch,

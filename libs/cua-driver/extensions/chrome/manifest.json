@@ -1,0 +1,10 @@
+{
+  "manifest_version": 3,
+  "name": "Cua Driver",
+  "version": "0.1.0",
+  "description": "Lets the Cua Driver on this Mac read and act on your Chrome tabs when you ask it to.",
+  "key": "MIIBIjANBgkqhkiG9w0BAQEFAAOCAQ8AMIIBCgKCAQEA4stbdXSbftKd9cL51xF86b+JlLtKxhjfiKRILoZx4BIGpGXZkVhy36DaTtaz9fRqFlbj4BO2kRie0LzyB1yR5n/OqePepCNTutXicq2l+Inur3Qq5wpYRgsv3e6o8l4c2949ZCvtrvFoMay02GTtxeuyobM1X9l4sHTUhtTmeDQGaolm//999WqKBTJhTplhoTJPJKz5FY5B/NSfMR6grey1v3SddtUWb1t6JEQFaNx/J9unui2vm97e9FRUkiaf+UsoPq97Cd84c1jR7w8zIcODWeeOWpvV41604jfr4k03OelNEDDy3h9MlNvEgensb+ozPghRbHmGI1DuV2KXlwIDAQAB",
+  "minimum_chrome_version": "120",
+  "background": { "service_worker": "background.js", "type": "module" },
+  "permissions": ["debugger", "tabs", "tabGroups", "nativeMessaging", "alarms"]
+}

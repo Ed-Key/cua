@@ -760,6 +760,7 @@ pub fn enforcement_adapters_for_call(
         ))
         || (tool == "browser_dialog"
             && args.get("action").and_then(Value::as_str) == Some("inspect"))
+        || (tool == "browser_tabs" && args.get("action").and_then(Value::as_str) == Some("list"))
     {
         add("private_observation");
     }
@@ -798,11 +799,12 @@ pub fn enforcement_adapters_for_call(
         add("file_transfer_and_output");
     }
 
-    if tool == "browser_dialog"
+    if (tool == "browser_dialog"
         && matches!(
             args.get("action").and_then(Value::as_str),
             Some("accept" | "dismiss")
-        )
+        ))
+        || (tool == "browser_tabs" && args.get("action").and_then(Value::as_str) != Some("list"))
     {
         add("browser_consequential_action");
     }
@@ -946,6 +948,7 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "install_extension"
         | "page"
         | "browser_dialog"
+        | "browser_tabs"
         | "browser_set_input_files"
         | "browser_download" => RiskClass::R3,
 

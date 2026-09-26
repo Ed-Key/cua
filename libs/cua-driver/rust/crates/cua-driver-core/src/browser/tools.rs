@@ -37,6 +37,9 @@ pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRe
     registry.register(Box::new(BrowserSetInputFilesTool::new(engine.clone())));
     registry.register(Box::new(BrowserDownloadTool::new(engine.clone())));
     registry.register(Box::new(BrowserPointerTool::new(engine.clone())));
+    registry.register(Box::new(super::tabs_tool::BrowserTabsTool::new(
+        super::extension_bridge::global().clone(),
+    )));
 }
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
@@ -2705,7 +2708,8 @@ mod tests {
                 "browser_dialog",
                 "browser_set_input_files",
                 "browser_download",
-                "browser_pointer"
+                "browser_pointer",
+                "browser_tabs"
             ]
         );
     }
