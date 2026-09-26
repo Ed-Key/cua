@@ -59,7 +59,7 @@ impl BrowserTabsTool {
                         "color": { "type": "string", "enum": GROUP_COLORS },
                         "collapsed": { "type": "boolean" },
                         "pid": { "type": "integer", "description": "The Chrome process, from list. Required for every change (not for list)." },
-                        "session": { "type": "string" }
+                        "session": crate::tool_schema::session_schema()
                     },
                     "required": ["action"],
                     "additionalProperties": false
