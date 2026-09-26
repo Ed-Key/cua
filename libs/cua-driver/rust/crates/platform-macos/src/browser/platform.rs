@@ -240,6 +240,9 @@ struct BrowserCursorTracker {
     /// cursor sits at the overlay's off-screen origin, so it stays hidden
     /// until its first action places it. Set when that move starts.
     placed: std::collections::HashSet<String>,
+    /// The Chrome window each tab was last reported in, kept apart from the
+    /// reports so a tab's move is seen whichever window reports first.
+    target_window: HashMap<String, (u64, i64)>,
 }
 
 impl BrowserCursorTracker {
@@ -290,22 +293,23 @@ impl BrowserCursorTracker {
         let mut affected = self.reports.get(&window).map(|report| report.targets.clone()).unwrap_or_default();
         affected.extend(window_targets.iter().cloned());
         // A tab belongs to one window: a tab moved here leaves the other report.
-        let mut moved = Vec::new();
         for (key, report) in self.reports.iter_mut() {
             if *key != window {
-                report.targets.retain(|target| {
-                    let here = window_targets.contains(target);
-                    if here {
-                        moved.push(target.clone());
-                    }
-                    !here
-                });
+                report.targets.retain(|target| !window_targets.contains(target));
             }
         }
+        let moved: Vec<&String> = window_targets
+            .iter()
+            .filter(|target| {
+                self.target_window
+                    .insert((*target).clone(), window)
+                    .is_some_and(|previous| previous != window)
+            })
+            .collect();
         // Its cursors' position and window pin belong to the old window: they
         // wait, hidden, for their next action to place them here.
         for (session, binding) in &self.bindings {
-            if moved.contains(&binding.cdp_target_id) {
+            if moved.contains(&&binding.cdp_target_id) {
                 self.placed.remove(session);
             }
         }
@@ -325,6 +329,7 @@ impl BrowserCursorTracker {
     /// its windows fall back to their own probes until the next report.
     fn forget_link(&mut self, link: u64) {
         self.reports.retain(|(report_link, _), _| *report_link != link);
+        self.target_window.retain(|_, (window_link, _)| *window_link != link);
     }
 
     fn visibility_among(&self, targets: &[String], selected: &str) -> Vec<(String, bool)> {
@@ -356,10 +361,9 @@ fn apply_cursor_visibility(
 ) {
     for (key, visible) in updates {
         let Some(state) = registry.get(key) else { continue };
-        if !tracker.placed.contains(key) {
-            continue;
-        }
-        crate::cursor::overlay::set_tab_hidden(key.clone(), !visible, state.config.enabled);
+        // Being unplaced stops a cursor showing, never hiding.
+        let hidden = !visible || !tracker.placed.contains(key);
+        crate::cursor::overlay::set_tab_hidden(key.clone(), hidden, state.config.enabled);
     }
 }
 
@@ -2017,6 +2021,15 @@ mod tests {
         assert_eq!(after_move.get("session-t"), Some(&false));
         assert_eq!(after_move.get("session-u"), Some(&true));
         assert!(!split.placed.contains("session-t"), "a moved tab's cursor waits to be placed again");
+
+        // The same move with the source window reporting first.
+        let mut source_first = BrowserCursorTracker::default();
+        source_first.activate((5, 1), Some("tab-V"), vec!["tab-V".to_owned(), "tab-W".to_owned()]);
+        source_first.update("session-w", 10, "tab-W", false);
+        source_first.placed.insert("session-w".to_owned());
+        source_first.activate((5, 1), Some("tab-V"), vec!["tab-V".to_owned()]);
+        source_first.activate((5, 2), Some("tab-W"), vec!["tab-W".to_owned()]);
+        assert!(!source_first.placed.contains("session-w"));
 
 
         // A closed Chrome window reports no tabs: its cursors hide.
