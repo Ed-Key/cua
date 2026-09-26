@@ -236,11 +236,13 @@ struct BrowserCursorTracker {
     /// report listing an action's tab decides visibility instead of the
     /// action's own activity probe, which may predate a later tab switch.
     reports: HashMap<(u64, i64), TabSwitchReport>,
-    /// Sessions whose cursor has been sent somewhere on screen. An unplaced
+    /// Where a browser action last sent each session's cursor. An unplaced
     /// cursor sits at the overlay's off-screen origin, so it stays hidden
     /// until its first action places it. Set when that move starts, not when
     /// its animation ends, so another action meanwhile cannot hide it.
-    placed: std::collections::HashSet<String>,
+    placed: HashMap<String, (f64, f64)>,
+    /// Sessions whose browser move is still animating.
+    moving: std::collections::HashSet<String>,
 }
 
 impl BrowserCursorTracker {
@@ -263,17 +265,16 @@ impl BrowserCursorTracker {
                 cdp_target_id: cdp_target_id.to_owned(),
             },
         );
-        let reported = self
+        let report = self
             .reports
             .values()
             .find(|report| report.targets.iter().any(|target| target == cdp_target_id))
-            .map(|report| report.selected.clone());
-        let selected = match reported {
-            Some(selected) => selected,
-            None if tab_is_active => cdp_target_id.to_owned(),
-            None => return vec![(session.to_owned(), false)],
-        };
-        self.visibility_in(window_id, &selected)
+            .cloned();
+        match report {
+            Some(report) => self.visibility_among(&report.targets, &report.selected),
+            None if tab_is_active => self.visibility_in(window_id, cdp_target_id),
+            None => vec![(session.to_owned(), false)],
+        }
     }
 
     /// The selected tab of a Chrome window changed (the user or Cua switched
@@ -289,17 +290,8 @@ impl BrowserCursorTracker {
         let selected = selected.unwrap_or_default().to_owned();
         // The previous report still lists a tab that just closed, so its
         // cursor is found (and hidden) even when no bound tab remains.
-        let previous = self.reports.get(&window).map(|report| report.targets.clone()).unwrap_or_default();
-        let mut windows: Vec<u64> = self
-            .bindings
-            .values()
-            .filter(|binding| {
-                window_targets.contains(&binding.cdp_target_id) || previous.contains(&binding.cdp_target_id)
-            })
-            .map(|binding| binding.window_id)
-            .collect();
-        windows.sort_unstable();
-        windows.dedup();
+        let mut affected = self.reports.get(&window).map(|report| report.targets.clone()).unwrap_or_default();
+        affected.extend(window_targets.iter().cloned());
         // A tab belongs to one window: a tab moved here leaves the other report.
         for (key, report) in self.reports.iter_mut() {
             if *key != window {
@@ -313,16 +305,31 @@ impl BrowserCursorTracker {
                 selected: selected.clone(),
             },
         );
-        windows
-            .into_iter()
-            .flat_map(|window_id| self.visibility_in(window_id, &selected))
-            .collect()
+        // Only this window's tabs (and any that just closed) change: a tab
+        // moved in from another window leaves that window's cursors alone.
+        self.visibility_among(&affected, &selected)
     }
 
     /// An extension link went away: its reports may go stale, so actions in
     /// its windows fall back to their own probes until the next report.
     fn forget_link(&mut self, link: u64) {
         self.reports.retain(|(report_link, _), _| *report_link != link);
+    }
+
+    fn visibility_among(&self, targets: &[String], selected: &str) -> Vec<(String, bool)> {
+        self.bindings
+            .iter()
+            .filter(|(_, binding)| targets.contains(&binding.cdp_target_id))
+            .map(|(key, binding)| (key.clone(), binding.cdp_target_id == selected))
+            .collect()
+    }
+
+    /// Whether the session's cursor is still the one a browser action placed:
+    /// mid-move, or where that move left it. A cursor since moved by a native
+    /// action belongs to that app, and tab switches must not hide it.
+    fn browser_owns(&self, session: &str, position: Option<(f64, f64)>) -> bool {
+        self.moving.contains(session)
+            || self.placed.get(session).is_some_and(|placed| position == Some(*placed))
     }
 
     fn visibility_in(&self, window_id: u64, selected: &str) -> Vec<(String, bool)> {
@@ -344,9 +351,11 @@ fn apply_cursor_visibility(
     updates: &[(String, bool)],
 ) {
     for (key, visible) in updates {
-        let enabled = *visible
-            && tracker.placed.contains(key)
-            && registry.get(key).is_some_and(|state| state.config.enabled);
+        let Some(state) = registry.get(key) else { continue };
+        if !tracker.browser_owns(key, state.position.map(|position| (position.x, position.y))) {
+            continue;
+        }
+        let enabled = *visible && state.config.enabled;
         crate::cursor::overlay::send_command(
             key.clone(),
             cursor_overlay::OverlayCommand::SetEnabled(enabled),
@@ -983,7 +992,9 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 && action.screen_x.is_some_and(f64::is_finite)
                 && action.screen_y.is_some_and(f64::is_finite);
             if placing {
-                tracker.placed.insert(action.session.clone());
+                let at = (action.screen_x.unwrap_or_default(), action.screen_y.unwrap_or_default());
+                tracker.placed.insert(action.session.clone(), at);
+                tracker.moving.insert(action.session.clone());
             }
             apply_cursor_visibility(&self.cursor_registry, &tracker, &updates);
             shown
@@ -1003,8 +1014,12 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             cursor_overlay::OverlayCommand::PinAbove(action.window_id),
         );
         crate::cursor::overlay::animate_cursor_to(action.session.clone(), screen_x, screen_y).await;
-        self.cursor_registry
-            .update_position(&action.session, screen_x, screen_y);
+        {
+            let mut tracker = self.browser_cursors.lock().unwrap();
+            self.cursor_registry
+                .update_position(&action.session, screen_x, screen_y);
+            tracker.moving.remove(&action.session);
+        }
 
         if matches!(
             action.kind,
@@ -1988,6 +2003,29 @@ mod tests {
             moved.update("session-moved", 55, "tab-Q", false),
             vec![("session-moved".to_owned(), true)]
         );
+
+        // A tab moved from window 1 into window 2: window 2's report changes
+        // only its own tabs, never window 1's cursors.
+        let mut split = BrowserCursorTracker::default();
+        split.activate((4, 1), Some("tab-S"), vec!["tab-S".to_owned(), "tab-T".to_owned()]);
+        split.activate((4, 2), Some("tab-U"), vec!["tab-U".to_owned()]);
+        split.update("session-s", 10, "tab-S", true);
+        split.update("session-t", 10, "tab-T", false);
+        split.update("session-u", 20, "tab-U", true);
+        let after_move = split
+            .activate((4, 2), Some("tab-U"), vec!["tab-U".to_owned(), "tab-T".to_owned()])
+            .into_iter()
+            .collect::<HashMap<_, _>>();
+        assert_eq!(after_move.get("session-s"), None);
+        assert_eq!(after_move.get("session-t"), Some(&false));
+        assert_eq!(after_move.get("session-u"), Some(&true));
+
+        // A cursor a native action moved elsewhere is no longer the browser's.
+        split.placed.insert("session-s".to_owned(), (100.0, 200.0));
+        assert!(split.browser_owns("session-s", Some((100.0, 200.0))));
+        assert!(!split.browser_owns("session-s", Some((640.0, 90.0))));
+        split.moving.insert("session-s".to_owned());
+        assert!(split.browser_owns("session-s", Some((640.0, 90.0))), "mid-move it is still the browser's");
 
         // Without the link's reports, the action's own probe decides again.
         tracker.forget_link(1);
