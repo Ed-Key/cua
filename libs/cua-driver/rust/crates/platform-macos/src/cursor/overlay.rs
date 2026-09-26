@@ -438,14 +438,25 @@ pub fn set_tab_hidden(key: CursorKey, hidden: bool, user_enabled: bool) {
 /// either way, so turning it on does not show it over another tab.
 pub fn set_user_enabled(key: CursorKey, enabled: bool) {
     with_visibility(|map| {
-        let shown = match map.get_mut(&key) {
-            Some(inputs) => {
-                inputs.user_enabled = enabled;
-                enabled && !inputs.tab_hidden
-            }
-            None => enabled,
-        };
-        send_command(key, OverlayCommand::SetEnabled(shown));
+        // Recorded even before any browser use, so a tab report racing this
+        // change cannot seed the entry with a stale setting.
+        let inputs = map.entry(key.clone()).or_insert(VisibilityInputs {
+            user_enabled: enabled,
+            tab_hidden: false,
+            native: false,
+        });
+        inputs.user_enabled = enabled;
+        send_command(key, OverlayCommand::SetEnabled(enabled && !inputs.tab_hidden));
+    });
+}
+
+/// A browser action takes a session cursor back from any native action, so
+/// its tab's selection decides visibility again.
+pub fn claim_for_browser(key: &str) {
+    with_visibility(|map| {
+        if let Some(inputs) = map.get_mut(key) {
+            inputs.native = false;
+        }
     });
 }
 
@@ -463,14 +474,9 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     animate(key, x, y).await;
 }
 
-/// Move a session cursor for a browser action, which takes the cursor back
-/// from any native action.
+/// Move a session cursor for a browser action (which already claimed it with
+/// `claim_for_browser`), keeping any tab-switch hide.
 pub async fn animate_browser_cursor_to(key: CursorKey, x: f64, y: f64) {
-    with_visibility(|map| {
-        if let Some(inputs) = map.get_mut(&key) {
-            inputs.native = false;
-        }
-    });
     animate(key, x, y).await;
 }
 
@@ -1672,6 +1678,14 @@ mod visibility_tests {
         with_visibility(|map| map[key])
     }
 
+    #[test]
+    fn turning_a_cursor_off_before_browser_use_is_kept() {
+        let key = "visibility-first-test".to_owned();
+        set_user_enabled(key.clone(), false);
+        set_tab_hidden(key.clone(), false, true);
+        assert!(!inputs(&key).user_enabled, "a report racing the change must not seed it on");
+    }
+
     #[tokio::test]
     async fn tab_hiding_the_user_setting_and_native_ownership_stay_separate() {
         let key = "visibility-test".to_owned();
@@ -1691,7 +1705,7 @@ mod visibility_tests {
 
         // A browser action takes it back; tab switches apply again, and a
         // report's sampled setting never overrides the user's current one.
-        animate_browser_cursor_to(key.clone(), 10.0, 10.0).await;
+        claim_for_browser(&key);
         set_tab_hidden(key.clone(), true, true);
         assert!(inputs(&key).tab_hidden);
         assert!(!inputs(&key).user_enabled, "the user turned it off; a stale report says on");

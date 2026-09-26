@@ -290,9 +290,23 @@ impl BrowserCursorTracker {
         let mut affected = self.reports.get(&window).map(|report| report.targets.clone()).unwrap_or_default();
         affected.extend(window_targets.iter().cloned());
         // A tab belongs to one window: a tab moved here leaves the other report.
+        let mut moved = Vec::new();
         for (key, report) in self.reports.iter_mut() {
             if *key != window {
-                report.targets.retain(|target| !window_targets.contains(target));
+                report.targets.retain(|target| {
+                    let here = window_targets.contains(target);
+                    if here {
+                        moved.push(target.clone());
+                    }
+                    !here
+                });
+            }
+        }
+        // Its cursors' position and window pin belong to the old window: they
+        // wait, hidden, for their next action to place them here.
+        for (session, binding) in &self.bindings {
+            if moved.contains(&binding.cdp_target_id) {
+                self.placed.remove(session);
             }
         }
         self.reports.insert(
@@ -959,6 +973,8 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         }
 
         self.follow_tab_switches();
+        // Whatever this action decides below, the browser owns the cursor again.
+        crate::cursor::overlay::claim_for_browser(&action.session);
         let cursor_enabled = self
             .cursor_registry
             .get_or_create(&action.session)
@@ -1991,6 +2007,7 @@ mod tests {
         split.activate((4, 2), Some("tab-U"), vec!["tab-U".to_owned()]);
         split.update("session-s", 10, "tab-S", true);
         split.update("session-t", 10, "tab-T", false);
+        split.placed.insert("session-t".to_owned());
         split.update("session-u", 20, "tab-U", true);
         let after_move = split
             .activate((4, 2), Some("tab-U"), vec!["tab-U".to_owned(), "tab-T".to_owned()])
@@ -1999,6 +2016,7 @@ mod tests {
         assert_eq!(after_move.get("session-s"), None);
         assert_eq!(after_move.get("session-t"), Some(&false));
         assert_eq!(after_move.get("session-u"), Some(&true));
+        assert!(!split.placed.contains("session-t"), "a moved tab's cursor waits to be placed again");
 
 
         // A closed Chrome window reports no tabs: its cursors hide.
