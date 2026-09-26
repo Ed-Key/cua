@@ -53,9 +53,20 @@ ipcMain.on('cua-e2e-fixture-state', (_event, state) => {
   request.end(body);
 });
 
-ipcMain.on('cua-e2e-sentinel-event', (_event, entry) => {
+function appendSentinelEvent(entry) {
   if (!sentinelMode || !sentinelJournalPath) return;
   fs.appendFileSync(sentinelJournalPath, `${JSON.stringify(entry)}\n`, 'utf8');
+}
+
+ipcMain.on('cua-e2e-sentinel-event', (_event, entry) => {
+  // Fault injection for the setup-boundary regression. Keep heartbeats live
+  // while the completion receipt for a physical setup click is delayed.
+  const delay = Number(process.env.CUA_E2E_SENTINEL_CLICK_RECEIPT_DELAY_MS || 0);
+  if (delay > 0 && (entry.kind === 'pointerup' || entry.kind === 'click')) {
+    setTimeout(() => appendSentinelEvent({ ...entry, journaled_at_ms: Date.now() }), delay);
+  } else {
+    appendSentinelEvent(entry);
+  }
 });
 
 let mainWindow;
@@ -107,6 +118,20 @@ function createWindow() {
   // 'cua-driver Web Harness' (the page's title).
   mainWindow.on('page-title-updated', e => e.preventDefault());
   mainWindow.setTitle(fixedTitle);
+  if (sentinelMode) {
+    // Renderer `window.blur` is not a complete macOS focus oracle. AppKit can
+    // deliver resignActive/resignKey to Electron's native window without the
+    // WebContents emitting a DOM blur. Journal BrowserWindow focus transitions
+    // independently so the background-action gate catches that exact class.
+    mainWindow.on('focus', () => appendSentinelEvent({
+      kind: 'native-window-focus',
+      at_ms: Date.now(),
+    }));
+    mainWindow.on('blur', () => appendSentinelEvent({
+      kind: 'native-window-blur',
+      at_ms: Date.now(),
+    }));
+  }
   mainWindow.webContents.setWindowOpenHandler(() => ({
     action: 'allow',
     overrideBrowserWindowOptions: {

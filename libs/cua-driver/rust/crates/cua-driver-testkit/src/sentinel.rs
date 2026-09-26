@@ -45,16 +45,26 @@ impl Drop for BlurRecoveryBudget {
 }
 
 /// Longest blur-to-focus gap, or `None` when some blur never recovered.
+/// For a focus-loss event, the event kind that ends it: a DOM blur recovers
+/// with a DOM focus, a native window blur with a native window focus.
+fn blur_pair(event: &serde_json::Value) -> Option<&'static str> {
+    match event_kind(event)? {
+        "blur" => Some("focus"),
+        "native-window-blur" => Some("native-window-focus"),
+        _ => None,
+    }
+}
+
 fn blur_recovery_ms(events: &[serde_json::Value]) -> Option<u64> {
     let mut worst = 0;
     for (index, event) in events.iter().enumerate() {
-        if event_kind(event) != Some("blur") {
+        let Some(recovery) = blur_pair(event) else {
             continue;
-        }
+        };
         let blurred_at = event["at_ms"].as_u64()?;
         let recovered_at = events[index + 1..]
             .iter()
-            .find(|later| event_kind(later) == Some("focus"))
+            .find(|later| event_kind(later) == Some(recovery))
             .and_then(|later| later["at_ms"].as_u64())?;
         worst = worst.max(recovered_at.saturating_sub(blurred_at));
     }
@@ -71,9 +81,13 @@ pub struct ForegroundSentinel {
 
 impl ForegroundSentinel {
     pub fn launch(driver: &mut impl Driver) -> Self {
+        Self::launch_with_env(driver, &[])
+    }
+
+    pub fn launch_with_env(driver: &mut impl Driver, env: &[(&str, &str)]) -> Self {
         let mut last_error = None;
         for attempt in 1..=2 {
-            match Self::try_launch(driver) {
+            match Self::try_launch(driver, env) {
                 Ok(sentinel) => return sentinel,
                 Err(error) => {
                     eprintln!(
@@ -92,7 +106,7 @@ impl ForegroundSentinel {
         );
     }
 
-    fn try_launch(driver: &mut impl Driver) -> Result<Self, String> {
+    fn try_launch(driver: &mut impl Driver, env: &[(&str, &str)]) -> Result<Self, String> {
         let electron = electron_fixture();
         if !electron.path.exists() {
             return Err(format!(
@@ -112,6 +126,7 @@ impl ForegroundSentinel {
             .map_err(|error| format!("allocate sentinel CDP port: {error}"))?
             .port();
         let mut command = Command::new(&electron.path);
+        command.envs(env.iter().copied());
         command
             .args(&electron.args)
             .env("CUA_E2E_SENTINEL", "1")
@@ -250,6 +265,7 @@ impl ForegroundSentinel {
         };
         let mut passed = Vec::new();
         let mut violations = Vec::new();
+        self.trace_journal("observed");
         if !events
             .iter()
             .any(|event| event_kind(event) == Some("heartbeat"))
@@ -260,7 +276,9 @@ impl ForegroundSentinel {
             let hidden = events.iter().any(|event| {
                 event_kind(event) == Some("visibility") && event["state"].as_str() == Some("hidden")
             });
-            let blurred = events.iter().any(|event| event_kind(event) == Some("blur"));
+            // A DOM blur or a native window resign: AppKit can lose key
+            // window status while document.hasFocus stays unchanged.
+            let blurred = events.iter().any(|event| blur_pair(event).is_some());
             let budget = BLUR_RECOVERY_BUDGET_MS.load(std::sync::atomic::Ordering::SeqCst);
             let recovered = blurred
                 && budget > 0
@@ -358,6 +376,13 @@ impl ForegroundSentinel {
         if is_wayland_session() {
             wait_for_native_focus_lost(self.target, background_target)?;
         } else {
+            #[cfg(target_os = "macos")]
+            wait_for_event(
+                &self.journal_path,
+                "native-window-blur",
+                Duration::from_secs(3),
+            )?;
+            #[cfg(not(target_os = "macos"))]
             wait_for_event(&self.journal_path, "blur", Duration::from_secs(3))?;
             let (_, focus_violations) = self.observe();
             if !focus_violations
@@ -419,12 +444,28 @@ impl ForegroundSentinel {
         activate_and_drain_setup_click(driver, self.target, &self.journal_path)?;
         wait_for_native_focus_stable(self.target);
         std::thread::sleep(Duration::from_millis(100));
+        self.trace_journal("setup-before-reset");
         reset_journal(&self.journal_path)?;
         // This heartbeat checks liveness only. Windows setup input has already
         // crossed its explicit renderer/main journal barrier before the reset.
         wait_for_event(&self.journal_path, "heartbeat", Duration::from_secs(2))?;
+        self.trace_journal("setup-before-final-reset");
         reset_journal(&self.journal_path)?;
         self.assert_background_posture(target)
+    }
+
+    fn trace_journal(&self, phase: &str) {
+        if std::env::var_os("CUA_E2E_SENTINEL_TRACE").is_some() {
+            eprintln!(
+                "sentinel-trace {}",
+                serde_json::json!({
+                    "phase": phase,
+                    "at_ms": std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_millis(),
+                    "pid": self.target.pid,
+                    "events": read_journal_events(&self.journal_path).unwrap_or_default(),
+                })
+            );
+        }
     }
 
     /// Run one background action while checking the native desktop and the
@@ -533,6 +574,12 @@ fn event_kind(event: &serde_json::Value) -> Option<&str> {
     event["kind"].as_str()
 }
 
+#[cfg(test)]
+fn is_focus_loss_event(event: &serde_json::Value) -> bool {
+    blur_pair(event).is_some()
+        || (event_kind(event) == Some("visibility") && event["state"].as_str() == Some("hidden"))
+}
+
 fn wait_for_event(path: &std::path::Path, kind: &str, timeout: Duration) -> Result<(), String> {
     let deadline = Instant::now() + timeout;
     loop {
@@ -573,9 +620,17 @@ fn activate_and_drain_setup_click(
         wait_for_setup_click_marker(_journal_path, "setup-click-armed", &token)?;
         token
     };
+    // macOS: activation explicitly clicks the renderer. Start a fresh
+    // receipt window so an earlier setup click cannot satisfy the wait, then
+    // await this click: heartbeats can overtake asynchronous input, and a
+    // late click inside the observation boundary would read as leaked input.
+    #[cfg(target_os = "macos")]
+    reset_journal(_journal_path)?;
     try_activate_native_foreground(driver, target)?;
     #[cfg(target_os = "windows")]
     wait_for_setup_click_marker(_journal_path, "setup-click-drained", &token)?;
+    #[cfg(target_os = "macos")]
+    wait_for_event(_journal_path, "click", Duration::from_secs(2))?;
     Ok(())
 }
 
@@ -1233,5 +1288,41 @@ fn electron_fixture() -> ElectronFixture {
                 "--force-renderer-accessibility",
             ],
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::is_focus_loss_event;
+
+    #[test]
+    fn a_native_blur_recovers_only_with_a_native_focus() {
+        use super::blur_recovery_ms;
+        use serde_json::json;
+        let native = [
+            json!({"kind": "native-window-blur", "at_ms": 100}),
+            json!({"kind": "focus", "at_ms": 110}),
+            json!({"kind": "native-window-focus", "at_ms": 190}),
+        ];
+        assert_eq!(blur_recovery_ms(&native), Some(90), "paired with its own kind");
+        let unrecovered = [
+            json!({"kind": "native-window-blur", "at_ms": 100}),
+            json!({"kind": "focus", "at_ms": 110}),
+        ];
+        assert_eq!(blur_recovery_ms(&unrecovered), None, "a DOM focus does not end it");
+    }
+
+    #[test]
+    fn native_window_blur_is_a_focus_loss_even_without_dom_blur() {
+        assert!(is_focus_loss_event(
+            &serde_json::json!({"kind": "native-window-blur"})
+        ));
+        assert!(is_focus_loss_event(&serde_json::json!({"kind": "blur"})));
+        assert!(is_focus_loss_event(
+            &serde_json::json!({"kind": "visibility", "state": "hidden"})
+        ));
+        assert!(!is_focus_loss_event(
+            &serde_json::json!({"kind": "native-window-focus"})
+        ));
     }
 }
