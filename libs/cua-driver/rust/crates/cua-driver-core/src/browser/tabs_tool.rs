@@ -29,7 +29,7 @@ impl BrowserTabsTool {
                 description: "List and organize the tabs of the user's own Chrome (their \
                     logged-in profile) through the Cua Driver Chrome extension. Actions: list \
                     (windows, tabs with title and URL, tab groups), open (a URL in a new tab, in \
-                    the background unless active:true), activate (select a tab in its window \
+                    the background unless active:true, grouped under \"Cua\"), activate (select a tab in its window \
                     without raising the window), close, move, group (put tabs in a new or \
                     existing group, optionally naming and coloring it), ungroup, and \
                     update_group. Tab, window, and group ids come from list. Requires the Cua \
@@ -52,6 +52,7 @@ impl BrowserTabsTool {
                         "window_id": { "type": "integer", "description": "Window for list (filter), open, move, or a new group." },
                         "index": { "type": "integer", "description": "Position for open or move; -1 or omitted means the end." },
                         "active": { "type": "boolean", "description": "open: select the new tab. Default false." },
+                        "group": { "type": "boolean", "description": "open: add the tab to the window's \"Cua\" tab group, so the agent's tabs stay together. Default true." },
                         "group_id": { "type": "integer", "description": "Existing group for group or update_group." },
                         "title": { "type": "string", "description": "Group name for group or update_group." },
                         "color": { "type": "string", "enum": GROUP_COLORS },
@@ -108,6 +109,7 @@ impl BrowserTabsTool {
                 put("windowId", int("window_id").map(Value::from));
                 put("index", int("index").map(Value::from));
                 put("active", Some(json!(args.get("active").and_then(Value::as_bool).unwrap_or(false))));
+                put("group", Some(json!(args.get("group").and_then(Value::as_bool).unwrap_or(true))));
                 ("tabs.create", params)
             }
             "activate" => {

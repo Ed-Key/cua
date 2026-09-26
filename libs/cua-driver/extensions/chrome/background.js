@@ -4,12 +4,18 @@
 // answers them with chrome.tabs, chrome.tabGroups, chrome.windows, and
 // chrome.debugger calls, and forwards debugger events. It holds no agent logic.
 
+import { clearActive, markActive, refresh } from "./indicator.js";
+
 const HOST = "com.trycua.cua_driver";
 const RECONNECT_ALARM = "cua-driver-reconnect";
+const AGENT_GROUP = { title: "Cua", color: "cyan" };
 
 let port = null;
 // Tabs this extension attached the debugger to, so detach only undoes its own.
 const attached = new Set();
+// Tabs where the user pressed Stop. Cua may not act in them again until the
+// user clicks the Cua Driver toolbar button.
+const stopped = new Set();
 
 function connect() {
   if (port) return;
@@ -98,9 +104,13 @@ const handlers = {
   "tabs.list": async ({ windowId }) =>
     (await chrome.tabs.query(defined({ windowId }))).map(tabInfo),
 
-  // New tabs open in the background unless the caller asks for focus.
-  "tabs.create": async ({ url, windowId, index, active = false }) =>
-    tabInfo(await chrome.tabs.create(defined({ url, windowId, index, active }))),
+  // New tabs open in the background unless the caller asks for focus, and
+  // join the window's "Cua" group so the agent's tabs stay together.
+  "tabs.create": async ({ url, windowId, index, active = false, group = true }) => {
+    const tab = await chrome.tabs.create(defined({ url, windowId, index, active }));
+    if (group) await addToAgentGroup(tab);
+    return tabInfo(await chrome.tabs.get(tab.id));
+  },
 
   "tabs.update": async ({ tabId, url, active, pinned, muted }) =>
     tabInfo(await chrome.tabs.update(tabId, defined({ url, active, pinned, muted }))),
@@ -155,8 +165,53 @@ const handlers = {
   "debugger.targets": async () => chrome.debugger.getTargets(),
 };
 
+// The window's "Cua" group, reused while it exists.
+async function addToAgentGroup(tab) {
+  const groups = await chrome.tabGroups.query({ windowId: tab.windowId, title: AGENT_GROUP.title });
+  const existing = groups.find((group) => group.color === AGENT_GROUP.color);
+  const groupId = await chrome.tabs.group(
+    existing ? { tabIds: [tab.id], groupId: existing.id } : { tabIds: [tab.id], createProperties: { windowId: tab.windowId } },
+  );
+  if (!existing) await chrome.tabGroups.update(groupId, AGENT_GROUP);
+}
+
+// The tabs a request acts on (reads such as tabs.list touch none).
+function tabsOf(method, params) {
+  if (method === "tabs.list" || method === "tabs.create" || method.startsWith("windows.") ||
+      method.startsWith("tabGroups.") || method === "debugger.targets" || method === "ping") {
+    return [];
+  }
+  return [params.tabId, ...(Array.isArray(params.tabIds) ? params.tabIds : [])].filter(
+    (tabId) => typeof tabId === "number",
+  );
+}
+
+async function stopTab(tabId) {
+  stopped.add(tabId);
+  clearActive(tabId);
+  if (attached.delete(tabId)) await chrome.debugger.detach({ tabId }).catch(() => {});
+  await chrome.action.setBadgeText({ text: "off" });
+  await chrome.action.setTitle({ title: "Cua Driver: stopped in a tab. Click to allow it again." });
+  post({ jsonrpc: "2.0", method: "user.stop", params: { tabId } });
+}
+
 async function handleMessage(message) {
   if (!message || message.id === undefined || typeof message.method !== "string") return;
+  const tabs = tabsOf(message.method, message.params ?? {});
+  if (tabs.some((tabId) => stopped.has(tabId))) {
+    post({
+      jsonrpc: "2.0",
+      id: message.id,
+      error: {
+        code: -32001,
+        message: "the user pressed Stop for Cua in this tab; ask them before continuing " +
+          "(they can allow it again from the Cua Driver toolbar button)",
+      },
+    });
+    return;
+  }
+  // Closing a tab is not work in it; everything else shows the indicator.
+  if (message.method !== "tabs.remove") tabs.forEach(markActive);
   const handler = handlers[message.method];
   if (!handler) {
     post({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `unknown method ${message.method}` } });
@@ -176,7 +231,30 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   attached.delete(source.tabId);
+  // "canceled_by_user": the user dismissed Chrome's debugging banner.
+  if (reason === "canceled_by_user") void stopTab(source.tabId);
   post({ jsonrpc: "2.0", method: "debugger.detached", params: { source, reason } });
+});
+
+chrome.runtime.onMessage.addListener((message, sender) => {
+  if (message?.type === "cua-stop" && sender.tab?.id !== undefined) void stopTab(sender.tab.id);
+});
+
+chrome.tabs.onUpdated.addListener((tabId, change) => {
+  if (change.status === "complete") refresh(tabId);
+});
+
+chrome.tabs.onRemoved.addListener((tabId) => {
+  stopped.delete(tabId);
+  attached.delete(tabId);
+  clearActive(tabId);
+});
+
+// The toolbar button lets Cua act again in tabs where the user pressed Stop.
+chrome.action.onClicked.addListener(async () => {
+  stopped.clear();
+  await chrome.action.setBadgeText({ text: "" });
+  await chrome.action.setTitle({ title: "Cua Driver" });
 });
 
 // The worker can be stopped at any time; the alarm (30 s minimum) and the
