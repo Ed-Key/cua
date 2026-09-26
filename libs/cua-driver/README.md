@@ -137,7 +137,9 @@ cua-driver mcp --grant existing-profile
 ```
 
 An embedding application can instead provide `DriverAuthorizationHost`, and a
-bounded runtime can declare `kind: existing_profile` in its manifest. Cua
+bounded runtime can declare `kind: existing_profile` in its manifest. On macOS,
+a connected Cua Driver Chrome extension in that Chrome also counts as consent in
+standard mode. Cua
 Driver does not render its own authorization modal or banner.
 
 See the hosted [permission mode

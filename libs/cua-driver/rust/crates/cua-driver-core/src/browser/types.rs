@@ -161,6 +161,8 @@ pub enum EndpointOwnershipMethod {
 
 /// How the platform located an endpoint. This is provenance, not authority:
 /// a path or socket owned by Chrome still requires an existing-profile grant.
+/// The one exception is `ExtensionRelay`: the user installing the extension in
+/// that Chrome is the consent.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum EndpointTransport {

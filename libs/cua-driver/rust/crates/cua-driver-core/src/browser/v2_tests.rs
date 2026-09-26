@@ -753,6 +753,7 @@ struct FixturePlatform {
     setup_invoked: Arc<AtomicBool>,
     setup_aborted: Arc<AtomicBool>,
     stall_consent: bool,
+    existing_transport: EndpointTransport,
 }
 
 #[async_trait]
@@ -824,7 +825,7 @@ impl BrowserPlatform for FixturePlatform {
         Ok(Some(OwnedEndpoint {
             ws_url: self.ws_url.clone(),
             http_port: None,
-            transport: EndpointTransport::LegacyJsonVersion,
+            transport: self.existing_transport,
             ownership: EndpointOwnershipProof {
                 method: EndpointOwnershipMethod::ListeningSocketPid,
                 owner_pid: pid,
@@ -968,6 +969,7 @@ async fn fixture_with_platform(
         setup_invoked: setup_invoked.clone(),
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
+        existing_transport: EndpointTransport::LegacyJsonVersion,
     }));
     Fixture {
         state,
@@ -1021,6 +1023,7 @@ async fn protected_existing_profile_fixture() -> (Fixture, Arc<FixtureProtectedP
             setup_invoked: setup_invoked.clone(),
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
+            existing_transport: EndpointTransport::LegacyJsonVersion,
         }),
         Some(provider.clone()),
     );
@@ -1050,6 +1053,7 @@ async fn existing_profile_setup_fixture() -> (Fixture, Arc<AtomicBool>) {
             setup_invoked: setup_invoked.clone(),
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
+            existing_transport: EndpointTransport::LegacyJsonVersion,
         }),
         Some(Arc::new(FixtureProtectedProvider {
             consent_seen: AtomicBool::new(false),
@@ -1104,6 +1108,7 @@ async fn standalone_consumer_bind_without_grant_refuses_before_endpoint_discover
         setup_invoked: setup_invoked.clone(),
         setup_aborted: Arc::new(AtomicBool::new(false)),
         stall_consent: false,
+        existing_transport: EndpointTransport::LegacyJsonVersion,
     }));
 
     let result = GetBrowserStateTool::new(engine)
@@ -1163,6 +1168,62 @@ async fn approved_existing_profile_attach_claims_then_binds_one_generation() {
         .await;
     assert_eq!(structured(&state)["status"], "ok", "{}", structured(&state));
     crate::session::fire_session_end("transport-v2-attach");
+}
+
+fn standard_mode_platform(ws_url: String, transport: EndpointTransport) -> FixturePlatform {
+    FixturePlatform {
+        ws_url,
+        trusted_input_limited: false,
+        managed_endpoint_visible: false,
+        process_role: BrowserProcessRole::StandaloneConsumer,
+        managed_discovery_invoked: Arc::new(AtomicBool::new(false)),
+        existing_endpoint_visible: Arc::new(AtomicBool::new(true)),
+        setup_invoked: Arc::new(AtomicBool::new(false)),
+        setup_aborted: Arc::new(AtomicBool::new(false)),
+        stall_consent: false,
+        existing_transport: transport,
+    }
+}
+
+#[tokio::test]
+async fn connected_extension_is_consent_for_its_own_chrome_only() {
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    let prepare = |platform: FixturePlatform, transport: &'static str| {
+        let setup_invoked = platform.setup_invoked.clone();
+        async move {
+            let result = BrowserPrepareTool::new(BrowserEngine::new(Arc::new(platform)))
+                .invoke(json!({
+                    "pid": 1,
+                    "window_id": 7,
+                    "session": SESSION,
+                    "_transport_session_id": transport,
+                    "strategy": { "kind": "existing_profile" }
+                }))
+                .await;
+            assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+            structured(&result).clone()
+        }
+    };
+
+    // Standard mode, no --grant, no approval host: the extension link is the consent.
+    let attached = prepare(
+        standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay),
+        "transport-extension-consent",
+    )
+    .await;
+    assert_eq!(attached["status"], "ok", "{attached}");
+    assert_eq!(attached["action"], "attached_existing_profile");
+    crate::session::fire_session_end("transport-extension-consent");
+
+    // The same Chrome reachable only through its own debugging port is not consent.
+    let refused = prepare(
+        standard_mode_platform(server.ws_url(), EndpointTransport::LegacyJsonVersion),
+        "transport-extension-absent",
+    )
+    .await;
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(refused["refusal"]["code"], "browser_consent_required");
 }
 
 #[tokio::test]
@@ -1350,6 +1411,7 @@ async fn refused_consent_cancels_stalled_claim_before_revoking_grant() {
             setup_invoked: Arc::new(AtomicBool::new(false)),
             setup_aborted: Arc::new(AtomicBool::new(false)),
             stall_consent: false,
+            existing_transport: EndpointTransport::LegacyJsonVersion,
         }),
         Some(Arc::new(FixtureProtectedProvider {
             consent_seen: AtomicBool::new(false),
@@ -1394,6 +1456,7 @@ async fn cancelled_prepare_aborts_the_exact_pending_setup() {
             setup_invoked: Arc::new(AtomicBool::new(false)),
             setup_aborted: setup_aborted.clone(),
             stall_consent: true,
+            existing_transport: EndpointTransport::LegacyJsonVersion,
         }),
         Some(Arc::new(FixtureProtectedProvider {
             consent_seen: AtomicBool::new(false),

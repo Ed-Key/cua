@@ -148,7 +148,8 @@ window_id)`.
 ### Existing profile
 
 Attaching to an authenticated profile requires explicit trusted launch or host
-authorization bound to the exact process, native window, and caller session.
+authorization bound to the exact process, native window, and caller session,
+or the Cua Driver Chrome extension connected in that Chrome (see below).
 Ordinary MCP approval is not enough:
 
 CDP exposes broad authority over the profile's live pages, cookies, storage,
@@ -239,10 +240,15 @@ Never:
 When the Cua Driver extension is installed in that Chrome and connected,
 `browser_prepare` with `strategy.kind: "existing_profile"` attaches through the
 extension: no remote-debugging port and no setup page. The result reports
-`endpoint_transport: "extension_relay"`. The same approval rules apply, and the
-driver still allows only the existing-profile command set. The link's Chrome is
-proven by the operating system (the extension's native host is this driver's
-own executable, started by that Chrome).
+`endpoint_transport: "extension_relay"`. The user installing the extension in
+that Chrome is the consent, so standard mode needs no `--grant existing-profile`
+for it. Bounded mode still needs its manifest, and an embedding host's
+authorization still decides when one is present. The consent covers only the
+extension route: without a connected extension the call is refused as before
+and never opens the setup page. The driver still allows only the
+existing-profile command set. The link's Chrome is proven by the operating
+system (the extension's native host is this driver's own executable, started by
+that Chrome).
 
 Through the extension, trusted typing and clicks do not bring Chrome forward:
 they land with another app in front, with the window fully covered, and with it
