@@ -207,6 +207,48 @@ impl FocusStealPreventer {
 }
 
 /// Begin-suppression convenience that bounces through the singleton.
+/// Pids the driver is activating on purpose right now (a foreground key's
+/// activation interval). Suppression leases stay armed for the rest of the
+/// action, but an activation of one of these pids is not a theft while the
+/// guard lives. Counted, so overlapping intervals nest.
+static INTENTIONAL_ACTIVATIONS: std::sync::Mutex<Option<HashMap<i32, usize>>> =
+    std::sync::Mutex::new(None);
+
+fn is_intentional(pid: i32) -> bool {
+    INTENTIONAL_ACTIVATIONS
+        .lock()
+        .ok()
+        .and_then(|map| map.as_ref().map(|m| m.contains_key(&pid)))
+        .unwrap_or(false)
+}
+
+/// Held for exactly the interval in which the driver itself activates
+/// `pid` (activate, deliver, restore the user's app). Dropping it ends the
+/// allowance; a later activation of `pid` is suppressed as usual.
+pub struct IntentionalActivation(i32);
+
+pub fn allow_intentional_activation(pid: i32) -> IntentionalActivation {
+    if let Ok(mut map) = INTENTIONAL_ACTIVATIONS.lock() {
+        *map.get_or_insert_with(HashMap::new).entry(pid).or_insert(0) += 1;
+    }
+    IntentionalActivation(pid)
+}
+
+impl Drop for IntentionalActivation {
+    fn drop(&mut self) {
+        if let Ok(mut map) = INTENTIONAL_ACTIVATIONS.lock() {
+            if let Some(m) = map.as_mut() {
+                if let Some(count) = m.get_mut(&self.0) {
+                    *count -= 1;
+                    if *count == 0 {
+                        m.remove(&self.0);
+                    }
+                }
+            }
+        }
+    }
+}
+
 pub fn begin_suppression(
     target_pid: Option<i32>,
     restore_to: i32,
@@ -550,6 +592,10 @@ impl Dispatcher {
         mut frontmost_pid: impl FnMut() -> Option<i32>,
         mut restore: impl FnMut(i32, &mut dyn FnMut() -> bool),
     ) {
+        if is_intentional(activated_pid) {
+            tracing::debug!(activated_pid, decision = "intentional", "focus activation dispatch");
+            return;
+        }
         let Some(winner) = self.winner_for_activation(activated_pid) else {
             tracing::debug!(activated_pid, decision = "no_matching_lease", "focus activation dispatch");
             return;
@@ -568,7 +614,8 @@ impl Dispatcher {
         }
         tracing::debug!(activated_pid, restore_to = winner.1, decision = "restore", "focus activation dispatch");
         restore(winner.1, &mut || {
-            self.winner_for_activation(activated_pid) == Some(winner)
+            !is_intentional(activated_pid)
+                && self.winner_for_activation(activated_pid) == Some(winner)
                 && frontmost_pid() == Some(activated_pid)
                 && self.winner_for_activation(activated_pid) == Some(winner)
         });
@@ -1093,6 +1140,28 @@ mod tests {
             restored.is_empty(),
             "missing current state cannot authorize activation"
         );
+    }
+
+    #[test]
+    fn an_intentional_activation_is_not_reverted_until_its_interval_ends() {
+        let d = Arc::new(Dispatcher::new());
+        let _h = d.add(Some(4242), 7, "test.intentional");
+        let mut restored = Vec::new();
+        {
+            let _allowed = allow_intentional_activation(4242);
+            d.dispatch_activation(4242, || Some(4242), |pid, admit| {
+                if admit() {
+                    restored.push(pid);
+                }
+            });
+        }
+        assert!(restored.is_empty(), "activation inside the interval is intended");
+        d.dispatch_activation(4242, || Some(4242), |pid, admit| {
+            if admit() {
+                restored.push(pid);
+            }
+        });
+        assert_eq!(restored, vec![7], "after the interval the lease protects again");
     }
 
     #[test]

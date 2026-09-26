@@ -5281,7 +5281,13 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             "bring_to_front",
             serde_json::json!({"pid":finder["pid"],"window_id":finder["window_id"]}),
         );
-        eprintln!("[file-picker] finder front: error={}", fronted.is_error());
+        assert_eq!(fronted.structured()["activated"], true, "Finder in front: {}", fronted.raw);
+        let finder_pid = finder["pid"].as_i64().unwrap() as i32;
+        assert_eq!(
+            platform_macos::apps::frontmost_pid(),
+            Some(finder_pid),
+            "Finder must be frontmost before the Escape"
+        );
         let escaped = fixture.driver.call(
             "press_key",
             serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"key":"escape","delivery_mode":"foreground"}),
@@ -5289,6 +5295,16 @@ fn run_native_file_picker(spec: &BrowserSpec) {
         eprintln!("[file-picker] escape from behind: {}", escaped.raw.to_string().chars().take(300).collect::<String>());
         assert!(!escaped.is_error(), "foreground Escape from behind: {}", escaped.raw);
         assert!(wait_closed(&mut fixture.driver), "foreground Escape from behind did not close the Open panel");
+        // The user's app comes back, and stays back through the window in
+        // which a late self-activation of the target would be reverted.
+        for delay in [Duration::from_millis(300), Duration::from_millis(1200)] {
+            thread::sleep(delay);
+            assert_eq!(
+                platform_macos::apps::frontmost_pid(),
+                Some(finder_pid),
+                "Finder must be restored after the foreground Escape"
+            );
+        }
         Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
     });
 }

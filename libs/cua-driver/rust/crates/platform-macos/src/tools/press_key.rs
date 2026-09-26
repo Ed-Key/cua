@@ -401,27 +401,19 @@ impl Tool for PressKeyTool {
         // so any reflex activations it triggers are caught by both the
         // wildcard snapshot suppressor and the targeted FocusGuard lease.
         let prior_front = apps::frontmost_pid();
-        // Foreground delivery activates the target on purpose: its wildcard
-        // suppression would revert that activation to the prior app, and the
-        // key would reach the prior app instead.
-        let snapshot = if fg {
-            WindowChangeDetector::snapshot_without_suppression(prior_front)
-        } else {
-            WindowChangeDetector::snapshot(prior_front)
-        };
+        let snapshot = WindowChangeDetector::snapshot(prior_front);
 
         let result = focus_guard::with_focus_suppressed(
-            // Foreground delivery activates the target on purpose; arming the
-            // guard against it would revert that activation (the key then
-            // reaches the previous app). The foreground path restores the
-            // user's app itself afterwards.
-            if fg { None } else { Some(pid) },
+            Some(pid),
             prior_front,
             "press_key.CGEvent",
             || async move {
                 // Pre-focus the element under suppression so its
                 // side-effects are captured by the snapshot + lease.
-                if let Some(guard) = pre_focus_guard.clone() {
+                // Foreground delivery repeats this focus write inside its
+                // activation interval; doing it here first could activate the
+                // target before that interval records the user's app.
+                if let Some(guard) = pre_focus_guard.clone().filter(|_| !fg) {
                     let _ = tokio::task::spawn_blocking(move || {
                         crate::input::ax_actions::focus_element(guard.as_ptr())
                     })

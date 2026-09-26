@@ -856,6 +856,10 @@ pub fn with_foreground_hid_activation(
         return action();
     }
 
+    // This activation is the point of the call: the action's suppression
+    // leases must not revert it. The allowance ends when this returns, after
+    // the user's app is restored, so a later self-activation is still caught.
+    let _intentional = crate::focus_steal::allow_intentional_activation(target_pid);
     let activated = unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     if activated != 0 {
         anyhow::bail!("WindowServer rejected foreground HID activation");
@@ -928,6 +932,8 @@ pub fn with_menu_shortcut_activation(
     }
 
     // Make target WindowServer-frontmost (kCPSNoWindows = 0x400).
+    // Intended activation of the target; see with_foreground_hid_activation.
+    let _intentional = crate::focus_steal::allow_intentional_activation(target_pid);
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
 
     // Run action then restore — even if action fails.

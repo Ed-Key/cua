@@ -386,14 +386,7 @@ impl Tool for TypeTextTool {
         // helper windows. Wrap so callers see them in the result suffix
         // and the wildcard suppressor catches reflex activations.
         let prior_front = apps::frontmost_pid();
-        // Foreground delivery activates the target on purpose: its wildcard
-        // suppression would revert that activation to the prior app, and the
-        // key would reach the prior app instead.
-        let snapshot = if delivery_mode.is_foreground() {
-            WindowChangeDetector::snapshot_without_suppression(prior_front)
-        } else {
-            WindowChangeDetector::snapshot(prior_front)
-        };
+        let snapshot = WindowChangeDetector::snapshot(prior_front);
 
         // Terminal-emulator short-circuit: when the target pid belongs
         // to a known terminal (Ghostty / Terminal.app / iTerm2 / …), the
@@ -405,11 +398,7 @@ impl Tool for TypeTextTool {
         let blocking_policy = keyboard_policy.clone();
         let native_guard = element_guard.clone();
         let result = focus_guard::with_focus_suppressed(
-            // Foreground delivery activates the target on purpose; arming the
-            // guard against it would revert that activation (the key then
-            // reaches the previous app). The foreground path restores the
-            // user's app itself afterwards.
-            if delivery_mode.is_foreground() { None } else { Some(pid) },
+            Some(pid),
             prior_front,
             "type_text.AXSelectedText",
             || async move {
