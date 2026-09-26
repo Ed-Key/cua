@@ -32,7 +32,8 @@ const MAX_ANCESTRY_DEPTH: usize = 40;
 /// `element` must be a valid `AXUIElementRef` for the duration of the call.
 pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
     if let Some(window) = copy_element_attr(element, "AXWindow") {
-        let window_id = ax_get_window_id(window);
+        // An element inside a sheet belongs to the sheet's parent window.
+        let window_id = crate::ax::bindings::surface_window_id(window);
         CFRelease(window as CFTypeRef);
         if window_id.is_some() {
             return window_id;
@@ -45,7 +46,7 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
     for _ in 0..MAX_ANCESTRY_DEPTH {
         match copy_string_attr(current, "AXRole").as_deref() {
             Some("AXWindow") | Some("AXSheet") => {
-                resolved = ax_get_window_id(current);
+                resolved = crate::ax::bindings::surface_window_id(current);
                 break;
             }
             Some("AXApplication") | None => break,

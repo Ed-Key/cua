@@ -576,6 +576,55 @@ pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
 /// This is a narrow read-only proof used before global keyboard delivery: an
 /// already focused exact window must not be re-activated, because doing so can
 /// make a focus-proxy renderer drop its current key target.
+/// The window an AX surface belongs to for reads, actions and focus checks.
+/// An `AXSheet` (an Open panel, a save prompt) has its own WindowServer id,
+/// but it lives inside its parent window's accessibility tree and is read
+/// and addressed through that window, so it folds into the parent's id.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+pub unsafe fn surface_window_id(element: AXUIElementRef) -> Option<u32> {
+    if copy_string_attr(element, "AXRole").as_deref() == Some("AXSheet") {
+        if let Some(parent) = copy_element_attr(element, "AXParent") {
+            let parent_id = ax_get_window_id(parent);
+            CFRelease(parent as CFTypeRef);
+            if parent_id.is_some() {
+                return parent_id;
+            }
+        }
+    }
+    ax_get_window_id(element)
+}
+
+/// The own WindowServer id of a sheet (an Open panel, a save prompt)
+/// attached to the app's window `window_id`, if one is attached.
+pub fn attached_sheet_of_window(pid: i32, window_id: u32) -> Option<u32> {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        let windows = copy_ax_windows(app);
+        CFRelease(app as CFTypeRef);
+        let mut found = None;
+        for window in windows {
+            if found.is_none() && ax_get_window_id(window) == Some(window_id) {
+                for child in copy_children(window) {
+                    if found.is_none()
+                        && copy_string_attr(child, "AXRole").as_deref() == Some("AXSheet")
+                    {
+                        found = ax_get_window_id(child).filter(|id| *id != window_id);
+                    }
+                    CFRelease(child as CFTypeRef);
+                }
+            }
+            CFRelease(window as CFTypeRef);
+        }
+        found
+    }
+}
+
 pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
@@ -585,7 +634,8 @@ pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
         let window = copy_element_attr(app, "AXFocusedWindow");
         CFRelease(app as CFTypeRef);
         let window = window?;
-        let window_id = ax_get_window_id(window);
+        // A focused sheet means its parent window is the focused one.
+        let window_id = surface_window_id(window);
         CFRelease(window as CFTypeRef);
         window_id
     }
