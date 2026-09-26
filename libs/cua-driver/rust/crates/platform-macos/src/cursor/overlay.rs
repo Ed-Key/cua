@@ -76,15 +76,18 @@ static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<OverlayMsg>> = OnceLock::new
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayMsg>>> = Mutex::new(None);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
 /// What decides whether a session cursor shows, for sessions that have used a
-/// browser tab: shown = `user_enabled && (native || !tab_hidden)`. The latest
-/// tab selection is always recorded; `native` (a native action owns the
-/// cursor, over another app) only stops it from applying until the browser
-/// takes the cursor back.
+/// browser tab: shown = `user_enabled && (native || (placed && !tab_hidden))`.
+/// The latest tab selection is always recorded; `native` (a native action
+/// owns the cursor, over another app) only stops it from applying until the
+/// browser takes the cursor back. `placed`: the cursor has a position in its
+/// browser tab (an unplaced one sits at the overlay's off-screen origin or at
+/// another app's position).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct VisibilityInputs {
     user_enabled: bool,
     tab_hidden: bool,
     native: bool,
+    placed: bool,
     /// The native browser window of the session's last browser action.
     browser_window: Option<u64>,
 }
@@ -93,7 +96,7 @@ static VISIBILITY: Mutex<Option<HashMap<CursorKey, VisibilityInputs>>> = Mutex::
 
 impl VisibilityInputs {
     fn shown(&self) -> bool {
-        self.user_enabled && (self.native || !self.tab_hidden)
+        self.user_enabled && (self.native || (self.placed && !self.tab_hidden))
     }
 }
 
@@ -434,6 +437,7 @@ pub fn set_tab_hidden(key: CursorKey, hidden: bool, user_enabled: bool) {
             user_enabled,
             tab_hidden: false,
             native: false,
+            placed: false,
             browser_window: None,
         });
         inputs.tab_hidden = hidden;
@@ -453,6 +457,7 @@ pub fn set_user_enabled(key: CursorKey, enabled: bool) {
             user_enabled: enabled,
             tab_hidden: false,
             native: false,
+            placed: false,
             browser_window: None,
         });
         inputs.user_enabled = enabled;
@@ -470,11 +475,35 @@ pub fn claim_for_browser(key: &str, window: u64, user_enabled: bool) -> bool {
             user_enabled,
             tab_hidden: false,
             native: false,
+            placed: false,
             browser_window: None,
         });
         inputs.browser_window = Some(window);
-        std::mem::replace(&mut inputs.native, false)
+        let was_native = std::mem::replace(&mut inputs.native, false);
+        if was_native {
+            // Its position is that app's until this browser action places it.
+            inputs.placed = false;
+        }
+        was_native
     })
+}
+
+/// Whether a session cursor has a position in its browser tab (set by a
+/// browser action that places it, cleared when its tab or window changes).
+pub fn set_placed(key: &str, placed: bool) {
+    with_visibility(|map| {
+        let Some(inputs) = map.get_mut(key) else { return };
+        let before = inputs.shown();
+        inputs.placed = placed;
+        if inputs.shown() != before {
+            send_command(key.to_owned(), OverlayCommand::SetEnabled(inputs.shown()));
+        }
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn is_placed(key: &str) -> bool {
+    with_visibility(|map| map.get(key).is_some_and(|inputs| inputs.placed))
 }
 
 /// Move a session cursor for a native action targeting `window`. A native
@@ -486,7 +515,10 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64, window: Option<u6
     with_visibility(|map| {
         let Some(inputs) = map.get_mut(&key) else { return };
         let before = inputs.shown();
-        inputs.native = !(window.is_some() && window == inputs.browser_window);
+        let in_browser_window = window.is_some() && window == inputs.browser_window;
+        inputs.native = !in_browser_window;
+        // A native move inside the browser window gives it a position there.
+        inputs.placed |= in_browser_window;
         if inputs.shown() != before {
             send_command(key.clone(), OverlayCommand::SetEnabled(inputs.shown()));
         }
@@ -885,18 +917,18 @@ fn render_loop(
                 Some(map) => {
                     // Drain via get-or-create; track the last-touched key so we
                     // can read its pinned_wid after ticking.
-                    let mut last_key: Option<CursorKey> = None;
+                    let mut touched: Vec<CursorKey> = Vec::new();
                     let mut had_msg = false;
                     if let Some(msg) = first_msg {
                         had_msg = true;
                         if let Some(k) = apply_msg(map, msg) {
-                            last_key = Some(k);
+                            touched.push(k);
                         }
                     }
                     while let Ok(msg) = rx.try_recv() {
                         had_msg = true;
                         if let Some(k) = apply_msg(map, msg) {
-                            last_key = Some(k);
+                            touched.push(k);
                         }
                     }
                     // Tick every cursor while an animation/fade is in progress
@@ -928,12 +960,14 @@ fn render_loop(
                         }
                     }
                     // Only a visible cursor chooses where the shared overlay is
-                    // stacked: hiding one (a background tab's cursor, say) must
-                    // not move the overlay behind the cursors still shown.
-                    let stacking = last_key
-                        .as_ref()
-                        .and_then(|k| map.cursors.get(k))
-                        .filter(|rs| cursor_is_externally_visible(rs));
+                    // stacked: the last one this batch touched that is still
+                    // visible after all of it. Hiding one (a background tab's
+                    // cursor, say) must not move the overlay behind the rest.
+                    let stacking = touched
+                        .iter()
+                        .rev()
+                        .filter_map(|k| map.cursors.get(k))
+                        .find(|rs| cursor_is_externally_visible(rs));
                     let pinned = stacking.map(|rs| rs.core.pinned_wid).unwrap_or(last_pinned);
                     let raise_unpinned = stacking.is_some() && pinned.is_none();
                     let next_frame_tick_needed = render_map_needs_frame_tick(map);
@@ -1695,6 +1729,16 @@ mod visibility_tests {
 
     fn inputs(key: &str) -> VisibilityInputs {
         with_visibility(|map| map[key])
+    }
+
+    #[tokio::test]
+    async fn a_native_move_in_the_browser_window_places_the_cursor() {
+        let key = "visibility-place-test".to_owned();
+        claim_for_browser(&key, 55, true);
+        set_tab_hidden(key.clone(), false, true);
+        assert!(!inputs(&key).shown(), "no position yet");
+        animate_cursor_to(key.clone(), 5.0, 5.0, Some(55)).await;
+        assert!(inputs(&key).placed && inputs(&key).shown());
     }
 
     #[test]

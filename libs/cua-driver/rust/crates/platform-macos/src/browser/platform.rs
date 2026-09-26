@@ -236,10 +236,6 @@ struct BrowserCursorTracker {
     /// report listing an action's tab decides visibility instead of the
     /// action's own activity probe, which may predate a later tab switch.
     reports: HashMap<(u64, i64), TabSwitchReport>,
-    /// Sessions whose cursor a browser action has sent on screen. An unplaced
-    /// cursor sits at the overlay's off-screen origin, so it stays hidden
-    /// until its first action places it. Set when that move starts.
-    placed: std::collections::HashSet<String>,
     /// The Chrome window each tab was last reported in, kept apart from the
     /// reports so a tab's move is seen whichever window reports first.
     target_window: HashMap<String, (u64, i64)>,
@@ -265,7 +261,7 @@ impl BrowserCursorTracker {
         // A cursor placed for another tab is not placed for this one: it waits,
         // hidden, until an action with a position places it here.
         if self.bindings.insert(session.to_owned(), binding.clone()).is_some_and(|previous| previous != binding) {
-            self.placed.remove(session);
+            crate::cursor::overlay::set_placed(session, false);
         }
         let report = self
             .reports
@@ -312,7 +308,7 @@ impl BrowserCursorTracker {
         // wait, hidden, for their next action to place them here.
         for (session, binding) in &self.bindings {
             if moved.contains(&&binding.cdp_target_id) {
-                self.placed.remove(session);
+                crate::cursor::overlay::set_placed(session, false);
             }
         }
         self.reports.insert(
@@ -352,20 +348,16 @@ impl BrowserCursorTracker {
 }
 
 /// Show or hide session cursors by their tabs' selection; the overlay combines
-/// that with the user's setting and native ownership. A cursor never placed
-/// (first used in a background tab) waits for its first action. Callers hold
+/// that with the user's setting, placement and native ownership. Callers hold
 /// the tracker lock, so a decision and its commands reach the overlay before
 /// any later decision's.
 fn apply_cursor_visibility(
     registry: &crate::cursor::CursorRegistry,
-    tracker: &BrowserCursorTracker,
     updates: &[(String, bool)],
 ) {
     for (key, visible) in updates {
         let Some(state) = registry.get(key) else { continue };
-        // Being unplaced stops a cursor showing, never hiding.
-        let hidden = !visible || !tracker.placed.contains(key);
-        crate::cursor::overlay::set_tab_hidden(key.clone(), hidden, state.config.enabled);
+        crate::cursor::overlay::set_tab_hidden(key.clone(), !visible, state.config.enabled);
     }
 }
 
@@ -433,7 +425,7 @@ async fn follow_reports(
                     .filter_map(|value| value.as_str().map(str::to_owned))
                     .collect();
                 let updates = tracker.activate((event.link, chrome_window), selected, window_targets);
-                apply_cursor_visibility(&registry, &tracker, &updates);
+                apply_cursor_visibility(&registry, &updates);
             }
             "link.closed" => tracker.forget_link(event.link),
             "hello" => request_selection(event.link),
@@ -985,15 +977,12 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             .config
             .enabled;
         // Whatever this action decides below, the browser owns the cursor again.
-        // Back from a native app, its position is that app's: it is placed
-        // again by this action if it has a position, and stays hidden if not.
-        let from_native =
-            crate::cursor::overlay::claim_for_browser(&action.session, action.window_id, cursor_enabled);
+        // Back from a native app, its position is that app's (the overlay then
+        // counts it unplaced): it is placed again below if this action has a
+        // position, and stays hidden if not.
+        crate::cursor::overlay::claim_for_browser(&action.session, action.window_id, cursor_enabled);
         let shown = {
             let mut tracker = self.browser_cursors.lock().unwrap();
-            if from_native {
-                tracker.placed.remove(&action.session);
-            }
             let updates = tracker.update(
                 &action.session,
                 action.window_id,
@@ -1006,9 +995,9 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 && action.screen_x.is_some_and(f64::is_finite)
                 && action.screen_y.is_some_and(f64::is_finite);
             if placing {
-                tracker.placed.insert(action.session.clone());
+                crate::cursor::overlay::set_placed(&action.session, true);
             }
-            apply_cursor_visibility(&self.cursor_registry, &tracker, &updates);
+            apply_cursor_visibility(&self.cursor_registry, &updates);
             shown
         };
         if !shown || !cursor_enabled {
@@ -2019,7 +2008,8 @@ mod tests {
         split.activate((4, 2), Some("tab-U"), vec!["tab-U".to_owned()]);
         split.update("session-s", 10, "tab-S", true);
         split.update("session-t", 10, "tab-T", false);
-        split.placed.insert("session-t".to_owned());
+        crate::cursor::overlay::claim_for_browser("session-t", 10, true);
+        crate::cursor::overlay::set_placed("session-t", true);
         split.update("session-u", 20, "tab-U", true);
         let after_move = split
             .activate((4, 2), Some("tab-U"), vec!["tab-U".to_owned(), "tab-T".to_owned()])
@@ -2028,23 +2018,25 @@ mod tests {
         assert_eq!(after_move.get("session-s"), None);
         assert_eq!(after_move.get("session-t"), Some(&false));
         assert_eq!(after_move.get("session-u"), Some(&true));
-        assert!(!split.placed.contains("session-t"), "a moved tab's cursor waits to be placed again");
+        assert!(!crate::cursor::overlay::is_placed("session-t"), "a moved tab's cursor waits to be placed again");
 
         // A session switching to another tab is unplaced until placed there.
         let mut retarget = BrowserCursorTracker::default();
         retarget.update("session-r", 10, "tab-R1", true);
-        retarget.placed.insert("session-r".to_owned());
+        crate::cursor::overlay::claim_for_browser("session-r", 10, true);
+        crate::cursor::overlay::set_placed("session-r", true);
         retarget.update("session-r", 20, "tab-R2", false);
-        assert!(!retarget.placed.contains("session-r"));
+        assert!(!crate::cursor::overlay::is_placed("session-r"));
 
         // The same move with the source window reporting first.
         let mut source_first = BrowserCursorTracker::default();
         source_first.activate((5, 1), Some("tab-V"), vec!["tab-V".to_owned(), "tab-W".to_owned()]);
         source_first.update("session-w", 10, "tab-W", false);
-        source_first.placed.insert("session-w".to_owned());
+        crate::cursor::overlay::claim_for_browser("session-w", 10, true);
+        crate::cursor::overlay::set_placed("session-w", true);
         source_first.activate((5, 1), Some("tab-V"), vec!["tab-V".to_owned()]);
         source_first.activate((5, 2), Some("tab-W"), vec!["tab-W".to_owned()]);
-        assert!(!source_first.placed.contains("session-w"));
+        assert!(!crate::cursor::overlay::is_placed("session-w"));
 
 
         // A closed Chrome window reports no tabs: its cursors hide.
