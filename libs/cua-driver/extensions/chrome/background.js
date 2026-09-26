@@ -79,10 +79,49 @@ function refuseIfStopped(tabId) {
   if (stopped.has(tabId)) throw new Error(STOPPED_MESSAGE);
 }
 
+// A tab Chrome restored without loading, or discarded to save memory, has no
+// page, and debugger commands to it hang. Reads never reload it (that reruns
+// the page's scripts and requests); the caller loads it explicitly first.
+const NOT_LOADED_MESSAGE =
+  "this tab is not loaded (Chrome restored or discarded it); load it first with " +
+  "browser_tabs action load, which reloads it in the background";
+const LOAD_TIMEOUT_MS = 10000;
+
+async function refuseIfNotLoaded(tabId) {
+  const tab = await chrome.tabs.get(tabId);
+  if (tab.status === "unloaded" || tab.discarded) throw new Error(NOT_LOADED_MESSAGE);
+}
+
+// Reload a sleeping tab in place and wait for its page. One settle path
+// clears the timer and both listeners on success, failure, timeout, or close.
+function loadTab(tabId) {
+  return new Promise((resolve, reject) => {
+    let timer;
+    const settle = (error) => {
+      clearTimeout(timer);
+      chrome.tabs.onUpdated.removeListener(onUpdated);
+      chrome.tabs.onRemoved.removeListener(onRemoved);
+      if (error) reject(error);
+      else resolve();
+    };
+    const onUpdated = (id, change) => {
+      if (id === tabId && change.status === "complete") settle();
+    };
+    const onRemoved = (id) => {
+      if (id === tabId) settle(new Error("the tab was closed while loading"));
+    };
+    chrome.tabs.onUpdated.addListener(onUpdated);
+    chrome.tabs.onRemoved.addListener(onRemoved);
+    timer = setTimeout(() => settle(new Error("the tab did not finish loading in time")), LOAD_TIMEOUT_MS);
+    chrome.tabs.reload(tabId).catch(settle);
+  });
+}
+
 function ensureAttached(tabId) {
   return serialized(tabId, async () => {
     refuseIfStopped(tabId);
     if (!attached.has(tabId)) {
+      await refuseIfNotLoaded(tabId);
       await chrome.debugger.attach({ tabId }, "1.3");
       attached.add(tabId);
       // Nothing runs in the tab after a Stop, not even the replay below.
@@ -204,6 +243,15 @@ const handlers = {
   "tabs.move": async ({ tabIds, windowId, index = -1 }) => {
     const moved = await chrome.tabs.move(tabIds, defined({ windowId, index }));
     return (Array.isArray(moved) ? moved : [moved]).map(tabInfo);
+  },
+
+  "tabs.load": async ({ tabId }) => {
+    const tab = await chrome.tabs.get(tabId);
+    if (tab.status === "unloaded" || tab.discarded) {
+      refuseIfStopped(tabId);
+      await loadTab(tabId);
+    }
+    return tabInfo(await chrome.tabs.get(tabId));
   },
 
   "tabs.remove": async ({ tabIds }) => {

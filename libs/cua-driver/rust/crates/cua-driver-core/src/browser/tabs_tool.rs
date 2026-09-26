@@ -30,7 +30,8 @@ impl BrowserTabsTool {
                     logged-in profile) through the Cua Driver Chrome extension. Actions: list \
                     (windows, tabs with title and URL, tab groups), open (a URL in a new tab, in \
                     the background unless active:true, grouped under \"Cua\"), activate (select a tab in its window \
-                    without raising the window), close, move, group (put tabs in a new or \
+                    without raising the window), load (a tab Chrome restored or discarded \
+                    without loading; page reads refuse it until it is loaded), close, move, group (put tabs in a new or \
                     existing group, optionally naming and coloring it), ungroup, and \
                     update_group. Tab, window, and group ids come from list, \
                     with the pid of the Chrome they belong to. Requires the Cua \
@@ -41,9 +42,9 @@ impl BrowserTabsTool {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["list", "open", "activate", "close", "move", "group", "ungroup", "update_group"]
+                            "enum": ["list", "open", "activate", "load", "close", "move", "group", "ungroup", "update_group"]
                         },
-                        "tab_id": { "type": "integer", "description": "One tab, for activate." },
+                        "tab_id": { "type": "integer", "description": "One tab, for activate or load." },
                         "tab_ids": {
                             "type": "array",
                             "items": { "type": "integer" },
@@ -231,6 +232,11 @@ impl BrowserTabsTool {
                 put("active", Some(json!(true)));
                 ("tabs.update", params)
             }
+            "load" => {
+                let tab = int("tab_id").ok_or("load needs tab_id")?;
+                put("tabId", Some(json!(tab)));
+                ("tabs.load", params)
+            }
             "close" => {
                 put("tabIds", Some(ids()?));
                 ("tabs.remove", params)
@@ -287,6 +293,7 @@ pub(crate) fn consent_summary(args: &Value) -> String {
             format!("Allow Cua to open {origin} in a new tab in your Chrome")
         }
         "activate" => "Allow Cua to switch to one of your Chrome tabs".to_owned(),
+        "load" => "Allow Cua to load a sleeping tab in your Chrome (it reloads in the background)".to_owned(),
         "close" => format!("Allow Cua to close {} in your Chrome", tabs(count("tab_ids"))),
         "move" => format!("Allow Cua to move {} in your Chrome", tabs(count("tab_ids"))),
         "group" => match args.get("title").and_then(Value::as_str) {
