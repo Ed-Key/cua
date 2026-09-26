@@ -248,8 +248,9 @@ Through the extension, trusted typing and clicks do not bring Chrome forward:
 they land with another app in front, with the window fully covered, and with it
 minimized. The user sees Chrome's debugging banner and, in the tab Cua works
 in, a "Cua is working in this tab" pill with Stop. After Stop, commands for that
-tab are refused with a message saying so: ask the user before continuing; they
-re-allow Cua from the extension's toolbar button. `chrome://` pages and the Web
+tab are refused with a message saying so: ask the user before continuing; the
+extension's toolbar button re-allows Cua in every tab where the user pressed
+Stop. `chrome://` pages and the Web
 Store cannot be debugged by any extension.
 
 `browser_tabs` lists and organizes the user's tabs through the same extension:

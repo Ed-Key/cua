@@ -25,14 +25,15 @@ After editing these files, press the extension's **Reload** button on
 
 - Chrome's banner: "Cua Driver started debugging this browser", while Cua is
   attached to a tab. The debugger is released after 20 seconds without a
-  command, which clears the banner.
+  command (not while a JavaScript dialog is open in the tab), which clears the
+  banner.
 - In the tab Cua is working in: a soft blue glow, a "Cua is working in this
   tab" pill with **Stop**, and the Cua cursor on the tab's favicon.
 - Tabs Cua opens start in the background in a cyan "Cua" tab group.
 
 **Stop** (or dismissing Chrome's banner) detaches the debugger and refuses any
-further Cua work in that tab. Click the Cua Driver toolbar button to allow it
-again.
+further Cua work in that tab. Clicking the Cua Driver toolbar button allows Cua
+again in every tab where you pressed Stop.
 
 ## Permissions
 
