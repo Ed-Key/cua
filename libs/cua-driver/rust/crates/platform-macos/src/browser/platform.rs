@@ -236,6 +236,11 @@ struct BrowserCursorTracker {
     /// report listing an action's tab decides visibility instead of the
     /// action's own activity probe, which may predate a later tab switch.
     reports: HashMap<(u64, i64), TabSwitchReport>,
+    /// Sessions whose cursor has been sent somewhere on screen. An unplaced
+    /// cursor sits at the overlay's off-screen origin, so it stays hidden
+    /// until its first action places it. Set when that move starts, not when
+    /// its animation ends, so another action meanwhile cannot hide it.
+    placed: std::collections::HashSet<String>,
 }
 
 impl BrowserCursorTracker {
@@ -295,6 +300,12 @@ impl BrowserCursorTracker {
             .collect();
         windows.sort_unstable();
         windows.dedup();
+        // A tab belongs to one window: a tab moved here leaves the other report.
+        for (key, report) in self.reports.iter_mut() {
+            if *key != window {
+                report.targets.retain(|target| !window_targets.contains(target));
+            }
+        }
         self.reports.insert(
             window,
             TabSwitchReport {
@@ -325,19 +336,17 @@ impl BrowserCursorTracker {
 
 /// Show or hide session cursors; a cursor its session turned off stays off,
 /// and one never placed (first used in a background tab) waits for its first
-/// action instead of appearing at the overlay's off-screen origin. `acting`
-/// is about to be placed. Callers hold the tracker lock, so a decision and its
-/// commands reach the overlay before any later decision's.
+/// action. Callers hold the tracker lock, so a decision and its commands reach
+/// the overlay before any later decision's.
 fn apply_cursor_visibility(
     registry: &crate::cursor::CursorRegistry,
+    tracker: &BrowserCursorTracker,
     updates: &[(String, bool)],
-    acting: Option<&str>,
 ) {
     for (key, visible) in updates {
         let enabled = *visible
-            && registry.get(key).is_some_and(|state| {
-                state.config.enabled && (state.position.is_some() || acting == Some(key.as_str()))
-            });
+            && tracker.placed.contains(key)
+            && registry.get(key).is_some_and(|state| state.config.enabled);
         crate::cursor::overlay::send_command(
             key.clone(),
             cursor_overlay::OverlayCommand::SetEnabled(enabled),
@@ -375,6 +384,11 @@ async fn follow_reports(
     tracker: std::sync::Weak<Mutex<BrowserCursorTracker>>,
 ) {
     use tokio::sync::broadcast::error::RecvError;
+    // Already-connected extensions report their current selections; ones
+    // connecting later do on their hello.
+    for link in cua_driver_core::browser::extension_bridge::global().links() {
+        request_selection(link.link);
+    }
     loop {
         let event = match events.recv().await {
             Ok(event) => Some(event),
@@ -404,12 +418,23 @@ async fn follow_reports(
                     .filter_map(|value| value.as_str().map(str::to_owned))
                     .collect();
                 let updates = tracker.activate((event.link, chrome_window), selected, window_targets);
-                apply_cursor_visibility(&registry, &updates, None);
+                apply_cursor_visibility(&registry, &tracker, &updates);
             }
             "link.closed" => tracker.forget_link(event.link),
+            "hello" => request_selection(event.link),
             _ => {}
         }
     }
+}
+
+/// Ask an extension link to report every window's selected tab (as
+/// tabs.activated events). An older extension without the method is ignored.
+fn request_selection(link: u64) {
+    tokio::spawn(async move {
+        let _ = cua_driver_core::browser::extension_bridge::global()
+            .request_on(link, "tabs.reportSelection", serde_json::json!({}))
+            .await;
+    });
 }
 
 impl Default for MacOsBrowserPlatform {
@@ -952,8 +977,16 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 &action.cdp_target_id,
                 action.tab_is_active,
             );
-            apply_cursor_visibility(&self.cursor_registry, &updates, Some(&action.session));
-            updates.contains(&(action.session.clone(), true))
+            let shown = updates.contains(&(action.session.clone(), true));
+            let placing = shown
+                && cursor_enabled
+                && action.screen_x.is_some_and(f64::is_finite)
+                && action.screen_y.is_some_and(f64::is_finite);
+            if placing {
+                tracker.placed.insert(action.session.clone());
+            }
+            apply_cursor_visibility(&self.cursor_registry, &tracker, &updates);
+            shown
         };
         if !shown || !cursor_enabled {
             return;
@@ -1835,7 +1868,21 @@ mod tests {
                 screen_y: None,
                 kind: BrowserVisualActionKind::Click,
             };
+            while cua_driver_core::browser::extension_bridge::global().links().is_empty() {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
             platform.visualize_browser_action(action("follow-red", "tab-A")).await;
+            // Listening asks the connected extension for its current selection.
+            use tokio::io::AsyncReadExt;
+            let mut length = [0u8; 4];
+            tokio::time::timeout(std::time::Duration::from_secs(2), extension.read_exact(&mut length))
+                .await
+                .expect("no selection request reached the extension")
+                .unwrap();
+            let mut body = vec![0u8; u32::from_ne_bytes(length) as usize];
+            extension.read_exact(&mut body).await.unwrap();
+            let request: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(request["method"], "tabs.reportSelection");
             platform.visualize_browser_action(action("follow-blue", "tab-B")).await;
             let switch = serde_json::json!({"jsonrpc": "2.0", "method": "tabs.activated",
                 "params": {"targetId": "tab-A", "windowId": 500, "windowTargets": ["tab-A", "tab-B"]}});
@@ -1929,6 +1976,17 @@ mod tests {
         assert_eq!(
             lone.activate((2, 9), Some("tab-M"), vec!["tab-M".to_owned()]),
             vec![("session-lone".to_owned(), false)]
+        );
+
+        // A tab dragged to another Chrome window belongs to that window's
+        // report only, so the old window's selection cannot decide for it.
+        let mut moved = BrowserCursorTracker::default();
+        moved.activate((3, 1), Some("tab-P"), vec!["tab-P".to_owned(), "tab-Q".to_owned()]);
+        moved.activate((3, 2), Some("tab-Q"), vec!["tab-Q".to_owned()]);
+        assert_eq!(moved.reports[&(3, 1)].targets, vec!["tab-P".to_owned()]);
+        assert_eq!(
+            moved.update("session-moved", 55, "tab-Q", false),
+            vec![("session-moved".to_owned(), true)]
         );
 
         // Without the link's reports, the action's own probe decides again.
