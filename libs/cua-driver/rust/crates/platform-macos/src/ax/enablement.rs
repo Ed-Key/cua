@@ -143,6 +143,19 @@ fn wait_outcome(
     }
 }
 
+/// Whether this process's most recent web-content wait timed out: the driver
+/// asked for its page accessibility tree and no web area appeared in time.
+pub fn web_content_wait_timed_out(pid: i32) -> bool {
+    let Some(stamp) = process_start_stamp(pid) else {
+        return false;
+    };
+    ENABLEMENT_STATE
+        .lock()
+        .ok()
+        .and_then(|state| state.get(&pid).copied())
+        .is_some_and(|entry| entry.stamp == stamp && matches!(entry.wait, Wait::TimedOut { .. }))
+}
+
 /// Bound every AX message by the time left, so a slow or hung app cannot
 /// stretch the probe past the readiness deadline.
 unsafe fn bound_by(element: AXUIElementRef, deadline: Instant) -> bool {

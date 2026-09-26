@@ -5577,6 +5577,84 @@ document.addEventListener('click', e => backgroundClickEvents.push({
         });
     }
 }
+/// A cold Chromium window read for the first time while another window fully
+/// covers it can expose browser chrome only. The driver must say so
+/// (web_content.exposed false) rather than return what reads like an empty
+/// page, and its recovery advice must work: after bring_to_front and a read the
+/// page is exposed, and it stays exposed once the window is covered again.
+#[cfg(target_os = "macos")]
+fn run_cold_covered_read(spec: &BrowserSpec) {
+    let scenario = format!("macos-{}-cold-covered-read", spec.name);
+    let case = CaseSpec::delivered(
+        scenario.clone(),
+        spec.name.clone(),
+        "standalone-chromium-native-content",
+        "cold_covered_read",
+        Targeting::Ax,
+        Delivery::Background,
+        Scope::Window,
+        DriverRoute::MacosAxAction,
+        vec![OracleKind::FixtureState],
+    );
+    execute_case(case, |evidence| {
+        let mut fixture =
+            launch_browser_with_html(spec, &scenario, standalone_named_groups_html(false));
+        *evidence = recording_evidence(fixture.driver.recording_dir());
+        let (pid, wid) = (fixture.pid, fixture.window_id);
+        let target = TargetWindow { pid, native_id: wid };
+        let read = |driver: &mut McpDriver| {
+            let state = driver.call(
+                "get_window_state",
+                serde_json::json!({"pid":pid,"window_id":wid,"include_screenshot":false,"diff":false}),
+            );
+            assert!(!state.is_error(), "{}", state.raw);
+            let has_page = state.structured()["tree_markdown"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("AXWebArea");
+            (has_page, state.structured()["web_content"].clone())
+        };
+        let sentinel = ForegroundSentinel::launch(&mut fixture.driver);
+        sentinel
+            .prepare_background_observation(&mut fixture.driver, target)
+            .unwrap();
+        // 1. First read, covered by the sentinel.
+        let (has_page, web_content) = read(&mut fixture.driver);
+        eprintln!("[cold-covered] first read: page={has_page} web_content={web_content}");
+        if has_page {
+            assert!(web_content.is_null(), "exposed page flagged: {web_content}");
+        } else {
+            assert_eq!(web_content["exposed"], false, "unexposed page not reported");
+            // 2. The advice: bring the window forward once and read again.
+            let front = fixture
+                .driver
+                .call("bring_to_front", serde_json::json!({"pid":pid,"window_id":wid}));
+            assert!(!front.is_error(), "{}", front.raw);
+            let deadline = Instant::now() + Duration::from_secs(10);
+            loop {
+                let (has_page, web_content) = read(&mut fixture.driver);
+                if has_page {
+                    assert!(web_content.is_null(), "exposed page flagged: {web_content}");
+                    break;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "page not exposed after bring_to_front: {web_content}"
+                );
+                thread::sleep(Duration::from_millis(300));
+            }
+            // 3. Covered again, the page stays exposed.
+            sentinel
+                .prepare_background_observation(&mut fixture.driver, target)
+                .unwrap();
+            let (has_page, web_content) = read(&mut fixture.driver);
+            assert!(has_page, "page lost after being covered again: {web_content}");
+        }
+        Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
+    });
+}
+#[cfg(target_os = "macos")]
+standalone_browser_test!(standalone_browser_cold_covered_read, run_cold_covered_read);
 #[cfg(target_os = "macos")]
 standalone_browser_test!(
     standalone_browser_native_background_first_click,

@@ -783,6 +783,12 @@ impl Tool for GetWindowStateTool {
         }
         if let Some(r) = tree_result.as_ref() {
             r.walk.apply(&mut structured);
+            let bounded = args.get("max_depth").is_some() || args.get("max_elements").is_some();
+            if !bounded {
+                if let Some(unexposed) = unexposed_web_content(pid, &r.nodes) {
+                    structured["web_content"] = unexposed;
+                }
+            }
         }
         if let Some(d) = outline_diff.as_ref() {
             structured["diff"] = serde_json::json!({
@@ -1368,6 +1374,30 @@ mod window_scope_contract_tests {
         assert_eq!(resolve_max_dimension(1024, Some(512), None), 512);
         assert_eq!(resolve_max_dimension(1024, None, None), 1024);
     }
+}
+
+/// Chromium can withhold a page from accessibility when it is asked while its
+/// window is fully covered (lane VM, Chrome 154: 13 of 13 cold reads of a
+/// covered window had no AXWebArea after 10 s, and disabling Chromium's
+/// occlusion tracking did not change that; a first read while visible kept the
+/// page after the window was covered). The walk then shows browser controls
+/// only, which reads like an empty page. When the driver's own web-content wait
+/// for this process timed out and this window has no page, say so and how to
+/// recover, instead of returning a silently partial tree.
+fn unexposed_web_content(pid: i32, nodes: &[crate::ax::tree::AXNode]) -> Option<Value> {
+    if nodes.iter().any(|node| node.role == "AXWebArea")
+        || !crate::ax::enablement::web_content_wait_timed_out(pid)
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "exposed": false,
+        "reason": "The browser did not expose this page to accessibility when the driver \
+            asked. Chromium can withhold a page from a window that is fully covered at that \
+            moment. Elements and tree_markdown show browser controls only, not the page.",
+        "next": "Use the browser_* tools for page content, or bring_to_front this window once \
+            and read it again; the page stays exposed after it is covered again."
+    }))
 }
 
 #[cfg(test)]
