@@ -55,17 +55,8 @@ fn run_host(origin: &str) -> i32 {
     let Ok(mut to_daemon) = socket.try_clone() else {
         return 1;
     };
-    // Tell the daemon which Chrome this link belongs to: Chrome launched this
-    // host, so the parent process is the browser.
-    let hello = serde_json::json!({
-        "jsonrpc": "2.0",
-        "method": "host.hello",
-        "params": { "chromePid": std::os::unix::process::parent_id() },
-    });
-    let frame = cua_driver_core::browser::extension_bridge::frame(&hello);
-    if to_daemon.write_all(&frame).is_err() {
-        return 1;
-    }
+    // The daemon identifies this link's Chrome from the OS (this process's
+    // parent), so nothing is announced here.
     std::thread::spawn(move || {
         let _ = std::io::copy(&mut std::io::stdin().lock(), &mut to_daemon);
         let _ = to_daemon.shutdown(std::net::Shutdown::Both);

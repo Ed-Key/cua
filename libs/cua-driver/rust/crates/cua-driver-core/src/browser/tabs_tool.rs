@@ -32,7 +32,8 @@ impl BrowserTabsTool {
                     the background unless active:true, grouped under \"Cua\"), activate (select a tab in its window \
                     without raising the window), close, move, group (put tabs in a new or \
                     existing group, optionally naming and coloring it), ungroup, and \
-                    update_group. Tab, window, and group ids come from list. Requires the Cua \
+                    update_group. Tab, window, and group ids come from list, \
+                    with the pid of the Chrome they belong to. Requires the Cua \
                     Driver extension in Chrome; the error says so when it is not connected."
                     .into(),
                 input_schema: json!({
@@ -57,6 +58,7 @@ impl BrowserTabsTool {
                         "title": { "type": "string", "description": "Group name for group or update_group." },
                         "color": { "type": "string", "enum": GROUP_COLORS },
                         "collapsed": { "type": "boolean" },
+                        "pid": { "type": "integer", "description": "The Chrome process, from list. Needed for changes when several Chrome instances are connected." },
                         "session": { "type": "string" }
                     },
                     "required": ["action"],
@@ -68,6 +70,36 @@ impl BrowserTabsTool {
                 open_world: true,
             },
             bridge,
+        }
+    }
+
+    /// The Chrome a request acts on: the one named by `pid`, or the only
+    /// connected one. Never a guess: numeric tab ids repeat across browsers.
+    fn resolve(&self, args: &Value) -> Result<(u64, i64), String> {
+        let links: Vec<_> = self
+            .bridge
+            .links()
+            .into_iter()
+            .filter_map(|link| link.chrome_pid.map(|pid| (link.link, pid)))
+            .collect();
+        if links.is_empty() {
+            return Err(
+                "the Cua Driver Chrome extension is not connected: install it in Chrome and keep Chrome open"
+                    .to_owned(),
+            );
+        }
+        match args.get("pid").and_then(Value::as_i64) {
+            Some(pid) => links
+                .iter()
+                .rev()
+                .find(|(_, candidate)| *candidate == pid)
+                .copied()
+                .ok_or_else(|| format!("no connected Chrome has pid {pid}; call list for the current ones")),
+            None if links.len() == 1 => Ok(links[0]),
+            None => Err(format!(
+                "several Chrome instances are connected (pids {}); pass pid from list",
+                links.iter().map(|(_, pid)| pid.to_string()).collect::<Vec<_>>().join(", ")
+            )),
         }
     }
 
@@ -90,13 +122,33 @@ impl BrowserTabsTool {
         };
         let (method, params) = match action {
             "list" => {
-                let filter = json!({ "windowId": int("window_id") });
-                let filter = strip_nulls(filter);
-                let (windows, tabs, groups) = tokio::try_join!(
-                    self.request("windows.list", json!({})),
-                    self.request("tabs.list", filter.clone()),
-                    self.request("tabGroups.list", filter),
-                )?;
+                let filter = strip_nulls(json!({ "windowId": int("window_id") }));
+                let links: Vec<_> = match args.get("pid") {
+                    Some(_) => vec![self.resolve(args)?],
+                    None => self
+                        .bridge
+                        .links()
+                        .into_iter()
+                        .filter_map(|link| link.chrome_pid.map(|pid| (link.link, pid)))
+                        .collect(),
+                };
+                if links.is_empty() {
+                    self.resolve(args)?;
+                }
+                let (mut windows, mut tabs, mut groups) = (Vec::new(), Vec::new(), Vec::new());
+                for (link, pid) in links {
+                    let (w, t, g) = tokio::try_join!(
+                        self.request(link, "windows.list", json!({})),
+                        self.request(link, "tabs.list", filter.clone()),
+                        self.request(link, "tabGroups.list", filter.clone()),
+                    )?;
+                    for (list, out) in [(w, &mut windows), (t, &mut tabs), (g, &mut groups)] {
+                        for mut item in list.as_array().cloned().unwrap_or_default() {
+                            item["pid"] = json!(pid);
+                            out.push(item);
+                        }
+                    }
+                }
                 return Ok(json!({ "windows": windows, "tabs": tabs, "groups": groups }));
             }
             "open" => {
@@ -147,12 +199,13 @@ impl BrowserTabsTool {
             }
             other => return Err(format!("unknown action {other:?}")),
         };
-        self.request(method, Value::Object(params)).await
+        let (link, _) = self.resolve(args)?;
+        self.request(link, method, Value::Object(params)).await
     }
 
-    async fn request(&self, method: &str, params: Value) -> Result<Value, String> {
+    async fn request(&self, link: u64, method: &str, params: Value) -> Result<Value, String> {
         self.bridge
-            .request(method, params)
+            .request_on(link, method, params)
             .await
             .map_err(|error| error.to_string())
     }
@@ -212,6 +265,42 @@ fn summary(action: &str, result: &Value) -> String {
 impl Tool for BrowserTabsTool {
     fn def(&self) -> &ToolDef {
         &self.def
+    }
+
+    /// A change to the user's tabs names exactly what it touches: the Chrome
+    /// (its OS-proven process), the action, the tabs, and for open the
+    /// destination origin. The default revalidation re-derives this right
+    /// before dispatch and refuses if anything moved.
+    async fn protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
+        if adapter_id != "browser_consequential_action" {
+            return Ok(None);
+        }
+        let (_, pid) = self.resolve(args)?;
+        let origin = match args.get("url").and_then(Value::as_str) {
+            Some(url) => Some(
+                url::Url::parse(url)
+                    .map_err(|_| "the URL to open is invalid".to_owned())?
+                    .origin()
+                    .ascii_serialization(),
+            ),
+            None => None,
+        };
+        Ok(Some(json!({
+            "kind": "chrome_tabs",
+            "pid": pid,
+            "action": args.get("action"),
+            "tab_id": args.get("tab_id"),
+            "tab_ids": args.get("tab_ids"),
+            "window_id": args.get("window_id"),
+            "group_id": args.get("group_id"),
+            "title": args.get("title"),
+            "color": args.get("color"),
+            "origin": origin,
+        })))
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {

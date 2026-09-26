@@ -17,6 +17,7 @@ use serde_json::{json, Value};
 use tokio::sync::{broadcast, mpsc};
 use tokio_tungstenite::tungstenite::Message;
 
+use super::cdp_ws::CdpMethodPolicy;
 use super::extension_bridge::{self, ExtensionBridge, ExtensionEvent};
 
 /// CDP's "method not found": the engine treats it as an unsupported feature.
@@ -91,6 +92,11 @@ impl Relay {
         let callback = |request: &Request, response: Response| -> Result<Response, ErrorResponse> {
             let token = request.uri().path().strip_prefix("/devtools/browser/").unwrap_or("");
             link = self.paths.lock().unwrap().get(token).copied();
+            // Browsers always send Origin on WebSocket handshakes and the
+            // engine's client never does: no web page may reach this relay.
+            if request.headers().contains_key("origin") {
+                link = None;
+            }
             if link.is_some() {
                 Ok(response)
             } else {
@@ -118,8 +124,6 @@ struct Routes {
     sessions: HashMap<String, i64>,
     /// Real chrome.debugger child sessions (out-of-process iframes) -> tabId.
     children: HashMap<String, i64>,
-    /// The tab session most recently used, which receives the tab's events.
-    latest: HashMap<i64, String>,
     /// The tab session that enabled Page, which receives its dialog events.
     page_enabled: HashMap<i64, String>,
 }
@@ -166,7 +170,7 @@ impl Session {
                     // Events the extension sent before this reply are already
                     // queued; CDP delivers them first, and the engine relies on it.
                     while let Ok(event) = events.try_recv() {
-                        if let Some(event) = this.translate(event) {
+                        for event in this.translate(event) {
                             if sink.send(Message::Text(event.to_string().into())).await.is_err() { return; }
                         }
                     }
@@ -175,7 +179,7 @@ impl Session {
                 event = events.recv() => {
                     match event {
                         Ok(event) => {
-                            if let Some(event) = this.translate(event) {
+                            for event in this.translate(event) {
                                 if sink.send(Message::Text(event.to_string().into())).await.is_err() { return; }
                             }
                         }
@@ -192,9 +196,19 @@ impl Session {
         let method = command.get("method").and_then(Value::as_str).unwrap_or_default();
         let params = command.get("params").cloned().unwrap_or_else(|| json!({}));
         let session = command.get("sessionId").and_then(Value::as_str);
-        let outcome = match session {
-            None => self.root(method, &params).await,
-            Some(session) => self.forward(session, method, params).await,
+        // The relay reaches the user's own profile, so it enforces the same
+        // allowlist the engine applies to an existing-profile connection,
+        // whoever holds the URL.
+        let outcome = if !CdpMethodPolicy::ExistingProfile.allows(method) {
+            Err((
+                METHOD_NOT_FOUND,
+                format!("'{method}' is not available for the user's own browser profile"),
+            ))
+        } else {
+            match session {
+                None => self.root(method, &params).await,
+                Some(session) => self.forward(session, method, params).await,
+            }
         };
         let mut reply = match outcome {
             Ok(result) => json!({ "id": id, "result": result }),
@@ -293,17 +307,20 @@ impl Session {
                 let tab = self.tab_of_target(target_id()).await?;
                 self.request("debugger.attach", json!({ "tabId": tab })).await?;
                 let session = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
-                let mut routes = self.routes.lock().unwrap();
-                routes.sessions.insert(session.clone(), tab);
-                routes.latest.insert(tab, session.clone());
+                self.routes.lock().unwrap().sessions.insert(session.clone(), tab);
                 Ok(json!({ "sessionId": session }))
             }
             "Target.detachFromTarget" => {
                 let session = params.get("sessionId").and_then(Value::as_str).unwrap_or_default();
                 // A relay tab session only stops being routed; the debugger
-                // stays attached for the tab's other sessions.
-                if self.routes.lock().unwrap().sessions.remove(session).is_some() {
-                    return Ok(json!({}));
+                // stays attached for the tab's other sessions (the extension
+                // releases it once the tab is idle).
+                {
+                    let mut routes = self.routes.lock().unwrap();
+                    if routes.sessions.remove(session).is_some() {
+                        routes.page_enabled.retain(|_, owner| owner != session);
+                        return Ok(json!({}));
+                    }
                 }
                 let tab = self.routes.lock().unwrap().children.get(session).copied();
                 match tab {
@@ -343,7 +360,6 @@ impl Session {
         let (tab, child) = {
             let mut routes = self.routes.lock().unwrap();
             if let Some(tab) = routes.sessions.get(session).copied() {
-                routes.latest.insert(tab, session.to_owned());
                 if method == "Page.enable" {
                     routes.page_enabled.insert(tab, session.to_owned());
                 }
@@ -361,61 +377,83 @@ impl Session {
         self.request("debugger.send", request).await
     }
 
-    /// Turn an extension notification into the CDP event the engine expects.
-    fn translate(&self, event: ExtensionEvent) -> Option<Value> {
+    /// Turn an extension notification into the CDP events the engine expects.
+    /// A tab event goes to every live session of that tab: the engine attaches
+    /// per operation, operations can overlap, and each filters by its own
+    /// session. Dialog events go to the session that enabled Page.
+    fn translate(&self, event: ExtensionEvent) -> Vec<Value> {
         if event.link != self.link {
-            return None;
+            return Vec::new();
         }
-        let source = event.params.get("source")?;
-        let tab = source.get("tabId").and_then(Value::as_i64)?;
+        let Some(tab) = event
+            .params
+            .get("source")
+            .and_then(|source| source.get("tabId"))
+            .and_then(Value::as_i64)
+        else {
+            return Vec::new();
+        };
+        let source_session = event
+            .params
+            .pointer("/source/sessionId")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let mut routes = self.routes.lock().unwrap();
+        let tab_sessions: Vec<String> = routes
+            .sessions
+            .iter()
+            .filter(|(_, owner)| **owner == tab)
+            .map(|(session, _)| session.clone())
+            .collect();
         match event.method.as_str() {
             "debugger.event" => {
-                let method = event.params.get("method").and_then(Value::as_str)?;
+                let Some(method) = event.params.get("method").and_then(Value::as_str) else {
+                    return Vec::new();
+                };
                 let params = event.params.get("params").cloned().unwrap_or_else(|| json!({}));
-                match method {
-                    "Target.attachedToTarget" => {
-                        if let Some(child) = params.get("sessionId").and_then(Value::as_str) {
+                if let Some(child) = params.get("sessionId").and_then(Value::as_str) {
+                    match method {
+                        "Target.attachedToTarget" => {
                             routes.children.insert(child.to_owned(), tab);
                         }
-                    }
-                    "Target.detachedFromTarget" => {
-                        if let Some(child) = params.get("sessionId").and_then(Value::as_str) {
+                        "Target.detachedFromTarget" => {
                             routes.children.remove(child);
                         }
+                        _ => {}
                     }
-                    _ => {}
                 }
-                let session = match source.get("sessionId").and_then(Value::as_str) {
-                    Some(child) => child.to_owned(),
-                    None if method.starts_with("Page.javascriptDialog") => routes
-                        .page_enabled
-                        .get(&tab)
-                        .or_else(|| routes.latest.get(&tab))?
-                        .clone(),
-                    None => routes.latest.get(&tab)?.clone(),
+                let sessions = match source_session {
+                    Some(child) => vec![child],
+                    None if method.starts_with("Page.javascriptDialog") => {
+                        match routes.page_enabled.get(&tab) {
+                            Some(session) => vec![session.clone()],
+                            None => tab_sessions,
+                        }
+                    }
+                    None => tab_sessions,
                 };
-                Some(json!({ "method": method, "params": params, "sessionId": session }))
+                sessions
+                    .into_iter()
+                    .map(|session| json!({ "method": method, "params": params, "sessionId": session }))
+                    .collect()
             }
             "debugger.detached" => {
-                // The tab closed or the user cancelled debugging: its sessions end.
-                let ended: Vec<String> = routes
-                    .sessions
-                    .iter()
-                    .filter(|(_, owner)| **owner == tab)
-                    .map(|(session, _)| session.clone())
-                    .collect();
+                // The debugger left the tab (idle release, tab closed, or the
+                // user cancelled): its sessions end; the next operation attaches again.
                 routes.sessions.retain(|_, owner| *owner != tab);
                 routes.children.retain(|_, owner| *owner != tab);
-                routes.latest.remove(&tab);
                 routes.page_enabled.remove(&tab);
-                let session = ended.first()?;
-                Some(json!({
-                    "method": "Target.detachedFromTarget",
-                    "params": { "sessionId": session, "reason": event.params.get("reason") },
-                }))
+                tab_sessions
+                    .into_iter()
+                    .map(|session| {
+                        json!({
+                            "method": "Target.detachedFromTarget",
+                            "params": { "sessionId": session, "reason": event.params.get("reason") },
+                        })
+                    })
+                    .collect()
             }
-            _ => None,
+            _ => Vec::new(),
         }
     }
 }

@@ -36,8 +36,10 @@ pub struct LinkInfo {
     pub link: u64,
     /// The extension's `hello` parameters (id, version, user agent).
     pub hello: Option<Value>,
-    /// The Chrome browser process, as reported by the native host (its
-    /// parent: Chrome launches the host).
+    /// The Chrome browser process this link belongs to, proven by the OS:
+    /// the socket peer is this driver's own executable and its parent is
+    /// Chrome (Chrome launches native hosts). `None` where the platform
+    /// cannot prove it.
     pub chrome_pid: Option<i64>,
 }
 
@@ -178,9 +180,6 @@ impl ExtensionBridge {
         if method == "hello" {
             *link.hello.lock().unwrap() = Some(params.clone());
         }
-        if method == "host.hello" {
-            *link.chrome_pid.lock().unwrap() = params.get("chromePid").and_then(Value::as_i64);
-        }
         let _ = self.events.send(ExtensionEvent {
             link: link.id,
             method: method.to_owned(),
@@ -207,12 +206,21 @@ impl ExtensionBridge {
     }
 
     async fn run_link(self: Arc<Self>, stream: tokio::net::UnixStream) {
+        // Identity comes from the OS, never from what the peer says: another
+        // process could claim any Chrome and answer for it.
+        let chrome_pid = match peer_chrome_pid(&stream) {
+            Ok(pid) => pid,
+            Err(reason) => {
+                tracing::warn!("rejected a Chrome extension bridge connection: {reason}");
+                return;
+            }
+        };
         let (mut reader, mut writer) = stream.into_split();
         let (outbox, mut frames) = mpsc::unbounded_channel::<Vec<u8>>();
         let link = Arc::new(Link {
             id: self.next_link.fetch_add(1, Ordering::SeqCst),
             hello: Mutex::new(None),
-            chrome_pid: Mutex::new(None),
+            chrome_pid: Mutex::new(chrome_pid),
             outbox,
             pending: Mutex::new(HashMap::new()),
             next_id: AtomicU64::new(1),
@@ -250,6 +258,53 @@ impl ExtensionBridge {
             .unwrap()
             .retain(|other| !Arc::ptr_eq(other, &link));
     }
+}
+
+/// The Chrome process behind a bridge connection. The peer must run as this
+/// user and be this driver's own executable in native-host mode, and Chrome is
+/// its parent. A process that spawns the driver itself becomes the parent, so
+/// it can never pose as a Chrome it is not.
+#[cfg(target_os = "macos")]
+fn peer_chrome_pid(stream: &tokio::net::UnixStream) -> Result<Option<i64>, String> {
+    let credentials = stream.peer_cred().map_err(|error| error.to_string())?;
+    if credentials.uid() != unsafe { libc::geteuid() } {
+        return Err("the peer belongs to another user".to_owned());
+    }
+    let pid = credentials.pid().ok_or("the peer pid is unavailable")?;
+    let executable = pid_path(pid).ok_or("the peer executable is unavailable")?;
+    let ours = std::env::current_exe().map_err(|error| error.to_string())?;
+    let canonical = |path: &std::path::Path| std::fs::canonicalize(path).ok();
+    if canonical(&executable).is_none() || canonical(&executable) != canonical(&ours) {
+        return Err(format!("the peer {} is not this driver", executable.display()));
+    }
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as libc::c_int;
+    let read = unsafe {
+        libc::proc_pidinfo(pid, libc::PROC_PIDTBSDINFO, 0, (&mut info as *mut libc::proc_bsdinfo).cast(), size)
+    };
+    if read != size {
+        return Err("the peer's parent is unavailable".to_owned());
+    }
+    Ok(Some(i64::from(info.pbi_ppid)))
+}
+
+#[cfg(target_os = "macos")]
+fn pid_path(pid: libc::pid_t) -> Option<std::path::PathBuf> {
+    use std::os::unix::ffi::OsStringExt as _;
+    let mut buffer = vec![0_u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    let length = unsafe { libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32) };
+    if length <= 0 {
+        return None;
+    }
+    buffer.truncate(length as usize);
+    Some(std::path::PathBuf::from(std::ffi::OsString::from_vec(buffer)))
+}
+
+/// Other platforms cannot prove the Chrome process yet: the link serves tab
+/// requests but never binds the page engine to a Chrome.
+#[cfg(all(unix, not(target_os = "macos")))]
+fn peer_chrome_pid(_stream: &tokio::net::UnixStream) -> Result<Option<i64>, String> {
+    Ok(None)
 }
 
 #[cfg(all(test, unix))]

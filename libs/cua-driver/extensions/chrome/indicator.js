@@ -13,6 +13,9 @@ const CURSOR_PATH =
   "C88,75 91,72 95,70 C95,70 108,63 108,63 C115,59 114,53 107,50 C107,50 55,30 55,30 Z";
 
 const idleTimers = new Map();
+// Bumped on every show/hide, so a slow favicon render cannot redraw the
+// indicator after a later hide (Stop, idle) already ran.
+const generations = new Map();
 
 /** Note activity in a tab; shows the indicator when it was idle. */
 export function markActive(tabId) {
@@ -43,7 +46,10 @@ export function refresh(tabId) {
 }
 
 async function show(tabId, on) {
+  const generation = (generations.get(tabId) ?? 0) + 1;
+  generations.set(tabId, generation);
   const favicon = on ? await badgedFavicon(tabId).catch(() => null) : null;
+  if (generations.get(tabId) !== generation) return;
   // Pages Chrome does not let extensions script (chrome://, the Web Store)
   // simply show nothing.
   await chrome.scripting

@@ -72,7 +72,7 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
 ];
 
 impl CdpMethodPolicy {
-    fn allows(self, method: &str) -> bool {
+    pub fn allows(self, method: &str) -> bool {
         match self {
             Self::Unrestricted => true,
             Self::ExistingProfile => EXISTING_PROFILE_METHODS.binary_search(&method).is_ok(),

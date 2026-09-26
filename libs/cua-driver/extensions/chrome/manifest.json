@@ -29,7 +29,8 @@
     "nativeMessaging",
     "alarms",
     "scripting",
-    "favicon"
+    "favicon",
+    "storage"
   ],
   "host_permissions": [
     "<all_urls>"
