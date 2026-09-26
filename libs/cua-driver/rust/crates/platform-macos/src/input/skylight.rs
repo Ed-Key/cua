@@ -546,12 +546,17 @@ pub fn restore_focus_after_without_raise(target_pid: pid_t, target_wid: u32) -> 
 /// focus plus make-key records, with no SetFrontProcess. Chromium routes a
 /// pid-addressed key to the renderer of its key window, so without the
 /// selection a background key reaches whichever window AppKit last made key,
-/// or none. The synthetic focus is taken back even when `body` fails.
+/// or none. A target that is already the front process runs `body` untouched:
+/// its key window already receives keys, and the synthetic defocus afterward
+/// would blur the user's real window.
 pub fn with_background_key_window<T>(
     target_pid: pid_t,
     target_wid: u32,
     body: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
+    if front_pid_matches(target_pid) == Some(true) {
+        return body();
+    }
     let post = post_event_record_to_fn()
         .ok_or_else(|| anyhow::anyhow!("background key window selection is unavailable"))?;
     let mut target_psn = [0u8; 8];
@@ -563,17 +568,36 @@ pub fn with_background_key_window<T>(
         activate_without_raise(target_pid, target_wid),
         "background keyboard focus was rejected"
     );
+    // Taken back on every exit, including a panic in `body`.
+    let _restore = SyntheticFocusRestore {
+        pid: target_pid,
+        wid: target_wid,
+    };
     let selected = [0x01, 0x02].into_iter().all(|kind| {
         let record = make_key_window_record(target_wid, kind);
         unsafe { post(target_psn.as_ptr() as *const c_void, record.as_ptr()) == 0 }
     });
-    let result = if selected {
-        body()
-    } else {
-        Err(anyhow::anyhow!("background key window selection was rejected"))
-    };
-    restore_focus_after_without_raise(target_pid, target_wid);
-    result
+    anyhow::ensure!(selected, "background key window selection was rejected");
+    body()
+}
+
+struct SyntheticFocusRestore {
+    pid: pid_t,
+    wid: u32,
+}
+
+impl Drop for SyntheticFocusRestore {
+    fn drop(&mut self) {
+        // The keys were already delivered, so a failed hand-back is reported,
+        // not turned into an action error the caller might retry.
+        if !restore_focus_after_without_raise(self.pid, self.wid) {
+            tracing::warn!(
+                pid = self.pid,
+                window_id = self.wid,
+                "could not take back synthetic focus after background key delivery"
+            );
+        }
+    }
 }
 
 /// The 248-byte focus/defocus event record with `wid` stamped little-endian at

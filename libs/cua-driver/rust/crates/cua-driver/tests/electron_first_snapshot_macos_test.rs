@@ -433,10 +433,10 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                 let tool = if scenario == TypingScenario::AddressedHotkey {
                     // A text-editing chord (Cmd+A is a menu key equivalent,
                     // which background delivery does not promise; use the
-                    // foreground rung for menu shortcuts). The focus click puts
-                    // the caret at the end of this short text, so only the
-                    // chord itself can move it to the start.
-                    args["keys"] = serde_json::json!(["cmd", "left"]);
+                    // foreground rung for menu shortcuts). From the caret at 0,
+                    // only the chord selects to the end: a focus click alone
+                    // leaves an empty selection.
+                    args["keys"] = serde_json::json!(["cmd", "shift", "right"]);
                     "hotkey"
                 } else {
                     args["key"] = serde_json::json!("right");
@@ -461,7 +461,7 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                     "web key success must not be inferred from AX"
                 );
                 let (start, end) = if scenario == TypingScenario::AddressedHotkey {
-                    (0, 0)
+                    (0, 8)
                 } else {
                     (8, 8)
                 };

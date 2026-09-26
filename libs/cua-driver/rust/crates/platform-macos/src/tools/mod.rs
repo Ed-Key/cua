@@ -306,7 +306,7 @@ pub(super) fn with_background_web_key_window<T>(
     dispatch: impl FnOnce() -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
     match window_id.filter(|_| {
-        type_text::target_in_web_area(pid, element_ptr.map(|ptr| (ptr, None)), window_id)
+        type_text::target_is_web_content(pid, element_ptr.map(|ptr| (ptr, None)), window_id)
     }) {
         Some(wid) => crate::input::skylight::with_background_key_window(pid, wid, dispatch),
         None => dispatch(),
@@ -357,11 +357,11 @@ pub(crate) async fn focus_by_pixel(
     if let Some(ref s) = session_id {
         click_args["_session_id"] = serde_json::json!(s);
     }
-    if from_zoom {
-        click_args["from_zoom"] = serde_json::json!(true);
-    }
+    // Driver-derived window pixels never pass through a caller's zoom.
     if window_native {
         click_args["_window_native_pixels"] = serde_json::json!(true);
+    } else if from_zoom {
+        click_args["from_zoom"] = serde_json::json!(true);
     }
     let click_tool = click::ClickTool::new(state.clone());
     let click = click_tool.invoke(click_args);
@@ -414,11 +414,11 @@ pub(crate) async fn focus_by_pixel(
     if let Some(ref s) = session_id {
         click_args["_session_id"] = serde_json::json!(s);
     }
-    if from_zoom {
-        click_args["from_zoom"] = serde_json::json!(true);
-    }
+    // Driver-derived window pixels never pass through a caller's zoom.
     if window_native {
         click_args["_window_native_pixels"] = serde_json::json!(true);
+    } else if from_zoom {
+        click_args["from_zoom"] = serde_json::json!(true);
     }
     let focus = click::ClickTool::new(state.clone())
         .invoke(click_args)

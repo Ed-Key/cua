@@ -1018,6 +1018,17 @@ pub(super) fn target_in_web_area(
     ))
 }
 
+/// Positively classified web content. Unlike [`target_in_web_area`], an
+/// unreadable window focus does not count: that is reason to distrust a
+/// readback, not permission to change the window's focus.
+pub(super) fn target_is_web_content(
+    pid: i32,
+    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    window_id: Option<u32>,
+) -> bool {
+    classify_target_web_area(pid, element_ptr_and_idx, window_id) == WebAreaClassification::WebContent
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WebAreaClassification {
     WebContent,

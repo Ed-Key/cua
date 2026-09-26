@@ -466,9 +466,15 @@ impl Tool for PressKeyTool {
                     }
                     // background (default): auth-envelope post, no raise.
                     dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                        super::with_background_web_key_window(pid, window_id, pre_focus_ptr, || {
+                        if fg {
+                            // Foreground px form: the focus click already
+                            // handled the target; no background lease is held.
                             crate::input::keyboard::press_key(pid, &key, &m)
-                        })
+                        } else {
+                            super::with_background_web_key_window(pid, window_id, pre_focus_ptr, || {
+                                crate::input::keyboard::press_key(pid, &key, &m)
+                            })
+                        }
                     })
                 })
                 .await
