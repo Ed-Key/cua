@@ -5169,13 +5169,14 @@ fn run_native_file_picker(spec: &BrowserSpec) {
         };
         let tree = state.structured()["tree_markdown"].as_str().unwrap_or_default().to_owned();
         assert!(tree.contains("AXSheet"), "parent read lacks the sheet: {tree}");
-        let cancel = state.structured()["elements"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .find(|e| e["role"] == "AXButton" && e["label"] == "Cancel")
-            .and_then(|e| e["element_token"].as_str().map(str::to_owned))
-            .expect("the sheet's Cancel button is actionable");
+        assert!(
+            state.structured()["elements"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .any(|e| e["role"] == "AXButton" && e["label"] == "Cancel" && e["element_token"].is_string()),
+            "the sheet's Cancel button is actionable"
+        );
         // Diagnostic: what a direct read of the sheet's own id answers.
         let direct = read(&mut fixture.driver, panel_pid, own_id);
         eprintln!(
@@ -5197,6 +5198,48 @@ fn run_native_file_picker(spec: &BrowserSpec) {
         );
         assert!(!fronted.is_error(), "bring_to_front with a sheet attached: {}", fronted.raw);
         assert_eq!(fronted.structured()["activated"], true, "{}", fronted.raw);
+
+        // 2b. A sheet on the sheet: typing "/" opens Go to Folder, whose path
+        // field is addressed, written, and read back through the parent window.
+        let slash = fixture.driver.call(
+            "press_key",
+            serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"key":"/","delivery_mode":"foreground"}),
+        );
+        assert!(!slash.is_error(), "{}", slash.raw);
+        let deadline = Instant::now() + Duration::from_secs(4);
+        let path_field = loop {
+            let state = read(&mut fixture.driver, panel_pid, panel_wid);
+            let found = state.structured()["elements"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                // The Go to field opens holding just "/".
+                .find(|e| e["role"] == "AXTextField" && (e["value"] == "/" || e["label"] == "/"))
+                .and_then(|e| e["element_token"].as_str().map(str::to_owned));
+            if let Some(token) = found {
+                break token;
+            }
+            assert!(Instant::now() < deadline, "Go to Folder field absent: {}", state.structured()["tree_markdown"]);
+            thread::sleep(Duration::from_millis(200));
+        };
+        let set = fixture.driver.call(
+            "set_value",
+            serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"element_token":path_field,"value":"/tmp"}),
+        );
+        assert_eq!(set.action_effect(), Some("confirmed"), "nested sheet field write: {}", set.raw);
+        let closed_go_to = fixture.driver.call(
+            "press_key",
+            serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"key":"escape","delivery_mode":"foreground"}),
+        );
+        assert!(!closed_go_to.is_error(), "{}", closed_go_to.raw);
+        thread::sleep(Duration::from_millis(500));
+        let cancel = read(&mut fixture.driver, panel_pid, panel_wid).structured()["elements"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .find(|e| e["role"] == "AXButton" && e["label"] == "Cancel")
+            .and_then(|e| e["element_token"].as_str().map(str::to_owned))
+            .expect("the Open panel is still up after closing Go to Folder");
 
         // 3. Cancel, addressed through the parent window, closes it.
         let clicked = fixture.driver.call(

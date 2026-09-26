@@ -585,9 +585,15 @@ pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
 ///
 /// `element` must be a valid `AXUIElementRef` for the duration of the call.
 pub unsafe fn surface_window_id(element: AXUIElementRef) -> Option<u32> {
-    if copy_string_attr(element, "AXRole").as_deref() == Some("AXSheet") {
+    surface_window_id_within(element, 4)
+}
+
+/// A sheet can sit on another sheet (Go to Folder on an Open panel), so fold
+/// upward until a real window, a few levels at most.
+unsafe fn surface_window_id_within(element: AXUIElementRef, levels: u8) -> Option<u32> {
+    if levels > 0 && copy_string_attr(element, "AXRole").as_deref() == Some("AXSheet") {
         if let Some(parent) = copy_element_attr(element, "AXParent") {
-            let parent_id = ax_get_window_id(parent);
+            let parent_id = surface_window_id_within(parent, levels - 1);
             CFRelease(parent as CFTypeRef);
             if parent_id.is_some() {
                 return parent_id;
