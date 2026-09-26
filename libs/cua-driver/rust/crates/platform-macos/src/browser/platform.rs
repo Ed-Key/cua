@@ -258,13 +258,15 @@ impl BrowserCursorTracker {
         cdp_target_id: &str,
         tab_is_active: bool,
     ) -> Vec<(String, bool)> {
-        self.bindings.insert(
-            session.to_owned(),
-            BrowserCursorBinding {
-                window_id,
-                cdp_target_id: cdp_target_id.to_owned(),
-            },
-        );
+        let binding = BrowserCursorBinding {
+            window_id,
+            cdp_target_id: cdp_target_id.to_owned(),
+        };
+        // A cursor placed for another tab is not placed for this one: it waits,
+        // hidden, until an action with a position places it here.
+        if self.bindings.insert(session.to_owned(), binding.clone()).is_some_and(|previous| previous != binding) {
+            self.placed.remove(session);
+        }
         let report = self
             .reports
             .values()
@@ -2021,6 +2023,13 @@ mod tests {
         assert_eq!(after_move.get("session-t"), Some(&false));
         assert_eq!(after_move.get("session-u"), Some(&true));
         assert!(!split.placed.contains("session-t"), "a moved tab's cursor waits to be placed again");
+
+        // A session switching to another tab is unplaced until placed there.
+        let mut retarget = BrowserCursorTracker::default();
+        retarget.update("session-r", 10, "tab-R1", true);
+        retarget.placed.insert("session-r".to_owned());
+        retarget.update("session-r", 20, "tab-R2", false);
+        assert!(!retarget.placed.contains("session-r"));
 
         // The same move with the source window reporting first.
         let mut source_first = BrowserCursorTracker::default();
