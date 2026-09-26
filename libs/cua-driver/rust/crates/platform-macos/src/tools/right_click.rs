@@ -231,7 +231,7 @@ impl Tool for RightClickTool {
             );
         }
         // Animate cursor to the click point; wait for arrival before firing.
-        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
+        crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y, window_id.map(|wid| wid as u64)).await;
         crate::cursor::overlay::send_command(
             cursor_key.clone(),
             cursor_overlay::OverlayCommand::ClickPulse {

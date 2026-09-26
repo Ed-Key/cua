@@ -562,6 +562,7 @@ impl Tool for ScrollTool {
                 cursor_key.clone(),
                 target.screen_x,
                 target.screen_y,
+                target.wid.map(|wid| wid as u64),
             )
             .await;
             self.state.cursor_registry.update_position(

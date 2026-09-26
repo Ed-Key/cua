@@ -362,7 +362,7 @@ impl Tool for ClickTool {
             }
             // Glide the session's agent cursor to the screen point for visibility.
             let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), sx, sy).await;
+            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), sx, sy, None).await;
             self.state
                 .cursor_registry
                 .update_position(&cursor_key, sx, sy);
@@ -559,7 +559,7 @@ impl Tool for ClickTool {
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
+                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy, Some(wid as u64)).await;
                 self.state
                     .cursor_registry
                     .update_position(&cursor_key, cx, cy);
@@ -674,7 +674,7 @@ impl Tool for ClickTool {
                         cursor_key.clone(),
                         cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                     );
-                    crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy).await;
+                    crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy, Some(wid as u64)).await;
                     self.state
                         .cursor_registry
                         .update_position(&cursor_key, cx, cy);
@@ -1027,7 +1027,7 @@ impl Tool for ClickTool {
             }
             // Animate the visual cursor to the click point and wait for it to
             // arrive — mirrors Swift's `AgentCursor.shared.animateAndWait(to:)`.
-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y).await;
+            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y, window_id.map(|wid| wid as u64)).await;
             // Keep the registry in sync with the overlay (see AX path above).
             self.state
                 .cursor_registry
