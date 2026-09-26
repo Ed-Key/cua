@@ -477,9 +477,11 @@ state must verify after mutation; unsupported appearance, scale, zoom,
 window-size, or toolbar geometry refuses without a click.
 
 Standalone Chromium activates its window when CDP's trusted pointer route is
-used on macOS. The driver therefore returns
+used over a remote-debugging port on macOS. The driver therefore returns
 `browser_input_trust_unavailable` before dispatch rather than falsely claiming
-background delivery. Use `input_route:"dom_event"` only when synthetic click
+background delivery. Through the Cua Driver Chrome extension
+(`endpoint_transport: "extension_relay"`) trusted input does not activate
+Chrome and is used directly; see `BROWSER.md`. Use `input_route:"dom_event"` only when synthetic click
 semantics are acceptable. Embedded Electron has a separately bounded route;
 do not infer that route for arbitrary WKWebView or Tauri hosts.
 
