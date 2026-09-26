@@ -317,8 +317,12 @@ impl Session {
                 // releases it once the tab is idle).
                 {
                     let mut routes = self.routes.lock().unwrap();
-                    if routes.sessions.remove(session).is_some() {
+                    if let Some(tab) = routes.sessions.remove(session) {
                         routes.page_enabled.retain(|_, owner| owner != session);
+                        // The tab's last session gone: its iframe routes go too.
+                        if !routes.sessions.values().any(|owner| *owner == tab) {
+                            routes.children.retain(|_, owner| *owner != tab);
+                        }
                         return Ok(json!({}));
                     }
                 }
@@ -436,6 +440,13 @@ impl Session {
                     .into_iter()
                     .map(|session| json!({ "method": method, "params": params, "sessionId": session }))
                     .collect()
+            }
+            // The extension released an idle debugger. Relay sessions stay
+            // valid (the next command reattaches and replays Page.enable);
+            // only out-of-process iframe sessions died with the attachment.
+            "debugger.released" => {
+                routes.children.retain(|_, owner| *owner != tab);
+                Vec::new()
             }
             "debugger.detached" => {
                 // The debugger left the tab (idle release, tab closed, or the

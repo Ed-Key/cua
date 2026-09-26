@@ -9,6 +9,9 @@ import { clearActive, markActive, refresh } from "./indicator.js";
 const HOST = "com.trycua.cua_driver";
 const RECONNECT_ALARM = "cua-driver-reconnect";
 const AGENT_GROUP = { title: "Cua", color: "cyan" };
+const STOPPED_MESSAGE =
+  "the user pressed Stop for Cua in this tab; ask them before continuing " +
+  "(they can allow it again from the Cua Driver toolbar button)";
 
 let port = null;
 // Tabs this extension attached the debugger to, so detach only undoes its own.
@@ -27,27 +30,59 @@ const saveStopped = () => chrome.storage.session.set({ stopped: [...stopped] }).
 // clears Chrome's debugging banner; the next command attaches again.
 const DEBUGGER_IDLE_MS = 20000;
 const debuggerIdle = new Map();
+// Tabs whose Page domain Cua enabled: replayed after an idle reattach so
+// dialog events keep flowing to the daemon's existing session.
+const pageEnabled = new Set();
+// Attach and detach run one at a time per tab, so Stop cannot slip between
+// an attach starting and a command being sent.
+const tabQueues = new Map();
+
+function serialized(tabId, work) {
+  const run = (tabQueues.get(tabId) ?? Promise.resolve()).then(work, work);
+  tabQueues.set(tabId, run.catch(() => {}));
+  return run;
+}
 
 function touchDebugger(tabId) {
   clearTimeout(debuggerIdle.get(tabId));
   debuggerIdle.set(tabId, setTimeout(() => void releaseDebugger(tabId, "idle"), DEBUGGER_IDLE_MS));
 }
 
-async function releaseDebugger(tabId, reason) {
-  clearTimeout(debuggerIdle.get(tabId));
-  debuggerIdle.delete(tabId);
-  if (!attached.delete(tabId)) return;
-  await chrome.debugger.detach({ tabId }).catch(() => {});
-  // Chrome reports only detaches it caused; tell the daemon about this one.
-  post({ jsonrpc: "2.0", method: "debugger.detached", params: { source: { tabId }, reason } });
+// "idle" keeps the daemon's sessions (the next command reattaches);
+// anything else ends them.
+function releaseDebugger(tabId, reason) {
+  return serialized(tabId, async () => {
+    clearTimeout(debuggerIdle.get(tabId));
+    debuggerIdle.delete(tabId);
+    if (reason !== "idle") pageEnabled.delete(tabId);
+    if (!attached.delete(tabId)) return;
+    await chrome.debugger.detach({ tabId }).catch(() => {});
+    // Chrome reports only detaches it caused; tell the daemon about this one.
+    const method = reason === "idle" ? "debugger.released" : "debugger.detached";
+    post({ jsonrpc: "2.0", method, params: { source: { tabId }, reason } });
+  });
 }
 
-async function ensureAttached(tabId) {
-  if (!attached.has(tabId)) {
-    await chrome.debugger.attach({ tabId }, "1.3");
-    attached.add(tabId);
-  }
-  touchDebugger(tabId);
+function refuseIfStopped(tabId) {
+  if (stopped.has(tabId)) throw new Error(STOPPED_MESSAGE);
+}
+
+function ensureAttached(tabId) {
+  return serialized(tabId, async () => {
+    refuseIfStopped(tabId);
+    if (!attached.has(tabId)) {
+      await chrome.debugger.attach({ tabId }, "1.3");
+      attached.add(tabId);
+      if (pageEnabled.has(tabId)) await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
+    }
+    // Stop may have landed while the attach was in flight.
+    if (stopped.has(tabId)) {
+      attached.delete(tabId);
+      await chrome.debugger.detach({ tabId }).catch(() => {});
+      throw new Error(STOPPED_MESSAGE);
+    }
+    touchDebugger(tabId);
+  });
 }
 
 function connect() {
@@ -191,6 +226,8 @@ const handlers = {
 
   "debugger.send": async ({ tabId, sessionId, method, params }) => {
     await ensureAttached(tabId);
+    refuseIfStopped(tabId);
+    if (method === "Page.enable" && !sessionId) pageEnabled.add(tabId);
     return chrome.debugger.sendCommand(defined({ tabId, sessionId }), method, params ?? {});
   },
 
@@ -233,15 +270,7 @@ async function handleMessage(message) {
   await stoppedLoaded;
   const tabs = tabsOf(message.method, message.params ?? {});
   if (tabs.some((tabId) => stopped.has(tabId))) {
-    post({
-      jsonrpc: "2.0",
-      id: message.id,
-      error: {
-        code: -32001,
-        message: "the user pressed Stop for Cua in this tab; ask them before continuing " +
-          "(they can allow it again from the Cua Driver toolbar button)",
-      },
-    });
+    post({ jsonrpc: "2.0", id: message.id, error: { code: -32001, message: STOPPED_MESSAGE } });
     return;
   }
   // Closing a tab is not work in it; everything else shows the indicator.
@@ -265,6 +294,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   attached.delete(source.tabId);
+  pageEnabled.delete(source.tabId);
   clearTimeout(debuggerIdle.get(source.tabId));
   debuggerIdle.delete(source.tabId);
   // "canceled_by_user": the user dismissed Chrome's debugging banner.
@@ -283,6 +313,8 @@ chrome.tabs.onUpdated.addListener((tabId, change) => {
 chrome.tabs.onRemoved.addListener((tabId) => {
   if (stopped.delete(tabId)) void saveStopped();
   attached.delete(tabId);
+  pageEnabled.delete(tabId);
+  tabQueues.delete(tabId);
   clearTimeout(debuggerIdle.get(tabId));
   debuggerIdle.delete(tabId);
   clearActive(tabId);

@@ -58,7 +58,7 @@ impl BrowserTabsTool {
                         "title": { "type": "string", "description": "Group name for group or update_group." },
                         "color": { "type": "string", "enum": GROUP_COLORS },
                         "collapsed": { "type": "boolean" },
-                        "pid": { "type": "integer", "description": "The Chrome process, from list. Needed for changes when several Chrome instances are connected." },
+                        "pid": { "type": "integer", "description": "The Chrome process, from list. Required for every change (not for list)." },
                         "session": { "type": "string" }
                     },
                     "required": ["action"],
@@ -73,8 +73,50 @@ impl BrowserTabsTool {
         }
     }
 
-    /// The Chrome a request acts on: the one named by `pid`, or the only
-    /// connected one. Never a guess: numeric tab ids repeat across browsers.
+    /// The Chrome a change acts on, named by `pid` from list. Required even
+    /// with one Chrome connected: a Chrome restarted between list and change
+    /// would otherwise receive the change. Several profiles of one Chrome share
+    /// its pid; the link whose tabs include the request's tab ids is chosen.
+    async fn resolve_change(&self, args: &Value) -> Result<(u64, i64), String> {
+        let pid = args
+            .get("pid")
+            .and_then(Value::as_i64)
+            .ok_or("changes need pid: the Chrome process, from list")?;
+        let candidates: Vec<u64> = self
+            .bridge
+            .links()
+            .into_iter()
+            .rev()
+            .filter(|link| link.chrome_pid == Some(pid))
+            .map(|link| link.link)
+            .collect();
+        let wanted: Vec<i64> = args
+            .get("tab_id")
+            .into_iter()
+            .chain(args.get("tab_ids").and_then(Value::as_array).into_iter().flatten())
+            .filter_map(Value::as_i64)
+            .collect();
+        if candidates.len() > 1 && !wanted.is_empty() {
+            for link in &candidates {
+                let tabs = self.request(*link, "tabs.list", json!({})).await?;
+                let owned: Vec<i64> = tabs
+                    .as_array()
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|tab| tab.get("tabId").and_then(Value::as_i64))
+                    .collect();
+                if wanted.iter().all(|tab| owned.contains(tab)) {
+                    return Ok((*link, pid));
+                }
+            }
+        }
+        candidates
+            .first()
+            .map(|link| (*link, pid))
+            .ok_or_else(|| format!("no connected Chrome has pid {pid}; call list for the current ones"))
+    }
+
+    /// The Chrome named by `pid`, or the only connected one (reads only).
     fn resolve(&self, args: &Value) -> Result<(u64, i64), String> {
         let links: Vec<_> = self
             .bridge
@@ -199,7 +241,7 @@ impl BrowserTabsTool {
             }
             other => return Err(format!("unknown action {other:?}")),
         };
-        let (link, _) = self.resolve(args)?;
+        let (link, _) = self.resolve_change(args).await?;
         self.request(link, method, Value::Object(params)).await
     }
 
@@ -208,6 +250,33 @@ impl BrowserTabsTool {
             .request_on(link, method, params)
             .await
             .map_err(|error| error.to_string())
+    }
+}
+
+/// What an approval prompt says for a change to the user's tabs.
+pub(crate) fn consent_summary(args: &Value) -> String {
+    let count = |key: &str| args.get(key).and_then(Value::as_array).map_or(0, Vec::len);
+    let tabs = |n: usize| if n == 1 { "1 tab".to_owned() } else { format!("{n} tabs") };
+    match args.get("action").and_then(Value::as_str).unwrap_or_default() {
+        "open" => {
+            let origin = args
+                .get("url")
+                .and_then(Value::as_str)
+                .and_then(|url| url::Url::parse(url).ok())
+                .map(|url| url.origin().ascii_serialization())
+                .unwrap_or_else(|| "a page".to_owned());
+            format!("Allow Cua to open {origin} in a new tab in your Chrome")
+        }
+        "activate" => "Allow Cua to switch to one of your Chrome tabs".to_owned(),
+        "close" => format!("Allow Cua to close {} in your Chrome", tabs(count("tab_ids"))),
+        "move" => format!("Allow Cua to move {} in your Chrome", tabs(count("tab_ids"))),
+        "group" => match args.get("title").and_then(Value::as_str) {
+            Some(title) => format!("Allow Cua to group {} as \"{title}\" in your Chrome", tabs(count("tab_ids"))),
+            None => format!("Allow Cua to group {} in your Chrome", tabs(count("tab_ids"))),
+        },
+        "ungroup" => format!("Allow Cua to ungroup {} in your Chrome", tabs(count("tab_ids"))),
+        "update_group" => "Allow Cua to rename or recolor a tab group in your Chrome".to_owned(),
+        other => format!("Allow Cua to change your Chrome tabs ({other})"),
     }
 }
 
@@ -279,7 +348,7 @@ impl Tool for BrowserTabsTool {
         if adapter_id != "browser_consequential_action" {
             return Ok(None);
         }
-        let (_, pid) = self.resolve(args)?;
+        let (_, pid) = self.resolve_change(args).await?;
         let origin = match args.get("url").and_then(Value::as_str) {
             Some(url) => Some(
                 url::Url::parse(url)
