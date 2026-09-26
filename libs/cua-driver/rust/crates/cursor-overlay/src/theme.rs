@@ -7,6 +7,7 @@
 
 use serde::{Deserialize, Serialize};
 
+pub use cua_driver_contract::cursor::{session_fill_hex, session_fill_rgba, DEFAULT_CURSOR_FILL};
 pub use cua_driver_contract::{
     CursorAction, CursorDelivery as DeliveryModifier, CursorPlayback as PlaybackKind,
     CursorReducedMotion as ReducedMotion, CursorTarget as TargetModifier,
@@ -18,64 +19,6 @@ pub const THEME_PROFILE: &str = "cua-driver-actions-v2";
 pub const CANVAS_SIZE: f32 = 128.0;
 pub const DISPLAY_SIZE: f32 = 42.0;
 const FLOAT_DURATION_SECS: f32 = 4.0;
-
-pub const DEFAULT_CURSOR_FILL: [u8; 4] = [94, 192, 232, 255];
-
-const SESSION_CURSOR_FILLS: &[[u8; 4]] = &[
-    [178, 132, 255, 255],
-    [247, 132, 170, 255],
-    [96, 218, 174, 255],
-    [244, 178, 66, 255],
-    [76, 204, 224, 255],
-    [221, 113, 236, 255],
-    [232, 82, 98, 255],
-    [184, 220, 54, 255],
-    [80, 126, 236, 255],
-];
-
-/// Return the stable fill color for one session-owned cursor.
-///
-/// The anonymous/default cursor keeps the original Cua blue. Named sessions
-/// hash into the former multi-cursor palette so concurrent runs are visually
-/// distinct without accepting an agent-controlled styling argument.
-pub fn session_fill_rgba(session_id: &str) -> [u8; 4] {
-    if session_id.is_empty() || session_id == "default" {
-        return DEFAULT_CURSOR_FILL;
-    }
-
-    SESSION_CURSOR_FILLS[stable_session_index(session_id, SESSION_CURSOR_FILLS.len())]
-}
-
-pub fn session_fill_hex(session_id: &str) -> String {
-    let [r, g, b, _] = session_fill_rgba(session_id);
-    format!("#{r:02X}{g:02X}{b:02X}")
-}
-
-fn stable_session_index(id: &str, count: usize) -> usize {
-    let suffix = id
-        .rfind(['-', '_', '.'])
-        .map(|index| &id[index + 1..])
-        .unwrap_or(id);
-    if let Ok(number) = suffix.parse::<usize>() {
-        if number > 0 {
-            return (number - 1) % count;
-        }
-    }
-    if suffix.len() == 1 {
-        if let Some(character) = suffix.chars().next() {
-            if character.is_ascii_alphabetic() {
-                return (character.to_ascii_lowercase() as usize - b'a' as usize) % count;
-            }
-        }
-    }
-
-    let mut hash: u32 = 2_166_136_261;
-    for character in id.chars() {
-        hash ^= character as u32;
-        hash = hash.wrapping_mul(16_777_619);
-    }
-    hash as usize % count
-}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CursorVisualState {

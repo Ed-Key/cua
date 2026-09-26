@@ -1188,13 +1188,18 @@ impl BrowserEngine {
         &self,
         conn: &CdpConnection,
         cdp_target_id: &str,
+        session: &str,
+        transport: super::types::EndpointTransport,
     ) -> Result<String, BrowserRefusal> {
+        let mut params = json!({ "targetId": cdp_target_id, "flatten": true });
+        // The Chrome extension draws its tab indicator in the session's cursor
+        // color. Only the relay reads this field; Chrome itself never sees it.
+        if transport == super::types::EndpointTransport::ExtensionRelay {
+            params["cuaSessionColor"] =
+                json!(cua_driver_contract::cursor::session_fill_hex(session));
+        }
         let attached = conn
-            .call(
-                None,
-                "Target.attachToTarget",
-                json!({ "targetId": cdp_target_id, "flatten": true }),
-            )
+            .call(None, "Target.attachToTarget", params)
             .await
             .map_err(|e| {
                 refuse(
@@ -1581,7 +1586,7 @@ impl BrowserEngine {
             ));
         }
 
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
         let dispatch_context = crate::tool::current_dispatch_authorization_context();
         if dispatch_context
             .as_deref()
@@ -1937,7 +1942,7 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
         let metrics = conn
             .call(Some(&cdp_session), "Page.getLayoutMetrics", json!({}))
             .await
@@ -2034,7 +2039,7 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
 
         let doc = conn
             .call(
@@ -2515,7 +2520,7 @@ impl BrowserEngine {
             })?;
             if let Some(identity) = &snapshot.semantic_root_identity {
                 let conn = self.connection_for_record(session, &record).await?;
-                let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+                let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
                 let tree = self.local_frame_tree(&conn, &cdp_session).await.map_err(|error| {
                     match error {
                         FrameTreeError::Unsupported => refuse(
@@ -2613,7 +2618,7 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
         let (document, document_complete) = self.semantic_document(&conn, &cdp_session).await?;
         let root = document.get("root").cloned().unwrap_or(Value::Null);
         let url = root

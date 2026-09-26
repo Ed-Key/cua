@@ -359,8 +359,12 @@ async function handleMessage(message) {
     post({ jsonrpc: "2.0", id: message.id, error: { code: -32001, message: STOPPED_MESSAGE } });
     return;
   }
-  // Closing a tab is not work in it; everything else shows the indicator.
-  if (message.method !== "tabs.remove") tabs.forEach(markActive);
+  // Closing a tab is not work in it; everything else shows the indicator, in
+  // the color of the session attaching to the tab when the daemon sends one.
+  const color = /^#[0-9A-F]{6}$/i.test(message.params?.sessionColor)
+    ? message.params.sessionColor
+    : undefined;
+  if (message.method !== "tabs.remove") tabs.forEach((tabId) => markActive(tabId, color));
   const handler = handlers[message.method];
   if (!handler) {
     post({ jsonrpc: "2.0", id: message.id, error: { code: -32601, message: `unknown method ${message.method}` } });

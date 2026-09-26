@@ -13,14 +13,18 @@ const CURSOR_PATH =
   "C88,75 91,72 95,70 C95,70 108,63 108,63 C115,59 114,53 107,50 C107,50 55,30 55,30 Z";
 
 const idleTimers = new Map();
+// The color of the session last working in each tab (its cursor color).
+const colors = new Map();
 // Bumped on every show/hide, so a slow favicon render cannot redraw the
 // indicator after a later hide (Stop, idle) already ran.
 const generations = new Map();
 
-/** Note activity in a tab; shows the indicator when it was idle. */
-export function markActive(tabId) {
+/** Note activity in a tab; shows the indicator when it was idle or recolored. */
+export function markActive(tabId, color) {
   if (typeof tabId !== "number" || tabId < 0) return;
-  const wasActive = idleTimers.has(tabId);
+  const recolored = color !== undefined && color !== colors.get(tabId);
+  if (recolored) colors.set(tabId, color);
+  const wasActive = idleTimers.has(tabId) && !recolored;
   clearTimeout(idleTimers.get(tabId));
   idleTimers.set(tabId, setTimeout(() => {
     idleTimers.delete(tabId);
@@ -48,18 +52,24 @@ export function refresh(tabId) {
 async function show(tabId, on) {
   const generation = (generations.get(tabId) ?? 0) + 1;
   generations.set(tabId, generation);
-  const favicon = on ? await badgedFavicon(tabId).catch(() => null) : null;
-  if (generations.get(tabId) !== generation) return;
+  const color = colors.get(tabId) ?? CUA_BLUE;
   // Pages Chrome does not let extensions script (chrome://, the Web Store)
   // simply show nothing.
-  await chrome.scripting
-    .executeScript({ target: { tabId }, func: pageIndicator, args: [on, favicon, CUA_BLUE] })
-    .catch(() => {});
+  const draw = (favicon) =>
+    chrome.scripting
+      .executeScript({ target: { tabId }, func: pageIndicator, args: [on, favicon, color] })
+      .catch(() => {});
+  // The glow and Stop go up at once; the favicon follows when rendered, unless
+  // a later show or hide superseded this one meanwhile.
+  await draw(null);
+  if (!on) return;
+  const favicon = await badgedFavicon(tabId, color).catch(() => null);
+  if (favicon && generations.get(tabId) === generation) await draw(favicon);
 }
 
 // The tab's own favicon with the Cua cursor over its lower right. The cursor
 // covers most of the icon so it reads at the 16 px tab size.
-async function badgedFavicon(tabId) {
+async function badgedFavicon(tabId, color) {
   const tab = await chrome.tabs.get(tabId);
   const size = 64;
   const canvas = new OffscreenCanvas(size, size);
@@ -87,7 +97,7 @@ async function badgedFavicon(tabId) {
   context.strokeStyle = "#ffffff";
   context.stroke(cursor);
   context.shadowColor = "transparent";
-  context.fillStyle = CUA_BLUE;
+  context.fillStyle = color;
   context.fill(cursor);
   context.restore();
   const bytes = new Uint8Array(await (await canvas.convertToBlob({ type: "image/png" })).arrayBuffer());
@@ -135,10 +145,22 @@ function pageIndicator(on, favicon, color) {
     return;
   }
 
-  if (doc.getElementById(HOST_ID)) return;
+  // Colors are custom properties on the host, inherited into the shadow root,
+  // so a recolor keeps the same elements (and a focused Stop button).
+  const paint = (host) => {
+    host.dataset.color = color;
+    host.style.setProperty("--cua-color", color);
+    host.style.setProperty("--cua-glow", `${color}8c`);
+  };
+  const existing = doc.getElementById(HOST_ID);
+  if (existing) {
+    paint(existing);
+    return;
+  }
   const host = doc.createElement("div");
   host.id = HOST_ID;
   set(host, { position: "fixed", inset: "0", pointerEvents: "none", zIndex: "2147483647" });
+  paint(host);
   // Closed: page scripts cannot restyle the indicator or press Stop.
   const root = host.attachShadow({ mode: "closed" });
 
@@ -146,7 +168,7 @@ function pageIndicator(on, favicon, color) {
   set(glow, {
     position: "absolute",
     inset: "0",
-    boxShadow: `inset 0 0 0 3px ${color}, inset 0 0 28px ${color}8c`,
+    boxShadow: "inset 0 0 0 3px var(--cua-color), inset 0 0 28px var(--cua-glow)",
   });
 
   const pill = doc.createElement("div");
@@ -177,7 +199,7 @@ function pageIndicator(on, favicon, color) {
   path.setAttribute("d",
     "M55,30 C48,28 42,33 43,41 C43,41 64,98 64,98 C67,106 73,106 77,99 C77,99 86,79 86,79 " +
     "C88,75 91,72 95,70 C95,70 108,63 108,63 C115,59 114,53 107,50 C107,50 55,30 55,30 Z");
-  path.setAttribute("fill", color);
+  path.style.fill = "var(--cua-color)";
   path.setAttribute("stroke", "#ffffff");
   path.setAttribute("stroke-width", "7");
   path.setAttribute("stroke-linejoin", "round");

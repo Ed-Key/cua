@@ -308,10 +308,10 @@ fn peer_chrome_pid(_stream: &tokio::net::UnixStream) -> Result<Option<i64>, Stri
 }
 
 #[cfg(all(test, unix))]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
-    fn bridge() -> Arc<ExtensionBridge> {
+    pub(crate) fn bridge() -> Arc<ExtensionBridge> {
         Arc::new(ExtensionBridge {
             links: Mutex::new(Vec::new()),
             next_link: AtomicU64::new(1),
@@ -319,16 +319,8 @@ mod tests {
         })
     }
 
-    async fn read_frame(stream: &mut tokio::net::UnixStream) -> Value {
-        let mut length = [0u8; 4];
-        stream.read_exact(&mut length).await.unwrap();
-        let mut body = vec![0u8; u32::from_ne_bytes(length) as usize];
-        stream.read_exact(&mut body).await.unwrap();
-        serde_json::from_slice(&body).unwrap()
-    }
-
-    #[tokio::test]
-    async fn a_request_round_trips_through_a_connected_extension() {
+    /// A fake extension connected to a fresh bridge, after its hello.
+    pub(crate) async fn connected() -> (Arc<ExtensionBridge>, tokio::net::UnixStream, tempfile::TempDir) {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("bridge.sock");
         let bridge = bridge();
@@ -346,6 +338,20 @@ mod tests {
         while bridge.links().first().and_then(|link| link.hello.clone()).is_none() {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
+        (bridge, extension, dir)
+    }
+
+    pub(crate) async fn read_frame(stream: &mut tokio::net::UnixStream) -> Value {
+        let mut length = [0u8; 4];
+        stream.read_exact(&mut length).await.unwrap();
+        let mut body = vec![0u8; u32::from_ne_bytes(length) as usize];
+        stream.read_exact(&mut body).await.unwrap();
+        serde_json::from_slice(&body).unwrap()
+    }
+
+    #[tokio::test]
+    async fn a_request_round_trips_through_a_connected_extension() {
+        let (bridge, mut extension, _dir) = connected().await;
 
         let pending = tokio::spawn({
             let bridge = bridge.clone();

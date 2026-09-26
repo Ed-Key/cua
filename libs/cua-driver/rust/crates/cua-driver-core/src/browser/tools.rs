@@ -45,7 +45,7 @@ pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRe
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
 /// The public caller session id, falling back to the daemon's internal mirror.
-fn session_of(args: &Value) -> String {
+pub(crate) fn session_of(args: &Value) -> String {
     args.opt_str("session")
         .or_else(|| args.opt_str("_session_id"))
         .unwrap_or_else(|| "default".into())
