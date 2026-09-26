@@ -84,9 +84,19 @@ struct VisibilityInputs {
     user_enabled: bool,
     tab_hidden: bool,
     native: bool,
+    /// The native browser window of the session's last browser action.
+    browser_window: Option<u64>,
 }
 
 static VISIBILITY: Mutex<Option<HashMap<CursorKey, VisibilityInputs>>> = Mutex::new(None);
+/// The window each cursor was last pinned above and not yet moved for: a
+/// native action pins its target window just before animating, which tells a
+/// click inside the session's browser window from one in another app.
+static PENDING_PIN: Mutex<Option<HashMap<CursorKey, u64>>> = Mutex::new(None);
+
+fn take_pending_pin(key: &str) -> Option<u64> {
+    PENDING_PIN.lock().unwrap().as_mut().and_then(|pins| pins.remove(key))
+}
 
 fn with_visibility<T>(f: impl FnOnce(&mut HashMap<CursorKey, VisibilityInputs>) -> T) -> T {
     f(VISIBILITY.lock().unwrap().get_or_insert_with(HashMap::new))
@@ -246,6 +256,9 @@ pub fn send_command(key: CursorKey, cmd: OverlayCommand) {
     // that bypass lifecycle dispatch.
     if key.is_empty() {
         return;
+    }
+    if let OverlayCommand::PinAbove(window) = &cmd {
+        PENDING_PIN.lock().unwrap().get_or_insert_with(HashMap::new).insert(key.clone(), *window);
     }
     if let Some(tx) = CMD_TX.get() {
         let _ = tx.try_send(OverlayMsg::Cmd(KeyedOverlayCommand { key, cmd }));
@@ -424,6 +437,7 @@ pub fn set_tab_hidden(key: CursorKey, hidden: bool, user_enabled: bool) {
             user_enabled,
             tab_hidden: false,
             native: false,
+            browser_window: None,
         });
         if inputs.native {
             return;
@@ -444,28 +458,40 @@ pub fn set_user_enabled(key: CursorKey, enabled: bool) {
             user_enabled: enabled,
             tab_hidden: false,
             native: false,
+            browser_window: None,
         });
         inputs.user_enabled = enabled;
         send_command(key, OverlayCommand::SetEnabled(enabled && !inputs.tab_hidden));
     });
 }
 
-/// A browser action takes a session cursor back from any native action, so
-/// its tab's selection decides visibility again.
-pub fn claim_for_browser(key: &str) {
+/// A browser action in native window `window` takes a session cursor back
+/// from any native action, so its tab's selection decides visibility again.
+/// `user_enabled` only seeds a cursor seen here for the first time.
+pub fn claim_for_browser(key: &str, window: u64, user_enabled: bool) {
     with_visibility(|map| {
-        if let Some(inputs) = map.get_mut(key) {
-            inputs.native = false;
-        }
+        let inputs = map.entry(key.to_owned()).or_insert(VisibilityInputs {
+            user_enabled,
+            tab_hidden: false,
+            native: false,
+            browser_window: None,
+        });
+        inputs.native = false;
+        inputs.browser_window = Some(window);
     });
 }
 
-/// Move a session cursor for a native action. The action owns the cursor from
-/// now on (tab switches leave it alone), and a tab-switch hide is dropped:
-/// the cursor has left the browser.
+/// Move a session cursor for a native action. Unless the action is inside the
+/// session's own browser window (a pixel click on a canvas, say), it owns the
+/// cursor from now on (tab switches leave it alone) and a tab-switch hide is
+/// dropped: the cursor has left the browser.
 pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
+    let pin = take_pending_pin(&key);
     with_visibility(|map| {
         let Some(inputs) = map.get_mut(&key) else { return };
+        if pin.is_some() && pin == inputs.browser_window {
+            return;
+        }
         inputs.native = true;
         if std::mem::replace(&mut inputs.tab_hidden, false) {
             send_command(key.clone(), OverlayCommand::SetEnabled(inputs.user_enabled));
@@ -477,6 +503,7 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
 /// Move a session cursor for a browser action (which already claimed it with
 /// `claim_for_browser`), keeping any tab-switch hide.
 pub async fn animate_browser_cursor_to(key: CursorKey, x: f64, y: f64) {
+    take_pending_pin(&key);
     animate(key, x, y).await;
 }
 
@@ -1699,15 +1726,27 @@ mod visibility_tests {
         // and tab switches meanwhile leave it alone.
         set_user_enabled(key.clone(), false);
         animate_cursor_to(key.clone(), 10.0, 10.0).await;
-        assert_eq!(inputs(&key), VisibilityInputs { user_enabled: false, tab_hidden: false, native: true });
+        assert_eq!(
+            inputs(&key),
+            VisibilityInputs { user_enabled: false, tab_hidden: false, native: true, browser_window: None }
+        );
         set_tab_hidden(key.clone(), true, false);
         assert!(!inputs(&key).tab_hidden, "a tab switch cannot hide a cursor a native action owns");
 
         // A browser action takes it back; tab switches apply again, and a
         // report's sampled setting never overrides the user's current one.
-        claim_for_browser(&key);
+        claim_for_browser(&key, 77, true);
         set_tab_hidden(key.clone(), true, true);
         assert!(inputs(&key).tab_hidden);
         assert!(!inputs(&key).user_enabled, "the user turned it off; a stale report says on");
+
+        // A native click pinned to that same browser window stays under tab
+        // visibility; one pinned to another app's window takes the cursor.
+        send_command(key.clone(), OverlayCommand::PinAbove(77));
+        animate_cursor_to(key.clone(), 10.0, 10.0).await;
+        assert!(!inputs(&key).native && inputs(&key).tab_hidden);
+        send_command(key.clone(), OverlayCommand::PinAbove(88));
+        animate_cursor_to(key.clone(), 10.0, 10.0).await;
+        assert!(inputs(&key).native && !inputs(&key).tab_hidden);
     }
 }

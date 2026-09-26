@@ -979,13 +979,13 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         }
 
         self.follow_tab_switches();
-        // Whatever this action decides below, the browser owns the cursor again.
-        crate::cursor::overlay::claim_for_browser(&action.session);
         let cursor_enabled = self
             .cursor_registry
             .get_or_create(&action.session)
             .config
             .enabled;
+        // Whatever this action decides below, the browser owns the cursor again.
+        crate::cursor::overlay::claim_for_browser(&action.session, action.window_id, cursor_enabled);
         let shown = {
             let mut tracker = self.browser_cursors.lock().unwrap();
             let updates = tracker.update(
