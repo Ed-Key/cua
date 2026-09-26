@@ -53,13 +53,18 @@ async function show(tabId, on) {
   const generation = (generations.get(tabId) ?? 0) + 1;
   generations.set(tabId, generation);
   const color = colors.get(tabId) ?? CUA_BLUE;
-  const favicon = on ? await badgedFavicon(tabId, color).catch(() => null) : null;
-  if (generations.get(tabId) !== generation) return;
   // Pages Chrome does not let extensions script (chrome://, the Web Store)
   // simply show nothing.
-  await chrome.scripting
-    .executeScript({ target: { tabId }, func: pageIndicator, args: [on, favicon, color] })
-    .catch(() => {});
+  const draw = (favicon) =>
+    chrome.scripting
+      .executeScript({ target: { tabId }, func: pageIndicator, args: [on, favicon, color] })
+      .catch(() => {});
+  // The glow and Stop go up at once; the favicon follows when rendered, unless
+  // a later show or hide superseded this one meanwhile.
+  await draw(null);
+  if (!on) return;
+  const favicon = await badgedFavicon(tabId, color).catch(() => null);
+  if (favicon && generations.get(tabId) === generation) await draw(favicon);
 }
 
 // The tab's own favicon with the Cua cursor over its lower right. The cursor
