@@ -377,8 +377,9 @@ impl Session {
                 }
                 (tab, None, routes.colors.get(session).cloned().unwrap_or(Value::Null))
             } else if let Some(tab) = routes.children.get(session).copied() {
-                // An iframe command belongs to an operation whose tab session
-                // already set the color.
+                // Chrome gives the extension one debugger attachment per tab,
+                // so an iframe session is shared by every tab session there and
+                // has no single owner: it keeps the color the tab already shows.
                 (tab, Some(session.to_owned()), Value::Null)
             } else {
                 return Err((-32001, format!("Session with given id not found: {session}")));
@@ -513,6 +514,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn each_tab_session_keeps_its_own_color_on_a_shared_tab() {
         use tokio::io::AsyncWriteExt;

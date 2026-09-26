@@ -140,13 +140,22 @@ function pageIndicator(on, favicon, color) {
     return;
   }
 
+  // Colors are custom properties on the host, inherited into the shadow root,
+  // so a recolor keeps the same elements (and a focused Stop button).
+  const paint = (host) => {
+    host.dataset.color = color;
+    host.style.setProperty("--cua-color", color);
+    host.style.setProperty("--cua-glow", `${color}8c`);
+  };
   const existing = doc.getElementById(HOST_ID);
-  if (existing?.dataset.color === color) return;
-  existing?.remove();
+  if (existing) {
+    paint(existing);
+    return;
+  }
   const host = doc.createElement("div");
   host.id = HOST_ID;
-  host.dataset.color = color;
   set(host, { position: "fixed", inset: "0", pointerEvents: "none", zIndex: "2147483647" });
+  paint(host);
   // Closed: page scripts cannot restyle the indicator or press Stop.
   const root = host.attachShadow({ mode: "closed" });
 
@@ -154,7 +163,7 @@ function pageIndicator(on, favicon, color) {
   set(glow, {
     position: "absolute",
     inset: "0",
-    boxShadow: `inset 0 0 0 3px ${color}, inset 0 0 28px ${color}8c`,
+    boxShadow: "inset 0 0 0 3px var(--cua-color), inset 0 0 28px var(--cua-glow)",
   });
 
   const pill = doc.createElement("div");
@@ -185,7 +194,7 @@ function pageIndicator(on, favicon, color) {
   path.setAttribute("d",
     "M55,30 C48,28 42,33 43,41 C43,41 64,98 64,98 C67,106 73,106 77,99 C77,99 86,79 86,79 " +
     "C88,75 91,72 95,70 C95,70 108,63 108,63 C115,59 114,53 107,50 C107,50 55,30 55,30 Z");
-  path.setAttribute("fill", color);
+  path.style.fill = "var(--cua-color)";
   path.setAttribute("stroke", "#ffffff");
   path.setAttribute("stroke-width", "7");
   path.setAttribute("stroke-linejoin", "round");
