@@ -410,54 +410,56 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
 /// seeded on-screen via [`seed_start_if_sentinel`] so its FIRST action glides
 /// in (it previously snapped silently via `ClickPulse`, invisible on a pure-AX
 /// run).
-/// Hide or show a session cursor for its browser tab's selection
-/// (`user_enabled` is the session's current setting). Ignored while a native
-/// action owns the cursor: it is over another app, not the tab.
+// Every setter queues its SetEnabled while still holding the visibility
+// lock (queuing never blocks), so commands reach the renderer in the order
+// the state changed.
+
+/// Hide or show a session cursor for its browser tab's selection.
+/// `user_enabled` only seeds a cursor seen here for the first time: the
+/// user's later changes come through `set_user_enabled` and win. Ignored while
+/// a native action owns the cursor: it is over another app, not the tab.
 pub fn set_tab_hidden(key: CursorKey, hidden: bool, user_enabled: bool) {
-    let shown = with_visibility(|map| {
+    with_visibility(|map| {
         let inputs = map.entry(key.clone()).or_insert(VisibilityInputs {
             user_enabled,
             tab_hidden: false,
             native: false,
         });
-        inputs.user_enabled = user_enabled;
         if inputs.native {
-            return None;
+            return;
         }
         inputs.tab_hidden = hidden;
-        Some(user_enabled && !hidden)
-    });
-    if let Some(shown) = shown {
+        let shown = inputs.user_enabled && !hidden;
         send_command(key, OverlayCommand::SetEnabled(shown));
-    }
+    });
 }
 
 /// The user turned a session cursor on or off. A tab-switch hide persists
 /// either way, so turning it on does not show it over another tab.
 pub fn set_user_enabled(key: CursorKey, enabled: bool) {
-    let shown = with_visibility(|map| match map.get_mut(&key) {
-        Some(inputs) => {
-            inputs.user_enabled = enabled;
-            enabled && !inputs.tab_hidden
-        }
-        None => enabled,
+    with_visibility(|map| {
+        let shown = match map.get_mut(&key) {
+            Some(inputs) => {
+                inputs.user_enabled = enabled;
+                enabled && !inputs.tab_hidden
+            }
+            None => enabled,
+        };
+        send_command(key, OverlayCommand::SetEnabled(shown));
     });
-    send_command(key, OverlayCommand::SetEnabled(shown));
 }
 
 /// Move a session cursor for a native action. The action owns the cursor from
 /// now on (tab switches leave it alone), and a tab-switch hide is dropped:
 /// the cursor has left the browser.
 pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
-    let reveal = with_visibility(|map| {
-        let inputs = map.get_mut(&key)?;
+    with_visibility(|map| {
+        let Some(inputs) = map.get_mut(&key) else { return };
         inputs.native = true;
-        let was_hidden = std::mem::replace(&mut inputs.tab_hidden, false);
-        was_hidden.then_some(inputs.user_enabled)
+        if std::mem::replace(&mut inputs.tab_hidden, false) {
+            send_command(key.clone(), OverlayCommand::SetEnabled(inputs.user_enabled));
+        }
     });
-    if let Some(user_enabled) = reveal {
-        send_command(key.clone(), OverlayCommand::SetEnabled(user_enabled));
-    }
     animate(key, x, y).await;
 }
 
@@ -1687,9 +1689,11 @@ mod visibility_tests {
         set_tab_hidden(key.clone(), true, false);
         assert!(!inputs(&key).tab_hidden, "a tab switch cannot hide a cursor a native action owns");
 
-        // A browser action takes it back; tab switches apply again.
+        // A browser action takes it back; tab switches apply again, and a
+        // report's sampled setting never overrides the user's current one.
         animate_browser_cursor_to(key.clone(), 10.0, 10.0).await;
         set_tab_hidden(key.clone(), true, true);
         assert!(inputs(&key).tab_hidden);
+        assert!(!inputs(&key).user_enabled, "the user turned it off; a stale report says on");
     }
 }
