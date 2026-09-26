@@ -588,6 +588,12 @@ struct SyntheticFocusRestore {
 
 impl Drop for SyntheticFocusRestore {
     fn drop(&mut self) {
+        // The target became the front process during delivery (the user or a
+        // foreground action activated it): real focus now owns it, and a
+        // synthetic defocus would blur that window.
+        if front_pid_matches(self.pid) == Some(true) {
+            return;
+        }
         // The keys were already delivered, so a failed hand-back is reported,
         // not turned into an action error the caller might retry.
         if !restore_focus_after_without_raise(self.pid, self.wid) {
