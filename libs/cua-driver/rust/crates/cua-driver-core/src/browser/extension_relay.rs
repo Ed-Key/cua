@@ -122,6 +122,9 @@ struct Routes {
     /// Relay-minted tab session -> tabId. The engine attaches per operation
     /// and never detaches, so several sessions can name one tab.
     sessions: HashMap<String, i64>,
+    /// Relay tab session -> the cua session's cursor color, sent with each of
+    /// its commands so a tab shared by two sessions shows whichever acts.
+    colors: HashMap<String, Value>,
     /// Real chrome.debugger child sessions (out-of-process iframes) -> tabId.
     children: HashMap<String, i64>,
     /// The tab session that enabled Page, which receives its dialog events.
@@ -306,9 +309,12 @@ impl Session {
             "Target.attachToTarget" => {
                 let tab = self.tab_of_target(target_id()).await?;
                 let color = params.get("cuaSessionColor").cloned().unwrap_or(Value::Null);
-                self.request("debugger.attach", json!({ "tabId": tab, "color": color })).await?;
+                self.request("debugger.attach", json!({ "tabId": tab, "sessionColor": color }))
+                    .await?;
                 let session = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
-                self.routes.lock().unwrap().sessions.insert(session.clone(), tab);
+                let mut routes = self.routes.lock().unwrap();
+                routes.sessions.insert(session.clone(), tab);
+                routes.colors.insert(session.clone(), color);
                 Ok(json!({ "sessionId": session }))
             }
             "Target.detachFromTarget" => {
@@ -319,6 +325,7 @@ impl Session {
                 {
                     let mut routes = self.routes.lock().unwrap();
                     if let Some(tab) = routes.sessions.remove(session) {
+                        routes.colors.remove(session);
                         routes.page_enabled.retain(|_, owner| owner != session);
                         // The tab's last session gone: its iframe routes go too.
                         if !routes.sessions.values().any(|owner| *owner == tab) {
@@ -362,20 +369,23 @@ impl Session {
 
     /// Session methods go to the tab, on the child session when it is one.
     async fn forward(&self, session: &str, method: &str, params: Value) -> Result<Value, (i64, String)> {
-        let (tab, child) = {
+        let (tab, child, color) = {
             let mut routes = self.routes.lock().unwrap();
             if let Some(tab) = routes.sessions.get(session).copied() {
                 if method == "Page.enable" {
                     routes.page_enabled.insert(tab, session.to_owned());
                 }
-                (tab, None)
+                (tab, None, routes.colors.get(session).cloned().unwrap_or(Value::Null))
             } else if let Some(tab) = routes.children.get(session).copied() {
-                (tab, Some(session.to_owned()))
+                // An iframe command belongs to an operation whose tab session
+                // already set the color.
+                (tab, Some(session.to_owned()), Value::Null)
             } else {
                 return Err((-32001, format!("Session with given id not found: {session}")));
             }
         };
-        let mut request = json!({ "tabId": tab, "method": method, "params": params });
+        let mut request =
+            json!({ "tabId": tab, "method": method, "params": params, "sessionColor": color });
         if let Some(child) = child {
             request["sessionId"] = json!(child);
         }
@@ -453,6 +463,8 @@ impl Session {
                 // The debugger left the tab (idle release, tab closed, or the
                 // user cancelled): its sessions end; the next operation attaches again.
                 routes.sessions.retain(|_, owner| *owner != tab);
+                let Routes { sessions, colors, .. } = &mut *routes;
+                colors.retain(|session, _| sessions.contains_key(session));
                 routes.children.retain(|_, owner| *owner != tab);
                 routes.page_enabled.remove(&tab);
                 tab_sessions
@@ -499,5 +511,45 @@ mod tests {
             cdp_error("Chrome extension: Debugger is not attached to the tab with id: 4."),
             (-32000, "Debugger is not attached to the tab with id: 4.".to_owned())
         );
+    }
+
+    #[tokio::test]
+    async fn each_tab_session_keeps_its_own_color_on_a_shared_tab() {
+        use tokio::io::AsyncWriteExt;
+        let (bridge, mut extension, _dir) = extension_bridge::tests::connected().await;
+        let session = Arc::new(Session {
+            link: bridge.links()[0].link,
+            bridge,
+            routes: Arc::new(Mutex::new(Routes::default())),
+        });
+        session.routes.lock().unwrap().targets.insert("T".to_owned(), 4);
+        // The fake extension answers every request and hands it to the test.
+        let (seen_tx, mut seen) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(async move {
+            loop {
+                let request = extension_bridge::tests::read_frame(&mut extension).await;
+                let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":{}});
+                extension.write_all(&extension_bridge::frame(&reply)).await.unwrap();
+                seen_tx.send(request).unwrap();
+            }
+        });
+        let attach = |color: &str| {
+            let session = session.clone();
+            let params = json!({ "targetId": "T", "flatten": true, "cuaSessionColor": color });
+            async move { session.root("Target.attachToTarget", &params).await.unwrap()["sessionId"].clone() }
+        };
+        let a = attach("#B284FF").await;
+        assert_eq!(seen.recv().await.unwrap()["params"]["sessionColor"], "#B284FF");
+        let b = attach("#F784AA").await;
+        assert_eq!(seen.recv().await.unwrap()["params"]["sessionColor"], "#F784AA");
+        for (tab_session, color) in [(&a, "#B284FF"), (&b, "#F784AA"), (&a, "#B284FF")] {
+            session
+                .forward(tab_session.as_str().unwrap(), "Runtime.evaluate", json!({}))
+                .await
+                .unwrap();
+            let sent = seen.recv().await.unwrap();
+            assert_eq!(sent["method"], "debugger.send");
+            assert_eq!(sent["params"]["sessionColor"], color);
+        }
     }
 }

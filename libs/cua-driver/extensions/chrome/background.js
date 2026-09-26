@@ -361,8 +361,8 @@ async function handleMessage(message) {
   }
   // Closing a tab is not work in it; everything else shows the indicator, in
   // the color of the session attaching to the tab when the daemon sends one.
-  const color = message.method === "debugger.attach" && /^#[0-9A-F]{6}$/i.test(message.params?.color)
-    ? message.params.color
+  const color = /^#[0-9A-F]{6}$/i.test(message.params?.sessionColor)
+    ? message.params.sessionColor
     : undefined;
   if (message.method !== "tabs.remove") tabs.forEach((tabId) => markActive(tabId, color));
   const handler = handlers[message.method];

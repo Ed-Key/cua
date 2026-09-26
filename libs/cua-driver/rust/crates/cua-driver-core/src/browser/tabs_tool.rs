@@ -182,7 +182,7 @@ impl BrowserTabsTool {
                 params.insert(key.to_owned(), value);
             }
         };
-        let (method, params) = match action {
+        let (method, mut params) = match action {
             "list" => {
                 let filter = strip_nulls(json!({ "windowId": int("window_id") }));
                 let links: Vec<_> = match args.get("pid") {
@@ -266,6 +266,11 @@ impl BrowserTabsTool {
             }
             other => return Err(format!("unknown action {other:?}")),
         };
+        // The tabs this touches show the indicator in the acting session's color.
+        params.insert(
+            "sessionColor".to_owned(),
+            json!(cua_driver_contract::cursor::session_fill_hex(&super::tools::session_of(args))),
+        );
         let (link, _) = self.resolve_change(args).await?;
         self.request(link, method, Value::Object(params)).await
     }
@@ -409,5 +414,32 @@ impl Tool for BrowserTabsTool {
                 .with_structured(json!({ "action": action, "result": result })),
             Err(error) => ToolResult::error(format!("browser_tabs {action}: {error}")),
         }
+    }
+}
+
+#[cfg(all(test, target_os = "macos"))]
+mod tests {
+    use super::*;
+    use crate::browser::extension_bridge::{self, tests::connected};
+    use tokio::io::AsyncWriteExt;
+
+    #[tokio::test]
+    async fn tab_changes_carry_the_acting_session_color() {
+        let (bridge, mut extension, _dir) = connected().await;
+        let pid = bridge.links()[0].chrome_pid.expect("macOS proves the peer's parent");
+        let tool = BrowserTabsTool::new(bridge);
+        let pending = tokio::spawn(async move {
+            tool.run(&json!({ "action": "activate", "tab_id": 4, "pid": pid, "session": "agent-2" }))
+                .await
+        });
+        let request = extension_bridge::tests::read_frame(&mut extension).await;
+        assert_eq!(request["method"], "tabs.update");
+        assert_eq!(
+            request["params"]["sessionColor"],
+            cua_driver_contract::cursor::session_fill_hex("agent-2")
+        );
+        let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":{"tabId":4}});
+        extension.write_all(&extension_bridge::frame(&reply)).await.unwrap();
+        pending.await.unwrap().unwrap();
     }
 }
