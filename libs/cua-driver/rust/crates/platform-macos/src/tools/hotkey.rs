@@ -346,12 +346,14 @@ impl Tool for HotkeyTool {
         // the target for the chord itself because the focus helper restores
         // the previous app before returning.
         let coordinate_focus = {
+            // The web-AX fallback's center is driver-derived window pixels,
+            // not a caller's screenshot pixels.
             let focus_xy = match ((px, py), web_ax_focus_xy) {
-                ((Some(cx), Some(cy)), _) => Some((cx, cy)),
-                ((None, None), Some(center)) => Some(center),
+                ((Some(cx), Some(cy)), _) => Some((cx, cy, false)),
+                ((None, None), Some((cx, cy))) => Some((cx, cy, true)),
                 _ => None,
             };
-            if let Some((cx, cy)) = focus_xy {
+            if let Some((cx, cy, window_native)) = focus_xy {
                 let from_zoom = args
                     .get("from_zoom")
                     .and_then(|v| v.as_bool())
@@ -366,6 +368,7 @@ impl Tool for HotkeyTool {
                     args.opt_str("session"),
                     args.opt_str("_session_id"),
                     from_zoom,
+                    window_native,
                     _mutation_lease.as_ref(),
                 )
                 .await
@@ -457,7 +460,14 @@ impl Tool for HotkeyTool {
                         // raise — even when window_id was supplied for targeting.
                         (false, false, _, Some(ptr)) => {
                             focus_hotkey_element(pid, ptr)?;
-                            crate::input::keyboard::hotkey(pid, &key, &m)
+                            super::with_background_web_key_window(pid, window_id, Some(ptr), || {
+                                crate::input::keyboard::hotkey(pid, &key, &m)
+                            })
+                        }
+                        (false, _, _, element_ptr) => {
+                            super::with_background_web_key_window(pid, window_id, element_ptr, || {
+                                crate::input::keyboard::hotkey(pid, &key, &m)
+                            })
                         }
                         _ => crate::input::keyboard::hotkey(pid, &key, &m),
                     }

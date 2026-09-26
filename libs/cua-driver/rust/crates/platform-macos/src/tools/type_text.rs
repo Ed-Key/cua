@@ -328,6 +328,7 @@ impl Tool for TypeTextTool {
                 args.opt_str("session"),
                 args.opt_str("_session_id"),
                 from_zoom,
+                false,
                 _mutation_lease.as_ref(),
             )
             .await
@@ -1538,13 +1539,22 @@ fn type_text_blocking(
     // --- Background rung 2: CGEvent keystrokes with read-back. ---
     // Never clear here: a partial AX write is rare, and clearing would violate
     // insert-at-cursor semantics.
-    let (verified, delivered_chars) = cgevent_type_verified(
+    // Web content: select the exact window as its process's key window for
+    // the keystrokes and their readback, without raising it.
+    let (verified, delivered_chars) = super::with_background_web_key_window(
         pid,
-        text,
-        delay_ms,
-        &readback,
-        element_ptr_and_idx,
-        /*settle_ms=*/ 0,
+        window_id,
+        element_ptr_and_idx.map(|(ptr, _)| ptr),
+        || {
+            cgevent_type_verified(
+                pid,
+                text,
+                delay_ms,
+                &readback,
+                element_ptr_and_idx,
+                /*settle_ms=*/ 0,
+            )
+        },
     )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),

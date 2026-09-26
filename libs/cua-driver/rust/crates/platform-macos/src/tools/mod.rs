@@ -296,6 +296,23 @@ pub(crate) async fn finish_window_observation(
     snapshot.detect_async().await
 }
 
+/// Deliver a background key to web content with its exact window selected as
+/// the key window (see [`crate::input::skylight::with_background_key_window`]).
+/// Native controls and pid-only requests keep their existing path.
+pub(super) fn with_background_web_key_window<T>(
+    pid: i32,
+    window_id: Option<u32>,
+    element_ptr: Option<usize>,
+    dispatch: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    match window_id.filter(|_| {
+        type_text::target_in_web_area(pid, element_ptr.map(|ptr| (ptr, None)), window_id)
+    }) {
+        Some(wid) => crate::input::skylight::with_background_key_window(pid, wid, dispatch),
+        None => dispatch(),
+    }
+}
+
 /// px-focus for the keyboard family (type_text / press_key / hotkey): focus the
 /// element at (x,y) before a keystroke — the *element px action* form of a
 /// keyboard tool. Prefer non-destructive AX focus so an existing selection is
@@ -313,6 +330,7 @@ pub(crate) async fn focus_by_pixel(
     session: Option<String>,
     session_id: Option<String>,
     from_zoom: bool,
+    window_native: bool,
     mutation_lease: Option<&BackgroundMutationLease>,
 ) -> Result<(), cua_driver_core::protocol::ToolResult> {
     use cua_driver_core::tool::Tool;
@@ -342,6 +360,9 @@ pub(crate) async fn focus_by_pixel(
     if from_zoom {
         click_args["from_zoom"] = serde_json::json!(true);
     }
+    if window_native {
+        click_args["_window_native_pixels"] = serde_json::json!(true);
+    }
     let click_tool = click::ClickTool::new(state.clone());
     let click = click_tool.invoke(click_args);
     let focus = if let Some(lease) = mutation_lease {
@@ -364,7 +385,16 @@ pub(crate) async fn focus_by_pixel(
         }
     } else if !foreground {
         return Err(cua_driver_core::protocol::ToolResult::error(format!(
-            "focus pixel-click at ({x:.0},{y:.0}) failed."
+            "focus pixel-click at ({x:.0},{y:.0}) failed: {}",
+            focus
+                .content
+                .iter()
+                .filter_map(|content| match content {
+                    cua_driver_core::protocol::Content::Text { text, .. } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join(" ")
         )));
     }
 
@@ -386,6 +416,9 @@ pub(crate) async fn focus_by_pixel(
     }
     if from_zoom {
         click_args["from_zoom"] = serde_json::json!(true);
+    }
+    if window_native {
+        click_args["_window_native_pixels"] = serde_json::json!(true);
     }
     let focus = click::ClickTool::new(state.clone())
         .invoke(click_args)

@@ -541,6 +541,41 @@ pub fn restore_focus_after_without_raise(target_pid: pid_t, target_wid: u32) -> 
     unsafe { post_fn(target_psn.as_ptr() as *const c_void, buf.as_ptr()) == 0 }
 }
 
+/// Run `body` with `target_wid` selected as its process's native key window,
+/// without raising it or changing the user's front app: target-only synthetic
+/// focus plus make-key records, with no SetFrontProcess. Chromium routes a
+/// pid-addressed key to the renderer of its key window, so without the
+/// selection a background key reaches whichever window AppKit last made key,
+/// or none. The synthetic focus is taken back even when `body` fails.
+pub fn with_background_key_window<T>(
+    target_pid: pid_t,
+    target_wid: u32,
+    body: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let post = post_event_record_to_fn()
+        .ok_or_else(|| anyhow::anyhow!("background key window selection is unavailable"))?;
+    let mut target_psn = [0u8; 8];
+    anyhow::ensure!(
+        get_process_psn_for_window(target_wid, target_pid, &mut target_psn),
+        "could not resolve the target window for background key delivery"
+    );
+    anyhow::ensure!(
+        activate_without_raise(target_pid, target_wid),
+        "background keyboard focus was rejected"
+    );
+    let selected = [0x01, 0x02].into_iter().all(|kind| {
+        let record = make_key_window_record(target_wid, kind);
+        unsafe { post(target_psn.as_ptr() as *const c_void, record.as_ptr()) == 0 }
+    });
+    let result = if selected {
+        body()
+    } else {
+        Err(anyhow::anyhow!("background key window selection was rejected"))
+    };
+    restore_focus_after_without_raise(target_pid, target_wid);
+    result
+}
+
 /// The 248-byte focus/defocus event record with `wid` stamped little-endian at
 /// bytes 0x3c–0x3f. The caller sets the direction byte at 0x8a.
 fn focus_record(wid: u32) -> [u8; 0xF8] {
