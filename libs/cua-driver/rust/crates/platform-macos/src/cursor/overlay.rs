@@ -88,11 +88,25 @@ struct VisibilityInputs {
     tab_hidden: bool,
     native: bool,
     placed: bool,
-    /// The native browser window of the session's last browser action.
-    browser_window: Option<u64>,
+    /// The browser process of the session's last browser action. A native
+    /// move into any of its windows (the tab may have been dragged to another
+    /// one) stays with the browser.
+    browser_pid: Option<i32>,
 }
 
 static VISIBILITY: Mutex<Option<HashMap<CursorKey, VisibilityInputs>>> = Mutex::new(None);
+
+/// The process owning a native window.
+#[cfg(not(test))]
+fn window_pid(window: u64) -> Option<i32> {
+    crate::windows::window_info_by_id(u32::try_from(window).ok()?).map(|info| info.pid)
+}
+
+/// Tests name windows by process: window 77 and 78 belong to process 7.
+#[cfg(test)]
+fn window_pid(window: u64) -> Option<i32> {
+    i32::try_from(window / 10).ok()
+}
 
 impl VisibilityInputs {
     fn shown(&self) -> bool {
@@ -438,7 +452,7 @@ pub fn set_tab_hidden(key: CursorKey, hidden: bool, user_enabled: bool) {
             tab_hidden: false,
             native: false,
             placed: false,
-            browser_window: None,
+            browser_pid: None,
         });
         inputs.tab_hidden = hidden;
         if !inputs.native {
@@ -452,13 +466,14 @@ pub fn set_tab_hidden(key: CursorKey, hidden: bool, user_enabled: bool) {
 pub fn set_user_enabled(key: CursorKey, enabled: bool) {
     with_visibility(|map| {
         // Recorded even before any browser use, so a tab report racing this
-        // change cannot seed the entry with a stale setting.
+        // change cannot seed the entry with a stale setting. A cursor no
+        // browser action has claimed is a native one: only the setting counts.
         let inputs = map.entry(key.clone()).or_insert(VisibilityInputs {
             user_enabled: enabled,
             tab_hidden: false,
-            native: false,
+            native: true,
             placed: false,
-            browser_window: None,
+            browser_pid: None,
         });
         inputs.user_enabled = enabled;
         send_command(key, OverlayCommand::SetEnabled(inputs.shown()));
@@ -470,15 +485,18 @@ pub fn set_user_enabled(key: CursorKey, enabled: bool) {
 /// `user_enabled` only seeds a cursor seen here for the first time. Returns
 /// whether a native action owned it (its position is then that app's).
 pub fn claim_for_browser(key: &str, window: u64, user_enabled: bool) -> bool {
+    let pid = window_pid(window);
     with_visibility(|map| {
         let inputs = map.entry(key.to_owned()).or_insert(VisibilityInputs {
             user_enabled,
             tab_hidden: false,
             native: false,
             placed: false,
-            browser_window: None,
+            browser_pid: None,
         });
-        inputs.browser_window = Some(window);
+        if pid.is_some() {
+            inputs.browser_pid = pid;
+        }
         let was_native = std::mem::replace(&mut inputs.native, false);
         if was_native {
             // Its position is that app's until this browser action places it.
@@ -507,15 +525,21 @@ pub(crate) fn is_placed(key: &str) -> bool {
 }
 
 /// Move a session cursor for a native action targeting `window`. A native
-/// action inside the session's own browser window (a pixel click on a
+/// action inside a window of the session's browser (a pixel click on a
 /// canvas, say) leaves the cursor to its tab's selection, taking it back if
 /// another app owned it. Any other native action owns the cursor from now on:
 /// it shows there, whatever the tab selection.
 pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64, window: Option<u64>) {
+    // The window lookup only matters for cursors a browser action claimed.
+    let pid = if with_visibility(|map| map.contains_key(&key)) {
+        window.and_then(window_pid)
+    } else {
+        None
+    };
     with_visibility(|map| {
         let Some(inputs) = map.get_mut(&key) else { return };
         let before = inputs.shown();
-        let in_browser_window = window.is_some() && window == inputs.browser_window;
+        let in_browser_window = pid.is_some() && pid == inputs.browser_pid;
         inputs.native = !in_browser_window;
         // A native move inside the browser window gives it a position there.
         inputs.placed |= in_browser_window;
@@ -1742,6 +1766,13 @@ mod visibility_tests {
     }
 
     #[test]
+    fn a_native_only_cursor_follows_the_user_setting_alone() {
+        let key = "visibility-native-only-test".to_owned();
+        set_user_enabled(key.clone(), true);
+        assert!(inputs(&key).shown(), "enabling a cursor no browser action claimed shows it");
+    }
+
+    #[test]
     fn turning_a_cursor_off_before_browser_use_is_kept() {
         let key = "visibility-first-test".to_owned();
         set_user_enabled(key.clone(), false);
@@ -1776,6 +1807,12 @@ mod visibility_tests {
         assert!(!inputs(&key).native && !inputs(&key).shown());
         set_tab_hidden(key.clone(), false, true);
         assert!(inputs(&key).shown());
+
+        // Another window of the same browser (the tab was dragged there) is
+        // still the browser.
+        animate_cursor_to(key.clone(), 10.0, 10.0, Some(88)).await;
+        animate_cursor_to(key.clone(), 10.0, 10.0, Some(78)).await;
+        assert!(!inputs(&key).native);
 
         // A native move with no window leaves the browser too.
         animate_cursor_to(key.clone(), 10.0, 10.0, None).await;
