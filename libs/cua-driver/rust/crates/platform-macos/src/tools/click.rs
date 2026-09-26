@@ -925,6 +925,15 @@ impl Tool for ClickTool {
                     }
                     Err(refusal) => return refusal,
                 }
+            } else if args
+                .get("_window_native_pixels")
+                .and_then(serde_json::Value::as_bool)
+                == Some(true)
+            {
+                // Driver-derived window pixels (an AX element's center) are
+                // already native: no screenshot scale applies, and the caller
+                // never had to take one. Public callers cannot set this flag;
+                // ingress strips underscore arguments.
             } else {
                 let ratio = match super::screenshot_scale(&self.state, &args, pid, window_id) {
                     Ok(ratio) => ratio,

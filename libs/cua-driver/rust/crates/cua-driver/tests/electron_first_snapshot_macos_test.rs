@@ -20,23 +20,108 @@ use cua_driver_testkit::{harness_app, spawn_in_job, Driver, FixtureJournal, McpD
 #[test]
 #[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
 fn first_electron_snapshot_contains_ready_web_controls() {
-    check_first_snapshot(false, false);
+    check_first_snapshot(false, false, None);
 }
 
 #[test]
 #[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
 fn first_background_electron_snapshot_contains_ready_web_controls() {
-    check_first_snapshot(true, false);
+    check_first_snapshot(true, false, None);
 }
 
 #[test]
 #[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
 fn first_background_electron_snapshot_control_accepts_first_click() {
-    check_first_snapshot(true, true);
+    check_first_snapshot(true, true, None);
 }
 
-fn check_first_snapshot(background: bool, click_first: bool) {
-    let executable = harness_app(
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_coordinate_typing_reaches_unfocused_renderer() {
+    check_first_snapshot(true, false, Some(TypingScenario::Fresh));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_coordinate_typing_preserves_selected_replacement() {
+    check_first_snapshot(true, false, Some(TypingScenario::ReplaceSelection));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_coordinate_typing_recovers_after_addressed_attempt() {
+    check_first_snapshot(true, false, Some(TypingScenario::AfterAddressedAttempt));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_coordinate_typing_preserves_selection_before_first_pointer() {
+    check_first_snapshot(true, false, Some(TypingScenario::SelectionBeforePointer));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_web_selection_is_observed_without_confirming_keys() {
+    check_first_snapshot(true, false, Some(TypingScenario::ObserveSelection));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_web_addressed_key_moves_caret_without_changing_text() {
+    check_first_snapshot(true, false, Some(TypingScenario::AddressedKey));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_web_pixel_key_moves_caret_without_changing_text() {
+    check_first_snapshot(true, false, Some(TypingScenario::PixelKey));
+}
+
+#[test]
+#[ignore = "requires the staged Electron fixture and an authorized macOS daemon"]
+fn background_web_addressed_hotkey_moves_caret_without_changing_text() {
+    check_first_snapshot(true, false, Some(TypingScenario::AddressedHotkey));
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TypingScenario {
+    AddressedKey,
+    PixelKey,
+    AddressedHotkey,
+    Fresh,
+    ReplaceSelection,
+    AfterAddressedAttempt,
+    SelectionBeforePointer,
+    ObserveSelection,
+}
+
+fn log_editor_focus(pid: i32, x: f64, y: f64, label: &str) -> Option<bool> {
+    use core_foundation::base::CFRelease;
+    use platform_macos::ax::bindings::*;
+    unsafe {
+        if let Some(element) = element_at_screen_position(pid, x, y) {
+            let role = copy_string_attr(element, "AXRole");
+            let focused = copy_bool_attr(element, "AXFocused");
+            let app_focus =
+                platform_macos::input::ax_actions::is_element_focused(pid, element as usize);
+            let window_focus = copy_element_attr(element, "AXWindow").map(|window| {
+                let result = (
+                    copy_bool_attr(window, "AXFocused"),
+                    copy_bool_attr(window, "AXMain"),
+                );
+                CFRelease(window as _);
+                result
+            });
+            eprintln!("{label}: role={role:?}, AXFocused={focused:?}, app_focus={app_focus}, window_focused_main={window_focus:?}");
+            CFRelease(element as _);
+            return window_focus.and_then(|(_, main)| main);
+        }
+    }
+    None
+}
+
+fn check_first_snapshot(background: bool, click_first: bool, typing: Option<TypingScenario>) {
+    let mut executable = harness_app(
         "harness-electron",
         "CuaTestHarness.Electron.app/Contents/MacOS/Electron",
     );
@@ -44,6 +129,89 @@ fn check_first_snapshot(background: bool, click_first: bool) {
         executable.exists(),
         "missing Electron fixture: {executable:?}"
     );
+    // Match a never-activated Electron composer, not a text field whose
+    // window was first foregrounded by the standard fixture startup.
+    let owned_fixture = typing.map(|_| tempfile::tempdir().expect("owned typing fixture"));
+    if let Some(root) = &owned_fixture {
+        let source_app = executable
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap()
+            .parent()
+            .unwrap();
+        let app = root.path().join("TypingFixture.app");
+        assert!(Command::new("/usr/bin/ditto")
+            .arg(source_app)
+            .arg(&app)
+            .status()
+            .unwrap()
+            .success());
+        let resources = app.join("Contents/Resources/app");
+        let host_path = resources.join("main.js");
+        let mut host = std::fs::read_to_string(&host_path).unwrap();
+        for (before, after) in [
+            (
+                "const { app, BrowserWindow, ipcMain } = require('electron');",
+                "const { app, BrowserWindow, ipcMain } = require('electron');\napp.dock.hide();",
+            ),
+            (
+                "show: !sentinelMode || customCuaCompositor,",
+                "show: false,",
+            ),
+            (
+                "          mainWindow.show();\n          mainWindow.focus();",
+                "          mainWindow.showInactive();",
+            ),
+        ] {
+            assert_eq!(host.matches(before).count(), 1, "known fixture host layout");
+            host = host.replacen(before, after, 1);
+        }
+        std::fs::write(host_path, host).unwrap();
+        let html_path = resources.join("web/index.html");
+        let mut html = std::fs::read_to_string(&html_path).unwrap();
+        let start = html.find("<input type=\"text\" id=\"txt-input\"").unwrap();
+        let end = start + html[start..].find("/>").unwrap() + 2;
+        html.replace_range(
+            start..end,
+            r#"<textarea id="txt-input" data-cua-id="txt-input"
+            aria-label="txt-input" rows="2" cols="30"></textarea>
+            <button id="select-input" data-cua-id="select-input"
+              onclick="const field=document.getElementById('txt-input');field.focus();field.select()">Select input text</button>
+            <button aria-label="Select suffix" onclick="const f=document.getElementById('txt-input');f.focus();f.setSelectionRange(5,8)">Select suffix</button>
+            <button aria-label="Place caret at start" onclick="const f=document.getElementById('txt-input');f.focus();f.setSelectionRange(0,0)">Place caret at start</button>
+            <button aria-label="Place caret at end" onclick="const f=document.getElementById('txt-input');f.focus();f.setSelectionRange(8,8)">Place caret at end</button>"#,
+        );
+        let anchor = "if ('value' in element) entry.value = element.value;";
+        assert_eq!(html.matches(anchor).count(), 1);
+        html = html.replacen(anchor, &format!("{anchor}\nif (element.tagName === 'TEXTAREA') {{ entry.selectionStart=element.selectionStart; entry.selectionEnd=element.selectionEnd; entry.focused=document.activeElement===element; }}"), 1);
+        std::fs::write(html_path, html).unwrap();
+        assert!(Command::new("/usr/libexec/PlistBuddy")
+            .args(["-c", "Add :LSUIElement bool true"])
+            .arg(app.join("Contents/Info.plist"))
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/codesign")
+            .args([
+                "--force",
+                "--deep",
+                "--sign",
+                "-",
+                "--preserve-metadata=entitlements,flags,runtime"
+            ])
+            .arg(&app)
+            .status()
+            .unwrap()
+            .success());
+        assert!(Command::new("/usr/bin/codesign")
+            .args(["--verify", "--deep", "--strict"])
+            .arg(&app)
+            .status()
+            .unwrap()
+            .success());
+        executable = app.join("Contents/MacOS/Electron");
+    }
     let profile = tempfile::tempdir().expect("fresh Electron profile");
     let journal = FixtureJournal::start();
     let mut driver = McpDriver::spawn_macos_daemon_proxy_named("electron-first-ax-snapshot")
@@ -115,7 +283,7 @@ fn check_first_snapshot(background: bool, click_first: bool) {
         let state = driver.call(
             "get_window_state",
             serde_json::json!({
-                "pid": pid, "window_id": wid, "include_screenshot": false,
+                "pid": pid, "window_id": wid, "include_screenshot": typing.is_some(),
             }),
         );
         let elapsed = start.elapsed();
@@ -153,6 +321,383 @@ fn check_first_snapshot(background: bool, click_first: bool) {
                     journal.snapshot()
                 );
                 std::thread::sleep(Duration::from_millis(25));
+            }
+        }
+        if let Some(scenario) = typing {
+            assert!(
+                !state.is_error(),
+                "typing snapshot failed: {}",
+                state.text()
+            );
+            let data = state.structured();
+            assert_eq!(data["screenshot_frame_valid"], true);
+            let fields: Vec<_> = data["elements"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|e| e["label"] == "txt-input" && e["role"] == "AXTextArea")
+                .collect();
+            assert_eq!(fields.len(), 1, "one fixture editor");
+            let field = &fields[0]["frame"];
+            let bounds = platform_macos::windows::window_bounds_by_id(wid as u32).unwrap();
+            let scale = data["screenshot_width"].as_f64().unwrap() / bounds.width;
+            let x = (field["x"].as_f64().unwrap() + field["w"].as_f64().unwrap() / 2.0 - bounds.x)
+                * scale;
+            let y = (field["y"].as_f64().unwrap() + field["h"].as_f64().unwrap() / 2.0 - bounds.y)
+                * scale;
+            assert_eq!(journal.text("lbl-input-mirror").as_deref(), Some("mirror="));
+            let before_number = journal.snapshot()["number-input"].clone();
+            if matches!(
+                scenario,
+                TypingScenario::AddressedKey
+                    | TypingScenario::PixelKey
+                    | TypingScenario::AddressedHotkey
+            ) {
+                let seeded = driver.call(
+                    "set_value",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "element_token":fields[0]["element_token"],
+                        "value":"KEEP abc"
+                    }),
+                );
+                assert!(!seeded.is_error(), "seed failed: {}", seeded.text());
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while journal.snapshot()["txt-input"]["value"] != "KEEP abc" {
+                    assert!(Instant::now() < deadline, "seed did not reach renderer");
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                let current = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":pid,"window_id":wid,"include_screenshot":false
+                    }),
+                );
+                let token = current.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["role"] == "AXButton" && e["label"] == "Place caret at start")
+                    .unwrap()["element_token"]
+                    .clone();
+                let selected = driver.call(
+                    "click",
+                    serde_json::json!({
+                        "pid":pid,"window_id":wid,"element_token":token,"delivery_mode":"background"
+                    }),
+                );
+                assert!(
+                    !selected.is_error(),
+                    "caret setup failed: {}",
+                    selected.text()
+                );
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let actual = journal.snapshot()["txt-input"].clone();
+                    if actual["focused"] == true
+                        && actual["selectionStart"] == 0
+                        && actual["selectionEnd"] == 0
+                    {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "caret setup not established: {actual}"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                let current = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":pid,"window_id":wid,"include_screenshot":false
+                    }),
+                );
+                let token = current.structured()["elements"]
+                    .as_array()
+                    .unwrap()
+                    .iter()
+                    .find(|e| e["role"] == "AXTextArea" && e["label"] == "txt-input")
+                    .unwrap()["element_token"]
+                    .clone();
+                let mut args =
+                    serde_json::json!({"pid":pid,"window_id":wid,"delivery_mode":"background"});
+                if scenario == TypingScenario::PixelKey {
+                    // A center click alone can put the caret at the end and
+                    // conceal a dropped key. Click at the start of the line.
+                    args["x"] =
+                        serde_json::json!((field["x"].as_f64().unwrap() + 4.0 - bounds.x) * scale);
+                    args["y"] =
+                        serde_json::json!((field["y"].as_f64().unwrap() + 15.0 - bounds.y) * scale);
+                } else {
+                    args["element_token"] = token;
+                }
+                let tool = if scenario == TypingScenario::AddressedHotkey {
+                    // A text-editing chord (Cmd+A is a menu key equivalent,
+                    // which background delivery does not promise; use the
+                    // foreground rung for menu shortcuts). From the caret at 0,
+                    // only the chord selects to the end: a focus click alone
+                    // leaves an empty selection.
+                    args["keys"] = serde_json::json!(["cmd", "shift", "right"]);
+                    "hotkey"
+                } else {
+                    args["key"] = serde_json::json!("right");
+                    args["modifiers"] = serde_json::json!(["cmd"]);
+                    "press_key"
+                };
+                if scenario == TypingScenario::PixelKey {
+                    // ed/main's contract: pixels refer to the latest screenshot
+                    // this session took. Addressed keys keep their token's
+                    // snapshot, which a fresh read would supersede.
+                    let shot = driver.call(
+                        "get_window_state",
+                        serde_json::json!({"pid":pid,"window_id":wid,"include_screenshot":true}),
+                    );
+                    assert!(!shot.is_error(), "{}", shot.text());
+                }
+                let key = driver.call(tool, args);
+                assert!(!key.is_error(), "key delivery failed: {}", key.text());
+                assert_eq!(
+                    key.action_effect(),
+                    Some("unverifiable"),
+                    "web key success must not be inferred from AX"
+                );
+                let (start, end) = if scenario == TypingScenario::AddressedHotkey {
+                    (0, 8)
+                } else {
+                    (8, 8)
+                };
+                let deadline = Instant::now() + Duration::from_secs(2);
+                loop {
+                    let actual = journal.snapshot()["txt-input"].clone();
+                    assert_eq!(actual["value"], "KEEP abc", "navigation changed the text");
+                    if actual["selectionStart"] == start && actual["selectionEnd"] == end {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "background {tool} did not move the actual selection: {actual}"
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                assert_eq!(
+                    journal.snapshot()["number-input"],
+                    before_number,
+                    "other editor changed"
+                );
+                return (state, elapsed);
+            }
+            if scenario == TypingScenario::AfterAddressedAttempt {
+                let addressed = driver.call(
+                    "type_text",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "element_token":fields[0]["element_token"],
+                        "text":"Original text", "delivery_mode":"background"
+                    }),
+                );
+                eprintln!("initial addressed typing: {}", addressed.text());
+                let refreshed = driver.call(
+                    "get_window_state",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "include_screenshot":true
+                    }),
+                );
+                assert!(
+                    !refreshed.is_error(),
+                    "refresh after addressed typing failed"
+                );
+                let observed = journal.text("lbl-input-mirror");
+                // An improved addressed route may complete directly. Never
+                // append another copy when the independent app state proves it.
+                if observed.as_deref() == Some("mirror=Original text") {
+                    assert_eq!(journal.snapshot()["number-input"], before_number);
+                    return (state, elapsed);
+                }
+                assert_eq!(
+                    observed.as_deref(),
+                    Some("mirror="),
+                    "do not retry a partial edit"
+                );
+                let _ = log_editor_focus(
+                    pid as i32,
+                    x / scale + bounds.x,
+                    y / scale + bounds.y,
+                    "after addressed attempt",
+                );
+                eprintln!(
+                    "renderer state before coordinate recovery: {}",
+                    journal.snapshot()["txt-input"]
+                );
+            }
+            if scenario == TypingScenario::SelectionBeforePointer {
+                let seeded = driver.call(
+                    "set_value",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "element_token":fields[0]["element_token"],
+                        "value":"Original text", "delivery_mode":"background"
+                    }),
+                );
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while journal.text("lbl-input-mirror").as_deref() != Some("mirror=Original text") {
+                    assert!(
+                        Instant::now() < deadline,
+                        "initial value did not land: {}",
+                        seeded.text()
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+            }
+            for payload in if matches!(
+                scenario,
+                TypingScenario::ReplaceSelection | TypingScenario::ObserveSelection
+            ) {
+                vec!["Original text", "Replacement"]
+            } else if scenario == TypingScenario::SelectionBeforePointer {
+                vec!["Replacement"]
+            } else {
+                vec!["Original text"]
+            } {
+                if payload == "Replacement" {
+                    // Select through a visible fixture control and prove the
+                    // actual range. Background Cmd+A is a separate unsupported
+                    // path in the current diagnostic and must not be assumed.
+                    let current = driver.call(
+                        "get_window_state",
+                        serde_json::json!({
+                            "pid":pid, "window_id":wid, "include_screenshot":false
+                        }),
+                    );
+                    assert!(!current.is_error(), "selection control read failed");
+                    let current = current.structured();
+                    let controls: Vec<_> = current["elements"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .filter(|e| e["role"] == "AXButton" && e["label"] == "Select input text")
+                        .collect();
+                    assert_eq!(controls.len(), 1);
+                    let selected = driver.call("click", serde_json::json!({
+                        "pid":pid, "window_id":wid, "element_token":controls[0]["element_token"],
+                        "delivery_mode":"background"
+                    }));
+                    assert!(
+                        !selected.is_error(),
+                        "selection failed: {}",
+                        selected.text()
+                    );
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        let observed = journal.snapshot()["txt-input"].clone();
+                        if observed["selectionStart"] == 0 && observed["selectionEnd"] == 13 {
+                            eprintln!("selection before replacement: {observed}");
+                            break;
+                        }
+                        assert!(
+                            Instant::now() < deadline,
+                            "Fixture control did not establish selection: {}; observed: {}",
+                            selected.text(),
+                            observed
+                        );
+                        std::thread::sleep(Duration::from_millis(25));
+                    }
+                }
+                if scenario == TypingScenario::ObserveSelection && payload == "Replacement" {
+                    let current = driver.call(
+                        "get_window_state",
+                        serde_json::json!({
+                            "pid":pid,"window_id":wid,"include_screenshot":false
+                        }),
+                    );
+                    let field = current.structured()["elements"]
+                        .as_array()
+                        .unwrap()
+                        .iter()
+                        .find(|e| e["label"] == "txt-input" && e["role"] == "AXTextArea")
+                        .unwrap();
+                    eprintln!(
+                        "web selection observation: {field}; renderer: {}",
+                        journal.snapshot()["txt-input"]
+                    );
+                    let _ = log_editor_focus(
+                        pid as i32,
+                        x / scale + bounds.x,
+                        y / scale + bounds.y,
+                        "selection observation",
+                    );
+                    assert_eq!(field["in_web_content"], true);
+                    assert_eq!(field["focused"], true);
+                    assert_eq!(
+                        field["text_selection"]["range"],
+                        serde_json::json!({"location":0,"length":13})
+                    );
+                    assert_eq!(field["text_selection"]["text"], "Original text");
+                    let key = driver.call(
+                        "press_key",
+                        serde_json::json!({
+                            "pid":pid,"window_id":wid,"element_token":field["element_token"],
+                            "key":"right","modifiers":["cmd"],"delivery_mode":"background"
+                        }),
+                    );
+                    assert!(!key.is_error(), "web key: {}", key.text());
+                    assert_eq!(
+                        key.action_effect(),
+                        Some("unverifiable"),
+                        "web AX must not confirm a key: {}",
+                        key.text()
+                    );
+                    assert_eq!(
+                        journal.text("lbl-input-mirror").as_deref(),
+                        Some("mirror=Original text")
+                    );
+                    return (state, elapsed);
+                }
+                let main = log_editor_focus(
+                    pid as i32,
+                    x / scale + bounds.x,
+                    y / scale + bounds.y,
+                    payload,
+                );
+                if scenario == TypingScenario::SelectionBeforePointer {
+                    assert_eq!(
+                        main,
+                        Some(false),
+                        "selection must predate native window focus"
+                    );
+                }
+                // ed/main's contract: pixels refer to the latest screenshot this
+                // session took, so read with one right before the pixel action.
+                let shot = driver.call(
+                    "get_window_state",
+                    serde_json::json!({"pid":pid,"window_id":wid,"include_screenshot":true}),
+                );
+                assert!(!shot.is_error(), "{}", shot.text());
+                let inserted = driver.call(
+                    "type_text",
+                    serde_json::json!({
+                        "pid":pid, "window_id":wid, "x":x, "y":y, "text":payload,
+                        "delivery_mode":"background"
+                    }),
+                );
+                eprintln!("coordinate typing result: {}", inserted.text());
+                let expected = format!("mirror={payload}");
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while journal.text("lbl-input-mirror").as_deref() != Some(expected.as_str()) {
+                    assert!(
+                        Instant::now() < deadline,
+                        "coordinate typing did not reach renderer: {}; journal: {}",
+                        inserted.text(),
+                        journal.snapshot()
+                    );
+                    std::thread::sleep(Duration::from_millis(25));
+                }
+                assert!(
+                    !inserted.is_error(),
+                    "typing reported failure after delivery: {}",
+                    inserted.text()
+                );
+                assert_eq!(
+                    journal.snapshot()["number-input"],
+                    before_number,
+                    "other editor changed"
+                );
             }
         }
         (state, elapsed)

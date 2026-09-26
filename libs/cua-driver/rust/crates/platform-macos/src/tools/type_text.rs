@@ -328,6 +328,7 @@ impl Tool for TypeTextTool {
                 args.opt_str("session"),
                 args.opt_str("_session_id"),
                 from_zoom,
+                false,
                 _mutation_lease.as_ref(),
             )
             .await
@@ -1017,6 +1018,29 @@ pub(super) fn target_in_web_area(
     ))
 }
 
+/// Whether a background key may prepare this target's window as web content.
+/// Positively classified web content qualifies. An unreadable window focus
+/// qualifies only in a Chromium-family process: a background Electron window
+/// often cannot report its focused element, but a native window with that gap
+/// must not receive synthetic focus changes.
+pub(super) fn target_is_web_content(
+    pid: i32,
+    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    window_id: Option<u32>,
+) -> bool {
+    match classify_target_web_area(pid, element_ptr_and_idx, window_id) {
+        WebAreaClassification::WebContent => true,
+        WebAreaClassification::WindowFocusUnavailable => {
+            crate::browser::electron_js::ElectronJs::is_electron(pid)
+                || crate::browser::platform::is_chromium(
+                    &crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
+                    &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
+                )
+        }
+        WebAreaClassification::NonWebContent | WebAreaClassification::Incomplete => false,
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WebAreaClassification {
     WebContent,
@@ -1538,13 +1562,22 @@ fn type_text_blocking(
     // --- Background rung 2: CGEvent keystrokes with read-back. ---
     // Never clear here: a partial AX write is rare, and clearing would violate
     // insert-at-cursor semantics.
-    let (verified, delivered_chars) = cgevent_type_verified(
+    // Web content: select the exact window as its process's key window for
+    // the keystrokes and their readback, without raising it.
+    let (verified, delivered_chars) = super::with_background_web_key_window(
         pid,
-        text,
-        delay_ms,
-        &readback,
-        element_ptr_and_idx,
-        /*settle_ms=*/ 0,
+        window_id,
+        element_ptr_and_idx.map(|(ptr, _)| ptr),
+        || {
+            cgevent_type_verified(
+                pid,
+                text,
+                delay_ms,
+                &readback,
+                element_ptr_and_idx,
+                /*settle_ms=*/ 0,
+            )
+        },
     )?;
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
