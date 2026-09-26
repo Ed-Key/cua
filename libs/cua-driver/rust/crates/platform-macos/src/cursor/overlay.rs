@@ -75,6 +75,11 @@ static CMD_TX: OnceLock<std::sync::mpsc::SyncSender<OverlayMsg>> = OnceLock::new
 // Single-consumer slot; receiver is moved into run_on_main_thread().
 static CMD_RX_CELL: Mutex<Option<std::sync::mpsc::Receiver<OverlayMsg>>> = Mutex::new(None);
 static RENDER: Mutex<Option<RenderMap>> = Mutex::new(None);
+/// Session cursors a browser tab switch hid because their tab is not the
+/// selected one. Kept apart from the user's enable setting so neither
+/// overrides the other; a native action takes the cursor out of the browser
+/// and clears it.
+static TAB_HIDDEN: Mutex<Option<std::collections::HashSet<CursorKey>>> = Mutex::new(None);
 static OVERLAY_WINDOW_ID: AtomicU32 = AtomicU32::new(0);
 
 pub(crate) fn is_overlay_window(window_id: u32) -> bool {
@@ -393,7 +398,45 @@ fn seed_start_in_map(map: &mut RenderMap, key: &CursorKey, target_x: f64, target
 /// seeded on-screen via [`seed_start_if_sentinel`] so its FIRST action glides
 /// in (it previously snapped silently via `ClickPulse`, invisible on a pure-AX
 /// run).
+/// Hide or show a session cursor for its browser tab's selection. Shown only
+/// when `user_enabled` too.
+pub fn set_tab_hidden(key: CursorKey, hidden: bool, user_enabled: bool) {
+    {
+        let mut guard = TAB_HIDDEN.lock().unwrap();
+        let set = guard.get_or_insert_with(Default::default);
+        if hidden {
+            set.insert(key.clone());
+        } else {
+            set.remove(&key);
+        }
+    }
+    send_command(key, OverlayCommand::SetEnabled(user_enabled && !hidden));
+}
+
+/// Whether a tab switch currently hides this cursor.
+pub fn is_tab_hidden(key: &str) -> bool {
+    TAB_HIDDEN.lock().unwrap().as_ref().is_some_and(|set| set.contains(key))
+}
+
+/// Drop a tab-switch hide (the user turned the cursor off, which wins).
+pub fn forget_tab_hidden(key: &str) {
+    if let Some(set) = TAB_HIDDEN.lock().unwrap().as_mut() {
+        set.remove(key);
+    }
+}
+
+/// Move a session cursor for a native action. A cursor hidden by a browser
+/// tab switch is shown again: it has left the browser.
 pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
+    animate(key, x, y, false).await;
+}
+
+/// Move a session cursor for a browser action, keeping any tab-switch hide.
+pub async fn animate_browser_cursor_to(key: CursorKey, x: f64, y: f64) {
+    animate(key, x, y, true).await;
+}
+
+async fn animate(key: CursorKey, x: f64, y: f64, from_browser: bool) {
     // Empty key is the explicit no-cursor sentinel → nothing to animate.
     if key.is_empty() {
         return;
@@ -414,6 +457,11 @@ pub async fn animate_cursor_to(key: CursorKey, x: f64, y: f64) {
     };
     if !should_animate {
         return;
+    }
+    let was_tab_hidden = !from_browser
+        && TAB_HIDDEN.lock().unwrap().as_mut().is_some_and(|set| set.remove(&key));
+    if was_tab_hidden {
+        send_command(key.clone(), OverlayCommand::SetEnabled(true));
     }
 
     // Create a one-shot channel; store the sender (keyed) so the render thread
@@ -1580,5 +1628,19 @@ mod tests {
             rxb.try_recv(),
             Err(tokio::sync::oneshot::error::TryRecvError::Empty)
         ));
+    }
+}
+
+#[cfg(test)]
+mod tab_hidden_tests {
+    #[test]
+    fn a_tab_switch_hide_is_separate_from_the_user_setting() {
+        super::set_tab_hidden("tab-hidden-test".to_owned(), true, true);
+        assert!(super::is_tab_hidden("tab-hidden-test"));
+        super::set_tab_hidden("tab-hidden-test".to_owned(), false, true);
+        assert!(!super::is_tab_hidden("tab-hidden-test"));
+        super::set_tab_hidden("tab-hidden-test".to_owned(), true, true);
+        super::forget_tab_hidden("tab-hidden-test");
+        assert!(!super::is_tab_hidden("tab-hidden-test"), "turning the cursor off drops the hide");
     }
 }

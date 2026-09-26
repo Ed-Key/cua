@@ -241,8 +241,11 @@ struct BrowserCursorTracker {
     /// until its first action places it. Set when that move starts, not when
     /// its animation ends, so another action meanwhile cannot hide it.
     placed: HashMap<String, (f64, f64)>,
-    /// Sessions whose browser move is still animating.
-    moving: std::collections::HashSet<String>,
+    /// Sessions whose browser move is still animating, with that move's
+    /// number: an older move of the same session, released early when a newer
+    /// one replaces its animation, must not record its stale position.
+    moving: HashMap<String, u64>,
+    next_move: u64,
 }
 
 impl BrowserCursorTracker {
@@ -328,7 +331,7 @@ impl BrowserCursorTracker {
     /// mid-move, or where that move left it. A cursor since moved by a native
     /// action belongs to that app, and tab switches must not hide it.
     fn browser_owns(&self, session: &str, position: Option<(f64, f64)>) -> bool {
-        self.moving.contains(session)
+        self.moving.contains_key(session)
             || self.placed.get(session).is_some_and(|placed| position == Some(*placed))
     }
 
@@ -355,11 +358,7 @@ fn apply_cursor_visibility(
         if !tracker.browser_owns(key, state.position.map(|position| (position.x, position.y))) {
             continue;
         }
-        let enabled = *visible && state.config.enabled;
-        crate::cursor::overlay::send_command(
-            key.clone(),
-            cursor_overlay::OverlayCommand::SetEnabled(enabled),
-        );
+        crate::cursor::overlay::set_tab_hidden(key.clone(), !visible, state.config.enabled);
     }
 }
 
@@ -978,7 +977,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             .get_or_create(&action.session)
             .config
             .enabled;
-        let shown = {
+        let (shown, move_number) = {
             let mut tracker = self.browser_cursors.lock().unwrap();
             let updates = tracker.update(
                 &action.session,
@@ -991,13 +990,17 @@ impl BrowserPlatform for MacOsBrowserPlatform {
                 && cursor_enabled
                 && action.screen_x.is_some_and(f64::is_finite)
                 && action.screen_y.is_some_and(f64::is_finite);
+            let mut move_number = None;
             if placing {
                 let at = (action.screen_x.unwrap_or_default(), action.screen_y.unwrap_or_default());
+                tracker.next_move += 1;
+                let number = tracker.next_move;
+                move_number = Some(number);
                 tracker.placed.insert(action.session.clone(), at);
-                tracker.moving.insert(action.session.clone());
+                tracker.moving.insert(action.session.clone(), number);
             }
             apply_cursor_visibility(&self.cursor_registry, &tracker, &updates);
-            shown
+            (shown, move_number)
         };
         if !shown || !cursor_enabled {
             return;
@@ -1013,12 +1016,14 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             action.session.clone(),
             cursor_overlay::OverlayCommand::PinAbove(action.window_id),
         );
-        crate::cursor::overlay::animate_cursor_to(action.session.clone(), screen_x, screen_y).await;
+        crate::cursor::overlay::animate_browser_cursor_to(action.session.clone(), screen_x, screen_y).await;
         {
             let mut tracker = self.browser_cursors.lock().unwrap();
-            self.cursor_registry
-                .update_position(&action.session, screen_x, screen_y);
-            tracker.moving.remove(&action.session);
+            if move_number.is_some() && tracker.moving.get(&action.session) == move_number.as_ref() {
+                self.cursor_registry
+                    .update_position(&action.session, screen_x, screen_y);
+                tracker.moving.remove(&action.session);
+            }
         }
 
         if matches!(
@@ -2024,7 +2029,7 @@ mod tests {
         split.placed.insert("session-s".to_owned(), (100.0, 200.0));
         assert!(split.browser_owns("session-s", Some((100.0, 200.0))));
         assert!(!split.browser_owns("session-s", Some((640.0, 90.0))));
-        split.moving.insert("session-s".to_owned());
+        split.moving.insert("session-s".to_owned(), 1);
         assert!(split.browser_owns("session-s", Some((640.0, 90.0))), "mid-move it is still the browser's");
 
         // Without the link's reports, the action's own probe decides again.
