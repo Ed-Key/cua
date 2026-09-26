@@ -33,6 +33,9 @@ const debuggerIdle = new Map();
 // Tabs whose Page domain Cua enabled: replayed after an idle reattach so
 // dialog events keep flowing to the daemon's existing session.
 const pageEnabled = new Set();
+// Tabs showing a JavaScript dialog. Chrome forgets a pending dialog when the
+// debugger detaches, so an idle release waits until the dialog closes.
+const dialogOpen = new Set();
 // Attach and detach run one at a time per tab, so Stop cannot slip between
 // an attach starting and a command being sent.
 const tabQueues = new Map();
@@ -52,6 +55,10 @@ function touchDebugger(tabId) {
 // anything else ends them.
 function releaseDebugger(tabId, reason) {
   return serialized(tabId, async () => {
+    if (reason === "idle" && dialogOpen.has(tabId)) {
+      touchDebugger(tabId);
+      return;
+    }
     clearTimeout(debuggerIdle.get(tabId));
     debuggerIdle.delete(tabId);
     if (reason !== "idle") pageEnabled.delete(tabId);
@@ -73,6 +80,12 @@ function ensureAttached(tabId) {
     if (!attached.has(tabId)) {
       await chrome.debugger.attach({ tabId }, "1.3");
       attached.add(tabId);
+      // Nothing runs in the tab after a Stop, not even the replay below.
+      if (stopped.has(tabId)) {
+        attached.delete(tabId);
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+        throw new Error(STOPPED_MESSAGE);
+      }
       if (pageEnabled.has(tabId)) await chrome.debugger.sendCommand({ tabId }, "Page.enable", {});
     }
     // Stop may have landed while the attach was in flight.
@@ -289,12 +302,15 @@ async function handleMessage(message) {
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method === "Page.javascriptDialogOpening") dialogOpen.add(source.tabId);
+  if (method === "Page.javascriptDialogClosed") dialogOpen.delete(source.tabId);
   post({ jsonrpc: "2.0", method: "debugger.event", params: { source, method, params } });
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   attached.delete(source.tabId);
   pageEnabled.delete(source.tabId);
+  dialogOpen.delete(source.tabId);
   clearTimeout(debuggerIdle.get(source.tabId));
   debuggerIdle.delete(source.tabId);
   // "canceled_by_user": the user dismissed Chrome's debugging banner.
@@ -314,6 +330,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (stopped.delete(tabId)) void saveStopped();
   attached.delete(tabId);
   pageEnabled.delete(tabId);
+  dialogOpen.delete(tabId);
   tabQueues.delete(tabId);
   clearTimeout(debuggerIdle.get(tabId));
   debuggerIdle.delete(tabId);

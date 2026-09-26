@@ -76,7 +76,8 @@ impl BrowserTabsTool {
     /// The Chrome a change acts on, named by `pid` from list. Required even
     /// with one Chrome connected: a Chrome restarted between list and change
     /// would otherwise receive the change. Several profiles of one Chrome share
-    /// its pid; the link whose tabs include the request's tab ids is chosen.
+    /// its pid; the profile that owns every tab, window, and group the request
+    /// names is chosen, and a request that names none of them is refused.
     async fn resolve_change(&self, args: &Value) -> Result<(u64, i64), String> {
         let pid = args
             .get("pid")
@@ -90,30 +91,48 @@ impl BrowserTabsTool {
             .filter(|link| link.chrome_pid == Some(pid))
             .map(|link| link.link)
             .collect();
-        let wanted: Vec<i64> = args
-            .get("tab_id")
-            .into_iter()
-            .chain(args.get("tab_ids").and_then(Value::as_array).into_iter().flatten())
-            .filter_map(Value::as_i64)
-            .collect();
-        if candidates.len() > 1 && !wanted.is_empty() {
-            for link in &candidates {
-                let tabs = self.request(*link, "tabs.list", json!({})).await?;
-                let owned: Vec<i64> = tabs
-                    .as_array()
-                    .into_iter()
-                    .flatten()
-                    .filter_map(|tab| tab.get("tabId").and_then(Value::as_i64))
-                    .collect();
-                if wanted.iter().all(|tab| owned.contains(tab)) {
-                    return Ok((*link, pid));
+        let ids = |key: &str| -> Vec<i64> {
+            args.get(key)
+                .into_iter()
+                .flat_map(|value| match value {
+                    Value::Array(values) => values.clone(),
+                    other => vec![other.clone()],
+                })
+                .filter_map(|value| value.as_i64())
+                .collect()
+        };
+        let (mut tabs, windows, groups) = (ids("tab_id"), ids("window_id"), ids("group_id"));
+        tabs.extend(ids("tab_ids"));
+        match candidates.len() {
+            0 => Err(format!("no connected Chrome has pid {pid}; call list for the current ones")),
+            1 => Ok((candidates[0], pid)),
+            _ if tabs.is_empty() && windows.is_empty() && groups.is_empty() => Err(format!(
+                "several profiles of Chrome {pid} are connected; name a window_id, tab, or group from list"
+            )),
+            _ => {
+                for link in &candidates {
+                    let owned = |list: Value, key: &str| -> Vec<i64> {
+                        list.as_array()
+                            .into_iter()
+                            .flatten()
+                            .filter_map(|item| item.get(key).and_then(Value::as_i64))
+                            .collect()
+                    };
+                    let owned_tabs = owned(self.request(*link, "tabs.list", json!({})).await?, "tabId");
+                    let owned_windows =
+                        owned(self.request(*link, "windows.list", json!({})).await?, "windowId");
+                    let owned_groups =
+                        owned(self.request(*link, "tabGroups.list", json!({})).await?, "groupId");
+                    if tabs.iter().all(|id| owned_tabs.contains(id))
+                        && windows.iter().all(|id| owned_windows.contains(id))
+                        && groups.iter().all(|id| owned_groups.contains(id))
+                    {
+                        return Ok((*link, pid));
+                    }
                 }
+                Err(format!("no single profile of Chrome {pid} owns every tab, window, and group named"))
             }
         }
-        candidates
-            .first()
-            .map(|link| (*link, pid))
-            .ok_or_else(|| format!("no connected Chrome has pid {pid}; call list for the current ones"))
     }
 
     /// The Chrome named by `pid`, or the only connected one (reads only).
