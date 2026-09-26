@@ -785,7 +785,7 @@ impl Tool for GetWindowStateTool {
             r.walk.apply(&mut structured);
             let bounded = args.get("max_depth").is_some() || args.get("max_elements").is_some();
             if !bounded {
-                if let Some(unexposed) = unexposed_web_content(pid, &r.nodes, r.walk.truncated()) {
+                if let Some(unexposed) = unexposed_web_content(pid, r) {
                     structured["web_content"] = unexposed;
                 }
             }
@@ -1383,21 +1383,16 @@ mod window_scope_contract_tests {
 /// page after the window was covered). The walk then shows browser controls
 /// only, which reads like an empty page. Report it when the driver's own
 /// web-content wait for this process timed out and a complete, non-empty walk
-/// of this window found no web content; an incomplete walk proves nothing.
+/// of this window reached no web content, counting elements pruned from the
+/// output; an incomplete walk (budget stop, depth cut, failed child read)
+/// proves nothing.
 // ponytail: the wait is tracked per process, so once any window of the process
 // exposes a page, a different covered window gets no note. Track readiness per
 // window if that case shows up.
-fn unexposed_web_content(
-    pid: i32,
-    nodes: &[crate::ax::tree::AXNode],
-    walk_truncated: bool,
-) -> Option<Value> {
-    let found_web_content = nodes
-        .iter()
-        .any(|node| node.role == "AXWebArea" || node.in_web_content);
-    if walk_truncated
-        || nodes.is_empty()
-        || found_web_content
+fn unexposed_web_content(pid: i32, walk: &crate::ax::tree::TreeWalkResult) -> Option<Value> {
+    if !walk.sightings.complete(&walk.walk)
+        || walk.nodes.is_empty()
+        || walk.sightings.web_content
         || !crate::ax::enablement::web_content_wait_timed_out(pid)
     {
         return None;
