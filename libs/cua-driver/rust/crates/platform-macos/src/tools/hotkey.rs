@@ -40,13 +40,13 @@ fn def() -> &'static ToolDef {
                Chromium/Electron accept it as trusted live input. With an AX target, \
                focus that exact element first. No top-level focus steal. \
                `window_id` here only targets the combo; it does not raise.\n\
-             • `foreground`: briefly front the window (NSMenu path, < 1 ms via \
-               SLPSSetFrontProcessWithOptions) so native menu key-equivalents \
-               (Cmd+Z, Cmd+W) dispatch, then restore the prior frontmost — the \
-               explicit escalation for menu-bar shortcuts on non-Chromium apps that \
-               ignore a background combo. With an AX target or x,y, the focused field \
-               receives the chord through the foreground HID queue (needed by native \
-               Chromium fields such as the omnibox). Requires window_id.\n\n\
+             • `foreground`: front the exact window, confirm it became key, send \
+               the chord through the foreground HID queue, then restore the prior \
+               frontmost — the explicit escalation for menu-bar shortcuts (Cmd+Z, \
+               Cmd+W) and native Chromium fields such as the omnibox that ignore a \
+               background combo. Fails instead of sending when the window does not \
+               become key. With an AX target or x,y, that field is focused first. \
+               Requires window_id.\n\n\
              A combo is never driver-verifiable (no read-back) → effect:\"unverifiable\"; \
              confirm via screenshot. NOTE: a keyboard combo does NOT focus a text \
              field — to type into a backgrounded Electron input, establish real \
@@ -432,27 +432,16 @@ impl Tool for HotkeyTool {
                             )?;
                             Ok(())
                         }
-                        // Screen Sharing is an input forwarder: modifier flags
-                        // on a PID-routed base-key event are not relayed to the
-                        // guest. Emit the physical modifier down/base/up
-                        // sequence through the guarded foreground HID path.
-                        (true, false, Some(wid), None)
-                            if crate::input::keyboard::is_screen_sharing_pid(pid) =>
-                        {
+                        // foreground rung: front the exact window, confirm it is
+                        // key, then send a physical chord. Without that proof a
+                        // chord posted while another app still held focus was
+                        // dropped yet reported as pressed. The physical
+                        // transitions also reach Screen Sharing guests.
+                        (true, false, Some(wid), None) => {
                             crate::input::skylight::with_foreground_hid_activation(
                                 pid as libc::pid_t,
                                 wid,
                                 || crate::input::keyboard::press_key_bare_global(&key, &m),
-                            )?;
-                            Ok(())
-                        }
-                        // foreground rung: briefly front the window so NSMenu key
-                        // equivalents dispatch, then restore prior frontmost.
-                        (true, false, Some(wid), None) => {
-                            crate::input::skylight::with_menu_shortcut_activation(
-                                pid as libc::pid_t,
-                                wid,
-                                || crate::input::keyboard::hotkey_no_auth(pid, &key, &m),
                             )?;
                             Ok(())
                         }

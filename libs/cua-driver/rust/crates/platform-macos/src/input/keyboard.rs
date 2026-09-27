@@ -114,32 +114,6 @@ pub fn hotkey(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
     press_key(pid, key, modifiers)
 }
 
-/// Send a key combination to `pid` WITHOUT the auth-message envelope.
-///
-/// Required for NSMenu key equivalents: with the envelope, SLEventPostToPid
-/// forks onto a direct-mach path that bypasses IOHIDPostEvent — NSMenu never
-/// sees those events. Without the envelope the path goes through IOHIDPostEvent
-/// so NSApplication.sendEvent: dispatches NSMenu key equivalents.
-pub fn hotkey_no_auth(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
-    let key_code = key_name_to_code(key)?;
-    let flags = modifier_flags(modifiers);
-    post_key_no_auth(pid, key_code, true, flags)?;
-    std::thread::sleep(std::time::Duration::from_millis(8));
-    post_key_no_auth(pid, key_code, false, flags)?;
-    Ok(())
-}
-
-/// Press and release a single key to `pid` WITHOUT the auth-message envelope.
-/// Works for single keys as well as combinations (same as hotkey_no_auth for single key).
-pub fn press_key_no_auth(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
-    let key_code = key_name_to_code(key)?;
-    let flags = modifier_flags(modifiers);
-    post_key_no_auth(pid, key_code, true, flags)?;
-    std::thread::sleep(std::time::Duration::from_millis(8));
-    post_key_no_auth(pid, key_code, false, flags)?;
-    Ok(())
-}
-
 /// Press and release one key on the global HID queue.
 ///
 /// This is reserved for an explicitly approved, bounded foreground assist.
@@ -414,28 +388,34 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
     Ok(())
 }
 
-/// Send a physical key chord using the exact bare-event sequence documented by
-/// Apple for `CGEventCreateKeyboardEvent`: NULL source, modifier downs, base
-/// down/up, then modifier ups in reverse order. No flags, Unicode payload, or
-/// event-type overrides are applied; CoreGraphics derives those from the
-/// virtual key transitions and its default source state.
+/// Send a physical key chord as bare NULL-source events: modifier downs, base
+/// down/up, then modifier ups in reverse order, with no Unicode payload or
+/// event-type overrides. Each event carries the modifier flags a physical
+/// keyboard would report at that point. CoreGraphics stamps the source state
+/// when an event is created, not when it is posted, so events created ahead of
+/// the modifier downs would otherwise send the base key without its modifiers
+/// (Cmd+V typed a plain "v" on every foreground attempt in the VM lab).
 pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
     use core_graphics::event::CGEventTapLocation;
 
     let key_code = key_name_to_code(key)?;
-    let mut modifier_codes = Vec::new();
+    let mut chord: Vec<(u16, CGEventFlags)> = Vec::new();
     for modifier in modifiers {
-        let Some((modifier_code, _)) = modifier_key_code_and_flag(modifier) else {
+        let Some((modifier_code, modifier_flag)) = modifier_key_code_and_flag(modifier) else {
             continue;
         };
-        if !modifier_codes.contains(&modifier_code) {
-            modifier_codes.push(modifier_code);
+        if !chord.iter().any(|(code, _)| *code == modifier_code) {
+            chord.push((modifier_code, modifier_flag));
         }
     }
 
-    let events = bare_chord_transitions(key_code, &modifier_codes)
+    let events = bare_chord_transitions(key_code, &chord)
         .into_iter()
-        .map(|(code, down)| create_bare_keyboard_event(code, down))
+        .map(|(code, down, flags)| {
+            let event = create_bare_keyboard_event(code, down)?;
+            event.set_flags(flags);
+            Ok(event)
+        })
         .collect::<anyhow::Result<Vec<_>>>()?;
     for event in events {
         event.post(CGEventTapLocation::HID);
@@ -444,12 +424,22 @@ pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()
     Ok(())
 }
 
-fn bare_chord_transitions(key_code: u16, modifier_codes: &[u16]) -> Vec<(u16, bool)> {
-    let mut transitions = Vec::with_capacity(modifier_codes.len() * 2 + 2);
-    transitions.extend(modifier_codes.iter().map(|&code| (code, true)));
-    transitions.push((key_code, true));
-    transitions.push((key_code, false));
-    transitions.extend(modifier_codes.iter().rev().map(|&code| (code, false)));
+fn bare_chord_transitions(
+    key_code: u16,
+    chord: &[(u16, CGEventFlags)],
+) -> Vec<(u16, bool, CGEventFlags)> {
+    let mut transitions = Vec::with_capacity(chord.len() * 2 + 2);
+    let mut flags = CGEventFlags::CGEventFlagNull;
+    for &(code, flag) in chord {
+        flags |= flag;
+        transitions.push((code, true, flags));
+    }
+    transitions.push((key_code, true, flags));
+    transitions.push((key_code, false, flags));
+    for &(code, flag) in chord.iter().rev() {
+        flags &= !flag;
+        transitions.push((code, false, flags));
+    }
     transitions
 }
 
@@ -608,25 +598,6 @@ fn post_key(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> any
     // state cannot leak into a targeted key press.
     event.set_flags(flags);
     post_keyboard_event(pid, &event);
-    Ok(())
-}
-
-fn post_key_no_auth(
-    pid: i32,
-    key_code: u16,
-    key_down: bool,
-    flags: CGEventFlags,
-) -> anyhow::Result<()> {
-    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
-        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    let event = CGEvent::new_keyboard_event(source, key_code, key_down)
-        .map_err(|_| anyhow::anyhow!("CGEvent::new_keyboard_event failed"))?;
-    event.set_flags(flags);
-    let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
-    // attach_auth_message = false → IOHIDPostEvent path → NSMenu fires
-    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false) {
-        event.post_to_pid(pid as libc::pid_t);
-    }
     Ok(())
 }
 
@@ -836,9 +807,23 @@ mod tests {
 
     #[test]
     fn bare_command_chord_orders_modifier_base_and_reverse_release() {
+        let cmd = CGEventFlags::CGEventFlagCommand;
+        let none = CGEventFlags::CGEventFlagNull;
         assert_eq!(
-            bare_chord_transitions(9, &[55]),
-            vec![(55, true), (9, true), (9, false), (55, false)]
+            bare_chord_transitions(9, &[(55, cmd)]),
+            vec![(55, true, cmd), (9, true, cmd), (9, false, cmd), (55, false, none)]
+        );
+        let shift = CGEventFlags::CGEventFlagShift;
+        assert_eq!(
+            bare_chord_transitions(9, &[(55, cmd), (56, shift)]),
+            vec![
+                (55, true, cmd),
+                (56, true, cmd | shift),
+                (9, true, cmd | shift),
+                (9, false, cmd | shift),
+                (56, false, cmd),
+                (55, false, none)
+            ]
         );
         let command_down = create_bare_keyboard_event(55, true).unwrap();
         assert_eq!(
