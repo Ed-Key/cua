@@ -15,6 +15,8 @@
 //   context_menu   — NSButton + NSMenu (Cut/Copy/Paste → menu_action=)
 //   scroll_target  — NSScrollView with a tall body and offset label
 //   ns_menubar     — main menu item with known title (Mac-specific)
+//   child-field    — (CUA_HARNESS_BRING_TO_FRONT_MODE) editable field in a
+//                    borderless child window holding focus, like Finder rename
 //   exit           — NSButton terminates the app
 //
 // AX identifiers (via `setAccessibilityIdentifier(_:)`) match the IDs in
@@ -658,12 +660,20 @@ final class ClickTargetButton: NSButton {
     override func acceptsFirstMouse(for event: NSEvent?) -> Bool { true }
 }
 
+// A borderless window that can hold keyboard focus, like Finder's inline
+// rename field (a separate small child window of the Finder window).
+final class KeyableChildWindow: NSWindow {
+    override var canBecomeKey: Bool { true }
+}
+
 // Opt-in windows for the persistent exact-window activation certification.
 // Ordinary harness launches keep the existing window layout and behavior.
 final class BringToFrontMatrixWindows: NSObject, NSTextFieldDelegate {
     let secondary: NSWindow
     var sheet: NSWindow?
     var floating: NSPanel?
+    var child: NSWindow?
+    private var childField: NSTextField?
     private var editField: NSTextField?
     private let editMirror = NSTextField(labelWithString: "")
     private let editCommit = NSTextField(labelWithString: "committed=none")
@@ -714,6 +724,26 @@ final class BringToFrontMatrixWindows: NSObject, NSTextFieldDelegate {
             candidate.contentView = NSTextField(labelWithString: "modal sheet blocks parent key status")
             sheet = candidate
             parent.beginSheet(candidate)
+        } else if mode == "child-field" {
+            // Mode child-field: an editable field in its own borderless child
+            // window over the main window, holding keyboard focus, as Finder's
+            // inline rename does. Field changes go to CUA_HARNESS_CHILD_JOURNAL.
+            let frame = parent.frame
+            let candidate = KeyableChildWindow(
+                contentRect: NSRect(x: frame.minX + 60, y: frame.maxY - 160, width: 220, height: 24),
+                styleMask: [.borderless], backing: .buffered, defer: false)
+            candidate.isReleasedWhenClosed = false
+            candidate.isRestorable = false
+            let field = NSTextField(string: "draft.txt")
+            field.frame = NSRect(x: 0, y: 0, width: 220, height: 24)
+            field.setAccessibilityIdentifier("txt-child-field")
+            field.delegate = self
+            candidate.contentView = field
+            parent.addChildWindow(candidate, ordered: .above)
+            candidate.makeKeyAndOrderFront(nil)
+            candidate.makeFirstResponder(field)
+            childField = field
+            child = candidate
         } else if mode == "floating" {
             let candidate = NSPanel(
                 contentRect: NSRect(x: 180, y: 180, width: 320, height: 140),
@@ -728,13 +758,29 @@ final class BringToFrontMatrixWindows: NSObject, NSTextFieldDelegate {
     }
 
     func controlTextDidChange(_ notification: Notification) {
-        guard let field = notification.object as? NSTextField, field === editField else { return }
+        guard let field = notification.object as? NSTextField else { return }
+        if field === childField { appendChildJournal("value=\(field.stringValue)") }
+        guard field === editField else { return }
         editMirror.stringValue = field.stringValue
     }
 
     func controlTextDidEndEditing(_ notification: Notification) {
-        guard let field = notification.object as? NSTextField, field === editField else { return }
+        guard let field = notification.object as? NSTextField else { return }
+        if field === childField { appendChildJournal("committed=\(field.stringValue)") }
+        guard field === editField else { return }
         editCommit.stringValue = "committed=\(field.stringValue)"
+    }
+
+    private func appendChildJournal(_ line: String) {
+        guard let path = ProcessInfo.processInfo.environment["CUA_HARNESS_CHILD_JOURNAL"],
+              let data = (line + "\n").data(using: .utf8) else { return }
+        if let handle = FileHandle(forWritingAtPath: path) {
+            handle.seekToEndOfFile()
+            handle.write(data)
+            handle.closeFile()
+        } else {
+            FileManager.default.createFile(atPath: path, contents: data)
+        }
     }
 
     @objc private func endSiblingEdit() {
@@ -758,6 +804,9 @@ func writeBringToFrontWindowReport(
         }
         if let floating = matrix.floating {
             lines.append("floating=\(floating.windowNumber)")
+        }
+        if let child = matrix.child {
+            lines.append("child=\(child.windowNumber)")
         }
     }
     do {

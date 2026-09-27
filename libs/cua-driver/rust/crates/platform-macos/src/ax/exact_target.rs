@@ -54,8 +54,7 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
         }
         let parent = copy_element_attr(current, "AXParent");
         // A top-level element that is not a window (Finder's inline rename
-        // field) is its own WindowServer child window; map it and fold it
-        // into the window that owns it.
+        // field) is its own WindowServer window; map that window.
         if let Some(app) = parent {
             if copy_string_attr(app, "AXRole").as_deref() == Some("AXApplication") {
                 CFRelease(app as CFTypeRef);
@@ -96,7 +95,9 @@ pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUI
         return result;
     }
     let element = focused_element_of_pid(pid)?;
-    if element_window_id(element) == Some(window_id) {
+    if element_window_id(element)
+        .is_some_and(|id| crate::ax::bindings::window_belongs_to(id, window_id))
+    {
         Some(element)
     } else {
         CFRelease(element as CFTypeRef);
@@ -144,14 +145,14 @@ fn count_competing_keyboard_destinations(
     target_window_id: u32,
     window_server_rows: impl IntoIterator<Item = (i32, u32)>,
     ax_records: &[AxWindowRecord],
-    owning_window_id: impl Fn(u32) -> u32,
+    part_of_target: impl Fn(u32) -> bool,
 ) -> usize {
     window_server_rows
         .into_iter()
         .filter(|(owner_pid, window_id)| {
             *owner_pid == pid
                 && *window_id != target_window_id
-                && owning_window_id(*window_id) != target_window_id
+                && !part_of_target(*window_id)
                 && ax_records
                     .iter()
                     .any(|record| record.window_id == *window_id && record.minimized != Some(true))
@@ -196,7 +197,9 @@ pub fn gather_background_facts(
             let records = ax_window_records(app, pid, window_id);
             let app_hidden = copy_bool_attr(app, "AXHidden");
             let element = element_ptr.map(|ptr| match element_window_id(ptr as AXUIElementRef) {
-                Some(id) if id == window_id => ElementAncestry::ProvenDescendant,
+                Some(id) if crate::ax::bindings::window_belongs_to(id, window_id) => {
+                    ElementAncestry::ProvenDescendant
+                }
                 Some(_) => ElementAncestry::OutsideTargetWindow,
                 None => ElementAncestry::Unproven,
             });
@@ -213,7 +216,7 @@ pub fn gather_background_facts(
             .iter()
             .map(|window| (window.pid, window.window_id)),
         &records,
-        crate::ax::bindings::owning_window_id,
+        |id| crate::ax::bindings::window_belongs_to(id, window_id),
     );
 
     BackgroundTargetFacts {
@@ -243,7 +246,7 @@ mod tests {
         let records = [ax_window(10, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records, |id| id),
+            count_competing_keyboard_destinations(42, 10, rows, &records, |_| false),
             0
         );
     }
@@ -254,7 +257,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records, |id| id),
+            count_competing_keyboard_destinations(42, 10, rows, &records, |_| false),
             1
         );
     }
@@ -265,7 +268,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(true))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records, |id| id),
+            count_competing_keyboard_destinations(42, 10, rows, &records, |_| false),
             0
         );
     }
@@ -280,10 +283,10 @@ mod tests {
             ax_window(21, None),
             ax_window(11, Some(false)),
         ];
-        let owner = |id| if id == 21 { 10 } else { id };
+        let child_of_target = |id| id == 21;
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records, owner),
+            count_competing_keyboard_destinations(42, 10, rows, &records, child_of_target),
             1
         );
     }
@@ -294,7 +297,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records, |id| id),
+            count_competing_keyboard_destinations(42, 10, rows, &records, |_| false),
             0
         );
     }

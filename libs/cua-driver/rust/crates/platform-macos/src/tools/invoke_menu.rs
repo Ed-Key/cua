@@ -329,7 +329,10 @@ fn focus_exact_window(pid: i32, window_id: u32) -> Result<(), String> {
         if exact_window_is_ready(
             crate::apps::frontmost_pid(),
             pid,
-            crate::ax::bindings::focused_window_id_of_pid(pid),
+            crate::ax::bindings::focused_as_target(
+                crate::ax::bindings::focused_window_id_of_pid(pid),
+                window_id,
+            ),
             window_id,
         ) {
             let since = stable_since.get_or_insert(now);

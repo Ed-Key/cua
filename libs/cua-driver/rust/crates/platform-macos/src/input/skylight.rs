@@ -921,7 +921,9 @@ const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
     let deadline = std::time::Instant::now() + ACTIVATION_WAIT_TIMEOUT;
     loop {
-        if crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id) {
+        if crate::ax::bindings::focused_window_id_of_pid(pid)
+            .is_some_and(|focused| crate::ax::bindings::window_belongs_to(focused, window_id))
+        {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -970,7 +972,12 @@ pub fn with_foreground_hid_activation(
         anyhow::bail!("could not resolve target window for foreground HID delivery");
     }
 
-    let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(target_pid);
+    // Focus inside a child of the target (Finder's rename field) is focus on
+    // the target: deliver without re-activating, which could end the edit.
+    let focused_window_id = crate::ax::bindings::focused_as_target(
+        crate::ax::bindings::focused_window_id_of_pid(target_pid),
+        target_wid,
+    );
     if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
     {
         // Re-activating an already key exact window can clear Chromium's
