@@ -600,7 +600,25 @@ unsafe fn surface_window_id_within(element: AXUIElementRef, levels: u8) -> Optio
             }
         }
     }
-    ax_get_window_id(element)
+    ax_get_window_id(element).map(owning_window_id)
+}
+
+/// Fold a WindowServer child window into the window that owns it.
+///
+/// Finder's inline rename field is a separate small child window whose AX
+/// element names only the application as its parent, so AX alone cannot tie
+/// it to its Finder window; WindowServer records the parent. Like a sheet, a
+/// child window is part of its parent for targeting and focus. Bounded, since
+/// child windows can nest.
+pub fn owning_window_id(window_id: u32) -> u32 {
+    let mut current = window_id;
+    for _ in 0..4 {
+        match crate::input::skylight::window_parent_id(current) {
+            Some(parent) if parent != current => current = parent,
+            _ => break,
+        }
+    }
+    current
 }
 
 /// The own WindowServer id of a sheet (an Open panel, a save prompt)
@@ -638,9 +656,19 @@ pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
             return None;
         }
         let window = copy_element_attr(app, "AXFocusedWindow");
+        let Some(window) = window else {
+            // Finder reports no focused window while its inline rename field
+            // (a child window) has focus; the focused element still resolves.
+            let element = copy_element_attr(app, "AXFocusedUIElement");
+            CFRelease(app as CFTypeRef);
+            let element = element?;
+            let window_id = crate::ax::exact_target::element_window_id(element);
+            CFRelease(element as CFTypeRef);
+            return window_id;
+        };
         CFRelease(app as CFTypeRef);
-        let window = window?;
-        // A focused sheet means its parent window is the focused one.
+        // A focused sheet or child window means its parent window is the
+        // focused one.
         let window_id = surface_window_id(window);
         CFRelease(window as CFTypeRef);
         window_id
