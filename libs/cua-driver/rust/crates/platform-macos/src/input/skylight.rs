@@ -377,6 +377,52 @@ pub(super) fn set_integer_field(event_ptr: *mut c_void, field: u32, value: i64) 
     }
 }
 
+/// WindowServer's parent window of `window_id`, when it has one.
+///
+/// A child window (`-[NSWindow addChildWindow:]`) is recorded with its parent
+/// in WindowServer. Finder's inline rename field is such a window: a separate
+/// small window whose AX element names only the application as its parent, so
+/// WindowServer is the only place that links it back to its Finder window.
+/// `None` means no parent (a top-level window) or the query is unavailable.
+pub fn window_parent_id(window_id: u32) -> Option<u32> {
+    type QueryWindows = unsafe extern "C" fn(u32, *const c_void, u32) -> *const c_void;
+    type CopyWindows = unsafe extern "C" fn(*const c_void) -> *const c_void;
+    type Advance = unsafe extern "C" fn(*const c_void) -> bool;
+    type GetU32 = unsafe extern "C" fn(*const c_void) -> u32;
+    use core_foundation::array::CFArray;
+    use core_foundation::base::TCFType;
+    use core_foundation::number::CFNumber;
+
+    let cid = main_connection_id()?;
+    let query_windows: QueryWindows = unsafe { as_fn(find_sym(b"SLSWindowQueryWindows\0")?) };
+    let copy_windows: CopyWindows = unsafe { as_fn(find_sym(b"SLSWindowQueryResultCopyWindows\0")?) };
+    let advance: Advance = unsafe { as_fn(find_sym(b"SLSWindowIteratorAdvance\0")?) };
+    let parent_of: GetU32 = unsafe { as_fn(find_sym(b"SLSWindowIteratorGetParentID\0")?) };
+    let window_of: GetU32 = unsafe { as_fn(find_sym(b"SLSWindowIteratorGetWindowID\0")?) };
+
+    let ids = CFArray::from_CFTypes(&[CFNumber::from(window_id as i32)]);
+    unsafe {
+        let query = query_windows(cid, ids.as_concrete_TypeRef() as *const c_void, 0);
+        if query.is_null() {
+            return None;
+        }
+        let iterator = copy_windows(query);
+        core_foundation::base::CFRelease(query as _);
+        if iterator.is_null() {
+            return None;
+        }
+        let mut parent = None;
+        while advance(iterator) {
+            if window_of(iterator) == window_id {
+                parent = Some(parent_of(iterator)).filter(|id| *id != 0);
+                break;
+            }
+        }
+        core_foundation::base::CFRelease(iterator as _);
+        parent
+    }
+}
+
 /// Return the Skylight main connection ID for the current process.
 pub fn main_connection_id() -> Option<u32> {
     connection_id_fn().map(|f| unsafe { f() })
@@ -875,7 +921,9 @@ const ACTIVATION_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_
 fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
     let deadline = std::time::Instant::now() + ACTIVATION_WAIT_TIMEOUT;
     loop {
-        if crate::ax::bindings::focused_window_id_of_pid(pid) == Some(window_id) {
+        if crate::ax::bindings::focused_window_id_of_pid(pid)
+            .is_some_and(|focused| crate::ax::bindings::window_belongs_to(focused, window_id))
+        {
             return true;
         }
         if std::time::Instant::now() >= deadline {
@@ -924,7 +972,12 @@ pub fn with_foreground_hid_activation(
         anyhow::bail!("could not resolve target window for foreground HID delivery");
     }
 
-    let focused_window_id = crate::ax::bindings::focused_window_id_of_pid(target_pid);
+    // Focus inside a child of the target (Finder's rename field) is focus on
+    // the target: deliver without re-activating, which could end the edit.
+    let focused_window_id = crate::ax::bindings::focused_as_target(
+        crate::ax::bindings::focused_window_id_of_pid(target_pid),
+        target_wid,
+    );
     if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
     {
         // Re-activating an already key exact window can clear Chromium's
@@ -948,7 +1001,12 @@ pub fn with_foreground_hid_activation(
         if prev_ok {
             unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
         }
-        anyhow::bail!("exact target window did not become focused for foreground HID delivery");
+        let focused = crate::ax::bindings::focused_window_id_of_pid(target_pid)
+            .map_or_else(|| "none".to_string(), |id| id.to_string());
+        anyhow::bail!(
+            "exact target window did not become focused for foreground HID delivery \
+             (window {target_wid} requested; the app reports window {focused} focused)"
+        );
     }
     settle_attached_sheet(target_pid, target_wid);
 

@@ -53,6 +53,15 @@ pub unsafe fn element_window_id(element: AXUIElementRef) -> Option<u32> {
             _ => {}
         }
         let parent = copy_element_attr(current, "AXParent");
+        // A top-level element that is not a window (Finder's inline rename
+        // field) is its own WindowServer window; map that window.
+        if let Some(app) = parent {
+            if copy_string_attr(app, "AXRole").as_deref() == Some("AXApplication") {
+                CFRelease(app as CFTypeRef);
+                resolved = crate::ax::bindings::surface_window_id(current);
+                break;
+            }
+        }
         if owned {
             CFRelease(current as CFTypeRef);
         }
@@ -86,7 +95,9 @@ pub unsafe fn focused_element_in_window(pid: i32, window_id: u32) -> Option<AXUI
         return result;
     }
     let element = focused_element_of_pid(pid)?;
-    if element_window_id(element) == Some(window_id) {
+    if element_window_id(element)
+        .is_some_and(|id| crate::ax::bindings::window_belongs_to(id, window_id))
+    {
         Some(element)
     } else {
         CFRelease(element as CFTypeRef);
@@ -127,17 +138,21 @@ unsafe fn ax_window_records(app: AXUIElementRef, pid: i32, window_id: u32) -> Ve
 /// not enough to prove another process-scoped keyboard destination. Requiring a
 /// fresh `AXWindows` mapping preserves the fail-closed two-window guard while
 /// ignoring render surfaces that cannot independently become the AX key window.
+/// A child window of the target (Finder's inline rename field) is part of the
+/// target, not a competitor.
 fn count_competing_keyboard_destinations(
     pid: i32,
     target_window_id: u32,
     window_server_rows: impl IntoIterator<Item = (i32, u32)>,
     ax_records: &[AxWindowRecord],
+    part_of_target: impl Fn(u32) -> bool,
 ) -> usize {
     window_server_rows
         .into_iter()
         .filter(|(owner_pid, window_id)| {
             *owner_pid == pid
                 && *window_id != target_window_id
+                && !part_of_target(*window_id)
                 && ax_records
                     .iter()
                     .any(|record| record.window_id == *window_id && record.minimized != Some(true))
@@ -182,7 +197,9 @@ pub fn gather_background_facts(
             let records = ax_window_records(app, pid, window_id);
             let app_hidden = copy_bool_attr(app, "AXHidden");
             let element = element_ptr.map(|ptr| match element_window_id(ptr as AXUIElementRef) {
-                Some(id) if id == window_id => ElementAncestry::ProvenDescendant,
+                Some(id) if crate::ax::bindings::window_belongs_to(id, window_id) => {
+                    ElementAncestry::ProvenDescendant
+                }
                 Some(_) => ElementAncestry::OutsideTargetWindow,
                 None => ElementAncestry::Unproven,
             });
@@ -199,6 +216,7 @@ pub fn gather_background_facts(
             .iter()
             .map(|window| (window.pid, window.window_id)),
         &records,
+        |id| crate::ax::bindings::window_belongs_to(id, window_id),
     );
 
     BackgroundTargetFacts {
@@ -228,7 +246,7 @@ mod tests {
         let records = [ax_window(10, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records),
+            count_competing_keyboard_destinations(42, 10, rows, &records, |_| false),
             0
         );
     }
@@ -239,7 +257,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records),
+            count_competing_keyboard_destinations(42, 10, rows, &records, |_| false),
             1
         );
     }
@@ -250,8 +268,26 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(true))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records),
+            count_competing_keyboard_destinations(42, 10, rows, &records, |_| false),
             0
+        );
+    }
+
+    #[test]
+    fn child_window_of_the_target_is_not_a_competitor() {
+        // Finder's inline rename field: its own AX-mapped window, a
+        // WindowServer child of the target. A real sibling still counts.
+        let rows = [(42, 10), (42, 21), (42, 11)];
+        let records = [
+            ax_window(10, Some(false)),
+            ax_window(21, None),
+            ax_window(11, Some(false)),
+        ];
+        let child_of_target = |id| id == 21;
+
+        assert_eq!(
+            count_competing_keyboard_destinations(42, 10, rows, &records, child_of_target),
+            1
         );
     }
 
@@ -261,7 +297,7 @@ mod tests {
         let records = [ax_window(10, Some(false)), ax_window(11, Some(false))];
 
         assert_eq!(
-            count_competing_keyboard_destinations(42, 10, rows, &records),
+            count_competing_keyboard_destinations(42, 10, rows, &records, |_| false),
             0
         );
     }

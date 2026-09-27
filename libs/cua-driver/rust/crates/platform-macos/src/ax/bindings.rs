@@ -603,6 +603,38 @@ unsafe fn surface_window_id_within(element: AXUIElementRef, levels: u8) -> Optio
     ax_get_window_id(element)
 }
 
+/// Whether `window_id` is `target`, or a WindowServer child window of it.
+///
+/// Finder's inline rename field is a separate small child window whose AX
+/// element names only the application as its parent, so AX alone cannot tie
+/// it to its Finder window; WindowServer records the parent. Callers keep
+/// exact ids (a child window can be targeted by its own id) and ask this only
+/// when deciding whether something counts as part of the requested window.
+pub fn window_belongs_to(window_id: u32, target: u32) -> bool {
+    belongs_via(window_id, target, crate::input::skylight::window_parent_id)
+}
+
+/// [`window_belongs_to`] with an injectable parent lookup. Bounded, since
+/// child windows can nest.
+fn belongs_via(window_id: u32, target: u32, parent_of: impl Fn(u32) -> Option<u32>) -> bool {
+    let mut current = window_id;
+    for _ in 0..5 {
+        if current == target {
+            return true;
+        }
+        match parent_of(current) {
+            Some(parent) if parent != current => current = parent,
+            _ => return false,
+        }
+    }
+    false
+}
+
+/// A focused window reading, reported as `target` when it is part of it.
+pub fn focused_as_target(focused: Option<u32>, target: u32) -> Option<u32> {
+    focused.map(|window| if window_belongs_to(window, target) { target } else { window })
+}
+
 /// The own WindowServer id of a sheet (an Open panel, a save prompt)
 /// attached to the app's window `window_id`, if one is attached.
 pub fn attached_sheet_of_window(pid: i32, window_id: u32) -> Option<u32> {
@@ -638,8 +670,17 @@ pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
             return None;
         }
         let window = copy_element_attr(app, "AXFocusedWindow");
+        let Some(window) = window else {
+            // Finder reports no focused window while its inline rename field
+            // (a child window) has focus; the focused element still resolves.
+            let element = copy_element_attr(app, "AXFocusedUIElement");
+            CFRelease(app as CFTypeRef);
+            let element = element?;
+            let window_id = crate::ax::exact_target::element_window_id(element);
+            CFRelease(element as CFTypeRef);
+            return window_id;
+        };
         CFRelease(app as CFTypeRef);
-        let window = window?;
         // A focused sheet means its parent window is the focused one.
         let window_id = surface_window_id(window);
         CFRelease(window as CFTypeRef);
@@ -1121,6 +1162,21 @@ pub unsafe fn copy_ax_windows_including(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn child_windows_belong_to_their_ancestors_only() {
+        // 21 is a child of 10; 30 is a child of 21; 11 is unrelated.
+        let parent_of = |id| match id {
+            21 => Some(10),
+            30 => Some(21),
+            _ => None,
+        };
+        assert!(super::belongs_via(10, 10, parent_of));
+        assert!(super::belongs_via(21, 10, parent_of));
+        assert!(super::belongs_via(30, 10, parent_of));
+        assert!(!super::belongs_via(10, 21, parent_of), "a parent is not part of its child");
+        assert!(!super::belongs_via(11, 10, parent_of));
+    }
+
     use super::*;
     use core_foundation::{boolean::CFBoolean, number::CFNumber};
 
