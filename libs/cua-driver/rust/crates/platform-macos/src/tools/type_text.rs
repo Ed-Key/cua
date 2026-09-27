@@ -371,7 +371,7 @@ impl Tool for TypeTextTool {
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y)
+                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y, Some(wid as u64))
                     .await;
                 self.state
                     .cursor_registry

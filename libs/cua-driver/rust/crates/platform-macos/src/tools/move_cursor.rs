@@ -145,7 +145,7 @@ impl Tool for MoveCursorTool {
                     );
                 }
                 // Preserve the first-move seeding and animation used by legacy moves.
-                crate::cursor::overlay::animate_cursor_to(cursor_id, x, y).await;
+                crate::cursor::overlay::animate_cursor_to(cursor_id, x, y, window_id.map(u64::from)).await;
             },
         )
         .await

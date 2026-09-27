@@ -312,6 +312,14 @@ const handlers = {
   },
 
   "debugger.targets": async () => chrome.debugger.getTargets(),
+
+  // The daemon asks when it starts following tab switches or a link connects:
+  // every window's current selection, before any switch happens.
+  "tabs.reportSelection": async () => {
+    const windows = await chrome.windows.getAll();
+    await Promise.all(windows.map((window) => reportWindow(window.id)));
+    return { windows: windows.length };
+  },
 };
 
 // The window's "Cua" group, reused while it exists.
@@ -394,6 +402,37 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   if (reason === "canceled_by_user") void stopTab(source.tabId);
   post({ jsonrpc: "2.0", method: "debugger.detached", params: { source, reason } });
 });
+
+// The daemon shows each session's cursor only over the tab it works in, so it
+// hears when the selected tab changes, whether the user or Cua switched it.
+// With every tab of the window, so the daemon finds the window even when no
+// session works in the new tab (and hides the others' cursors).
+// Numbered per window: a slow report superseded by a later switch is dropped
+// so it cannot arrive last and win.
+const activationReports = new Map();
+async function reportWindow(windowId) {
+  const report = (activationReports.get(windowId) ?? 0) + 1;
+  activationReports.set(windowId, report);
+  // Page targets only, as the relay reports them: a tab can list other kinds.
+  const [all, tabs] = await Promise.all([chrome.debugger.getTargets(), chrome.tabs.query({ windowId })]);
+  if (activationReports.get(windowId) !== report) return;
+  const targets = all.filter((target) => target.type === "page");
+  const inWindow = new Set(tabs.map((tab) => tab.id));
+  const windowTargets = targets.filter((target) => inWindow.has(target.tabId)).map((target) => target.id);
+  const active = tabs.find((tab) => tab.active)?.id;
+  const selected = targets.find((target) => target.tabId === active)?.id ?? null;
+  post({ jsonrpc: "2.0", method: "tabs.activated", params: { targetId: selected, windowId, windowTargets } });
+}
+chrome.tabs.onActivated.addListener(({ windowId }) => void reportWindow(windowId));
+// A closed window has no selected tab: report it empty so its cursors hide,
+// and outdate any report for it still being assembled.
+chrome.windows.onRemoved.addListener((windowId) => {
+  activationReports.set(windowId, (activationReports.get(windowId) ?? 0) + 1);
+  post({ jsonrpc: "2.0", method: "tabs.activated", params: { targetId: null, windowId, windowTargets: [] } });
+});
+// A tab dragged to another window changes both windows' tab lists.
+chrome.tabs.onDetached.addListener((_, { oldWindowId }) => void reportWindow(oldWindowId));
+chrome.tabs.onAttached.addListener((_, { newWindowId }) => void reportWindow(newWindowId));
 
 chrome.runtime.onMessage.addListener((message, sender) => {
   if (message?.type === "cua-stop" && sender.tab?.id !== undefined) void stopTab(sender.tab.id);
