@@ -578,6 +578,17 @@ final class HarnessWindowController: NSObject, NSTextFieldDelegate, NSTableViewD
         menuActionLabel.stringValue = "menu_action=window_arrange_left"
     }
 
+    // Like a document save, the work lands on a later run-loop turn and acts
+    // on whichever window is key then. Records that window's number to
+    // CUA_HARNESS_MENU_JOURNAL.
+    @objc func onRecordKeyLater(_ sender: NSMenuItem) {
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+            guard let path = ProcessInfo.processInfo.environment["CUA_HARNESS_MENU_JOURNAL"] else { return }
+            let key = NSApp.keyWindow.map { String($0.windowNumber) } ?? "none"
+            try? "key=\(key)\n".write(toFile: path, atomically: true, encoding: .utf8)
+        }
+    }
+
     func validateMenuItem(_ menuItem: NSMenuItem) -> Bool {
         if menuItem.action == #selector(onArrangeLeft(_:)) {
             // Real macOS Window-menu commands are contextual: the application
@@ -847,6 +858,13 @@ func installMenuBar(target: HarnessWindowController) {
     arrangeMenu.addItem(leftItem)
     arrangeItem.submenu = arrangeMenu
     windowMenu.addItem(arrangeItem)
+    let recordItem = NSMenuItem(
+        title: "Record Key Window Later",
+        action: #selector(HarnessWindowController.onRecordKeyLater(_:)),
+        keyEquivalent: ""
+    )
+    recordItem.target = target
+    windowMenu.addItem(recordItem)
     windowItem.submenu = windowMenu
     main.addItem(windowItem)
     NSApp.mainMenu = main

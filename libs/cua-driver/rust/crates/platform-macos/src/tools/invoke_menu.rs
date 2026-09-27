@@ -402,24 +402,22 @@ impl Tool for InvokeMenuTool {
             let prior_frontmost = crate::apps::frontmost_pid();
             let prior_frontmost_window =
                 prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
-            let needs_activation = prior_frontmost != Some(pid);
 
             let result = focus_exact_window(pid, window_id)
                 .and_then(|()| unsafe { invoke_path(pid, &path) });
 
-            // Restore the exact prior key window when one was observable,
-            // including across applications. Falling back to app activation
-            // preserves the previous behavior for apps without an AX window.
-            if let Some(prior_pid) = prior_frontmost {
-                let already_restored =
-                    prior_pid == pid && prior_frontmost_window == Some(window_id);
-                if !already_restored {
-                    let restored_exact = prior_frontmost_window.is_some_and(|prior_window_id| {
-                        focus_exact_window(prior_pid, prior_window_id).is_ok()
-                    });
-                    if needs_activation && !restored_exact {
-                        let _ = crate::apps::restore_prior_app(prior_pid);
-                    }
+            // Restore the exact prior key window of another application when one
+            // was observable, falling back to app activation for apps without
+            // an AX window. Within the target application the requested window
+            // stays key: the menu command acts on the key window after this
+            // call returns (TextEdit writes a saved document asynchronously),
+            // and re-keying a sibling document dropped the save.
+            if let Some(prior_pid) = prior_frontmost.filter(|prior_pid| *prior_pid != pid) {
+                let restored_exact = prior_frontmost_window.is_some_and(|prior_window_id| {
+                    focus_exact_window(prior_pid, prior_window_id).is_ok()
+                });
+                if !restored_exact {
+                    let _ = crate::apps::restore_prior_app(prior_pid);
                 }
             }
             result
