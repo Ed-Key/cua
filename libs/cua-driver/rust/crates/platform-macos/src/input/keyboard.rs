@@ -409,11 +409,14 @@ pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()
         }
     }
 
-    let events = bare_chord_transitions(key_code, &chord)
+    let key_flag = modifier_key_code_and_flag(key).map(|(_, flag)| flag);
+    let events = bare_chord_transitions(key_code, key_flag, &chord)
         .into_iter()
         .map(|(code, down, flags)| {
             let event = create_bare_keyboard_event(code, down)?;
-            event.set_flags(flags);
+            if let Some(flags) = flags {
+                event.set_flags(flags);
+            }
             Ok(event)
         })
         .collect::<anyhow::Result<Vec<_>>>()?;
@@ -424,21 +427,33 @@ pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()
     Ok(())
 }
 
+/// The chord's transitions with the flags each event should carry. A base key
+/// that is itself a modifier carries its own flag while down. Caps Lock is a
+/// toggle whose flag reports lock state, so its events keep the flags
+/// CoreGraphics derives (`None`).
 fn bare_chord_transitions(
     key_code: u16,
+    key_flag: Option<CGEventFlags>,
     chord: &[(u16, CGEventFlags)],
-) -> Vec<(u16, bool, CGEventFlags)> {
+) -> Vec<(u16, bool, Option<CGEventFlags>)> {
+    const CAPS_LOCK: u16 = 57;
     let mut transitions = Vec::with_capacity(chord.len() * 2 + 2);
     let mut flags = CGEventFlags::CGEventFlagNull;
     for &(code, flag) in chord {
         flags |= flag;
-        transitions.push((code, true, flags));
+        transitions.push((code, true, Some(flags)));
     }
-    transitions.push((key_code, true, flags));
-    transitions.push((key_code, false, flags));
+    let (base_down, base_up) = if key_code == CAPS_LOCK {
+        (None, None)
+    } else {
+        let own = key_flag.unwrap_or(CGEventFlags::CGEventFlagNull);
+        (Some(flags | own), Some(flags))
+    };
+    transitions.push((key_code, true, base_down));
+    transitions.push((key_code, false, base_up));
     for &(code, flag) in chord.iter().rev() {
         flags &= !flag;
-        transitions.push((code, false, flags));
+        transitions.push((code, false, Some(flags)));
     }
     transitions
 }
@@ -808,22 +823,46 @@ mod tests {
     #[test]
     fn bare_command_chord_orders_modifier_base_and_reverse_release() {
         let cmd = CGEventFlags::CGEventFlagCommand;
+        let shift = CGEventFlags::CGEventFlagShift;
         let none = CGEventFlags::CGEventFlagNull;
         assert_eq!(
-            bare_chord_transitions(9, &[(55, cmd)]),
-            vec![(55, true, cmd), (9, true, cmd), (9, false, cmd), (55, false, none)]
-        );
-        let shift = CGEventFlags::CGEventFlagShift;
-        assert_eq!(
-            bare_chord_transitions(9, &[(55, cmd), (56, shift)]),
+            bare_chord_transitions(9, None, &[(55, cmd)]),
             vec![
-                (55, true, cmd),
-                (56, true, cmd | shift),
-                (9, true, cmd | shift),
-                (9, false, cmd | shift),
-                (56, false, cmd),
-                (55, false, none)
+                (55, true, Some(cmd)),
+                (9, true, Some(cmd)),
+                (9, false, Some(cmd)),
+                (55, false, Some(none))
             ]
+        );
+        assert_eq!(
+            bare_chord_transitions(9, None, &[(55, cmd), (56, shift)]),
+            vec![
+                (55, true, Some(cmd)),
+                (56, true, Some(cmd | shift)),
+                (9, true, Some(cmd | shift)),
+                (9, false, Some(cmd | shift)),
+                (56, false, Some(cmd)),
+                (55, false, Some(none))
+            ]
+        );
+        // A modifier pressed on its own keeps its flag while down.
+        assert_eq!(
+            bare_chord_transitions(56, Some(shift), &[]),
+            vec![(56, true, Some(shift)), (56, false, Some(none))]
+        );
+        assert_eq!(
+            bare_chord_transitions(56, Some(shift), &[(55, cmd)]),
+            vec![
+                (55, true, Some(cmd)),
+                (56, true, Some(cmd | shift)),
+                (56, false, Some(cmd)),
+                (55, false, Some(none))
+            ]
+        );
+        // Caps Lock reports lock state, so CoreGraphics keeps deriving it.
+        assert_eq!(
+            bare_chord_transitions(57, None, &[]),
+            vec![(57, true, None), (57, false, None)]
         );
         let command_down = create_bare_keyboard_event(55, true).unwrap();
         assert_eq!(
