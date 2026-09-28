@@ -720,13 +720,15 @@ pub fn current_runtime_cache<S: SnapshotPayload>() -> Option<Arc<ElementCacheCor
 /// A token already names the snapshot it came from, and this runtime's cache
 /// knows which process and window that snapshot observed, so requiring the
 /// caller to repeat `pid` only turned token-only calls into errors. Runs
-/// before authorization, so policy sees the same target the tool acts on.
+/// after typed-target normalization and before authorization, so policy sees
+/// the same target the tool acts on.
 /// Stale or foreign tokens are left alone; the tool reports them as before.
 pub fn fill_target_from_element_token(args: &mut serde_json::Value) {
     let Some(object) = args.as_object_mut() else {
         return;
     };
-    if object.get("pid").is_some_and(|pid| !pid.is_null()) {
+    // A scoped call (desktop actions) keeps its meaning; so does any caller pid.
+    if object.contains_key("scope") || object.get("pid").is_some_and(|pid| !pid.is_null()) {
         return;
     }
     let Some((snapshot_id, _)) = object

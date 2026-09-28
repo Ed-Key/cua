@@ -1130,11 +1130,13 @@ impl ToolRegistry {
         // Normalize deprecated public argument spellings before any policy,
         // consent, recording, or implementation layer interprets the call.
         normalize_delivery_mode_args(tool.def(), &mut args);
-        crate::element_cache::fill_target_from_element_token(&mut args);
         if let Err(result) = crate::action_target::normalize_action_target(resolved_name, &mut args)
         {
             return result;
         }
+        // After target normalization: a typed `target` has become pid/window_id
+        // and is left alone.
+        crate::element_cache::fill_target_from_element_token(&mut args);
         if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {
             return result;
         }
@@ -4815,6 +4817,27 @@ resources:
         )
         .await;
         assert_eq!((window_kept["pid"].clone(), window_kept["window_id"].clone()), (pid.into(), 2.into()));
+
+        // Dispatch order: a typed target is normalized first, so a matching
+        // token-only element click through the SDK still passes.
+        let typed = DISPATCH_RUNTIME_SCOPE
+            .scope("token-fill-runtime-a".to_owned(), async {
+                let mut args = serde_json::json!({
+                    "element_token": token,
+                    "target": {"kind": "window", "pid": pid, "window_id": 45},
+                });
+                crate::action_target::normalize_action_target("click", &mut args).unwrap();
+                crate::element_cache::fill_target_from_element_token(&mut args);
+                args
+            })
+            .await;
+        assert_eq!((typed["pid"].clone(), typed["window_id"].clone()), (pid.into(), 45.into()));
+        let scoped = fill(
+            "token-fill-runtime-a",
+            serde_json::json!({"element_token": token, "scope": "desktop"}),
+        )
+        .await;
+        assert!(scoped.get("pid").is_none());
 
         // Another runtime generation's token and a malformed token stay unresolved.
         let foreign = fill("token-fill-runtime-b", serde_json::json!({"element_token": token})).await;
