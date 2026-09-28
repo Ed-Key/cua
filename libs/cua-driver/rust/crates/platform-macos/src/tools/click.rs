@@ -187,7 +187,7 @@ fn def() -> &'static ToolDef {
                Works on backgrounded/hidden windows without moving the real mouse pointer or stealing focus. \
                The visible agent cursor follows the configured motion policy automatically. \
                The snapshot cache is scoped per (pid, window_id) and is replaced by the \
-               next snapshot of the same window — re-snapshot every turn before clicking.\n\n\
+               next snapshot of the same window, so tokens from the latest snapshot stay valid for several clicks in a row.\n\n\
              - x, y (window-local screenshot pixels, top-left origin of the PNG returned \
                by get_window_state): CGEvent path. Synthesizes mouse events and posts to \
                pid. Use modifier for cmd/shift/option/ctrl. Needs a visible on-screen \

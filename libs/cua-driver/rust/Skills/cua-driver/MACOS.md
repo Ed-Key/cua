@@ -560,6 +560,16 @@ act_and_read({pid, window_id, action:"click", element_token,
   observe:{include_screenshot:false}})
 ```
 
+For several actions whose targets are already visible, pass `steps` instead of `action` and read once at the end. Steps run in order in the background and stop at the first failure; the response names the step that stopped:
+
+```javascript
+act_and_read({pid, window_id, steps:[
+  {action:"click", element_token:"s0000002a:7"},
+  {action:"click", element_token:"s0000002a:3"},
+  {action:"hotkey", keys:["cmd","c"]}],
+  observe:{include_screenshot:false}})
+```
+
 For replacing an entire writable field, the same tool accepts `action:"set_value"` and `value`. Request `observe.include_screenshot:true` when the resulting rendered field needs verification. Read action status and observation separately: an observation does not promote an uncertain action to success. Use ordinary tools for discovery or unsupported actions. On an action error, inspect the returned observation before deciding the next action. If transport fails or times out, stop issuing input and report the uncertainty. A timeout is not proof that input stopped; never blindly replay the action.
 
 When `act_and_read` advertises scroll, it also accepts `action:"scroll"`, a fresh `element_token` for the intended scroll container, and `direction` (`up`, `down`, `left`, or `right`). Optional `by` (`line` or `page`) and `amount` (1 through 50) have the same defaults as the ordinary scroll tool. It returns the subsequent read in the same response. For example:

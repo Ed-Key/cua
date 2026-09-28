@@ -378,6 +378,13 @@ fn agent_instructions() -> String {
         )
     };
 
+    // act_and_read is registered only on macOS; elsewhere keep the one-action step.
+    let act_step = if cfg!(target_os = "macos") {
+        "Batch visible steps in one `act_and_read` `steps` call."
+    } else {
+        "Act with the fresh index."
+    };
+
     format!(
         r#"cua-driver: cross-platform background computer-use automation.
 
@@ -387,10 +394,10 @@ On continuation/recent-work, when available, call `history_status`; if ready, ma
 
 For app/window outcomes, use the narrowest semantic Cua route first: `set_window_frame` plus `list_windows` readback for geometry, typed browser tools for supported page content, and clipboard tools for clipboard state. Then climb through background `element_index` ({tree_kind}), background pixels, foreground delivery, and desktop fallback. Never advance on transport success alone.
 
-Workflow per turn:
+Workflow per task:
 0. `start_session` is optional. For multi-call work, prefer a short `session` label and repeat it on every call that accepts it. Unnamed calls use the transport's implicit session. Only `start_session` revives an ended name; `end_session` explicitly cleans up.
-1. `launch_app`, then `get_window_state(pid, window_id)` to refresh element indices.
-2. Act with the fresh index.
+1. `launch_app`, then `get_window_state(pid, window_id)`.
+2. {act_step}
 3. `verify_state(pid, window_id, expect)` checks bounded postconditions. `unknown` is not success; `include_screenshot:true` lets the multimodal agent judge visual evidence.
 
 Read `skill://cua-driver/SKILL.md` via `skills/get` or `resources/read`. Hosts control activation/consent. When activated, follow SKILL.md and {platform_skill_pointer}."#

@@ -9,7 +9,7 @@
   "tools": [
     {
       "name": "act_and_read",
-      "description": "macOS: run one token-targeted background click, set_value or scroll, then read the same window's fresh accessibility state. Use when you already intend to act and inspect. Scroll requires direction, accepts optional by and amount, and uses the existing scroll tool defaults. Tree-only by default; observe selects query/context and optional screenshot. Returns both child results separately, including action errors. No retries or semantic verification: a fresh read does not prove the action succeeded. Not a transaction against other clients or user input. Windows and Linux are not yet supported.",
+      "description": "macOS: act, then read the same window's fresh accessibility state in one call. Pass one token-targeted background click, set_value or scroll, or `steps`: up to 8 actions on this window (click, set_value, scroll, type_text, press_key, hotkey), run in order in the background and stopped at the first failure. Use steps for work whose targets are already visible, such as several button presses or a field then its submit button, instead of one call per action. Tree-only by default; observe selects query/context and optional screenshot. Returns each child result, including errors and which step stopped. No retries or semantic verification: the fresh read shows what happened. Not a transaction against other clients or user input. Windows and Linux are not yet supported.",
       "platforms": [
         "macos"
       ],
@@ -27,6 +27,7 @@
         "additionalProperties": false,
         "properties": {
           "action": {
+            "description": "Single-action form: click, set_value or scroll. Omit when passing steps.",
             "enum": [
               "click",
               "set_value",
@@ -59,6 +60,7 @@
             "type": "string"
           },
           "element_token": {
+            "description": "Single-action form: the target element. Omit when passing steps.",
             "type": "string"
           },
           "observe": {
@@ -102,6 +104,88 @@
             "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Unnamed calls use the transport's implicit session.",
             "type": "string"
           },
+          "steps": {
+            "description": "Instead of action: 1 to 8 actions on this window, run in order and stopped at the first\nfailure, then one observation.",
+            "items": {
+              "additionalProperties": false,
+              "description": "One action in `steps`. Every step targets the call's pid and window_id.",
+              "properties": {
+                "action": {
+                  "enum": [
+                    "click",
+                    "set_value",
+                    "scroll",
+                    "type_text",
+                    "press_key",
+                    "hotkey"
+                  ],
+                  "type": "string"
+                },
+                "amount": {
+                  "description": "Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.",
+                  "maximum": 50,
+                  "minimum": 1,
+                  "type": "integer"
+                },
+                "by": {
+                  "description": "Scroll only. Omit to retain the scroll tool's line default.",
+                  "enum": [
+                    "line",
+                    "page"
+                  ],
+                  "type": "string"
+                },
+                "direction": {
+                  "description": "Required for scroll; not allowed for other actions.",
+                  "enum": [
+                    "up",
+                    "down",
+                    "left",
+                    "right"
+                  ],
+                  "type": "string"
+                },
+                "element_token": {
+                  "description": "Required for click, set_value and scroll; optional for type_text; not allowed for\npress_key and hotkey.",
+                  "type": "string"
+                },
+                "key": {
+                  "description": "Required for press_key; not allowed for other actions.",
+                  "type": "string"
+                },
+                "keys": {
+                  "description": "Required for hotkey, for example [\"cmd\", \"a\"]; not allowed for other actions.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "minItems": 1,
+                  "type": "array"
+                },
+                "modifiers": {
+                  "description": "Optional for press_key; not allowed for other actions.",
+                  "items": {
+                    "type": "string"
+                  },
+                  "type": "array"
+                },
+                "text": {
+                  "description": "Required for type_text; not allowed for other actions.",
+                  "type": "string"
+                },
+                "value": {
+                  "description": "Required for set_value; not allowed for other actions.",
+                  "type": "string"
+                }
+              },
+              "required": [
+                "action"
+              ],
+              "type": "object"
+            },
+            "maxItems": 8,
+            "minItems": 1,
+            "type": "array"
+          },
           "value": {
             "description": "Required for action set_value; not allowed for other actions.",
             "type": "string"
@@ -114,9 +198,7 @@
         },
         "required": [
           "pid",
-          "window_id",
-          "action",
-          "element_token"
+          "window_id"
         ],
         "type": "object"
       },
@@ -142,6 +224,30 @@
               "structuredContent": true
             },
             "type": "object"
+          },
+          "steps": {
+            "items": {
+              "additionalProperties": false,
+              "properties": {
+                "isError": {
+                  "type": "boolean"
+                },
+                "structuredContent": true
+              },
+              "type": "object"
+            },
+            "type": [
+              "array",
+              "null"
+            ]
+          },
+          "stopped_at": {
+            "format": "uint32",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
           },
           "timings": {
             "additionalProperties": false,
