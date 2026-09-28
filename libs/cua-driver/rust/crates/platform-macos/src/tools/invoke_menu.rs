@@ -420,7 +420,15 @@ impl Tool for InvokeMenuTool {
                 if !restored_exact {
                     let _ = crate::apps::restore_prior_app(prior_pid);
                 }
-                front_restored = Some(crate::apps::frontmost_pid() == Some(prior_pid));
+                // Fallback activation is asynchronous and NSWorkspace's frontmost
+                // app can lag it, so confirm within a short bound.
+                let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                let mut restored = crate::apps::frontmost_pid() == Some(prior_pid);
+                while !restored && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                    restored = crate::apps::frontmost_pid() == Some(prior_pid);
+                }
+                front_restored = Some(restored);
             }
             result.map(|()| front_restored)
         })
@@ -431,7 +439,7 @@ impl Tool for InvokeMenuTool {
                 "Resolved the live native menu path and dispatched its final accessibility action; verify the command's semantic effect from fresh state.{}",
                 match front_restored {
                     Some(true) => " The target app was active only for the menu action; the previous front app is front again.",
-                    Some(false) => " The target app was activated for the menu action and the previous front app could not be restored.",
+                    Some(false) => " The target app was activated for the menu action; the previous front app was not confirmed back in front.",
                     None => "",
                 }
             ))
