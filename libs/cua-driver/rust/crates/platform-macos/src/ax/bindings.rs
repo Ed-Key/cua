@@ -767,6 +767,77 @@ pub unsafe fn copy_element_attr(
 /// # Safety
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+/// Whether an element currently answers accessibility requests (it has not
+/// been destroyed). Read right before an action, so a stale handle is never
+/// mistaken for one the action replaced.
+///
+/// # Safety
+///
+/// `element` must be a valid (retained) `AXUIElementRef`.
+pub unsafe fn element_is_alive(element: AXUIElementRef) -> bool {
+    let attr = CFStr::new("AXRole");
+    let mut value: CFTypeRef = std::ptr::null();
+    let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+    if !value.is_null() {
+        CFRelease(value);
+    }
+    err != kAXErrorInvalidUIElement
+}
+
+/// Whether an action error means the action ran and replaced its element: the
+/// element was alive when dispatched, the action did not fail for being
+/// invalid (a stale handle fails that way before anything happens), and the
+/// element is gone afterwards.
+pub fn action_replaced_element(action_error: AXError, alive_before: bool, gone_after: impl FnOnce() -> bool) -> bool {
+    action_error != kAXErrorSuccess
+        && action_error != kAXErrorInvalidUIElement
+        && alive_before
+        && gone_after()
+}
+
+/// Whether an element stopped existing right after an action on it.
+///
+/// An action can replace the very element it was performed on: Finder's
+/// AXOpen on a folder icon navigates the window, destroying the icon, and the
+/// action call then returns an error although it ran. Afterwards the element
+/// answers every attribute with kAXErrorInvalidUIElement. Finder takes a few
+/// hundred milliseconds to tear the icon down, so this polls for up to 800 ms
+/// of wall-clock time, with each native request bounded by what is left of
+/// that budget (an unresponsive app would otherwise hold each read for the
+/// element's normal messaging timeout). It only runs after an action already
+/// failed, so it never slows a success.
+///
+/// # Safety
+///
+/// `element` must be a valid (retained) `AXUIElementRef`.
+pub unsafe fn element_gone_after_action(element: AXUIElementRef) -> bool {
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(800);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + BUDGET;
+    let mut gone = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let _ = AXUIElementSetMessagingTimeout(element, remaining.as_secs_f32().max(0.05));
+        let attr = CFStr::new("AXRole");
+        let mut value: CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        if err == kAXErrorInvalidUIElement {
+            gone = true;
+            break;
+        }
+        std::thread::sleep(POLL.min(deadline.saturating_duration_since(std::time::Instant::now())));
+    }
+    // Restore the element's normal per-request bound for any later use.
+    let _ = AXUIElementSetMessagingTimeout(element, crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS);
+    gone
+}
+
 pub unsafe fn perform_action(element: AXUIElementRef, action_name: &str) -> AXError {
     #[cfg(test)]
     if let Some(result) = test_support::perform_action(element, action_name) {
@@ -1162,6 +1233,21 @@ pub unsafe fn copy_ax_windows_including(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn only_an_action_that_destroyed_a_live_element_counts_as_replaced() {
+        use super::{action_replaced_element, kAXErrorInvalidUIElement, kAXErrorSuccess};
+        let attribute_unsupported = -25205;
+        // Finder: alive at dispatch, error, gone afterwards.
+        assert!(action_replaced_element(attribute_unsupported, true, || true));
+        // Stale handle: dead before dispatch, or the action failed as invalid.
+        assert!(!action_replaced_element(attribute_unsupported, false, || true));
+        assert!(!action_replaced_element(kAXErrorInvalidUIElement, true, || true));
+        // Still there afterwards: a real failure.
+        assert!(!action_replaced_element(attribute_unsupported, true, || false));
+        // Success needs no reinterpretation, and the after-probe is not run.
+        assert!(!action_replaced_element(kAXErrorSuccess, true, || panic!("probed after success")));
+    }
+
     #[test]
     fn child_windows_belong_to_their_ancestors_only() {
         // 21 is a child of 10; 30 is a child of 21; 11 is unrelated.
