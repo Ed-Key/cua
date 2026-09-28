@@ -879,8 +879,7 @@ pub fn with_foreground_assist(
     // key window. Without this the app is "frontmost" to WindowServer while
     // remaining, from AppKit's point of view, unfocused — so the AXFocused
     // write in the body has no responder chain to attach to.
-    make_exact_window_key(target_pid, target_wid);
-    await_window_focused(target_pid, target_wid);
+    focus_exact_window(target_pid, target_wid);
     settle_attached_sheet(target_pid, target_wid);
 
     let result = body();
@@ -931,6 +930,33 @@ fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
         }
         std::thread::sleep(ACTIVATION_POLL_INTERVAL);
     }
+}
+
+/// Make `target_wid` the app's focused window after its process was fronted,
+/// and report whether that was observed.
+///
+/// SkyLight's key-window records are the quiet first try. They do not move key
+/// status from one window of an app to another in every app: with a second
+/// Finder window key, Finder keeps it and the requested window never becomes
+/// focused. The exact AX window raise that `bring_to_front` uses completes
+/// that case, so it runs when the records alone did not land.
+fn focus_exact_window(pid: libc::pid_t, window_id: u32) -> bool {
+    focus_with_ax_fallback(
+        || {
+            make_exact_window_key(pid, window_id);
+        },
+        || await_window_focused(pid, window_id),
+        || crate::ax::bindings::raise_exact_window(pid, window_id),
+    )
+}
+
+fn focus_with_ax_fallback(
+    request_key: impl FnOnce(),
+    mut await_focused: impl FnMut() -> bool,
+    raise_ax_window: impl FnOnce() -> bool,
+) -> bool {
+    request_key();
+    await_focused() || (raise_ax_window() && await_focused())
 }
 
 /// Give an attached sheet (an Open panel) time to take key status once its
@@ -996,8 +1022,7 @@ pub fn with_foreground_hid_activation(
         anyhow::bail!("WindowServer rejected foreground HID activation");
     }
 
-    make_exact_window_key(target_pid, target_wid);
-    if !await_window_focused(target_pid, target_wid) {
+    if !focus_exact_window(target_pid, target_wid) {
         if prev_ok {
             unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
         }
@@ -1034,7 +1059,7 @@ fn preserves_exact_existing_focus(
 
 #[cfg(test)]
 mod tests {
-    use super::{make_key_window_record, preserves_exact_existing_focus};
+    use super::{focus_with_ax_fallback, make_key_window_record, preserves_exact_existing_focus};
 
     #[test]
     fn make_key_records_address_only_the_exact_window() {
@@ -1047,6 +1072,29 @@ mod tests {
         assert_eq!(&press[0x3C..0x40], &[0x12, 0x34, 0x56, 0x78]);
         assert_eq!(press[0x3A], 0x10);
         assert!(press[0x20..0x30].iter().all(|byte| *byte == 0xFF));
+    }
+
+    #[test]
+    fn exact_window_focus_falls_back_to_the_ax_raise() {
+        // Finder with another of its windows key ignores the key-window
+        // records; the AX raise is what focuses the requested window.
+        let mut focused = [false, true].into_iter();
+        let mut raised = false;
+        assert!(focus_with_ax_fallback(
+            || {},
+            || focused.next().unwrap(),
+            || {
+                raised = true;
+                true
+            }
+        ));
+        assert!(raised);
+
+        // Already focused after the records: no AX raise.
+        assert!(focus_with_ax_fallback(|| {}, || true, || panic!("raised needlessly")));
+
+        // Neither works: refuse.
+        assert!(!focus_with_ax_fallback(|| {}, || false, || true));
     }
 
     #[test]

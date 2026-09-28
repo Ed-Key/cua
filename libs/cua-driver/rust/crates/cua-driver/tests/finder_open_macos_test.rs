@@ -115,3 +115,56 @@ fn click_open_on_a_finder_folder_opens_it_and_reports_success() {
         )
     });
 }
+
+/// The icon's state in a fresh snapshot with a screenshot: whether Finder
+/// reports it selected, and its centre in that screenshot's pixels.
+fn note_icon(driver: &mut McpDriver, pid: u64, window_id: u64) -> (bool, f64, f64) {
+    let deadline = Instant::now() + Duration::from_secs(8);
+    loop {
+        let state: ToolResponse = driver.call(
+            "get_window_state",
+            serde_json::json!({"pid": pid, "window_id": window_id, "diff": false, "timeout_ms": 4000}),
+        );
+        if let Some(icon) = state.structured()["elements"].as_array().and_then(|elements| {
+            elements.iter().find(|e| e["label"] == "note.txt" && e["role"] == "AXImage").cloned()
+        }) {
+            let frame = &icon["screenshot_frame"];
+            let centre = |pos: &str, size: &str| frame[pos].as_f64().unwrap() + frame[size].as_f64().unwrap() / 2.0;
+            return (icon["selected"] == true, centre("x", "w"), centre("y", "h"));
+        }
+        assert!(Instant::now() < deadline, "no note.txt icon in the Finder window");
+        std::thread::sleep(Duration::from_millis(300));
+    }
+}
+
+/// A foreground pixel click on a Finder window that is not Finder's key window
+/// (another Finder window is in front) must focus that exact window and select
+/// the icon. SkyLight's key-window request alone leaves the other window key,
+/// and the click then refused with "exact target window did not become
+/// focused".
+#[test]
+#[ignore]
+fn foreground_click_reaches_a_finder_window_behind_another() {
+    let mut driver = McpDriver::spawn_macos_daemon_proxy_named("macos-finder-foreground-click")
+        .expect("start installed macOS daemon proxy");
+    let target = folder_with_subfolder("fg-target");
+    let front = folder_with_subfolder("fg-front");
+    assert!(Command::new("open").arg(target.root.path()).status().expect("open target").success());
+    let (pid, window_id) = finder_window(&mut driver, &target.name);
+    assert!(Command::new("open").arg(front.root.path()).status().expect("open front").success());
+    finder_window(&mut driver, &front.name);
+    std::thread::sleep(Duration::from_millis(500));
+
+    let (_, x, y) = note_icon(&mut driver, pid, window_id);
+    let result = driver.call(
+        "click",
+        serde_json::json!({"pid": pid, "window_id": window_id, "x": x, "y": y, "delivery_mode": "foreground"}),
+    );
+    assert!(!result.is_error(), "foreground click refused: {}", result.text());
+
+    let deadline = Instant::now() + Duration::from_secs(3);
+    while !note_icon(&mut driver, pid, window_id).0 {
+        assert!(Instant::now() < deadline, "Finder did not select note.txt in the target window");
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
