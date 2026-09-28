@@ -767,6 +767,37 @@ pub unsafe fn copy_element_attr(
 /// # Safety
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+/// Whether an element stopped existing right after an action on it.
+///
+/// An action can replace the very element it was performed on: Finder's
+/// AXOpen on a folder icon navigates the window, destroying the icon, and the
+/// action call then returns an error although it ran. Afterwards the element
+/// answers every attribute with kAXErrorInvalidUIElement. Finder takes a few
+/// hundred milliseconds to tear the icon down, so poll for up to 800 ms. This
+/// only runs after an action already failed, so it never slows a success.
+///
+/// # Safety
+///
+/// `element` must be a valid (retained) `AXUIElementRef`.
+pub unsafe fn element_gone_after_action(element: AXUIElementRef) -> bool {
+    const POLLS: usize = 16;
+    for attempt in 0..POLLS {
+        let attr = CFStr::new("AXRole");
+        let mut value: CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
+        if !value.is_null() {
+            CFRelease(value);
+        }
+        if err == kAXErrorInvalidUIElement {
+            return true;
+        }
+        if attempt + 1 < POLLS {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+    }
+    false
+}
+
 pub unsafe fn perform_action(element: AXUIElementRef, action_name: &str) -> AXError {
     #[cfg(test)]
     if let Some(result) = test_support::perform_action(element, action_name) {

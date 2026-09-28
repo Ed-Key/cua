@@ -315,6 +315,15 @@ fn ax_double_click(
         if err == kAXErrorSuccess {
             return Ok(format!("AXOpen performed on element [{idx}]."));
         }
+        // Finder's AXOpen navigates the window, destroying the icon it was
+        // performed on, and then reports an error although it ran.
+        if unsafe { crate::ax::bindings::element_gone_after_action(element) } {
+            return Ok(format!(
+                "AXOpen performed on element [{idx}]; the element no longer exists afterwards \
+                 (the action replaced it; AX returned {err}). Take a fresh snapshot before \
+                 acting again: do not retry this action."
+            ));
+        }
         if !foreground {
             anyhow::bail!(
                 "AXOpen returned {err} for element [{idx}]; background delivery will not \

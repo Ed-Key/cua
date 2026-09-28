@@ -1627,6 +1627,24 @@ fn perform_ax_click(
     }
 
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
+    if err != crate::ax::bindings::kAXErrorSuccess
+        && unsafe { crate::ax::bindings::element_gone_after_action(element) }
+    {
+        // The action replaced its own element (Finder's AXOpen navigates the
+        // window), so the call reported an error although it ran. Report it as
+        // performed but unverified; a retry would act twice.
+        return Ok((
+            format!(
+                "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; the element no longer \
+                 exists afterwards (the action replaced it; AX returned {err}). Take a fresh \
+                 snapshot before acting again: do not retry this action."
+            ),
+            false,
+            false,
+            false,
+            false,
+        ));
+    }
     if err != crate::ax::bindings::kAXErrorSuccess {
         // Some collection rows claim a click-like action but Finder returns
         // kAXErrorCannotComplete. Use the same verified selection fallback
