@@ -284,6 +284,8 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
             "get_window_state",
             serde_json::json!({
                 "pid": pid, "window_id": wid, "include_screenshot": typing.is_some(),
+                // Reads enabled:true and the screen-point frame below.
+                "element_fields": "full",
             }),
         );
         let elapsed = start.elapsed();

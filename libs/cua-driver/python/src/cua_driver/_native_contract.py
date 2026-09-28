@@ -1089,9 +1089,84 @@ class _UniffiFfiConverterBoolean:
     def write(cls, value, buf):
         buf.write_u8(value)
 
+
+
+
+
+
+class ElementFields(enum.Enum):
+    """
+    macOS: how much of each `elements` record `get_window_state` returns.
+"""
+
+    COMPACT = 0
+    """
+    Omit per-element frame, depth and parent_index, omit enabled when
+    true and selected when false, and drop the top-level _note.
+"""
+
+    FULL = 1
+    """
+    Every field.
+"""
+
+
+
+class _UniffiFfiConverterTypeElementFields(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return ElementFields.COMPACT
+        if variant == 2:
+            return ElementFields.FULL
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == ElementFields.COMPACT:
+            return
+        if value == ElementFields.FULL:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == ElementFields.COMPACT:
+            buf.write_i32(1)
+        if value == ElementFields.FULL:
+            buf.write_i32(2)
+
+
+
+class _UniffiFfiConverterOptionalTypeElementFields(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeElementFields.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeElementFields.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeElementFields.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class ActionReadObservation:
-    def __init__(self, *, include_screenshot:bool = False, query:typing.Optional[str] = _DEFAULT, query_context:bool = False, max_elements:typing.Optional[int] = _DEFAULT, max_depth:typing.Optional[int] = _DEFAULT):
+    def __init__(self, *, include_screenshot:bool = False, query:typing.Optional[str] = _DEFAULT, query_context:bool = False, max_elements:typing.Optional[int] = _DEFAULT, max_depth:typing.Optional[int] = _DEFAULT, element_fields:typing.Optional[ElementFields] = _DEFAULT):
         self.include_screenshot = include_screenshot
         if query is _DEFAULT:
             self.query = None
@@ -1106,12 +1181,16 @@ class ActionReadObservation:
             self.max_depth = None
         else:
             self.max_depth = max_depth
+        if element_fields is _DEFAULT:
+            self.element_fields = None
+        else:
+            self.element_fields = element_fields
 
 
 
 
     def __str__(self):
-        return "ActionReadObservation(include_screenshot={}, query={}, query_context={}, max_elements={}, max_depth={})".format(self.include_screenshot, self.query, self.query_context, self.max_elements, self.max_depth)
+        return "ActionReadObservation(include_screenshot={}, query={}, query_context={}, max_elements={}, max_depth={}, element_fields={})".format(self.include_screenshot, self.query, self.query_context, self.max_elements, self.max_depth, self.element_fields)
     def __eq__(self, other):
         if self.include_screenshot != other.include_screenshot:
             return False
@@ -1122,6 +1201,8 @@ class ActionReadObservation:
         if self.max_elements != other.max_elements:
             return False
         if self.max_depth != other.max_depth:
+            return False
+        if self.element_fields != other.element_fields:
             return False
         return True
 
@@ -1134,6 +1215,7 @@ class _UniffiFfiConverterTypeActionReadObservation(_UniffiConverterRustBuffer):
             query_context=_UniffiFfiConverterBoolean.read(buf),
             max_elements=_UniffiFfiConverterOptionalUInt32.read(buf),
             max_depth=_UniffiFfiConverterOptionalUInt32.read(buf),
+            element_fields=_UniffiFfiConverterOptionalTypeElementFields.read(buf),
         )
 
     @staticmethod
@@ -1143,6 +1225,7 @@ class _UniffiFfiConverterTypeActionReadObservation(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.check_lower(value.query_context)
         _UniffiFfiConverterOptionalUInt32.check_lower(value.max_elements)
         _UniffiFfiConverterOptionalUInt32.check_lower(value.max_depth)
+        _UniffiFfiConverterOptionalTypeElementFields.check_lower(value.element_fields)
 
     @staticmethod
     def write(value, buf):
@@ -1151,6 +1234,7 @@ class _UniffiFfiConverterTypeActionReadObservation(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.query_context, buf)
         _UniffiFfiConverterOptionalUInt32.write(value.max_elements, buf)
         _UniffiFfiConverterOptionalUInt32.write(value.max_depth, buf)
+        _UniffiFfiConverterOptionalTypeElementFields.write(value.element_fields, buf)
 
 
 
@@ -4418,7 +4502,7 @@ class _UniffiFfiConverterTypeGetSessionStateInput(_UniffiConverterRustBuffer):
 
 @dataclass
 class GetWindowStateInput:
-    def __init__(self, *, pid:int, window_id:int, session:typing.Optional[str], query:typing.Optional[str], query_context:typing.Optional[bool] = _DEFAULT, diff:typing.Optional[bool] = _DEFAULT, include_accessibility_tree:typing.Optional[bool], include_screenshot:typing.Optional[bool], screenshot_out_file:typing.Optional[str], max_elements:typing.Optional[int], max_depth:typing.Optional[int], max_dimension:typing.Optional[int], max_image_dimension:typing.Optional[int], timeout_ms:typing.Optional[int] = _DEFAULT):
+    def __init__(self, *, pid:int, window_id:int, session:typing.Optional[str], query:typing.Optional[str], query_context:typing.Optional[bool] = _DEFAULT, diff:typing.Optional[bool] = _DEFAULT, element_fields:typing.Optional[ElementFields] = _DEFAULT, include_accessibility_tree:typing.Optional[bool], include_screenshot:typing.Optional[bool], screenshot_out_file:typing.Optional[str], max_elements:typing.Optional[int], max_depth:typing.Optional[int], max_dimension:typing.Optional[int], max_image_dimension:typing.Optional[int], timeout_ms:typing.Optional[int] = _DEFAULT):
         self.pid = pid
         self.window_id = window_id
         self.session = session
@@ -4431,6 +4515,10 @@ class GetWindowStateInput:
             self.diff = None
         else:
             self.diff = diff
+        if element_fields is _DEFAULT:
+            self.element_fields = None
+        else:
+            self.element_fields = element_fields
         self.include_accessibility_tree = include_accessibility_tree
         self.include_screenshot = include_screenshot
         self.screenshot_out_file = screenshot_out_file
@@ -4447,7 +4535,7 @@ class GetWindowStateInput:
 
 
     def __str__(self):
-        return "GetWindowStateInput(pid={}, window_id={}, session={}, query={}, query_context={}, diff={}, include_accessibility_tree={}, include_screenshot={}, screenshot_out_file={}, max_elements={}, max_depth={}, max_dimension={}, max_image_dimension={}, timeout_ms={})".format(self.pid, self.window_id, self.session, self.query, self.query_context, self.diff, self.include_accessibility_tree, self.include_screenshot, self.screenshot_out_file, self.max_elements, self.max_depth, self.max_dimension, self.max_image_dimension, self.timeout_ms)
+        return "GetWindowStateInput(pid={}, window_id={}, session={}, query={}, query_context={}, diff={}, element_fields={}, include_accessibility_tree={}, include_screenshot={}, screenshot_out_file={}, max_elements={}, max_depth={}, max_dimension={}, max_image_dimension={}, timeout_ms={})".format(self.pid, self.window_id, self.session, self.query, self.query_context, self.diff, self.element_fields, self.include_accessibility_tree, self.include_screenshot, self.screenshot_out_file, self.max_elements, self.max_depth, self.max_dimension, self.max_image_dimension, self.timeout_ms)
     def __eq__(self, other):
         if self.pid != other.pid:
             return False
@@ -4460,6 +4548,8 @@ class GetWindowStateInput:
         if self.query_context != other.query_context:
             return False
         if self.diff != other.diff:
+            return False
+        if self.element_fields != other.element_fields:
             return False
         if self.include_accessibility_tree != other.include_accessibility_tree:
             return False
@@ -4489,6 +4579,7 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
             query=_UniffiFfiConverterOptionalString.read(buf),
             query_context=_UniffiFfiConverterOptionalBoolean.read(buf),
             diff=_UniffiFfiConverterOptionalBoolean.read(buf),
+            element_fields=_UniffiFfiConverterOptionalTypeElementFields.read(buf),
             include_accessibility_tree=_UniffiFfiConverterOptionalBoolean.read(buf),
             include_screenshot=_UniffiFfiConverterOptionalBoolean.read(buf),
             screenshot_out_file=_UniffiFfiConverterOptionalString.read(buf),
@@ -4507,6 +4598,7 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.query)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.query_context)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.diff)
+        _UniffiFfiConverterOptionalTypeElementFields.check_lower(value.element_fields)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.include_accessibility_tree)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.include_screenshot)
         _UniffiFfiConverterOptionalString.check_lower(value.screenshot_out_file)
@@ -4524,6 +4616,7 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.query, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.query_context, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.diff, buf)
+        _UniffiFfiConverterOptionalTypeElementFields.write(value.element_fields, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.include_accessibility_tree, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.include_screenshot, buf)
         _UniffiFfiConverterOptionalString.write(value.screenshot_out_file, buf)
@@ -8971,10 +9064,13 @@ class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowElement:
-    def __init__(self, *, element_index:int, role:str, depth:int, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], focused:typing.Optional[bool] = _DEFAULT, text_selection:typing.Optional[TextSelection] = _DEFAULT, placeholder:typing.Optional[str] = _DEFAULT, url:typing.Optional[str] = _DEFAULT, value_settable:typing.Optional[bool] = _DEFAULT, value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
+    def __init__(self, *, element_index:int, role:str, depth:typing.Optional[int] = _DEFAULT, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], focused:typing.Optional[bool] = _DEFAULT, text_selection:typing.Optional[TextSelection] = _DEFAULT, placeholder:typing.Optional[str] = _DEFAULT, url:typing.Optional[str] = _DEFAULT, value_settable:typing.Optional[bool] = _DEFAULT, value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
         self.element_index = element_index
         self.role = role
-        self.depth = depth
+        if depth is _DEFAULT:
+            self.depth = None
+        else:
+            self.depth = depth
         self.element_token = element_token
         self.label = label
         self.value = value
@@ -9062,7 +9158,7 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         return WindowElement(
             element_index=_UniffiFfiConverterUInt64.read(buf),
             role=_UniffiFfiConverterString.read(buf),
-            depth=_UniffiFfiConverterUInt32.read(buf),
+            depth=_UniffiFfiConverterOptionalUInt32.read(buf),
             element_token=_UniffiFfiConverterOptionalString.read(buf),
             label=_UniffiFfiConverterOptionalString.read(buf),
             value=_UniffiFfiConverterOptionalString.read(buf),
@@ -9086,7 +9182,7 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
     def check_lower(value):
         _UniffiFfiConverterUInt64.check_lower(value.element_index)
         _UniffiFfiConverterString.check_lower(value.role)
-        _UniffiFfiConverterUInt32.check_lower(value.depth)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.depth)
         _UniffiFfiConverterOptionalString.check_lower(value.element_token)
         _UniffiFfiConverterOptionalString.check_lower(value.label)
         _UniffiFfiConverterOptionalString.check_lower(value.value)
@@ -9109,7 +9205,7 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
     def write(value, buf):
         _UniffiFfiConverterUInt64.write(value.element_index, buf)
         _UniffiFfiConverterString.write(value.role, buf)
-        _UniffiFfiConverterUInt32.write(value.depth, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.depth, buf)
         _UniffiFfiConverterOptionalString.write(value.element_token, buf)
         _UniffiFfiConverterOptionalString.write(value.label, buf)
         _UniffiFfiConverterOptionalString.write(value.value, buf)
@@ -9492,6 +9588,7 @@ __all__ = [
     "ActionReadAction",
     "ScrollDirection",
     "ScrollBy",
+    "ElementFields",
     "ActionReadStepKind",
     "ActionDeliveryMode",
     "ActionEscalationTarget",

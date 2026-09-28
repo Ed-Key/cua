@@ -136,12 +136,55 @@ const FfiConverterTypeScrollBy = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * macOS: how much of each `elements` record `get_window_state` returns.
+ */
+export enum ElementFields {
+    /**
+     * Omit per-element frame, depth and parent_index, omit enabled when
+     * true and selected when false, and drop the top-level _note.
+     */
+    Compact,
+    /**
+     * Every field.
+     */
+    Full
+}
+
+const FfiConverterTypeElementFields = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ElementFields;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ElementFields.Compact;
+                case 2: return ElementFields.Full;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ElementFields.Compact: return ordinalConverter.write(1, into);
+                case ElementFields.Full: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
 export type ActionReadObservation = {
     includeScreenshot: boolean,
     query?: string,
     queryContext: boolean,
     maxElements?: number,
-    maxDepth?: number
+    maxDepth?: number,
+    /**
+     * Passed to get_window_state: "compact" (default) or "full" element records.
+     */
+    elementFields?: ElementFields
 }
 
 /**
@@ -153,7 +196,8 @@ export const ActionReadObservation = (() => {
         query: undefined,
         queryContext: false,
         maxElements: undefined,
-        maxDepth: undefined
+        maxDepth: undefined,
+        elementFields: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<ActionReadObservation, ReturnType<typeof defaults>>(defaults);
@@ -174,7 +218,8 @@ const FfiConverterTypeActionReadObservation = (() => {
                 query: FfiConverterOptionalString.read(from),
                 queryContext: FfiConverterBool.read(from),
                 maxElements: FfiConverterOptionalUInt32.read(from),
-                maxDepth: FfiConverterOptionalUInt32.read(from)
+                maxDepth: FfiConverterOptionalUInt32.read(from),
+                elementFields: FfiConverterOptionalTypeElementFields.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -183,13 +228,15 @@ const FfiConverterTypeActionReadObservation = (() => {
             FfiConverterBool.write(value.queryContext, into);
             FfiConverterOptionalUInt32.write(value.maxElements, into);
             FfiConverterOptionalUInt32.write(value.maxDepth, into);
+            FfiConverterOptionalTypeElementFields.write(value.elementFields, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterBool.allocationSize(value.includeScreenshot) +
              FfiConverterOptionalString.allocationSize(value.query) +
              FfiConverterBool.allocationSize(value.queryContext) +
              FfiConverterOptionalUInt32.allocationSize(value.maxElements) +
-             FfiConverterOptionalUInt32.allocationSize(value.maxDepth);
+             FfiConverterOptionalUInt32.allocationSize(value.maxDepth) +
+             FfiConverterOptionalTypeElementFields.allocationSize(value.elementFields);
 
         }
     };
@@ -2958,6 +3005,13 @@ export type GetWindowStateInput = {
      * False forces the full outline.
      */
     diff?: boolean,
+    /**
+     * macOS only. "compact" (default) omits per-element frame, depth and
+     * parent_index, omits enabled when true and selected when false, and
+     * drops the _note; "full" returns every field. Other platforms accept
+     * and ignore it and always return full records.
+     */
+    elementFields?: ElementFields,
     includeAccessibilityTree?: boolean,
     includeScreenshot?: boolean,
     screenshotOutFile?: string,
@@ -2984,6 +3038,7 @@ export const GetWindowStateInput = (() => {
     const defaults = () => ({
         queryContext: undefined,
         diff: undefined,
+        elementFields: undefined,
         timeoutMs: undefined
     });
     const create = (() => {
@@ -3007,6 +3062,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
                 query: FfiConverterOptionalString.read(from),
                 queryContext: FfiConverterOptionalBoolean.read(from),
                 diff: FfiConverterOptionalBoolean.read(from),
+                elementFields: FfiConverterOptionalTypeElementFields.read(from),
                 includeAccessibilityTree: FfiConverterOptionalBoolean.read(from),
                 includeScreenshot: FfiConverterOptionalBoolean.read(from),
                 screenshotOutFile: FfiConverterOptionalString.read(from),
@@ -3024,6 +3080,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
             FfiConverterOptionalString.write(value.query, into);
             FfiConverterOptionalBoolean.write(value.queryContext, into);
             FfiConverterOptionalBoolean.write(value.diff, into);
+            FfiConverterOptionalTypeElementFields.write(value.elementFields, into);
             FfiConverterOptionalBoolean.write(value.includeAccessibilityTree, into);
             FfiConverterOptionalBoolean.write(value.includeScreenshot, into);
             FfiConverterOptionalString.write(value.screenshotOutFile, into);
@@ -3040,6 +3097,7 @@ const FfiConverterTypeGetWindowStateInput = (() => {
              FfiConverterOptionalString.allocationSize(value.query) +
              FfiConverterOptionalBoolean.allocationSize(value.queryContext) +
              FfiConverterOptionalBoolean.allocationSize(value.diff) +
+             FfiConverterOptionalTypeElementFields.allocationSize(value.elementFields) +
              FfiConverterOptionalBoolean.allocationSize(value.includeAccessibilityTree) +
              FfiConverterOptionalBoolean.allocationSize(value.includeScreenshot) +
              FfiConverterOptionalString.allocationSize(value.screenshotOutFile) +
@@ -6708,7 +6766,10 @@ const FfiConverterTypeWindowChange = (() => {
 export type WindowElement = {
     elementIndex: bigint,
     role: string,
-    depth: number,
+    /**
+     * Absent in macOS compact element records.
+     */
+    depth?: number,
     elementToken?: string,
     label?: string,
     value?: string,
@@ -6734,11 +6795,23 @@ export type WindowElement = {
      */
     valueSettable?: boolean,
     valueDescription?: string,
+    /**
+     * macOS compact records omit it when true.
+     */
     enabled?: boolean,
+    /**
+     * macOS compact records omit it when false.
+     */
     selected?: boolean,
     inWebContent?: boolean,
     actions?: Array<string>,
+    /**
+     * Absent in macOS compact element records.
+     */
     parentIndex?: bigint,
+    /**
+     * Screen coordinates. Absent in macOS compact element records.
+     */
     frame?: ElementFrame,
     min?: number,
     max?: number
@@ -6749,6 +6822,7 @@ export type WindowElement = {
  */
 export const WindowElement = (() => {
     const defaults = () => ({
+        depth: undefined,
         focused: undefined,
         textSelection: undefined,
         placeholder: undefined,
@@ -6772,7 +6846,7 @@ const FfiConverterTypeWindowElement = (() => {
             return {
                 elementIndex: FfiConverterUInt64.read(from),
                 role: FfiConverterString.read(from),
-                depth: FfiConverterUInt32.read(from),
+                depth: FfiConverterOptionalUInt32.read(from),
                 elementToken: FfiConverterOptionalString.read(from),
                 label: FfiConverterOptionalString.read(from),
                 value: FfiConverterOptionalString.read(from),
@@ -6795,7 +6869,7 @@ const FfiConverterTypeWindowElement = (() => {
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterUInt64.write(value.elementIndex, into);
             FfiConverterString.write(value.role, into);
-            FfiConverterUInt32.write(value.depth, into);
+            FfiConverterOptionalUInt32.write(value.depth, into);
             FfiConverterOptionalString.write(value.elementToken, into);
             FfiConverterOptionalString.write(value.label, into);
             FfiConverterOptionalString.write(value.value, into);
@@ -6817,7 +6891,7 @@ const FfiConverterTypeWindowElement = (() => {
         allocationSize(value: TypeName): number {
             return FfiConverterUInt64.allocationSize(value.elementIndex) +
              FfiConverterString.allocationSize(value.role) +
-             FfiConverterUInt32.allocationSize(value.depth) +
+             FfiConverterOptionalUInt32.allocationSize(value.depth) +
              FfiConverterOptionalString.allocationSize(value.elementToken) +
              FfiConverterOptionalString.allocationSize(value.label) +
              FfiConverterOptionalString.allocationSize(value.value) +
@@ -7030,6 +7104,9 @@ const FfiConverterOptionalTypeScrollBy = new FfiConverterOptional(FfiConverterTy
 
 // FfiConverter for number | undefined
 const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
+
+// FfiConverter for ElementFields | undefined
+const FfiConverterOptionalTypeElementFields = new FfiConverterOptional(FfiConverterTypeElementFields);
 
 // FfiConverter for Array<string>
 const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
@@ -7252,6 +7329,7 @@ export default Object.freeze({
     FfiConverterTypeDesktopScope,
     FfiConverterTypeDragInput,
     FfiConverterTypeEffectiveScope,
+    FfiConverterTypeElementFields,
     FfiConverterTypeElementFrame,
     FfiConverterTypeElementPredicate,
     FfiConverterTypeElementSelector,

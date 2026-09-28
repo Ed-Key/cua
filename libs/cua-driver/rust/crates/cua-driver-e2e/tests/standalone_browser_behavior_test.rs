@@ -142,6 +142,7 @@ fn run_native_named_groups(spec: &BrowserSpec) {
                     serde_json::json!({
                         "pid": fixture.pid, "window_id": fixture.window_id,
                         "capture_mode": "ax", "query": "Save",
+                        "element_fields": "full",
                     }),
                 );
                 assert!(!snapshot.is_error(), "native observation: {}", snapshot.raw);
@@ -228,6 +229,7 @@ fn run_native_named_groups(spec: &BrowserSpec) {
                         "pid": fixture.pid, "window_id": fixture.window_id,
                         "include_screenshot": false, "diff": false,
                         "query": "Billing", "query_context": context,
+                        "element_fields": "full",
                     }),
                 );
                 assert!(!read.is_error(), "{}", read.raw);
@@ -2230,6 +2232,7 @@ fn wait_for_native_omnibox_value(fixture: &mut BrowserFixture, expected: &str) {
                 "pid": fixture.pid as i64,
                 "window_id": fixture.window_id,
                 "capture_mode": "ax",
+                "element_fields": "full",
             }),
         );
         let (_, _, _, value) = native_omnibox(&snapshot);
@@ -2267,6 +2270,7 @@ fn run_native_omnibox_select_all(spec: &BrowserSpec) {
                 "pid": fixture.pid as i64,
                 "window_id": fixture.window_id,
                 "capture_mode": "ax",
+                "element_fields": "full",
             }),
         );
         let (index, x, y, _) = native_omnibox(&snapshot);
@@ -2345,6 +2349,7 @@ fn generic_editor_coordinates(fixture: &mut BrowserFixture) -> (f64, f64) {
             "pid": fixture.pid as i64,
             "window_id": fixture.window_id,
             "capture_mode": "vision",
+            "element_fields": "full",
         }),
     );
     assert!(!state.is_error(), "native browser snapshot: {}", state.raw);
@@ -5640,7 +5645,7 @@ document.addEventListener('click', e => backgroundClickEvents.push({
                     "get_window_state",
                     serde_json::json!({
                         "pid":fixture.pid,"window_id":fixture.window_id,"query":"Save",
-                        "include_screenshot":pixel
+                        "include_screenshot":pixel,"element_fields":"full"
                     }),
                 );
                 assert!(!snapshot.is_error(), "{}", snapshot.raw);

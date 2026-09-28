@@ -148,6 +148,20 @@ pub fn timeout_ms_schema() -> Value {
     })
 }
 
+/// Shared `get_window_state.element_fields`. Only macOS projects records;
+/// Windows and Linux accept it and always return full records.
+pub fn element_fields_schema() -> Value {
+    json!({
+        "type": "string",
+        "enum": ["compact", "full"],
+        "description": "macOS only. \"compact\" (default) omits per-element frame, depth and \
+            parent_index, omits enabled when true and selected when false, and drops the \
+            _note; \"full\" returns every field. Use screenshot_frame (screenshot pixels) \
+            for pixel actions. Other platforms accept and ignore it and always return \
+            full records."
+    })
+}
+
 /// Shared `get_desktop_state.max_image_dimension`: an opt-in long-edge cap
 /// whose downsizing is mapped back for later desktop-scope actions
 /// (`crate::desktop_capture_scale`) and by the capture's `capture_id`.
@@ -190,6 +204,7 @@ fn shared_param_canonical(name: &str) -> Option<Value> {
         "snapshot_id" => snapshot_id_schema(),
         "capture_mode" => crate::capture_mode::capture_mode_schema(),
         "timeout_ms" => timeout_ms_schema(),
+        "element_fields" => element_fields_schema(),
         _ => return None,
     };
     Some(structural(&v))
