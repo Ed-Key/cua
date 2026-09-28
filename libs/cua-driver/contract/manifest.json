@@ -2697,7 +2697,7 @@
     },
     {
       "name": "invoke_menu",
-      "description": "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. Briefly activates the app, then restores the previous front window. Details: skill://cua-driver/MACOS.md",
+      "description": "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. Afterward the previous front app is back in front. Details: skill://cua-driver/MACOS.md",
       "platforms": [
         "macos",
         "windows",
