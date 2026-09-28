@@ -32,8 +32,9 @@ fn def() -> &'static ToolDef {
             (back-compat). Every actionable element is tagged with [element_index N] \
             in the markdown and as `element_index` in the structured array — pass \
             those indices to click, type_text, press_key, etc.\n\n\
-            INVARIANT: call get_window_state once per turn per (pid, window_id) before any \
-            element-indexed action. On macOS a row keeps its element_index across looks at \
+            INVARIANT: take a snapshot of a (pid, window_id) before its first element-indexed \
+            action, and again only when you need state the last snapshot cannot show; its \
+            element tokens stay valid across calls and turns until the next snapshot of that window. On macOS a row keeps its element_index across looks at \
             the same window and a vanished row's number is not reused while this session keeps the window's numbering (after eviction a full look restarts at 0), so after the first \
             look the response is a change-only diff by default (see `diff`); each look still \
             mints a new snapshot_id, so pair an unchanged row's element_index with the latest \

@@ -79,6 +79,8 @@ cua-driver click '{"target":{"kind":"window","pid":844,"window_id":10725},"eleme
 | Send a key or combination       | `press_key` with `key`, or `hotkey` with `keys`                                |
 | Scroll / drag                   | Inspect `describe scroll` / `describe drag`; units and supported shapes matter |
 
+Each tool call is a model round trip. Tokens from one snapshot stay valid until the next snapshot of that window, so perform every step whose target is already visible (several button presses, a field then its submit button) without looking again in between. When an action changes what you need to see next, prefer `act_and_read`, which returns the fresh read with the action, or `run_sequence` for known click and typing steps. Look again only before a decision that needs new state.
+
 Text insertion and value replacement are different intents. Setting a field does not prove a form submission, navigation, or rename committed. Open a collapsed search/input control and reobserve before typing into it; one focus-click may not both open and focus it. Inspect the existing value/selection before replacing content.
 
 If a text action returns `unverifiable`, take a fresh snapshot before retrying. A deferred provider can publish after the call unwinds, so retrying immediately may duplicate text. If renderer focus is missing, the advertised `type_text` pixel form focuses then types in one call. For minimized windows, prefer an exposed semantic commit control; do not assume Return or a value write commits, and do not silently restore the window.
