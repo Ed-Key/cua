@@ -237,7 +237,7 @@ pub struct WindowInfo {
     pub is_on_screen: bool,
     #[serde(deserialize_with = "required_nullable")]
     #[schemars(required, schema_with = "nullable_z_index_schema")]
-    /// Higher values are closer to the front. Null means stacking order is unavailable; callers must not infer an order from array position.
+    /// Higher values are closer to the front. Null is unknown; callers must not infer an order from array position.
     pub z_index: Option<i64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub layer: Option<i32>,
@@ -268,7 +268,7 @@ impl ToolOutput for ListWindowsOutput {
         let mut schema = crate::outputs::output_schema_with_additional_properties::<Self>(true);
         // Stacking semantics are part of the existing live discovery contract.
         schema["properties"]["windows"]["items"]["properties"]["z_index"]["description"] =
-            serde_json::json!("Higher values are closer to the front. Null means the provider cannot observe stacking order; callers must not infer an order from array position or treat null as zero.");
+            serde_json::json!("Higher values are closer to the front. Null is unknown; callers must not infer an order from array position.");
         schema
     }
 }

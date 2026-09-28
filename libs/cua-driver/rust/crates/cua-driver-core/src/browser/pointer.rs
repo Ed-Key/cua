@@ -294,23 +294,23 @@ impl BrowserPointerTool {
         Self {
             def: ToolDef {
                 name: "browser_pointer".into(),
-                description: "Perform hover, right-click, double-click, scroll, or drag in an exactly-bound browser tab. Semantic refs must declare pointer for hover, right-click, double-click, and drag; scroll accepts a scroll or pointer capability. The trusted route uses CDP Input events and refuses if standalone background posture cannot be preserved. The explicit dom_event route requires a page ref and synthesizes full-background DOM events. Never activates or brings a tab to the foreground.".into(),
+                description: "Hover, right-click, double-click, scroll, or drag in a bound tab by ref or viewport x,y, without activating the tab. Refs need the pointer capability (scroll also accepts scroll). dom_event requires a ref.".into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
-                        "target_id": { "type": "string", "description": "Opaque target id minted by get_browser_state." },
-                        "tab_id": { "type": "string", "description": "Opaque tab id minted by get_browser_state." },
+                        "target_id": { "type": "string", "description": "Target id from get_browser_state." },
+                        "tab_id": { "type": "string", "description": "Tab id from get_browser_state." },
                         "session": required_session_schema(),
                         "action": { "type": "string", "enum": ["hover", "right_click", "double_click", "scroll", "drag"] },
                         "input_route": { "type": "string", "enum": ["trusted", "dom_event"], "default": "trusted" },
-                        "ref": { "type": "string", "description": "Origin page ref. Alternative to x/y." },
+                        "ref": { "type": "string", "description": "Origin page ref, instead of x,y." },
                         "x": { "type": "number", "description": "Origin viewport x in CSS pixels." },
                         "y": { "type": "number", "description": "Origin viewport y in CSS pixels." },
-                        "destination_ref": { "type": "string", "description": "Drag destination page ref in the exact same frame." },
-                        "to_x": { "type": "number", "description": "Drag destination viewport x in CSS pixels." },
-                        "to_y": { "type": "number", "description": "Drag destination viewport y in CSS pixels." },
-                        "delta_x": { "type": "number", "description": "Horizontal scroll delta in CSS pixels." },
-                        "delta_y": { "type": "number", "description": "Vertical scroll delta in CSS pixels." }
+                        "destination_ref": { "type": "string", "description": "Drag destination ref in the same frame." },
+                        "to_x": { "type": "number", "description": "Drag destination x in CSS pixels." },
+                        "to_y": { "type": "number", "description": "Drag destination y in CSS pixels." },
+                        "delta_x": { "type": "number", "description": "Horizontal scroll in CSS pixels." },
+                        "delta_y": { "type": "number", "description": "Vertical scroll in CSS pixels." }
                     },
                     "required": ["target_id", "tab_id", "session", "action"],
                     "additionalProperties": true

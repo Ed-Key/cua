@@ -79,6 +79,7 @@ const SKILL_FILES: &[&str] = &[
     "README.md",
     "SKILL.md",
     "WORKFLOW.md",
+    "TOOLS.md",
     "RUNTIME.md",
     "WINDOWS.md",
     "MACOS.md",

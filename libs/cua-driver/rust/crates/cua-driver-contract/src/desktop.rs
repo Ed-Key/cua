@@ -97,7 +97,7 @@ fn get_window_state() -> ToolContract {
 fn clipboard_read() -> ToolContract {
     let mut contract = contract::<ClipboardReadInput, ClipboardReadOutput>(
         "clipboard_read",
-        "List available system clipboard types and optionally return privacy-sensitive plain text. Clipboard content is never retained in telemetry.",
+        "List the system clipboard's types; include_text also returns its plain text.",
         &["clipboard.read", "clipboard.types"],
         ToolAnnotations {
             read_only: true,
@@ -114,7 +114,7 @@ fn clipboard_read() -> ToolContract {
 fn clipboard_write() -> ToolContract {
     let mut contract = contract::<ClipboardWriteInput, ClipboardWriteOutput>(
         "clipboard_write",
-        "Replace the system clipboard with exactly one value: plain text, an image from an absolute local path, or a file URL from an absolute local path. Returns the available types for read-back before paste.",
+        "Replace the system clipboard with one value: text, an image file, or a file URL (absolute paths). Returns the types for read-back before paste.",
         &["clipboard.write", "clipboard.write.text", "clipboard.write.image", "clipboard.write.file_url", "clipboard.types"],
         ToolAnnotations {
             read_only: false,
@@ -200,10 +200,9 @@ fn get_cursor_position() -> ToolContract {
 fn move_cursor() -> ToolContract {
     contract::<MoveCursorInput, ActionResult>(
         "move_cursor",
-        "Move a cursor to (x, y). Exact window targets use get_window_state screenshot \
-            pixels; explicit desktop targets use get_desktop_state screenshot pixels. On macOS, \
-            window moves affect the agent cursor overlay, desktop moves affect the real OS \
-            pointer, and legacy untargeted moves use screen points.",
+        "Move a cursor to x,y: window targets use get_window_state pixels and move the \
+            agent cursor; desktop targets use get_desktop_state pixels and move the real \
+            pointer (macOS).",
         &["agent_cursor.move", "input.pointer.move"],
         ToolAnnotations {
             read_only: false,
@@ -218,7 +217,7 @@ fn move_cursor() -> ToolContract {
 fn set_window_frame() -> ToolContract {
     contract::<SetWindowFrameInput, ActionResult>(
         "set_window_frame",
-        "Set one exact top-level window's frame in the desktop-coordinate space reported by list_windows and verify the resulting geometry through an independent readback.",
+        "Set an exact top-level window's frame (list_windows desktop coordinates) and verify it by readback.",
         &["window.frame.set"],
         ToolAnnotations {
             read_only: false,
@@ -233,7 +232,7 @@ fn set_window_frame() -> ToolContract {
 fn invoke_menu() -> ToolContract {
     contract::<InvokeMenuInput, ActionResult>(
         "invoke_menu",
-        "Resolve an exact application-menu path one live native level at a time and invoke its final item through accessibility APIs. Missing, ambiguous, disabled, or structurally mismatched segments fail closed; this tool never falls back to pixels.",
+        "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. May briefly activate the window. Details: skill://cua-driver/MACOS.md",
         &["menu.path.invoke", "accessibility.menu.native"],
         ToolAnnotations {
             read_only: false,

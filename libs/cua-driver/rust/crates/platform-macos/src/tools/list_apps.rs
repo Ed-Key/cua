@@ -12,24 +12,9 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "list_apps".into(),
-        description: "List macOS apps — both currently running and installed-but-not-running — \
-            with per-app state flags:\n\n\
-            - running: is a process for this app live? (pid is 0 when false)\n\
-            - active: is it the system-frontmost app? (implies running)\n\
-            - launch_path: filesystem path to the `.app` bundle, when known. \
-            Pass this to `launch_app` to start the app cold.\n\
-            - kind: `\"desktop\"` for `.app` bundles on macOS.\n\
-            - last_used: RFC3339 timestamp from the bundle's filesystem mtime, \
-            when readable; otherwise null.\n\n\
-            Only apps with NSApplicationActivationPolicyRegular are included — \
-            background helpers and system UI agents are filtered out. Installed \
-            apps come from scanning /Applications, /Applications/Utilities, \
-            ~/Applications, /System/Applications, and /System/Applications/Utilities.\n\n\
-            Use this for \"is X installed?\" as well as \"is X running?\". For \
-            per-window state — on-screen, on-current-Space, minimized, \
-            window titles — call list_windows instead. For just opening an \
-            app — running or not — call launch_app({bundle_id: ...}) directly; \
-            list_apps is not a prerequisite."
+        description: "List running and installed regular apps with running, active, pid (0 when \
+            not running), launch_path, and last_used. Answers \"is X installed or running?\"; use \
+            list_windows for windows. launch_app does not need this first."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",

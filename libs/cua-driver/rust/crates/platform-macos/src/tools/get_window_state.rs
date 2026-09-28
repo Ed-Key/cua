@@ -27,124 +27,58 @@ const AX_WALK_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_se
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_window_state".into(),
-        description: "Walk a running app's AX tree and return BOTH a structured \
-            `elements` array (preferred) AND a Markdown rendering of the same tree \
-            (back-compat). Every actionable element is tagged with [element_index N] \
-            in the markdown and as `element_index` in the structured array — pass \
-            those indices to click, type_text, press_key, etc.\n\n\
-            INVARIANT: take a snapshot of a (pid, window_id) before its first element-indexed \
-            action, and again only when you need state the last snapshot cannot show; its \
-            element tokens stay valid across calls and turns until the next snapshot of that window. On macOS a row keeps its element_index across looks at \
-            the same window and a vanished row's number is not reused while this session keeps the window's numbering (after eviction a full look restarts at 0), so after the first \
-            look the response is a change-only diff by default (see `diff`); each look still \
-            mints a new snapshot_id, so pair an unchanged row's element_index with the latest \
-            snapshot_id.\n\n\
-            PREFERRED CONSUMERS read `structuredContent.elements` (one entry per \
-            indexed row with `element_index`, `role`, `label`, `value` (the \
-            element's text/AXValue when present — use it to verify what a field \
-            holds), `actions` (names of AX actions exposed by the element, \
-            omitted when empty), `screenshot_frame` (screenshot pixels, the space of \
-            pixel `x`,`y`)). By default (`element_fields:\"compact\"`) records omit the \
-            screen-point `frame`, `parent_index` and `depth` (the markdown indentation \
-            shows structure), omit `enabled` when true and `selected` when false; pass \
-            `element_fields:\"full\"` for every field. The markdown \
-            `tree_markdown` stays available \
-            and unchanged in shape for existing text-parsing callers — but new \
-            fields will only be added to the structured side.\n\n\
-            Always returns BOTH the element tree AND a screenshot — ground on \
-            both and cross-check (the tree lies on some surfaces: Electron \
-            echo-confirms, Catalyst null values, virtualized off-viewport rows \
-            with `h:1` frames). You choose the modality at ACTION time, not here: \
-            an element ax action (pass `element_index`/`element_token` → the \
-            accessibility rung) or an element px action (pass `x`,`y` → the pixel \
-            rung, read straight off this screenshot). `capture_mode` is deprecated \
-            and ignored. Pass `include_screenshot:false` to skip the grab and get \
-            the tree only — the cheap path when you're just re-indexing before an \
-            element ax action.\n\n\
-            The mirror image: pass `include_accessibility_tree:false` to SKIP the \
-            AX walk entirely (the expensive part, bounded by timeout_ms) and return just the \
-            screenshot plus window metadata — `window_bounds`, `screenshot_scale`, \
-            `screenshot_width`/`screenshot_height`, `app_name`, and `window_title` \
-            — the capture-only path for rendering a live window preview / \
-            picture-in-picture without paying for perception. Setting BOTH \
-            `include_accessibility_tree:false` and `include_screenshot:false` is an \
-            error (nothing to return). Optional `max_image_dimension` overrides the \
-            configured screenshot long-edge limit for this call; use 0 for native \
-            resolution. The legacy `max_dimension` remains a tighter cap for \
-            compatibility.\n\n\
-            The snapshot is SCOPED to `window_id`: a window_id that no longer exists is \
-            refused with `window_id_not_found`, and one owned by another process is \
-            refused with `window_owner_pid_mismatch` naming the real `owner_pid` to retry \
-            with (macOS hosts a sandboxed app's Open/Save panel out-of-process, so its \
-            window belongs to the panel service, not the app). If the window is live under \
-            this pid but its accessibility surface can't be resolved, the tree comes back \
-            EMPTY with `degraded_reason: ax_window_unresolved` and the screenshot of the \
-            requested window; background input is refused until it resolves, so \
-            re-snapshot or act with `delivery_mode:\"foreground\"`. A window on another \
-            Space still resolves by its exact CGWindowID. This tool never returns another \
-            surface's elements under your window_id. Before exposing a screenshot, \
-            its raw dimensions are validated as a coherent 1x/2x representation of \
-            the requested WindowServer bounds. `px_frame_mismatch` or \
-            `px_capture_unavailable` omits an unprovable screenshot/pixel frame \
-            instead of guessing a transform; the truthful AX payload remains available.\n\n\
-            Optional `query` projects both tree_markdown and structured `elements` to \
-            matching lines plus their ancestor chain (case-insensitive substring). The \
-            element_index values are unchanged, the complete snapshot remains actionable, \
-            and `element_count` continues to report its total size; \
-            `filtered_element_count` reports the projected response size. Ancestors \
-            come from the real AX hierarchy, not indentation. With `query_context:true` \
-            each match also keeps everything collected under it (for example a \
-            message heading with its body text and links), still without sibling \
-            branches.\n\n\
-            Optional `max_elements` / `max_depth` bound the AX walk to mitigate \
-            context-window blow-up on Electron / Obsidian / large web apps that \
-            produce 10k+ element trees. When applied, BOTH the markdown \
-            and the structured elements are truncated identically. Omit both for \
-            current default behaviour (≤2 000 elements, depth ≤25).".into(),
+        description: "Read one window (pid, window_id): accessibility rows with element_token \
+            and element_index, plus a screenshot whose pixels are the x,y space for pixel \
+            actions. On macOS later looks return only changed rows (diff); pair element_index \
+            with the latest snapshot_id. Details: skill://cua-driver/WORKFLOW.md".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["pid", "window_id"],
             "properties": {
-                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
+                "session": cua_driver_core::tool_schema::session_schema(),
                 "pid": { "type": "integer", "description": "Target process ID." },
-                "window_id": { "type": "integer", "description": "Target window ID from list_windows." },
-                "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching rows plus their ancestors without renumbering element_index values." },
-                "query_context": { "type": "boolean", "description": "Default false. With a nonblank query, also keep every row collected under each match (display text included), not only its ancestors. Uses the same walk; no extra reads. Display-only rows appear in tree_markdown; structured elements still hold only actionable rows." },
-                "diff": { "type": "boolean", "description": "Default true. After the first look at a window, return only rows added, changed, or removed since this session's previous look (display-only text included); unchanged rows keep their element_index. The full outline is still sent for the first look, when it would be shorter, when a query is set, or when the previous look used different max_elements/max_depth. Pass false to force the full outline. macOS only." },
+                "window_id": { "type": "integer", "description": "Window ID from list_windows." },
+                "query": { "type": "string", "description": "Case-insensitive filter: matching rows plus ancestors; indices unchanged." },
+                "query_context": { "type": "boolean", "default": false, "description": "With query, also keep every row under each match." },
+                "diff": { "type": "boolean", "default": true, "description": "Return only rows changed since this session's last look; false forces the full outline. macOS only." },
                 "element_fields": cua_driver_core::tool_schema::element_fields_schema(),
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_accessibility_tree": {
                     "type": "boolean",
-                    "description": "Default true — walk the AX tree and return `elements` + `tree_markdown` alongside the screenshot. Set false to SKIP the AX walk entirely (the expensive part, bounded by timeout_ms) and return just the screenshot plus window metadata (bounds, scale, app_name, window_title) — the capture-only path for rendering a live window preview / picture-in-picture. Mirrors include_screenshot. Setting BOTH include_accessibility_tree:false AND include_screenshot:false is an error (nothing to return)."
+                    "default": true,
+                    "description": "false skips the tree walk and returns only the screenshot and window metadata; not with include_screenshot:false."
                 },
                 "include_screenshot": {
                     "type": "boolean",
-                    "description": "Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return the tree only (the cheap path when you're just re-indexing before an element ax action; saves the image tokens + screen-grab latency). screenshot_out_file still forces a capture to disk."
+                    "default": true,
+                    "description": "false returns the tree only, which cannot ground a pixel action."
                 },
                 "screenshot_out_file": {
                     "type": "string",
-                    "description": "When set, write the PNG to this file path (~ expanded) instead of embedding base64 in the response. The structured output will contain screenshot_file_path instead."
+                    "description": "Write the PNG to this path instead of inline base64."
                 },
                 "max_elements": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Cap on the total number of AX nodes walked. Truncates depth-first; markdown and structured elements truncate together. Omit for the default (2 000). Lower this for Electron / Obsidian / large web apps that produce 10k+ element trees and blow context windows."
+                    "default": 2000,
+                    "description": "Cap on elements walked; tree and elements truncate together."
                 },
                 "max_depth": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Cap on the AX-tree walk depth. Nodes whose rendered indent would exceed this are omitted. Omit for the default (25). Lower this for deep menu/Electron trees."
+                    "default": 25,
+                    "description": "Cap on tree depth."
                 },
                 "timeout_ms": cua_driver_core::tool_schema::timeout_ms_schema(),
                 "max_dimension": {
                     "type": "integer",
                     "minimum": 1,
-                    "description": "Optional cap on the returned screenshot's long edge, in pixels (aspect ratio preserved) — the cheap path for a small preview / thumbnail. Applied on top of the session/global max_image_dimension ceiling; the tighter of the two wins. Omit for the configured default."
+                    "description": "Legacy long-edge cap; the tighter of this and max_image_dimension wins."
                 },
                 "max_image_dimension": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Per-call override for the returned screenshot's long edge in pixels. An explicit value wins over the session/global setting; 0 returns native resolution. Omit to preserve configured behavior."
+                    "description": "Per-call screenshot long-edge limit; 0 is native resolution."
                 }
             },
             "additionalProperties": false
@@ -1339,24 +1273,24 @@ mod window_scope_contract_tests {
     }
 
     #[test]
-    fn schema_advertises_the_window_scope_error_codes() {
-        let description = def().description.clone();
+    fn skill_documents_the_window_scope_error_codes() {
+        // The tool description stays short; the tool reference in the skill
+        // pack carries the error codes an agent needs to recover.
+        let tools_md = include_str!("../../../../Skills/cua-driver/TOOLS.md");
         for code in [
             "window_id_not_found",
             "window_owner_pid_mismatch",
             "ax_window_unresolved",
         ] {
-            assert!(
-                description.contains(code),
-                "tool description must advertise {code}"
-            );
+            assert!(tools_md.contains(code), "TOOLS.md must document {code}");
         }
+        assert!(def().description.contains("skill://cua-driver/"));
     }
 
     /// The capture-only fold-in: get_window_state advertises the new
     /// `include_accessibility_tree` / `max_dimension` controls, keeps pid +
     /// window_id required (schema not loosened), and documents the degenerate
-    /// both-false case in its description.
+    /// both-false case on the include_accessibility_tree property.
     #[test]
     fn schema_advertises_capture_only_controls() {
         let d = def();
@@ -1381,9 +1315,11 @@ mod window_scope_contract_tests {
             "pid and window_id must stay required: {required:?}"
         );
         assert!(
-            d.description.contains("include_accessibility_tree:false")
-                && d.description.contains("include_screenshot:false"),
-            "description must document the both-false error"
+            props["include_accessibility_tree"]["description"]
+                .as_str()
+                .unwrap()
+                .contains("include_screenshot:false"),
+            "include_accessibility_tree must document the both-false error"
         );
     }
 }

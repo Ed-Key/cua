@@ -49,37 +49,18 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "scroll".into(),
-        description: "Scroll the target pid. Two paths, picked by how you address the scroll:\n\n\
-            • **Targeted wheel path** — when you pass a target, either \
-            `element_index`/`element_token` (preferred) or window-local `x, y` pixels: \
-            the driver synthesizes a real mouse-wheel event (CGEventCreateScrollWheelEvent, \
-            at that screen point. The renderer hit-tests the wheel at the \
-            cursor, so the scroll lands on whatever element is under the point — exactly \
-            like physically rolling the wheel over it. This is the ONLY way to scroll a \
-            nested `overflow:auto` region (e.g. a scrollable <div> with no tabindex): such \
-            regions never take keyboard focus, so the keystroke path below no-ops on them. \
-            Use this for inner/nested scrollers in web views.\n\n\
-            • **Keystroke path (focused region)** — when you pass NO target (just pid + \
-            direction): synthesizes PageDown/PageUp (by='page') or Down/Up arrows \
-            (by='line'); horizontal uses Left/Right arrows. Drives the focused / page \
-            scroller only.\n\n\
-            Mapping: by='page' → larger step; by='line' → smaller step; amount = number of \
-            wheel notches (targeted path) or keystroke repetitions (keystroke path).\n\n\
-            On macOS Electron, background element scrolling reads the current element \
-            rectangle and sends wheel events without AXScrollToVisible or keyboard focus. \
-            The rectangle must be usable and contained in the exact window; clipped, \
-            offscreen or placeholder targets are refused. Use fresh screenshot coordinates \
-            when the element cannot provide that geometry. Untargeted background keyboard \
-            scrolling remains unavailable. Delivery does not prove that content moved; \
-            verify the resulting state.".into(),
+        description: "Scroll with a real wheel event at an element (element_token preferred) or \
+            at x,y screenshot pixels; only this reaches nested scroll regions. With no target it \
+            sends Page or arrow keys to the focused scroller. Delivery does not prove content \
+            moved; verify. Details: skill://cua-driver/MACOS.md".into(),
         input_schema: serde_json::json!({
             "type": "object",
             // `pid` conditionally required (validated in code), not pinned in the
             // schema — keeps the contract consistent across platforms.
             "required": ["direction"],
             "properties": {
-                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
-                "pid": { "type": "integer" },
+                "session": cua_driver_core::tool_schema::session_schema(),
+                "pid": { "type": "integer", "description": "Target process ID." },
                 "direction": {
                     "type": "string",
                     "enum": ["up", "down", "left", "right"],
@@ -88,21 +69,23 @@ fn def() -> &'static ToolDef {
                 "by": {
                     "type": "string",
                     "enum": ["line", "page"],
-                    "description": "Scroll granularity. Default: line."
+                    "default": "line",
+                    "description": "Step size per notch or keystroke."
                 },
                 "amount": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 50,
-                    "description": "Pixel-wheel path: number of wheel notches. Keystroke path: number of keystroke repetitions. Default: 3."
+                    "default": 3,
+                    "description": "Wheel notches, or keystroke repeats with no target."
                 },
-                "window_id": { "type": "integer" },
+                "window_id": { "type": "integer", "description": "Target window ID; required with x,y." },
                 "element_index": cua_driver_core::tool_schema::element_index_schema(),
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
                 "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
-                "x": { "type": "number", "description": "Window-local screenshot X (top-left origin of the PNG from get_window_state). With `y`, routes through the pixel-wheel path at this point — use for a scrollable surface that isn't in the AX tree. Requires window_id to anchor the window→screen conversion." },
-                "y": { "type": "number", "description": "Window-local screenshot Y. See `x`." },
-                "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Use desktop with x,y and no pid/window_id for native get_desktop_state screenshot coordinates." },
+                "x": { "type": "number", "description": "X in get_window_state screenshot pixels, for surfaces missing from the tree." },
+                "y": { "type": "number", "description": "Y in the same screenshot pixels." },
+                "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Legacy frame; prefer target. \"desktop\" with x,y and no pid/window_id uses get_desktop_state pixels." },
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema()
             },
             "additionalProperties": false

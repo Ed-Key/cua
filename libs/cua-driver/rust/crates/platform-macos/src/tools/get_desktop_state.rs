@@ -37,15 +37,14 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_desktop_state".into(),
-        description: "Capture the full display in true screen pixels, full size unless \
-            `max_image_dimension` caps it. Use its PNG as the coordinate source for actions \
-            whose target is {kind:\"desktop\",display_id:\"primary\"}. Returns the true \
-            screen size and backing scale factor. Vision-only: no AX tree walk."
+        description: "Capture the full display in screen pixels, with its size and scale factor. The PNG \
+            is the coordinate source for actions with target {kind:\"desktop\",\
+            display_id:\"primary\"}. No tree walk."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
+                "session": cua_driver_core::tool_schema::session_schema(),
                 "screenshot_out_file": { "type": "string", "description": "Write PNG here instead of base64." },
                 "max_image_dimension": cua_driver_core::tool_schema::desktop_max_image_dimension_schema()
             },

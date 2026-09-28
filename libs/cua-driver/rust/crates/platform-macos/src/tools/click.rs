@@ -176,31 +176,11 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "click".into(),
         description:
-            "Click against a target pid. **Prefer `element_token` over pixel \
-             coordinates** — the token works on backgrounded / minimized / hidden / \
-             off-Space windows, identifies one exact snapshot element, and tells \
-             you what you're clicking via the cached element's role + label. Reach for \
-             `x, y` only when the target is a canvas / video / WebGL / custom-drawn surface \
-             that doesn't appear in the AX tree.\n\n\
-             Two addressing modes:\n\n\
-             - element_token, or element_index + snapshot_id (from get_window_state): AX action path. \
-               Works on backgrounded/hidden windows without moving the real mouse pointer or stealing focus. \
-               The visible agent cursor follows the configured motion policy automatically. \
-               The snapshot cache is scoped per (pid, window_id) and is replaced by the \
-               next snapshot of the same window, so tokens from the latest snapshot stay valid for several clicks in a row.\n\n\
-             - x, y (window-local screenshot pixels, top-left origin of the PNG returned \
-               by get_window_state): CGEvent path. Synthesizes mouse events and posts to \
-               pid. Use modifier for cmd/shift/option/ctrl. Needs a visible on-screen \
-               window to anchor the conversion.\n\n\
-             button: \"left\" (default), \"right\", or \"middle\". Defaults to left so the \
-             field is fully back-compat — omit it and you get the legacy left-click behaviour. \
-             Pixel path: routes through the CGEvent left/right/middle mouse-button primitives. \
-             AX path: \"right\" maps to AXShowMenu (same surface as the dedicated `right_click` \
-             tool); \"middle\" has no AX equivalent and falls back to a pixel middle-click at the \
-             element's center.\n\
-             action: press (default), show_menu, pick, confirm, cancel, open.\n\
-             from_zoom: set true after a zoom call to auto-translate zoom-image pixel \
-             coordinates to full-window space."
+            "Click an element or point. Prefer element_token (or element_index + snapshot_id) \
+             from get_window_state; it works on background or hidden windows without moving \
+             the pointer. Use x,y in get_window_state screenshot pixels only for surfaces \
+             missing from the tree. Background by default. \
+             Details: skill://cua-driver/WORKFLOW.md"
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -211,45 +191,42 @@ fn def() -> &'static ToolDef {
             // cua_driver_core::tool_schema.)
             "required": [],
             "properties": {
-                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
+                "session": cua_driver_core::tool_schema::session_schema(),
                 "pid":           { "type": "integer", "description": "Target process ID." },
-                "window_id":     { "type": "integer", "description": "Target window ID. Required for element_index. Optional when element_token is supplied (the token carries it)." },
+                "window_id":     { "type": "integer", "description": "Target window ID; required with element_index, carried by element_token." },
                 "element_index": cua_driver_core::tool_schema::element_index_schema(),
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
                 "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
-                "capture_id": { "type": "string", "description": "Optional immutable source capture ID returned by get_window_state or get_desktop_state. With x,y, Driver atomically admits and consumes that exact capture before dispatch; stale, mismatched, or out-of-bounds captures are refused without fallback." },
-                "x":             { "type": "number",  "description": "X in screenshot pixels. A window target uses the get_window_state PNG; a desktop target uses the native get_desktop_state PNG. The driver reverses Retina backing scale and any window-image downscale." },
-                "y":             { "type": "number",  "description": "Y in screenshot pixels from the image selected by target." },
-                "action":        { "type": "string",  "description": "AX action: press, show_menu, pick, confirm, cancel, open." },
+                "capture_id": { "type": "string", "description": "Capture ID from get_window_state or get_desktop_state that x,y were read from; stale captures are refused." },
+                "x":             { "type": "number",  "description": "X in screenshot pixels: get_window_state for a window, get_desktop_state for the desktop." },
+                "y":             { "type": "number",  "description": "Y in the same screenshot pixels." },
+                "action":        { "type": "string",  "description": "AX action: press (default), show_menu, pick, confirm, cancel, open." },
                 "button":        {
                     "type": "string",
                     "enum": ["left", "right", "middle"],
-                    "description": "Mouse button. Default: \"left\" — omit for legacy left-click behaviour. Pixel path uses the matching CGEvent primitive; AX path maps \"right\" to AXShowMenu and falls back to a pixel middle-click at the element's center for \"middle\"."
+                    "default": "left",
+                    "description": "Mouse button. On an element, right opens its menu and middle clicks its center."
                 },
-                "count":         { "type": "integer", "description": "Click count (pixel path only). Default 1." },
+                "count":         { "type": "integer", "default": 1, "description": "Click count, pixel path only." },
                 "modifier": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Modifier keys: cmd, shift, option/alt, ctrl."
+                    "description": "Modifier keys: cmd, shift, option/alt, ctrl. Needs delivery_mode \"foreground\"."
                 },
                 "from_zoom": {
                     "type": "boolean",
-                    "description": "When true, x and y are in the last zoom image for this pid; driver translates back to full-window coordinates."
+                    "description": "x,y are pixels of the last zoom image for this pid."
                 },
                 "debug_image_out": {
                     "type": "string",
-                    "description": "Optional file path. When set on a pixel-addressed click, captures a fresh screenshot, draws a red crosshair at (x, y), and writes the PNG. Use to verify coordinate spaces. Requires window_id; incompatible with from_zoom."
+                    "description": "PNG path; draws a crosshair at x,y on a fresh screenshot. Needs window_id."
                 },
                 "delivery_mode": {
                     "type": "string",
                     "enum": ["background", "foreground"],
-                    "description": "Best-effort-background ladder rung (default \"background\"). \"background\": perform the AX action or post the CGEvent without fronting. \"foreground\": briefly front the window, act, let transient UI settle, then restore the prior frontmost app. Requires window_id. Modified clicks require \"foreground\" so macOS observes physical modifier-key state. A generic click has no independent postcondition read-back, except selection of list-like AX rows whose AXSelected state can be confirmed; otherwise confirm the effect from a fresh state snapshot. Use the agent loop: background AX (element_index) → snapshot → background pixel (x/y) → snapshot → delivery_mode:\"foreground\"."
+                    "description": "\"background\" (default) acts without raising the window; \"foreground\" briefly fronts it, acts, and restores the prior app. Needs window_id."
                 },
-                "scope": {
-                    "type": "string",
-                    "enum": ["window", "desktop"],
-                    "description": "Coordinate frame for a windowless screen-absolute click (default \"window\"). Pass \"desktop\" when sending x,y with NO pid/window_id — the coordinates are then true screen pixels (read from get_desktop_state with scope=\"desktop\"). Per-call; not a setting."
-                }
+                "scope": cua_driver_core::tool_schema::scope_schema()
             },
             "additionalProperties": false
         }),
@@ -1830,25 +1807,18 @@ mod tests {
         assert_eq!(props["capture_id"]["type"], "string");
     }
 
-    /// Surface 5 hard constraint: the tool description must mention the
-    /// `button` argument and the "left" default so MCP introspection (which
-    /// pipes description into LLM prompts) carries the back-compat note.
+    /// Surface 5 hard constraint: MCP introspection must carry the "left"
+    /// default so an omitted `button` keeps the legacy left-click behaviour.
+    /// The default lives in the schema, where clients read it.
     #[test]
-    fn description_mentions_button_default() {
+    fn schema_declares_left_button_default() {
         let d = def();
-        let desc = d.description.to_ascii_lowercase();
-        assert!(
-            desc.contains("button"),
-            "description should mention button arg"
-        );
-        assert!(
-            desc.contains("left"),
-            "description should mention left default"
-        );
-        assert!(
-            desc.contains("middle"),
-            "description should mention middle button"
-        );
+        let button = &d.input_schema["properties"]["button"];
+        assert_eq!(button["default"], "left");
+        assert!(button["description"]
+            .as_str()
+            .unwrap()
+            .contains("middle"));
     }
 
     /// Regression for the Swift→Rust port gap: only a raw background left

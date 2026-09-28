@@ -48,6 +48,10 @@ const FILES: &[(&str, &str)] = &[
         include_str!("../../../Skills/cua-driver/SKILL.md"),
     ),
     (
+        "TOOLS.md",
+        include_str!("../../../Skills/cua-driver/TOOLS.md"),
+    ),
+    (
         "VISUAL.md",
         include_str!("../../../Skills/cua-driver/VISUAL.md"),
     ),

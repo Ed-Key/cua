@@ -53,11 +53,8 @@ pub fn delivery_mode_schema_with(description: &str) -> Value {
 /// `delivery_mode` with the generic, tool-agnostic blurb.
 pub fn delivery_mode_schema() -> Value {
     delivery_mode_schema_with(
-        "Best-effort-background ladder rung (default \"background\"). \
-         \"background\": inject without fronting or raising the target — no focus \
-         steal. \"foreground\": briefly front the target, act, then restore the \
-         prior frontmost — the explicit last resort when a background attempt \
-         didn't land. Re-call with \"foreground\" only for the action that needs it.",
+        "\"background\" (default) acts without raising the target; \"foreground\" \
+         briefly fronts it and restores the prior app.",
     )
 }
 
@@ -85,9 +82,8 @@ pub fn scope_schema() -> Value {
     json!({
         "type": "string",
         "enum": ["window", "desktop"],
-        "description": "Coordinate frame (default \"window\"). Pass \"desktop\" \
-            with x,y and NO pid/window_id for a windowless screen-absolute action \
-            (coordinates read from get_desktop_state). Per-call; not a setting."
+        "description": "Legacy frame; prefer target. \"desktop\" with x,y and no \
+            pid/window_id uses get_desktop_state pixels."
     })
 }
 
@@ -95,9 +91,8 @@ pub fn scope_schema() -> Value {
 pub fn element_index_schema() -> Value {
     json!({
         "type": "integer",
-        "description": "Element index from get_window_state. Requires the \
-            matching `snapshot_id` alongside it. Prefer `element_token`, \
-            which carries both values."
+        "description": "Index from get_window_state, with its snapshot_id. Prefer \
+            element_token."
     })
 }
 
@@ -106,8 +101,7 @@ pub fn snapshot_id_schema() -> Value {
     json!({
         "type": "string",
         "pattern": "^s[0-9a-f]{8}$",
-        "description": "Snapshot handle from get_window_state. Required when \
-            targeting by element_index; stale snapshots fail closed."
+        "description": "snapshot_id that element_index came from."
     })
 }
 
@@ -115,10 +109,7 @@ pub fn snapshot_id_schema() -> Value {
 pub fn element_token_schema() -> Value {
     json!({
         "type": "string",
-        "description": "Opaque per-snapshot element handle from \
-            `structuredContent.elements[].element_token`. If element_index, \
-            snapshot_id, or window_id are also supplied they must agree. Returns \
-            an explicit stale error once a newer snapshot supersedes it."
+        "description": "Element handle from the latest get_window_state."
     })
 }
 
@@ -137,14 +128,8 @@ pub fn timeout_ms_schema() -> Value {
         "minimum": TIMEOUT_MS_MIN,
         "maximum": TIMEOUT_MS_MAX,
         "default": TIMEOUT_MS_DEFAULT,
-        "description": format!(
-            "Wall-clock budget in milliseconds for the accessibility-tree walk \
-             (default {TIMEOUT_MS_DEFAULT}, min {TIMEOUT_MS_MIN}, max {TIMEOUT_MS_MAX}). \
-             Bounds the WHOLE walk. When the budget runs out the tool returns the PARTIAL tree \
-             it has, flagged with `truncated: true`, `truncation_reason`, `nodes_visited`, \
-             `nodes_pending` and `elements_complete: false`; retry with a larger value \
-             (e.g. 5000) or narrow with `query` / `max_depth`."
-        )
+        "description": "Budget for the accessibility walk. On timeout the partial \
+            tree returns with truncated:true; retry larger or narrow with query."
     })
 }
 
@@ -154,11 +139,8 @@ pub fn element_fields_schema() -> Value {
     json!({
         "type": "string",
         "enum": ["compact", "full"],
-        "description": "macOS only. \"compact\" (default) omits per-element frame, depth and \
-            parent_index, omits enabled when true and selected when false, and drops the \
-            _note; \"full\" returns every field. Use screenshot_frame (screenshot pixels) \
-            for pixel actions. Other platforms accept and ignore it and always return \
-            full records."
+        "description": "macOS: \"compact\" (default) omits frame, depth, parent_index and default \
+            flags; \"full\" returns every field. Other platforms return full records."
     })
 }
 
@@ -169,11 +151,8 @@ pub fn desktop_max_image_dimension_schema() -> Value {
     json!({
         "type": "integer",
         "minimum": 0,
-        "description": "Optional long-edge cap for the returned PNG, in pixels (aspect ratio \
-            preserved). Omitted or 0 returns the full-size capture. When the cap downsizes \
-            the image, the response reports `screenshot_original_width/height`, and x/y read \
-            off it for this session's later scope:\"desktop\" actions (or passed with its \
-            `capture_id`) are mapped back to the full-size frame automatically."
+        "description": "Long-edge cap for the PNG; 0 is full size. Later desktop x,y \
+            from a capped image are mapped back automatically."
     })
 }
 
@@ -267,8 +246,7 @@ fn session_description_has_multi_call_guidance(schema: &Value) -> bool {
         .and_then(Value::as_str)
         .map(|description| description.split_whitespace().collect::<Vec<_>>().join(" "))
         .is_some_and(|description| {
-            description.contains("prefer a short public session label")
-                && description.contains("repeat it on every call that accepts it")
+            description.contains("run label") && description.contains("repeat it on every call")
         })
 }
 
@@ -294,8 +272,8 @@ pub fn shared_schema_violations(tool_name: &str, input_schema: &Value) -> Vec<St
                 && !session_description_has_multi_call_guidance(pschema)
             {
                 violations.push(format!(
-                    "{tool_name}.session: description must prefer a short public session label \
-                     for multi-call work and tell callers to repeat it on every accepting call"
+                    "{tool_name}.session: description must ask for a short run label \
+                     and tell callers to repeat it on every accepting call"
                 ));
             }
         }

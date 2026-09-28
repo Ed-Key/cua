@@ -188,11 +188,7 @@ impl TextSelectionPredicate {
 #[serde(deny_unknown_fields)]
 pub struct ElementPredicate {
     pub selector: ElementSelector,
-    /// Assert that at least one trusted element matches the selector.
-    ///
-    /// Element walks are not yet exhaustive on every platform, so absence
-    /// cannot be proven. `false` is rejected instead of returning an
-    /// indefinitely-unknown predicate.
+    /// Must be true: at least one trusted element matches. Absence cannot be proven.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "true_only_boolean_schema")]
     pub exists: Option<bool>,
@@ -228,9 +224,8 @@ pub struct VerifyStateInput {
     /// One to eight predicates, combined with logical AND.
     #[schemars(length(min = 1, max = 8))]
     pub expect: Vec<StatePredicate>,
-    /// For multi-call work, prefer a short public session label and repeat it on every call that
-    /// accepts it. Omit it to use the authenticated transport's implicit lifecycle session. This
-    /// field never selects capture modality or authorization.
+    /// Short run label; repeat it on every call. Omit for the implicit session.
+    /// It never selects capture modality or authorization.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "string_schema")]
     pub session: Option<String>,
@@ -242,8 +237,7 @@ pub struct VerifyStateInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "stable_samples_schema")]
     pub stable_samples: Option<u64>,
-    /// Return the final window screenshot as image content for a multimodal
-    /// caller. The driver does not interpret that image.
+    /// Return the final window screenshot for you to judge; the driver does not interpret it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub include_screenshot: Option<bool>,
 }
@@ -363,12 +357,10 @@ impl ToolOutput for VerifyStateOutput {}
 pub fn contracts() -> Vec<ToolContract> {
     vec![ToolContract {
         name: VerifyStateInput::TOOL_NAME.into(),
-        description: "Deterministically verify bounded predicates against one exact window. \
-            The driver evaluates structured window/accessibility state and may return the final \
-            screenshot as uninterpreted visual evidence for a multimodal caller. Predicate \
-            results are satisfied, unsatisfied, or unknown; unknown never implies success. \
-            Accessibility projections are conservative: absence remains unknown unless the \
-            observed search domain is proven exhaustive."
+        description: "Check up to 8 predicates (AND) against one exact window's accessibility \
+            state, with a bounded wait and stable samples. Returns satisfied, unsatisfied, or \
+            unknown; unknown is not success. include_screenshot returns the final image for you \
+            to judge. Details: skill://cua-driver/WORKFLOW.md"
             .into(),
         platforms: ALL_PLATFORMS.to_vec(),
         aliases: Vec::new(),

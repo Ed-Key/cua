@@ -61,6 +61,8 @@ Use `--all-platforms` when the agent assists users across operating systems.
 - `SKILL.md`: lean entrypoint, mandatory safety rules, and task-based routing.
 - `WORKFLOW.md`: exact targets, bounded snapshots, coordinates, action semantics,
   verification, filesystem and clipboard proof.
+- `TOOLS.md`: per-tool detail kept out of the short tool descriptions: result
+  fields, error codes, parameter semantics, and diagnostics contracts.
 - `RUNTIME.md`: preflight, transport/session ownership, authorization, cursor,
   and cleanup.
 - `MACOS.md`, `WINDOWS.md`, or `LINUX.md`: host-specific launch, capture,
