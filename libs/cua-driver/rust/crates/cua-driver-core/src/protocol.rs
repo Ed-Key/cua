@@ -390,7 +390,7 @@ For app/window outcomes, use the narrowest semantic Cua route first: `set_window
 Workflow per task:
 0. `start_session` is optional. For multi-call work, prefer a short `session` label and repeat it on every call that accepts it. Unnamed calls use the transport's implicit session. Only `start_session` revives an ended name; `end_session` explicitly cleans up.
 1. `launch_app`, then `get_window_state(pid, window_id)`.
-2. Reuse its tokens until that window's next snapshot; batch visible steps.
+2. Batch visible steps in one `act_and_read` `steps` call.
 3. `verify_state(pid, window_id, expect)` checks bounded postconditions. `unknown` is not success; `include_screenshot:true` lets the multimodal agent judge visual evidence.
 
 Read `skill://cua-driver/SKILL.md` via `skills/get` or `resources/read`. Hosts control activation/consent. When activated, follow SKILL.md and {platform_skill_pointer}."#
