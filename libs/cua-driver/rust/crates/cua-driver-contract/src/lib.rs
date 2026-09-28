@@ -23,7 +23,7 @@ mod outputs;
 mod sequence;
 pub use action_read::{
     ActAndReadInput, ActAndReadOutput, ActionReadAction, ActionReadChildResult,
-    ActionReadObservation, ActionReadTimings,
+    ActionReadObservation, ActionReadStep, ActionReadStepKind, ActionReadTimings,
 };
 mod session;
 pub use sequence::*;

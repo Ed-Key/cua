@@ -815,6 +815,31 @@ class _UniffiFfiConverterTypeActionReadAction(_UniffiConverterRustBuffer):
 
 
 
+class _UniffiFfiConverterOptionalTypeActionReadAction(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeActionReadAction.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeActionReadAction.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeActionReadAction.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 class _UniffiFfiConverterString:
     @staticmethod
     def check_lower(value):
@@ -1127,13 +1152,301 @@ class _UniffiFfiConverterTypeActionReadObservation(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalUInt32.write(value.max_elements, buf)
         _UniffiFfiConverterOptionalUInt32.write(value.max_depth, buf)
 
+
+
+
+
+
+class ActionReadStepKind(enum.Enum):
+
+    CLICK = 0
+
+    SET_VALUE = 1
+
+    SCROLL = 2
+
+    TYPE_TEXT = 3
+
+    PRESS_KEY = 4
+
+    HOTKEY = 5
+
+
+
+class _UniffiFfiConverterTypeActionReadStepKind(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return ActionReadStepKind.CLICK
+        if variant == 2:
+            return ActionReadStepKind.SET_VALUE
+        if variant == 3:
+            return ActionReadStepKind.SCROLL
+        if variant == 4:
+            return ActionReadStepKind.TYPE_TEXT
+        if variant == 5:
+            return ActionReadStepKind.PRESS_KEY
+        if variant == 6:
+            return ActionReadStepKind.HOTKEY
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == ActionReadStepKind.CLICK:
+            return
+        if value == ActionReadStepKind.SET_VALUE:
+            return
+        if value == ActionReadStepKind.SCROLL:
+            return
+        if value == ActionReadStepKind.TYPE_TEXT:
+            return
+        if value == ActionReadStepKind.PRESS_KEY:
+            return
+        if value == ActionReadStepKind.HOTKEY:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == ActionReadStepKind.CLICK:
+            buf.write_i32(1)
+        if value == ActionReadStepKind.SET_VALUE:
+            buf.write_i32(2)
+        if value == ActionReadStepKind.SCROLL:
+            buf.write_i32(3)
+        if value == ActionReadStepKind.TYPE_TEXT:
+            buf.write_i32(4)
+        if value == ActionReadStepKind.PRESS_KEY:
+            buf.write_i32(5)
+        if value == ActionReadStepKind.HOTKEY:
+            buf.write_i32(6)
+
+
+
+class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterString.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterString.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterString.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalSequenceString(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterSequenceString.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterSequenceString.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterSequenceString.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class ActionReadStep:
+    """
+    One action in `steps`. Every step targets the call's pid and window_id.
+"""
+    def __init__(self, *, action:ActionReadStepKind, element_token:typing.Optional[str] = _DEFAULT, value:typing.Optional[str] = _DEFAULT, text:typing.Optional[str] = _DEFAULT, key:typing.Optional[str] = _DEFAULT, modifiers:typing.Optional[typing.List[str]] = _DEFAULT, keys:typing.Optional[typing.List[str]] = _DEFAULT, direction:typing.Optional[ScrollDirection] = _DEFAULT, by:typing.Optional[ScrollBy] = _DEFAULT, amount:typing.Optional[int] = _DEFAULT):
+        self.action = action
+        if element_token is _DEFAULT:
+            self.element_token = None
+        else:
+            self.element_token = element_token
+        if value is _DEFAULT:
+            self.value = None
+        else:
+            self.value = value
+        if text is _DEFAULT:
+            self.text = None
+        else:
+            self.text = text
+        if key is _DEFAULT:
+            self.key = None
+        else:
+            self.key = key
+        if modifiers is _DEFAULT:
+            self.modifiers = None
+        else:
+            self.modifiers = modifiers
+        if keys is _DEFAULT:
+            self.keys = None
+        else:
+            self.keys = keys
+        if direction is _DEFAULT:
+            self.direction = None
+        else:
+            self.direction = direction
+        if by is _DEFAULT:
+            self.by = None
+        else:
+            self.by = by
+        if amount is _DEFAULT:
+            self.amount = None
+        else:
+            self.amount = amount
+
+
+
+
+    def __str__(self):
+        return "ActionReadStep(action={}, element_token={}, value={}, text={}, key={}, modifiers={}, keys={}, direction={}, by={}, amount={})".format(self.action, self.element_token, self.value, self.text, self.key, self.modifiers, self.keys, self.direction, self.by, self.amount)
+    def __eq__(self, other):
+        if self.action != other.action:
+            return False
+        if self.element_token != other.element_token:
+            return False
+        if self.value != other.value:
+            return False
+        if self.text != other.text:
+            return False
+        if self.key != other.key:
+            return False
+        if self.modifiers != other.modifiers:
+            return False
+        if self.keys != other.keys:
+            return False
+        if self.direction != other.direction:
+            return False
+        if self.by != other.by:
+            return False
+        if self.amount != other.amount:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeActionReadStep(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return ActionReadStep(
+            action=_UniffiFfiConverterTypeActionReadStepKind.read(buf),
+            element_token=_UniffiFfiConverterOptionalString.read(buf),
+            value=_UniffiFfiConverterOptionalString.read(buf),
+            text=_UniffiFfiConverterOptionalString.read(buf),
+            key=_UniffiFfiConverterOptionalString.read(buf),
+            modifiers=_UniffiFfiConverterOptionalSequenceString.read(buf),
+            keys=_UniffiFfiConverterOptionalSequenceString.read(buf),
+            direction=_UniffiFfiConverterOptionalTypeScrollDirection.read(buf),
+            by=_UniffiFfiConverterOptionalTypeScrollBy.read(buf),
+            amount=_UniffiFfiConverterOptionalUInt32.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeActionReadStepKind.check_lower(value.action)
+        _UniffiFfiConverterOptionalString.check_lower(value.element_token)
+        _UniffiFfiConverterOptionalString.check_lower(value.value)
+        _UniffiFfiConverterOptionalString.check_lower(value.text)
+        _UniffiFfiConverterOptionalString.check_lower(value.key)
+        _UniffiFfiConverterOptionalSequenceString.check_lower(value.modifiers)
+        _UniffiFfiConverterOptionalSequenceString.check_lower(value.keys)
+        _UniffiFfiConverterOptionalTypeScrollDirection.check_lower(value.direction)
+        _UniffiFfiConverterOptionalTypeScrollBy.check_lower(value.by)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.amount)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeActionReadStepKind.write(value.action, buf)
+        _UniffiFfiConverterOptionalString.write(value.element_token, buf)
+        _UniffiFfiConverterOptionalString.write(value.value, buf)
+        _UniffiFfiConverterOptionalString.write(value.text, buf)
+        _UniffiFfiConverterOptionalString.write(value.key, buf)
+        _UniffiFfiConverterOptionalSequenceString.write(value.modifiers, buf)
+        _UniffiFfiConverterOptionalSequenceString.write(value.keys, buf)
+        _UniffiFfiConverterOptionalTypeScrollDirection.write(value.direction, buf)
+        _UniffiFfiConverterOptionalTypeScrollBy.write(value.by, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.amount, buf)
+
+class _UniffiFfiConverterSequenceTypeActionReadStep(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeActionReadStep.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeActionReadStep.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeActionReadStep.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalSequenceTypeActionReadStep(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterSequenceTypeActionReadStep.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterSequenceTypeActionReadStep.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterSequenceTypeActionReadStep.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class ActAndReadInput:
-    def __init__(self, *, pid:int, window_id:int, action:ActionReadAction, element_token:str, value:typing.Optional[str] = _DEFAULT, direction:typing.Optional[ScrollDirection] = _DEFAULT, by:typing.Optional[ScrollBy] = _DEFAULT, amount:typing.Optional[int] = _DEFAULT, session:typing.Optional[str] = _DEFAULT, observe:ActionReadObservation = _DEFAULT):
+    def __init__(self, *, pid:int, window_id:int, action:typing.Optional[ActionReadAction] = _DEFAULT, element_token:typing.Optional[str] = _DEFAULT, value:typing.Optional[str] = _DEFAULT, direction:typing.Optional[ScrollDirection] = _DEFAULT, by:typing.Optional[ScrollBy] = _DEFAULT, amount:typing.Optional[int] = _DEFAULT, session:typing.Optional[str] = _DEFAULT, observe:ActionReadObservation = _DEFAULT, steps:typing.Optional[typing.List[ActionReadStep]] = _DEFAULT):
         self.pid = pid
         self.window_id = window_id
-        self.action = action
-        self.element_token = element_token
+        if action is _DEFAULT:
+            self.action = None
+        else:
+            self.action = action
+        if element_token is _DEFAULT:
+            self.element_token = None
+        else:
+            self.element_token = element_token
         if value is _DEFAULT:
             self.value = None
         else:
@@ -1158,12 +1471,16 @@ class ActAndReadInput:
             self.observe = ActionReadObservation()
         else:
             self.observe = observe
+        if steps is _DEFAULT:
+            self.steps = None
+        else:
+            self.steps = steps
 
 
 
 
     def __str__(self):
-        return "ActAndReadInput(pid={}, window_id={}, action={}, element_token={}, value={}, direction={}, by={}, amount={}, session={}, observe={})".format(self.pid, self.window_id, self.action, self.element_token, self.value, self.direction, self.by, self.amount, self.session, self.observe)
+        return "ActAndReadInput(pid={}, window_id={}, action={}, element_token={}, value={}, direction={}, by={}, amount={}, session={}, observe={}, steps={})".format(self.pid, self.window_id, self.action, self.element_token, self.value, self.direction, self.by, self.amount, self.session, self.observe, self.steps)
     def __eq__(self, other):
         if self.pid != other.pid:
             return False
@@ -1185,6 +1502,8 @@ class ActAndReadInput:
             return False
         if self.observe != other.observe:
             return False
+        if self.steps != other.steps:
+            return False
         return True
 
 class _UniffiFfiConverterTypeActAndReadInput(_UniffiConverterRustBuffer):
@@ -1193,41 +1512,44 @@ class _UniffiFfiConverterTypeActAndReadInput(_UniffiConverterRustBuffer):
         return ActAndReadInput(
             pid=_UniffiFfiConverterUInt32.read(buf),
             window_id=_UniffiFfiConverterUInt32.read(buf),
-            action=_UniffiFfiConverterTypeActionReadAction.read(buf),
-            element_token=_UniffiFfiConverterString.read(buf),
+            action=_UniffiFfiConverterOptionalTypeActionReadAction.read(buf),
+            element_token=_UniffiFfiConverterOptionalString.read(buf),
             value=_UniffiFfiConverterOptionalString.read(buf),
             direction=_UniffiFfiConverterOptionalTypeScrollDirection.read(buf),
             by=_UniffiFfiConverterOptionalTypeScrollBy.read(buf),
             amount=_UniffiFfiConverterOptionalUInt32.read(buf),
             session=_UniffiFfiConverterOptionalString.read(buf),
             observe=_UniffiFfiConverterTypeActionReadObservation.read(buf),
+            steps=_UniffiFfiConverterOptionalSequenceTypeActionReadStep.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterUInt32.check_lower(value.pid)
         _UniffiFfiConverterUInt32.check_lower(value.window_id)
-        _UniffiFfiConverterTypeActionReadAction.check_lower(value.action)
-        _UniffiFfiConverterString.check_lower(value.element_token)
+        _UniffiFfiConverterOptionalTypeActionReadAction.check_lower(value.action)
+        _UniffiFfiConverterOptionalString.check_lower(value.element_token)
         _UniffiFfiConverterOptionalString.check_lower(value.value)
         _UniffiFfiConverterOptionalTypeScrollDirection.check_lower(value.direction)
         _UniffiFfiConverterOptionalTypeScrollBy.check_lower(value.by)
         _UniffiFfiConverterOptionalUInt32.check_lower(value.amount)
         _UniffiFfiConverterOptionalString.check_lower(value.session)
         _UniffiFfiConverterTypeActionReadObservation.check_lower(value.observe)
+        _UniffiFfiConverterOptionalSequenceTypeActionReadStep.check_lower(value.steps)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterUInt32.write(value.pid, buf)
         _UniffiFfiConverterUInt32.write(value.window_id, buf)
-        _UniffiFfiConverterTypeActionReadAction.write(value.action, buf)
-        _UniffiFfiConverterString.write(value.element_token, buf)
+        _UniffiFfiConverterOptionalTypeActionReadAction.write(value.action, buf)
+        _UniffiFfiConverterOptionalString.write(value.element_token, buf)
         _UniffiFfiConverterOptionalString.write(value.value, buf)
         _UniffiFfiConverterOptionalTypeScrollDirection.write(value.direction, buf)
         _UniffiFfiConverterOptionalTypeScrollBy.write(value.by, buf)
         _UniffiFfiConverterOptionalUInt32.write(value.amount, buf)
         _UniffiFfiConverterOptionalString.write(value.session, buf)
         _UniffiFfiConverterTypeActionReadObservation.write(value.observe, buf)
+        _UniffiFfiConverterOptionalSequenceTypeActionReadStep.write(value.steps, buf)
 
 
 
@@ -2609,29 +2931,6 @@ class _UniffiFfiConverterTypeClipboardReadInput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterBoolean.write(value.include_text, buf)
         _UniffiFfiConverterOptionalString.write(value.session, buf)
 
-class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        for item in value:
-            _UniffiFfiConverterString.check_lower(item)
-
-    @classmethod
-    def write(cls, value, buf):
-        items = len(value)
-        buf.write_i32(items)
-        for item in value:
-            _UniffiFfiConverterString.write(item, buf)
-
-    @classmethod
-    def read(cls, buf):
-        count = buf.read_i32()
-        if count < 0:
-            raise InternalError("Unexpected negative sequence length")
-
-        return [
-            _UniffiFfiConverterString.read(buf) for i in range(count)
-        ]
-
 @dataclass
 class ClipboardReadOutput:
     def __init__(self, *, supported:bool, types:typing.List[str], text:typing.Optional[str], privacy_sensitive:bool, content_redacted_from_telemetry:bool):
@@ -3324,31 +3623,6 @@ class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
             return None
         elif flag == 1:
             return _UniffiFfiConverterUInt64.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-class _UniffiFfiConverterOptionalSequenceString(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterSequenceString.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterSequenceString.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterSequenceString.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
@@ -9209,6 +9483,7 @@ __all__ = [
     "ActionReadAction",
     "ScrollDirection",
     "ScrollBy",
+    "ActionReadStepKind",
     "ActionDeliveryMode",
     "ActionEscalationTarget",
     "ActionEscalationReason",
@@ -9239,6 +9514,7 @@ __all__ = [
     "VisualParseErrorCode",
     "Platform",
     "ActionReadObservation",
+    "ActionReadStep",
     "ActAndReadInput",
     "ActionDelivery",
     "ActionError",

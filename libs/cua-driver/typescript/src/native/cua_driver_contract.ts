@@ -196,11 +196,176 @@ const FfiConverterTypeActionReadObservation = (() => {
     return new FFIConverter();
 })();
 
+export enum ActionReadStepKind {
+    Click,
+    SetValue,
+    Scroll,
+    TypeText,
+    PressKey,
+    Hotkey
+}
+
+const FfiConverterTypeActionReadStepKind = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = ActionReadStepKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return ActionReadStepKind.Click;
+                case 2: return ActionReadStepKind.SetValue;
+                case 3: return ActionReadStepKind.Scroll;
+                case 4: return ActionReadStepKind.TypeText;
+                case 5: return ActionReadStepKind.PressKey;
+                case 6: return ActionReadStepKind.Hotkey;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case ActionReadStepKind.Click: return ordinalConverter.write(1, into);
+                case ActionReadStepKind.SetValue: return ordinalConverter.write(2, into);
+                case ActionReadStepKind.Scroll: return ordinalConverter.write(3, into);
+                case ActionReadStepKind.TypeText: return ordinalConverter.write(4, into);
+                case ActionReadStepKind.PressKey: return ordinalConverter.write(5, into);
+                case ActionReadStepKind.Hotkey: return ordinalConverter.write(6, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * One action in `steps`. Every step targets the call's pid and window_id.
+ */
+export type ActionReadStep = {
+    action: ActionReadStepKind,
+    /**
+     * Required for click, set_value and scroll; optional for type_text; not allowed for
+     * press_key and hotkey.
+     */
+    elementToken?: string,
+    /**
+     * Required for set_value; not allowed for other actions.
+     */
+    value?: string,
+    /**
+     * Required for type_text; not allowed for other actions.
+     */
+    text?: string,
+    /**
+     * Required for press_key; not allowed for other actions.
+     */
+    key?: string,
+    /**
+     * Optional for press_key; not allowed for other actions.
+     */
+    modifiers?: Array<string>,
+    /**
+     * Required for hotkey, for example ["cmd", "a"]; not allowed for other actions.
+     */
+    keys?: Array<string>,
+    /**
+     * Required for scroll; not allowed for other actions.
+     */
+    direction?: ScrollDirection,
+    /**
+     * Scroll only. Omit to retain the scroll tool's line default.
+     */
+    by?: ScrollBy,
+    /**
+     * Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.
+     */
+    amount?: number
+}
+
+/**
+ * Generated factory for {@link ActionReadStep} record objects.
+ */
+export const ActionReadStep = (() => {
+    const defaults = () => ({
+        elementToken: undefined,
+        value: undefined,
+        text: undefined,
+        key: undefined,
+        modifiers: undefined,
+        keys: undefined,
+        direction: undefined,
+        by: undefined,
+        amount: undefined
+    });
+    const create = (() => {
+        return uniffiCreateRecord<ActionReadStep, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<ActionReadStep>,
+    });
+})();
+
+const FfiConverterTypeActionReadStep = (() => {
+    type TypeName = ActionReadStep;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                action: FfiConverterTypeActionReadStepKind.read(from),
+                elementToken: FfiConverterOptionalString.read(from),
+                value: FfiConverterOptionalString.read(from),
+                text: FfiConverterOptionalString.read(from),
+                key: FfiConverterOptionalString.read(from),
+                modifiers: FfiConverterOptionalSequenceString.read(from),
+                keys: FfiConverterOptionalSequenceString.read(from),
+                direction: FfiConverterOptionalTypeScrollDirection.read(from),
+                by: FfiConverterOptionalTypeScrollBy.read(from),
+                amount: FfiConverterOptionalUInt32.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeActionReadStepKind.write(value.action, into);
+            FfiConverterOptionalString.write(value.elementToken, into);
+            FfiConverterOptionalString.write(value.value, into);
+            FfiConverterOptionalString.write(value.text, into);
+            FfiConverterOptionalString.write(value.key, into);
+            FfiConverterOptionalSequenceString.write(value.modifiers, into);
+            FfiConverterOptionalSequenceString.write(value.keys, into);
+            FfiConverterOptionalTypeScrollDirection.write(value.direction, into);
+            FfiConverterOptionalTypeScrollBy.write(value.by, into);
+            FfiConverterOptionalUInt32.write(value.amount, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeActionReadStepKind.allocationSize(value.action) +
+             FfiConverterOptionalString.allocationSize(value.elementToken) +
+             FfiConverterOptionalString.allocationSize(value.value) +
+             FfiConverterOptionalString.allocationSize(value.text) +
+             FfiConverterOptionalString.allocationSize(value.key) +
+             FfiConverterOptionalSequenceString.allocationSize(value.modifiers) +
+             FfiConverterOptionalSequenceString.allocationSize(value.keys) +
+             FfiConverterOptionalTypeScrollDirection.allocationSize(value.direction) +
+             FfiConverterOptionalTypeScrollBy.allocationSize(value.by) +
+             FfiConverterOptionalUInt32.allocationSize(value.amount);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type ActAndReadInput = {
     pid: number,
     windowId: number,
-    action: ActionReadAction,
-    elementToken: string,
+    /**
+     * Single-action form: click, set_value or scroll. Omit when passing steps.
+     */
+    action?: ActionReadAction,
+    /**
+     * Single-action form: the target element. Omit when passing steps.
+     */
+    elementToken?: string,
+    /**
+     * Required for action set_value; not allowed for other actions.
+     */
     value?: string,
     /**
      * Required only for scroll. Uses the existing background scroll route.
@@ -214,8 +379,17 @@ export type ActAndReadInput = {
      * Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.
      */
     amount?: number,
+    /**
+     * For multi-call work, prefer a short public session label and repeat it on every call that
+     * accepts it. Unnamed calls use the transport's implicit session.
+     */
     session?: string,
-    observe: ActionReadObservation
+    observe: ActionReadObservation,
+    /**
+     * Instead of action: 1 to 8 actions on this window, run in order and stopped at the first
+     * failure, then one observation.
+     */
+    steps?: Array<ActionReadStep>
 }
 
 /**
@@ -223,12 +397,15 @@ export type ActAndReadInput = {
  */
 export const ActAndReadInput = (() => {
     const defaults = () => ({
+        action: undefined,
+        elementToken: undefined,
         value: undefined,
         direction: undefined,
         by: undefined,
         amount: undefined,
         session: undefined,
-        observe: ActionReadObservation.create({})
+        observe: ActionReadObservation.create({}),
+        steps: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<ActAndReadInput, ReturnType<typeof defaults>>(defaults);
@@ -247,39 +424,42 @@ const FfiConverterTypeActAndReadInput = (() => {
             return {
                 pid: FfiConverterUInt32.read(from),
                 windowId: FfiConverterUInt32.read(from),
-                action: FfiConverterTypeActionReadAction.read(from),
-                elementToken: FfiConverterString.read(from),
+                action: FfiConverterOptionalTypeActionReadAction.read(from),
+                elementToken: FfiConverterOptionalString.read(from),
                 value: FfiConverterOptionalString.read(from),
                 direction: FfiConverterOptionalTypeScrollDirection.read(from),
                 by: FfiConverterOptionalTypeScrollBy.read(from),
                 amount: FfiConverterOptionalUInt32.read(from),
                 session: FfiConverterOptionalString.read(from),
-                observe: FfiConverterTypeActionReadObservation.read(from)
+                observe: FfiConverterTypeActionReadObservation.read(from),
+                steps: FfiConverterOptionalSequenceTypeActionReadStep.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterUInt32.write(value.pid, into);
             FfiConverterUInt32.write(value.windowId, into);
-            FfiConverterTypeActionReadAction.write(value.action, into);
-            FfiConverterString.write(value.elementToken, into);
+            FfiConverterOptionalTypeActionReadAction.write(value.action, into);
+            FfiConverterOptionalString.write(value.elementToken, into);
             FfiConverterOptionalString.write(value.value, into);
             FfiConverterOptionalTypeScrollDirection.write(value.direction, into);
             FfiConverterOptionalTypeScrollBy.write(value.by, into);
             FfiConverterOptionalUInt32.write(value.amount, into);
             FfiConverterOptionalString.write(value.session, into);
             FfiConverterTypeActionReadObservation.write(value.observe, into);
+            FfiConverterOptionalSequenceTypeActionReadStep.write(value.steps, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterUInt32.allocationSize(value.pid) +
              FfiConverterUInt32.allocationSize(value.windowId) +
-             FfiConverterTypeActionReadAction.allocationSize(value.action) +
-             FfiConverterString.allocationSize(value.elementToken) +
+             FfiConverterOptionalTypeActionReadAction.allocationSize(value.action) +
+             FfiConverterOptionalString.allocationSize(value.elementToken) +
              FfiConverterOptionalString.allocationSize(value.value) +
              FfiConverterOptionalTypeScrollDirection.allocationSize(value.direction) +
              FfiConverterOptionalTypeScrollBy.allocationSize(value.by) +
              FfiConverterOptionalUInt32.allocationSize(value.amount) +
              FfiConverterOptionalString.allocationSize(value.session) +
-             FfiConverterTypeActionReadObservation.allocationSize(value.observe);
+             FfiConverterTypeActionReadObservation.allocationSize(value.observe) +
+             FfiConverterOptionalSequenceTypeActionReadStep.allocationSize(value.steps);
 
         }
     };
@@ -2768,7 +2948,8 @@ export type GetWindowStateInput = {
     query?: string,
     /**
      * macOS only. Default false. With a nonblank query, also keep every row
-     * collected under each match, not only its ancestors.
+     * collected under each match, not only its ancestors. Display-only rows
+     * appear in tree_markdown; structured elements hold only actionable rows.
      */
     queryContext?: boolean,
     /**
@@ -6826,6 +7007,9 @@ const FfiConverterTypePlatform = (() => {
     return new FFIConverter();
 })();
 
+// FfiConverter for ActionReadAction | undefined
+const FfiConverterOptionalTypeActionReadAction = new FfiConverterOptional(FfiConverterTypeActionReadAction);
+
 // FfiConverter for string | undefined
 const FfiConverterOptionalString = new FfiConverterOptional(FfiConverterString);
 
@@ -6837,6 +7021,18 @@ const FfiConverterOptionalTypeScrollBy = new FfiConverterOptional(FfiConverterTy
 
 // FfiConverter for number | undefined
 const FfiConverterOptionalUInt32 = new FfiConverterOptional(FfiConverterUInt32);
+
+// FfiConverter for Array<string>
+const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
+
+// FfiConverter for Array<string> | undefined
+const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
+
+// FfiConverter for Array<ActionReadStep>
+const FfiConverterSequenceTypeActionReadStep = new FfiConverterArray(FfiConverterTypeActionReadStep);
+
+// FfiConverter for Array<ActionReadStep> | undefined
+const FfiConverterOptionalSequenceTypeActionReadStep = new FfiConverterOptional(FfiConverterSequenceTypeActionReadStep);
 
 // FfiConverter for ActionDelivery | undefined
 const FfiConverterOptionalTypeActionDelivery = new FfiConverterOptional(FfiConverterTypeActionDelivery);
@@ -6859,9 +7055,6 @@ const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64
 // FfiConverter for ClickButton | undefined
 const FfiConverterOptionalTypeClickButton = new FfiConverterOptional(FfiConverterTypeClickButton);
 
-// FfiConverter for Array<string>
-const FfiConverterSequenceString = new FfiConverterArray(FfiConverterString);
-
 // FfiConverter for ActionTarget | undefined
 const FfiConverterOptionalTypeActionTarget = new FfiConverterOptional(FfiConverterTypeActionTarget);
 
@@ -6870,9 +7063,6 @@ const FfiConverterOptionalTypeDesktopScope = new FfiConverterOptional(FfiConvert
 
 // FfiConverter for bigint | undefined
 const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
-
-// FfiConverter for Array<string> | undefined
-const FfiConverterOptionalSequenceString = new FfiConverterOptional(FfiConverterSequenceString);
 
 // FfiConverter for boolean | undefined
 const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
@@ -7028,6 +7218,8 @@ export default Object.freeze({
     FfiConverterTypeActionEvidenceKind,
     FfiConverterTypeActionReadAction,
     FfiConverterTypeActionReadObservation,
+    FfiConverterTypeActionReadStep,
+    FfiConverterTypeActionReadStepKind,
     FfiConverterTypeActionResult,
     FfiConverterTypeActionRoute,
     FfiConverterTypeActionTarget,

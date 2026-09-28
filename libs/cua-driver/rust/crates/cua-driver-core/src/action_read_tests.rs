@@ -629,3 +629,360 @@ fn action_read_scroll_schema_accepts_bounded_options_and_rejects_nulls() {
         assert!(!validator.is_valid(&value), "{value}");
     }
 }
+
+const STEP_TOOLS: [&str; 6] = [
+    "click",
+    "set_value",
+    "scroll",
+    "type_text",
+    "press_key",
+    "hotkey",
+];
+
+/// Registry with the given child tools; only `failing` returns a tool error.
+fn steps_registry(tools: &[&str], failing: Option<&str>) -> (Arc<ToolRegistry>, Log) {
+    let mut registry = ToolRegistry::new();
+    let log = Arc::new(Mutex::new(vec![]));
+    for &name in tools.iter().chain(&["get_window_state"]) {
+        registry.register(Box::new(NativeIo {
+            def: ToolDef {
+                name: name.into(),
+                description: "native boundary double".into(),
+                input_schema: json!({"type":"object"}),
+                read_only: name == "get_window_state",
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+            log: log.clone(),
+            observation_error: false,
+            action_error: failing == Some(name),
+        }));
+    }
+    registry.register_sequence_tools();
+    registry.register_session_tools();
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+    (registry, log)
+}
+
+fn all_steps() -> Value {
+    json!([
+        {"action":"click","element_token":"t-click"},
+        {"action":"set_value","element_token":"t-field","value":"hello"},
+        {"action":"type_text","text":" world"},
+        {"action":"press_key","key":"return","modifiers":["shift"]},
+        {"action":"hotkey","keys":["cmd","a"]},
+        {"action":"scroll","element_token":"t-list","direction":"down","by":"page","amount":2}
+    ])
+}
+
+#[test]
+fn action_read_validates_exactly_one_form_and_each_step() {
+    use cua_driver_contract::{ActAndReadInput, ToolInput};
+    let check = |patch: Value| -> Result<(), String> {
+        let mut args = json!({"pid":42,"window_id":7});
+        args.as_object_mut()
+            .unwrap()
+            .extend(patch.as_object().unwrap().clone());
+        serde_json::from_value::<ActAndReadInput>(args)
+            .map_err(|e| format!("parse: {e}"))?
+            .validate()
+    };
+    check(json!({"steps":all_steps()})).unwrap();
+    check(json!({"action":"click","element_token":"t"})).unwrap();
+    for (steps, message) in [
+        (
+            json!([{"action":"type_text","text":"x","element_token":"t"}]),
+            None,
+        ),
+        (
+            json!([{"action":"click"}]),
+            Some("step 1: a nonblank element_token is required for click"),
+        ),
+        (
+            json!([{"action":"set_value","element_token":" ","value":"v"}]),
+            Some("step 1: a nonblank element_token is required for set_value"),
+        ),
+        (
+            json!([{"action":"scroll","direction":"up"}]),
+            Some("step 1: a nonblank element_token is required for scroll"),
+        ),
+        (
+            json!([{"action":"click","element_token":"t"},{"action":"set_value","element_token":"t"}]),
+            Some("step 2: value is required for set_value"),
+        ),
+        (
+            json!([{"action":"scroll","element_token":"t"}]),
+            Some("step 1: direction is required for scroll"),
+        ),
+        (
+            json!([{"action":"scroll","element_token":"t","direction":"up","amount":51}]),
+            Some("step 1: scroll amount must be between 1 and 50"),
+        ),
+        (
+            json!([{"action":"click","element_token":"t","amount":2}]),
+            Some("step 1: amount is only allowed for scroll"),
+        ),
+        (
+            json!([{"action":"click","element_token":"t","value":"v"}]),
+            Some("step 1: value is only allowed for set_value"),
+        ),
+        (
+            json!([{"action":"type_text"}]),
+            Some("step 1: text is required for type_text"),
+        ),
+        (
+            json!([{"action":"type_text","text":"x","element_token":" "}]),
+            Some("step 1: element_token must be nonblank when given"),
+        ),
+        (
+            json!([{"action":"type_text","text":"x","key":"a"}]),
+            Some("step 1: key is only allowed for press_key"),
+        ),
+        (
+            json!([{"action":"press_key"}]),
+            Some("step 1: key is required for press_key"),
+        ),
+        (
+            json!([{"action":"press_key","key":" "}]),
+            Some("step 1: key must be nonblank"),
+        ),
+        (
+            json!([{"action":"press_key","key":"a","element_token":"t"}]),
+            Some("step 1: element_token is not allowed for press_key"),
+        ),
+        (
+            json!([{"action":"press_key","key":"a","keys":["cmd","a"]}]),
+            Some("step 1: keys is only allowed for hotkey"),
+        ),
+        (
+            json!([{"action":"hotkey"}]),
+            Some("step 1: keys is required for hotkey"),
+        ),
+        (
+            json!([{"action":"hotkey","keys":[]}]),
+            Some("step 1: keys must be a non-empty array of nonblank strings"),
+        ),
+        (
+            json!([{"action":"hotkey","keys":["cmd","a"],"element_token":"t"}]),
+            Some("step 1: element_token is not allowed for hotkey"),
+        ),
+        (
+            json!([{"action":"hotkey","keys":["cmd","a"],"modifiers":["cmd"]}]),
+            Some("step 1: modifiers is only allowed for press_key"),
+        ),
+        (
+            json!([]),
+            Some("steps must contain between 1 and 8 actions"),
+        ),
+        (
+            json!(vec![json!({"action":"press_key","key":"a"}); 9]),
+            Some("steps must contain between 1 and 8 actions"),
+        ),
+    ] {
+        let result = check(json!({"steps":steps}));
+        match message {
+            None => result.unwrap(),
+            Some(message) => assert_eq!(result.unwrap_err(), message, "{steps}"),
+        }
+    }
+    check(json!({"steps":vec![json!({"action":"press_key","key":"a"}); 8]})).unwrap();
+    for mixed in [
+        json!({"action":"click"}),
+        json!({"element_token":"t"}),
+        json!({"value":"v"}),
+        json!({"direction":"up"}),
+        json!({"by":"line"}),
+        json!({"amount":1}),
+    ] {
+        let mut patch = json!({"steps":all_steps()});
+        patch
+            .as_object_mut()
+            .unwrap()
+            .extend(mixed.as_object().unwrap().clone());
+        assert!(check(patch).unwrap_err().starts_with("pass either steps"));
+    }
+    assert_eq!(
+        check(json!({})).unwrap_err(),
+        "action and element_token are required unless steps is given"
+    );
+    assert_eq!(
+        check(json!({"action":"click"})).unwrap_err(),
+        "a nonblank element_token is required"
+    );
+    for bad in [
+        json!({"steps":null}),
+        json!({"steps":[{"action":"drag","element_token":"t"}]}),
+        json!({"steps":[{"action":"click","element_token":"t","delivery_mode":"foreground"}]}),
+        json!({"steps":[{"action":"press_key","key":null}]}),
+    ] {
+        assert!(
+            check(bad.clone()).unwrap_err().starts_with("parse:"),
+            "{bad}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn action_read_steps_run_in_order_then_observe_once() {
+    let _serial = SERIAL.lock().await;
+    let (registry, log) = steps_registry(&STEP_TOOLS, None);
+    let ctx = context();
+    let result = registry
+        .invoke_with_context(
+            "act_and_read",
+            json!({"pid":42,"window_id":7,"session":"steps","steps":all_steps(),
+                "observe":{"include_screenshot":true}}),
+            ctx.clone(),
+        )
+        .await;
+    assert_ne!(result.is_error, Some(true), "{result:?}");
+    let calls = log.lock().unwrap();
+    assert_eq!(
+        calls.iter().map(|c| c.0.as_str()).collect::<Vec<_>>(),
+        [
+            "click",
+            "set_value",
+            "type_text",
+            "press_key",
+            "hotkey",
+            "scroll",
+            "get_window_state"
+        ]
+    );
+    for (name, args) in calls.iter() {
+        assert_eq!(args["pid"], 42, "{name}");
+        assert_eq!(args["window_id"], 7, "{name}");
+        assert_eq!(args["session"], ctx.runtime_session_key("steps"), "{name}");
+        assert!(args.get("action").is_none(), "{name}");
+        let background = !matches!(name.as_str(), "set_value" | "get_window_state");
+        assert_eq!(
+            args.get("delivery_mode") == Some(&json!("background")),
+            background,
+            "{name}"
+        );
+    }
+    assert_eq!(calls[0].1["element_token"], "t-click");
+    assert_eq!(calls[1].1["value"], "hello");
+    assert_eq!(calls[2].1["text"], " world");
+    assert!(calls[2].1.get("element_token").is_none());
+    assert_eq!(calls[3].1["key"], "return");
+    assert_eq!(calls[3].1["modifiers"], json!(["shift"]));
+    assert_eq!(calls[4].1["keys"], json!(["cmd", "a"]));
+    assert_eq!(calls[5].1["direction"], "down");
+    assert_eq!(calls[5].1["by"], "page");
+    assert_eq!(calls[5].1["amount"], 2);
+    assert_eq!(calls[6].1["include_screenshot"], true);
+
+    let output = result.structured_content.clone().unwrap();
+    assert_eq!(output["steps"].as_array().unwrap().len(), 6);
+    assert!(output.get("stopped_at").is_none());
+    assert_eq!(output["action"], output["steps"][5]);
+    assert_eq!(
+        output["observation"]["structuredContent"]["snapshot_id"],
+        "fresh"
+    );
+    let schema = cua_driver_contract::tool_success_output_schema("act_and_read").unwrap();
+    assert!(
+        jsonschema::validator_for(&schema)
+            .unwrap()
+            .is_valid(&output),
+        "{output}"
+    );
+    let headers: Vec<&str> = result
+        .content
+        .iter()
+        .filter_map(|c| match c {
+            Content::Text { text, .. }
+                if text.ends_with("RESULT (unchanged child content follows)") =>
+            {
+                Some(text.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    assert_eq!(headers.len(), 7);
+    assert!(headers[0].starts_with("STEP 1 RESULT"));
+    assert!(headers[5].starts_with("STEP 6 RESULT"));
+    assert!(headers[6].starts_with("OBSERVATION RESULT"));
+    assert!(!headers.iter().any(|h| h.starts_with("ACTION RESULT")));
+}
+
+#[tokio::test]
+async fn action_read_steps_stop_at_first_error_and_still_observe() {
+    let _serial = SERIAL.lock().await;
+    let (registry, log) = steps_registry(&STEP_TOOLS, Some("set_value"));
+    let result = registry
+        .invoke_with_context(
+            "act_and_read",
+            json!({"pid":42,"window_id":7,"steps":all_steps()}),
+            context(),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert_eq!(
+        log.lock()
+            .unwrap()
+            .iter()
+            .map(|c| c.0.as_str())
+            .collect::<Vec<_>>(),
+        ["click", "set_value", "get_window_state"]
+    );
+    let output = result.structured_content.clone().unwrap();
+    assert_eq!(output["stopped_at"], 2);
+    let steps = output["steps"].as_array().unwrap();
+    assert_eq!(steps.len(), 2);
+    assert_ne!(steps[0]["isError"], true);
+    assert_eq!(steps[1]["isError"], true);
+    assert_eq!(steps[1]["structuredContent"]["detail"], "retained");
+    assert_eq!(output["action"], steps[1]);
+    assert_eq!(
+        output["observation"]["structuredContent"]["snapshot_id"],
+        "fresh"
+    );
+    // Text-only clients get the same evidence, including where it stopped.
+    let text_evidence: Vec<Value> = result
+        .content
+        .iter()
+        .filter_map(|part| match part {
+            Content::Text { text, .. } => serde_json::from_str(text).ok(),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(text_evidence, [output]);
+}
+
+#[tokio::test]
+async fn action_read_steps_require_every_child_tool_before_dispatch() {
+    let _serial = SERIAL.lock().await;
+    let (registry, log) = steps_registry(&["click", "set_value", "scroll"], None);
+    let result = registry
+        .invoke_with_context(
+            "act_and_read",
+            json!({"pid":42,"window_id":7,"steps":all_steps()}),
+            context(),
+        )
+        .await;
+    assert_eq!(result.is_error, Some(true));
+    assert!(result.content.iter().any(
+        |c| matches!(c,Content::Text{text,..} if text.contains("requires registered type_text"))
+    ));
+    assert!(log.lock().unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn action_read_single_form_output_has_no_step_fields() {
+    let _serial = SERIAL.lock().await;
+    for action_error in [false, true] {
+        let (registry, _) = registry_with_action(false, action_error);
+        let result = registry
+            .invoke_with_context("act_and_read", input(), context())
+            .await;
+        let output = result.structured_content.unwrap();
+        assert!(output.get("steps").is_none());
+        assert!(output.get("stopped_at").is_none());
+        assert!(matches!(&result.content[0],
+            Content::Text{text,..} if text == "ACTION RESULT (unchanged child content follows)"));
+    }
+}

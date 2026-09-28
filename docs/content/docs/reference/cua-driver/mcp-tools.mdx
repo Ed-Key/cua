@@ -1097,23 +1097,26 @@ accepts it. Omit it to use the authenticated transport's implicit lifecycle sess
 
 ### `act_and_read`
 
-macOS: run one token-targeted background click, set_value or scroll, then read the same window's fresh accessibility state. Use when you already intend to act and inspect. Scroll requires direction, accepts optional by and amount, and uses the existing scroll tool defaults. Tree-only by default; observe selects query/context and optional screenshot. Returns both child results separately, including action errors. No retries or semantic verification: a fresh read does not prove the action succeeded. Not a transaction against other clients or user input. Windows and Linux are not yet supported.
+macOS: act, then read the same window's fresh accessibility state in one call. Pass one token-targeted background click, set_value or scroll, or `steps`: up to 8 actions on this window (click, set_value, scroll, type_text, press_key, hotkey), run in order in the background and stopped at the first failure. Use steps for work whose targets are already visible, such as several button presses or a field then its submit button, instead of one call per action. Tree-only by default; observe selects query/context and optional screenshot. Returns each child result, including errors and which step stopped. No retries or semantic verification: the fresh read shows what happened. Not a transaction against other clients or user input. Windows and Linux are not yet supported.
 
 **Arguments:**
 
-- `action` (string, required)
+- `action` (string, optional): Single-action form: click, set_value or scroll. Omit when passing steps.
 - `amount` (integer, optional): Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3. range: 1–50
 - `by` (string, optional): Scroll only. Omit to retain the scroll tool's line default.
 - `direction` (string, optional): Required only for scroll. Uses the existing background scroll route.
-- `element_token` (string, required)
+- `element_token` (string, optional): Single-action form: the target element. Omit when passing steps.
 - `observe` (object, optional): default: `{"include_screenshot":false,"query_context":false}`
 - `pid` (integer, required): range: 1–2147483647
-- `session` (string, optional)
+- `session` (string, optional): For multi-call work, prefer a short public session label and repeat it on every call that
+accepts it. Unnamed calls use the transport's implicit session.
+- `steps` (array of object, optional): Instead of action: 1 to 8 actions on this window, run in order and stopped at the first
+failure, then one observation. items: 1–8
 - `value` (string, optional): Required for action set_value; not allowed for other actions.
 - `window_id` (integer, required): range: 1–4294967295
 
 ```json
-{"action":"click","element_token":"example","pid":844,"window_id":10725}
+{"pid":844,"window_id":10725}
 ```
 
 ### `install_extension`

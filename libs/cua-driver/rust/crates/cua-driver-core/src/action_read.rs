@@ -8,8 +8,8 @@ use crate::{
 };
 use async_trait::async_trait;
 use cua_driver_contract::{
-    ActAndReadInput, ActAndReadOutput, ActionReadAction, ActionReadChildResult, ActionReadTimings,
-    ToolInput,
+    ActAndReadInput, ActAndReadOutput, ActionReadAction, ActionReadChildResult, ActionReadStep,
+    ActionReadStepKind, ActionReadTimings, ToolInput,
 };
 use serde_json::{json, Value};
 use std::{
@@ -74,41 +74,66 @@ impl Tool for ActAndReadTool {
         let Some(registry) = self.registry.lock().unwrap().upgrade() else {
             return ToolResult::error("act_and_read registry is unavailable");
         };
-        for name in [input.action.as_str(), "get_window_state"] {
+        // Child calls in order: one for the single-action form, one per step otherwise.
+        let base = json!({"pid":input.pid,"window_id":input.window_id});
+        let steps_form = input.steps.is_some();
+        let mut calls: Vec<(&'static str, Value)> = match &input.steps {
+            Some(steps) => steps.iter().map(|step| step_call(&base, step)).collect(),
+            None => {
+                let kind = input.action.expect("validated single action");
+                let mut action = base.clone();
+                action["element_token"] = json!(input.element_token);
+                if matches!(kind, ActionReadAction::Click | ActionReadAction::Scroll) {
+                    action["delivery_mode"] = json!("background");
+                }
+                if let Some(value) = &input.value {
+                    action["value"] = json!(value);
+                }
+                if let Some(direction) = input.direction {
+                    action["direction"] = json!(direction);
+                }
+                if let Some(by) = input.by {
+                    action["by"] = json!(by);
+                }
+                if let Some(amount) = input.amount {
+                    action["amount"] = json!(amount);
+                }
+                vec![(kind.as_str(), action)]
+            }
+        };
+        for name in calls
+            .iter()
+            .map(|(name, _)| *name)
+            .chain(["get_window_state"])
+        {
             if registry.get_def(name).is_none() {
                 return ToolResult::error(format!(
                     "act_and_read requires registered {name}; no input dispatched"
                 ));
             }
         }
-        let mut action = json!({"pid":input.pid,"window_id":input.window_id,"element_token":input.element_token});
-        if matches!(
-            input.action,
-            ActionReadAction::Click | ActionReadAction::Scroll
-        ) {
-            action["delivery_mode"] = json!("background");
-        }
-        if let Some(value) = input.value {
-            action["value"] = json!(value);
-        }
-        if let Some(direction) = input.direction {
-            action["direction"] = json!(direction);
-        }
-        if let Some(by) = input.by {
-            action["by"] = json!(by);
-        }
-        if let Some(amount) = input.amount {
-            action["amount"] = json!(amount);
-        }
         let mut observation = serde_json::to_value(input.observe).expect("observation serializes");
         observation["pid"] = json!(input.pid);
         observation["window_id"] = json!(input.window_id);
         if let Some(session) = input.session {
-            action["session"] = json!(session);
-            observation["session"] = action["session"].clone();
+            for (_, call) in &mut calls {
+                call["session"] = json!(session);
+            }
+            observation["session"] = json!(session);
         }
         let started = Instant::now();
-        let action_result = registry.invoke(input.action.as_str(), action).await;
+        let mut results = Vec::with_capacity(calls.len());
+        let mut stopped_at = None;
+        for (i, (name, call)) in calls.into_iter().enumerate() {
+            let result = registry.invoke(name, call).await;
+            let failed = result.is_error == Some(true);
+            results.push(split(result));
+            if failed {
+                // Later steps assumed this one landed. Stop; never retry.
+                stopped_at = Some(i as u32 + 1);
+                break;
+            }
+        }
         let action_ms = millis(started.elapsed());
         // A completed tool error is not evidence that input never landed.
         // Observe once, retaining the error. Never replay the action.
@@ -119,21 +144,33 @@ impl Tool for ActAndReadTool {
             observation_ms: millis(observation_started.elapsed()),
             total_ms: millis(started.elapsed()),
         };
-        let (action_content, action) = split(action_result);
         let (observation_content, observation) = split(observation_result);
-        let is_error = action.is_error == Some(true) || observation.is_error == Some(true);
-        let mut content = vec![Content::text(
-            "ACTION RESULT (unchanged child content follows)",
-        )];
-        content.extend(action_content);
+        let is_error = stopped_at.is_some() || observation.is_error == Some(true);
+        let mut content = vec![];
+        let mut step_results = vec![];
+        for (i, (child_content, child)) in results.into_iter().enumerate() {
+            content.push(Content::text(if steps_form {
+                format!("STEP {} RESULT (unchanged child content follows)", i + 1)
+            } else {
+                "ACTION RESULT (unchanged child content follows)".to_owned()
+            }));
+            content.extend(child_content);
+            step_results.push(child);
+        }
         content.push(Content::text(
             "OBSERVATION RESULT (unchanged child content follows)",
         ));
         content.extend(observation_content);
+        let action = step_results
+            .last()
+            .expect("at least one action ran")
+            .clone();
         let output = serde_json::to_value(ActAndReadOutput {
             action,
             observation,
             timings,
+            steps: steps_form.then_some(step_results),
+            stopped_at: stopped_at.filter(|_| steps_form),
         })
         .expect("action/read output serializes");
         if is_error {
@@ -149,4 +186,20 @@ impl Tool for ActAndReadTool {
             ..Default::default()
         }
     }
+}
+
+/// Build one step's child call: the call's window plus the step's own fields,
+/// which share the child tools' argument names. Every step runs in the
+/// background; set_value is an AX write with no delivery_mode parameter.
+fn step_call(base: &Value, step: &ActionReadStep) -> (&'static str, Value) {
+    let mut call = base.clone();
+    let Value::Object(fields) = serde_json::to_value(step).expect("step serializes") else {
+        unreachable!("a step is a JSON object")
+    };
+    let object = call.as_object_mut().expect("base call is an object");
+    object.extend(fields.into_iter().filter(|(name, _)| name != "action"));
+    if step.action != ActionReadStepKind::SetValue {
+        object.insert("delivery_mode".into(), json!("background"));
+    }
+    (step.action.as_str(), call)
 }
