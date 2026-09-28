@@ -232,7 +232,7 @@ fn set_window_frame() -> ToolContract {
 fn invoke_menu() -> ToolContract {
     contract::<InvokeMenuInput, ActionResult>(
         "invoke_menu",
-        "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. May briefly activate the window. Details: skill://cua-driver/MACOS.md",
+        "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. Briefly activates the app, then restores the previous front window. Details: skill://cua-driver/MACOS.md",
         &["menu.path.invoke", "accessibility.menu.native"],
         ToolAnnotations {
             read_only: false,

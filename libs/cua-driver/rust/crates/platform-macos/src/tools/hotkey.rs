@@ -32,8 +32,8 @@ fn def() -> &'static ToolDef {
         name: "hotkey".into(),
         description:
             "Press a key chord, modifiers first and one key last, e.g. [\"cmd\",\"c\"]. \
-             Background by default without raising the window; menu-bar shortcuts and the \
-             browser omnibox may need delivery_mode \"foreground\". Never read back \
+             Background by default without raising the window; for a menu command such as Cmd+S, \
+             use invoke_menu; the browser omnibox may need delivery_mode \"foreground\". Never read back \
              (unverifiable), and a chord does not focus a text field. \
              Details: skill://cua-driver/MACOS.md"
             .into(),
