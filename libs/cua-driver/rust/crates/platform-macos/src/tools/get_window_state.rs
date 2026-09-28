@@ -552,6 +552,7 @@ impl Tool for GetWindowStateTool {
                 max_elements,
                 max_depth,
                 screenshot: screenshot_transform,
+                full_elements,
             };
             let mut next_id = prior.as_ref().map_or(0, |p| p.next_id);
             match prior.as_ref() {
@@ -566,24 +567,14 @@ impl Tool for GetWindowStateTool {
             }
             // Numbers may have changed; re-render the full outline.
             r.tree_markdown = crate::ax::tree::render_outline(&r.nodes, tree_query(query.as_deref(), query_context), &r.walk);
-            // Diff only against a previous look this session actually received
-            // in full, taken with the same bounds. Another session never saw
-            // the outline the diff is relative to; a query look delivered only
-            // its matches; different walk bounds would present bound
-            // differences as application changes; a different screenshot
-            // transform would leave omitted rows with frames for another image.
+            // See `diff_baseline` for when a previous look can anchor a diff.
             //
             // ponytail: numbering history lives in the snapshot payload, so the
             // per-pid LRU (8 windows) or session retirement drops it; the next
             // look is then a fresh full outline numbered from 0, which the
             // caller sees whole. Keep a separate history map if agents start
             // juggling more windows per app than that.
-            let comparable = prior.as_ref().filter(|p| {
-                p.full_delivered
-                    && p.bounds == bounds
-                    && p.session == session_id
-                    && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
-            });
+            let comparable = diff_baseline(prior.as_ref(), &bounds, &session_id);
             if let (true, Some(p)) = (want_diff, comparable) {
                 let title = r
                     .nodes
@@ -1194,6 +1185,26 @@ fn build_elements_array(
             Some(entry)
         })
         .collect()
+}
+
+/// The previous look a diff may be relative to: one this session actually
+/// received in full, taken with the same bounds. Another session never saw
+/// the outline the diff is relative to; a query look delivered only its
+/// matches; different walk bounds would present bound differences as
+/// application changes; a different screenshot transform would leave omitted
+/// rows with frames for another image; a different `element_fields`
+/// projection would leave unchanged rows with fields the caller never got.
+fn diff_baseline<'a>(
+    prior: Option<&'a crate::ax::cache::PriorLook>,
+    bounds: &crate::ax::cache::LookBounds,
+    session: &Option<String>,
+) -> Option<&'a crate::ax::cache::PriorLook> {
+    prior.filter(|p| {
+        p.full_delivered
+            && p.bounds == *bounds
+            && p.session == *session
+            && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
+    })
 }
 
 /// The `element_fields:"compact"` projection. Agents re-read every result on
@@ -2068,5 +2079,33 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("compact\" (default)"));
+    }
+
+    #[test]
+    fn switching_element_fields_forces_a_full_look() {
+        let nodes = vec![node(Some(0), "AXButton", Some("Save"), 1, None, None, vec![])];
+        let compact = crate::ax::cache::LookBounds {
+            max_elements: 10,
+            max_depth: 5,
+            ..Default::default()
+        };
+        let prior = crate::ax::cache::PriorLook {
+            elements: Vec::new(),
+            rows: crate::ax::diff::rows_of(&nodes),
+            next_id: 1,
+            bounds: compact,
+            session: Some("s".into()),
+            full_delivered: true,
+        };
+        let session = Some("s".to_owned());
+        assert!(diff_baseline(Some(&prior), &compact, &session).is_some());
+        let full = crate::ax::cache::LookBounds {
+            full_elements: true,
+            ..compact
+        };
+        assert!(
+            diff_baseline(Some(&prior), &full, &session).is_none(),
+            "a full request after a compact look must not diff against compact rows"
+        );
     }
 }

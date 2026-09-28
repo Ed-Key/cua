@@ -334,6 +334,12 @@ pub struct WindowElement {
     /// Screen coordinates. Absent in macOS compact element records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<ElementFrame>,
+    /// The same rectangle in pixels of this response's screenshot, the space
+    /// of window pixel `x`,`y`. Present when a screenshot was delivered and
+    /// the element has geometry; kept in compact records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
+    pub screenshot_frame: Option<ElementFrame>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -543,8 +549,20 @@ mod tests {
         ] {
             let output: WindowStateOutput = serde_json::from_value(value).unwrap();
             assert!(output.elements.is_some());
+
             output.validate().unwrap();
         }
+        let compact: WindowElement = serde_json::from_value(json!({
+            "element_index": 0, "role": "AXButton",
+            "screenshot_frame": {"x": 20, "y": 40, "w": 60, "h": 80}
+        }))
+        .unwrap();
+        assert_eq!(compact.depth, None);
+        assert_eq!(
+            compact.screenshot_frame,
+            Some(ElementFrame { x: 20.0, y: 40.0, w: 60.0, h: 80.0 }),
+            "typed compact records keep screenshot geometry"
+        );
     }
 
     #[test]

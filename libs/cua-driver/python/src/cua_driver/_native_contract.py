@@ -9064,7 +9064,7 @@ class _UniffiFfiConverterOptionalTypeElementFrame(_UniffiConverterRustBuffer):
 
 @dataclass
 class WindowElement:
-    def __init__(self, *, element_index:int, role:str, depth:typing.Optional[int] = _DEFAULT, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], focused:typing.Optional[bool] = _DEFAULT, text_selection:typing.Optional[TextSelection] = _DEFAULT, placeholder:typing.Optional[str] = _DEFAULT, url:typing.Optional[str] = _DEFAULT, value_settable:typing.Optional[bool] = _DEFAULT, value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], min:typing.Optional[float], max:typing.Optional[float]):
+    def __init__(self, *, element_index:int, role:str, depth:typing.Optional[int] = _DEFAULT, element_token:typing.Optional[str], label:typing.Optional[str], value:typing.Optional[str], focused:typing.Optional[bool] = _DEFAULT, text_selection:typing.Optional[TextSelection] = _DEFAULT, placeholder:typing.Optional[str] = _DEFAULT, url:typing.Optional[str] = _DEFAULT, value_settable:typing.Optional[bool] = _DEFAULT, value_description:typing.Optional[str], enabled:typing.Optional[bool], selected:typing.Optional[bool], in_web_content:typing.Optional[bool], actions:typing.Optional[typing.List[str]], parent_index:typing.Optional[int], frame:typing.Optional[ElementFrame], screenshot_frame:typing.Optional[ElementFrame] = _DEFAULT, min:typing.Optional[float], max:typing.Optional[float]):
         self.element_index = element_index
         self.role = role
         if depth is _DEFAULT:
@@ -9101,6 +9101,10 @@ class WindowElement:
         self.actions = actions
         self.parent_index = parent_index
         self.frame = frame
+        if screenshot_frame is _DEFAULT:
+            self.screenshot_frame = None
+        else:
+            self.screenshot_frame = screenshot_frame
         self.min = min
         self.max = max
 
@@ -9108,7 +9112,7 @@ class WindowElement:
 
 
     def __str__(self):
-        return "WindowElement(element_index={}, role={}, depth={}, element_token={}, label={}, value={}, focused={}, text_selection={}, placeholder={}, url={}, value_settable={}, value_description={}, enabled={}, selected={}, in_web_content={}, actions={}, parent_index={}, frame={}, min={}, max={})".format(self.element_index, self.role, self.depth, self.element_token, self.label, self.value, self.focused, self.text_selection, self.placeholder, self.url, self.value_settable, self.value_description, self.enabled, self.selected, self.in_web_content, self.actions, self.parent_index, self.frame, self.min, self.max)
+        return "WindowElement(element_index={}, role={}, depth={}, element_token={}, label={}, value={}, focused={}, text_selection={}, placeholder={}, url={}, value_settable={}, value_description={}, enabled={}, selected={}, in_web_content={}, actions={}, parent_index={}, frame={}, screenshot_frame={}, min={}, max={})".format(self.element_index, self.role, self.depth, self.element_token, self.label, self.value, self.focused, self.text_selection, self.placeholder, self.url, self.value_settable, self.value_description, self.enabled, self.selected, self.in_web_content, self.actions, self.parent_index, self.frame, self.screenshot_frame, self.min, self.max)
     def __eq__(self, other):
         if self.element_index != other.element_index:
             return False
@@ -9146,6 +9150,8 @@ class WindowElement:
             return False
         if self.frame != other.frame:
             return False
+        if self.screenshot_frame != other.screenshot_frame:
+            return False
         if self.min != other.min:
             return False
         if self.max != other.max:
@@ -9174,6 +9180,7 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
             actions=_UniffiFfiConverterOptionalSequenceString.read(buf),
             parent_index=_UniffiFfiConverterOptionalUInt64.read(buf),
             frame=_UniffiFfiConverterOptionalTypeElementFrame.read(buf),
+            screenshot_frame=_UniffiFfiConverterOptionalTypeElementFrame.read(buf),
             min=_UniffiFfiConverterOptionalFloat64.read(buf),
             max=_UniffiFfiConverterOptionalFloat64.read(buf),
         )
@@ -9198,6 +9205,7 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalSequenceString.check_lower(value.actions)
         _UniffiFfiConverterOptionalUInt64.check_lower(value.parent_index)
         _UniffiFfiConverterOptionalTypeElementFrame.check_lower(value.frame)
+        _UniffiFfiConverterOptionalTypeElementFrame.check_lower(value.screenshot_frame)
         _UniffiFfiConverterOptionalFloat64.check_lower(value.min)
         _UniffiFfiConverterOptionalFloat64.check_lower(value.max)
 
@@ -9221,6 +9229,7 @@ class _UniffiFfiConverterTypeWindowElement(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalSequenceString.write(value.actions, buf)
         _UniffiFfiConverterOptionalUInt64.write(value.parent_index, buf)
         _UniffiFfiConverterOptionalTypeElementFrame.write(value.frame, buf)
+        _UniffiFfiConverterOptionalTypeElementFrame.write(value.screenshot_frame, buf)
         _UniffiFfiConverterOptionalFloat64.write(value.min, buf)
         _UniffiFfiConverterOptionalFloat64.write(value.max, buf)
 

@@ -6813,6 +6813,12 @@ export type WindowElement = {
      * Screen coordinates. Absent in macOS compact element records.
      */
     frame?: ElementFrame,
+    /**
+     * The same rectangle in pixels of this response's screenshot, the space
+     * of window pixel `x`,`y`. Present when a screenshot was delivered and
+     * the element has geometry; kept in compact records.
+     */
+    screenshotFrame?: ElementFrame,
     min?: number,
     max?: number
 }
@@ -6828,6 +6834,7 @@ export const WindowElement = (() => {
         placeholder: undefined,
         url: undefined,
         valueSettable: undefined,
+        screenshotFrame: undefined,
     });
     const create = (() => {
         return uniffiCreateRecord<WindowElement, ReturnType<typeof defaults>>(defaults);
@@ -6862,6 +6869,7 @@ const FfiConverterTypeWindowElement = (() => {
                 actions: FfiConverterOptionalSequenceString.read(from),
                 parentIndex: FfiConverterOptionalUInt64.read(from),
                 frame: FfiConverterOptionalTypeElementFrame.read(from),
+                screenshotFrame: FfiConverterOptionalTypeElementFrame.read(from),
                 min: FfiConverterOptionalFloat64.read(from),
                 max: FfiConverterOptionalFloat64.read(from)
             };
@@ -6885,6 +6893,7 @@ const FfiConverterTypeWindowElement = (() => {
             FfiConverterOptionalSequenceString.write(value.actions, into);
             FfiConverterOptionalUInt64.write(value.parentIndex, into);
             FfiConverterOptionalTypeElementFrame.write(value.frame, into);
+            FfiConverterOptionalTypeElementFrame.write(value.screenshotFrame, into);
             FfiConverterOptionalFloat64.write(value.min, into);
             FfiConverterOptionalFloat64.write(value.max, into);
         }
@@ -6907,6 +6916,7 @@ const FfiConverterTypeWindowElement = (() => {
              FfiConverterOptionalSequenceString.allocationSize(value.actions) +
              FfiConverterOptionalUInt64.allocationSize(value.parentIndex) +
              FfiConverterOptionalTypeElementFrame.allocationSize(value.frame) +
+             FfiConverterOptionalTypeElementFrame.allocationSize(value.screenshotFrame) +
              FfiConverterOptionalFloat64.allocationSize(value.min) +
              FfiConverterOptionalFloat64.allocationSize(value.max);
 

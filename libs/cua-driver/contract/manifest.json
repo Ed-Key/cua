@@ -2119,6 +2119,36 @@
                 "role": {
                   "type": "string"
                 },
+                "screenshot_frame": {
+                  "properties": {
+                    "h": {
+                      "format": "double",
+                      "type": "number"
+                    },
+                    "w": {
+                      "format": "double",
+                      "type": "number"
+                    },
+                    "x": {
+                      "format": "double",
+                      "type": "number"
+                    },
+                    "y": {
+                      "format": "double",
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "w",
+                    "h"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
                 "selected": {
                   "type": [
                     "boolean",
