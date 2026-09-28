@@ -1176,8 +1176,14 @@ impl ToolRegistry {
             .and_then(Value::as_str)
             .map(str::to_owned);
         if let Some(session) = runtime_session.as_deref() {
+            let owner = args
+                .get("_transport_session_id")
+                .and_then(Value::as_str)
+                .unwrap_or(session);
+            let public_label = args.get("_public_session_label").and_then(Value::as_str);
             if !matches!(resolved_name, "start_session" | "end_session")
                 && crate::session::is_session_ended(session)
+                && !crate::session::reclaim_exited_session(session, public_label, owner)
             {
                 let mut result = protected_refusal(
                     "session_ended",

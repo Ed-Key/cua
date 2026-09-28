@@ -611,7 +611,9 @@ pub fn activate_or_revive_session_for_owner(
 
     let needs_cleanup = {
         let ended = ended_sessions().lock().unwrap();
+        let exited = owner_exited_sessions().lock().unwrap().contains(session_id);
         match ended.get(session_id) {
+            Some(Some(_)) if exited => true,
             Some(Some(owner)) if owner != owner_transport => {
                 return Err("session is not available to this transport");
             }
@@ -629,7 +631,9 @@ pub fn activate_or_revive_session_for_owner(
     let now = Instant::now();
     let revived = {
         let mut ended = ended_sessions().lock().unwrap();
+        let exited = owner_exited_sessions().lock().unwrap().contains(session_id);
         let revived = match ended.get(session_id) {
+            Some(Some(_)) if exited => true,
             Some(Some(owner)) if owner != owner_transport => {
                 return Err("session is not available to this transport");
             }
@@ -674,6 +678,48 @@ pub fn activate_or_revive_session_for_owner(
         .unwrap()
         .insert(session_id.to_owned(), now);
     Ok(revived)
+}
+
+/// Whether [`reclaim_exited_session`] would admit `owner_transport`. Read-only,
+/// for transport guards that must stay free of side effects.
+pub fn exited_session_reclaimable(session_id: &str, owner_transport: &str) -> bool {
+    // Lock order matches tombstone installation: ended, then exited.
+    let ended = ended_sessions().lock().unwrap();
+    matches!(ended.get(session_id), Some(Some(owner)) if owner != owner_transport)
+        && owner_exited_sessions().lock().unwrap().contains(session_id)
+}
+
+/// Start a fresh episode under a label whose previous owner's connection
+/// closed. This is the implicit `start_session` a new connection gets when it
+/// reuses such a label. Returns false for any other tombstone (explicit end,
+/// idle timeout, revocation) and for the exited owner itself, whose late
+/// in-flight calls must stay refused.
+pub fn reclaim_exited_session(
+    session_id: &str,
+    public_label: Option<&str>,
+    owner_transport: &str,
+) -> bool {
+    if !exited_session_reclaimable(session_id, owner_transport) {
+        return false;
+    }
+    let (transport, client_kind) = infer_transport_metadata(owner_transport);
+    match activate_or_revive_session_for_owner(
+        session_id,
+        public_label,
+        owner_transport,
+        public_label.is_none(),
+        transport,
+        client_kind,
+        None,
+    ) {
+        Ok(revived) => {
+            if revived {
+                fire_session_revive_for_owner(session_id, owner_transport);
+            }
+            true
+        }
+        Err(_) => false,
+    }
 }
 
 pub fn session_snapshot(
@@ -936,6 +982,11 @@ fn capture_modality_for(tool_name: &str, args: &serde_json::Value) -> Option<Cap
 /// once. Growth is bounded (one short string per ended session over the
 /// daemon's lifetime); eviction is a deliberate non-blocking follow-up.
 static ENDED_SESSIONS: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLock::new();
+/// Tombstones left because the owning connection closed. No live transport can
+/// act for such a session any more, so another transport may reclaim its label
+/// (see [`reclaim_exited_session`]). A flag only counts while its tombstone
+/// exists; every new tombstone clears it first.
+static OWNER_EXITED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
 /// Runtime generations that have received terminal revoke-all.
 ///
 /// This latch is intentionally independent of grants and public session
@@ -957,6 +1008,10 @@ fn revive_hooks() -> &'static Mutex<HashMap<u64, SessionReviveHook>> {
 
 fn ended_sessions() -> &'static Mutex<HashMap<String, Option<String>>> {
     ENDED_SESSIONS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn owner_exited_sessions() -> &'static Mutex<HashSet<String>> {
+    OWNER_EXITED_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
 fn suspended_runtime_scopes() -> &'static Mutex<HashSet<String>> {
@@ -1165,6 +1220,11 @@ pub fn release_process_state_for_shutdown() {
         ended.clear();
         ended.shrink_to_fit();
     }
+    if let Some(exited) = OWNER_EXITED_SESSIONS.get() {
+        let mut exited = exited.lock().unwrap();
+        exited.clear();
+        exited.shrink_to_fit();
+    }
     if let Some(scopes) = SUSPENDED_RUNTIME_SCOPES.get() {
         let mut scopes = scopes.lock().unwrap();
         scopes.clear();
@@ -1213,6 +1273,7 @@ fn mark_session_ended(session_id: &str, owner_transport: Option<&str>) -> bool {
             session_id.to_owned(),
             owner_transport.map(str::to_owned).or(record_owner),
         );
+        owner_exited_sessions().lock().unwrap().remove(session_id);
         true
     }
 }
@@ -1562,6 +1623,15 @@ fn finish_session_end(session_id: &str, reason: SessionEndReason) {
     let cursor = cursor.or(fallback);
     if first_fire {
         initialize_session_cleanup(session_id);
+        // Reclaimable only once cleanup is tracked; before that a reclaim
+        // would see no pending cleanup and this teardown could then clear
+        // the new episode's state.
+        if reason == SessionEndReason::ProcessExit {
+            owner_exited_sessions()
+                .lock()
+                .unwrap()
+                .insert(session_id.to_owned());
+        }
     }
     let _ = retry_session_cleanup(session_id);
     if first_fire {
@@ -1901,6 +1971,61 @@ mod tests {
         assert!(session_snapshot(sid, owner_a, DEFAULT_SESSION_IDLE_TTL).is_some());
         assert!(session_snapshot(sid, owner_b, DEFAULT_SESSION_IDLE_TTL).is_none());
         assert!(end_session_for_owner(sid, owner_a));
+    }
+
+    #[test]
+    fn a_label_whose_owner_exited_can_be_reclaimed_by_another_transport() {
+        let sid = "test-exited-owner-reclaim-E1F2";
+        let owner_a = "test-exited-owner-a";
+        let owner_b = "test-exited-owner-b";
+        activate_session(
+            sid,
+            Some("t"),
+            owner_a,
+            false,
+            SessionTransport::McpHttp,
+            SessionClientKind::Mcp,
+        )
+        .unwrap();
+        assert_eq!(
+            end_sessions_for_owner(owner_a, SessionEndReason::ProcessExit),
+            1
+        );
+        assert!(is_session_ended(sid));
+
+        // The exited owner's late calls stay refused.
+        assert!(!reclaim_exited_session(sid, Some("t"), owner_a));
+        assert!(is_session_ended(sid));
+
+        assert!(exited_session_reclaimable(sid, owner_b));
+        assert!(reclaim_exited_session(sid, Some("t"), owner_b));
+        assert!(!is_session_ended(sid));
+        assert!(session_snapshot(sid, owner_b, DEFAULT_SESSION_IDLE_TTL).is_some());
+        assert!(session_snapshot(sid, owner_a, DEFAULT_SESSION_IDLE_TTL).is_none());
+
+        // An explicit end by the new owner restores full protection.
+        assert!(end_session_for_owner(sid, owner_b));
+        assert!(!exited_session_reclaimable(sid, owner_a));
+        assert!(!reclaim_exited_session(sid, Some("t"), owner_a));
+        assert!(is_session_ended(sid));
+    }
+
+    #[test]
+    fn an_idle_ended_label_cannot_be_reclaimed_by_another_transport() {
+        let sid = "test-idle-owner-reclaim-A9B8";
+        let owner_a = "test-idle-owner-a";
+        activate_session(
+            sid,
+            Some("t"),
+            owner_a,
+            false,
+            SessionTransport::McpHttp,
+            SessionClientKind::Mcp,
+        )
+        .unwrap();
+        end_session_with_reason(sid, SessionEndReason::IdleTimeout);
+        assert!(!reclaim_exited_session(sid, Some("t"), "test-idle-owner-b"));
+        assert!(is_session_ended(sid));
     }
 
     #[test]
