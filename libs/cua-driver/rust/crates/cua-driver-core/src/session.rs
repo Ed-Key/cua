@@ -1598,12 +1598,6 @@ fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
 
 fn finish_session_end(session_id: &str, reason: SessionEndReason) {
     let first_fire = mark_session_ended(session_id, None);
-    if first_fire && reason == SessionEndReason::ProcessExit {
-        owner_exited_sessions()
-            .lock()
-            .unwrap()
-            .insert(session_id.to_owned());
-    }
     let mut cursor_readers = CURSOR_OUTCOME_READERS
         .get()
         .map(|readers| {
@@ -1629,6 +1623,15 @@ fn finish_session_end(session_id: &str, reason: SessionEndReason) {
     let cursor = cursor.or(fallback);
     if first_fire {
         initialize_session_cleanup(session_id);
+        // Reclaimable only once cleanup is tracked; before that a reclaim
+        // would see no pending cleanup and this teardown could then clear
+        // the new episode's state.
+        if reason == SessionEndReason::ProcessExit {
+            owner_exited_sessions()
+                .lock()
+                .unwrap()
+                .insert(session_id.to_owned());
+        }
     }
     let _ = retry_session_cleanup(session_id);
     if first_fire {

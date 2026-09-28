@@ -238,8 +238,19 @@ impl SdkAdapter {
         let result = self
             .driver
             .call_tool_from_trusted_adapter(name, arguments)
-            .await
-            .map_err(|error| {
+            .await;
+        // Core reclaims a closed connection's label before running the tool,
+        // so follow that transition whatever the tool itself returned. A
+        // mirror-only tombstone (end_session or revoke) stays.
+        if core_ended_before && !cua_driver_core::session::is_session_ended(&core_session) {
+            if let Some(session) = mirror_session.as_deref() {
+                let mut sessions = self.public_sessions.lock().unwrap();
+                if !sessions.explicitly_ended.contains(session) {
+                    sessions.ended.remove(session);
+                }
+            }
+        }
+        let result = result.map_err(|error| {
                 if let Some((session, marker, previous, newly_explicit)) = ending_tombstone {
                     self.public_sessions.lock().unwrap().rollback_ended(
                         session,
@@ -283,10 +294,6 @@ impl SdkAdapter {
             // must stay.
             if name == "start_session" {
                 sessions.explicitly_ended.remove(session);
-            }
-            if name == "start_session"
-                || (core_ended_before && !cua_driver_core::session::is_session_ended(&core_session))
-            {
                 sessions.ended.remove(session);
             }
             if let Some(capture_scope) = capture_scope {
@@ -748,6 +755,18 @@ mod tests {
         assert!(!sdk.is_session_reclaimable(exited, Some("owner-a")));
         assert!(!sdk.is_session_reclaimable(revoked, Some("owner-b")));
         assert!(sdk.is_session_reclaimable(exited, Some("owner-b")));
+        // A reclaiming call that fails on its own terms still reclaims.
+        let mut failing = args(exited, "owner-b");
+        failing["reason"] = json!("not-a-reason");
+        let failed = sdk
+            .invoke_raw("escalate_session", failing)
+            .await
+            .expect("failing call");
+        assert_eq!(failed["isError"], true, "{failed}");
+        assert!(
+            !sdk.is_session_ended(exited),
+            "the mirror must follow core even when the reclaiming call fails"
+        );
         let reused = sdk
             .invoke_raw("get_config", args(exited, "owner-b"))
             .await
