@@ -762,7 +762,11 @@ fn action_read_validates_exactly_one_form_and_each_step() {
         ),
         (
             json!([{"action":"hotkey","keys":[]}]),
-            Some("step 1: keys must be a non-empty array of nonblank strings"),
+            Some("step 1: keys needs at least two nonblank keys (a modifier plus a key); use press_key for a single key"),
+        ),
+        (
+            json!([{"action":"hotkey","keys":["cmd"]}]),
+            Some("step 1: keys needs at least two nonblank keys (a modifier plus a key); use press_key for a single key"),
         ),
         (
             json!([{"action":"hotkey","keys":["cmd","a"],"element_token":"t"}]),

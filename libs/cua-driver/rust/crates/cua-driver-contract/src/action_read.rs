@@ -229,9 +229,10 @@ impl ActionReadStep {
         if self
             .keys
             .as_ref()
-            .is_some_and(|k| k.is_empty() || k.iter().any(|k| k.trim().is_empty()))
+            .is_some_and(|k| k.len() < 2 || k.iter().any(|k| k.trim().is_empty()))
         {
-            return Err("keys must be a non-empty array of nonblank strings".into());
+            // The hotkey tool needs a modifier plus a key; use press_key for one key.
+            return Err("keys needs at least two nonblank keys (a modifier plus a key); use press_key for a single key".into());
         }
         if self.amount.is_some_and(|n| !(1..=50).contains(&n)) {
             return Err("scroll amount must be between 1 and 50".into());
