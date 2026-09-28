@@ -101,7 +101,11 @@ fn ax_snapshot(driver: &mut McpDriver, session: &str, pid: u32, wid: u64) -> ser
     driver
         .call(
             "get_window_state",
-            serde_json::json!({ "session": session, "pid": pid as i64, "window_id": wid, "capture_mode": "ax" }),
+            // The helpers below read screen-point frames.
+            serde_json::json!({
+                "session": session, "pid": pid as i64, "window_id": wid,
+                "capture_mode": "ax", "element_fields": "full"
+            }),
         )
         .structured()
         .clone()

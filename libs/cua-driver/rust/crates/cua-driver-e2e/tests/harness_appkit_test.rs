@@ -133,7 +133,9 @@ fn snapshot_elements(driver: &mut McpDriver, pid: u32, window_id: u64) -> ToolRe
             "capture_mode": "ax",
             // Tests look rows up by id on every read; a change-only diff has
             // no rows to search.
-            "diff": false
+            "diff": false,
+            // element_pixel_frame reads screen-point frames.
+            "element_fields": "full"
         }),
     )
 }
@@ -2437,7 +2439,10 @@ fn run_focus_theft_case(delay_ms: u64, route: TheftRoute) {
             } else {
                 let pre = driver.call(
                     "get_window_state",
-                    serde_json::json!({"pid": pid as i64, "window_id": wid, "diff": false}),
+                    serde_json::json!({
+                        "pid": pid as i64, "window_id": wid, "diff": false,
+                        "element_fields": "full"
+                    }),
                 );
                 let (x, y) = if raw {
                     (

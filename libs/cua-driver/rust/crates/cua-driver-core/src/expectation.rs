@@ -141,6 +141,9 @@ impl ObservationProvider for ToolObservationProvider {
                 // public dispatch. Direct platform-tool invocation is the
                 // trusted in-process channel for this non-mutating mode.
                 "_observation_only": true,
+                // Predicates read enabled/selected (absent means unknown, not
+                // the default), frame, and parent_index for the web-area walk.
+                "element_fields": "full",
             }))
             .await;
         if state.is_error == Some(true) {

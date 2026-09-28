@@ -414,7 +414,8 @@ fn snapshot(fixture: &mut Fixture) -> ToolResponse {
         serde_json::json!({
             "pid": fixture.pid as i64,
             "window_id": fixture.wid,
-            "capture_mode": "ax"
+            "capture_mode": "ax",
+            "element_fields": "full"
         }),
     );
     refresh_wayland_window_geometry(fixture);
@@ -853,6 +854,7 @@ fn sdk_window_input(fixture: &Fixture) -> GetWindowStateInput {
         query: None,
         query_context: None,
         diff: None,
+        element_fields: None,
         include_accessibility_tree: Some(true),
         include_screenshot: Some(false),
         screenshot_out_file: None,

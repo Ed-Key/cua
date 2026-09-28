@@ -23,6 +23,21 @@ fn nonnegative_integer_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":"integer", "minimum":0})
 }
 
+fn element_fields_schema(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({"type":"string", "enum":["compact","full"]})
+}
+
+/// macOS: how much of each `elements` record `get_window_state` returns.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum ElementFields {
+    /// Omit per-element frame, depth and parent_index, omit enabled when
+    /// true and selected when false, and drop the top-level _note.
+    Compact,
+    /// Every field.
+    Full,
+}
+
 fn nullable_pid_schema(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":["integer","null"], "minimum":0, "maximum":4294967295_u64})
 }
@@ -88,6 +103,14 @@ pub struct GetWindowStateInput {
     #[schemars(schema_with = "bool_schema")]
     #[uniffi(default = None)]
     pub diff: Option<bool>,
+    /// macOS only. "compact" (default) omits per-element frame, depth and
+    /// parent_index, omits enabled when true and selected when false, and
+    /// drops the _note; "full" returns every field. Other platforms accept
+    /// and ignore it and always return full records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "element_fields_schema")]
+    #[uniffi(default = None)]
+    pub element_fields: Option<ElementFields>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "bool_schema")]
     pub include_accessibility_tree: Option<bool>,
@@ -262,7 +285,10 @@ pub struct ElementFrame {
 pub struct WindowElement {
     pub element_index: u64,
     pub role: String,
-    pub depth: u32,
+    /// Absent in macOS compact element records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
+    pub depth: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub element_token: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -292,18 +318,28 @@ pub struct WindowElement {
     pub value_settable: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub value_description: Option<String>,
+    /// macOS compact records omit it when true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// macOS compact records omit it when false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selected: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub in_web_content: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub actions: Option<Vec<String>>,
+    /// Absent in macOS compact element records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub parent_index: Option<u64>,
+    /// Screen coordinates. Absent in macOS compact element records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub frame: Option<ElementFrame>,
+    /// The same rectangle in pixels of this response's screenshot, the space
+    /// of window pixel `x`,`y`. Present when a screenshot was delivered and
+    /// the element has geometry; kept in compact records.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
+    pub screenshot_frame: Option<ElementFrame>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub min: Option<f64>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -508,11 +544,25 @@ mod tests {
             json!({"pid":7,"window_id":9,"element_count":0,"elements":[],"tree_markdown":"","elements_complete":false,"degraded":true,"degraded_reason":"ax_window_unresolved"}),
             json!({"pid":7,"window_id":9,"element_count":1,"elements":[{"element_index":0,"role":"button","depth":1,"element_token":"s1:0","label":"Apply","frame":{"x":10,"y":20,"w":30,"h":40},"enabled":true}],"elements_complete":false,"screenshot_error":"capture unavailable"}),
             json!({"pid":7,"window_id":9,"elements":[{"element_index":0,"role":"button","depth":1}],"degraded":true,"degraded_reason":"accessibility_window_identity_unproven"}),
+            // macOS element_fields:"compact" records: no frame, depth or parent_index.
+            json!({"pid":7,"window_id":9,"elements":[{"element_index":0,"role":"AXButton","element_token":"s1:0","label":"Apply","screenshot_frame":{"x":20,"y":40,"w":60,"h":80}},{"element_index":1,"role":"AXCheckBox","enabled":false,"selected":true}],"elements_complete":false}),
         ] {
             let output: WindowStateOutput = serde_json::from_value(value).unwrap();
             assert!(output.elements.is_some());
+
             output.validate().unwrap();
         }
+        let compact: WindowElement = serde_json::from_value(json!({
+            "element_index": 0, "role": "AXButton",
+            "screenshot_frame": {"x": 20, "y": 40, "w": 60, "h": 80}
+        }))
+        .unwrap();
+        assert_eq!(compact.depth, None);
+        assert_eq!(
+            compact.screenshot_frame,
+            Some(ElementFrame { x: 20.0, y: 40.0, w: 60.0, h: 80.0 }),
+            "typed compact records keep screenshot geometry"
+        );
     }
 
     #[test]
@@ -550,6 +600,19 @@ mod tests {
         .unwrap();
         native_resolution.validate().unwrap();
         assert_eq!(ListAppsInput::input_schema()["properties"], json!({}));
+        assert_eq!(
+            GetWindowStateInput::input_schema()["properties"]["element_fields"]["enum"],
+            json!(["compact", "full"])
+        );
+        let full: GetWindowStateInput = serde_json::from_value(json!({
+            "pid": 7, "window_id": 9, "element_fields": "full"
+        }))
+        .unwrap();
+        assert_eq!(full.element_fields, Some(ElementFields::Full));
+        assert!(serde_json::from_value::<GetWindowStateInput>(json!({
+            "pid": 7, "window_id": 9, "element_fields": "all"
+        }))
+        .is_err());
     }
 
     #[test]

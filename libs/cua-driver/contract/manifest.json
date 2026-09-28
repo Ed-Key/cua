@@ -9,7 +9,7 @@
   "tools": [
     {
       "name": "act_and_read",
-      "description": "macOS: act, then read the same window's fresh accessibility state in one call. Pass one token-targeted background click, set_value or scroll, or `steps`: up to 8 actions on this window (click, set_value, scroll, type_text, press_key, hotkey), run in order in the background and stopped at the first failure. Use steps for work whose targets are already visible, such as several button presses or a field then its submit button, instead of one call per action. Tree-only by default; observe selects query/context and optional screenshot. Returns each child result, including errors and which step stopped. No retries or semantic verification: the fresh read shows what happened. Not a transaction against other clients or user input. Windows and Linux are not yet supported.",
+      "description": "macOS: act, then read the same window's fresh accessibility state in one call. Pass one token-targeted background click, set_value or scroll, or `steps`: up to 8 actions on this window (click, set_value, scroll, type_text, press_key, hotkey), run in order in the background and stopped at the first failure. Use steps for work whose targets are already visible, such as several button presses or a field then its submit button, instead of one call per action. Tree-only by default; observe selects query/context, element_fields (compact by default) and optional screenshot. Returns each child result, including errors and which step stopped. No retries or semantic verification: the fresh read shows what happened. Not a transaction against other clients or user input. Windows and Linux are not yet supported.",
       "platforms": [
         "macos"
       ],
@@ -70,6 +70,14 @@
               "query_context": false
             },
             "properties": {
+              "element_fields": {
+                "description": "Passed to get_window_state: \"compact\" (default) or \"full\" element records.",
+                "enum": [
+                  "compact",
+                  "full"
+                ],
+                "type": "string"
+              },
               "include_screenshot": {
                 "default": false,
                 "type": "boolean"
@@ -1900,6 +1908,14 @@
             "description": "macOS only. Default true: after the first look at a window, return only\nrows added, changed, or removed since the previous look by this session.\nFalse forces the full outline.",
             "type": "boolean"
           },
+          "element_fields": {
+            "description": "macOS only. \"compact\" (default) omits per-element frame, depth and\nparent_index, omits enabled when true and selected when false, and\ndrops the _note; \"full\" returns every field. Other platforms accept\nand ignore it and always return full records.",
+            "enum": [
+              "compact",
+              "full"
+            ],
+            "type": "string"
+          },
           "include_accessibility_tree": {
             "type": "boolean"
           },
@@ -2002,7 +2018,10 @@
                 "depth": {
                   "format": "uint32",
                   "minimum": 0,
-                  "type": "integer"
+                  "type": [
+                    "integer",
+                    "null"
+                  ]
                 },
                 "element_index": {
                   "format": "uint64",
@@ -2100,6 +2119,36 @@
                 "role": {
                   "type": "string"
                 },
+                "screenshot_frame": {
+                  "properties": {
+                    "h": {
+                      "format": "double",
+                      "type": "number"
+                    },
+                    "w": {
+                      "format": "double",
+                      "type": "number"
+                    },
+                    "x": {
+                      "format": "double",
+                      "type": "number"
+                    },
+                    "y": {
+                      "format": "double",
+                      "type": "number"
+                    }
+                  },
+                  "required": [
+                    "x",
+                    "y",
+                    "w",
+                    "h"
+                  ],
+                  "type": [
+                    "object",
+                    "null"
+                  ]
+                },
                 "selected": {
                   "type": [
                     "boolean",
@@ -2169,8 +2218,7 @@
               },
               "required": [
                 "element_index",
-                "role",
-                "depth"
+                "role"
               ],
               "type": "object"
             },

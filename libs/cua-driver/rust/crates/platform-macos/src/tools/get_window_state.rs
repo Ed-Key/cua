@@ -43,7 +43,11 @@ fn def() -> &'static ToolDef {
             indexed row with `element_index`, `role`, `label`, `value` (the \
             element's text/AXValue when present — use it to verify what a field \
             holds), `actions` (names of AX actions exposed by the element, \
-            omitted when empty), `frame: {x,y,w,h}`, `parent_index`, `depth`). The markdown \
+            omitted when empty), `screenshot_frame` (screenshot pixels, the space of \
+            pixel `x`,`y`)). By default (`element_fields:\"compact\"`) records omit the \
+            screen-point `frame`, `parent_index` and `depth` (the markdown indentation \
+            shows structure), omit `enabled` when true and `selected` when false; pass \
+            `element_fields:\"full\"` for every field. The markdown \
             `tree_markdown` stays available \
             and unchanged in shape for existing text-parsing callers — but new \
             fields will only be added to the structured side.\n\n\
@@ -107,6 +111,7 @@ fn def() -> &'static ToolDef {
                 "query": { "type": "string", "description": "Case-insensitive filter for tree_markdown and structured elements. Returns matching rows plus their ancestors without renumbering element_index values." },
                 "query_context": { "type": "boolean", "description": "Default false. With a nonblank query, also keep every row collected under each match (display text included), not only its ancestors. Uses the same walk; no extra reads. Display-only rows appear in tree_markdown; structured elements still hold only actionable rows." },
                 "diff": { "type": "boolean", "description": "Default true. After the first look at a window, return only rows added, changed, or removed since this session's previous look (display-only text included); unchanged rows keep their element_index. The full outline is still sent for the first look, when it would be shorter, when a query is set, or when the previous look used different max_elements/max_depth. Pass false to force the full outline. macOS only." },
+                "element_fields": cua_driver_core::tool_schema::element_fields_schema(),
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_accessibility_tree": {
                     "type": "boolean",
@@ -320,6 +325,13 @@ impl Tool for GetWindowStateTool {
             None | Some(serde_json::Value::Bool(true)) => query.is_none() && !observation_only,
             Some(serde_json::Value::Bool(false)) => false,
             Some(_) => return ToolResult::error("diff must be a boolean"),
+        };
+        let full_elements = match args.get("element_fields").map(|v| v.as_str()) {
+            None | Some(Some("compact")) => false,
+            Some(Some("full")) => true,
+            Some(_) => {
+                return ToolResult::error("element_fields must be \"compact\" or \"full\"")
+            }
         };
 
         // The walk leaves one retain on every actionable element. The owner
@@ -540,6 +552,7 @@ impl Tool for GetWindowStateTool {
                 max_elements,
                 max_depth,
                 screenshot: screenshot_transform,
+                full_elements,
             };
             let mut next_id = prior.as_ref().map_or(0, |p| p.next_id);
             match prior.as_ref() {
@@ -554,24 +567,14 @@ impl Tool for GetWindowStateTool {
             }
             // Numbers may have changed; re-render the full outline.
             r.tree_markdown = crate::ax::tree::render_outline(&r.nodes, tree_query(query.as_deref(), query_context), &r.walk);
-            // Diff only against a previous look this session actually received
-            // in full, taken with the same bounds. Another session never saw
-            // the outline the diff is relative to; a query look delivered only
-            // its matches; different walk bounds would present bound
-            // differences as application changes; a different screenshot
-            // transform would leave omitted rows with frames for another image.
+            // See `diff_baseline` for when a previous look can anchor a diff.
             //
             // ponytail: numbering history lives in the snapshot payload, so the
             // per-pid LRU (8 windows) or session retirement drops it; the next
             // look is then a fresh full outline numbered from 0, which the
             // caller sees whole. Keep a separate history map if agents start
             // juggling more windows per app than that.
-            let comparable = prior.as_ref().filter(|p| {
-                p.full_delivered
-                    && p.bounds == bounds
-                    && p.session == session_id
-                    && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
-            });
+            let comparable = diff_baseline(prior.as_ref(), &bounds, &session_id);
             if let (true, Some(p)) = (want_diff, comparable) {
                 let title = r
                     .nodes
@@ -763,6 +766,9 @@ impl Tool for GetWindowStateTool {
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
                 AX walk on apps with very large trees."
         });
+        if !full_elements {
+            compact_elements(&mut structured);
+        }
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
         }
@@ -1179,6 +1185,52 @@ fn build_elements_array(
             Some(entry)
         })
         .collect()
+}
+
+/// The previous look a diff may be relative to: one this session actually
+/// received in full, taken with the same bounds. Another session never saw
+/// the outline the diff is relative to; a query look delivered only its
+/// matches; different walk bounds would present bound differences as
+/// application changes; a different screenshot transform would leave omitted
+/// rows with frames for another image; a different `element_fields`
+/// projection would leave unchanged rows with fields the caller never got.
+fn diff_baseline<'a>(
+    prior: Option<&'a crate::ax::cache::PriorLook>,
+    bounds: &crate::ax::cache::LookBounds,
+    session: &Option<String>,
+) -> Option<&'a crate::ax::cache::PriorLook> {
+    prior.filter(|p| {
+        p.full_delivered
+            && p.bounds == *bounds
+            && p.session == *session
+            && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
+    })
+}
+
+/// The `element_fields:"compact"` projection. Agents re-read every result on
+/// later turns, so drop what they pay for without using: screen-point frames
+/// (`screenshot_frame` is the pixel-action space, and `frame` misled agents
+/// into clicking screen points as pixels), structure the markdown indentation
+/// already shows, default states, and the `_note` boilerplate.
+fn compact_elements(structured: &mut Value) {
+    let Some(map) = structured.as_object_mut() else {
+        return;
+    };
+    map.remove("_note");
+    let Some(elements) = map.get_mut("elements").and_then(Value::as_array_mut) else {
+        return;
+    };
+    for entry in elements.iter_mut().filter_map(Value::as_object_mut) {
+        for key in ["frame", "depth", "parent_index"] {
+            entry.remove(key);
+        }
+        if entry.get("enabled") == Some(&Value::Bool(true)) {
+            entry.remove("enabled");
+        }
+        if entry.get("selected") == Some(&Value::Bool(false)) {
+            entry.remove("selected");
+        }
+    }
 }
 
 fn tree_query(text: Option<&str>, context: bool) -> Option<crate::ax::tree::Query<'_>> {
@@ -1920,6 +1972,140 @@ mod tests {
             entries[0].get("element_token").is_none(),
             "observation-only entries must not emit unregistered element_token: {}",
             entries[0]
+        );
+    }
+
+    fn compact_fixture() -> Value {
+        let mut nodes = vec![
+            node(
+                Some(0),
+                "AXGroup",
+                Some("Toolbar"),
+                1,
+                None,
+                Some([10.0, 20.0, 300.0, 40.0]),
+                vec![],
+            ),
+            node(
+                Some(1),
+                "AXButton",
+                Some("Save"),
+                2,
+                Some(0),
+                Some([12.0, 22.0, 60.0, 30.0]),
+                vec!["AXPress".into()],
+            ),
+            node(
+                Some(2),
+                "AXCheckBox",
+                Some("Bold"),
+                2,
+                Some(0),
+                Some([80.0, 22.0, 20.0, 20.0]),
+                vec![],
+            ),
+        ];
+        nodes[1].enabled = Some(true);
+        nodes[1].selected = Some(false);
+        nodes[1].value_settable = Some(false);
+        nodes[2].enabled = Some(false);
+        nodes[2].selected = Some(true);
+        let elements = cua_driver_core::element_frame::with_screenshot_frames(
+            build_elements_array_with_token(&nodes, Some(7)),
+            (0.0, 0.0),
+            2.0,
+        );
+        json!({
+            "window_id": 9,
+            "tree_markdown": "- AXGroup",
+            "elements": elements,
+            "_note": "Prefer `elements`",
+        })
+    }
+
+    #[test]
+    fn compact_elements_drop_geometry_structure_defaults_and_note() {
+        let mut structured = compact_fixture();
+        compact_elements(&mut structured);
+        assert!(structured.get("_note").is_none());
+        assert_eq!(structured["tree_markdown"], "- AXGroup");
+        let elements = structured["elements"].as_array().unwrap();
+        assert_eq!(elements.len(), 3);
+        for entry in elements {
+            for key in ["frame", "depth", "parent_index"] {
+                assert!(entry.get(key).is_none(), "{key} must be omitted: {entry}");
+            }
+            assert!(entry.get("screenshot_frame").is_some(), "{entry}");
+            assert!(entry.get("element_token").is_some(), "{entry}");
+        }
+        let save = &elements[1];
+        assert!(save.get("enabled").is_none(), "enabled:true is the default");
+        assert!(
+            save.get("selected").is_none(),
+            "selected:false is the default"
+        );
+        assert_eq!(save["value_settable"], false);
+        assert_eq!(save["actions"], json!(["AXPress"]));
+        assert_eq!(
+            save["screenshot_frame"],
+            json!({"x": 24, "y": 44, "w": 120, "h": 60})
+        );
+        let bold = &elements[2];
+        assert_eq!(bold["enabled"], false, "non-default enabled is kept");
+        assert_eq!(bold["selected"], true, "non-default selected is kept");
+    }
+
+    #[test]
+    fn full_elements_keep_every_field() {
+        // Full mode never runs the projection, so records are what the builder emits.
+        let full = compact_fixture();
+        let save = &full["elements"][1];
+        assert_eq!(save["depth"], 2);
+        assert_eq!(save["parent_index"], 0);
+        assert_eq!(save["enabled"], true);
+        assert_eq!(save["selected"], false);
+        assert_eq!(
+            save["frame"],
+            json!({"x": 12.0, "y": 22.0, "w": 60.0, "h": 30.0})
+        );
+        assert!(full.get("_note").is_some());
+    }
+
+    #[test]
+    fn schema_advertises_element_fields() {
+        let property = &def().input_schema["properties"]["element_fields"];
+        assert_eq!(property["enum"], json!(["compact", "full"]));
+        assert!(property["description"]
+            .as_str()
+            .unwrap()
+            .contains("compact\" (default)"));
+    }
+
+    #[test]
+    fn switching_element_fields_forces_a_full_look() {
+        let nodes = vec![node(Some(0), "AXButton", Some("Save"), 1, None, None, vec![])];
+        let compact = crate::ax::cache::LookBounds {
+            max_elements: 10,
+            max_depth: 5,
+            ..Default::default()
+        };
+        let prior = crate::ax::cache::PriorLook {
+            elements: Vec::new(),
+            rows: crate::ax::diff::rows_of(&nodes),
+            next_id: 1,
+            bounds: compact,
+            session: Some("s".into()),
+            full_delivered: true,
+        };
+        let session = Some("s".to_owned());
+        assert!(diff_baseline(Some(&prior), &compact, &session).is_some());
+        let full = crate::ax::cache::LookBounds {
+            full_elements: true,
+            ..compact
+        };
+        assert!(
+            diff_baseline(Some(&prior), &full, &session).is_none(),
+            "a full request after a compact look must not diff against compact rows"
         );
     }
 }

@@ -31,6 +31,10 @@ fn depth(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":"integer","minimum":1,"maximum":100})
 }
 
+fn element_fields(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({"type":"string","enum":["compact","full"]})
+}
+
 fn direction(generator: &mut SchemaGenerator) -> Schema {
     ScrollDirection::json_schema(generator)
 }
@@ -274,6 +278,15 @@ pub struct ActionReadObservation {
     #[schemars(schema_with = "depth")]
     #[uniffi(default = None)]
     pub max_depth: Option<u32>,
+    /// Passed to get_window_state: "compact" (default) or "full" element records.
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
+    #[schemars(schema_with = "element_fields")]
+    #[uniffi(default = None)]
+    pub element_fields: Option<crate::ElementFields>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, uniffi::Record)]
@@ -478,7 +491,7 @@ impl ToolOutput for ActAndReadOutput {}
 pub fn contracts() -> Vec<ToolContract> {
     vec![ToolContract {
         name: ActAndReadInput::TOOL_NAME.into(),
-        description: "macOS: act, then read the same window's fresh accessibility state in one call. Pass one token-targeted background click, set_value or scroll, or `steps`: up to 8 actions on this window (click, set_value, scroll, type_text, press_key, hotkey), run in order in the background and stopped at the first failure. Use steps for work whose targets are already visible, such as several button presses or a field then its submit button, instead of one call per action. Tree-only by default; observe selects query/context and optional screenshot. Returns each child result, including errors and which step stopped. No retries or semantic verification: the fresh read shows what happened. Not a transaction against other clients or user input. Windows and Linux are not yet supported.".into(),
+        description: "macOS: act, then read the same window's fresh accessibility state in one call. Pass one token-targeted background click, set_value or scroll, or `steps`: up to 8 actions on this window (click, set_value, scroll, type_text, press_key, hotkey), run in order in the background and stopped at the first failure. Use steps for work whose targets are already visible, such as several button presses or a field then its submit button, instead of one call per action. Tree-only by default; observe selects query/context, element_fields (compact by default) and optional screenshot. Returns each child result, including errors and which step stopped. No retries or semantic verification: the fresh read shows what happened. Not a transaction against other clients or user input. Windows and Linux are not yet supported.".into(),
         platforms:vec![Platform::Macos], aliases:vec![], capabilities:vec!["action.read".into()],
         annotations:ToolAnnotations { read_only:false,destructive:true,idempotent:false,open_world:false },
         schema_mode:SchemaMode::CanonicalRuntime,cursor_semantics:None,

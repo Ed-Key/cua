@@ -60,16 +60,19 @@ impl ScreenshotTransform {
 }
 
 /// Everything about a look that changes what its rows mean without the app
-/// changing: the walk bounds, and the screenshot transform actually
-/// delivered (None when no screenshot came back), which decides each row's
-/// `screenshot_frame`. A diff is only offered between looks with equal
-/// bounds, so a consumer never keeps coordinates for a differently scaled or
-/// differently placed image, or misses frames that only now exist.
+/// changing: the walk bounds, the screenshot transform actually delivered
+/// (None when no screenshot came back), which decides each row's
+/// `screenshot_frame`, and the `element_fields` projection. A diff is only
+/// offered between looks with equal bounds, so a consumer never keeps
+/// coordinates for a differently scaled or differently placed image, misses
+/// frames that only now exist, or keeps compact rows after asking for full.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct LookBounds {
     pub max_elements: usize,
     pub max_depth: usize,
     pub screenshot: Option<ScreenshotTransform>,
+    /// `element_fields:"full"`; false for the compact default.
+    pub full_elements: bool,
 }
 
 /// The latest look at one window. Besides owning the element handles that
