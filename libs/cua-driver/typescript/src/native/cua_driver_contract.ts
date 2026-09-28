@@ -3700,7 +3700,12 @@ const FfiConverterTypeWindowInfo = (() => {
 
 export type ListWindowsOutput = {
     windows: Array<WindowInfo>,
-    currentSpaceId?: bigint
+    currentSpaceId?: bigint,
+    /**
+     * macOS: how many windows an unfiltered call left out because they are
+     * not on the current Space. Absent when nothing was filtered by default.
+     */
+    offScreenOmitted?: number
 }
 
 /**
@@ -3708,6 +3713,7 @@ export type ListWindowsOutput = {
  */
 export const ListWindowsOutput = (() => {
     const defaults = () => ({
+        offScreenOmitted: undefined
     });
     const create = (() => {
         return uniffiCreateRecord<ListWindowsOutput, ReturnType<typeof defaults>>(defaults);
@@ -3725,16 +3731,19 @@ const FfiConverterTypeListWindowsOutput = (() => {
         read(from: RustBuffer): TypeName {
             return {
                 windows: FfiConverterSequenceTypeWindowInfo.read(from),
-                currentSpaceId: FfiConverterOptionalUInt64.read(from)
+                currentSpaceId: FfiConverterOptionalUInt64.read(from),
+                offScreenOmitted: FfiConverterOptionalUInt32.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterSequenceTypeWindowInfo.write(value.windows, into);
             FfiConverterOptionalUInt64.write(value.currentSpaceId, into);
+            FfiConverterOptionalUInt32.write(value.offScreenOmitted, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterSequenceTypeWindowInfo.allocationSize(value.windows) +
-             FfiConverterOptionalUInt64.allocationSize(value.currentSpaceId);
+             FfiConverterOptionalUInt64.allocationSize(value.currentSpaceId) +
+             FfiConverterOptionalUInt32.allocationSize(value.offScreenOmitted);
 
         }
     };

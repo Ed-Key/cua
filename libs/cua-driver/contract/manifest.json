@@ -3078,7 +3078,7 @@
     },
     {
       "name": "list_windows",
-      "description": "Discover exact native windows and observable bounds and stacking order.",
+      "description": "Discover exact native windows and observable bounds and stacking order. On macOS, without pid, only the current Space's windows are listed and off_screen_omitted counts the rest; pass on_screen_only:false to include them.",
       "platforms": [
         "macos",
         "windows",
@@ -3117,6 +3117,14 @@
         "properties": {
           "current_space_id": {
             "format": "uint64",
+            "minimum": 0,
+            "type": [
+              "integer",
+              "null"
+            ]
+          },
+          "off_screen_omitted": {
+            "format": "uint32",
             "minimum": 0,
             "type": [
               "integer",
