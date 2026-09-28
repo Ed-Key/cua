@@ -25,6 +25,9 @@ impl ActAndReadTool {
         Self { registry }
     }
 }
+/// Pause before a key step that follows another step (see the steps loop).
+const KEY_STEP_SETTLE: Duration = Duration::from_millis(500);
+
 fn millis(d: Duration) -> u64 {
     d.as_millis().min(u64::MAX as u128) as u64
 }
@@ -125,6 +128,15 @@ impl Tool for ActAndReadTool {
         let mut results = Vec::with_capacity(calls.len());
         let mut stopped_at = None;
         for (i, (name, call)) in calls.into_iter().enumerate() {
+            // A key step sent milliseconds after the previous step can race the
+            // app's handling of it: in TextEdit, Cmd+S right after inserted text
+            // sometimes neither saved nor answered for about 15 s, while a 0.5 s
+            // gap saved every time. Agents calling one tool at a time always had
+            // that gap.
+            // ponytail: fixed settle before key steps; wait on an app-idle signal if 500 ms proves too short or too slow.
+            if i > 0 && matches!(name, "press_key" | "hotkey") {
+                tokio::time::sleep(KEY_STEP_SETTLE).await;
+            }
             let result = registry.invoke(name, call).await;
             let failed = result.is_error == Some(true);
             results.push(split(result));
