@@ -66,6 +66,7 @@ pub struct SdkAdapter {
     runtime_prefix: String,
     runtime_scope: String,
     _session_end_hook: cua_driver_core::session::SessionEndHookRegistration,
+    _session_revive_hook: cua_driver_core::session::SessionReviveHookRegistration,
     session_lifecycle: tokio::sync::Mutex<()>,
 }
 
@@ -133,6 +134,22 @@ impl SdkAdapter {
                 sessions.scopes.entry(public.to_owned()).or_default();
                 sessions.mark_ended(public);
             });
+        // Core revives a label on start_session and when a new connection
+        // reclaims one its closed owner left. Follow that transition itself,
+        // whatever the call then returns; an end_session or revoke tombstone
+        // stays until start_session succeeds.
+        let revive_sessions = public_sessions.clone();
+        let revive_prefix = runtime_prefix.clone();
+        let session_revive_hook =
+            cua_driver_core::session::register_scoped_session_revive_hook(move |session| {
+                let Some(public) = session.strip_prefix(&revive_prefix) else {
+                    return;
+                };
+                let mut sessions = revive_sessions.lock().unwrap();
+                if !sessions.explicitly_ended.contains(public) {
+                    sessions.ended.remove(public);
+                }
+            });
         Ok(Arc::new(Self {
             driver,
             tools_list,
@@ -140,6 +157,7 @@ impl SdkAdapter {
             runtime_prefix,
             runtime_scope,
             _session_end_hook: session_end_hook,
+            _session_revive_hook: session_revive_hook,
             session_lifecycle: tokio::sync::Mutex::new(()),
         }))
     }
@@ -218,13 +236,6 @@ impl SdkAdapter {
                 .entry(session.clone())
                 .or_default();
         }
-        let core_session = format!(
-            "{}{}",
-            self.runtime_prefix,
-            mirror_session.as_deref().unwrap_or_default()
-        );
-        let core_ended_before =
-            mirror_session.is_some() && cua_driver_core::session::is_session_ended(&core_session);
         let ending_tombstone = ending_session.map(|session| {
             // Mark before dispatch so a concurrently arriving legacy socket
             // call cannot slip through after teardown has begun.
@@ -238,19 +249,8 @@ impl SdkAdapter {
         let result = self
             .driver
             .call_tool_from_trusted_adapter(name, arguments)
-            .await;
-        // Core reclaims a closed connection's label before running the tool,
-        // so follow that transition whatever the tool itself returned. A
-        // mirror-only tombstone (end_session or revoke) stays.
-        if core_ended_before && !cua_driver_core::session::is_session_ended(&core_session) {
-            if let Some(session) = mirror_session.as_deref() {
-                let mut sessions = self.public_sessions.lock().unwrap();
-                if !sessions.explicitly_ended.contains(session) {
-                    sessions.ended.remove(session);
-                }
-            }
-        }
-        let result = result.map_err(|error| {
+            .await
+            .map_err(|error| {
                 if let Some((session, marker, previous, newly_explicit)) = ending_tombstone {
                     self.public_sessions.lock().unwrap().rollback_ended(
                         session,
