@@ -5378,19 +5378,25 @@ class _UniffiFfiConverterSequenceTypeWindowInfo(_UniffiConverterRustBuffer):
 
 @dataclass
 class ListWindowsOutput:
-    def __init__(self, *, windows:typing.List[WindowInfo], current_space_id:typing.Optional[int]):
+    def __init__(self, *, windows:typing.List[WindowInfo], current_space_id:typing.Optional[int], off_screen_omitted:typing.Optional[int] = _DEFAULT):
         self.windows = windows
         self.current_space_id = current_space_id
+        if off_screen_omitted is _DEFAULT:
+            self.off_screen_omitted = None
+        else:
+            self.off_screen_omitted = off_screen_omitted
 
 
 
 
     def __str__(self):
-        return "ListWindowsOutput(windows={}, current_space_id={})".format(self.windows, self.current_space_id)
+        return "ListWindowsOutput(windows={}, current_space_id={}, off_screen_omitted={})".format(self.windows, self.current_space_id, self.off_screen_omitted)
     def __eq__(self, other):
         if self.windows != other.windows:
             return False
         if self.current_space_id != other.current_space_id:
+            return False
+        if self.off_screen_omitted != other.off_screen_omitted:
             return False
         return True
 
@@ -5400,17 +5406,20 @@ class _UniffiFfiConverterTypeListWindowsOutput(_UniffiConverterRustBuffer):
         return ListWindowsOutput(
             windows=_UniffiFfiConverterSequenceTypeWindowInfo.read(buf),
             current_space_id=_UniffiFfiConverterOptionalUInt64.read(buf),
+            off_screen_omitted=_UniffiFfiConverterOptionalUInt32.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterSequenceTypeWindowInfo.check_lower(value.windows)
         _UniffiFfiConverterOptionalUInt64.check_lower(value.current_space_id)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.off_screen_omitted)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterSequenceTypeWindowInfo.write(value.windows, buf)
         _UniffiFfiConverterOptionalUInt64.write(value.current_space_id, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.off_screen_omitted, buf)
 
 @dataclass
 class MoveCursorInput:

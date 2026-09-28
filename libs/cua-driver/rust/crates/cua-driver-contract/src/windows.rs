@@ -233,6 +233,11 @@ pub struct ListWindowsOutput {
     pub windows: Vec<WindowInfo>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub current_space_id: Option<u64>,
+    /// macOS: how many windows an unfiltered call left out because they are
+    /// not on the current Space. Absent when nothing was filtered by default.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[uniffi(default = None)]
+    pub off_screen_omitted: Option<u32>,
 }
 
 impl ToolOutput for ListWindowsOutput {

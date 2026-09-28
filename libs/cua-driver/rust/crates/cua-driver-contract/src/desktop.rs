@@ -59,7 +59,7 @@ fn list_apps() -> ToolContract {
 fn list_windows() -> ToolContract {
     contract::<ListWindowsInput, ListWindowsOutput>(
         "list_windows",
-        "Discover exact native windows and observable bounds and stacking order. Without pid, only the current Space's windows are listed and off_screen_omitted counts the rest; pass on_screen_only:false to include them.",
+        "Discover exact native windows and observable bounds and stacking order. On macOS, without pid, only the current Space's windows are listed and off_screen_omitted counts the rest; pass on_screen_only:false to include them.",
         &["window.list"],
         ToolAnnotations {
             read_only: true,
