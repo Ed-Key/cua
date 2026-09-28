@@ -311,13 +311,16 @@ fn ax_double_click(
 
     // Try AXOpen first (Finder items, openable list rows, document cells).
     if has_ax_open {
+        let alive_before = unsafe { crate::ax::bindings::element_is_alive(element) };
         let err = unsafe { perform_action(element, "AXOpen") };
         if err == kAXErrorSuccess {
             return Ok(format!("AXOpen performed on element [{idx}]."));
         }
         // Finder's AXOpen navigates the window, destroying the icon it was
         // performed on, and then reports an error although it ran.
-        if unsafe { crate::ax::bindings::element_gone_after_action(element) } {
+        if crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
+            crate::ax::bindings::element_gone_after_action(element)
+        }) {
             return Ok(format!(
                 "AXOpen performed on element [{idx}]; the element no longer exists afterwards \
                  (the action replaced it; AX returned {err}). Take a fresh snapshot before \
