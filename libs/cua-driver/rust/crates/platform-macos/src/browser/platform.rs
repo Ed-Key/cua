@@ -8,7 +8,6 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
-use cua_driver_core::browser::existing_profile_setup_descriptor;
 use cua_driver_core::browser::platform::{
     select_isolated_browser_executable, BrowserConsentOutcome, BrowserConsentRequest,
     BrowserPlatform, BrowserVisualAction, BrowserVisualActionKind, ExistingProfileSetupOutcome,
@@ -19,6 +18,10 @@ use cua_driver_core::browser::types::{
     BrowserClassification, BrowserEngineFamily, BrowserProcessRole, BrowserProduct,
     EndpointOwnershipMethod, EndpointOwnershipProof, EndpointTransport, NativeOwnershipMethod,
     NativeOwnershipProof, NativeWindowInfo, OwnedEndpoint, ProcessFingerprint, Rect,
+};
+use cua_driver_core::browser::{
+    existing_profile_setup_descriptor, is_firefox, loopback_websocket_port,
+    parse_devtools_active_port,
 };
 use serde::Serialize;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -228,6 +231,9 @@ struct TabSwitchReport {
     selected: String,
 }
 
+/// macOS keeps its own tracker rather than core's shared one: it follows the
+/// Chrome extension's tab reports and unplaces cursors in the macOS overlay,
+/// neither of which the other platforms have.
 #[derive(Debug, Default)]
 struct BrowserCursorTracker {
     bindings: HashMap<String, BrowserCursorBinding>,
@@ -465,13 +471,6 @@ pub(crate) fn is_chromium(name: &str, bundle_id: &str) -> bool {
         .any(|token| products.contains(&token))
 }
 
-fn is_firefox(name: &str, bundle_id: &str) -> bool {
-    format!("{name} {bundle_id}")
-        .to_ascii_lowercase()
-        .split(|ch: char| !ch.is_ascii_alphanumeric())
-        .any(|token| token == "firefox")
-}
-
 fn browser_product(name: &str, bundle_id: &str) -> BrowserProduct {
     let name = name.to_ascii_lowercase();
     let bundle_id = bundle_id.to_ascii_lowercase();
@@ -566,18 +565,6 @@ fn has_trusted_codesign_identity(
         )
 }
 
-fn loopback_websocket_port(url: &str) -> Option<u16> {
-    ["ws://127.0.0.1:", "ws://localhost:", "ws://[::1]:"]
-        .iter()
-        .find_map(|prefix| {
-            url.strip_prefix(prefix)?
-                .split('/')
-                .next()?
-                .parse::<u16>()
-                .ok()
-        })
-}
-
 fn stable_hash(value: &str) -> u64 {
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     value.hash(&mut hasher);
@@ -593,21 +580,6 @@ fn default_user_data_dir(product: BrowserProduct) -> Option<PathBuf> {
         _ => return None,
     };
     Some(home.join(relative))
-}
-
-fn parse_devtools_active_port(text: &str) -> Option<(u16, &str)> {
-    let mut lines = text.lines().map(str::trim).filter(|line| !line.is_empty());
-    let port = lines.next()?.parse::<u16>().ok()?;
-    let path = lines.next()?;
-    if lines.next().is_some() {
-        return None;
-    }
-    let instance = path.strip_prefix("/devtools/browser/")?;
-    (!instance.is_empty()
-        && instance
-            .bytes()
-            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'-' || byte == b'_'))
-    .then_some((port, path))
 }
 
 fn process_arguments(pid: i64) -> Result<Vec<Vec<u8>>, BrowserRefusal> {
@@ -1061,7 +1033,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
             .unwrap_or("");
         let chromium = is_chromium(name, bundle_id);
         let webkit = bundle_id == "com.apple.Safari" || name.eq_ignore_ascii_case("Safari");
-        let gecko = is_firefox(name, bundle_id);
+        let gecko = is_firefox(&format!("{name} {bundle_id}"));
         let product_kind = browser_product(name, bundle_id);
         let helper = name.to_ascii_lowercase().contains("helper")
             || bundle_id.to_ascii_lowercase().contains(".helper")
@@ -2067,55 +2039,6 @@ mod tests {
         assert!(!is_chromium("Safari", "com.apple.Safari"));
         assert!(!is_chromium("Search", "com.example.Search"));
         assert!(!is_chromium("Operator", "com.example.Operator"));
-    }
-
-    #[test]
-    fn firefox_classifier_uses_product_tokens() {
-        assert!(is_firefox("Firefox", "org.mozilla.firefox"));
-        assert!(is_firefox("Mozilla Firefox", "org.mozilla.firefox"));
-        assert!(!is_firefox("FirefoxHelper", "com.example.FirefoxHelper"));
-        assert!(!is_firefox("Waterfox", "net.waterfox.current"));
-    }
-
-    #[test]
-    fn websocket_url_must_keep_the_attested_listener_port() {
-        assert_eq!(
-            loopback_websocket_port("ws://127.0.0.1:9222/devtools/browser/id"),
-            Some(9222)
-        );
-        assert_ne!(
-            loopback_websocket_port("ws://localhost:9333/devtools/browser/foreign"),
-            Some(9222)
-        );
-        assert_eq!(
-            loopback_websocket_port("ws://192.0.2.1:9222/devtools"),
-            None
-        );
-    }
-
-    #[test]
-    fn active_port_parser_requires_one_exact_browser_path() {
-        assert_eq!(
-            parse_devtools_active_port(
-                "9222\n/devtools/browser/f1d991b4-2694-4b28-b63a-1f2a8da3a435\n"
-            ),
-            Some((
-                9222,
-                "/devtools/browser/f1d991b4-2694-4b28-b63a-1f2a8da3a435"
-            ))
-        );
-        assert_eq!(
-            parse_devtools_active_port("9222\n/devtools/page/id\n"),
-            None
-        );
-        assert_eq!(
-            parse_devtools_active_port("9222\n/devtools/browser/id\nextra\n"),
-            None
-        );
-        assert_eq!(
-            parse_devtools_active_port("9222\n/devtools/browser/../page\n"),
-            None
-        );
     }
 
     #[test]

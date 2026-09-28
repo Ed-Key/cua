@@ -18,6 +18,7 @@
 //! platform tool registry.
 
 mod autostart;
+mod broken_pipe;
 mod bundle;
 mod check_update_tool;
 mod chrome_native_host;
@@ -132,7 +133,7 @@ fn maybe_wrap_finite_command() {
     let Ok(status) = status else {
         return;
     };
-    let exit_code = status.code().unwrap_or(1);
+    let exit_code = broken_pipe::shell_exit_code(status);
     telemetry::spawn_cli_completion_worker(
         command_name,
         tool_name.as_deref(),
@@ -470,7 +471,9 @@ fn main() {
     if let Some(code) = chrome_native_host::run_if_requested() {
         std::process::exit(code);
     }
-    cua_driver_sdk::configure_perception_client_provider(extension_manager::perception_client);
+    cua_driver_sdk::configure_perception_client_resolver(
+        extension_manager::perception_client_resolver(),
+    );
     if let Some(code) = platform_macos::permissions::gate::run_permission_probe_if_requested() {
         std::process::exit(code);
     }
@@ -512,6 +515,7 @@ fn main() {
     if telemetry::run_update_event_worker_if_requested() {
         return;
     }
+    broken_pipe::install_for_finite_command_from_argv();
     maybe_wrap_finite_command();
 
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
@@ -910,7 +914,9 @@ fn main() -> anyhow::Result<()> {
     if let Some(code) = chrome_native_host::run_if_requested() {
         std::process::exit(code);
     }
-    cua_driver_sdk::configure_perception_client_provider(extension_manager::perception_client);
+    cua_driver_sdk::configure_perception_client_resolver(
+        extension_manager::perception_client_resolver(),
+    );
     if let Some(code) = history_runtime::run_offline_purge_if_requested() {
         std::process::exit(code);
     }
@@ -927,6 +933,7 @@ fn main() -> anyhow::Result<()> {
     if telemetry::run_update_event_worker_if_requested() {
         return Ok(());
     }
+    broken_pipe::install_for_finite_command_from_argv();
     maybe_wrap_finite_command();
 
     // ── CLI subcommand dispatch ──────────────────────────────────────────────
