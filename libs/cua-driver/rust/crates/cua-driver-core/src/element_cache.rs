@@ -661,6 +661,7 @@ impl<S: SnapshotPayload> Default for ElementCacheCore<S> {
 
 trait RuntimeCache: Any + Send + Sync {
     fn contains(&self, pid: i32, snapshot_id: u32) -> bool;
+    fn locate(&self, snapshot_id: u32) -> Option<(i32, u64)>;
     fn clear(&self) -> usize;
 }
 
@@ -672,6 +673,15 @@ impl<S: SnapshotPayload> RuntimeCache for ElementCacheCore<S> {
             .snapshots
             .get(&pid)
             .is_some_and(|lane| lane.iter().any(|entry| entry.id == snapshot_id))
+    }
+
+    fn locate(&self, snapshot_id: u32) -> Option<(i32, u64)> {
+        let inner = self.inner.lock().unwrap();
+        inner.snapshots.iter().find_map(|(pid, lane)| {
+            lane.iter()
+                .find(|entry| entry.id == snapshot_id)
+                .map(|entry| (*pid, entry.window_id))
+        })
     }
 
     fn clear(&self) -> usize {
@@ -703,6 +713,42 @@ pub fn current_runtime_cache<S: SnapshotPayload>() -> Option<Arc<ElementCacheCor
         .upgrade()?;
     let erased: Arc<dyn Any + Send + Sync> = cache;
     erased.downcast().ok()
+}
+
+/// Fill a missing `pid` (and `window_id`) from `element_token`.
+///
+/// A token already names the snapshot it came from, and this runtime's cache
+/// knows which process and window that snapshot observed, so requiring the
+/// caller to repeat `pid` only turned token-only calls into errors. Runs
+/// before authorization, so policy sees the same target the tool acts on.
+/// Stale or foreign tokens are left alone; the tool reports them as before.
+pub fn fill_target_from_element_token(args: &mut serde_json::Value) {
+    let Some(object) = args.as_object_mut() else {
+        return;
+    };
+    if object.get("pid").is_some_and(|pid| !pid.is_null()) {
+        return;
+    }
+    let Some((snapshot_id, _)) = object
+        .get("element_token")
+        .and_then(serde_json::Value::as_str)
+        .and_then(crate::element_token::parse_token)
+    else {
+        return;
+    };
+    // Release the registry lock before using (and possibly dropping) the cache.
+    let cache = runtime_caches()
+        .lock()
+        .unwrap()
+        .get(&current_runtime_scope())
+        .and_then(Weak::upgrade);
+    let Some((pid, window_id)) = cache.and_then(|cache| cache.locate(snapshot_id)) else {
+        return;
+    };
+    object.insert("pid".into(), pid.into());
+    if object.get("window_id").is_none_or(serde_json::Value::is_null) {
+        object.insert("window_id".into(), window_id.into());
+    }
 }
 
 pub fn retire_runtime_scope(runtime_scope: &str) -> usize {
