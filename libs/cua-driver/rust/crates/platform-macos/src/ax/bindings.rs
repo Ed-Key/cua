@@ -630,6 +630,34 @@ fn belongs_via(window_id: u32, target: u32, parent_of: impl Fn(u32) -> Option<u3
     false
 }
 
+/// Best-effort completion of the one exact-window request. This addresses only
+/// the requested AX window; it never orders every window owned by the process.
+pub fn raise_exact_window(pid: i32, window_id: u32) -> bool {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return false;
+        }
+        let mut target = None;
+        for window in copy_ax_windows(app) {
+            if target.is_none() && ax_get_window_id(window) == Some(window_id) {
+                target = Some(window);
+            } else {
+                CFRelease(window as CFTypeRef);
+            }
+        }
+        CFRelease(app as CFTypeRef);
+        let Some(target) = target else {
+            return false;
+        };
+        let raised = perform_action(target, "AXRaise") == 0;
+        let main = set_bool_attr_true(target, "AXMain") == 0;
+        let focused = set_bool_attr_true(target, "AXFocused") == 0;
+        CFRelease(target as CFTypeRef);
+        raised || main || focused
+    }
+}
+
 /// A focused window reading, reported as `target` when it is part of it.
 pub fn focused_as_target(focused: Option<u32>, target: u32) -> Option<u32> {
     focused.map(|window| if window_belongs_to(window, target) { target } else { window })
