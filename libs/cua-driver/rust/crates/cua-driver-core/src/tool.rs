@@ -1134,6 +1134,9 @@ impl ToolRegistry {
         {
             return result;
         }
+        // After target normalization: a typed `target` has become pid/window_id
+        // and is left alone.
+        crate::element_cache::fill_target_from_element_token(&mut args);
         if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {
             return result;
         }
@@ -4775,6 +4778,73 @@ resources:
                 ..
             }
         ));
+    }
+
+    #[tokio::test]
+    async fn an_element_token_alone_names_its_target_process_and_window() {
+        let pid = 8_675_310;
+        let (cache, token) = DISPATCH_RUNTIME_SCOPE
+            .scope("token-fill-runtime-a".to_owned(), async {
+                let cache = crate::snapshot_test_support::cache();
+                let snapshot =
+                    cache.publish(pid, 45, crate::snapshot_test_support::Payload(vec![0, 1]));
+                (cache, crate::element_token::token_for(snapshot, 1))
+            })
+            .await;
+        let fill = |scope: &'static str, args: serde_json::Value| {
+            DISPATCH_RUNTIME_SCOPE.scope(scope.to_owned(), async move {
+                let mut args = args;
+                crate::element_cache::fill_target_from_element_token(&mut args);
+                args
+            })
+        };
+
+        let filled = fill("token-fill-runtime-a", serde_json::json!({"element_token": token})).await;
+        assert_eq!(filled["pid"], pid);
+        assert_eq!(filled["window_id"], 45);
+
+        // A caller's own pid or window_id is never overridden; the tool
+        // still reports any conflict with the token.
+        let kept = fill(
+            "token-fill-runtime-a",
+            serde_json::json!({"element_token": token, "pid": 1, "window_id": 2}),
+        )
+        .await;
+        assert_eq!((kept["pid"].clone(), kept["window_id"].clone()), (1.into(), 2.into()));
+        let window_kept = fill(
+            "token-fill-runtime-a",
+            serde_json::json!({"element_token": token, "window_id": 2}),
+        )
+        .await;
+        assert_eq!((window_kept["pid"].clone(), window_kept["window_id"].clone()), (pid.into(), 2.into()));
+
+        // Dispatch order: a typed target is normalized first, so a matching
+        // token-only element click through the SDK still passes.
+        let typed = DISPATCH_RUNTIME_SCOPE
+            .scope("token-fill-runtime-a".to_owned(), async {
+                let mut args = serde_json::json!({
+                    "element_token": token,
+                    "target": {"kind": "window", "pid": pid, "window_id": 45},
+                });
+                crate::action_target::normalize_action_target("click", &mut args).unwrap();
+                crate::element_cache::fill_target_from_element_token(&mut args);
+                args
+            })
+            .await;
+        assert_eq!((typed["pid"].clone(), typed["window_id"].clone()), (pid.into(), 45.into()));
+        let scoped = fill(
+            "token-fill-runtime-a",
+            serde_json::json!({"element_token": token, "scope": "desktop"}),
+        )
+        .await;
+        assert!(scoped.get("pid").is_none());
+
+        // Another runtime generation's token and a malformed token stay unresolved.
+        let foreign = fill("token-fill-runtime-b", serde_json::json!({"element_token": token})).await;
+        assert!(foreign.get("pid").is_none());
+        let malformed = fill("token-fill-runtime-a", serde_json::json!({"element_token": "nope"})).await;
+        assert!(malformed.get("pid").is_none());
+        drop(cache);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
