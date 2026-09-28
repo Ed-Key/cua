@@ -197,6 +197,9 @@ impl Tool for HotkeyTool {
             .filter(|k| !is_modifier(k))
             .cloned()
             .collect();
+        let cmd_chord = modifiers
+            .iter()
+            .any(|k| matches!(k.to_ascii_lowercase().as_str(), "cmd" | "command"));
 
         if non_modifiers.is_empty() {
             return ToolResult::error(
@@ -471,8 +474,16 @@ impl Tool for HotkeyTool {
                                    pixel-click to focus then type_text instead.)"
                     });
                 }
+                // Apps often drop a background menu shortcut (TextEdit ignores
+                // Cmd+S); invoke_menu runs the same command by path.
+                let menu_hint = if !fg && cmd_chord {
+                    " A background menu shortcut can be ignored; if its effect is missing, \
+                     run the same command with invoke_menu, e.g. path [\"File\",\"Save\"]."
+                } else {
+                    ""
+                };
                 ToolResult::text(format!(
-                    "Pressed {key_display} on pid {pid}{label}.{}",
+                    "Pressed {key_display} on pid {pid}{label}.{menu_hint}{}",
                     changes.result_suffix()
                 ))
                 .with_structured(structured)
