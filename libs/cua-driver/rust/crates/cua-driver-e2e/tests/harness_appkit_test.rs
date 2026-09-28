@@ -2975,23 +2975,21 @@ fn harness_appkit_placeholder_value_and_writability() {
 }
 
 macro_rules! focus_theft_tests {
-    ($($name:ident: $delay:expr, $targeting:expr;)*) => {$(
+    ($name:ident, $delay:expr, $targeting:expr) => {
         #[test]
         #[ignore]
         fn $name() {
             run_focus_theft_case($delay, $targeting);
         }
-    )*};
+    };
 }
 
-focus_theft_tests! {
-    harness_appkit_focus_theft_0ms_ax: 0, TheftRoute::Ax;
-    harness_appkit_focus_theft_300ms_ax: 300, TheftRoute::Ax;
-    harness_appkit_focus_theft_800ms_ax: 800, TheftRoute::Ax;
-    harness_appkit_focus_theft_0ms_px: 0, TheftRoute::Px;
-    harness_appkit_focus_theft_300ms_px: 300, TheftRoute::Px;
-    harness_appkit_focus_theft_800ms_px: 800, TheftRoute::Px;
-}
+focus_theft_tests!(harness_appkit_focus_theft_0ms_ax, 0, TheftRoute::Ax);
+focus_theft_tests!(harness_appkit_focus_theft_300ms_ax, 300, TheftRoute::Ax);
+focus_theft_tests!(harness_appkit_focus_theft_800ms_ax, 800, TheftRoute::Ax);
+focus_theft_tests!(harness_appkit_focus_theft_0ms_px, 0, TheftRoute::Px);
+focus_theft_tests!(harness_appkit_focus_theft_300ms_px, 300, TheftRoute::Px);
+focus_theft_tests!(harness_appkit_focus_theft_800ms_px, 800, TheftRoute::Px);
 
 fn run_editor_identity_case(mode: &str) {
     let journal = tempfile::tempdir().unwrap();
