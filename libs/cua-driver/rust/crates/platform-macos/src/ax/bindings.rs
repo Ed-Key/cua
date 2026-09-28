@@ -773,15 +773,26 @@ pub unsafe fn copy_element_attr(
 /// AXOpen on a folder icon navigates the window, destroying the icon, and the
 /// action call then returns an error although it ran. Afterwards the element
 /// answers every attribute with kAXErrorInvalidUIElement. Finder takes a few
-/// hundred milliseconds to tear the icon down, so poll for up to 800 ms. This
-/// only runs after an action already failed, so it never slows a success.
+/// hundred milliseconds to tear the icon down, so this polls for up to 800 ms
+/// of wall-clock time, with each native request bounded by what is left of
+/// that budget (an unresponsive app would otherwise hold each read for the
+/// element's normal messaging timeout). It only runs after an action already
+/// failed, so it never slows a success.
 ///
 /// # Safety
 ///
 /// `element` must be a valid (retained) `AXUIElementRef`.
 pub unsafe fn element_gone_after_action(element: AXUIElementRef) -> bool {
-    const POLLS: usize = 16;
-    for attempt in 0..POLLS {
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(800);
+    const POLL: std::time::Duration = std::time::Duration::from_millis(50);
+    let deadline = std::time::Instant::now() + BUDGET;
+    let mut gone = false;
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            break;
+        }
+        let _ = AXUIElementSetMessagingTimeout(element, remaining.as_secs_f32().max(0.05));
         let attr = CFStr::new("AXRole");
         let mut value: CFTypeRef = std::ptr::null();
         let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
@@ -789,13 +800,14 @@ pub unsafe fn element_gone_after_action(element: AXUIElementRef) -> bool {
             CFRelease(value);
         }
         if err == kAXErrorInvalidUIElement {
-            return true;
+            gone = true;
+            break;
         }
-        if attempt + 1 < POLLS {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-        }
+        std::thread::sleep(POLL.min(deadline.saturating_duration_since(std::time::Instant::now())));
     }
-    false
+    // Restore the element's normal per-request bound for any later use.
+    let _ = AXUIElementSetMessagingTimeout(element, crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS);
+    gone
 }
 
 pub unsafe fn perform_action(element: AXUIElementRef, action_name: &str) -> AXError {
