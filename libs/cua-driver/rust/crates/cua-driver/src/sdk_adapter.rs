@@ -4,7 +4,7 @@
 //! this adapter. Platform registries remain private to `cua-driver-sdk`.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, Mutex},
 };
 
@@ -16,6 +16,10 @@ use serde_json::{json, Value};
 struct PublicSessionState {
     scopes: HashMap<String, CaptureScope>,
     ended: HashMap<String, u64>,
+    // Labels ended through end_session or operator revoke. These never become
+    // reclaimable by another connection, even if core only saw a later
+    // owner exit; only start_session clears them.
+    explicitly_ended: HashSet<String>,
     next_tombstone: u64,
 }
 
@@ -27,7 +31,16 @@ impl PublicSessionState {
         marker
     }
 
-    fn rollback_ended(&mut self, session: &str, marker: u64, previous: Option<u64>) {
+    fn rollback_ended(
+        &mut self,
+        session: &str,
+        marker: u64,
+        previous: Option<u64>,
+        newly_explicit: bool,
+    ) {
+        if newly_explicit {
+            self.explicitly_ended.remove(session);
+        }
         if self.ended.get(session).copied() != Some(marker) {
             return;
         }
@@ -205,13 +218,21 @@ impl SdkAdapter {
                 .entry(session.clone())
                 .or_default();
         }
+        let core_session = format!(
+            "{}{}",
+            self.runtime_prefix,
+            mirror_session.as_deref().unwrap_or_default()
+        );
+        let core_ended_before =
+            mirror_session.is_some() && cua_driver_core::session::is_session_ended(&core_session);
         let ending_tombstone = ending_session.map(|session| {
             // Mark before dispatch so a concurrently arriving legacy socket
             // call cannot slip through after teardown has begun.
             let mut sessions = self.public_sessions.lock().unwrap();
             let previous = sessions.ended.get(session).copied();
             let marker = sessions.mark_ended(session);
-            (session, marker, previous)
+            let newly_explicit = sessions.explicitly_ended.insert(session.to_owned());
+            (session, marker, previous, newly_explicit)
         });
 
         let result = self
@@ -219,30 +240,36 @@ impl SdkAdapter {
             .call_tool_from_trusted_adapter(name, arguments)
             .await
             .map_err(|error| {
-                if let Some((session, marker, previous)) = ending_tombstone {
-                    self.public_sessions
-                        .lock()
-                        .unwrap()
-                        .rollback_ended(session, marker, previous);
+                if let Some((session, marker, previous, newly_explicit)) = ending_tombstone {
+                    self.public_sessions.lock().unwrap().rollback_ended(
+                        session,
+                        marker,
+                        previous,
+                        newly_explicit,
+                    );
                 }
                 error.to_string()
             })?;
         let value: Value = serde_json::from_str(&result.raw_json).map_err(|error| {
-            if let Some((session, marker, previous)) = ending_tombstone {
-                self.public_sessions
-                    .lock()
-                    .unwrap()
-                    .rollback_ended(session, marker, previous);
+            if let Some((session, marker, previous, newly_explicit)) = ending_tombstone {
+                self.public_sessions.lock().unwrap().rollback_ended(
+                    session,
+                    marker,
+                    previous,
+                    newly_explicit,
+                );
             }
             format!("{name} returned invalid SDK result JSON: {error}")
         })?;
         let failed = value.get("isError").and_then(Value::as_bool) == Some(true);
         if failed {
-            if let Some((session, marker, previous)) = ending_tombstone {
-                self.public_sessions
-                    .lock()
-                    .unwrap()
-                    .rollback_ended(session, marker, previous);
+            if let Some((session, marker, previous, newly_explicit)) = ending_tombstone {
+                self.public_sessions.lock().unwrap().rollback_ended(
+                    session,
+                    marker,
+                    previous,
+                    newly_explicit,
+                );
             }
         } else if let Some(session) = mirror_session.as_deref() {
             let capture_scope = value
@@ -250,7 +277,16 @@ impl SdkAdapter {
                 .cloned()
                 .and_then(|scope| serde_json::from_value(scope).ok());
             let mut sessions = self.public_sessions.lock().unwrap();
+            // A call can also reclaim a label whose owner's connection closed.
+            // Follow core only when this call took it from ended to live; a
+            // mirror-only tombstone (revoke of another transport's session)
+            // must stay.
             if name == "start_session" {
+                sessions.explicitly_ended.remove(session);
+            }
+            if name == "start_session"
+                || (core_ended_before && !cua_driver_core::session::is_session_ended(&core_session))
+            {
                 sessions.ended.remove(session);
             }
             if let Some(capture_scope) = capture_scope {
@@ -266,6 +302,27 @@ impl SdkAdapter {
             .unwrap()
             .ended
             .contains_key(session)
+    }
+
+    /// Whether a call from `transport_session` may reclaim `session`, ended
+    /// because its owner's connection closed. Read-only; the core dispatch
+    /// boundary performs the reclaim after authorization.
+    pub fn is_session_reclaimable(&self, session: &str, transport_session: Option<&str>) -> bool {
+        if self
+            .public_sessions
+            .lock()
+            .unwrap()
+            .explicitly_ended
+            .contains(session)
+        {
+            return false;
+        }
+        transport_session.is_some_and(|transport| {
+            cua_driver_core::session::exited_session_reclaimable(
+                &format!("{}{session}", self.runtime_prefix),
+                &format!("{}{transport}", self.runtime_prefix),
+            )
+        })
     }
 
     pub fn mark_all_sessions_ended(&self) {
@@ -662,6 +719,46 @@ mod tests {
 
         first.shutdown().await.expect("shutdown first");
         second.shutdown().await.expect("shutdown second");
+    }
+
+    #[tokio::test]
+    async fn a_closed_connections_label_is_reclaimable_but_a_revoked_one_is_not() {
+        let _runtime_guard = crate::test_runtime_lock().lock().await;
+        let sdk = SdkAdapter::load(host_driver()).await.expect("SDK adapter");
+        let args = |session: &str, transport: &str| {
+            json!({
+                "session": session,
+                "_session_id": session,
+                "_transport_session_id": transport,
+            })
+        };
+        let (exited, revoked) = ("adapter-exited-label", "adapter-revoked-label");
+        for session in [exited, revoked] {
+            let started = sdk
+                .invoke_raw("start_session", args(session, "owner-a"))
+                .await
+                .expect("start session");
+            assert_ne!(started["isError"], true);
+        }
+        sdk.end_session(revoked).await.expect("operator revoke");
+        sdk.end_transport_sessions("owner-a");
+        assert!(sdk.is_session_ended(exited));
+        assert!(sdk.is_session_ended(revoked));
+
+        assert!(!sdk.is_session_reclaimable(exited, Some("owner-a")));
+        assert!(!sdk.is_session_reclaimable(revoked, Some("owner-b")));
+        assert!(sdk.is_session_reclaimable(exited, Some("owner-b")));
+        let reused = sdk
+            .invoke_raw("get_config", args(exited, "owner-b"))
+            .await
+            .expect("reuse exited label");
+        assert_ne!(reused["isError"], true, "{reused}");
+        assert!(
+            !sdk.is_session_ended(exited),
+            "a reclaim must clear the adapter's early tombstone"
+        );
+
+        sdk.shutdown().await.expect("shutdown");
     }
 
     #[tokio::test]

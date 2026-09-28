@@ -3,7 +3,7 @@
 use std::io::Write as _;
 use std::process::Command;
 
-use cua_driver_testkit::{CliDriver, Driver};
+use cua_driver_testkit::{CliDriver, Driver, McpDriver};
 
 fn missing_socket() -> (String, Option<tempfile::TempDir>) {
     #[cfg(unix)]
@@ -314,6 +314,46 @@ fn named_cli_session_cleanup_is_isolated() {
 
     let ended = driver.call("end_session", serde_json::json!({"session": second}));
     assert!(!ended.is_error(), "second end failed: {}", ended.text());
+}
+
+#[test]
+fn a_label_left_by_a_closed_connection_serves_the_next_connection() {
+    let driver = CliDriver::new();
+    assert!(driver.available(), "test daemon failed to start");
+    let socket = driver
+        .daemon_socket()
+        .expect("test daemon socket")
+        .to_owned();
+    let label = format!("exited-owner-{}", std::process::id());
+    {
+        let mut first = McpDriver::spawn_daemon_proxy_unrecorded(&socket).expect("first proxy");
+        let listed = first.call("list_apps", serde_json::json!({"session": label}));
+        assert!(!listed.is_error(), "first use failed: {}", listed.text());
+    }
+
+    // The daemon ends the label once it sees the first connection close; until
+    // then the label is still the first connection's and refused to others.
+    let mut second = McpDriver::spawn_daemon_proxy_unrecorded(&socket).expect("second proxy");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let listed = second.call("list_apps", serde_json::json!({"session": label}));
+        if !listed.is_error() {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the next connection could not use the label: {}",
+            listed.text()
+        );
+        std::thread::sleep(std::time::Duration::from_millis(200));
+    }
+
+    // A label ended explicitly keeps its protection from other connections.
+    let ended = second.call("end_session", serde_json::json!({"session": label}));
+    assert!(!ended.is_error(), "end failed: {}", ended.text());
+    let mut third = McpDriver::spawn_daemon_proxy_unrecorded(&socket).expect("third proxy");
+    let refused = third.call("list_apps", serde_json::json!({"session": label}));
+    assert!(refused.is_error(), "an explicitly ended label was reused");
 }
 
 #[test]

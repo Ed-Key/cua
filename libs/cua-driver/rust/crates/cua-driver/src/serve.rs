@@ -503,7 +503,10 @@ async fn invoke_daemon_tool(
     });
 
     if let Some(sid) = &effective_session {
-        if !is_session_lifecycle_tool(&tool_name) && sdk.is_session_ended(sid) {
+        if !is_session_lifecycle_tool(&tool_name)
+            && sdk.is_session_ended(sid)
+            && !sdk.is_session_reclaimable(sid, req.session_id.as_deref())
+        {
             observe_daemon_error(observation, 1);
             return DaemonResponse::err(
                 format!(
