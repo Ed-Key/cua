@@ -154,19 +154,15 @@ fn hold_tab(link: u64, tab: i64) {
     *tab_holders().lock().unwrap().entry((link, tab)).or_default() += 1;
 }
 
-/// Drop one holder of `tab`; true when it was the last.
-fn release_tab(link: u64, tab: i64) -> bool {
+/// Drop one holder of `tab`.
+fn release_tab(link: u64, tab: i64) {
     let mut holders = tab_holders().lock().unwrap();
     match holders.get_mut(&(link, tab)) {
-        Some(count) if *count > 1 => {
-            *count -= 1;
-            false
-        }
+        Some(count) if *count > 1 => *count -= 1,
         Some(_) => {
             holders.remove(&(link, tab));
-            true
         }
-        None => false,
+        None => {}
     }
 }
 
@@ -187,13 +183,19 @@ impl Session {
     async fn release_held_tabs(&self) {
         let tabs = self.held_tabs.lock().unwrap().take().unwrap_or_default();
         for tab in tabs {
-            if release_tab(self.link, tab) {
-                let _ = self
-                    .bridge
-                    .request_on(self.link, "debugger.detach", json!({ "tabId": tab }))
-                    .await;
-            }
+            release_tab(self.link, tab);
+            self.detach_if_unheld(tab).await;
         }
+    }
+
+    async fn detach_if_unheld(&self, tab: i64) {
+        if tab_holders().lock().unwrap().contains_key(&(self.link, tab)) {
+            return;
+        }
+        let _ = self
+            .bridge
+            .request_on(self.link, "debugger.detach", json!({ "tabId": tab }))
+            .await;
     }
 
     async fn run(self, socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
@@ -360,10 +362,24 @@ impl Session {
                 let color = params.get("cuaSessionColor").cloned().unwrap_or(Value::Null);
                 self.request("debugger.attach", json!({ "tabId": tab, "sessionColor": color }))
                     .await?;
-                if let Some(held) = self.held_tabs.lock().unwrap().as_mut() {
-                    if held.insert(tab) {
-                        hold_tab(self.link, tab);
+                // Ownership rule: an attachment belongs to the connection
+                // that requested it only if that connection is still open
+                // when the attach completes. One that completes after the
+                // connection closed belongs to no one, so it is released
+                // here exactly as a closing connection releases its tabs:
+                // detached unless another connection holds the tab.
+                let adopted = match self.held_tabs.lock().unwrap().as_mut() {
+                    Some(held) => {
+                        if held.insert(tab) {
+                            hold_tab(self.link, tab);
+                        }
+                        true
                     }
+                    None => false,
+                };
+                if !adopted {
+                    self.detach_if_unheld(tab).await;
+                    return Err((-32001, "the connection closed while attaching".to_owned()));
                 }
                 let session = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
                 let mut routes = self.routes.lock().unwrap();
@@ -645,13 +661,21 @@ mod tests {
         // One connection closing leaves the tab attached for the other.
         first.release_held_tabs().await;
         assert!(seen.try_recv().is_err(), "no detach while a connection holds the tab");
-        // A late attach on a closed connection holds nothing.
-        first.root("Target.attachToTarget", &attach).await.unwrap();
+        // An attach that completes after its connection closed is nobody's:
+        // refused, and left attached only because the other connection holds it.
+        assert!(first.root("Target.attachToTarget", &attach).await.is_err());
         assert_eq!(seen.recv().await.unwrap()["method"], "debugger.attach");
+        assert!(seen.try_recv().is_err(), "the other connection still holds the tab");
         second.release_held_tabs().await;
         let detach = seen.recv().await.unwrap();
         assert_eq!(detach["method"], "debugger.detach");
         assert_eq!(detach["params"]["tabId"], 9);
         assert!(tab_holders().lock().unwrap().get(&(link, 9)).is_none());
+        // With no holder left, such a late attachment is detached at once.
+        assert!(second.root("Target.attachToTarget", &attach).await.is_err());
+        assert_eq!(seen.recv().await.unwrap()["method"], "debugger.attach");
+        let detach = seen.recv().await.unwrap();
+        assert_eq!(detach["method"], "debugger.detach");
+        assert_eq!(detach["params"]["tabId"], 9);
     }
 }
