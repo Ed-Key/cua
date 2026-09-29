@@ -225,6 +225,19 @@ struct PreparedProfile {
     marker: ProfileMarker,
 }
 
+/// What authorizes an existing-profile attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExistingProfileConsent {
+    Protected,
+    BoundedManifest,
+    LaunchGrant,
+    Unrestricted,
+    /// The user installed the Cua Driver extension in this Chrome and it
+    /// is connected: an OS-proven link from their own profile. Installing
+    /// it is the consent, as it is for comparable browser agents.
+    ExtensionInstalled,
+}
+
 pub(crate) struct ManagedBrowser {
     child: Box<dyn IsolatedBrowserProcess>,
     owned_pid: i64,
@@ -823,34 +836,13 @@ impl BrowserEngine {
         })
     }
 
-    async fn attach_existing_profile(
+    /// Which consent covers attaching to `pid`'s existing profile right now,
+    /// and the permission mode it was decided under. Refuses when none does.
+    pub(super) async fn existing_profile_consent(
         &self,
-        request: PrepareRequest,
-    ) -> Result<PrepareOutcome, BrowserRefusal> {
-        #[derive(PartialEq)]
-        enum ConsentPath {
-            Protected,
-            BoundedManifest,
-            LaunchGrant,
-            Unrestricted,
-            /// The user installed the Cua Driver extension in this Chrome and it
-            /// is connected: an OS-proven link from their own profile. Installing
-            /// it is the consent, as it is for comparable browser agents.
-            ExtensionInstalled,
-        }
-
-        let pid = request.pid.ok_or_else(|| {
-            refusal(
-                BrowserRefusalCode::BrowserConsentRequired,
-                "strategy=existing_profile requires an exact pid approval anchor",
-            )
-        })?;
-        let window_id = request.window_id.ok_or_else(|| {
-            refusal(
-                BrowserRefusalCode::BrowserConsentRequired,
-                "strategy=existing_profile requires an exact window_id approval anchor",
-            )
-        })?;
+        pid: i64,
+        window_id: u64,
+    ) -> Result<(crate::authorization::PermissionMode, ExistingProfileConsent), BrowserRefusal> {
         let mode = crate::tool::current_dispatch_authorization_context()
             .map(|context| context.mode())
             .map(Ok)
@@ -862,7 +854,7 @@ impl BrowserEngine {
                 )
             })?;
         let consent_path = if mode == crate::authorization::PermissionMode::Unrestricted {
-            ConsentPath::Unrestricted
+            ExistingProfileConsent::Unrestricted
         } else if mode == crate::authorization::PermissionMode::Bounded {
             let context = crate::tool::current_dispatch_authorization_context().ok_or_else(|| {
                 refusal(
@@ -886,17 +878,17 @@ impl BrowserEngine {
                     }),
                 )
                 .map_err(|message| refusal(BrowserRefusalCode::BrowserConsentRequired, message))?;
-            ConsentPath::BoundedManifest
+            ExistingProfileConsent::BoundedManifest
         } else if crate::authorization::launch_grant_enabled("existing_profile") {
-            ConsentPath::LaunchGrant
+            ExistingProfileConsent::LaunchGrant
         } else if self.approval_broker.provider_id().is_some() {
-            ConsentPath::Protected
+            ExistingProfileConsent::Protected
         } else if matches!(
             self.platform.discover_existing_profile_endpoint(pid).await,
             Ok(Some(ref endpoint))
                 if endpoint.transport == super::types::EndpointTransport::ExtensionRelay
         ) {
-            ConsentPath::ExtensionInstalled
+            ExistingProfileConsent::ExtensionInstalled
         } else {
             return Err(refusal(
                 BrowserRefusalCode::BrowserConsentRequired,
@@ -908,6 +900,39 @@ impl BrowserEngine {
                 "authorization_host": self.approval_broker.provider_id(),
             })));
         };
+        Ok((mode, consent_path))
+    }
+
+    async fn attach_existing_profile(
+        &self,
+        request: PrepareRequest,
+    ) -> Result<PrepareOutcome, BrowserRefusal> {
+        self.attach_existing_profile_via(request, false).await
+    }
+
+    /// `extension_only`: the caller's consent covers the extension route
+    /// only (the bind's own grant), so any other endpoint is refused exactly
+    /// as it is for [`ExistingProfileConsent::ExtensionInstalled`].
+    pub(super) async fn attach_existing_profile_via(
+        &self,
+        request: PrepareRequest,
+        extension_only: bool,
+    ) -> Result<PrepareOutcome, BrowserRefusal> {
+        let pid = request.pid.ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserConsentRequired,
+                "strategy=existing_profile requires an exact pid approval anchor",
+            )
+        })?;
+        let window_id = request.window_id.ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserConsentRequired,
+                "strategy=existing_profile requires an exact window_id approval anchor",
+            )
+        })?;
+        let (mode, consent_path) = self.existing_profile_consent(pid, window_id).await?;
+        let extension_route_only =
+            extension_only || consent_path == ExistingProfileConsent::ExtensionInstalled;
         if request.profile.is_some() || request.allow_launch {
             return Err(refusal(
                 BrowserRefusalCode::BrowserConsentRequired,
@@ -939,7 +964,7 @@ impl BrowserEngine {
         // Consent through the extension covers the extension route only: never
         // the setup page that enables Chrome's remote debugging, and never a
         // different endpoint that appeared meanwhile.
-        if consent_path == ConsentPath::ExtensionInstalled
+        if extension_route_only
             && !endpoint
                 .as_ref()
                 .is_some_and(|endpoint| endpoint.transport == super::types::EndpointTransport::ExtensionRelay)
@@ -1047,7 +1072,7 @@ impl BrowserEngine {
         // native window, browser product, and endpoint owner have all been
         // proven. Bounded capability manifests, launch grants, and unrestricted mode
         // never enter this callback path.
-        let protected_consent = if matches!(consent_path, ConsentPath::Protected) {
+        let protected_consent = if matches!(consent_path, ExistingProfileConsent::Protected) {
             let transport_session = request
                 .transport_session
                 .as_deref()

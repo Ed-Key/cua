@@ -246,8 +246,10 @@ Never:
 ### Through the Cua Driver Chrome extension (macOS)
 
 When the Cua Driver extension is installed in that Chrome and connected,
-`browser_prepare` with `strategy.kind: "existing_profile"` attaches through the
-extension: no remote-debugging port and no setup page. The result reports
+binding with `get_browser_state(pid, window_id)` attaches through the extension
+by itself, and `browser_prepare` with `strategy.kind: "existing_profile"` does
+the same explicitly: no remote-debugging port, no setup page, and no browser
+setting changes. The result reports
 `endpoint_transport: "extension_relay"`. The user installing the extension in
 that Chrome is the consent, so standard mode needs no `--grant existing-profile`
 for it. Bounded mode still needs its manifest, and an embedding host's
@@ -524,12 +526,15 @@ result from the current host, process, window, session, and tab.
 
 - `browser_requires_setup`: obtain explicit approval and call
   `browser_prepare`; never make setup a hidden read side effect.
-- `browser_consent_required`: restart standard mode with the trusted launch
-  grant, use a capability manifest that admits the exact resource while the
-  selected profile remains independently binding, or let the embedding host
-  decide the attested request. When detail contains
-  `next_action: browser_prepare`, run that explicit operation for the exact pid
-  and window. Do not automate a generic approval dialog.
+- `browser_consent_required`: first make the call the refusal names in
+  `detail.next_call`, `browser_prepare {pid, window_id, strategy: {kind:
+  "existing_profile"}}`, then bind again. When cua's Chrome extension is
+  connected in that Chrome this changes no browser settings (a bind through a
+  connected extension normally attaches by itself). If that call is refused
+  too, restart standard mode with the trusted launch grant, use a capability
+  manifest that admits the exact resource while the selected profile remains
+  independently binding, or let the embedding host decide the attested
+  request. Do not automate a generic approval dialog.
 - `browser_binding_ambiguous` or heuristic binding: resolve the native-window
   ambiguity and bind again; do not mutate.
 - `browser_ref_stale`: snapshot again and use a new ref.

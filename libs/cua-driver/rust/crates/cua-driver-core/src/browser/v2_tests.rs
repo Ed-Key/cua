@@ -818,6 +818,11 @@ impl BrowserPlatform for FixturePlatform {
         self.discover_existing_profile_endpoint(pid).await
     }
 
+    async fn extension_link_connected(&self, _pid: i64) -> bool {
+        self.existing_endpoint_visible.load(Ordering::SeqCst)
+            && self.existing_transport == EndpointTransport::ExtensionRelay
+    }
+
     async fn discover_existing_profile_endpoint(
         &self,
         pid: i64,
@@ -1137,6 +1142,19 @@ async fn standalone_consumer_bind_without_grant_refuses_before_endpoint_discover
         refusal["refusal"]["detail"]["next_action"],
         "browser_prepare"
     );
+    // The exact call, so an agent never assembles it by guessing.
+    assert_eq!(
+        refusal["refusal"]["detail"]["next_call"],
+        json!({
+            "tool": "browser_prepare",
+            "arguments": { "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } }
+        })
+    );
+    assert_eq!(refusal["refusal"]["detail"]["extension_connected"], false);
+    assert!(refusal["refusal"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("changes no browser settings"));
     assert!(
         !managed_discovery_invoked.load(Ordering::SeqCst),
         "read-only bind must not inspect a consent-gated endpoint"
@@ -1341,6 +1359,52 @@ async fn connected_extension_is_consent_for_the_extension_route_only() {
         assert_eq!(changed["status"], "refused", "{changed}");
         assert_eq!(changed["refusal"]["code"], "browser_consent_required");
     }
+}
+
+#[tokio::test]
+async fn a_connected_extension_lets_the_bind_attach_without_a_prepare_step() {
+    const TRANSPORT: &str = "transport-extension-bind";
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    let platform = standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay);
+    let setup_invoked = platform.setup_invoked.clone();
+    let engine = BrowserEngine::new(Arc::new(platform));
+    let bound = GetBrowserStateTool::new(engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": TRANSPORT
+        }))
+        .await;
+    let bound = structured(&bound).clone();
+    assert_eq!(bound["status"], "ok", "{bound}");
+    assert_eq!(bound["endpoint_access_class"], "existing_profile_approved");
+    assert_eq!(bound["endpoint_transport"], "extension_relay");
+    assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+    crate::session::fire_session_end(TRANSPORT);
+
+    // The extension appears connected but its route is gone by the time the
+    // bind attaches: refused, never a fallback to another endpoint.
+    let platform = standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay);
+    platform
+        .route_script
+        .lock()
+        .unwrap()
+        .extend([Some(EndpointTransport::ExtensionRelay), Some(EndpointTransport::LegacyJsonVersion)]);
+    let setup_invoked = platform.setup_invoked.clone();
+    let refused = GetBrowserStateTool::new(BrowserEngine::new(Arc::new(platform)))
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": "transport-extension-bind-gone"
+        }))
+        .await;
+    let refused = structured(&refused).clone();
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(refused["refusal"]["code"], "browser_consent_required");
+    assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
 }
 
 #[tokio::test]

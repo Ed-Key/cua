@@ -250,8 +250,8 @@ impl GetBrowserStateTool {
             name: "get_browser_state".into(),
             description: "Read-only browser inspection. Bind with pid + window_id to get a \
                 target_id and tab ids; snapshot with target_id + tab_id to get page refs \
-                (semantic_v2 adds a ranked outline and typed refs). Without an endpoint it \
-                refuses with browser_requires_setup; use browser_prepare. \
+                (semantic_v2 adds a ranked outline and typed refs). Consent and setup \
+                refusals give the browser_prepare call to make. \
                 Details: skill://cua-driver/BROWSER.md"
                 .into(),
             input_schema: json!({

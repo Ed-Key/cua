@@ -173,6 +173,53 @@ pub(super) fn unsupported_engine_refusal(
     }))
 }
 
+/// Name the exact call that approves a standalone profile, and what it costs,
+/// on the consent refusal a bind returns.
+fn existing_profile_next_call(
+    refusal: BrowserRefusal,
+    pid: i64,
+    window_id: u64,
+    extension_connected: bool,
+) -> BrowserRefusal {
+    if refusal.code != BrowserRefusalCode::BrowserConsentRequired {
+        return refusal;
+    }
+    let mut detail = refusal.detail.clone().unwrap_or_else(|| json!({}));
+    detail["next_call"] = json!({
+        "tool": "browser_prepare",
+        "arguments": {
+            "pid": pid,
+            "window_id": window_id,
+            "strategy": { "kind": "existing_profile" },
+        },
+    });
+    detail["extension_connected"] = json!(extension_connected);
+    let call = format!(
+        "browser_prepare {{\"pid\": {pid}, \"window_id\": {window_id}, \"strategy\": \
+         {{\"kind\": \"existing_profile\"}}}}"
+    );
+    BrowserRefusal {
+        message: if extension_connected {
+            format!(
+                "this Chrome profile needs existing-profile approval from this session's \
+                 approval host or capability manifest: call {call}, then get_browser_state \
+                 again. cua's Chrome extension is connected, so attaching changes no browser \
+                 settings."
+            )
+        } else {
+            format!(
+                "this Chrome profile needs existing-profile approval before Cua can read it: \
+                 call {call}, then get_browser_state again. With cua's Chrome extension \
+                 connected in this Chrome that call changes no browser settings; without the \
+                 extension it needs a runtime grant or an approval host and may turn on \
+                 Chrome's remote debugging for this profile."
+            )
+        },
+        detail: Some(detail),
+        ..refusal
+    }
+}
+
 fn endpoint_access_class(
     has_existing_profile_grant: bool,
     driver_owned: bool,
@@ -1250,8 +1297,20 @@ impl BrowserEngine {
         let driver_owned = self.is_driver_owned_pid_for_session(session, pid)
             || transport_session
                 .is_some_and(|owner| self.is_driver_owned_pid_for_session(owner, pid));
-        let access_class =
-            endpoint_access_class(grant.is_some(), driver_owned, class.process_role)?;
+        let mut extension_connected = false;
+        if grant.is_none()
+            && !driver_owned
+            && class.process_role == BrowserProcessRole::StandaloneConsumer
+        {
+            extension_connected = self.platform.extension_link_connected(pid).await;
+            if extension_connected {
+                grant = self
+                    .grant_through_extension(session, transport_session, pid, window_id)
+                    .await?;
+            }
+        }
+        let access_class = endpoint_access_class(grant.is_some(), driver_owned, class.process_role)
+            .map_err(|refusal| existing_profile_next_call(refusal, pid, window_id, extension_connected))?;
 
         let native = self.native_window_checked(pid, window_id).await?;
         let fingerprint = self.platform.process_fingerprint(pid).await?;
@@ -1379,6 +1438,42 @@ impl BrowserEngine {
         let target_id = self.store.mint_target(session, record.clone());
         let record = self.store.get_target(session, &target_id)?;
         Ok((target_id, record))
+    }
+
+    /// The bind's own existing-profile grant. With cua's Chrome extension
+    /// connected in this browser, attaching through it is the grant
+    /// `browser_prepare` would make without asking (installing the extension
+    /// is the consent) and it changes no browser setting, so the agent is not
+    /// sent through a separate prepare step. Returns `None` when the consent
+    /// in force needs an explicit `browser_prepare` (an approval host or a
+    /// bounded manifest).
+    async fn grant_through_extension(
+        &self,
+        session: &str,
+        transport_session: Option<&str>,
+        pid: i64,
+        window_id: u64,
+    ) -> Result<Option<ExistingProfileGrant>, BrowserRefusal> {
+        use super::prepare::ExistingProfileConsent as Consent;
+        match self.existing_profile_consent(pid, window_id).await {
+            Ok((_, Consent::ExtensionInstalled | Consent::Unrestricted | Consent::LaunchGrant)) => {}
+            Ok((_, Consent::Protected | Consent::BoundedManifest)) | Err(_) => return Ok(None),
+        }
+        self.attach_existing_profile_via(
+            super::platform::PrepareRequest {
+                pid: Some(pid),
+                window_id: Some(window_id),
+                session: session.to_owned(),
+                transport_session: transport_session.map(str::to_owned),
+                strategy: Some(super::platform::PrepareStrategy::ExistingProfile),
+                profile: None,
+                allow_launch: false,
+            },
+            true,
+        )
+        .await?;
+        self.existing_profile_grant(session, transport_session, pid)
+            .await
     }
 
     pub(crate) async fn native_window_checked(
