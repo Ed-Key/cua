@@ -134,10 +134,11 @@ impl SdkAdapter {
                 sessions.scopes.entry(public.to_owned()).or_default();
                 sessions.mark_ended(public);
             });
-        // Core revives a label on start_session and when a new connection
-        // reclaims one its closed owner left. Follow that transition itself,
-        // whatever the call then returns; an end_session or revoke tombstone
-        // stays until start_session succeeds.
+        // Core revives a label on start_session, when a new connection
+        // reclaims one its closed owner left, and when an idle-reclaimed
+        // unnamed session is recreated on its next call. Follow that
+        // transition itself, whatever the call then returns; an end_session
+        // or revoke tombstone stays until start_session succeeds.
         let revive_sessions = public_sessions.clone();
         let revive_prefix = runtime_prefix.clone();
         let session_revive_hook =
@@ -303,12 +304,21 @@ impl SdkAdapter {
         Ok(value)
     }
 
+    /// Whether the legacy socket must refuse a call on this ended session.
+    /// An unnamed transport session reclaimed by the idle sweep is not
+    /// refused: core recreates it on the call.
     pub fn is_session_ended(&self, session: &str) -> bool {
-        self.public_sessions
+        if !self
+            .public_sessions
             .lock()
             .unwrap()
             .ended
             .contains_key(session)
+        {
+            return false;
+        }
+        let internal = format!("{}{session}", self.runtime_prefix);
+        !cua_driver_core::session::recreates_on_next_call(&internal, &internal)
     }
 
     /// Whether a call from `transport_session` may reclaim `session`, ended
