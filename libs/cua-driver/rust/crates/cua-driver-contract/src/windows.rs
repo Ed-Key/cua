@@ -24,11 +24,13 @@ fn nonnegative_integer_schema(_: &mut SchemaGenerator) -> Schema {
 }
 
 fn element_fields_schema(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({"type":"string", "enum":["compact","full"]})
+    json_schema!({"type":"string", "enum":["none","compact","full"]})
 }
 
 /// macOS: how much of each `elements` record `get_window_state` returns.
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[derive(
+    Debug, Clone, Copy, Default, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum,
+)]
 #[serde(rename_all = "snake_case")]
 pub enum ElementFields {
     /// Omit per-element frame, depth and parent_index, omit enabled when
@@ -36,6 +38,12 @@ pub enum ElementFields {
     Compact,
     /// Every field.
     Full,
+    // Declared last so the existing UniFFI ordinals keep their values.
+    /// Omit the `elements` array; address elements by tree index with
+    /// `element_token` = `<snapshot_id>:<index>` or `element_index` +
+    /// `snapshot_id`. The macOS default.
+    #[default]
+    None,
 }
 
 fn nullable_pid_schema(_: &mut SchemaGenerator) -> Schema {
@@ -103,10 +111,11 @@ pub struct GetWindowStateInput {
     #[schemars(schema_with = "bool_schema")]
     #[uniffi(default = None)]
     pub diff: Option<bool>,
-    /// macOS only. "compact" (default) omits per-element frame, depth and
-    /// parent_index, omits enabled when true and selected when false, and
-    /// drops the _note; "full" returns every field. Other platforms accept
-    /// and ignore it and always return full records.
+    /// macOS only. "none" (default) omits the elements array (tokens are
+    /// `<snapshot_id>:<index>` from the tree); "compact" omits per-element
+    /// frame, depth and parent_index, omits enabled when true and selected
+    /// when false, and drops the _note; "full" returns every field. Other
+    /// platforms accept and ignore it and always return full records.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "element_fields_schema")]
     #[uniffi(default = None)]
@@ -602,8 +611,13 @@ mod tests {
         assert_eq!(ListAppsInput::input_schema()["properties"], json!({}));
         assert_eq!(
             GetWindowStateInput::input_schema()["properties"]["element_fields"]["enum"],
-            json!(["compact", "full"])
+            json!(["none", "compact", "full"])
         );
+        let none: GetWindowStateInput = serde_json::from_value(json!({
+            "pid": 7, "window_id": 9, "element_fields": "none"
+        }))
+        .unwrap();
+        assert_eq!(none.element_fields, Some(ElementFields::None));
         let full: GetWindowStateInput = serde_json::from_value(json!({
             "pid": 7, "window_id": 9, "element_fields": "full"
         }))

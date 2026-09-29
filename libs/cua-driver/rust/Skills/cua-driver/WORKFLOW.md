@@ -41,7 +41,7 @@ On macOS a row keeps its `element_index` across looks at the same window, and a 
 
 Actions return without waiting to see whether a window opens. On macOS, the first `get_window_state` of that app after an action reports windows, sheets, or dialogs the app opened since, as `window_change` (once). When exactly one appeared, `window_change.rebind` gives its `pid` and `window_id`: read and act there next. Its `pid` can differ from the app's (file panels run in a separate process). With several candidates, pick from `new_windows` yourself.
 
-Prefer `structuredContent.elements` in MCP (the CLI prints structured fields directly) over parsing `tree_markdown`. Rows may contain `element_token`, role, label, value, actions, parent, depth, enabled/selected state, `frame` (screen coordinates, the space of `scope:"desktop"` actions), and `screenshot_frame` (pixels of the screenshot in the same response, the space of window-local pointer `x`/`y`). Missing fields are unknown.
+On macOS a read returns no `elements` array by default. Take the row's `[index]` from `tree_markdown` and use `element_token` `<snapshot_id>:<index>` (the tree's first line names the snapshot). Pass `element_fields:"compact"` (or `"full"`) when you need element records. Records may contain `element_token`, role, label, value, actions, parent, depth, enabled/selected state, `frame` (screen coordinates, the space of `scope:"desktop"` actions), and `screenshot_frame` (pixels of the screenshot in the same response, the space of window-local pointer `x`/`y`). Missing fields are unknown.
 
 On macOS a row can also carry:
 
@@ -61,7 +61,7 @@ The accessibility model may lag or disagree with rendered state: Electron text s
 
 ## Act once
 
-Use an opaque `element_token` from the latest snapshot of the intended window. If using an integer, pair `element_index` with that response's `snapshot_id`. Do not derive or edit tokens. A later snapshot can invalidate a pending action, including when another agent observes the same window.
+Use an `element_token` from the latest snapshot of the intended window: `<snapshot_id>:<index>` for a row of its tree. If using an integer, pair `element_index` with that response's `snapshot_id`. Never build a token from an older snapshot's id. A later snapshot can invalidate a pending action, including when another agent observes the same window.
 
 Example CLI window action, with IDs and token replaced from the preceding response:
 

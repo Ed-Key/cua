@@ -1110,6 +1110,13 @@ class ElementFields(enum.Enum):
     Every field.
 """
 
+    NONE = 2
+    """
+    Omit the `elements` array; address elements by tree index with
+    `element_token` = `<snapshot_id>:<index>` or `element_index` +
+    `snapshot_id`. The macOS default.
+"""
+
 
 
 class _UniffiFfiConverterTypeElementFields(_UniffiConverterRustBuffer):
@@ -1120,6 +1127,8 @@ class _UniffiFfiConverterTypeElementFields(_UniffiConverterRustBuffer):
             return ElementFields.COMPACT
         if variant == 2:
             return ElementFields.FULL
+        if variant == 3:
+            return ElementFields.NONE
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -1127,6 +1136,8 @@ class _UniffiFfiConverterTypeElementFields(_UniffiConverterRustBuffer):
         if value == ElementFields.COMPACT:
             return
         if value == ElementFields.FULL:
+            return
+        if value == ElementFields.NONE:
             return
         raise ValueError(value)
 
@@ -1136,6 +1147,8 @@ class _UniffiFfiConverterTypeElementFields(_UniffiConverterRustBuffer):
             buf.write_i32(1)
         if value == ElementFields.FULL:
             buf.write_i32(2)
+        if value == ElementFields.NONE:
+            buf.write_i32(3)
 
 
 

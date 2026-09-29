@@ -371,7 +371,8 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                 let current = driver.call(
                     "get_window_state",
                     serde_json::json!({
-                        "pid":pid,"window_id":wid,"include_screenshot":false
+                        "pid":pid,"window_id":wid,"include_screenshot":false,
+                        "element_fields":"compact"
                     }),
                 );
                 let token = current.structured()["elements"]
@@ -410,7 +411,8 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                 let current = driver.call(
                     "get_window_state",
                     serde_json::json!({
-                        "pid":pid,"window_id":wid,"include_screenshot":false
+                        "pid":pid,"window_id":wid,"include_screenshot":false,
+                        "element_fields":"compact"
                     }),
                 );
                 let token = current.structured()["elements"]
@@ -564,7 +566,8 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                     let current = driver.call(
                         "get_window_state",
                         serde_json::json!({
-                            "pid":pid, "window_id":wid, "include_screenshot":false
+                            "pid":pid, "window_id":wid, "include_screenshot":false,
+                            "element_fields":"compact"
                         }),
                     );
                     assert!(!current.is_error(), "selection control read failed");
@@ -605,7 +608,8 @@ fn check_first_snapshot(background: bool, click_first: bool, typing: Option<Typi
                     let current = driver.call(
                         "get_window_state",
                         serde_json::json!({
-                            "pid":pid,"window_id":wid,"include_screenshot":false
+                            "pid":pid,"window_id":wid,"include_screenshot":false,
+                            "element_fields":"compact"
                         }),
                     );
                     let field = current.structured()["elements"]

@@ -85,6 +85,19 @@ def test_snapshot_requires_a_unique_fresh_element_token():
     assert caught.value.code == "element_not_uniquely_resolved"
 
 
+def test_window_state_requests_full_element_records():
+    calls = []
+
+    class RecordingDriver(BaseDriver):
+        def call(self, tool, **args):
+            calls.append((tool, args))
+            return {"snapshot_id": "s1", "elements_complete": True, "elements": []}
+
+    RecordingDriver(session="test").window_state(WindowTarget(10, 20))
+    assert calls[0][0] == "get_window_state"
+    assert calls[0][1]["element_fields"] == "full"
+
+
 @pytest.mark.parametrize("action", [{}, {"effect": "unverifiable", "route": "accessibility"}])
 def test_mutation_requires_a_confirmed_driver_effect(action):
     driver = MutationDriver(action)

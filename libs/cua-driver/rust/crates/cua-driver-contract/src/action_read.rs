@@ -32,7 +32,7 @@ fn depth(_: &mut SchemaGenerator) -> Schema {
 }
 
 fn element_fields(_: &mut SchemaGenerator) -> Schema {
-    json_schema!({"type":"string","enum":["compact","full"]})
+    json_schema!({"type":"string","enum":["none","compact","full"]})
 }
 
 fn direction(generator: &mut SchemaGenerator) -> Schema {
@@ -277,7 +277,7 @@ pub struct ActionReadObservation {
     #[schemars(schema_with = "depth")]
     #[uniffi(default = None)]
     pub max_depth: Option<u32>,
-    /// Passed to get_window_state: "compact" (default) or "full" element records.
+    /// Passed to get_window_state: "none" (default, tree only), "compact" or "full" element records.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

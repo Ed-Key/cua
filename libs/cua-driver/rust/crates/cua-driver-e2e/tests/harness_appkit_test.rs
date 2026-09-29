@@ -806,7 +806,8 @@ fn harness_appkit_query_projects_structured_elements() {
                     "pid": pid as i64,
                     "window_id": wid,
                     "query": "btn-increment",
-                    "include_screenshot": false
+                    "include_screenshot": false,
+                    "element_fields": "compact"
                 }),
             );
             assert!(
@@ -1770,6 +1771,7 @@ fn harness_appkit_verify_display_text_preserves_action_snapshot() {
                 "get_window_state",
                 serde_json::json!({
                     "pid": pid, "window_id": wid, "include_screenshot": false,
+                    "element_fields": "compact",
                     // Public ingress must strip this private provider flag.
                     "_observation_only": true
                 }),

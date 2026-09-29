@@ -5238,7 +5238,7 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             driver.call(
                 "get_window_state",
                 // The sheet is walked after the whole page; allow the walk time.
-                serde_json::json!({"pid":pid,"window_id":wid,"include_screenshot":false,"diff":false,"timeout_ms":5000}),
+                serde_json::json!({"pid":pid,"window_id":wid,"include_screenshot":false,"diff":false,"timeout_ms":5000,"element_fields":"compact"}),
             )
         };
         let deadline = Instant::now() + Duration::from_secs(10);
@@ -5903,7 +5903,8 @@ fn standalone_browser_first_native_snapshot_contains_page() {
                 // No query: this checks the unfiltered first observation.
                 serde_json::json!({
                     "pid":fixture.pid,"window_id":fixture.window_id,
-                    "include_screenshot":false,"max_elements":1000,"diff":false
+                    "include_screenshot":false,"max_elements":1000,"diff":false,
+                    "element_fields":"compact"
                 }),
             );
             assert!(!snapshot.is_error());

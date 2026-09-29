@@ -223,7 +223,7 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                 "get_window_state",
                 serde_json::json!({
                     "pid":fixture.pid,"window_id":fixture.window_id,
-                    "include_screenshot":false,"diff":false
+                    "include_screenshot":false,"diff":false,"element_fields":"compact"
                 }),
             );
             assert!(!snapshot.is_error(), "{}", snapshot.raw);
@@ -240,7 +240,7 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                 "get_window_state",
                 serde_json::json!({
                     "pid":fixture.pid,"window_id":fixture.window_id,
-                    "include_screenshot":false,"diff":false
+                    "include_screenshot":false,"diff":false,"element_fields":"compact"
                 }),
             );
             assert!(!refreshed.is_error(), "{}", refreshed.raw);
@@ -373,7 +373,7 @@ historyPane.addEventListener('wheel',e=>window.scrollProbe.events.push({trusted:
                     "get_window_state",
                     serde_json::json!({
                         "pid":fixture.pid,"window_id":fixture.window_id,"capture_mode":"ax",
-                        "diff":false
+                        "diff":false,"element_fields":"compact"
                     }),
                 );
                 assert!(!snapshot.is_error(), "{}", snapshot.raw);

@@ -23,7 +23,9 @@ Read the window once, then act on an element from that snapshot. The snapshot al
 ```jsonc
 // 1. snapshot: returns the accessibility tree AND a screenshot by default
 get_window_state({ pid, window_id })
-// → elements[], each with an element_index and a frame, plus a grounding screenshot
+// → tree_markdown with each actionable row tagged [element_index], plus a grounding
+//   screenshot. Windows and Linux also return elements[]; on macOS pass
+//   element_fields: "compact" (or "full" for frames) to get them.
 
 // 2. act by element_index: the element ax action, background by default
 click({ pid, window_id, element_index: 12 })

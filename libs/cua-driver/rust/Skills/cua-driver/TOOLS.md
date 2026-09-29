@@ -29,8 +29,8 @@ check `describe <tool>` there.
 
 ## get_window_state
 
-- Returns `structuredContent.elements` (preferred) and `tree_markdown`, the same tree as text with actionable rows tagged `[element_index N]`. New fields are added only to `elements`.
-- Record fields: `element_index`, `element_token`, `role`, `label`, `value` (the element's AXValue; use it to check what a field holds), `actions` (AX action names, omitted when empty), and `screenshot_frame`. Compact records (the default) omit `frame`, `parent_index`, `depth`, `enabled` when true, and `selected` when false; `element_fields:"full"` returns every field.
+- Returns `tree_markdown`, the window's tree as text with actionable rows tagged `[N]` (their `element_index`). On macOS the default `element_fields:"none"` omits `structuredContent.elements`; the tree's first line reads `element_token = <snapshot_id>:<index>`, so row `[N]` has token `<snapshot_id>:N`. Pass `element_fields:"compact"` or `"full"` to get element records. Other platforms always return `elements`.
+- Record fields: `element_index`, `element_token`, `role`, `label`, `value` (the element's AXValue; use it to check what a field holds), `actions` (AX action names, omitted when empty), and `screenshot_frame`. Compact records omit `frame`, `parent_index`, `depth`, `enabled` when true, and `selected` when false; `element_fields:"full"` returns every field.
 - `include_accessibility_tree:false` skips the tree walk and returns the screenshot plus `window_bounds`, `screenshot_scale`, `screenshot_width`/`screenshot_height`, `app_name`, and `window_title` (the capture-only path, for example a live preview). Setting both `include_accessibility_tree:false` and `include_screenshot:false` is an error.
 - `max_image_dimension` overrides the configured screenshot long edge for one call (0 is native resolution). The legacy `max_dimension` applies on top of it; the tighter cap wins.
 - With `query`, `element_count` still reports the whole snapshot and `filtered_element_count` the projected rows. Ancestors come from the real accessibility hierarchy, not indentation.
@@ -96,7 +96,7 @@ check `describe <tool>` there.
 
 ## act_and_read
 
-- `observe` selects `query`, `query_context`, `element_fields` (compact by default), and an optional screenshot for the final read.
+- `observe` selects `query`, `query_context`, `element_fields` (none by default, so the read is the tree only), and an optional screenshot for the final read.
 - The result carries each child result, including errors, and `stopped_at` (1-based) when a step stopped the run. There is no semantic verification; the fresh read shows what happened.
 - It is not a transaction against other clients or user input. macOS only; Windows and Linux are not supported yet.
 
