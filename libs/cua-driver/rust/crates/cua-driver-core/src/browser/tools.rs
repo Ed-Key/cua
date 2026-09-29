@@ -1327,7 +1327,7 @@ const READ_EDIT_STATE: &str = "function() { \
     let start = null, end = null; \
     if (field) { try { start = this.selectionStart; end = this.selectionEnd; } catch (e) {} } \
     return { value: field ? String(this.value) : String(this.innerText || ''), start: start, \
-        end: end, field: field, \
+        end: end, field: field, connected: this.isConnected, \
         password: this.tagName === 'INPUT' && (this.type || '').toLowerCase() === 'password' }; \
 }";
 
@@ -1356,6 +1356,9 @@ struct EditState {
     /// An input or textarea, as opposed to a contenteditable element.
     field: bool,
     password: bool,
+    /// Still in the live document. A page that replaced the element keeps
+    /// the old node's value, which then proves nothing about the page.
+    connected: bool,
 }
 
 async fn read_edit_state(conn: &CdpConnection, cdp: &str, object_id: &str) -> Option<EditState> {
@@ -1378,6 +1381,7 @@ async fn read_edit_state(conn: &CdpConnection, cdp: &str, object_id: &str) -> Op
         end: state["end"].as_u64().map(|n| n as usize),
         field: state["field"].as_bool().unwrap_or(false),
         password: state["password"].as_bool().unwrap_or(false),
+        connected: state["connected"].as_bool().unwrap_or(false),
     })
 }
 
@@ -1388,24 +1392,74 @@ enum Readback {
         actual: String,
         expected: Option<String>,
     },
+    /// The edited node left the document (the page replaced it).
+    Detached,
     Unverifiable,
 }
 
-/// What an input or textarea should hold after `text` lands at its selection
-/// (or replaces it). `None` for contenteditable, whose text is not a plain
-/// splice of what was typed.
-fn expected_field_value(before: &EditState, text: &str, replace: bool) -> Option<String> {
-    if !before.field {
-        return None;
+/// What browser_type asked the node to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMode {
+    /// Insert at the caret (insert_text or keystrokes).
+    Insert,
+    /// Select all, then insert (replace:true).
+    Replace,
+    /// The native value setter (mode set_value).
+    SetValue,
+}
+
+/// The one postcondition every browser_type path checks. Each mode and node
+/// kind has its own rule below; none of them guesses.
+fn judge_edit(before: &EditState, after: &EditState, text: &str, mode: EditMode) -> Readback {
+    if !after.connected {
+        return Readback::Detached;
     }
-    if replace {
-        return Some(text.to_owned());
+    let exact = |expected: String| {
+        if after.value == expected {
+            Readback::Confirmed(after.value.clone())
+        } else {
+            Readback::Mismatch {
+                actual: after.value.clone(),
+                expected: Some(expected),
+            }
+        }
+    };
+    let holds = |landed: bool| {
+        if landed {
+            Readback::Confirmed(after.value.clone())
+        } else {
+            Readback::Mismatch {
+                actual: after.value.clone(),
+                expected: None,
+            }
+        }
+    };
+    match (mode, before.field) {
+        // An input or textarea replaced or set holds exactly the text.
+        (EditMode::Replace | EditMode::SetValue, true) => exact(text.to_owned()),
+        (EditMode::Replace | EditMode::SetValue, false) => {
+            holds(replaced_editable_text(&after.value, text))
+        }
+        (EditMode::Insert, true) => match inserted_at_selection(before, text) {
+            Some(expected) => exact(expected),
+            None => holds(inserted_somewhere(&before.value, &after.value, text)),
+        },
+        (EditMode::Insert, false) => holds(inserted_somewhere(
+            &normalize_whitespace(&before.value, true),
+            &normalize_whitespace(&after.value, true),
+            &normalize_whitespace(text, false),
+        )),
     }
+}
+
+/// Input or textarea with a known selection: the text replaces the selection
+/// (UTF-16 offsets). `None` when the selection is unknown (email and number
+/// inputs have no selection API, yet the caret can sit anywhere).
+fn inserted_at_selection(before: &EditState, text: &str) -> Option<String> {
     let units: Vec<u16> = before.value.encode_utf16().collect();
-    // Without a selection API the caret a focus leaves is at the end.
     let (start, end) = match (before.start, before.end) {
         (Some(start), Some(end)) if start <= end && end <= units.len() => (start, end),
-        _ => (units.len(), units.len()),
+        _ => return None,
     };
     let mut expected = String::from_utf16_lossy(&units[..start]);
     expected.push_str(text);
@@ -1413,20 +1467,45 @@ fn expected_field_value(before: &EditState, text: &str, replace: bool) -> Option
     Some(expected)
 }
 
-fn judge_edit(before: &EditState, after: &EditState, text: &str, replace: bool) -> Readback {
-    let expected = expected_field_value(before, text, replace);
-    let landed = match expected.as_deref() {
-        Some(expected) => after.value == expected,
-        None if replace && text.is_empty() => after.value.trim().is_empty(),
-        None => after.value.contains(text) && (text.is_empty() || after.value != before.value),
-    };
-    if landed {
-        Readback::Confirmed(after.value.clone())
-    } else {
-        Readback::Mismatch {
-            actual: after.value.clone(),
-            expected,
+/// `after` is `before` with `text` inserted at some position.
+fn inserted_somewhere(before: &str, after: &str, text: &str) -> bool {
+    let (before, after, text): (Vec<char>, Vec<char>, Vec<char>) =
+        (before.chars().collect(), after.chars().collect(), text.chars().collect());
+    if after.len() != before.len() + text.len() {
+        return false;
+    }
+    (0..=before.len()).any(|at| {
+        after[..at] == before[..at]
+            && after[at..at + text.len()] == text[..]
+            && after[at + text.len()..] == before[at..]
+    })
+}
+
+/// A contenteditable replaced with `text` shows exactly that text, apart
+/// from the whitespace its rendering adds or collapses.
+fn replaced_editable_text(after: &str, text: &str) -> bool {
+    normalize_whitespace(after, true) == normalize_whitespace(text, true)
+}
+
+/// Collapse whitespace runs to one space; `trim` also drops the ends.
+fn normalize_whitespace(value: &str, trim: bool) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+            }
+            in_space = true;
+        } else {
+            out.push(ch);
+            in_space = false;
         }
+    }
+    if trim {
+        out.trim().to_owned()
+    } else {
+        out
     }
 }
 
@@ -1438,7 +1517,7 @@ async fn await_edit_readback(
     object_id: &str,
     before: &EditState,
     text: &str,
-    replace: bool,
+    mode: EditMode,
 ) -> Readback {
     let mut judged = Readback::Unverifiable;
     for attempt in 0..10 {
@@ -1448,8 +1527,8 @@ async fn await_edit_readback(
         let Some(after) = read_edit_state(conn, cdp, object_id).await else {
             return judged;
         };
-        judged = judge_edit(before, &after, text, replace);
-        if matches!(judged, Readback::Confirmed(_)) {
+        judged = judge_edit(before, &after, text, mode);
+        if matches!(judged, Readback::Confirmed(_) | Readback::Detached) {
             break;
         }
     }
@@ -1865,6 +1944,13 @@ impl Tool for BrowserTypeTool {
         // What the field held before any input, for the read-back below.
         let before = read_edit_state(conn, cdp, &object_id).await;
         let replaces = replace || mode == "set_value";
+        let edit_mode = if mode == "set_value" {
+            EditMode::SetValue
+        } else if replace {
+            EditMode::Replace
+        } else {
+            EditMode::Insert
+        };
         let (typed, delivered_chars) = if mode == "set_value" {
             match conn
                 .call(
@@ -2187,7 +2273,7 @@ impl Tool for BrowserTypeTool {
 
         if typed.is_ok() {
             if let Some(before) = before.as_ref() {
-                match await_edit_readback(conn, cdp, &object_id, before, &text, replaces).await {
+                match await_edit_readback(conn, cdp, &object_id, before, &text, edit_mode).await {
                     Readback::Mismatch { actual, expected } => {
                         let shown = shown_value(&actual, before.password);
                         return ToolResult::error(format!(
@@ -2248,6 +2334,24 @@ impl Tool for BrowserTypeTool {
                             "replace": replaces,
                             "replaced_chars": replaced_chars,
                             "value": (!before.password).then(|| truncate_value(&actual)),
+                        }));
+                    }
+                    Readback::Detached => {
+                        return ToolResult::text(format!(
+                            "typed {requested_chars} char(s) into {tab_id}, but the page \
+                             replaced the field while it handled the input, so what it holds \
+                             now is unknown. Snapshot the tab again and read the new field."
+                        ))
+                        .with_structured(json!({
+                            "status": "ok",
+                            "effect": "unverifiable",
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "ref": ext_ref,
+                            "mode": mode,
+                            "requested_chars": requested_chars,
+                            "delivered_chars": delivered_chars,
+                            "readback": "element_replaced",
                         }));
                     }
                     Readback::Unverifiable => {}
@@ -2707,73 +2811,73 @@ impl Tool for BrowserSetInputFilesTool {
 
 #[cfg(test)]
 mod tests {
-    fn edit(value: &str, start: Option<usize>, end: Option<usize>, field: bool) -> EditState {
-        EditState {
-            value: value.to_owned(),
-            start,
-            end,
-            field,
-            password: false,
+    #[test]
+    fn every_browser_type_mode_has_one_postcondition() {
+        use EditMode::{Insert, Replace, SetValue};
+        enum Want {
+            Confirmed,
+            Mismatch(Option<&'static str>),
+            Detached,
         }
-    }
-
-    #[test]
-    fn typed_text_is_expected_at_the_selection_or_the_end() {
-        // Caret after "ab" in "abcd", replacing "c".
-        assert_eq!(
-            expected_field_value(&edit("abcd", Some(2), Some(3), true), "X", false).as_deref(),
-            Some("abXd")
-        );
-        // Email inputs have no selection API: the focused caret is at the end.
-        assert_eq!(
-            expected_field_value(&edit("a@", None, None, true), "b.c", false).as_deref(),
-            Some("a@b.c")
-        );
-        // Selections are UTF-16 offsets.
-        assert_eq!(
-            expected_field_value(&edit("😀z", Some(2), Some(2), true), "y", false).as_deref(),
-            Some("😀yz")
-        );
-        assert_eq!(
-            expected_field_value(&edit("old", Some(3), Some(3), true), "new", true).as_deref(),
-            Some("new")
-        );
-        assert_eq!(expected_field_value(&edit("x", None, None, false), "y", false), None);
-    }
-
-    #[test]
-    fn a_field_that_changes_the_input_is_a_mismatch() {
-        let before = edit("", None, None, true);
-        assert_eq!(
-            judge_edit(&before, &edit("1234", None, None, true), "12ab34", false),
-            Readback::Mismatch {
-                actual: "1234".into(),
-                expected: Some("12ab34".into())
-            }
-        );
-        assert_eq!(
-            judge_edit(&before, &edit("ada@x.io", None, None, true), "ada@x.io", false),
-            Readback::Confirmed("ada@x.io".into())
-        );
-        // A React-controlled field that reset itself holds nothing.
-        assert!(matches!(
-            judge_edit(&before, &edit("", None, None, true), "ada@x.io", false),
-            Readback::Mismatch { .. }
-        ));
-        // Contenteditable: the text must appear and the content must change.
-        let rich = edit("Hello", None, None, false);
-        assert_eq!(
-            judge_edit(&rich, &edit("Hello world", None, None, false), " world", false),
-            Readback::Confirmed("Hello world".into())
-        );
-        assert!(matches!(
-            judge_edit(&rich, &edit("Hello", None, None, false), "Hello", false),
-            Readback::Mismatch { .. }
-        ));
-        assert_eq!(
-            judge_edit(&rich, &edit("\n", None, None, false), "", true),
-            Readback::Confirmed("\n".into())
-        );
+        let field = |value: &str, selection: Option<(usize, usize)>| EditState {
+            value: value.to_owned(),
+            start: selection.map(|(start, _)| start),
+            end: selection.map(|(_, end)| end),
+            field: true,
+            password: false,
+            connected: true,
+        };
+        let editable = |value: &str| EditState {
+            field: false,
+            ..field(value, None)
+        };
+        let detached = |value: &str| EditState {
+            connected: false,
+            ..field(value, None)
+        };
+        #[rustfmt::skip]
+        let cases: Vec<(&str, EditState, EditState, &str, EditMode, Want)> = vec![
+            // Input or textarea with a known caret or selection.
+            ("caret insert", field("abcd", Some((2, 2))), field("abXcd", None), "X", Insert, Want::Confirmed),
+            ("selection replaced", field("abcd", Some((2, 3))), field("abXd", None), "X", Insert, Want::Confirmed),
+            ("caret insert, UTF-16", field("😀z", Some((2, 2))), field("😀yz", None), "y", Insert, Want::Confirmed),
+            ("caret insert, wrong spot", field("abcd", Some((2, 2))), field("abcdX", None), "X", Insert, Want::Mismatch(Some("abXcd"))),
+            ("rejected characters", field("", Some((0, 0))), field("1234", None), "12ab34", Insert, Want::Mismatch(Some("12ab34"))),
+            ("React reset the field", field("", Some((0, 0))), field("", None), "ada@x.io", Insert, Want::Mismatch(Some("ada@x.io"))),
+            // Email and number inputs: no selection API, caret anywhere.
+            ("unknown caret, mid-field", field("a@b.com", None), field("ax@b.com", None), "x", Insert, Want::Confirmed),
+            ("unknown caret, at the end", field("a@b.com", None), field("a@b.comx", None), "x", Insert, Want::Confirmed),
+            ("unknown caret, text lost", field("a@b.com", None), field("a@b.co", None), "x", Insert, Want::Mismatch(None)),
+            ("unknown caret, empty field", field("", None), field("ada@x.io", None), "ada@x.io", Insert, Want::Confirmed),
+            // Replace and set_value on an input or textarea.
+            ("replace", field("old", Some((3, 3))), field("new", None), "new", Replace, Want::Confirmed),
+            ("replace appended", field("old", None), field("oldnew", None), "new", Replace, Want::Mismatch(Some("new"))),
+            ("clear", field("old", None), field("", None), "", Replace, Want::Confirmed),
+            ("set_value", field("old", None), field("new", None), "new", SetValue, Want::Confirmed),
+            ("set_value ignored", field("old", None), field("old", None), "new", SetValue, Want::Mismatch(Some("new"))),
+            // Contenteditable.
+            ("editable insert", editable("Hello"), editable("Hello world"), " world", Insert, Want::Confirmed),
+            ("editable insert, extra whitespace", editable("Hello\n"), editable("Hello  world\n"), " world", Insert, Want::Confirmed),
+            ("editable insert lost", editable("Hello"), editable("Hello"), "Hello", Insert, Want::Mismatch(None)),
+            ("editable replace, same text", editable("Hello"), editable("Hello"), "Hello", Replace, Want::Confirmed),
+            ("editable replace appended", editable("Hello"), editable("Hello world"), "world", Replace, Want::Mismatch(None)),
+            ("editable replace", editable("Hello"), editable("world\n"), "world", Replace, Want::Confirmed),
+            ("editable clear", editable("Hello"), editable("\n"), "", Replace, Want::Confirmed),
+            // The page replaced the edited element.
+            ("detached node", field("", Some((0, 0))), detached("ada@x.io"), "ada@x.io", Insert, Want::Detached),
+        ];
+        for (name, before, after, text, mode, want) in cases {
+            let got = judge_edit(&before, &after, text, mode);
+            let ok = match (&want, &got) {
+                (Want::Confirmed, Readback::Confirmed(value)) => *value == after.value,
+                (Want::Mismatch(expected), Readback::Mismatch { actual, expected: got }) => {
+                    *actual == after.value && got.as_deref() == *expected
+                }
+                (Want::Detached, Readback::Detached) => true,
+                _ => false,
+            };
+            assert!(ok, "{name}: got {got:?}");
+        }
     }
 
     #[test]

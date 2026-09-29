@@ -84,6 +84,8 @@ struct FixtureState {
     /// The simulated field keeps digits only, like a controlled React input
     /// that rejects letters.
     field_digits_only: bool,
+    /// The page replaces the field on input: reads report a detached node.
+    field_detached_after_input: bool,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -117,6 +119,7 @@ impl Default for FixtureState {
             tab_visible: true,
             field_value: None,
             field_digits_only: false,
+            field_detached_after_input: false,
             calls: Vec::new(),
         }
     }
@@ -758,11 +761,16 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             "Runtime.callFunctionOn" => {
                 let function = call.params["functionDeclaration"].as_str().unwrap_or_default();
                 let digits_only = st.field_digits_only;
+                let typed = st
+                    .calls
+                    .iter()
+                    .any(|(_, method, _)| method == "Input.insertText");
+                let connected = !(st.field_detached_after_input && typed);
                 match st.field_value.as_mut() {
                     Some(value) if function.contains("selectionStart") => MockReply::ok(json!({
                         "result": { "value": {
                             "value": value.clone(), "start": null, "end": null,
-                            "field": true, "password": false,
+                            "field": true, "password": false, "connected": connected,
                         } }
                     })),
                     Some(value) if function.contains("getOwnPropertyDescriptor") => {
@@ -2911,7 +2919,30 @@ async fn a_field_that_rejects_input_is_reported_as_a_mismatch() {
     assert_eq!(s["code"], "browser_type_mismatch", "{s}");
     assert_eq!(s["effect"], "mismatch");
     assert_eq!(s["value"], "1234");
-    assert_eq!(s["expected"], "12ab34");
+    // The fixture field reports no selection (like an email input), so no
+    // single expected value is claimed.
+    assert!(s["expected"].is_null(), "{s}");
+}
+
+#[tokio::test]
+async fn a_field_the_page_replaced_is_unverifiable_not_confirmed() {
+    let f = fixture_with(|state| {
+        state.field_value = Some(String::new());
+        state.field_detached_after_input = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "ada", "session": SESSION
+        }))
+        .await;
+    let s = structured(&typed);
+    assert_eq!(s["effect"], "unverifiable", "{s}");
+    assert_eq!(s["readback"], "element_replaced");
 }
 
 #[tokio::test]
