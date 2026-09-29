@@ -139,7 +139,9 @@ struct Session {
     /// attached while any connection holds it and detaches once the last
     /// one closes (the engine drops its connection when the cua session ends).
     /// `None` once the connection closed, so a late attach holds nothing.
-    held_tabs: Mutex<Option<std::collections::HashSet<i64>>>,
+    /// Keyed by tab, then by the Cua session that attached it: one relay
+    /// connection can be shared by several Cua sessions on this Chrome.
+    held_tabs: Mutex<Option<HashMap<i64, std::collections::HashSet<String>>>>,
 }
 
 /// How many relay connections hold each (extension link, tab).
@@ -162,6 +164,10 @@ fn tab_holders() -> &'static Mutex<HashMap<(u64, i64), usize>> {
 /// - A connection that closes owns the release of every tab it reserved,
 ///   including one whose attach is still in flight; the attach then finds
 ///   its connection closed and returns an error without adopting the tab.
+/// - Holders are Cua sessions, not connections: the engine shares one relay
+///   connection among the Cua sessions on this Chrome, names the session on
+///   every attach (`cuaSession`), and sends `Cua.releaseSession` when a
+///   session ends. A tab detaches only when no live session holds it.
 fn attach_gates() -> &'static super::keyed_gates::KeyedGates<(u64, i64)> {
     static GATES: std::sync::OnceLock<super::keyed_gates::KeyedGates<(u64, i64)>> =
         std::sync::OnceLock::new();
@@ -193,7 +199,7 @@ impl Session {
             link,
             bridge: extension_bridge::global().clone(),
             routes: Arc::new(Mutex::new(Routes::default())),
-            held_tabs: Mutex::new(Some(std::collections::HashSet::new())),
+            held_tabs: Mutex::new(Some(HashMap::new())),
         }
     }
 
@@ -201,19 +207,62 @@ impl Session {
     /// from each one no other connection holds.
     async fn release_held_tabs(&self) {
         let tabs = self.held_tabs.lock().unwrap().take().unwrap_or_default();
-        for tab in tabs {
+        for (tab, holders) in tabs {
             let _gate = attach_gates().lock((self.link, tab)).await;
-            release_tab(self.link, tab);
+            for _ in holders {
+                release_tab(self.link, tab);
+            }
             self.detach_if_unheld(tab).await;
         }
     }
 
-    /// Reserve `tab` for this connection, then attach. See [`attach_gates`].
-    async fn attach_tab(&self, tab: i64, color: &Value) -> Result<(), (i64, String)> {
+    /// One Cua session ended: release the tabs it holds on this connection.
+    async fn release_session(&self, cua_session: &str) {
+        let tabs: Vec<i64> = self
+            .held_tabs
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|held| {
+                held.iter()
+                    .filter(|(_, holders)| holders.contains(cua_session))
+                    .map(|(tab, _)| *tab)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for tab in tabs {
+            let _gate = attach_gates().lock((self.link, tab)).await;
+            let released = match self.held_tabs.lock().unwrap().as_mut() {
+                Some(held) => {
+                    let removed = held
+                        .get_mut(&tab)
+                        .is_some_and(|holders| holders.remove(cua_session));
+                    if held.get(&tab).is_some_and(|holders| holders.is_empty()) {
+                        held.remove(&tab);
+                    }
+                    removed
+                }
+                None => false,
+            };
+            if released {
+                release_tab(self.link, tab);
+                self.detach_if_unheld(tab).await;
+            }
+        }
+    }
+
+    /// Reserve `tab` for `cua_session` on this connection, then attach. See
+    /// [`attach_gates`].
+    async fn attach_tab(
+        &self,
+        tab: i64,
+        color: &Value,
+        cua_session: &str,
+    ) -> Result<(), (i64, String)> {
         let _gate = attach_gates().lock((self.link, tab)).await;
         let newly_reserved = match self.held_tabs.lock().unwrap().as_mut() {
             Some(held) => {
-                let new = held.insert(tab);
+                let new = held.entry(tab).or_default().insert(cua_session.to_owned());
                 if new {
                     hold_tab(self.link, tab);
                 }
@@ -231,7 +280,12 @@ impl Session {
         }
         if attached.is_err() && newly_reserved {
             if let Some(held) = self.held_tabs.lock().unwrap().as_mut() {
-                held.remove(&tab);
+                if let Some(holders) = held.get_mut(&tab) {
+                    holders.remove(cua_session);
+                    if holders.is_empty() {
+                        held.remove(&tab);
+                    }
+                }
             }
             release_tab(self.link, tab);
             self.detach_if_unheld(tab).await;
@@ -411,12 +465,22 @@ impl Session {
             "Target.attachToTarget" => {
                 let tab = self.tab_of_target(target_id()).await?;
                 let color = params.get("cuaSessionColor").cloned().unwrap_or(Value::Null);
-                self.attach_tab(tab, &color).await?;
+                let cua_session =
+                    params.get("cuaSession").and_then(Value::as_str).unwrap_or_default();
+                self.attach_tab(tab, &color, cua_session).await?;
                 let session = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
                 let mut routes = self.routes.lock().unwrap();
                 routes.sessions.insert(session.clone(), tab);
                 routes.colors.insert(session.clone(), color);
                 Ok(json!({ "sessionId": session }))
+            }
+            // Not CDP: the engine's notice that one Cua session sharing this
+            // connection ended.
+            "Cua.releaseSession" => {
+                let cua_session =
+                    params.get("cuaSession").and_then(Value::as_str).unwrap_or_default();
+                self.release_session(cua_session).await;
+                Ok(json!({}))
             }
             "Target.detachFromTarget" => {
                 let session = params.get("sessionId").and_then(Value::as_str).unwrap_or_default();
@@ -625,7 +689,7 @@ mod tests {
             link: bridge.links()[0].link,
             bridge,
             routes: Arc::new(Mutex::new(Routes::default())),
-            held_tabs: Mutex::new(Some(Default::default())),
+            held_tabs: Mutex::new(Some(HashMap::new())),
         });
         session.routes.lock().unwrap().targets.insert("T".to_owned(), 4);
         // The fake extension answers every request and hands it to the test.
@@ -687,7 +751,7 @@ mod tests {
             link,
             bridge,
             routes: Arc::new(Mutex::new(Routes::default())),
-            held_tabs: Mutex::new(Some(Default::default())),
+            held_tabs: Mutex::new(Some(HashMap::new())),
         };
         session.routes.lock().unwrap().targets.insert("T".to_owned(), tab);
         Arc::new(session)
@@ -783,5 +847,52 @@ mod tests {
             .await
             .is_err());
         assert!(quiet(&mut seen));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tab_detaches_only_when_no_cua_session_on_the_shared_connection_holds_it() {
+        let (bridge, extension, _dir) = extension_bridge::tests::connected().await;
+        let link = bridge.links()[0].link;
+        let (mut seen, release) = gated_extension(extension);
+        // One relay connection shared by two Cua sessions.
+        let shared = relay_session(bridge, link, 21);
+        shared.routes.lock().unwrap().targets.insert("U".to_owned(), 22);
+        let attach = |target: &'static str, cua: &'static str| {
+            let shared = shared.clone();
+            let release = release.clone();
+            async move {
+                let pending = tokio::spawn(async move {
+                    shared
+                        .root("Target.attachToTarget", &json!({ "targetId": target, "cuaSession": cua }))
+                        .await
+                });
+                release.send(()).unwrap();
+                pending.await.unwrap().unwrap();
+            }
+        };
+        attach("T", "one").await; // tab 21: only session one
+        attach("U", "one").await; // tab 22: both sessions
+        attach("U", "two").await;
+        for _ in 0..3 {
+            assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        }
+
+        // Session one ends; the notice passes the relay's method allowlist.
+        let reply = shared
+            .answer(json!({ "id": 1, "method": "Cua.releaseSession", "params": { "cuaSession": "one" } }))
+            .await;
+        assert!(reply.get("error").is_none(), "{reply}");
+        let detach = seen.recv().await.unwrap();
+        assert_eq!(detach["method"], "debugger.detach");
+        assert_eq!(detach["params"]["tabId"], 21, "only the tab no live session holds");
+        assert!(quiet(&mut seen), "session two still holds tab 22");
+
+        // The connection closes with session two still holding tab 22.
+        shared.release_held_tabs().await;
+        let detach = seen.recv().await.unwrap();
+        assert_eq!(detach["params"]["tabId"], 22);
+        assert!(tab_holders().lock().unwrap().get(&(link, 21)).is_none());
+        assert!(tab_holders().lock().unwrap().get(&(link, 22)).is_none());
     }
 }

@@ -43,6 +43,8 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Browser.getWindowBounds",
     "Browser.getWindowForTarget",
     "Browser.setDownloadBehavior",
+    // Relay-only notice that one Cua session sharing the connection ended.
+    "Cua.releaseSession",
     "DOM.describeNode",
     "DOM.focus",
     "DOM.getBoxModel",
@@ -411,7 +413,14 @@ impl CdpConnection {
 #[derive(Clone)]
 struct PoolEntry {
     conn: Arc<CdpConnection>,
+    /// The newest grant generation that claimed this socket (`None` for an
+    /// ordinary driver-owned endpoint).
     generation: Option<u64>,
+    /// Every live grant generation sharing this socket. Ownership rule: an
+    /// existing-profile socket is shared by the Cua sessions whose grants
+    /// claimed it and closes only when the last of them releases it, so
+    /// ending one session never tears down another's tabs or dialog state.
+    holders: HashSet<u64>,
 }
 
 fn claimed_ports() -> &'static StdMutex<HashMap<u16, usize>> {
@@ -473,6 +482,7 @@ impl CdpPool {
             PoolEntry {
                 conn: conn.clone(),
                 generation: None,
+                holders: HashSet::new(),
             },
         );
         Ok(conn)
@@ -488,17 +498,19 @@ impl CdpPool {
         let port = loopback_port(ws_url)
             .ok_or_else(|| anyhow::anyhow!("existing-profile endpoint has no loopback port"))?;
         let mut conns = self.conns.lock().await;
-        let conn = match conns.get(ws_url) {
-            Some(entry) if !entry.conn.is_closed() => entry.conn.clone(),
+        let (conn, mut holders) = match conns.get(ws_url) {
+            Some(entry) if !entry.conn.is_closed() => (entry.conn.clone(), entry.holders.clone()),
             Some(_) => anyhow::bail!("the approved browser socket closed before it was claimed"),
-            None => Arc::new(CdpConnection::connect(ws_url).await?),
+            None => (Arc::new(CdpConnection::connect(ws_url).await?), HashSet::new()),
         };
         conn.restrict_to_existing_profile();
+        holders.insert(generation);
         conns.insert(
             ws_url.to_owned(),
             PoolEntry {
                 conn: conn.clone(),
-                generation: Some(generation),
+                generation: holders.iter().max().copied(),
+                holders,
             },
         );
         if self.claimed_loopback_ports.lock().unwrap().insert(port) {
@@ -519,7 +531,7 @@ impl CdpPool {
         let entry = conns
             .get(ws_url)
             .ok_or_else(|| anyhow::anyhow!("the grant-owned browser socket is missing"))?;
-        if entry.generation != Some(generation) {
+        if !entry.holders.contains(&generation) {
             anyhow::bail!("the browser socket belongs to a different connection generation");
         }
         if entry.conn.is_closed() {
@@ -538,13 +550,14 @@ impl CdpPool {
         {
             let conns = self.conns.lock().await;
             if let Some(entry) = conns.get(ws_url) {
-                if entry
-                    .generation
-                    .is_some_and(|generation| generation > old_generation)
+                if !entry.holders.contains(&old_generation)
+                    && entry
+                        .generation
+                        .is_some_and(|generation| generation > old_generation)
                 {
                     anyhow::bail!("the reconnect source generation is no longer current");
                 }
-                if entry.generation == Some(old_generation) && !entry.conn.is_closed() {
+                if entry.holders.contains(&old_generation) && !entry.conn.is_closed() {
                     return Ok(entry.conn.clone());
                 }
             }
@@ -556,22 +569,30 @@ impl CdpPool {
         let conn = Arc::new(CdpConnection::connect(ws_url).await?);
         conn.restrict_to_existing_profile();
         let mut conns = self.conns.lock().await;
+        // The other sessions sharing the dead socket move to the new one with
+        // this grant; the source generation is replaced by the new one.
+        let mut holders = HashSet::new();
         if let Some(entry) = conns.get(ws_url) {
-            if entry
-                .generation
-                .is_some_and(|generation| generation > old_generation)
+            if entry.holders.contains(&new_generation) && !entry.conn.is_closed() {
+                return Ok(entry.conn.clone());
+            }
+            if !entry.holders.contains(&old_generation)
+                && entry
+                    .generation
+                    .is_some_and(|generation| generation > old_generation)
             {
-                if entry.generation == Some(new_generation) && !entry.conn.is_closed() {
-                    return Ok(entry.conn.clone());
-                }
                 anyhow::bail!("the reconnect source generation is no longer current");
             }
+            holders = entry.holders.clone();
+            holders.remove(&old_generation);
         }
+        holders.insert(new_generation);
         conns.insert(
             ws_url.to_owned(),
             PoolEntry {
                 conn: conn.clone(),
-                generation: Some(new_generation),
+                generation: holders.iter().max().copied(),
+                holders,
             },
         );
         Ok(conn)
@@ -590,16 +611,26 @@ impl CdpPool {
         }
     }
 
+    /// Release one grant generation's claim on the socket. The socket closes
+    /// (and the listener claim marker is released) only when no other live
+    /// generation shares it.
     pub async fn release_existing(&self, ws_url: &str, generation: u64) {
         let mut conns = self.conns.lock().await;
-        if conns
-            .get(ws_url)
-            .is_some_and(|entry| entry.generation == Some(generation))
-        {
-            conns.remove(ws_url);
+        let Some(entry) = conns.get_mut(ws_url) else {
+            drop(conns);
+            self.release_claim_marker(ws_url);
+            return;
+        };
+        if !entry.holders.remove(&generation) {
+            return;
         }
-        drop(conns);
-        self.release_claim_marker(ws_url);
+        if entry.holders.is_empty() {
+            conns.remove(ws_url);
+            drop(conns);
+            self.release_claim_marker(ws_url);
+        } else {
+            entry.generation = entry.holders.iter().max().copied();
+        }
     }
 }
 

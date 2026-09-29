@@ -1457,6 +1457,32 @@ async fn a_connected_extension_lets_the_bind_attach_without_a_prepare_step() {
 }
 
 #[tokio::test]
+async fn a_shared_existing_profile_socket_outlives_one_of_its_sessions() {
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    let url = server.ws_url();
+    let pool = super::cdp_ws::CdpPool::new();
+    // Two Cua sessions' grants claim the same browser socket.
+    let first = pool.claim_existing(&url, 1).await.unwrap();
+    let second = pool.claim_existing(&url, 2).await.unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    first.register_dialog_session("sess-b", "target-b");
+    assert!(pool.get_existing(&url, 1).await.is_ok(), "an earlier claim stays usable");
+
+    // Ending the first session keeps the socket, and the second session's
+    // dialog routing on it, alive.
+    pool.release_existing(&url, 1).await;
+    let still = pool.get_existing(&url, 2).await.unwrap();
+    assert!(Arc::ptr_eq(&still, &second) && !still.is_closed());
+    assert!(still.has_dialog_session("target-b"));
+    assert!(pool.get_existing(&url, 1).await.is_err());
+
+    // The last session's release closes it.
+    pool.release_existing(&url, 2).await;
+    assert!(pool.get_existing(&url, 2).await.is_err());
+}
+
+#[tokio::test]
 async fn relay_tab_attach_carries_the_session_cursor_color() {
     const TRANSPORT: &str = "transport-session-color";
     let state = Arc::new(StdMutex::new(FixtureState::default()));

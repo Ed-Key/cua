@@ -1154,9 +1154,7 @@ impl BrowserEngine {
             protected_consent,
         );
         if let Some(previous) = previous_grant {
-            self.pool
-                .release_existing(&previous.endpoint_ws_url, previous.generation)
-                .await;
+            self.release_grant_socket(&previous).await;
             if let Some(protected) = previous.protected_consent.as_ref() {
                 self.approval_broker.revoke(protected).await;
             }

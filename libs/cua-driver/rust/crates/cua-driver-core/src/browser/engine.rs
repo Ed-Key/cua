@@ -711,10 +711,7 @@ impl BrowserEngine {
                             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                                 let engine = engine.clone();
                                 runtime.spawn(async move {
-                                    engine
-                                        .pool
-                                        .release_existing(&grant.endpoint_ws_url, grant.generation)
-                                        .await;
+                                    engine.release_grant_socket(&grant).await;
                                     if let Some(protected) = grant.protected_consent.as_ref() {
                                         engine.approval_broker.revoke(protected).await;
                                     }
@@ -786,9 +783,7 @@ impl BrowserEngine {
                             .push(request);
                     }
                 }
-                self.pool
-                    .release_existing(&grant.endpoint_ws_url, grant.generation)
-                    .await;
+                self.release_grant_socket(&grant).await;
                 if let Some(protected) = grant.protected_consent.as_ref() {
                     self.approval_broker.revoke(protected).await;
                 }
@@ -830,13 +825,36 @@ impl BrowserEngine {
                         .push(request);
                 }
             }
-            self.pool
-                .release_existing(&grant.endpoint_ws_url, grant.generation)
-                .await;
+            self.release_grant_socket(&grant).await;
             if let Some(protected) = grant.protected_consent.as_ref() {
                 self.approval_broker.revoke(protected).await;
             }
         }
+    }
+
+    /// Release one grant's claim on its browser socket. Through the extension
+    /// relay the socket may be shared with other Cua sessions, so the relay
+    /// is first told this session's tabs are released; the socket itself
+    /// closes only when its last grant releases it.
+    pub(crate) async fn release_grant_socket(&self, grant: &ExistingProfileGrant) {
+        if super::extension_relay::is_relay_url(&grant.endpoint_ws_url) {
+            if let Ok(conn) = self
+                .pool
+                .get_existing(&grant.endpoint_ws_url, grant.generation)
+                .await
+            {
+                let _ = conn
+                    .call(
+                        None,
+                        "Cua.releaseSession",
+                        json!({ "cuaSession": grant.public_session }),
+                    )
+                    .await;
+            }
+        }
+        self.pool
+            .release_existing(&grant.endpoint_ws_url, grant.generation)
+            .await;
     }
 
     pub(crate) async fn connect(&self, ws_url: &str) -> Result<Arc<CdpConnection>, BrowserRefusal> {
@@ -1247,6 +1265,9 @@ impl BrowserEngine {
         if transport == super::types::EndpointTransport::ExtensionRelay {
             params["cuaSessionColor"] =
                 json!(cua_driver_contract::cursor::session_fill_hex(session));
+            // The relay counts tab holders per Cua session (see
+            // extension_relay::attach_gates).
+            params["cuaSession"] = json!(session);
         }
         let attached = conn
             .call(None, "Target.attachToTarget", params)
