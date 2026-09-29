@@ -170,6 +170,38 @@ impl WalkOutcome {
     }
 }
 
+/// A walk that ran out of time after fewer nodes than this most likely hit an
+/// app that was slow to answer its first reads (waking up, busy main thread),
+/// not a large tree: it earns one retry.
+pub const RETRY_BELOW_NODES: usize = 10;
+/// Ceiling for the retry's budget.
+pub const RETRY_CAP_MS: u64 = 8_000;
+
+/// The budget for one retry of `first`: four times its budget, capped, when it
+/// timed out after fewer than [`RETRY_BELOW_NODES`] nodes. `None` when a
+/// retry could not do better (the walk finished, stopped for another reason,
+/// got far enough, or already had the capped budget).
+pub fn retry_timeout_ms(first: &WalkOutcome) -> Option<u64> {
+    if first.stop != Some(WalkStop::Timeout) || first.nodes_visited >= RETRY_BELOW_NODES {
+        return None;
+    }
+    let budget = first.timeout_ms.saturating_mul(4).min(RETRY_CAP_MS);
+    (budget > first.timeout_ms).then_some(budget)
+}
+
+impl WalkOutcome {
+    /// Record the abandoned first walk next to the retry's own fields, so
+    /// both timings are visible.
+    pub fn apply_retry_of(&self, first: &WalkOutcome, structured: &mut Value) {
+        structured["walk_retry"] = json!({
+            "first_timeout_ms": first.timeout_ms,
+            "first_elapsed_ms": first.elapsed_ms,
+            "first_nodes_visited": first.nodes_visited,
+            "retry_elapsed_ms": self.elapsed_ms,
+        });
+    }
+}
+
 /// The note that heads a partial tree, naming why the walk stopped.
 pub fn truncation_note(
     reason: Option<&str>,
@@ -202,6 +234,35 @@ pub fn truncation_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outcome(stop: Option<WalkStop>, timeout_ms: u64, visited: usize) -> WalkOutcome {
+        WalkOutcome {
+            timeout_ms,
+            stop,
+            nodes_visited: visited,
+            nodes_pending: 5,
+            elapsed_ms: timeout_ms,
+        }
+    }
+
+    /// A walk that stalled on its first reads retries once with four times the
+    /// budget (capped); a walk that got going, finished, or hit the node cap
+    /// does not.
+    #[test]
+    fn only_an_early_timeout_earns_a_bigger_retry() {
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 1000, 1)), Some(4000));
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 1000, 9)), Some(4000));
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 3000, 0)), Some(8000));
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 1000, 10)), None);
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 8000, 1)), None);
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::NodeBudget), 1000, 1)), None);
+        assert_eq!(retry_timeout_ms(&outcome(None, 1000, 1)), None);
+
+        let mut structured = json!({});
+        outcome(None, 4000, 40).apply_retry_of(&outcome(Some(WalkStop::Timeout), 1000, 1), &mut structured);
+        assert_eq!(structured["walk_retry"]["first_elapsed_ms"], 1000);
+        assert_eq!(structured["walk_retry"]["retry_elapsed_ms"], 4000);
+    }
 
     #[test]
     fn node_budget_stops_and_counts_pending() {

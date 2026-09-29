@@ -41,6 +41,11 @@ pub const DEFAULT_MAX_ELEMENTS: usize = 2_000;
 /// indefinitely.
 pub(crate) const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 2.0;
 
+/// Per-read bound inside the walk. One node that does not answer costs this
+/// much and is skipped, instead of spending two seconds of a one-second
+/// `timeout_ms` budget on a single read.
+const WALK_READ_TIMEOUT_SECONDS: f32 = 0.5;
+
 unsafe fn set_messaging_timeout(element: AXUIElementRef) {
     let _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_SECONDS);
 }
@@ -471,9 +476,18 @@ unsafe fn walk_element(
 
     // Messaging timeouts are per AX object, not inherited from the application
     // element, so every descendant must be bounded before any attribute read.
-    set_messaging_timeout(element);
+    let _ = AXUIElementSetMessagingTimeout(element, WALK_READ_TIMEOUT_SECONDS);
 
-    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
+    let role = match copy_string_attr_checked(element, "AXRole") {
+        Ok(role) => role,
+        // The node did not answer in time: skip it and its subtree rather
+        // than spend the budget waiting on it again for every attribute.
+        Err(super::bindings::kAXErrorCannotComplete) => {
+            sightings.child_read_failed = true;
+            return;
+        }
+        Err(_) => "AXUnknown".into(),
+    };
 
     let in_web_content = in_web_content || is_web_content_role(&role);
     sightings.web_content |= in_web_content;
