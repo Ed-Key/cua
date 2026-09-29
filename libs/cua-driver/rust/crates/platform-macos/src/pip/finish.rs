@@ -23,8 +23,8 @@
 //!
 //! | Event | Verdicts (per window) | Claims (per label) | Lifecycle: finale, idle deadline, user close | Picture and stack |
 //! |---|---|---|---|---|
-//! | Action note (on push) | records the action at its event ms; ends a session finish older than it | none | only if newer than the last applied action: cancels the finale, restarts the idle deadline, lifts a user close | none |
-//! | Captured frame | resolves a pid-only action to its window at the action's event ms (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card, back items, touched windows |
+//! | Action note (on push) | records the action at its event ms, and the window it touched (identity and app, titled with the app name until a frame names it); ends a session finish older than it | none | only if newer than the last applied action: cancels the finale, restarts the idle deadline, lifts a user close | none |
+//! | Captured frame | resolves a pid-only action to its window at the action's event ms (replacing that action's app-only chip) and names the touched window (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card, back items, window titles |
 //! | Verification | latest by event ms per window (an older one never wins) | latest by event ms per label, kept across finales; an older one is ignored | if it brought news: replays a playing finale, or owes a finale when the stretch's finale is over | chips and cards follow the verdicts |
 //! | Idle timer | the session finishes (now) | none | the finale is due once per stretch: plays if the panel is up and not closed (or owed and may show), else settles silently | the panel fades after |
 //! | `end_session` | the session finishes (now) | none | as the idle timer, then the panel closes | the panel leaves the live set |
@@ -127,15 +127,52 @@ impl Verdicts {
         }
     }
 
+    /// The action note: the session acted on `target` at `at_ms`, in an
+    /// app named `app_name`. The source of truth for touched windows: the
+    /// window is touched now (titled with the app name until a frame names
+    /// it), even if its capture never lands (coalesced, or dropped when the
+    /// session ends).
+    pub(super) fn note_action(&mut self, target: Tag, at_ms: u64, app_name: &str) {
+        self.record_action(target, at_ms);
+        self.touch(target, at_ms, None, app_name);
+    }
+
     /// A captured frame of the session acting in `tag` (titled `title`) at
-    /// `at_ms`: its window is resolved (for a pid-only action) and touched.
+    /// `at_ms`: its window is resolved (for a pid-only action) and named.
     pub(super) fn act(&mut self, tag: Tag, title: &str, at_ms: u64) {
         self.record_action(tag, at_ms);
-        // A newer action in a shown window is new work; the frame of an
-        // action already shown is not.
-        let (at_ms, shown) = match self.touched.iter().find(|touched| touched.tag == tag) {
-            Some(known) if known.at_ms >= at_ms => (known.at_ms, known.shown),
-            _ => (at_ms, false),
+        self.touch(tag, at_ms, Some(title), "");
+    }
+
+    /// Touch `tag` for an action at `at_ms`: a frame's `title` names it; a
+    /// note keeps a known title, else uses `fallback`. A newer action in a
+    /// shown window is new work; the frame of an action already shown is
+    /// not. A window resolved for a pid-only action replaces that action's
+    /// app-only entry (and inherits whether it was shown).
+    fn touch(&mut self, tag: Tag, at_ms: u64, title: Option<&str>, fallback: &str) {
+        if tag == (None, None) {
+            return;
+        }
+        let mut placeholder_shown = false;
+        if let (Some(pid), Some(_)) = tag {
+            self.touched.retain(|touched| {
+                let placeholder = touched.tag == (Some(pid), None) && touched.at_ms <= at_ms;
+                placeholder_shown |= placeholder && touched.at_ms == at_ms && touched.shown;
+                !placeholder
+            });
+        }
+        let (at_ms, shown, known_title) =
+            match self.touched.iter().find(|touched| touched.tag == tag) {
+                Some(known) if known.at_ms >= at_ms => {
+                    (known.at_ms, known.shown, known.title.clone())
+                }
+                Some(known) => (at_ms, false, known.title.clone()),
+                None => (at_ms, placeholder_shown, String::new()),
+            };
+        let title = match title.filter(|title| !title.is_empty()) {
+            Some(title) => title.to_owned(),
+            None if !known_title.is_empty() => known_title,
+            None => fallback.to_owned(),
         };
         self.touched.retain(|touched| touched.tag != tag);
         let index = self
@@ -145,7 +182,7 @@ impl Verdicts {
             index,
             Touched {
                 tag,
-                title: title.to_owned(),
+                title,
                 at_ms,
                 shown,
             },
@@ -561,6 +598,41 @@ mod tests {
         assert!(verdicts.finished(10));
         verdicts.record_action(B, 200);
         assert!(!verdicts.finished(10), "working again");
+    }
+
+    #[test]
+    fn row_action_note_touches_its_window_without_any_frame() {
+        // Act in a new window and end at once: end_session drops the pending
+        // capture, so no frame ever lands. The chip is there, app-titled.
+        let mut verdicts = Verdicts::default();
+        verdicts.note_action(A, 100, "Notes");
+        verdicts.finish_session(200);
+        assert_eq!(
+            verdicts.finale().rows,
+            Rows::Chips(vec![FinaleChip {
+                tag: A,
+                title: "Notes".into(),
+                finished: true
+            }])
+        );
+        // Coalesced captures: two notes, only the later frame lands; both
+        // windows keep their chips, the framed one with its window title.
+        let mut verdicts = Verdicts::default();
+        verdicts.note_action(A, 100, "Notes");
+        verdicts.note_action(B, 110, "Mail");
+        verdicts.act(B, "Inbox", 110);
+        let titles: Vec<String> = verdicts.touched().map(|(_, title)| title).collect();
+        assert_eq!(titles, ["Inbox", "Notes"]);
+        // A later note does not rename a window a frame named.
+        verdicts.note_action(B, 120, "Mail");
+        assert_eq!(verdicts.touched().next().unwrap().1, "Inbox");
+        // A pid-only action's app chip becomes its window's when the frame
+        // resolves it: one chip, not two.
+        let mut verdicts = Verdicts::default();
+        verdicts.note_action((Some(3), None), 100, "Safari");
+        verdicts.act((Some(3), Some(30)), "Docs", 100);
+        let touched: Vec<(Tag, String)> = verdicts.touched().collect();
+        assert_eq!(touched, [((Some(3), Some(30)), "Docs".to_owned())]);
     }
 
     #[test]

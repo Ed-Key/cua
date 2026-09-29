@@ -1295,6 +1295,8 @@ unsafe fn apply_action(state: &mut State, action: Action) {
         timestamp_ms,
     } = action;
     let worker = state.worker.clone();
+    // The touched window's stand-in title until a frame names it.
+    let app = app_name(target.0);
     // Main-queue order, as for verifications.
     let Some(panel) = state.panels.get_mut(&key) else {
         if !worker.is_live(&key) {
@@ -1304,14 +1306,14 @@ unsafe fn apply_action(state: &mut State, action: Action) {
             .early
             .entry(key)
             .or_default()
-            .record_action(target, timestamp_ms);
+            .note_action(target, timestamp_ms, &app);
         return;
     };
     // The session resumed from this action, not from when its (possibly
     // slow, possibly coalesced) capture lands.
     resume(panel, &key, &worker, timestamp_ms);
     let restacked = restack(panel, &key, &worker, |panel| {
-        panel.verdicts.record_action(target, timestamp_ms)
+        panel.verdicts.note_action(target, timestamp_ms, &app)
     });
     note_finished(panel, &key);
     if restacked {
@@ -1365,6 +1367,21 @@ unsafe fn show_target(panel: &Panel, pid: Option<i32>, title: Option<String>) ->
         .unwrap_or_default();
     set_text(panel.target_title, &title);
     title
+}
+
+/// A running app's name (cheap; main queue), or "".
+unsafe fn app_name(pid: Option<i32>) -> String {
+    let Some(pid) = pid else {
+        return String::new();
+    };
+    let app: *mut AnyObject = msg_send![
+        class!(NSRunningApplication),
+        runningApplicationWithProcessIdentifier: pid
+    ];
+    if app.is_null() {
+        return String::new();
+    }
+    ns_to_string(msg_send![app, localizedName]).unwrap_or_default()
 }
 
 /// A running app's icon, or null.
