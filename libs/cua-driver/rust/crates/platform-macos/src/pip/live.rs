@@ -8,6 +8,13 @@
 //! thread ever waits on it. Requests coalesce per session: only the newest
 //! one for a session is acted on.
 //!
+//! No ScreenCaptureKit call can wedge that thread: opens and resizes run on
+//! helper threads with a bounded wait (a timeout abandons the stream and
+//! reports [`Event::Ended`]), stops are fire and forget, and a stream that
+//! fails to open is retried a few times before the panel gives up on live.
+//! Each start, stop, resize, retry and timeout logs a `pip` tracing line
+//! with the session key, generation and elapsed time.
+//!
 //! Each stream captures one window (a desktop-independent-window filter),
 //! scaled to the panel's image well at [`LIVE_FPS`]. Frames go to the main
 //! queue through a one-frame slot per stream, so a busy main thread sees
@@ -17,6 +24,7 @@
 
 use std::collections::HashMap;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use screencapturekit::cm::{CMTime, SCFrameStatus};
 use screencapturekit::prelude::{
@@ -177,6 +185,280 @@ pub(super) enum Request {
 
 type Deliver = Arc<dyn Fn(Event) + Send + Sync>;
 
+/// Longest the stream thread waits on one blocking stop or resize call.
+const CALL_TIMEOUT: Duration = Duration::from_secs(2);
+/// Longest it waits for a stream to open (`SCShareableContent` lookup plus
+/// `startCapture`), which is slower while windows churn.
+const OPEN_TIMEOUT: Duration = Duration::from_secs(4);
+/// A stream that fails to open (a just-launched window is often not yet in
+/// ScreenCaptureKit's list) is retried this many times, this far apart,
+/// before the panel gives up on live for that target.
+const OPEN_RETRIES: u32 = 3;
+const RETRY_DELAY: Duration = Duration::from_millis(500);
+
+/// The blocking ScreenCaptureKit calls, behind a trait so the stream
+/// thread's timeout and retry decisions are tested with a fake.
+trait Backend: Send + Sync + 'static {
+    type Stream: Send + Sync + 'static;
+    fn open(
+        &self,
+        key: &str,
+        generation: u64,
+        target: Target,
+        well: (f64, f64),
+        deliver: &Deliver,
+    ) -> anyhow::Result<Self::Stream>;
+    fn stop(&self, stream: &Self::Stream);
+    fn resize(&self, stream: &Self::Stream, well: (f64, f64)) -> anyhow::Result<()>;
+}
+
+/// Result of a call running on a helper thread, shared with its waiter.
+enum Call<T> {
+    Pending,
+    Done(T),
+    /// The waiter gave up; the helper cleans up its own result.
+    Abandoned,
+}
+
+/// Run `f` on a helper thread and wait at most `timeout` for it. On timeout
+/// the thread is left behind (it may be stuck inside ScreenCaptureKit for
+/// good), the call counts as failed, and if `f` ever does return, its value
+/// goes to `late` on that helper thread instead of being lost.
+fn bounded<T: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> T + Send + 'static,
+    late: impl FnOnce(T) + Send + 'static,
+) -> Option<T> {
+    let shared = Arc::new((Mutex::new(Call::Pending), Condvar::new()));
+    let helper = shared.clone();
+    std::thread::Builder::new()
+        .name("cua-pip-sck".into())
+        .spawn(move || {
+            let value = f();
+            let mut call = lock(&helper.0);
+            if matches!(*call, Call::Abandoned) {
+                drop(call);
+                late(value);
+            } else {
+                *call = Call::Done(value);
+                helper.1.notify_one();
+            }
+        })
+        .ok()?;
+    let deadline = Instant::now() + timeout;
+    let mut call = lock(&shared.0);
+    loop {
+        if matches!(*call, Call::Done(_)) {
+            let Call::Done(value) = std::mem::replace(&mut *call, Call::Abandoned) else {
+                unreachable!()
+            };
+            return Some(value);
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            *call = Call::Abandoned;
+            return None;
+        }
+        call = shared
+            .1
+            .wait_timeout(call, left)
+            .unwrap_or_else(|e| e.into_inner())
+            .0;
+    }
+}
+
+struct Running<S> {
+    generation: u64,
+    stream: Arc<S>,
+}
+
+/// A failed open waiting to be tried again.
+struct Retry {
+    at: Instant,
+    generation: u64,
+    target: Target,
+    well: (f64, f64),
+    /// Retries already made.
+    attempt: u32,
+}
+
+/// The stream thread's state and decisions. One stuck ScreenCaptureKit call
+/// delays it by at most a timeout and never wedges it: stops are fire and
+/// forget, and a stream whose call timed out is abandoned, never used again.
+struct Worker<B: Backend> {
+    backend: Arc<B>,
+    deliver: Deliver,
+    call_timeout: Duration,
+    open_timeout: Duration,
+    retry_delay: Duration,
+    running: HashMap<String, Running<B::Stream>>,
+    retries: HashMap<String, Retry>,
+}
+
+impl<B: Backend> Worker<B> {
+    fn new(backend: B, deliver: Deliver) -> Self {
+        Self {
+            backend: Arc::new(backend),
+            deliver,
+            call_timeout: CALL_TIMEOUT,
+            open_timeout: OPEN_TIMEOUT,
+            retry_delay: RETRY_DELAY,
+            running: HashMap::new(),
+            retries: HashMap::new(),
+        }
+    }
+
+    fn handle(&mut self, key: String, request: Request) {
+        // Any newer request for the session supersedes a pending retry.
+        self.retries.remove(&key);
+        match request {
+            Request::Stop => self.stop_running(&key),
+            Request::Resize { well } => self.resize(&key, well),
+            Request::Start {
+                generation,
+                target,
+                well,
+            } => {
+                self.stop_running(&key);
+                self.open(key, generation, target, well, 0);
+            }
+        }
+    }
+
+    /// Earliest pending retry, for the loop's wake-up.
+    fn next_retry(&self) -> Option<Instant> {
+        self.retries.values().map(|retry| retry.at).min()
+    }
+
+    /// Run the retries that are due at `now`.
+    fn retry_due(&mut self, now: Instant) {
+        let due: Vec<String> = self
+            .retries
+            .iter()
+            .filter(|(_, retry)| retry.at <= now)
+            .map(|(key, _)| key.clone())
+            .collect();
+        for key in due {
+            if let Some(retry) = self.retries.remove(&key) {
+                self.open(
+                    key,
+                    retry.generation,
+                    retry.target,
+                    retry.well,
+                    retry.attempt + 1,
+                );
+            }
+        }
+    }
+
+    fn end(&self, key: String, generation: u64) {
+        (self.deliver)(Event::Ended { key, generation });
+    }
+
+    /// Stop the session's stream without waiting for ScreenCaptureKit: a
+    /// stream whose window is gone can hang in `stopCapture`, and nothing
+    /// depends on it finishing.
+    fn stop_running(&mut self, key: &str) {
+        let Some(running) = self.running.remove(key) else {
+            return;
+        };
+        let backend = self.backend.clone();
+        let (key, generation) = (key.to_owned(), running.generation);
+        let stream = running.stream;
+        let spawned = std::thread::Builder::new()
+            .name("cua-pip-stop".into())
+            .spawn(move || {
+                let started = Instant::now();
+                backend.stop(&stream);
+                tracing::info!(target: "pip", session = %key, generation, elapsed_ms = started.elapsed().as_millis() as u64, "PiP stream stopped");
+            });
+        if let Err(error) = spawned {
+            tracing::warn!(target: "pip", %error, "PiP could not spawn a stop thread; stream abandoned");
+        }
+    }
+
+    fn resize(&mut self, key: &str, well: (f64, f64)) {
+        let Some(running) = self.running.get(key) else {
+            return;
+        };
+        let (generation, stream) = (running.generation, running.stream.clone());
+        let backend = self.backend.clone();
+        let started = Instant::now();
+        let result = bounded(
+            self.call_timeout,
+            move || backend.resize(&stream, well),
+            |_| {},
+        );
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Some(Ok(())) => {
+                tracing::info!(target: "pip", session = %key, generation, ?well, elapsed_ms, "PiP stream resized");
+            }
+            Some(Err(error)) => {
+                tracing::info!(target: "pip", session = %key, generation, %error, elapsed_ms, "PiP stream resize failed; keeping the stream");
+            }
+            None => {
+                tracing::warn!(target: "pip", session = %key, generation, elapsed_ms, "PiP stream resize timed out; abandoning the stream");
+                self.stop_running(key);
+                self.end(key.to_owned(), generation);
+            }
+        }
+    }
+
+    fn open(&mut self, key: String, generation: u64, target: Target, well: (f64, f64), attempt: u32) {
+        let started = Instant::now();
+        let backend = self.backend.clone();
+        let late_backend = self.backend.clone();
+        let deliver = self.deliver.clone();
+        let call_key = key.clone();
+        let result = bounded(
+            self.open_timeout,
+            move || backend.open(&call_key, generation, target, well, &deliver),
+            move |stream| {
+                // The waiter gave up, so nothing owns this stream: stop it.
+                if let Ok(stream) = stream {
+                    late_backend.stop(&stream);
+                    tracing::info!(target: "pip", generation, "PiP stream that opened after its timeout was stopped");
+                }
+            },
+        );
+        let elapsed_ms = started.elapsed().as_millis() as u64;
+        match result {
+            Some(Ok(stream)) => {
+                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, elapsed_ms, "PiP stream started");
+                self.running.insert(
+                    key,
+                    Running {
+                        generation,
+                        stream: Arc::new(stream),
+                    },
+                );
+            }
+            Some(Err(error)) if attempt < OPEN_RETRIES => {
+                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, %error, elapsed_ms, "PiP stream did not open; retrying");
+                self.retries.insert(
+                    key,
+                    Retry {
+                        at: Instant::now() + self.retry_delay,
+                        generation,
+                        target,
+                        well,
+                        attempt,
+                    },
+                );
+            }
+            Some(Err(error)) => {
+                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, %error, elapsed_ms, "PiP live stream unavailable; using stills");
+                self.end(key, generation);
+            }
+            None => {
+                tracing::warn!(target: "pip", session = %key, generation, ?target, elapsed_ms, "PiP stream open timed out; using stills");
+                self.end(key, generation);
+            }
+        }
+    }
+}
+
 pub(super) struct Streams {
     requests: Mutex<LatestPerSession<Request>>,
     ready: Condvar,
@@ -191,41 +473,13 @@ impl Streams {
             ready: Condvar::new(),
         });
         let looping = streams.clone();
-        let deliver: Deliver = Arc::new(deliver);
+        let mut worker = Worker::new(SckBackend, Arc::new(deliver));
         std::thread::Builder::new()
             .name("cua-pip-stream".into())
-            .spawn(move || {
-                let mut running: HashMap<String, SCStream> = HashMap::new();
-                loop {
-                    let (key, request) = looping.next();
-                    if let Request::Resize { well } = request {
-                        if let Some(stream) = running.get(&key) {
-                            if let Err(error) = stream.update_configuration(&stream_config(well)) {
-                                tracing::info!(target: "pip", %error, "PiP live stream resize failed");
-                            }
-                        }
-                        continue;
-                    }
-                    if let Some(old) = running.remove(&key) {
-                        let _ = old.stop_capture();
-                    }
-                    let Request::Start {
-                        generation,
-                        target,
-                        well,
-                    } = request
-                    else {
-                        continue;
-                    };
-                    match open(&key, generation, target, well, &deliver) {
-                        Ok(stream) => {
-                            running.insert(key, stream);
-                        }
-                        Err(error) => {
-                            tracing::info!(target: "pip", ?target, %error, "PiP live stream unavailable; using stills");
-                            deliver(Event::Ended { key, generation });
-                        }
-                    }
+            .spawn(move || loop {
+                match looping.next(worker.next_retry()) {
+                    Some((key, request)) => worker.handle(key, request),
+                    None => worker.retry_due(Instant::now()),
                 }
             })?;
         Ok(streams)
@@ -246,19 +500,60 @@ impl Streams {
         self.ready.notify_one();
     }
 
-    fn next(&self) -> (String, Request) {
+    /// The next request, or `None` once `wake` (a retry deadline) passes.
+    fn next(&self, wake: Option<Instant>) -> Option<(String, Request)> {
         let mut requests = lock(&self.requests);
         loop {
             if let Some(item) = requests.pop() {
-                return item;
+                return Some(item);
             }
-            requests = self.ready.wait(requests).unwrap_or_else(|e| e.into_inner());
+            requests = match wake {
+                None => self.ready.wait(requests).unwrap_or_else(|e| e.into_inner()),
+                Some(at) => {
+                    let left = at.saturating_duration_since(Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    self.ready
+                        .wait_timeout(requests, left)
+                        .unwrap_or_else(|e| e.into_inner())
+                        .0
+                }
+            };
         }
     }
 }
 
-/// Build and start a window stream. Runs on the stream thread only.
-fn open(
+/// The real ScreenCaptureKit backend.
+struct SckBackend;
+
+impl Backend for SckBackend {
+    type Stream = SCStream;
+
+    fn open(
+        &self,
+        key: &str,
+        generation: u64,
+        target: Target,
+        well: (f64, f64),
+        deliver: &Deliver,
+    ) -> anyhow::Result<SCStream> {
+        open_stream(key, generation, target, well, deliver)
+    }
+
+    fn stop(&self, stream: &SCStream) {
+        let _ = stream.stop_capture();
+    }
+
+    fn resize(&self, stream: &SCStream, well: (f64, f64)) -> anyhow::Result<()> {
+        stream
+            .update_configuration(&stream_config(well))
+            .map_err(|e| anyhow::anyhow!("{e}"))
+    }
+}
+
+/// Build and start a window stream.
+fn open_stream(
     key: &str,
     generation: u64,
     target: Target,
@@ -283,7 +578,7 @@ fn open(
     let ended = deliver.clone();
     let ended_key = key.to_owned();
     let callbacks = StreamCallbacks::new().on_error(move |error| {
-        tracing::info!(target: "pip", %error, "PiP live stream stopped");
+        tracing::info!(target: "pip", session = %ended_key, generation, %error, "PiP live stream stopped by ScreenCaptureKit");
         ended(Event::Ended {
             key: ended_key.clone(),
             generation,
@@ -304,6 +599,7 @@ fn open(
                     Some(SCFrameStatus::Complete) => {}
                     // The window is gone: fall back to stills.
                     Some(SCFrameStatus::Stopped) => {
+                        tracing::info!(target: "pip", session = %frame_key, generation, "PiP live stream window gone (frame status Stopped)");
                         return frames(Event::Ended {
                             key: frame_key.clone(),
                             generation,
@@ -331,7 +627,7 @@ fn open(
     stream
         .start_capture()
         .map_err(|e| anyhow::anyhow!("SCStream::start_capture failed: {e}"))?;
-    tracing::debug!(target: "pip", window_id, width, height, fps = LIVE_FPS, "PiP live stream started");
+    tracing::debug!(target: "pip", session = %key, generation, window_id, width, height, fps = LIVE_FPS, "PiP live stream configured");
     Ok(stream)
 }
 
@@ -463,15 +759,15 @@ mod tests {
         );
         streams.request("s", Request::Resize { well: (400.0, 250.0) });
         assert!(matches!(
-            streams.next(),
+            streams.next(None).unwrap(),
             (_, Request::Start { generation: 1, well, .. }) if well == (400.0, 250.0)
         ));
         streams.request("t", Request::Stop);
         streams.request("t", Request::Resize { well: (1.0, 1.0) });
-        assert!(matches!(streams.next(), (key, Request::Stop) if key == "t"));
+        assert!(matches!(streams.next(None).unwrap(), (key, Request::Stop) if key == "t"));
         // With nothing pending, a resize is queued for the stream thread.
         streams.request("u", Request::Resize { well: (1.0, 1.0) });
-        assert!(matches!(streams.next(), (key, Request::Resize { .. }) if key == "u"));
+        assert!(matches!(streams.next(None).unwrap(), (key, Request::Resize { .. }) if key == "u"));
     }
 
     #[test]
@@ -488,9 +784,210 @@ mod tests {
         streams.request("s", start(1));
         streams.request("t", start(2));
         streams.request("s", Request::Stop);
-        assert!(matches!(streams.next(), (key, Request::Stop) if key == "s"));
+        assert!(matches!(streams.next(None).unwrap(), (key, Request::Stop) if key == "s"));
         assert!(
-            matches!(streams.next(), (key, Request::Start { generation: 2, .. }) if key == "t")
+            matches!(streams.next(None).unwrap(), (key, Request::Start { generation: 2, .. }) if key == "t")
         );
+    }
+
+    // ── Worker with a fake ScreenCaptureKit ───────────────────────────────
+
+    enum Open {
+        Ok,
+        Err,
+        /// Blocks until the sender is used or dropped, then succeeds.
+        Hang(std::sync::mpsc::Receiver<()>),
+    }
+
+    #[derive(Default)]
+    struct FakeInner {
+        plan: Mutex<std::collections::VecDeque<Open>>,
+        opens: std::sync::atomic::AtomicU32,
+        stopped: Mutex<Vec<u32>>,
+        hang_stop: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+        hang_resize: std::sync::atomic::AtomicBool,
+    }
+
+    #[derive(Clone, Default)]
+    struct Fake(Arc<FakeInner>);
+
+    struct FakeStream(u32);
+
+    impl Backend for Fake {
+        type Stream = FakeStream;
+
+        fn open(
+            &self,
+            _key: &str,
+            _generation: u64,
+            _target: Target,
+            _well: (f64, f64),
+            _deliver: &Deliver,
+        ) -> anyhow::Result<FakeStream> {
+            use std::sync::atomic::Ordering::SeqCst;
+            let id = self.0.opens.fetch_add(1, SeqCst);
+            let step = lock(&self.0.plan).pop_front().unwrap_or(Open::Ok);
+            match step {
+                Open::Ok => Ok(FakeStream(id)),
+                Open::Err => Err(anyhow::anyhow!("window is not shareable")),
+                Open::Hang(gate) => {
+                    let _ = gate.recv();
+                    Ok(FakeStream(id))
+                }
+            }
+        }
+
+        fn stop(&self, stream: &FakeStream) {
+            if let Some(gate) = lock(&self.0.hang_stop).take() {
+                let _ = gate.recv();
+            }
+            lock(&self.0.stopped).push(stream.0);
+        }
+
+        fn resize(&self, _stream: &FakeStream, _well: (f64, f64)) -> anyhow::Result<()> {
+            while self.0.hang_resize.load(std::sync::atomic::Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Ok(())
+        }
+    }
+
+    type Ended = Arc<Mutex<Vec<(String, u64)>>>;
+
+    fn worker(fake: &Fake) -> (Worker<Fake>, Ended) {
+        let ended: Ended = Arc::default();
+        let sink = ended.clone();
+        let deliver: Deliver = Arc::new(move |event| {
+            if let Event::Ended { key, generation } = event {
+                lock(&sink).push((key, generation));
+            }
+        });
+        let mut worker = Worker::new(fake.clone(), deliver);
+        worker.call_timeout = Duration::from_millis(100);
+        worker.open_timeout = Duration::from_millis(100);
+        worker.retry_delay = Duration::from_millis(10);
+        (worker, ended)
+    }
+
+    fn start(generation: u64) -> Request {
+        Request::Start {
+            generation,
+            target: A,
+            well: (320.0, 200.0),
+        }
+    }
+
+    fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !done() {
+            assert!(Instant::now() < deadline, "timed out waiting for {what}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    #[test]
+    fn a_stuck_open_times_out_without_blocking_other_sessions() {
+        let fake = Fake::default();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        lock(&fake.0.plan).push_back(Open::Hang(gate));
+        let (mut worker, ended) = worker(&fake);
+
+        let began = Instant::now();
+        worker.handle("a".into(), start(1));
+        assert!(began.elapsed() < Duration::from_secs(2));
+        assert_eq!(*lock(&ended), vec![("a".to_owned(), 1)]);
+        assert!(!worker.running.contains_key("a"));
+
+        // The next session starts at once.
+        worker.handle("b".into(), start(2));
+        assert!(worker.running.contains_key("b"));
+
+        // The stuck open finally returns: nobody owns that stream, so it is
+        // stopped instead of leaking a capture.
+        drop(release);
+        wait_until("the late stream to be stopped", || {
+            lock(&fake.0.stopped).contains(&0)
+        });
+    }
+
+    #[test]
+    fn stopping_a_hung_stream_never_blocks_the_thread() {
+        let fake = Fake::default();
+        let (_hold, gate) = std::sync::mpsc::channel::<()>();
+        let (mut worker, _) = worker(&fake);
+        worker.handle("a".into(), start(1));
+        *lock(&fake.0.hang_stop) = Some(gate);
+
+        let began = Instant::now();
+        worker.handle("a".into(), Request::Stop);
+        worker.handle("b".into(), start(2));
+        assert!(began.elapsed() < Duration::from_millis(80));
+        assert!(!worker.running.contains_key("a"));
+        assert!(worker.running.contains_key("b"));
+    }
+
+    #[test]
+    fn a_resize_that_times_out_abandons_the_stream() {
+        let fake = Fake::default();
+        let (mut worker, ended) = worker(&fake);
+        worker.handle("a".into(), start(7));
+        fake.0
+            .hang_resize
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+
+        worker.handle("a".into(), Request::Resize { well: (400.0, 250.0) });
+        fake.0
+            .hang_resize
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        assert_eq!(*lock(&ended), vec![("a".to_owned(), 7)]);
+        assert!(!worker.running.contains_key("a"));
+        // The abandoned stream is stopped, never reused.
+        wait_until("the abandoned stream to be stopped", || {
+            lock(&fake.0.stopped).contains(&0)
+        });
+    }
+
+    #[test]
+    fn a_failed_open_is_retried_a_few_times_then_reported() {
+        let fake = Fake::default();
+        lock(&fake.0.plan).extend((0..10).map(|_| Open::Err));
+        let (mut worker, ended) = worker(&fake);
+
+        worker.handle("a".into(), start(1));
+        assert!(worker.next_retry().is_some());
+        assert!(lock(&ended).is_empty());
+        let far = Instant::now() + Duration::from_secs(60);
+        while worker.next_retry().is_some() {
+            worker.retry_due(far);
+        }
+        // The first try plus OPEN_RETRIES retries, then Ended, once.
+        assert_eq!(
+            fake.0.opens.load(std::sync::atomic::Ordering::SeqCst),
+            OPEN_RETRIES + 1
+        );
+        assert_eq!(*lock(&ended), vec![("a".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn a_retry_that_opens_the_stream_reports_nothing() {
+        let fake = Fake::default();
+        lock(&fake.0.plan).push_back(Open::Err);
+        let (mut worker, ended) = worker(&fake);
+        worker.handle("a".into(), start(1));
+        worker.retry_due(Instant::now() + Duration::from_secs(60));
+        assert!(worker.running.contains_key("a"));
+        assert!(worker.next_retry().is_none());
+        assert!(lock(&ended).is_empty());
+    }
+
+    #[test]
+    fn a_newer_request_cancels_a_pending_retry() {
+        let fake = Fake::default();
+        lock(&fake.0.plan).push_back(Open::Err);
+        let (mut worker, _) = worker(&fake);
+        worker.handle("a".into(), start(1));
+        assert!(worker.next_retry().is_some());
+        worker.handle("a".into(), Request::Stop);
+        assert!(worker.next_retry().is_none());
     }
 }

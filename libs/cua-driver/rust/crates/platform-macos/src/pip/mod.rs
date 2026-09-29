@@ -130,8 +130,9 @@ struct Area {
 /// column wraps to a new column toward the side with more room (left on
 /// ties), so the default bottom-right anchor stacks upward then wraps left
 /// and a top-left anchor stacks downward then wraps right. Every frame is
-/// clamped inside `visible`; a full grid overlaps its last slot instead of
-/// going off-screen.
+/// inside `visible` (slot 0 is clamped first, so the rest follow from where
+/// it really is); a full grid overlaps its last slot instead of going
+/// off-screen.
 fn stack_origin(
     bottom_right: (f64, f64),
     visible: Area,
@@ -139,7 +140,12 @@ fn stack_origin(
     slot: usize,
 ) -> (f64, f64) {
     let (w, h) = size;
-    let (x0, y0) = (bottom_right.0 - w, bottom_right.1);
+    let clamp = |v: f64, lo: f64, size: f64, extent: f64| v.min(lo + extent - size).max(lo);
+    // Slot 0 first, inside the visible frame: room, directions and offsets
+    // all come from where it really is, so slots never overlap even for an
+    // anchor that is off-screen.
+    let x0 = clamp(bottom_right.0 - w, visible.x, w, visible.w);
+    let y0 = clamp(bottom_right.1, visible.y, h, visible.h);
     let (step_y, step_x) = (h + STACK_GAP, w + STACK_GAP);
     // Space left beyond slot 0 in each direction, edge inset included.
     let up = visible.y + visible.h - EDGE_INSET - (y0 + h);
@@ -153,15 +159,9 @@ fn stack_origin(
     let (per_column, columns) = (fit(room_y, step_y), fit(room_x, step_x));
     let slot = slot.min(per_column * columns - 1);
     let (column, row) = (slot / per_column, slot % per_column);
-    let clamp = |v: f64, lo: f64, size: f64, extent: f64| v.min(lo + extent - size).max(lo);
     (
-        clamp(
-            x0 + dir_x * column as f64 * step_x,
-            visible.x,
-            w,
-            visible.w,
-        ),
-        clamp(y0 + dir_y * row as f64 * step_y, visible.y, h, visible.h),
+        x0 + dir_x * column as f64 * step_x,
+        y0 + dir_y * row as f64 * step_y,
     )
 }
 
@@ -535,6 +535,15 @@ impl CaptureWorker {
             .collect()
     }
 
+    /// A frame for the session was delivered at `at`. The session's activity
+    /// deadline is the later of that and its last push, so the visibility
+    /// poll and the panel's idle hide count from the same moment.
+    fn mark_delivered(&self, session_key: &str, at: Instant) {
+        if let Some((_, last)) = lock(&self.active).get_mut(session_key) {
+            *last = (*last).max(at);
+        }
+    }
+
     fn is_current(&self, session_key: &str, epoch: u64) -> bool {
         should_apply(epoch, lock(&self.epochs).current(session_key))
     }
@@ -840,6 +849,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     panel.resolved_window = resolved_window;
     panel.dismissed = false;
     panel.last_frame = Instant::now();
+    state.worker.mark_delivered(&key, panel.last_frame);
     refresh(state, &key);
     // Small slack so the monotonic check in the callback is past the bar.
     dispatch_to_main_after(
@@ -1915,6 +1925,50 @@ mod tests {
     }
 
     #[test]
+    fn slots_never_overlap_even_for_an_off_screen_anchor() {
+        let screen = Area {
+            x: 0.0,
+            y: 0.0,
+            w: 1440.0,
+            h: 900.0,
+        };
+        let visible = Area {
+            x: 0.0,
+            y: 70.0,
+            w: 1440.0,
+            h: 805.0,
+        };
+        for anchor in [
+            Some((0, 0)),
+            Some((-500, -500)),
+            Some((5000, 5000)),
+            Some((1400, 0)),
+            Some((0, 880)),
+            None,
+        ] {
+            let bottom_right = first_slot_bottom_right(screen, visible, SIZE, anchor);
+            let origins: Vec<_> = (0..=20)
+                .map(|slot| stack_origin(bottom_right, visible, SIZE, slot))
+                .collect();
+            // Past the grid, slots repeat the last one; before it, all differ.
+            let last = origins.iter().position(|o| o == origins.last().unwrap()).unwrap();
+            for (i, a) in origins[..=last].iter().enumerate() {
+                for b in &origins[i + 1..=last] {
+                    let apart = (a.0 - b.0).abs() >= SIZE.0 || (a.1 - b.1).abs() >= SIZE.1;
+                    assert!(apart, "{anchor:?}: {a:?} overlaps {b:?}");
+                }
+            }
+        }
+        // The reported case: 320x200+0+0 puts slot 0 at the top-left corner
+        // and slot 1 a full panel plus gap below it.
+        let bottom_right = first_slot_bottom_right(screen, visible, SIZE, Some((0, 0)));
+        let slot0 = stack_origin(bottom_right, visible, SIZE, 0);
+        let slot1 = stack_origin(bottom_right, visible, SIZE, 1);
+        assert_eq!(slot0, (0.0, 875.0 - 258.0));
+        assert_eq!(slot1, (0.0, slot0.1 - 258.0 - STACK_GAP));
+    }
+
+    #[test]
     fn every_slot_stays_inside_the_visible_frame() {
         // Default and anchored placements on screens from barely one panel
         // to large; slots far beyond the grid overlap its last slot.
@@ -2201,6 +2255,30 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(recv(&delivered), ("third".to_owned(), Some((7, vec![1]))));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn polling_and_the_panel_share_one_activity_deadline() {
+        let (worker, _delivered) = worker(Arc::new(|_| Some((7, vec![1]))), Duration::from_secs(5));
+        worker.push(frame("s", "act"));
+        let pushed = Instant::now();
+        // Delivered 5 s after the push (a slow capture).
+        let delivered = pushed + Duration::from_secs(5);
+        worker.mark_delivered("s", delivered);
+        // The panel hides 8 s after delivery; polling must run until then.
+        let hide_at = delivered + IDLE_HIDE_AFTER;
+        let before_hide = hide_at - Duration::from_millis(1);
+        assert!(!idle_hide_due(delivered, before_hide));
+        assert_eq!(worker.active_targets(before_hide).len(), 1);
+        assert!(idle_hide_due(delivered, hide_at));
+        assert!(worker.active_targets(hide_at).is_empty());
+        // An older delivery never pulls the deadline back, and an ended
+        // session is not resurrected.
+        worker.mark_delivered("s", pushed);
+        assert_eq!(worker.active_targets(before_hide).len(), 1);
+        worker.forget("s");
+        worker.mark_delivered("s", delivered);
+        assert!(worker.active_targets(before_hide).is_empty());
     }
 
     #[test]
