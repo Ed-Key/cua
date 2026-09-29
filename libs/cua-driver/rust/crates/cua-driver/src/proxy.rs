@@ -873,7 +873,15 @@ async fn handle_proxy_tool_request(
         "tools/call" => match req.tool_call() {
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
             Ok(call) => {
-                if let Err(error) = authorize_tool_call(&call.name, &call.args) {
+                // The daemon resolves and authorizes target shorthands.
+                let early = if cua_driver_core::authorization::authorized_after_target_resolution(
+                    &call.name, &call.args,
+                ) {
+                    Ok(())
+                } else {
+                    authorize_tool_call(&call.name, &call.args)
+                };
+                if let Err(error) = early {
                     return proxy_tool_result_response(
                         id,
                         cua_driver_core::mcp_result::conforming_proxy_tool_result(

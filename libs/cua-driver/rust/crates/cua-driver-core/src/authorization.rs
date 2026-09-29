@@ -1121,6 +1121,15 @@ pub fn risk_metadata_json(tool: &str) -> Value {
 /// evaluated first. Unknown/unreviewed tools then fail closed before registry
 /// dispatch; migrated resource adapters perform their typed grant check after
 /// this coordinator admits the call into the adapter.
+/// Whether a transport's early authorization must leave this call to the
+/// registry. A target shorthand (get_window_state's `app`) becomes pid +
+/// window_id only inside the registry, just before it authorizes, so an early
+/// check would judge the unresolved call and could refuse what the registry
+/// allows. The registry always authorizes, so nothing goes unchecked.
+pub fn authorized_after_target_resolution(tool: &str, args: &Value) -> bool {
+    tool == "get_window_state" && args.get("app").is_some()
+}
+
 pub fn authorize_tool_call(
     tool: &str,
     args: &Value,

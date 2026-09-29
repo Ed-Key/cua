@@ -949,7 +949,7 @@ fn app_pids(app: &str, apps: &[crate::apps::AppInfo]) -> Vec<i32> {
 /// windows fall back to CG titles.
 fn ax_window_titles(pids: &[i32]) -> HashMap<u32, String> {
     use crate::ax::bindings::{
-        ax_get_window_id, copy_ax_windows, copy_string_attr, AXUIElementCreateApplication,
+        ax_get_window_id_checked, copy_ax_windows, copy_string_attr, AXUIElementCreateApplication,
         AXUIElementRef, AXUIElementSetMessagingTimeout,
     };
     use core_foundation::base::{CFRelease, CFTypeRef};
@@ -965,8 +965,7 @@ fn ax_window_titles(pids: &[i32]) -> HashMap<u32, String> {
     };
     let mut titles = HashMap::new();
     for &pid in pids {
-        let mut pid_titles = Vec::new();
-        let mut finished = true;
+        let mut reads = Vec::new();
         unsafe {
             let app = AXUIElementCreateApplication(pid);
             if app.is_null() {
@@ -978,23 +977,44 @@ fn ax_window_titles(pids: &[i32]) -> HashMap<u32, String> {
                 Vec::new()
             };
             for window in windows {
-                finished = finished && bound(window);
-                if finished {
-                    if let Some(id) = ax_get_window_id(window) {
-                        let title = copy_string_attr(window, "AXTitle").unwrap_or_default();
-                        pid_titles.push((id, title));
-                    }
-                }
+                let read = if bound(window) {
+                    ax_get_window_id_checked(window)
+                        .map(|id| {
+                            id.map(|id| {
+                                (id, copy_string_attr(window, "AXTitle").unwrap_or_default())
+                            })
+                        })
+                        .map_err(drop)
+                } else {
+                    Err(())
+                };
+                reads.push(read);
                 CFRelease(window as CFTypeRef);
             }
             CFRelease(app as CFTypeRef);
         }
-        // A read that ran into the deadline may be partial: keep none of it.
-        if finished && std::time::Instant::now() < deadline {
-            titles.extend(pid_titles);
-        }
+        let in_time = std::time::Instant::now() < deadline;
+        titles.extend(complete_ax_windows(reads, in_time).unwrap_or_default());
     }
     titles
+}
+
+/// One process's AX windows, or `None` when any window id read failed or the
+/// deadline cut the lookup short. Partial data would hide that process's
+/// other windows, so it falls back to CG titles instead. `Ok(None)` is a
+/// window with no CG window (not composited) and is simply skipped.
+fn complete_ax_windows(
+    reads: Vec<Result<Option<(u32, String)>, ()>>,
+    in_time: bool,
+) -> Option<Vec<(u32, String)>> {
+    if !in_time {
+        return None;
+    }
+    reads
+        .into_iter()
+        .filter_map(Result::transpose)
+        .collect::<Result<_, _>>()
+        .ok()
 }
 
 /// Pick `app`'s window among `windows` (the default `list_windows` set:
@@ -1765,6 +1785,41 @@ mod app_target_tests {
             s["candidates"],
             serde_json::json!([
                 {"window_id": 4, "pid": 21, "title": "B.txt"},
+                {"window_id": 3, "pid": 20, "title": "A.txt"}
+            ])
+        );
+    }
+
+    /// A process whose AX window-id reads did not all succeed has no AX data,
+    /// so its titled CG windows still count.
+    #[test]
+    fn incomplete_ax_reads_fall_back_to_cg_titles() {
+        let full = complete_ax_windows(vec![Ok(Some((3, "A.txt".into()))), Ok(None)], true);
+        assert_eq!(full, Some(vec![(3, "A.txt".to_owned())]));
+        assert_eq!(
+            complete_ax_windows(vec![Ok(Some((3, "A.txt".into())))], false),
+            None
+        );
+        let failed = complete_ax_windows(vec![Ok(Some((5, "C.txt".into()))), Err(())], true);
+        assert_eq!(failed, None);
+
+        let apps = [
+            app("TextEdit", 20, "com.apple.TextEdit"),
+            app("TextEdit", 21, "com.apple.TextEdit"),
+        ];
+        let windows = [
+            window(3, 20, "", 1),
+            window(5, 21, "C.txt", 2),
+            window(6, 21, "D.txt", 3),
+        ];
+        let ax_titles: HashMap<u32, String> = full.into_iter().chain(failed).flatten().collect();
+        let (_, s) = refusal(select_app_window("TextEdit", &apps, &windows, &ax_titles));
+        assert_eq!(s["code"], "app_window_ambiguous");
+        assert_eq!(
+            s["candidates"],
+            serde_json::json!([
+                {"window_id": 6, "pid": 21, "title": "D.txt"},
+                {"window_id": 5, "pid": 21, "title": "C.txt"},
                 {"window_id": 3, "pid": 20, "title": "A.txt"}
             ])
         );
