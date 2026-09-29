@@ -1653,6 +1653,37 @@ impl ToolRegistry {
             }
             _ => {}
         }
+        // Experimental PiP push — only when --experimental-pip is on argv.
+        // We push for the same set of action tools the recording pipeline
+        // cares about (non-read-only, not the recording-control meta-tools),
+        // and a finished verify_state as labelled claims. Only identity and
+        // labels cross here, and both pushes only enqueue: the backend
+        // captures the target on its own worker, so neither the action nor
+        // the verification ever waits on the PiP.
+        //
+        // Before the lifecycle guard drops: that drop runs a session end that
+        // raced this call (and its hooks, which drop the session's panel)
+        // synchronously, so these events must already be queued ahead of it.
+        if pip_hook::pip_enabled() && should_record && !private_consent_turn {
+            let frame = pip_frame(resolved_name, &args, &public_args, &runtime_prefix);
+            if pip_hook::pip_frame_wanted(resolved_name, &frame) {
+                pip_hook::push_pip_frame(frame);
+            }
+        }
+        if pip_hook::pip_enabled()
+            && resolved_name == "verify_state"
+            && result.is_error != Some(true)
+        {
+            let frame = pip_frame(resolved_name, &args, &public_args, &runtime_prefix);
+            if let Some(event) = pip_hook::verification_event(
+                frame,
+                start_ms,
+                &public_args,
+                result.structured_content.as_ref(),
+            ) {
+                pip_hook::push_pip_verification(event);
+            }
+        }
         drop(lifecycle_dispatch);
         // The platform worker has exited, so another text operation for this
         // pid may now start even while result projection and evidence capture
@@ -1776,19 +1807,6 @@ impl ToolRegistry {
                 result.action_record.as_ref(),
                 result.is_error == Some(true),
             );
-        }
-
-        // Experimental PiP push — only when --experimental-pip is on argv.
-        // We push for the same set of action tools the recording pipeline
-        // cares about (non-read-only, not the recording-control meta-tools).
-        // Only identity crosses here: the backend captures the target on
-        // its own worker, so a slow or stuck capture never delays this
-        // action's result.
-        if pip_hook::pip_enabled() && should_record && !private_consent_turn {
-            let frame = pip_frame(name, &args, &public_args, &runtime_prefix);
-            if pip_hook::pip_frame_wanted(name, &frame) {
-                pip_hook::push_pip_frame(frame);
-            }
         }
 
         result

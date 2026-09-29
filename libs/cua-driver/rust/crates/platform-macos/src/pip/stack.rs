@@ -1,11 +1,15 @@
 //! A panel's card stack: the window the agent is acting in is the front
-//! card, and up to two windows it acted in recently are fanned behind it,
-//! each a few points up and to the left of the card in front of it.
+//! card, and up to three windows it acted in recently are back items. A back
+//! window the session is not finished with is a card fanned behind the
+//! front one, each a few points up and to the left of the card in front of
+//! it; a finished one collapses into a chip (app icon, green check) in a
+//! column left of the cards. Back items live in a trail window that follows
+//! the panel on a loose spring.
 //!
-//! Everything here is pure (unit tested): the stack model, where each card
-//! rests, the spring that animates cards back to rest (after a promotion, or
-//! trailing a drag), resize clamping, and the header layout at small sizes.
-//! AppKit lives in `mod.rs`.
+//! Everything here is pure (unit tested): the stack model, where each item
+//! rests, the springs that animate items back to rest (after a promotion)
+//! and the trail after a drag, resize clamping, and the header layout at
+//! small sizes. AppKit lives in `mod.rs`.
 
 use std::time::{Duration, Instant};
 
@@ -13,29 +17,42 @@ use cursor_overlay::Spring;
 
 use super::{Area, HEADER_HEIGHT};
 
-/// Front card plus two behind it.
-pub(super) const MAX_CARDS: usize = 3;
+/// Front card plus up to three back items (cards and chips together).
+pub(super) const MAX_CARDS: usize = 4;
 /// A back card drops this long after the session last acted in its window.
 pub(super) const BACK_CARD_TTL: Duration = Duration::from_secs(30);
 /// Each card sits this far up and left of the one in front of it. Also the
 /// height of a back card's title strip, which is what peeks out above.
 pub(super) const CARD_STEP: f64 = 14.0;
-/// The farthest a back card trails its resting place while the panel is
-/// dragged.
-pub(super) const LAG_MAX: f64 = 10.0;
-/// Transparent room above and left of the front card for the back cards and
-/// their lag. Always reserved, so the front card never jumps when the stack
-/// grows; fully transparent pixels let clicks through.
-pub(super) const STACK_MARGIN: f64 = 2.0 * CARD_STEP + LAG_MAX;
+/// Transparent room above and left of the front card where the back cards
+/// rest (they are drawn by the trail window, underneath). Always reserved,
+/// so the front card never jumps when the stack grows and a card promoted
+/// from the back animates inside the panel; fully transparent pixels let
+/// clicks through.
+pub(super) const STACK_MARGIN: f64 = (MAX_CARDS - 1) as f64 * CARD_STEP;
 /// Scale of the card at each depth, about its top-left corner.
-const DEPTH_SCALE: [f64; MAX_CARDS] = [1.0, 0.95, 0.9];
+const DEPTH_SCALE: [f64; MAX_CARDS] = [1.0, 0.95, 0.9, 0.85];
 /// Opacity of the card at each depth.
-pub(super) const DEPTH_ALPHA: [f64; MAX_CARDS] = [1.0, 0.86, 0.66];
-/// Natural frequency (rad/s) of the drag-follow spring: settles in ~150 ms.
-pub(super) const FOLLOW_OMEGA: f64 = 40.0;
-/// Natural frequency of the restack spring (a card moving to a new depth):
+pub(super) const DEPTH_ALPHA: [f64; MAX_CARDS] = [1.0, 0.86, 0.66, 0.5];
+/// Natural frequency of the restack spring (an item moving to a new place):
 /// settles in ~250 ms.
 pub(super) const RESTACK_OMEGA: f64 = 30.0;
+/// Chip: a glass circle holding the app icon, with a caption under it.
+pub(super) const CHIP: f64 = 40.0;
+pub(super) const CHIP_ICON: f64 = 28.0;
+pub(super) const CHIP_CAPTION: f64 = 12.0;
+/// A chip's whole frame (circle and caption).
+pub(super) const CHIP_W: f64 = 56.0;
+pub(super) const CHIP_H: f64 = CHIP + 2.0 + CHIP_CAPTION;
+/// Between chips in the column, and between the column and the cards.
+const CHIP_ROW_GAP: f64 = 6.0;
+const CHIP_GAP: f64 = 8.0;
+/// The trail window extends this far left of the panel window, for chips.
+pub(super) const TRAIL_PAD: f64 = CHIP_GAP + CHIP_W;
+/// The farthest a chip reaches left of the panel window: with the most back
+/// cards that still leave room for a chip (placement reserves this).
+pub(super) const CHIP_REACH: f64 =
+    CHIP_GAP + CHIP_W - STACK_MARGIN + (MAX_CARDS - 2) as f64 * CARD_STEP;
 /// Smallest front card the user can resize to.
 pub(super) const MIN_CARD: (f64, f64) = (240.0, 180.0);
 /// Largest front card, as a fraction of the screen's visible frame.
@@ -68,10 +85,6 @@ impl<K: PartialEq + Copy, V: Default> CardStack<K, V> {
 
     pub(super) fn cards(&self) -> &[Card<K, V>] {
         &self.cards
-    }
-
-    pub(super) fn len(&self) -> usize {
-        self.cards.len()
     }
 
     pub(super) fn keys(&self) -> Vec<K> {
@@ -158,6 +171,111 @@ pub(super) fn own_pixels<K: PartialEq, P>(key: K, still: Option<&(K, P)>) -> Opt
         .map(|(_, pixels)| pixels)
 }
 
+/// Where a stack item is drawn: the front card (in the panel), a back card
+/// at a depth (1 = right behind the front), or a chip in the chip column
+/// (0 = bottom).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Slot {
+    Front,
+    Card(usize),
+    Chip(usize),
+}
+
+/// Views a panel has for its items: the front card, a card per back depth,
+/// a chip per back item.
+pub(super) const VIEWS: usize = 1 + 2 * (MAX_CARDS - 1);
+
+impl Slot {
+    /// Index of the view that draws this slot, `0..VIEWS`.
+    pub(super) fn view(self) -> usize {
+        match self {
+            Slot::Front => 0,
+            Slot::Card(depth) => depth,
+            Slot::Chip(row) => MAX_CARDS + row,
+        }
+    }
+
+    /// Resting opacity.
+    pub(super) fn alpha(self) -> f64 {
+        match self {
+            Slot::Front => DEPTH_ALPHA[0],
+            Slot::Card(depth) => DEPTH_ALPHA[depth.min(MAX_CARDS - 1)],
+            Slot::Chip(_) => 1.0,
+        }
+    }
+}
+
+/// Each item's slot, front first, from whether each item's window is
+/// finished: back items the session finished with are chips (in stack
+/// order, bottom up), the rest are cards (in stack order, front to back).
+/// The front card stays a card either way.
+pub(super) fn slots(finished: &[bool]) -> Vec<Slot> {
+    let (mut cards, mut chips) = (0, 0);
+    finished
+        .iter()
+        .enumerate()
+        .map(|(index, &done)| match (index, done) {
+            (0, _) => Slot::Front,
+            (_, true) => {
+                chips += 1;
+                Slot::Chip(chips - 1)
+            }
+            (_, false) => {
+                cards += 1;
+                Slot::Card(cards)
+            }
+        })
+        .collect()
+}
+
+/// Resting frame of `slot` in panel coordinates (AppKit, origin
+/// bottom-left of the panel window) for a front card of `card` size, with
+/// `back_cards` cards behind it. Chips sit in a column just left of the
+/// leftmost card, from the bottom up; they may extend left of the panel
+/// window (into the trail window's `TRAIL_PAD`).
+pub(super) fn slot_frame(card: (f64, f64), slot: Slot, back_cards: usize) -> Area {
+    match slot {
+        Slot::Front => rest_frame(card, 0),
+        Slot::Card(depth) => rest_frame(card, depth),
+        Slot::Chip(row) => Area {
+            x: STACK_MARGIN - back_cards as f64 * CARD_STEP - CHIP_GAP - CHIP_W,
+            y: row as f64 * (CHIP_H + CHIP_ROW_GAP),
+            w: CHIP_W,
+            h: CHIP_H,
+        },
+    }
+}
+
+/// The stack item under `point` (panel coordinates): the front card when
+/// the press is in the panel, else a back item in the trail window, chips
+/// first (they never overlap cards), then cards front to back. `frames` are
+/// where each item of `layout` is drawn.
+pub(super) fn item_at(
+    point: (f64, f64),
+    layout: &[Slot],
+    frames: &[Area],
+    in_trail: bool,
+) -> Option<usize> {
+    let mut order: Vec<usize> = (0..layout.len().min(frames.len()))
+        .filter(|&index| (layout[index] != Slot::Front) == in_trail)
+        .collect();
+    order.sort_by_key(|&index| match layout[index] {
+        Slot::Front | Slot::Chip(_) => 0,
+        Slot::Card(depth) => depth,
+    });
+    order
+        .into_iter()
+        .find(|&index| contains(&frames[index], point))
+}
+
+/// Number of back cards among `slots`.
+pub(super) fn back_cards(slots: &[Slot]) -> usize {
+    slots
+        .iter()
+        .filter(|slot| matches!(slot, Slot::Card(_)))
+        .count()
+}
+
 // ── Layout ────────────────────────────────────────────────────────────────
 
 /// Panel window size for a front card of `card` size.
@@ -186,24 +304,24 @@ pub(super) fn rest_frame(card: (f64, f64), depth: usize) -> Area {
     }
 }
 
-/// The card under `point`, front first: the lowest depth whose frame
-/// contains it. `frames` is indexed by depth.
-pub(super) fn card_at(point: (f64, f64), frames: &[Area]) -> Option<usize> {
-    frames.iter().position(|frame| contains(frame, point))
-}
-
 fn contains(area: &Area, (x, y): (f64, f64)) -> bool {
     x >= area.x && x <= area.x + area.w && y >= area.y && y <= area.y + area.h
 }
 
 // ── Motion ────────────────────────────────────────────────────────────────
 
-/// One critically damped spring step toward zero offset, with the cursor
-/// overlay's integrator (semi-implicit Euler in four substeps, `Spring`
-/// state). Critical damping (`c = 2ω`) settles without visible overshoot.
-/// Returns whether the spring is still moving; a settled spring is zeroed.
+/// One critically damped spring step toward zero offset (see
+/// `damped_step`). Critical damping settles without visible overshoot.
 pub(super) fn spring_step(spring: &mut Spring, omega: f64, dt: f64) -> bool {
-    let (k, c) = (omega * omega, 2.0 * omega);
+    damped_step(spring, omega, 1.0, dt)
+}
+
+/// One spring step toward zero offset with damping ratio `zeta`, with the
+/// cursor overlay's integrator (semi-implicit Euler in four substeps,
+/// `Spring` state). Damping acts on the spring's own (on-screen) velocity.
+/// Returns whether the spring is still moving; a settled spring is zeroed.
+pub(super) fn damped_step(spring: &mut Spring, omega: f64, zeta: f64, dt: f64) -> bool {
+    let (k, c) = (omega * omega, 2.0 * zeta * omega);
     let substeps = 4;
     let sdt = dt / substeps as f64;
     for _ in 0..substeps {
@@ -266,19 +384,12 @@ impl Motion {
         self.omega = RESTACK_OMEGA;
     }
 
-    /// The panel moved by `delta`: a back card stays where it was on screen
-    /// (up to `LAG_MAX` behind its resting place), then springs after it.
-    pub(super) fn trail(&mut self, delta: (f64, f64)) {
-        (self.pos.ox, self.pos.oy) = lag((self.pos.ox, self.pos.oy), delta);
-        self.omega = FOLLOW_OMEGA;
-    }
-
     /// Advance by `dt` seconds. Whether it is still moving.
     pub(super) fn step(&mut self, dt: f64) -> bool {
         let omega = if self.omega > 0.0 {
             self.omega
         } else {
-            FOLLOW_OMEGA
+            RESTACK_OMEGA
         };
         let pos = spring_step(&mut self.pos, omega, dt);
         let size = spring_step(&mut self.size, omega, dt);
@@ -286,15 +397,113 @@ impl Motion {
     }
 }
 
-/// A back card's offset after the panel moved by `delta`: pushed back by
-/// the move, at most `LAG_MAX` from rest.
-pub(super) fn lag(offset: (f64, f64), delta: (f64, f64)) -> (f64, f64) {
-    let (x, y) = (offset.0 - delta.0, offset.1 - delta.1);
-    let length = x.hypot(y);
-    if length <= LAG_MAX {
-        (x, y)
-    } else {
-        (x * LAG_MAX / length, y * LAG_MAX / length)
+// ── Loose trail ───────────────────────────────────────────────────────────
+
+/// The feel of the trail (back cards and chips) following a dragged panel,
+/// tuned to Codex Computer Use's PiP: loose and a little playful. At a
+/// normal drag speed (~800 pt/s) the trail hangs ~83 pt behind (measured
+/// right after each drag event, when it has not moved yet); when the drag
+/// stops it swings ~7 pt past its resting place and settles in ~0.6 s.
+/// Between events the lag is `2·ζ·v/ω`: lower `TRAIL_OMEGA` is looser (more
+/// lag, slower settle), lower `TRAIL_ZETA` is bouncier (0.65 gives a small
+/// visible overshoot; 1.0 would give none).
+pub(super) const TRAIL_OMEGA: f64 = 14.5;
+pub(super) const TRAIL_ZETA: f64 = 0.65;
+/// Lag never exceeds this, so a violent fling cannot throw the trail far
+/// off its panel.
+pub(super) const TRAIL_LAG_CAP: f64 = 140.0;
+
+/// The trail window's offset from its resting place, and the measurement
+/// of the last drag's lag (for logs).
+#[derive(Default)]
+pub(super) struct Trail {
+    spring: Spring,
+    /// A drag is moving the panel.
+    dragging: bool,
+    /// Largest lag since the current drag started.
+    max_lag: f64,
+    /// When the last drag ended, until its settle is reported.
+    released: Option<Instant>,
+}
+
+impl Trail {
+    pub(super) fn offset(&self) -> (f64, f64) {
+        (self.spring.ox, self.spring.oy)
+    }
+
+    pub(super) fn moving(&self) -> bool {
+        self.spring.ox != 0.0
+            || self.spring.oy != 0.0
+            || self.spring.vx != 0.0
+            || self.spring.vy != 0.0
+    }
+
+    /// The panel was dragged by `delta`: the trail stays where it is on
+    /// screen (at most `TRAIL_LAG_CAP` behind), and springs after it.
+    pub(super) fn panel_dragged(&mut self, delta: (f64, f64)) {
+        if !self.dragging {
+            self.dragging = true;
+            self.max_lag = 0.0;
+            self.released = None;
+        }
+        let (x, y) = (self.spring.ox - delta.0, self.spring.oy - delta.1);
+        let length = x.hypot(y);
+        let scale = if length > TRAIL_LAG_CAP {
+            TRAIL_LAG_CAP / length
+        } else {
+            1.0
+        };
+        (self.spring.ox, self.spring.oy) = (x * scale, y * scale);
+        self.measure();
+    }
+
+    /// The panel moved without a drag (placed, resized): no trailing.
+    pub(super) fn snap(&mut self) {
+        self.spring = Spring::default();
+    }
+
+    /// The drag ended at `now`.
+    pub(super) fn release(&mut self, now: Instant) {
+        if self.dragging {
+            self.dragging = false;
+            self.released = Some(now);
+        }
+    }
+
+    /// Advance by `dt` seconds. Whether it is still moving.
+    pub(super) fn step(&mut self, dt: f64) -> bool {
+        let moving = damped_step(&mut self.spring, TRAIL_OMEGA, TRAIL_ZETA, dt);
+        self.measure();
+        moving
+    }
+
+    fn measure(&mut self) {
+        if self.dragging || self.released.is_some() {
+            self.max_lag = self.max_lag.max(self.spring.ox.hypot(self.spring.oy));
+        }
+    }
+
+    /// Once per drag, when the trail has come to rest after it: the largest
+    /// lag it showed (pt) and how long it took to settle after release.
+    pub(super) fn settled(&mut self, now: Instant) -> Option<(f64, Duration)> {
+        if self.dragging || self.moving() {
+            return None;
+        }
+        let released = self.released.take()?;
+        Some((self.max_lag, now.saturating_duration_since(released)))
+    }
+}
+
+/// The trail window's frame (AppKit) for a panel window at `panel` with the
+/// trail `offset` from rest: the panel's frame widened left by `TRAIL_PAD`,
+/// moved by the offset. Panel coordinates map to trail coordinates by
+/// adding `TRAIL_PAD` to x.
+pub(super) fn trail_frame(panel: Area, offset: (f64, f64)) -> Area {
+    Area {
+        x: panel.x - TRAIL_PAD + offset.0,
+        y: panel.y + offset.1,
+        w: panel.w + TRAIL_PAD,
+        h: panel.h,
     }
 }
 
@@ -467,16 +676,92 @@ mod tests {
     }
 
     #[test]
-    fn acting_in_a_new_window_pushes_it_in_front_and_caps_at_three() {
+    fn acting_in_a_new_window_pushes_it_in_front_and_keeps_three_back_items() {
         let t = Instant::now();
         let mut stack = Stack::new();
         stack.act(1, t);
         assert_eq!(stack.keys(), [1]);
         stack.act(2, t);
         assert_eq!(stack.keys(), [2, 1]);
-        stack.act(3, t);
-        stack.act(4, t);
-        assert_eq!(stack.keys(), [4, 3, 2], "the oldest card drops past three");
+        for key in [3, 4, 5] {
+            stack.act(key, t);
+        }
+        assert_eq!(
+            stack.keys(),
+            [5, 4, 3, 2],
+            "the front plus three back items; the oldest drops"
+        );
+    }
+
+    #[test]
+    fn finished_back_windows_are_chips_and_the_rest_stay_cards() {
+        use Slot::*;
+        // Front finished or not, it stays the front card.
+        assert_eq!(slots(&[true]), [Front]);
+        // Back items: finished ones are chips bottom-up, the rest cards by depth.
+        assert_eq!(
+            slots(&[false, true, false, true]),
+            [Front, Chip(0), Card(1), Chip(1)]
+        );
+        assert_eq!(
+            slots(&[false, false, false, false]),
+            [Front, Card(1), Card(2), Card(3)]
+        );
+        assert_eq!(
+            slots(&[true, true, true, true]),
+            [Front, Chip(0), Chip(1), Chip(2)]
+        );
+        // Every slot has its own view.
+        let all = [Front, Card(1), Card(2), Card(3), Chip(0), Chip(1), Chip(2)];
+        let mut views: Vec<usize> = all.iter().map(|slot| slot.view()).collect();
+        views.sort();
+        assert_eq!(views, (0..VIEWS).collect::<Vec<_>>());
+    }
+
+    #[test]
+    fn chips_sit_left_of_the_cards_inside_the_trail_window() {
+        let (win_w, win_h) = window_size(CARD);
+        for finished in [
+            [false, true, true, true],
+            [false, false, true, true],
+            [false, false, false, true],
+            [false, true, false, false],
+        ] {
+            let slots = slots(&finished);
+            let cards = back_cards(&slots);
+            let frames: Vec<Area> = slots
+                .iter()
+                .map(|slot| slot_frame(CARD, *slot, cards))
+                .collect();
+            for (slot, frame) in slots.iter().zip(&frames) {
+                // Inside the trail window (the panel widened by TRAIL_PAD).
+                assert!(
+                    frame.x >= -TRAIL_PAD && frame.x + frame.w <= win_w,
+                    "{slot:?}"
+                );
+                assert!(frame.y >= 0.0 && frame.y + frame.h <= win_h, "{slot:?}");
+                if let Slot::Chip(_) = slot {
+                    // Clear of every card (front and back), and of each other.
+                    for (other, rect) in slots.iter().zip(&frames) {
+                        if other != slot {
+                            let apart = frame.x + frame.w <= rect.x
+                                || rect.x + rect.w <= frame.x
+                                || frame.y + frame.h <= rect.y
+                                || rect.y + rect.h <= frame.y;
+                            assert!(apart, "{slot:?} overlaps {other:?}");
+                        }
+                    }
+                }
+            }
+        }
+        // CHIP_REACH is exactly the farthest any chip reaches left.
+        let reach = (0..MAX_CARDS - 1)
+            .map(|cards| -slot_frame(CARD, Slot::Chip(0), cards).x)
+            .fold(f64::MIN, f64::max);
+        assert_eq!(reach, CHIP_REACH);
+        // Three chips fit beside the smallest front card.
+        let top = slot_frame(MIN_CARD, Slot::Chip(2), 0);
+        assert!(top.y + top.h <= MIN_CARD.1);
     }
 
     #[test]
@@ -563,6 +848,35 @@ mod tests {
     }
 
     #[test]
+    fn presses_find_the_front_in_the_panel_and_back_items_in_the_trail() {
+        let layout = slots(&[false, false, true, false]);
+        let cards = back_cards(&layout);
+        let frames: Vec<Area> = layout
+            .iter()
+            .map(|slot| slot_frame(CARD, *slot, cards))
+            .collect();
+        let front = frames[0];
+        let inside = |area: &Area| (area.x + 4.0, area.y + area.h - 4.0);
+        // In the panel only the front card is hit, even over a back card.
+        assert_eq!(item_at(inside(&front), &layout, &frames, false), Some(0));
+        assert_eq!(item_at(inside(&frames[1]), &layout, &frames, false), None);
+        // In the trail: the strip of card depth 1, the one above it (depth
+        // 2), and the chip; the front card is not the trail's.
+        assert_eq!(item_at(inside(&frames[1]), &layout, &frames, true), Some(1));
+        assert_eq!(item_at(inside(&frames[3]), &layout, &frames, true), Some(3));
+        assert_eq!(item_at(inside(&frames[2]), &layout, &frames, true), Some(2));
+        assert_eq!(
+            item_at((front.x + 100.0, 50.0), &layout, &frames, true),
+            Some(1),
+            "under the front card lies depth 1"
+        );
+        assert_eq!(
+            item_at((-TRAIL_PAD + 1.0, 250.0), &layout, &frames, true),
+            None
+        );
+    }
+
+    #[test]
     fn back_cards_only_show_stills_of_their_own_window() {
         assert_eq!(own_pixels(5, Some(&(5, "w5"))), Some(&"w5"));
         assert_eq!(own_pixels(5, Some(&(6, "w6"))), None);
@@ -595,84 +909,143 @@ mod tests {
             assert_eq!(card.x, above.x - CARD_STEP);
             assert!((card.y + card.h - (above.y + above.h + CARD_STEP)).abs() < 1e-9);
             // Smaller, and its right and bottom stay hidden behind the front
-            // card even when trailing a drag by the full lag.
+            // card.
             assert!(card.w < above.w && card.h < above.h);
-            assert!(card.x + card.w + LAG_MAX < front.x + front.w);
-            assert!(card.y - LAG_MAX >= 0.0);
-            // Its top-left, lag included, stays inside the window.
-            assert!(card.x - LAG_MAX >= 0.0);
-            assert!(card.y + card.h + LAG_MAX <= win_h);
+            assert!(card.x + card.w < front.x + front.w);
+            assert!(card.y >= 0.0);
+            // Its top-left stays inside the window.
+            assert!(card.x >= 0.0);
+            assert!(card.y + card.h <= win_h + 1e-9);
         }
         // Same at the minimum card size.
-        let small = rest_frame(MIN_CARD, 2);
-        assert!(small.x + small.w + LAG_MAX < STACK_MARGIN + MIN_CARD.0);
+        let small = rest_frame(MIN_CARD, MAX_CARDS - 1);
+        assert!(small.x + small.w < STACK_MARGIN + MIN_CARD.0);
+    }
+
+    /// The item a press lands on: the panel (front card) is above the
+    /// trail, and a press it does not take passes to the trail.
+    fn pressed(point: (f64, f64), layout: &[Slot], frames: &[Area]) -> Option<usize> {
+        item_at(point, layout, frames, false).or_else(|| item_at(point, layout, frames, true))
     }
 
     #[test]
     fn clicks_hit_the_frontmost_card_under_the_pointer() {
+        let layout = slots(&[false; MAX_CARDS]);
         let frames: Vec<Area> = (0..MAX_CARDS)
             .map(|depth| rest_frame(CARD, depth))
             .collect();
         let front = frames[0];
         // Inside the front card, even where back cards lie beneath it.
         assert_eq!(
-            card_at((front.x + 20.0, front.y + front.h - 5.0), &frames),
+            pressed((front.x + 20.0, front.y + front.h - 5.0), &layout, &frames),
             Some(0)
         );
         // The strip peeking above the front card belongs to depth 1, the one
         // above that to depth 2.
         assert_eq!(
-            card_at((front.x + 40.0, front.y + front.h + 7.0), &frames),
+            pressed((front.x + 40.0, front.y + front.h + 7.0), &layout, &frames),
             Some(1)
         );
         assert_eq!(
-            card_at(
+            pressed(
                 (front.x + 40.0, front.y + front.h + CARD_STEP + 7.0),
+                &layout,
                 &frames
             ),
             Some(2)
         );
         // The empty corner of the margin is nobody's.
-        assert_eq!(card_at((1.0, 1.0), &frames), None);
+        assert_eq!(pressed((1.0, 1.0), &layout, &frames), None);
         // With one card, the peek area is empty.
         assert_eq!(
-            card_at((front.x + 40.0, front.y + front.h + 7.0), &frames[..1]),
+            pressed(
+                (front.x + 40.0, front.y + front.h + 7.0),
+                &layout[..1],
+                &frames[..1]
+            ),
             None
         );
     }
 
-    fn settle(motion: &mut Motion, max_secs: f64) -> (f64, Vec<Area>) {
-        let rest = rest_frame(CARD, 1);
+    /// Drag the panel along x at a speed ramping to `speed` pt/s over 100 ms,
+    /// hold it for 400 ms, and stop, in 60 Hz steps (as mouse events and the
+    /// ticker do). Returns the largest lag, the largest overshoot past rest
+    /// after the stop, and the settle time the trail reports.
+    fn drag_and_release(speed: f64) -> (f64, f64, Duration) {
         let dt = 1.0 / 60.0;
+        let start = Instant::now();
+        let mut trail = Trail::default();
         let mut t = 0.0;
-        let mut frames = vec![motion.frame(rest)];
-        while motion.step(dt) {
+        while t < 0.5 {
+            trail.panel_dragged(((t / 0.1_f64).min(1.0) * speed * dt, 0.0));
+            trail.step(dt);
             t += dt;
-            frames.push(motion.frame(rest));
-            assert!(t < max_secs, "still moving after {t:.3}s");
         }
-        frames.push(motion.frame(rest));
-        (t, frames)
+        let released = start + Duration::from_secs_f64(t);
+        trail.release(released);
+        let mut overshoot = 0.0_f64;
+        let mut after = 0.0;
+        while trail.step(dt) {
+            after += dt;
+            overshoot = overshoot.max(trail.offset().0);
+            assert!(trail.settled(released).is_none(), "reported while moving");
+            assert!(after < 2.0, "still moving after {after:.3}s");
+        }
+        after += dt;
+        let (max_lag, settle) = trail
+            .settled(released + Duration::from_secs_f64(after))
+            .unwrap();
+        assert!(trail.settled(released).is_none(), "reported once per drag");
+        assert_eq!(trail.offset(), (0.0, 0.0));
+        (max_lag, overshoot, settle)
     }
 
     #[test]
-    fn a_trailing_card_catches_up_in_about_150_ms_without_overshoot() {
-        let rest = rest_frame(CARD, 1);
-        let mut motion = Motion::default();
-        // The panel jumped 40pt right and 25pt up: the card trails by LAG_MAX.
-        motion.trail((40.0, 25.0));
-        let start = motion.frame(rest);
-        assert!(((start.x - rest.x).hypot(start.y - rest.y) - LAG_MAX).abs() < 1e-9);
-        let (secs, frames) = settle(&mut motion, 0.25);
-        assert!((0.1..=0.2).contains(&secs), "settled in {secs:.3}s");
-        assert_eq!(*frames.last().unwrap(), rest);
-        // Critically damped: never passes rest by more than a hair.
-        for frame in &frames {
-            assert!(
-                frame.x <= rest.x + 0.05 && frame.y <= rest.y + 0.05,
-                "{frame:?}"
-            );
-        }
+    fn the_trail_hangs_70_to_90_pt_behind_a_normal_drag_and_swings_back() {
+        let (max_lag, overshoot, settle) = drag_and_release(800.0);
+        assert!((70.0..=90.0).contains(&max_lag), "max lag {max_lag:.1}");
+        // Slightly underdamped: a small but visible swing past rest.
+        assert!(overshoot >= 1.0, "overshoot {overshoot:.2}");
+        assert!(overshoot <= 0.12 * max_lag, "overshoot {overshoot:.2}");
+        let ms = settle.as_millis();
+        assert!((500..=700).contains(&ms), "settled in {ms} ms");
+    }
+
+    #[test]
+    fn the_trail_lag_scales_with_speed_but_is_capped() {
+        let (slow, _, _) = drag_and_release(200.0);
+        assert!(slow < 30.0, "{slow}");
+        let (fling, _, _) = drag_and_release(4000.0);
+        assert!((fling - TRAIL_LAG_CAP).abs() < 1e-6, "{fling}");
+    }
+
+    #[test]
+    fn the_trail_window_is_the_panel_widened_for_chips_and_moved_by_the_lag() {
+        let panel = Area {
+            x: 1000.0,
+            y: 100.0,
+            w: 378.0,
+            h: 300.0,
+        };
+        assert_eq!(
+            trail_frame(panel, (0.0, 0.0)),
+            Area {
+                x: 1000.0 - TRAIL_PAD,
+                y: 100.0,
+                w: 378.0 + TRAIL_PAD,
+                h: 300.0
+            }
+        );
+        assert_eq!(
+            trail_frame(panel, (-80.0, 5.0)).x,
+            1000.0 - TRAIL_PAD - 80.0
+        );
+        // A snap (placement, resize) drops any lag without a report.
+        let mut trail = Trail::default();
+        trail.panel_dragged((50.0, 0.0));
+        trail.snap();
+        assert!(!trail.moving());
+        assert!(trail.settled(Instant::now()).is_none());
     }
 
     #[test]
@@ -704,21 +1077,12 @@ mod tests {
                 vy: vx,
             };
             let mut steps = 0;
-            while spring_step(&mut spring, FOLLOW_OMEGA, 1.0 / 60.0) {
+            while spring_step(&mut spring, RESTACK_OMEGA, 1.0 / 60.0) {
                 steps += 1;
                 assert!(steps < 120, "no convergence from {ox}, {vx}");
             }
             assert_eq!((spring.ox, spring.vx), (0.0, 0.0));
         }
-    }
-
-    #[test]
-    fn lag_is_capped_and_keeps_its_direction() {
-        assert_eq!(lag((0.0, 0.0), (3.0, 4.0)), (-3.0, -4.0));
-        let (x, y) = lag((0.0, 0.0), (30.0, 40.0));
-        assert!((x + 6.0).abs() < 1e-9 && (y + 8.0).abs() < 1e-9);
-        // Moving back toward rest shrinks the lag.
-        assert_eq!(lag((-3.0, -4.0), (-3.0, -4.0)), (0.0, 0.0));
     }
 
     #[test]
@@ -791,12 +1155,13 @@ mod tests {
 
     #[test]
     fn presses_are_classified_by_region() {
+        let layout = slots(&[false; MAX_CARDS]);
         let frames: Vec<Area> = (0..MAX_CARDS)
             .map(|depth| rest_frame(CARD, depth))
             .collect();
         let front = frames[0];
         let region = |point: (f64, f64)| {
-            let depth = card_at(point, &frames);
+            let depth = pressed(point, &layout, &frames);
             let edges = if depth == Some(0) {
                 resize_edges(point, front)
             } else {
