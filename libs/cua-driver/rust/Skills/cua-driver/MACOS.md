@@ -524,11 +524,13 @@ and unbound embedded webviews remain native surfaces. Inspect them with
 tool and Apple Events JavaScript bridge remain compatibility surfaces, not the
 starting point for new browser workflows.
 
-When cua's Chrome extension is connected to a Chrome, native `type_text`,
-`set_value`, and `click` aimed at that Chrome's web pages refuse with
+When cua's Chrome extension is connected and shows the target window and page
+(same window, active tab), native `click` on that page, and native
+`type_text` or `set_value` on its text fields, refuse with
 `browser_route_required` before sending input and name the calls to make
-instead (`get_browser_state`, then `browser_type` or `browser_click`). Chrome's
-own UI and `chrome://` pages keep native input. Without the extension,
+instead (`get_browser_state`, then `browser_type` or `browser_click`). Selects,
+sliders, Chrome's own UI, `chrome://` pages, and windows the extension cannot
+see (incognito without extension access, other profiles) keep native input. Without the extension,
 `type_text` into a Chrome page sends key events rather than an accessibility
 value write, which page frameworks such as React ignore, and an unchanged page
 value is reported as unverifiable rather than as zero characters delivered.

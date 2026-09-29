@@ -481,6 +481,7 @@ impl Tool for ClickTool {
                     super::browser_route::page_input_redirect(
                         "click",
                         "browser_click",
+                        super::browser_route::Control::Any,
                         pid,
                         window_id,
                         Some(guard.as_ptr() as usize),
@@ -491,6 +492,7 @@ impl Tool for ClickTool {
                     super::browser_route::page_input_redirect_at_pixel(
                         "click",
                         "browser_click",
+                        super::browser_route::Control::Any,
                         pid,
                         window_id,
                         x,

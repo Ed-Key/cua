@@ -11,6 +11,14 @@
 //! prompts, extension UI) has no web area and keeps native input, as do pages
 //! an extension cannot reach (chrome:// pages, other extensions, the Web
 //! Store).
+//!
+//! Redirect rule: refuse native input only when (1) the extension link for
+//! this Chrome provably shows the exact target window and page (a window of
+//! the link matches the native window's bounds and its active tab shows the
+//! page's URL; incognito windows without extension access and other profiles'
+//! windows share the browser pid but never appear on the link), and (2) the
+//! browser tools support the control (text controls for typing and value
+//! setting; any element for clicks). Anything else keeps the native path.
 
 use crate::ax::bindings::{copy_string_attr, copy_url_attr, AXUIElementRef};
 use core_foundation::base::{CFRelease, CFTypeRef, TCFType};
@@ -86,20 +94,205 @@ unsafe fn enclosing_page_url(start: AXUIElementRef) -> Option<String> {
     url
 }
 
-/// Which element a native input would act on: the addressed element, or the
-/// exact window's focused element.
-fn page_url_of_target(pid: i32, window_id: u32, element: Option<usize>) -> Option<String> {
+/// What a native input would act on inside a page: the element's AX role
+/// and the URL of the page around it.
+struct PageTarget {
+    role: String,
+    url: String,
+}
+
+/// # Safety
+///
+/// `element` must be a live AX element reference; it is borrowed.
+unsafe fn page_target(element: AXUIElementRef) -> Option<PageTarget> {
+    let url = enclosing_page_url(element)?;
+    Some(PageTarget {
+        role: copy_string_attr(element, "AXRole").unwrap_or_default(),
+        url,
+    })
+}
+
+/// The addressed element, or the exact window's focused element.
+fn page_target_of(pid: i32, window_id: u32, element: Option<usize>) -> Option<PageTarget> {
     unsafe {
         match element {
-            Some(ptr) => enclosing_page_url(ptr as AXUIElementRef),
+            Some(ptr) => page_target(ptr as AXUIElementRef),
             None => {
                 let focused = crate::ax::exact_target::focused_element_in_window(pid, window_id)?;
-                let url = enclosing_page_url(focused);
+                let target = page_target(focused);
                 CFRelease(focused as CFTypeRef);
-                url
+                target
             }
         }
     }
+}
+
+/// Which controls a browser tool can take over from a native tool.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum Control {
+    /// browser_click: any element or point.
+    Any,
+    /// browser_type (text modes and set_value): text inputs, textareas, and
+    /// contenteditable. Not selects (AXPopUpButton), range sliders, checkboxes.
+    Text,
+}
+
+impl Control {
+    fn supports(self, role: &str) -> bool {
+        match self {
+            Control::Any => true,
+            Control::Text => matches!(
+                role,
+                "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
+            ),
+        }
+    }
+}
+
+/// The same page, ignoring the fragment and a trailing slash.
+fn same_page(a: &str, b: &str) -> bool {
+    let strip = |url: &str| {
+        let url = url.split('#').next().unwrap_or(url);
+        url.trim_end_matches('/').to_owned()
+    };
+    !a.is_empty() && strip(a) == strip(b)
+}
+
+/// Whether an extension link's windows and tabs show the native window
+/// (matched by bounds, within a few points) with `url` in its active tab.
+fn link_shows(
+    bounds: (f64, f64, f64, f64),
+    windows: &serde_json::Value,
+    tabs: &serde_json::Value,
+    url: &str,
+) -> bool {
+    const TOLERANCE: f64 = 8.0;
+    let (x, y, width, height) = bounds;
+    let close = |value: &serde_json::Value, want: f64| {
+        value.as_f64().is_some_and(|got| (got - want).abs() <= TOLERANCE)
+    };
+    let matching_windows: Vec<i64> = windows
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter(|window| {
+            close(&window["left"], x)
+                && close(&window["top"], y)
+                && close(&window["width"], width)
+                && close(&window["height"], height)
+        })
+        .filter_map(|window| window["windowId"].as_i64())
+        .collect();
+    tabs.as_array().into_iter().flatten().any(|tab| {
+        tab["active"].as_bool() == Some(true)
+            && tab["windowId"]
+                .as_i64()
+                .is_some_and(|id| matching_windows.contains(&id))
+            && tab["url"]
+                .as_str()
+                .is_some_and(|tab_url| same_page(tab_url, url))
+    })
+}
+
+/// Whether a connected extension link of `pid` shows `window_id` on `url`.
+async fn extension_shows_window(pid: i32, window_id: u32, url: &str) -> bool {
+    let Some(bounds) = crate::windows::window_bounds_by_id(window_id) else {
+        return false;
+    };
+    let bridge = cua_driver_core::browser::extension_bridge::global();
+    let links: Vec<u64> = bridge
+        .links()
+        .into_iter()
+        .filter(|link| link.chrome_pid == Some(i64::from(pid)))
+        .map(|link| link.link)
+        .collect();
+    for link in links {
+        let windows = bridge
+            .request_on(link, "windows.list", serde_json::json!({}))
+            .await;
+        let tabs = bridge
+            .request_on(link, "tabs.list", serde_json::json!({}))
+            .await;
+        let (Ok(windows), Ok(tabs)) = (windows, tabs) else {
+            continue;
+        };
+        if link_shows(
+            (bounds.x, bounds.y, bounds.width, bounds.height),
+            &windows,
+            &tabs,
+            url,
+        ) {
+            return true;
+        }
+    }
+    false
+}
+
+/// Apply the redirect rule to a resolved page target.
+async fn redirect_for(
+    tool: &'static str,
+    next: &'static str,
+    control: Control,
+    pid: i32,
+    window_id: u32,
+    target: PageTarget,
+) -> Option<ToolResult> {
+    (control.supports(&target.role)
+        && extension_can_reach(&target.url)
+        && extension_shows_window(pid, window_id, &target.url).await)
+        .then(|| redirect_result(tool, next, pid, window_id))
+}
+
+/// Refuse native input to a page target under the redirect rule.
+/// `element` is the addressed element, `None` for the window's focused element.
+pub(super) async fn page_input_redirect(
+    tool: &'static str,
+    next: &'static str,
+    control: Control,
+    pid: i32,
+    window_id: Option<u32>,
+    element: Option<usize>,
+) -> Option<ToolResult> {
+    let window_id = window_id?;
+    if !extension_connected(pid) {
+        return None;
+    }
+    let target = tokio::task::spawn_blocking(move || page_target_of(pid, window_id, element))
+        .await
+        .ok()
+        .flatten()?;
+    redirect_for(tool, next, control, pid, window_id, target).await
+}
+
+/// [`page_input_redirect`] for a pixel target in the window's screenshot
+/// coordinates: hit-tests the point.
+pub(super) async fn page_input_redirect_at_pixel(
+    tool: &'static str,
+    next: &'static str,
+    control: Control,
+    pid: i32,
+    window_id: Option<u32>,
+    x: f64,
+    y: f64,
+) -> Option<ToolResult> {
+    let window_id = window_id?;
+    if !extension_connected(pid) {
+        return None;
+    }
+    let target = tokio::task::spawn_blocking(move || {
+        let frame = super::px_frame::resolve_window_px_frame(window_id).ok()?;
+        let (screen_x, screen_y, _, _) = frame.to_screen(x, y);
+        unsafe {
+            let hit = crate::ax::bindings::element_at_screen_position(pid, screen_x, screen_y)?;
+            let target = page_target(hit);
+            CFRelease(hit as CFTypeRef);
+            target
+        }
+    })
+    .await
+    .ok()
+    .flatten()?;
+    redirect_for(tool, next, control, pid, window_id, target).await
 }
 
 /// The refusal for native `tool` input on a page the extension reaches.
@@ -121,57 +314,6 @@ fn redirect_result(tool: &str, next: &str, pid: i32, window_id: u32) -> ToolResu
             { "tool": next },
         ],
     }))
-}
-
-/// Refuse native input to a page target when the extension is connected to
-/// its Chrome. `element` is the addressed element, `None` for the window's
-/// focused element.
-pub(super) async fn page_input_redirect(
-    tool: &'static str,
-    next: &'static str,
-    pid: i32,
-    window_id: Option<u32>,
-    element: Option<usize>,
-) -> Option<ToolResult> {
-    let window_id = window_id?;
-    if !extension_connected(pid) {
-        return None;
-    }
-    let url = tokio::task::spawn_blocking(move || page_url_of_target(pid, window_id, element))
-        .await
-        .ok()
-        .flatten()?;
-    extension_can_reach(&url).then(|| redirect_result(tool, next, pid, window_id))
-}
-
-/// [`page_input_redirect`] for a pixel target in the window's screenshot
-/// coordinates: hit-tests the point.
-pub(super) async fn page_input_redirect_at_pixel(
-    tool: &'static str,
-    next: &'static str,
-    pid: i32,
-    window_id: Option<u32>,
-    x: f64,
-    y: f64,
-) -> Option<ToolResult> {
-    let window_id = window_id?;
-    if !extension_connected(pid) {
-        return None;
-    }
-    let url = tokio::task::spawn_blocking(move || {
-        let frame = super::px_frame::resolve_window_px_frame(window_id).ok()?;
-        let (screen_x, screen_y, _, _) = frame.to_screen(x, y);
-        unsafe {
-            let hit = crate::ax::bindings::element_at_screen_position(pid, screen_x, screen_y)?;
-            let url = enclosing_page_url(hit);
-            CFRelease(hit as CFTypeRef);
-            url
-        }
-    })
-    .await
-    .ok()
-    .flatten()?;
-    extension_can_reach(&url).then(|| redirect_result(tool, next, pid, window_id))
 }
 
 #[cfg(test)]
@@ -215,5 +357,49 @@ mod tests {
             })
         );
         assert_eq!(structured["next_calls"][1]["tool"], "browser_type");
+    }
+
+    #[test]
+    fn only_controls_the_browser_tools_support_are_redirected() {
+        for role in ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"] {
+            assert!(Control::Text.supports(role), "{role}");
+        }
+        // Selects and range sliders keep set_value's native option and
+        // numeric paths; browser_type refuses them.
+        for role in ["AXPopUpButton", "AXSlider", "AXCheckBox", "AXButton", "AXWebArea"] {
+            assert!(!Control::Text.supports(role), "{role}");
+        }
+        assert!(Control::Any.supports("AXPopUpButton"));
+    }
+
+    #[test]
+    fn only_a_window_the_extension_shows_is_redirected() {
+        let bounds = (0.0, 30.0, 1100.0, 794.0);
+        let url = "http://127.0.0.1:8765/react-form/";
+        let windows = serde_json::json!([
+            { "windowId": 5, "left": 0, "top": 30, "width": 1100, "height": 794 },
+            { "windowId": 6, "left": 400, "top": 100, "width": 800, "height": 600 },
+        ]);
+        let tabs = |window: i64, active: bool, url: &str| {
+            serde_json::json!([{ "tabId": 1, "windowId": window, "active": active, "url": url }])
+        };
+        assert!(link_shows(bounds, &windows, &tabs(5, true, url), url));
+        assert!(link_shows(
+            bounds,
+            &windows,
+            &tabs(5, true, "http://127.0.0.1:8765/react-form#x"),
+            url
+        ));
+        // The window is not on the link: an incognito window without
+        // extension access, or another profile's window, in the same process.
+        let other_only = serde_json::json!([windows[1].clone()]);
+        assert!(!link_shows(bounds, &other_only, &tabs(6, true, url), url));
+        // Right window, but its active tab shows another page, or the page
+        // is only in a background tab.
+        assert!(!link_shows(bounds, &windows, &tabs(5, true, "https://example.com/"), url));
+        assert!(!link_shows(bounds, &windows, &tabs(5, false, url), url));
+        // The page in a different window of the link does not count.
+        assert!(!link_shows(bounds, &windows, &tabs(6, true, url), url));
+        assert!(!same_page("", ""));
     }
 }

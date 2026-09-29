@@ -243,6 +243,7 @@ impl Tool for TypeTextTool {
                 super::browser_route::page_input_redirect(
                     "type_text",
                     "browser_type",
+                    super::browser_route::Control::Text,
                     pid,
                     window_id,
                     Some(guard.as_ptr() as usize),
@@ -253,6 +254,7 @@ impl Tool for TypeTextTool {
                 super::browser_route::page_input_redirect_at_pixel(
                     "type_text",
                     "browser_type",
+                    super::browser_route::Control::Text,
                     pid,
                     window_id,
                     x,
@@ -264,6 +266,7 @@ impl Tool for TypeTextTool {
                 super::browser_route::page_input_redirect(
                     "type_text",
                     "browser_type",
+                    super::browser_route::Control::Text,
                     pid,
                     window_id,
                     None,

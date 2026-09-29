@@ -144,6 +144,7 @@ impl Tool for SetValueTool {
         if let Some(redirect) = super::browser_route::page_input_redirect(
             "set_value",
             "browser_type with mode set_value",
+            super::browser_route::Control::Text,
             pid,
             Some(window_id),
             Some(element_ptr as usize),
