@@ -380,7 +380,7 @@ fn agent_instructions() -> String {
 
     // act_and_read is registered only on macOS; elsewhere keep the one-action step.
     let act_step = if cfg!(target_os = "macos") {
-        "Batch visible steps in one `act_and_read` `steps` call."
+        "Act and read with one `act_and_read` (`steps` batch), not click then `get_window_state`."
     } else {
         "Act with the fresh index."
     };
