@@ -679,8 +679,7 @@ pub struct ToolState {
     /// cannot both number a new row from the same `next_id`.
     look_locks: std::sync::Mutex<HashMap<(i32, u64), Arc<tokio::sync::Mutex<()>>>>,
     /// The last `background_input` report each session was sent per window.
-    pub(crate) background_input_sent:
-        std::sync::Mutex<HashMap<get_window_state::BackgroundInputKey, serde_json::Value>>,
+    pub(crate) background_input_sent: Arc<get_window_state::BackgroundInputSent>,
 }
 
 impl ToolState {
@@ -736,7 +735,7 @@ impl ToolState {
             host_owns_permission_ux,
             host_bundle_id,
             look_locks: std::sync::Mutex::new(HashMap::new()),
-            background_input_sent: std::sync::Mutex::new(HashMap::new()),
+            background_input_sent: Arc::default(),
         }
     }
 }
@@ -864,9 +863,11 @@ pub fn register_all(
         let zoom_registry = state.zoom_registry.clone();
         let cursor_registry = state.cursor_registry.clone();
         let capture_bindings = state.capture_bindings.clone();
+        let background_input_sent = state.background_input_sent.clone();
         let registration =
             cua_driver_core::session::register_scoped_session_end_hook(move |session_id| {
                 session_config.clear(session_id);
+                get_window_state::retire_background_input(&background_input_sent, session_id);
                 zoom_registry.retire_session(session_id);
                 element_cache.retire_session_screenshots(session_id);
                 capture_bindings.retire_session(session_id);

@@ -919,33 +919,70 @@ async fn window_target(args: &Value) -> Result<(i32, u32), ToolResult> {
     let Some(app) = app else {
         return Ok((args.require_i32("pid")?, args.require_u32("window_id")?));
     };
-    let (apps, windows) = tokio::task::spawn_blocking(|| {
-        (
-            crate::apps::list_running_apps(),
-            crate::windows::visible_windows(),
-        )
+    let wanted = app.clone();
+    let (apps, windows, ax_titles) = tokio::task::spawn_blocking(move || {
+        let apps = crate::apps::list_running_apps();
+        let ax_titles = ax_window_titles(&app_pids(&wanted, &apps));
+        (apps, crate::windows::visible_windows(), ax_titles)
     })
     .await
     .map_err(|e| ToolResult::error(format!("app lookup failed: {e}")))?;
-    select_app_window(&app, &apps, &windows)
+    select_app_window(&app, &apps, &windows, &ax_titles)
+}
+
+/// Pids of the running apps whose name (any case) or exact bundle id is `app`.
+fn app_pids(app: &str, apps: &[crate::apps::AppInfo]) -> Vec<i32> {
+    let app = app.trim();
+    let wanted = app.to_lowercase();
+    apps.iter()
+        .filter(|a| a.name.to_lowercase() == wanted || a.bundle_id.as_deref() == Some(app))
+        .map(|a| a.pid)
+        .collect()
+}
+
+/// CG window id -> AXTitle ("" when it has none) for every AX window of `pids`.
+/// Empty when Accessibility is not granted.
+fn ax_window_titles(pids: &[i32]) -> HashMap<u32, String> {
+    use crate::ax::bindings::{
+        ax_get_window_id, copy_ax_windows, copy_string_attr, AXUIElementCreateApplication,
+        AXUIElementSetMessagingTimeout,
+    };
+    use core_foundation::base::{CFRelease, CFTypeRef};
+    let mut titles = HashMap::new();
+    for &pid in pids {
+        unsafe {
+            let app = AXUIElementCreateApplication(pid);
+            if app.is_null() {
+                continue;
+            }
+            let _ = AXUIElementSetMessagingTimeout(app, 1.0);
+            for window in copy_ax_windows(app) {
+                if let Some(id) = ax_get_window_id(window) {
+                    titles.insert(id, copy_string_attr(window, "AXTitle").unwrap_or_default());
+                }
+                CFRelease(window as CFTypeRef);
+            }
+            CFRelease(app as CFTypeRef);
+        }
+    }
+    titles
 }
 
 /// Pick `app`'s window among `windows` (the default `list_windows` set:
-/// current Space, on screen, layer 0). Untitled windows are skipped: they are
-/// helper surfaces such as Chrome's toolbar strips. Several candidates are
-/// refused rather than guessed.
+/// current Space, on screen, layer 0). `ax_titles` maps CG window ids to the
+/// app's AX windows and their AXTitle. A window with an AX window is a
+/// candidate, titled from AX (CG titles are redacted without Screen
+/// Recording); surfaces with none, such as Chrome's toolbar strips, are not.
+/// Without any AX windows (Accessibility not granted), titled CG windows are
+/// the candidates. Several candidates are refused rather than guessed.
 fn select_app_window(
     app: &str,
     apps: &[crate::apps::AppInfo],
     windows: &[crate::windows::WindowInfo],
+    ax_titles: &HashMap<u32, String>,
 ) -> Result<(i32, u32), ToolResult> {
     let app = app.trim();
-    let wanted = app.to_lowercase();
-    let pids: Vec<i32> = apps
-        .iter()
-        .filter(|a| a.name.to_lowercase() == wanted || a.bundle_id.as_deref() == Some(app))
-        .map(|a| a.pid)
-        .collect();
+    let pids = app_pids(app, apps);
     if pids.is_empty() {
         return Err(ToolResult::error(format!(
             "no running app named \"{app}\" (match the app name or bundle id from list_apps). \
@@ -957,13 +994,36 @@ fn select_app_window(
             "suggestion": "call launch_app, or list_windows to find the window"
         })));
     }
-    let mut candidates: Vec<&crate::windows::WindowInfo> = windows
+    let app_windows: Vec<&crate::windows::WindowInfo> =
+        windows.iter().filter(|w| pids.contains(&w.pid)).collect();
+    let ax_known = app_windows
         .iter()
-        .filter(|w| pids.contains(&w.pid) && !w.title.trim().is_empty())
+        .any(|w| ax_titles.contains_key(&w.window_id));
+    let mut candidates: Vec<(&crate::windows::WindowInfo, &str)> = app_windows
+        .iter()
+        .filter_map(|w| {
+            let ax_title = ax_titles.get(&w.window_id).map(|t| t.trim());
+            let title = ax_title.filter(|t| !t.is_empty()).unwrap_or(w.title.trim());
+            match ax_title {
+                Some(_) => Some((*w, title)),
+                None if !ax_known && !title.is_empty() => Some((*w, title)),
+                None => None,
+            }
+        })
         .collect();
-    candidates.sort_by(|a, b| b.z_index.cmp(&a.z_index));
+    candidates.sort_by(|a, b| b.0.z_index.cmp(&a.0.z_index));
     match candidates.as_slice() {
-        [only] => Ok((only.pid, only.window_id)),
+        [(only, _)] => Ok((only.pid, only.window_id)),
+        [] if !app_windows.is_empty() => Err(ToolResult::error(format!(
+            "\"{app}\" has on-screen windows, but none could be identified as a real window. \
+             This may be a permission limit (Accessibility or Screen Recording not granted; \
+             see check_permissions). Call list_windows and pass pid + window_id."
+        ))
+        .with_structured(serde_json::json!({
+            "code": "app_window_unidentified",
+            "app": app,
+            "suggestion": "call check_permissions, or list_windows and pass pid + window_id"
+        }))),
         [] => Err(ToolResult::error(format!(
             "\"{app}\" has no on-screen window on the current Space. Call launch_app to \
              open one, or list_windows to find it."
@@ -976,7 +1036,7 @@ fn select_app_window(
         several => {
             let lines: Vec<String> = several
                 .iter()
-                .map(|w| format!("window_id {} (pid {}): {}", w.window_id, w.pid, w.title))
+                .map(|(w, title)| format!("window_id {} (pid {}): {title}", w.window_id, w.pid))
                 .collect();
             Err(ToolResult::error(format!(
                 "\"{app}\" has {} windows on the current Space; pass pid + window_id for one:\n{}",
@@ -988,10 +1048,10 @@ fn select_app_window(
                 "app": app,
                 "candidates": several
                     .iter()
-                    .map(|w| serde_json::json!({
+                    .map(|(w, title)| serde_json::json!({
                         "window_id": w.window_id,
                         "pid": w.pid,
-                        "title": w.title
+                        "title": title
                     }))
                     .collect::<Vec<_>>(),
                 "suggestion": "pass pid + window_id for one of the candidates"
@@ -1006,6 +1066,16 @@ fn select_app_window(
 /// snapshot diff baseline uses, so a second client still gets its own copy.
 pub(crate) type BackgroundInputKey = (Option<String>, i32, u32);
 
+pub(crate) type BackgroundInputSent = std::sync::Mutex<HashMap<BackgroundInputKey, Value>>;
+
+/// Forget what an ended session was sent, so a session restarted under the
+/// same name gets `background_input` again on its first read.
+pub(crate) fn retire_background_input(sent: &BackgroundInputSent, session_id: &str) {
+    sent.lock()
+        .unwrap()
+        .retain(|(session, _, _), _| session.as_deref() != Some(session_id));
+}
+
 /// Whether this look should carry `report`: the first for its key, a changed
 /// report, or a full look. Records what was sent.
 fn background_input_is_news(
@@ -1017,8 +1087,8 @@ fn background_input_is_news(
     if !full_look && sent.get(&key) == Some(report) {
         return false;
     }
-    // ponytail: wholesale reset bounds memory across closed windows and ended
-    // sessions; each key then re-sends once. Evict per session if that shows up.
+    // ponytail: wholesale reset bounds memory across closed windows; each key
+    // then re-sends once. Ended sessions are retired by the session-end hook.
     if sent.len() >= 512 && !sent.contains_key(&key) {
         sent.clear();
     }
@@ -1549,44 +1619,122 @@ mod app_target_tests {
         (text, result.structured_content.expect("structured refusal"))
     }
 
+    fn no_ax() -> HashMap<u32, String> {
+        HashMap::new()
+    }
+
+    fn ax(entries: &[(u32, &str)]) -> HashMap<u32, String> {
+        entries.iter().map(|(id, t)| (*id, t.to_string())).collect()
+    }
+
     #[test]
     fn one_titled_window_is_the_target() {
         let apps = [
             app("Google Chrome", 10, "com.google.Chrome"),
             app("TextEdit", 20, "com.apple.TextEdit"),
         ];
-        // Chrome's untitled toolbar strips are not candidates.
+        // Without AX windows, Chrome's untitled toolbar strips are not candidates.
         let windows = [
             window(1, 10, "", 3),
             window(2, 10, "Docs", 2),
             window(3, 20, "Untitled", 1),
         ];
         assert_eq!(
-            select_app_window("google chrome", &apps, &windows).unwrap(),
+            select_app_window("google chrome", &apps, &windows, &no_ax()).unwrap(),
             (10, 2)
         );
         assert_eq!(
-            select_app_window("com.apple.TextEdit", &apps, &windows).unwrap(),
+            select_app_window("com.apple.TextEdit", &apps, &windows, &no_ax()).unwrap(),
             (20, 3)
         );
         // Bundle ids match exactly, names ignore case only.
-        assert!(select_app_window("com.apple.textedit", &apps, &windows).is_err());
-        assert!(select_app_window("Chrome", &apps, &windows).is_err());
+        assert!(select_app_window("com.apple.textedit", &apps, &windows, &no_ax()).is_err());
+        assert!(select_app_window("Chrome", &apps, &windows, &no_ax()).is_err());
+    }
+
+    /// Without Screen Recording every CG title is empty; AX still names the
+    /// real window, and toolbar strips have no AX window.
+    #[test]
+    fn redacted_cg_titles_resolve_through_ax_windows() {
+        let apps = [app("Google Chrome", 10, "com.google.Chrome")];
+        let windows = [
+            window(1, 10, "", 3),
+            window(2, 10, "", 2),
+            window(5, 10, "", 1),
+        ];
+        assert_eq!(
+            select_app_window("Google Chrome", &apps, &windows, &ax(&[(2, "Docs")])).unwrap(),
+            (10, 2)
+        );
+        // An AX window with an empty AXTitle is still a real window.
+        assert_eq!(
+            select_app_window("Google Chrome", &apps, &windows, &ax(&[(5, "")])).unwrap(),
+            (10, 5)
+        );
+    }
+
+    #[test]
+    fn titled_cg_surfaces_without_an_ax_window_are_ignored() {
+        let apps = [app("Google Chrome", 10, "com.google.Chrome")];
+        let windows = [window(1, 10, "Strip", 3), window(2, 10, "Docs", 2)];
+        assert_eq!(
+            select_app_window("Google Chrome", &apps, &windows, &ax(&[(2, "Docs")])).unwrap(),
+            (10, 2)
+        );
+    }
+
+    #[test]
+    fn two_ax_windows_are_listed_with_ax_titles() {
+        let apps = [app("TextEdit", 20, "com.apple.TextEdit")];
+        let windows = [
+            window(3, 20, "", 1),
+            window(4, 20, "", 2),
+            window(6, 20, "", 3),
+        ];
+        let (text, s) = refusal(select_app_window(
+            "TextEdit",
+            &apps,
+            &windows,
+            &ax(&[(3, "A.txt"), (4, "B.txt")]),
+        ));
+        assert_eq!(s["code"], "app_window_ambiguous");
+        assert_eq!(
+            s["candidates"],
+            serde_json::json!([
+                {"window_id": 4, "pid": 20, "title": "B.txt"},
+                {"window_id": 3, "pid": 20, "title": "A.txt"}
+            ])
+        );
+        assert!(text.contains("window_id 3 (pid 20): A.txt"), "{text}");
     }
 
     #[test]
     fn no_window_or_no_app_is_refused_with_a_next_step() {
         let apps = [app("TextEdit", 20, "com.apple.TextEdit")];
+        let (text, s) = refusal(select_app_window("TextEdit", &apps, &[], &no_ax()));
+        assert_eq!(s["code"], "app_window_not_found");
+        assert!(text.contains("launch_app") && text.contains("list_windows"));
+        let (text, s) = refusal(select_app_window("Notes", &apps, &[], &no_ax()));
+        assert_eq!(s["code"], "app_not_running");
+        assert!(text.contains("launch_app") && text.contains("list_windows"));
+    }
+
+    /// Windows exist but neither AX nor CG titles identify one: say it may be
+    /// permissions instead of telling the agent to launch an open app.
+    #[test]
+    fn unidentifiable_windows_point_at_permissions() {
+        let apps = [app("TextEdit", 20, "com.apple.TextEdit")];
         let (text, s) = refusal(select_app_window(
             "TextEdit",
             &apps,
             &[window(9, 20, "", 0)],
+            &no_ax(),
         ));
-        assert_eq!(s["code"], "app_window_not_found");
-        assert!(text.contains("launch_app") && text.contains("list_windows"));
-        let (text, s) = refusal(select_app_window("Notes", &apps, &[]));
-        assert_eq!(s["code"], "app_not_running");
-        assert!(text.contains("launch_app") && text.contains("list_windows"));
+        assert_eq!(s["code"], "app_window_unidentified");
+        assert!(
+            text.contains("permission") && !text.contains("launch_app"),
+            "{text}"
+        );
     }
 
     #[test]
@@ -1597,7 +1745,7 @@ mod app_target_tests {
             app("TextEdit", 21, "com.apple.TextEdit"),
         ];
         let windows = [window(3, 20, "A.txt", 1), window(4, 21, "B.txt", 2)];
-        let (text, s) = refusal(select_app_window("TextEdit", &apps, &windows));
+        let (text, s) = refusal(select_app_window("TextEdit", &apps, &windows, &no_ax()));
         assert_eq!(s["code"], "app_window_ambiguous");
         assert_eq!(
             s["candidates"],
@@ -1608,6 +1756,34 @@ mod app_target_tests {
         );
         assert!(text.contains("window_id 3 (pid 20): A.txt"), "{text}");
         assert!(text.contains("pass pid + window_id"), "{text}");
+    }
+
+    #[test]
+    fn ended_session_gets_background_input_again() {
+        let sent = BackgroundInputSent::default();
+        let report = serde_json::json!({"routes": []});
+        let key = |s: &str| (Some(s.to_owned()), 7, 9);
+        assert!(background_input_is_news(
+            &mut sent.lock().unwrap(),
+            key("a"),
+            &report,
+            false
+        ));
+        assert!(background_input_is_news(
+            &mut sent.lock().unwrap(),
+            key("b"),
+            &report,
+            false
+        ));
+        retire_background_input(&sent, "a");
+        assert!(
+            background_input_is_news(&mut sent.lock().unwrap(), key("a"), &report, false),
+            "restarted session's first read"
+        );
+        assert!(
+            !background_input_is_news(&mut sent.lock().unwrap(), key("b"), &report, false),
+            "other session untouched"
+        );
     }
 
     #[test]
