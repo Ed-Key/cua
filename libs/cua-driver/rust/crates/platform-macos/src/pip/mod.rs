@@ -343,6 +343,9 @@ struct Panel {
     close: usize,
     /// Back card views, depth 1 then 2.
     backs: [BackView; MAX_CARDS - 1],
+    /// Each depth's hit plate (see `new_hit_plate`), framed and hidden with
+    /// its card.
+    plates: [usize; MAX_CARDS],
     /// Windows the session acted in, front card first.
     cards: CardStack<Tag, CardInfo>,
     /// Each depth's animated offset from its resting frame.
@@ -427,8 +430,9 @@ struct Gesture {
     origin: (f64, f64),
     /// Front card edges being resized (0 = not a resize).
     edges: u8,
-    /// The card pressed, front = 0.
-    depth: Option<usize>,
+    /// The window of the back card pressed: a click raises that window, not
+    /// whatever sits at the pressed depth when the button comes up.
+    pressed: Option<Tag>,
     /// The pointer went past `DRAG_SLOP`: a drag, not a click.
     moved: bool,
     /// Largest front card on the panel's screen.
@@ -643,9 +647,18 @@ impl CaptureWorker {
     }
 
     /// Enqueue only; never captures, never blocks on a capture.
+    ///
+    /// A session's first frame sets its polled target; after that only
+    /// `retarget` does (the panel's displayed target is the one source of
+    /// truth), so polls keep answering for what the panel shows while this
+    /// frame is captured.
     fn push(&self, frame: PipFrame) {
         let target = (frame.target_pid, frame.target_window_id);
-        lock(&self.active).insert(frame.session_key.clone(), (target, Instant::now()));
+        let now = Instant::now();
+        lock(&self.active)
+            .entry(frame.session_key.clone())
+            .and_modify(|(_, pushed)| *pushed = now)
+            .or_insert((target, now));
         let epoch = lock(&self.epochs).stamp(&frame.session_key);
         lock(&self.queue).push(frame.session_key.clone(), (frame, epoch));
         self.ready.notify_one();
@@ -679,8 +692,8 @@ impl CaptureWorker {
         lock(&self.watched).insert(session_key.to_owned(), windows);
     }
 
-    /// The user brought a back card to the front: polls follow its window
-    /// until the session's next frame.
+    /// The panel now shows `target`: polls answer for it. Called in the same
+    /// step as every change of the displayed target (`set_panel_target`).
     fn retarget(&self, session_key: &str, target: Target) {
         if let Some((current, _)) = lock(&self.active).get_mut(session_key) {
             *current = target;
@@ -1023,7 +1036,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     if restacked {
         announce_stack(panel, &key);
     }
-    panel.target = new_target;
+    set_panel_target(panel, &key, &worker, new_target);
     panel.target_visible = target_visible;
     panel.resolved_window = resolved_window;
     panel.dismissed = false;
@@ -1198,12 +1211,19 @@ unsafe fn raise_card(state: &mut State, key: &str, tag: Tag) {
     show_target(panel, pid, Some(title));
     set_text(panel.status, &status);
     announce_stack(panel, key);
-    panel.target = tag;
+    set_panel_target(panel, key, &worker, tag);
     panel.resolved_window = tag.1;
     // Shown until the poll says otherwise for this window.
     panel.target_visible = false;
-    worker.retarget(key, tag);
     refresh(state, key);
+}
+
+/// The only place the panel's displayed target changes: the visibility
+/// poll is pointed at the same target in the same step, so its answers are
+/// never rejected as being about another target.
+fn set_panel_target(panel: &mut Panel, key: &str, worker: &CaptureWorker, target: Target) {
+    panel.target = target;
+    worker.retarget(key, target);
 }
 
 unsafe extern "C" fn idle_check_cb(ctx: *mut c_void) {
@@ -1816,9 +1836,11 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     };
     let rect = NSRect::new(NSPoint::new(origin.0, origin.1), NSSize::new(width, height));
 
-    // NSWindowStyleMaskBorderless (0) | Resizable (1 << 3) |
-    // NonactivatingPanel (1 << 7)
-    let style_mask: u64 = (1 << 3) | (1 << 7);
+    // NSWindowStyleMaskBorderless (0) | NonactivatingPanel (1 << 7). Not
+    // Resizable: the panel resizes itself from the band inside the front
+    // card's edges (one path, clamped by `resize_window`), so AppKit's own
+    // edge tracking on a borderless window never competes for those presses.
+    let style_mask: u64 = 1 << 7;
     let window: *mut AnyObject = msg_send![panel_class(), alloc];
     let window: *mut AnyObject = msg_send![
         window,
@@ -1844,13 +1866,6 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let _: () = msg_send![window, setBackgroundColor: clear];
     let _: () = msg_send![window, setOpaque: false];
     let _: () = msg_send![window, setHasShadow: true];
-    // Bounds for any resizing AppKit does itself; the panel's own resize
-    // clamps to the same.
-    let max = visible_frame_of(window).map_or(card, |visible| max_card((visible.w, visible.h)));
-    let (min_w, min_h) = window_size(MIN_CARD);
-    let (max_w, max_h) = window_size(max);
-    let _: () = msg_send![window, setContentMinSize: NSSize::new(min_w, min_h)];
-    let _: () = msg_send![window, setContentMaxSize: NSSize::new(max_w, max_h)];
     let name = label.map(str::to_owned).unwrap_or_else(|| short_key(key));
     let _: () = msg_send![window, setTitle: ns_string(&format!("cua PiP · {name}"))];
 
@@ -1884,6 +1899,17 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let _: () = msg_send![stack_view, addTrackingArea: tracking];
     let _: () = msg_send![tracking, release];
 
+    // Hit plates under the cards, bottom-most: WindowServer passes presses
+    // on fully transparent pixels to the window below (activating it), and
+    // a card's rounded corners are transparent. A near-invisible square fill
+    // under every drawn card keeps each press on a card, its corners and
+    // resize band included, in this panel. The margin elsewhere stays clear
+    // and click-through.
+    let plates = [
+        new_hit_plate(stack_view),
+        new_hit_plate(stack_view),
+        new_hit_plate(stack_view),
+    ];
     // Back cards, deepest first so depth 1 draws over depth 2.
     let back2 = new_back_card(stack_view, card, 2, session_color(0.5), session_color(0.16));
     let back1 = new_back_card(stack_view, card, 1, session_color(0.5), session_color(0.16));
@@ -2007,6 +2033,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         focus: focus as usize,
         close: close as usize,
         backs: [back1, back2],
+        plates,
         cards: CardStack::new(),
         motion: Default::default(),
         card,
@@ -2027,6 +2054,25 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     };
     apply_card_frames(&mut panel);
     Some(panel)
+}
+
+/// A square view with an almost transparent fill (alpha 0.01, invisible)
+/// in `parent`, so presses on it are never passed to the window below.
+unsafe fn new_hit_plate(parent: *mut AnyObject) -> usize {
+    let plate = new_view(class!(NSView), NSRect::ZERO);
+    let _: () = msg_send![plate, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![plate, layer];
+    let fill: *mut AnyObject = msg_send![
+        class!(NSColor),
+        colorWithSRGBRed: 1.0_f64
+        green: 1.0_f64
+        blue: 1.0_f64
+        alpha: 0.01_f64
+    ];
+    let fill: *mut CGColor = msg_send![fill, CGColor];
+    let _: () = msg_send![layer, setBackgroundColor: fill];
+    add_subview(parent, plate);
+    plate as usize
 }
 
 /// A back card inside `parent`: glass under a title strip (app icon and
@@ -2226,6 +2272,7 @@ unsafe fn apply_card_frames(panel: &mut Panel) {
     let frames = displayed_frames(panel);
     for (depth, frame) in frames.iter().enumerate() {
         set_frame(card_view(panel, depth), *frame);
+        set_frame(panel.plates[depth], *frame);
     }
     layout_front(panel, (frames[0].w, frames[0].h));
     // The window shadow follows the cards' outline once they are at rest.
@@ -2238,6 +2285,8 @@ unsafe fn apply_card_frames(panel: &mut Panel) {
 unsafe fn render_backs(panel: &Panel) {
     for depth in 1..MAX_CARDS {
         let back = &panel.backs[depth - 1];
+        let shown = depth < panel.cards.len();
+        let _: () = msg_send![panel.plates[depth] as *mut AnyObject, setHidden: !shown];
         let Some(card) = panel.cards.cards().get(depth) else {
             let _: () = msg_send![back.view as *mut AnyObject, setHidden: true];
             let _: () = msg_send![
@@ -2404,6 +2453,12 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
             } else {
                 0
             };
+            let pressed = depth
+                .filter(|depth| *depth > 0)
+                .and_then(|depth| panel.cards.cards().get(depth))
+                .map(|card| card.key);
+            let region = stack::press_region(point, depth, edges, frames[0]);
+            tracing::info!(target: "pip", session = %key, region, x = point.0, y = point.1, "PiP panel press");
             let key = key.clone();
             state.gesture = Some(Gesture {
                 key,
@@ -2411,7 +2466,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
                 start: area_of(frame),
                 origin: (frame.origin.x, frame.origin.y),
                 edges,
-                depth,
+                pressed,
                 moved: false,
                 max,
             });
@@ -2474,13 +2529,10 @@ extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyO
             panel.slot = None;
             return;
         }
-        // A click (not a resize) on a back card raises it.
-        let tag = gesture
-            .depth
-            .filter(|depth| *depth > 0 && gesture.edges == 0)
-            .and_then(|depth| panel.cards.cards().get(depth))
-            .map(|card| card.key);
-        if let Some(tag) = tag {
+        // A click (not a resize) on a back card raises its window, if that
+        // window is still behind the front card.
+        let pressed = gesture.pressed.filter(|_| gesture.edges == 0);
+        if let Some(tag) = stack::click_target(pressed, &panel.cards.keys()) {
             unsafe { raise_card(state, &gesture.key, tag) };
         }
     });
@@ -3258,6 +3310,32 @@ mod tests {
         release.send(()).unwrap();
         assert_eq!(recv(&delivered), ("third".to_owned(), Some((7, vec![1]))));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn polling_follows_the_displayed_target_across_a_click_and_an_in_flight_capture() {
+        let (worker, _delivered) = worker(Arc::new(|_| None), Duration::from_secs(5));
+        let polled = |worker: &CaptureWorker| worker.active_targets(Instant::now())[0].1;
+        let a = (Some(42), Some(7));
+        let (b, c) = ((Some(42), Some(8)), (Some(43), Some(9)));
+        // The first frame sets the polled target.
+        worker.push(frame("s", "act in A"));
+        assert_eq!(polled(&worker), a);
+        // The user clicks back card B: the panel shows B, polls follow.
+        worker.retarget("s", b);
+        assert_eq!(polled(&worker), b);
+        // A new action's push does not move polling away from what the
+        // panel shows while its capture runs.
+        worker.push(PipFrame {
+            target_pid: c.0,
+            target_window_id: c.1,
+            ..frame("s", "act in C")
+        });
+        assert_eq!(polled(&worker), b);
+        // A capture of A that was in flight lands: the panel shows A again
+        // and polling moves with it in the same step.
+        worker.retarget("s", a);
+        assert_eq!(polled(&worker), a);
     }
 
     #[test]

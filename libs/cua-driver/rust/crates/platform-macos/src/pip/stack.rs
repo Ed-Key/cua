@@ -139,6 +139,17 @@ pub(super) fn previous_depths<K: PartialEq>(old: &[K], new: &[K]) -> Vec<Option<
         .collect()
 }
 
+/// The window a click raises: the back card pressed (`pressed`, taken at
+/// mouse-down) if it is still a back card in `keys` when the button comes
+/// up; `None` (cancel) if it dropped or already came to the front.
+pub(super) fn click_target<K: PartialEq + Copy>(pressed: Option<K>, keys: &[K]) -> Option<K> {
+    let pressed = pressed?;
+    keys.iter()
+        .skip(1)
+        .any(|key| *key == pressed)
+        .then_some(pressed)
+}
+
 /// The tag rule for back cards: a card shows a still only if the still was
 /// captured from the card's own window.
 pub(super) fn own_pixels<K: PartialEq, P>(key: K, still: Option<&(K, P)>) -> Option<&P> {
@@ -295,6 +306,24 @@ pub(super) const TOP: u8 = 1 << 0;
 pub(super) const LEFT: u8 = 1 << 1;
 pub(super) const BOTTOM: u8 = 1 << 2;
 pub(super) const RIGHT: u8 = 1 << 3;
+
+/// Where a press on the panel landed, for logs: "margin", "back-card",
+/// "corner" or "edge" (the front card's resize band), "header", "body".
+pub(super) fn press_region(
+    point: (f64, f64),
+    depth: Option<usize>,
+    edges: u8,
+    front: Area,
+) -> &'static str {
+    match depth {
+        None => "margin",
+        Some(0) if edges.count_ones() == 2 => "corner",
+        Some(0) if edges != 0 => "edge",
+        Some(0) if point.1 >= front.y + front.h - HEADER_HEIGHT => "header",
+        Some(0) => "body",
+        Some(_) => "back-card",
+    }
+}
 
 /// Which edges of the front card `point` is on (0 = none): within
 /// `RESIZE_BAND` inside an edge, corners combining two.
@@ -518,6 +547,19 @@ mod tests {
             previous_depths(&[1, 2], &[4, 1, 2]),
             [None, Some(0), Some(1)]
         );
+    }
+
+    #[test]
+    fn a_click_raises_the_pressed_window_even_if_the_stack_reordered() {
+        // [A, B, C], press B; an action in C reorders to [C, A, B] before
+        // the button comes up: B is raised, not A (now at B's old depth).
+        let (a, b, c) = (1, 2, 3);
+        assert_eq!(click_target(Some(b), &[c, a, b]), Some(b));
+        // B dropped meanwhile, or an action already brought it to the
+        // front: the click is cancelled.
+        assert_eq!(click_target(Some(b), &[c, a]), None);
+        assert_eq!(click_target(Some(b), &[b, c, a]), None);
+        assert_eq!(click_target::<u32>(None, &[c, a, b]), None);
     }
 
     #[test]
@@ -745,6 +787,31 @@ mod tests {
             0,
             "outside the card"
         );
+    }
+
+    #[test]
+    fn presses_are_classified_by_region() {
+        let frames: Vec<Area> = (0..MAX_CARDS)
+            .map(|depth| rest_frame(CARD, depth))
+            .collect();
+        let front = frames[0];
+        let region = |point: (f64, f64)| {
+            let depth = card_at(point, &frames);
+            let edges = if depth == Some(0) {
+                resize_edges(point, front)
+            } else {
+                0
+            };
+            press_region(point, depth, edges, front)
+        };
+        // 3 pt inside the window's bottom-right corner: the front card's
+        // resize corner (this press used to fall through the panel).
+        assert_eq!(region((front.x + front.w - 3.0, 3.0)), "corner");
+        assert_eq!(region((front.x + front.w - 3.0, front.h / 2.0)), "edge");
+        assert_eq!(region((front.x + front.w / 2.0, front.h - 12.0)), "header");
+        assert_eq!(region((front.x + front.w / 2.0, front.h / 2.0)), "body");
+        assert_eq!(region((front.x + 40.0, front.h + 7.0)), "back-card");
+        assert_eq!(region((1.0, 1.0)), "margin");
     }
 
     #[test]
