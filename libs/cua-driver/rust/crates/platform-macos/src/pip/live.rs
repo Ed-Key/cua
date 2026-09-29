@@ -84,13 +84,26 @@ pub(super) fn stream_step(
 pub(super) struct StreamState {
     pub(super) requested: Option<Target>,
     generation: u64,
+    /// Image well size (points) the stream was last sized for.
+    well: (f64, f64),
 }
 
 impl StreamState {
     /// Generations are handed out from 1, so 0 never matches an event.
-    pub(super) fn begin(&mut self, target: Target, generation: u64) {
+    pub(super) fn begin(&mut self, target: Target, generation: u64, well: (f64, f64)) {
         self.requested = Some(target);
         self.generation = generation;
+        self.well = well;
+    }
+
+    /// Whether a running stream must be reconfigured for a new `well`.
+    /// Records the new size when it must.
+    pub(super) fn needs_resize(&mut self, well: (f64, f64)) -> bool {
+        let running = self.generation != 0 && self.well != well;
+        if running {
+            self.well = well;
+        }
+        running
     }
 
     pub(super) fn stop(&mut self) {
@@ -114,17 +127,26 @@ impl StreamState {
     }
 }
 
-/// Stream size in pixels for a `window`-point window shown aspect-fit in a
-/// `well`-point image well. Never upscales a window smaller than the well.
-pub(super) fn stream_pixel_size(window: (f64, f64), well: (f64, f64)) -> (u32, u32) {
-    let (w, h) = if window.0 > 0.0 && window.1 > 0.0 {
-        let fit = (well.0 / window.0).min(well.1 / window.1).min(1.0);
-        (window.0 * fit, window.1 * fit)
-    } else {
-        well
-    };
+/// Stream buffer size in pixels for a `well`-point image well: the whole
+/// well at [`PIXEL_SCALE`], whatever the window's bounds. ScreenCaptureKit
+/// scales the window into it preserving aspect, so a window that changes
+/// shape needs no reconfiguration.
+pub(super) fn stream_pixel_size(well: (f64, f64)) -> (u32, u32) {
     let px = |points: f64| (points * PIXEL_SCALE).round().max(2.0) as u32;
-    (px(w), px(h))
+    (px(well.0), px(well.1))
+}
+
+/// Stream configuration for a `well`-point image well.
+fn stream_config(well: (f64, f64)) -> SCStreamConfiguration {
+    let (width, height) = stream_pixel_size(well);
+    SCStreamConfiguration::new()
+        .with_width(width)
+        .with_height(height)
+        .with_scales_to_fit(true)
+        .with_preserves_aspect_ratio(true)
+        .with_shows_cursor(false)
+        .with_queue_depth(QUEUE_DEPTH)
+        .with_minimum_frame_interval(&CMTime::new(1, LIVE_FPS))
 }
 
 /// Newest undelivered frame of one stream.
@@ -148,6 +170,8 @@ pub(super) enum Request {
         /// Image well size in points.
         well: (f64, f64),
     },
+    /// The panel's image well changed size; reconfigure the running stream.
+    Resize { well: (f64, f64) },
     Stop,
 }
 
@@ -174,6 +198,14 @@ impl Streams {
                 let mut running: HashMap<String, SCStream> = HashMap::new();
                 loop {
                     let (key, request) = looping.next();
+                    if let Request::Resize { well } = request {
+                        if let Some(stream) = running.get(&key) {
+                            if let Err(error) = stream.update_configuration(&stream_config(well)) {
+                                tracing::info!(target: "pip", %error, "PiP live stream resize failed");
+                            }
+                        }
+                        continue;
+                    }
                     if let Some(old) = running.remove(&key) {
                         let _ = old.stop_capture();
                     }
@@ -201,7 +233,16 @@ impl Streams {
 
     /// Queue a request; never blocks on ScreenCaptureKit.
     pub(super) fn request(&self, key: &str, request: Request) {
-        lock(&self.requests).push(key.to_owned(), request);
+        {
+            let mut requests = lock(&self.requests);
+            match (request, requests.latest.get_mut(key)) {
+                // Not started yet: it just starts at the new size.
+                (Request::Resize { well: new }, Some(Request::Start { well, .. })) => *well = new,
+                // About to stop: nothing to resize.
+                (Request::Resize { .. }, Some(Request::Stop)) => {}
+                (request, _) => requests.push(key.to_owned(), request),
+            }
+        }
         self.ready.notify_one();
     }
 
@@ -233,19 +274,11 @@ fn open(
         .into_iter()
         .find(|window| window.window_id() == window_id)
         .ok_or_else(|| anyhow::anyhow!("window {window_id} is not shareable"))?;
-    let frame = window.frame();
-    let (width, height) = stream_pixel_size((frame.size.width, frame.size.height), well);
+    let (width, height) = stream_pixel_size(well);
 
     // Captures only this window, wherever it is and whatever covers it.
     let filter = SCContentFilter::create().with_window(&window).build();
-    let config = SCStreamConfiguration::new()
-        .with_width(width)
-        .with_height(height)
-        .with_scales_to_fit(true)
-        .with_preserves_aspect_ratio(true)
-        .with_shows_cursor(false)
-        .with_queue_depth(QUEUE_DEPTH)
-        .with_minimum_frame_interval(&CMTime::new(1, LIVE_FPS));
+    let config = stream_config(well);
 
     let ended = deliver.clone();
     let ended_key = key.to_owned();
@@ -374,7 +407,7 @@ mod tests {
     #[test]
     fn a_frame_arriving_after_the_stream_ended_is_dropped() {
         let mut state = StreamState::default();
-        state.begin(A, 3);
+        state.begin(A, 3, (320.0, 200.0));
         assert!(state.accepts(3));
         assert!(state.end(3));
         // SCK's sample handler can still deliver a frame of generation 3.
@@ -388,28 +421,57 @@ mod tests {
         assert!(!state.end(3));
         assert!(!state.end(2));
         // A new stream gets a fresh generation and works again.
-        state.begin(B, 4);
+        state.begin(B, 4, (320.0, 200.0));
         assert!(state.accepts(4) && !state.accepts(3));
         state.stop();
         assert!(!state.accepts(4) && state.requested.is_none());
     }
 
     #[test]
-    fn stream_size_fits_the_well_at_retina_scale() {
-        // A 1600x1000 window in a 320x200 well: exact fit, doubled.
-        assert_eq!(
-            stream_pixel_size((1600.0, 1000.0), (320.0, 200.0)),
-            (640, 400)
+    fn stream_buffer_is_the_whole_well_at_retina_scale() {
+        // Independent of the window: a 320x200 well is always 640x400.
+        assert_eq!(stream_pixel_size((320.0, 200.0)), (640, 400));
+        assert_eq!(stream_pixel_size((100.0, 50.0)), (200, 100));
+        assert_eq!(stream_pixel_size((0.0, 0.0)), (2, 2));
+    }
+
+    #[test]
+    fn a_running_stream_resizes_only_when_the_well_changes() {
+        let mut state = StreamState::default();
+        state.begin(A, 1, (320.0, 200.0));
+        assert!(!state.needs_resize((320.0, 200.0)));
+        assert!(state.needs_resize((400.0, 250.0)));
+        assert!(!state.needs_resize((400.0, 250.0)));
+        // No running stream: nothing to reconfigure.
+        state.stop();
+        assert!(!state.needs_resize((500.0, 300.0)));
+    }
+
+    #[test]
+    fn a_resize_folds_into_a_pending_start_and_dies_with_a_pending_stop() {
+        let streams = Streams {
+            requests: Mutex::new(LatestPerSession::new()),
+            ready: Condvar::new(),
+        };
+        streams.request(
+            "s",
+            Request::Start {
+                generation: 1,
+                target: A,
+                well: (320.0, 200.0),
+            },
         );
-        // A tall window is limited by the well's height.
-        assert_eq!(
-            stream_pixel_size((400.0, 1000.0), (320.0, 200.0)),
-            (160, 400)
-        );
-        // A window smaller than the well is not upscaled.
-        assert_eq!(stream_pixel_size((100.0, 50.0), (320.0, 200.0)), (200, 100));
-        // Unknown window size falls back to the well.
-        assert_eq!(stream_pixel_size((0.0, 0.0), (320.0, 200.0)), (640, 400));
+        streams.request("s", Request::Resize { well: (400.0, 250.0) });
+        assert!(matches!(
+            streams.next(),
+            (_, Request::Start { generation: 1, well, .. }) if well == (400.0, 250.0)
+        ));
+        streams.request("t", Request::Stop);
+        streams.request("t", Request::Resize { well: (1.0, 1.0) });
+        assert!(matches!(streams.next(), (key, Request::Stop) if key == "t"));
+        // With nothing pending, a resize is queued for the stream thread.
+        streams.request("u", Request::Resize { well: (1.0, 1.0) });
+        assert!(matches!(streams.next(), (key, Request::Resize { .. }) if key == "u"));
     }
 
     #[test]

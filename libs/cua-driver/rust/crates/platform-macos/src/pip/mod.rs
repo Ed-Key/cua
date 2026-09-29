@@ -950,7 +950,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
     ) {
         StreamStep::Start(target) => {
             *next_stream_generation += 1;
-            panel.stream.begin(target, *next_stream_generation);
+            panel.stream.begin(target, *next_stream_generation, *image_size);
             // Never show one window's live pixels as another's preview.
             clear_live(panel);
             streams.request(
@@ -972,7 +972,11 @@ unsafe fn refresh(state: &mut State, key: &str) {
                 clear_live(panel);
             }
         }
-        StreamStep::Keep => {}
+        StreamStep::Keep => {
+            if panel.stream.needs_resize(*image_size) {
+                streams.request(key, Request::Resize { well: *image_size });
+            }
+        }
     }
     sync_layers(panel);
 }
