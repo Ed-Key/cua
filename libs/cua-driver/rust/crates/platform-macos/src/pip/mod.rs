@@ -2115,7 +2115,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
     remove_finale_view(panel);
     let (well_w, well_h) = well_size(panel.card);
     let overlay = new_view(
-        class!(NSView),
+        decor_view_class(),
         ns_rect(Area {
             x: PAD,
             y: PAD,
@@ -2815,7 +2815,7 @@ unsafe fn session_ns_color(key: &str) -> *mut AnyObject {
 /// A halo view in `parent`: a hosted layer that shows a glow image (see
 /// `halo_image`) at opacity 0 until the session acts.
 unsafe fn new_halo(parent: *mut AnyObject) -> usize {
-    let view = new_view(class!(NSView), NSRect::ZERO);
+    let view = new_view(decor_view_class(), NSRect::ZERO);
     let layer = host_layer(view);
     let _: () = msg_send![layer, setContentsGravity: ns_string("resize")];
     let _: () = msg_send![layer, setContentsScale: backing_scale()];
@@ -3141,7 +3141,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     add_subview(body, live_view);
 
     // The agent cursor's sprite, clipped to the well, above the pixels.
-    let cursor_view = new_view(class!(NSView), NSRect::ZERO);
+    let cursor_view = new_view(decor_view_class(), NSRect::ZERO);
     let _: () = msg_send![cursor_view, setWantsLayer: true];
     let clip_layer: *mut AnyObject = msg_send![cursor_view, layer];
     let _: () = msg_send![clip_layer, setMasksToBounds: true];
@@ -3154,7 +3154,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     add_subview(body, cursor_view);
 
     // The empty well: the target's icon, dimmed, over a quiet line.
-    let placeholder = new_view(class!(NSView), NSRect::ZERO);
+    let placeholder = new_view(decor_view_class(), NSRect::ZERO);
     let placeholder_icon = new_icon_view(NSRect::new(
         NSPoint::new(0.0, 18.0),
         NSSize::new(PLACEHOLDER_ICON, PLACEHOLDER_ICON),
@@ -3175,7 +3175,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
 
     // The action caption: white on a soft dark gradient inside the well's
     // bottom, shown for a moment after each action.
-    let caption = new_view(class!(NSView), NSRect::ZERO);
+    let caption = new_view(decor_view_class(), NSRect::ZERO);
     let _: () = msg_send![caption, setWantsLayer: true];
     let gradient: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
     let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
@@ -4161,6 +4161,26 @@ fn stack_view_class() -> &'static AnyClass {
             builder.add_method(
                 sel!(setFrameSize:),
                 stack_set_frame_size as extern "C" fn(_, _, _),
+            );
+        })
+    })
+}
+
+extern "C" fn decor_hit_test(_this: *mut AnyObject, _cmd: Sel, _point: NSPoint) -> *mut AnyObject {
+    std::ptr::null_mut()
+}
+
+/// A view that only decorates (the halo, the cursor sprite, the caption,
+/// the placeholder, the finale overlay): it and everything in it are
+/// never hit, so presses reach what is under them (the header buttons,
+/// or the stack view for a drag).
+fn decor_view_class() -> &'static AnyClass {
+    static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
+    CLASS.get_or_init(|| {
+        register_class("CuaPipDecor", class!(NSView), |builder| unsafe {
+            builder.add_method(
+                sel!(hitTest:),
+                decor_hit_test as extern "C" fn(_, _, _) -> _,
             );
         })
     })
