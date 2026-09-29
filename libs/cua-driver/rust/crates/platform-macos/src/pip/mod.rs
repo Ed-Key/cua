@@ -159,6 +159,12 @@ unsafe impl objc2::RefEncode for CGPath {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPathCreateMutable() -> *mut CGPath;
+    fn CGPathCreateWithRoundedRect(
+        rect: NSRect,
+        corner_width: f64,
+        corner_height: f64,
+        transform: *const c_void,
+    ) -> *mut CGPath;
     fn CGPathMoveToPoint(path: *mut CGPath, transform: *const c_void, x: f64, y: f64);
     fn CGPathAddLineToPoint(path: *mut CGPath, transform: *const c_void, x: f64, y: f64);
     fn CGPathRelease(path: *mut CGPath);
@@ -172,18 +178,26 @@ extern "C" {
 // ── Tunables ──────────────────────────────────────────────────────────────
 
 const IDLE_HIDE_AFTER: Duration = Duration::from_secs(8);
-const FADE: Duration = Duration::from_millis(250);
-const CORNER_RADIUS: f64 = 14.0;
-const BORDER_WIDTH: f64 = 2.0;
-const HEADER_HEIGHT: f64 = 28.0;
-const STATUS_HEIGHT: f64 = 16.0;
-const PAD: f64 = 8.0;
-/// Radius of the image well (and a back card's still), inside the card's.
-const WELL_RADIUS: f64 = 8.0;
+const FADE: Duration = Duration::from_millis(200);
+const CORNER_RADIUS: f64 = 16.0;
+const HEADER_HEIGHT: f64 = 24.0;
+const PAD: f64 = 6.0;
+/// Radius of the image well (and a back card's still): concentric with the
+/// card's corners.
+const WELL_RADIUS: f64 = CORNER_RADIUS - PAD;
+/// The session-colored glow around the front card (and each chip): where
+/// the agent's color lives, instead of a border.
+const HALO_RADIUS: f64 = 12.0;
+const HALO_OPACITY: f64 = 0.55;
+/// The action caption inside the well: its height, how long it stays after
+/// an action, and its fade.
+const CAPTION_HEIGHT: f64 = 20.0;
+const CAPTION_HOLD: Duration = Duration::from_millis(1200);
+const CAPTION_FADE: Duration = Duration::from_millis(300);
 /// Distance from the screen's visible-frame edge to the first panel.
 const EDGE_INSET: f64 = 16.0;
-/// Gap between stacked panels.
-const STACK_GAP: f64 = 10.0;
+/// Gap between stacked panels (their halos must not touch).
+const STACK_GAP: f64 = 12.0;
 /// How often active sessions re-check whether their window is fully visible.
 const VISIBILITY_POLL: Duration = Duration::from_millis(500);
 
@@ -392,8 +406,12 @@ struct Panel {
     /// The window a pid-only `target` currently resolves to, as last looked
     /// up off the main thread (the stream follows it).
     resolved_window: Option<u32>,
-    /// "Preview unavailable", centered over the image well.
+    /// The empty well: the target app's icon over "Waiting for the first
+    /// frame", centered.
     placeholder: usize,
+    placeholder_icon: usize,
+    /// The action caption inside the well's bottom, and its label.
+    caption: usize,
     status: usize,
     client_icon: usize,
     client_label: usize,
@@ -1133,6 +1151,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
         }
     }
     set_text(panel.status, &frame.action_label);
+    flash_caption(panel);
 
     // Who: resolve the client icon + label only when the identity changes.
     let client = (
@@ -1168,6 +1187,19 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     panel.target_visible = target_visible;
     panel.resolved_window = resolved_window;
     refresh(state, &key);
+}
+
+/// Show or hide the session label in the header, relaying out when it
+/// changes.
+unsafe fn show_client_label(panel: &mut Panel, shown: bool) {
+    let label = panel.client_label as *mut AnyObject;
+    let hidden: bool = msg_send![label, isHidden];
+    if hidden != shown {
+        return;
+    }
+    let _: () = msg_send![label, setHidden: !shown];
+    panel.laid_out = (0.0, 0.0);
+    apply_card_frames(panel);
 }
 
 /// Apply an action's lifecycle (the action note row of the table in
@@ -1352,6 +1384,7 @@ unsafe fn show_target(panel: &Panel, pid: Option<i32>, title: Option<String>) ->
         None => std::ptr::null_mut(),
     };
     let _: () = msg_send![panel.target_icon as *mut AnyObject, setImage: app_icon(app)];
+    let _: () = msg_send![panel.placeholder_icon as *mut AnyObject, setImage: app_icon(app)];
     let title = title
         .filter(|title| !title.is_empty())
         .or_else(|| {
@@ -1559,6 +1592,7 @@ unsafe fn raise_card(state: &mut State, id: i64, tag: Tag) {
     };
     show_target(panel, pid, Some(title));
     set_text(panel.status, &status);
+    flash_caption(panel);
     announce_stack(panel, key);
     if live {
         set_panel_target(panel, key, &worker, tag);
@@ -1737,9 +1771,16 @@ unsafe fn refresh(state: &mut State, key: &str) {
         .chain(ending.iter())
         .filter_map(|panel| panel.slot)
         .collect();
+    // The session label shows only when another shown panel has the same
+    // client (icon and color no longer tell them apart).
+    let client = panels.get(key).and_then(|panel| panel.client.as_ref().map(|c| c.0.clone()));
+    let ambiguous = panels
+        .iter()
+        .any(|(other, panel)| other.as_str() != key && panel.shown && panel.client.as_ref().map(|c| c.0.clone()) == client);
     let Some(panel) = panels.get_mut(key) else {
         return;
     };
+    show_client_label(panel, ambiguous);
     let active = !idle_hide_due(panel.last_action, Instant::now());
     // Gone idle after acting: the session finished. The finale plays if the
     // panel is up; the panel stays up for it whatever else happens.
@@ -1909,7 +1950,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
         class!(NSView),
         ns_rect(Area {
             x: PAD,
-            y: 6.0 + STATUS_HEIGHT + 4.0,
+            y: PAD,
             w: well_w,
             h: well_h,
         }),
@@ -1925,7 +1966,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
     ];
     let scrim: *mut CGColor = msg_send![scrim, CGColor];
     let _: () = msg_send![layer, setBackgroundColor: scrim];
-    let _: () = msg_send![layer, setCornerRadius: 8.0_f64];
+    let _: () = msg_send![layer, setCornerRadius: WELL_RADIUS];
     let _: () = msg_send![overlay, setAutoresizingMask: 18u64];
     let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
     let start = CACurrentMediaTime();
@@ -2536,8 +2577,44 @@ fn button_target() -> usize {
 
 // ── Panel construction ────────────────────────────────────────────────────
 
-/// Height of the front card around its image well: header, gaps, status.
-const CARD_CHROME_HEIGHT: f64 = HEADER_HEIGHT + 4.0 + 4.0 + STATUS_HEIGHT + 6.0;
+/// Height of the front card around its image well: the header above it and
+/// the pad above and below.
+const CARD_CHROME_HEIGHT: f64 = HEADER_HEIGHT + 2.0 * PAD;
+/// The empty well's icon, and the width of its line of text.
+const PLACEHOLDER_ICON: f64 = 32.0;
+const PLACEHOLDER_W: f64 = 200.0;
+
+/// The session's cursor color as an autoreleased `NSColor`.
+unsafe fn session_ns_color(key: &str) -> *mut AnyObject {
+    let [r, g, b, _] = cursor_overlay::session_fill_rgba(key);
+    msg_send![
+        class!(NSColor),
+        colorWithSRGBRed: r as f64 / 255.0
+        green: g as f64 / 255.0
+        blue: b as f64 / 255.0
+        alpha: 1.0_f64
+    ]
+}
+
+/// Give `layer` a soft glow in `color`: a shadow with no offset. The
+/// shadow's shape is set per size by `halo_path` (a rounded rect for a
+/// card, a circle for a chip), so it does not depend on the glass drawing
+/// anything opaque.
+unsafe fn halo(layer: *mut AnyObject, color: *mut CGColor) {
+    let _: () = msg_send![layer, setShadowColor: color];
+    let _: () = msg_send![layer, setShadowRadius: HALO_RADIUS];
+    let _: () = msg_send![layer, setShadowOpacity: HALO_OPACITY as f32];
+    let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, 0.0)];
+    let _: () = msg_send![layer, setMasksToBounds: false];
+}
+
+/// Shape the halo of `layer` as a rounded rect of `size` and `radius`.
+unsafe fn halo_path(layer: *mut AnyObject, size: (f64, f64), radius: f64) {
+    let rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(size.0, size.1));
+    let path = CGPathCreateWithRoundedRect(rect, radius, radius, std::ptr::null());
+    let _: () = msg_send![layer, setShadowPath: path as *const CGPath];
+    CGPathRelease(path);
+}
 
 /// Front card size in points for an image well of `image_size`.
 fn panel_size((image_w, image_h): (f64, f64)) -> (f64, f64) {
@@ -2639,18 +2716,6 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let stack_view = new_view(stack_view_class(), bounds);
     let _: () = msg_send![window, setContentView: stack_view];
     let _: () = msg_send![stack_view, release];
-    // MouseEnteredAndExited (0x01) | MouseMoved (0x02) | ActiveAlways (0x80)
-    // | InVisibleRect (0x200): resize cursors over a non-key panel.
-    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-    let tracking: *mut AnyObject = msg_send![
-        tracking,
-        initWithRect: NSRect::ZERO
-        options: 0x283u64
-        owner: stack_view
-        userInfo: std::ptr::null_mut::<AnyObject>()
-    ];
-    let _: () = msg_send![stack_view, addTrackingArea: tracking];
-    let _: () = msg_send![tracking, release];
 
     // Hit plates under the cards, bottom-most: WindowServer passes presses
     // on fully transparent pixels to the window below (activating it), and
@@ -2676,14 +2741,26 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let deck = glass_container(stack_view, bounds);
     let chips: Vec<ChipView> = (1..MAX_CARDS).map(|_| new_chip(deck, true)).collect();
 
-    // Front card: rounded, with the session-colored border. A layer's border
-    // composites above its sublayers, so it rims the glass.
-    let front_view = new_view(class!(NSView), ns_rect(slot_frame(card, Slot::Front, 0)));
+    // Front card: glass with a session-colored halo (a shadow of the card's
+    // outline, so it glows outside the glass and hides under it), no
+    // border. The system draws the edge highlight.
+    let front_view = new_view(card_view_class(), ns_rect(slot_frame(card, Slot::Front, 0)));
     let _: () = msg_send![front_view, setWantsLayer: true];
     let front_layer: *mut AnyObject = msg_send![front_view, layer];
-    let _: () = msg_send![front_layer, setCornerRadius: CORNER_RADIUS];
-    let _: () = msg_send![front_layer, setBorderWidth: BORDER_WIDTH];
-    let _: () = msg_send![front_layer, setBorderColor: session_color(1.0)];
+    halo(front_layer, session_color(1.0));
+    // MouseEnteredAndExited (0x01) | MouseMoved (0x02) | ActiveAlways (0x80)
+    // | InVisibleRect (0x200): hover-revealed buttons and resize cursors
+    // over a non-key panel, only over the card itself.
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::ZERO
+        options: 0x283u64
+        owner: front_view
+        userInfo: std::ptr::null_mut::<AnyObject>()
+    ];
+    let _: () = msg_send![front_view, addTrackingArea: tracking];
+    let _: () = msg_send![tracking, release];
 
     // Everything visible sits in `body`, hosted by the glass background.
     // `layout_front` sizes it all.
@@ -2693,14 +2770,14 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let _: () = msg_send![front_view, addSubview: glass];
     let _: () = msg_send![glass, release];
 
-    // Header strip: a faint wash of the session color inside the glass.
+    // Header: client icon first, then the target; text only when needed.
     let header = new_view(class!(NSView), NSRect::ZERO);
-    let _: () = msg_send![header, setWantsLayer: true];
-    let header_layer: *mut AnyObject = msg_send![header, layer];
-    let _: () = msg_send![header_layer, setBackgroundColor: session_color(0.16)];
-
     let client_icon = new_icon_view(NSRect::ZERO);
-    let client_label = new_label(NSRect::ZERO, 12.0, 0.23, false); // NSFontWeightMedium
+    // The session label shows only when two shown panels share a client
+    // (see `refresh`), in the session color.
+    let client_label = new_label(NSRect::ZERO, 11.0, 0.23, false); // NSFontWeightMedium
+    let _: () = msg_send![client_label, setTextColor: session_ns_color(key)];
+    let _: () = msg_send![client_label, setHidden: true];
     let id = state.next_id;
     state.next_id += 1;
     let focus = new_button(
@@ -2717,8 +2794,11 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         id,
         NSRect::ZERO,
     );
+    // Revealed on hover.
+    let _: () = msg_send![focus, setAlphaValue: 0.0_f64];
+    let _: () = msg_send![close, setAlphaValue: 0.0_f64];
     let target_icon = new_icon_view(NSRect::ZERO);
-    let target_title = new_label(NSRect::ZERO, 11.0, 0.0, true);
+    let target_title = new_label(NSRect::ZERO, 11.0, 0.0, false);
     for view in [
         client_icon,
         client_label,
@@ -2732,22 +2812,13 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let _: () = msg_send![body, addSubview: header];
     let _: () = msg_send![header, release];
 
-    // Screenshot well: the latest still.
+    // Screenshot well: the latest still, straight on the glass.
     let image_view = new_view(class!(NSImageView), NSRect::ZERO);
     let _: () = msg_send![image_view, setImageScaling: 3u64]; // proportionally up or down
     let _: () = msg_send![image_view, setWantsLayer: true];
     let image_layer: *mut AnyObject = msg_send![image_view, layer];
-    let _: () = msg_send![image_layer, setCornerRadius: 8.0_f64];
+    let _: () = msg_send![image_layer, setCornerRadius: WELL_RADIUS];
     let _: () = msg_send![image_layer, setMasksToBounds: true];
-    let well: *mut AnyObject = msg_send![
-        class!(NSColor),
-        colorWithSRGBRed: 0.0_f64
-        green: 0.0_f64
-        blue: 0.0_f64
-        alpha: 0.22_f64
-    ];
-    let well_cg: *mut CGColor = msg_send![well, CGColor];
-    let _: () = msg_send![image_layer, setBackgroundColor: well_cg];
     add_subview(body, image_view);
 
     // Live mirror over the well: a layer-hosting view whose layer shows
@@ -2755,7 +2826,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let live_view = new_view(class!(NSView), NSRect::ZERO);
     let live_layer: *mut AnyObject = msg_send![class!(CALayer), layer];
     let _: () = msg_send![live_layer, setContentsGravity: ns_string("resizeAspect")];
-    let _: () = msg_send![live_layer, setCornerRadius: 8.0_f64];
+    let _: () = msg_send![live_layer, setCornerRadius: WELL_RADIUS];
     let _: () = msg_send![live_layer, setMasksToBounds: true];
     // setLayer before setWantsLayer: the view hosts this layer as is.
     let _: () = msg_send![live_view, setLayer: live_layer];
@@ -2763,13 +2834,62 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let _: () = msg_send![live_view, setHidden: true];
     add_subview(body, live_view);
 
-    let placeholder = new_label(NSRect::ZERO, 11.0, 0.0, true);
-    set_text(placeholder as usize, "Preview unavailable");
+    // The empty well: the target's icon, dimmed, over a quiet line.
+    let placeholder = new_view(class!(NSView), NSRect::ZERO);
+    let placeholder_icon = new_icon_view(NSRect::new(
+        NSPoint::new(0.0, 18.0),
+        NSSize::new(PLACEHOLDER_ICON, PLACEHOLDER_ICON),
+    ));
+    let _: () = msg_send![placeholder_icon, setAlphaValue: 0.45_f64];
+    let _: () = msg_send![placeholder, addSubview: placeholder_icon];
+    let placeholder_text = new_label(
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(PLACEHOLDER_W, 14.0)),
+        11.0,
+        0.0,
+        true,
+    );
+    set_text(placeholder_text as usize, "Waiting for the first frame");
+    let _: () = msg_send![placeholder_text, setAlignment: 2isize]; // NSTextAlignmentCenter (NSInteger)
+    let _: () = msg_send![placeholder, addSubview: placeholder_text];
     let _: () = msg_send![placeholder, setHidden: true];
-    let _: () = msg_send![body, addSubview: placeholder];
+    add_subview(body, placeholder);
 
-    let status = new_label(NSRect::ZERO, 11.0, 0.0, true);
-    let _: () = msg_send![body, addSubview: status];
+    // The action caption: white on a soft dark gradient inside the well's
+    // bottom, shown for a moment after each action.
+    let caption = new_view(class!(NSView), NSRect::ZERO);
+    let _: () = msg_send![caption, setWantsLayer: true];
+    let gradient: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
+    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+    let clear: *mut CGColor = msg_send![clear, CGColor];
+    let dark: *mut AnyObject = msg_send![
+        class!(NSColor),
+        colorWithSRGBRed: 0.0_f64
+        green: 0.0_f64
+        blue: 0.0_f64
+        alpha: 0.55_f64
+    ];
+    let dark: *mut CGColor = msg_send![dark, CGColor];
+    let colors: *mut AnyObject = msg_send![
+        class!(NSArray),
+        arrayWithObjects: dark as *mut AnyObject
+        count: 1usize
+    ];
+    let colors: *mut AnyObject = msg_send![colors, arrayByAddingObject: clear as *mut AnyObject];
+    let _: () = msg_send![gradient, setColors: colors];
+    // Bottom (dark) to top (clear): the layer's y axis points up.
+    let _: () = msg_send![gradient, setStartPoint: NSPoint::new(0.5, 0.0)];
+    let _: () = msg_send![gradient, setEndPoint: NSPoint::new(0.5, 1.0)];
+    let _: () = msg_send![caption, setLayer: gradient];
+    let _: () = msg_send![caption, setWantsLayer: true];
+    let caption_layer: *mut AnyObject = msg_send![caption, layer];
+    let _: () = msg_send![caption_layer, setCornerRadius: WELL_RADIUS];
+    let _: () = msg_send![caption_layer, setMasksToBounds: true];
+    let _: () = msg_send![caption_layer, setOpacity: 0.0_f32];
+    let status = new_label(NSRect::ZERO, 11.0, 0.23, false);
+    let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
+    let _: () = msg_send![status, setTextColor: white];
+    let _: () = msg_send![caption, addSubview: status];
+    add_subview(body, caption);
     add_subview(deck, front_view);
 
     let mut panel = Panel {
@@ -2784,6 +2904,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         stream: live::StreamState::default(),
         resolved_window: None,
         placeholder: placeholder as usize,
+        placeholder_icon: placeholder_icon as usize,
+        caption: caption as usize,
         status: status as usize,
         client_icon: client_icon as usize,
         client_label: client_label as usize,
@@ -2848,6 +2970,13 @@ unsafe fn new_pip_window(rect: NSRect) -> Option<*mut AnyObject> {
         return None;
     }
     let _: () = msg_send![window, setReleasedWhenClosed: false];
+    // Dark glass with white text, whatever the desktop: the mirrored window
+    // (usually light) sits on a darker vessel, like Control Center.
+    let dark: *mut AnyObject = msg_send![
+        class!(NSAppearance),
+        appearanceNamed: ns_string("NSAppearanceNameDarkAqua")
+    ];
+    let _: () = msg_send![window, setAppearance: dark];
     let _: () = msg_send![window, setFloatingPanel: true];
     let _: () = msg_send![window, setLevel: 3i64]; // NSFloatingWindowLevel
     let _: () = msg_send![window, setBecomesKeyOnlyIfNeeded: true];
@@ -3053,7 +3182,8 @@ unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
 }
 
 /// Lay the front card's views out for a card of `size` (nothing to do when
-/// they already are): header across the top, image well, status line.
+/// they already are): header across the top, the image well below it with
+/// the caption inside its bottom edge.
 unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
     if panel.laid_out == (w, h) {
         return;
@@ -3068,6 +3198,8 @@ unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
             h,
         },
     );
+    let front_layer: *mut AnyObject = msg_send![panel.front_view as *mut AnyObject, layer];
+    halo_path(front_layer, (w, h), CORNER_RADIUS);
     set_frame(
         panel.header,
         Area {
@@ -3078,9 +3210,15 @@ unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
         },
     );
     let label = panel.client_label as *mut AnyObject;
-    let _: () = msg_send![label, sizeToFit];
-    let fitted: NSRect = msg_send![label, frame];
-    let layout = stack::header_layout(w, fitted.size.width);
+    let hidden: bool = msg_send![label, isHidden];
+    let label_w = if hidden {
+        0.0
+    } else {
+        let _: () = msg_send![label, sizeToFit];
+        let fitted: NSRect = msg_send![label, frame];
+        fitted.size.width
+    };
+    let layout = stack::header_layout(w, label_w);
     for (view, area) in [
         (panel.client_icon, layout.client_icon),
         (panel.client_label, layout.client_label),
@@ -3094,16 +3232,13 @@ unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
     let (well_w, well_h) = well_size((w, h));
     let well = Area {
         x: PAD,
-        y: 6.0 + STATUS_HEIGHT + 4.0,
+        y: PAD,
         w: well_w,
         h: well_h,
     };
     set_frame(panel.image_view, well);
     set_frame(panel.live_view, well);
-    let placeholder = panel.placeholder as *mut AnyObject;
-    let _: () = msg_send![placeholder, sizeToFit];
-    let fitted: NSRect = msg_send![placeholder, frame];
-    let (text_w, text_h) = (fitted.size.width.min(well_w), fitted.size.height);
+    let (text_w, text_h) = (PLACEHOLDER_W.min(well_w), PLACEHOLDER_ICON + 18.0);
     set_frame(
         panel.placeholder,
         Area {
@@ -3114,14 +3249,46 @@ unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
         },
     );
     set_frame(
-        panel.status,
+        panel.placeholder_icon,
         Area {
-            x: PAD + 2.0,
-            y: 6.0,
-            w: (well_w - 4.0).max(0.0),
-            h: STATUS_HEIGHT,
+            x: (text_w - PLACEHOLDER_ICON) / 2.0,
+            y: 18.0,
+            w: PLACEHOLDER_ICON,
+            h: PLACEHOLDER_ICON,
         },
     );
+    set_frame(
+        panel.caption,
+        Area {
+            x: well.x,
+            y: well.y,
+            w: well_w,
+            h: CAPTION_HEIGHT.min(well_h),
+        },
+    );
+    set_frame(
+        panel.status,
+        Area {
+            x: 8.0,
+            y: 2.0,
+            w: (well_w - 16.0).max(0.0),
+            h: 16.0,
+        },
+    );
+}
+
+/// Show the action caption, then fade it after `CAPTION_HOLD`. A new
+/// action restarts the clock.
+unsafe fn flash_caption(panel: &Panel) {
+    let layer: *mut AnyObject = msg_send![panel.caption as *mut AnyObject, layer];
+    let begin = CACurrentMediaTime() + CAPTION_HOLD.as_secs_f64();
+    let _: () = msg_send![layer, removeAnimationForKey: ns_string("caption")];
+    let fade: *mut AnyObject = msg_send![
+        class!(CABasicAnimation),
+        animationWithKeyPath: ns_string("opacity")
+    ];
+    configure_animation(fade, 1.0, 0.0, begin, CAPTION_FADE.as_secs_f64());
+    let _: () = msg_send![layer, addAnimation: fade forKey: ns_string("caption")];
 }
 
 /// Where the view for `slot` settles, in panel coordinates: its resting
@@ -3515,16 +3682,14 @@ extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyO
     });
 }
 
-extern "C" fn stack_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
+extern "C" fn card_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     unsafe {
         let window = window_of(this);
         let point = event_point(this, event);
         let edges = try_with_state(|state| {
             panel_for(state, window).map(|panel| {
-                resize_edges(
-                    panel_point(point),
-                    view_frame(panel, Slot::Front, back_cards(&panel.layout)),
-                )
+                let front = view_frame(panel, Slot::Front, back_cards(&panel.layout));
+                resize_edges((point.0 + front.x, point.1 + front.y), front)
             })
         })
         .flatten()
@@ -3533,8 +3698,33 @@ extern "C" fn stack_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut Any
     }
 }
 
-extern "C" fn stack_mouse_exited(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    unsafe { set_resize_cursor(0) };
+extern "C" fn card_mouse_entered(this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    unsafe { reveal_buttons(this, true) };
+}
+
+extern "C" fn card_mouse_exited(this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+    unsafe {
+        set_resize_cursor(0);
+        reveal_buttons(this, false);
+    }
+}
+
+/// Fade the header buttons of the card `view` in or out.
+unsafe fn reveal_buttons(view: *mut AnyObject, shown: bool) {
+    let window = window_of(view);
+    let buttons = try_with_state(|state| panel_for(state, window).map(|panel| (panel.focus, panel.close)));
+    let Some((focus, close)) = buttons.flatten() else {
+        return;
+    };
+    let alpha = if shown { 1.0 } else { 0.0 };
+    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+    let _: () = msg_send![context, setDuration: 0.15_f64];
+    for button in [focus, close] {
+        let animator: *mut AnyObject = msg_send![button as *mut AnyObject, animator];
+        let _: () = msg_send![animator, setAlphaValue: alpha];
+    }
+    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
 }
 
 /// The frame-resize cursor for `edges` (macOS 15+), else the arrow.
@@ -3632,16 +3822,30 @@ fn stack_view_class() -> &'static AnyClass {
             );
             builder.add_method(sel!(mouseUp:), stack_mouse_up as extern "C" fn(_, _, _));
             builder.add_method(
+                sel!(setFrameSize:),
+                stack_set_frame_size as extern "C" fn(_, _, _),
+            );
+        })
+    })
+}
+
+/// The front card's view: owns the tracking area that reveals the header
+/// buttons and sets resize cursors. Presses fall through to the stack view.
+fn card_view_class() -> &'static AnyClass {
+    static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
+    CLASS.get_or_init(|| {
+        register_class("CuaPipCard", class!(NSView), |builder| unsafe {
+            builder.add_method(
                 sel!(mouseMoved:),
-                stack_mouse_moved as extern "C" fn(_, _, _),
+                card_mouse_moved as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                sel!(mouseEntered:),
+                card_mouse_entered as extern "C" fn(_, _, _),
             );
             builder.add_method(
                 sel!(mouseExited:),
-                stack_mouse_exited as extern "C" fn(_, _, _),
-            );
-            builder.add_method(
-                sel!(setFrameSize:),
-                stack_set_frame_size as extern "C" fn(_, _, _),
+                card_mouse_exited as extern "C" fn(_, _, _),
             );
         })
     })
