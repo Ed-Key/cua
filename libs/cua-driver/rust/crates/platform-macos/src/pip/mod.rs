@@ -120,7 +120,7 @@ mod live;
 mod stack;
 mod visibility;
 
-use cursor::{cursor_in_well, sprite_frame, Sprite};
+use cursor::{cursor_in_well, sprite_placement, Sprite};
 pub(crate) use cursor::SPRITE_BOX;
 use finish::{
     checklist_fit, chip_grid, Claim, Finale, Lifecycle, Rows, Verdicts, CAPTION_GAP, CAPTION_LINE,
@@ -398,6 +398,11 @@ struct Panel {
     cursor_layer: usize,
     cursor_image: usize,
     sprite: Sprite,
+    /// The cursor's latest screen point while it has a sprite to show
+    /// (`None` when hidden, faded or off screen), kept so the sprite can be
+    /// re-placed when the target window moves or the well resizes without
+    /// waiting for the overlay to render again.
+    cursor_at: Option<(f64, f64)>,
     /// The first cursor update was logged.
     cursor_seen: bool,
     /// The target window's frame (CoreGraphics, top-left origin) as last
@@ -1121,6 +1126,7 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
         return false;
     };
     let well = well_size(panel.card);
+    panel.cursor_at = update.image.map(|_| (update.x, update.y));
     // Only over the live picture: not under a finale, and only with a
     // window frame to map into.
     let point = match (update.image, panel.target_frame, panel.finale_view) {
@@ -1132,22 +1138,17 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
         panel.cursor_seen = true;
         tracing::info!(target: "pip", session = %update.key, mapped = point.is_some(), image = update.image.is_some(), frame = ?panel.target_frame, "PiP cursor feed started");
     }
-    let layer = panel.cursor_layer as *mut AnyObject;
     let _: () = msg_send![class!(CATransaction), begin];
     let _: () = msg_send![class!(CATransaction), setDisableActions: true];
     let taken = match point {
-        Some(point) => {
+        Some(_) => {
             let image = update.image.unwrap_or(0);
             set_cursor_image(panel, image);
-            let _: () = msg_send![layer, setFrame: ns_rect(sprite_frame(point, well.1))];
-            let _: () = msg_send![layer, setHidden: false];
             true
         }
-        None => {
-            let _: () = msg_send![layer, setHidden: true];
-            false
-        }
+        None => false,
     };
+    place_sprite(panel);
     let _: () = msg_send![class!(CATransaction), commit];
     if log {
         if let Some((x, y)) = point {
@@ -1156,6 +1157,27 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
         }
     }
     taken
+}
+
+/// Put the sprite where the cursor's latest screen point lands in the well
+/// now (see `cursor::sprite_placement`), or hide it: on every cursor
+/// update, and whenever the target window's frame or the well changes.
+unsafe fn place_sprite(panel: &Panel) {
+    let layer = panel.cursor_layer as *mut AnyObject;
+    let placement = if panel.finale_view.is_some() || panel.cursor_image == 0 {
+        None
+    } else {
+        sprite_placement(panel.target_frame, panel.cursor_at, well_size(panel.card))
+    };
+    match placement {
+        Some(frame) => {
+            let _: () = msg_send![layer, setFrame: ns_rect(frame)];
+            let _: () = msg_send![layer, setHidden: false];
+        }
+        None => {
+            let _: () = msg_send![layer, setHidden: true];
+        }
+    }
 }
 
 /// Show `image` (a retained `CGImage`, or 0 for none) on the sprite layer
@@ -1309,6 +1331,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     panel.target_visible = target_visible;
     panel.resolved_window = resolved_window;
     panel.target_frame = target_frame;
+    place_sprite(panel);
     refresh(state, &key);
 }
 
@@ -1754,8 +1777,10 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
             });
             if panel.target == update.target {
                 // The window may have moved: the cursor maps into its new
-                // place even when nothing else changed.
+                // place even when nothing else changed, without waiting for
+                // the overlay to render again.
                 panel.target_frame = update.target_frame;
+                place_sprite(panel);
             }
             // An answer about an older target, or no change: nothing more.
             if panel.target != update.target
@@ -2040,6 +2065,7 @@ unsafe fn remove_finale_view(panel: &mut Panel) {
     panel.displayed = None;
     if let Some(view) = panel.finale_view.take() {
         let _: () = msg_send![view as *mut AnyObject, removeFromSuperview];
+        place_sprite(panel);
     }
 }
 
@@ -2241,6 +2267,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
     let _: () = msg_send![panel.front_view as *mut AnyObject, addSubview: overlay];
     let _: () = msg_send![overlay, release];
     panel.finale_view = Some(overlay as usize);
+    place_sprite(panel);
 }
 
 /// The main screen's backing scale (2 on Retina), for crisp layer contents.
@@ -3045,6 +3072,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         cursor_layer: cursor_layer as usize,
         cursor_image: 0,
         sprite: Sprite::default(),
+        cursor_at: None,
         cursor_seen: false,
         target_frame: None,
         live_frame: None,
@@ -3349,6 +3377,8 @@ unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
     set_frame(panel.image_view, well);
     set_frame(panel.live_view, well);
     set_frame(panel.cursor_view, well);
+    // The well changed size: the sprite moves with the picture's scale.
+    place_sprite(panel);
     let (text_w, text_h) = (PLACEHOLDER_W.min(well_w), PLACEHOLDER_ICON + 18.0);
     set_frame(
         panel.placeholder,

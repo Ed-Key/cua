@@ -46,6 +46,21 @@ pub(super) fn sprite_frame(point: (f64, f64), well_h: f64) -> Area {
     }
 }
 
+/// Where the sprite goes for the cursor's latest screen `point` (`None`
+/// while it has none to show), the target window's last known `window`
+/// frame, and a well of `well` size: the sprite frame, or `None` to hide
+/// it. Recomputed whenever any of the three changes, so a window that
+/// moves or a well that resizes never leaves the sprite where it was.
+pub(super) fn sprite_placement(
+    window: Option<Area>,
+    point: Option<(f64, f64)>,
+    well: (f64, f64),
+) -> Option<Area> {
+    let window = window?;
+    let point = point?;
+    cursor_in_well(window, point, well).map(|in_well| sprite_frame(in_well, well.1))
+}
+
 /// The sprite's state between updates: whether the last update was a
 /// click pulse, so each click is logged once.
 #[derive(Default)]
@@ -126,6 +141,28 @@ mod tests {
         );
         // The well's top-left maps to the top-left of the AppKit frame.
         assert_eq!(sprite_frame((0.0, 0.0), 200.0).y, 200.0 - SPRITE_BOX / 2.0);
+    }
+
+    #[test]
+    fn the_sprite_follows_the_window_and_the_well_not_just_new_renders() {
+        let well = (320.0, 200.0);
+        let point = Some((500.0, 350.0));
+        let before = sprite_placement(Some(WINDOW), point, well).unwrap();
+        // The window moves 30 pt right with no new cursor render: the same
+        // screen point is now 10 pt (a third) further left in the well.
+        let moved = Area { x: WINDOW.x + 30.0, ..WINDOW };
+        let after = sprite_placement(Some(moved), point, well).unwrap();
+        assert!((before.x - after.x - 10.0).abs() < 1e-9, "{before:?} {after:?}");
+        assert_eq!(before.y, after.y);
+        // It moves so far the point is outside: the sprite hides.
+        let far = Area { x: 600.0, ..WINDOW };
+        assert_eq!(sprite_placement(Some(far), point, well), None);
+        // The well resizes: the sprite is re-placed for the new scale.
+        let bigger = sprite_placement(Some(WINDOW), point, (640.0, 400.0)).unwrap();
+        assert!((bigger.x + SPRITE_BOX / 2.0 - 2.0 * (before.x + SPRITE_BOX / 2.0)).abs() < 1e-9);
+        // No window frame or no cursor point: hidden.
+        assert_eq!(sprite_placement(None, point, well), None);
+        assert_eq!(sprite_placement(Some(WINDOW), None, well), None);
     }
 
     // ── Row: cursor update ───────────────────────────────────────────────

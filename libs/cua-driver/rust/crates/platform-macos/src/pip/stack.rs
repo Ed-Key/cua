@@ -584,9 +584,14 @@ pub(super) fn press_region(
 }
 
 /// The item a press on `point` lands on when the hover bar is `bar`: the
-/// bar counts as the front card (a drag), else `item`.
+/// bar (when shown) counts as the front card and wins over anything under
+/// it, such as a back card's strip it overlaps (a drag, never a raise);
+/// else `item`.
 pub(super) fn pressed_item(point: (f64, f64), item: Option<usize>, bar: Option<Area>) -> Option<usize> {
-    item.or_else(|| bar.filter(|bar| contains(bar, point)).map(|_| 0))
+    if bar.is_some_and(|bar| contains(&bar, point)) {
+        return Some(0);
+    }
+    item
 }
 
 /// Which edges of the front card `point` is on (0 = none): within
@@ -1281,6 +1286,14 @@ mod tests {
         assert_eq!(pressed_item(on_bar, None, Some(bar)), Some(0));
         assert_eq!(press_region(on_bar, Some(0), 0, front, Some(bar)), "bar");
         assert_eq!(pressed_item((1.0, 1.0), None, Some(bar)), None);
+        // The bar overlaps the strip of the card behind the front one: a
+        // press there is the bar's (a drag), not a click that raises the
+        // back card. Without the bar, the strip is the back card's.
+        let strip = (bar.x + bar.w / 2.0, front.y + front.h + 3.0);
+        assert!(contains(&bar, strip) && contains(&frames[1], strip));
+        assert_eq!(pressed(strip, &layout, &frames), Some(1));
+        assert_eq!(pressed_item(strip, Some(1), Some(bar)), Some(0));
+        assert_eq!(pressed_item(strip, Some(1), None), Some(1));
     }
 
     #[test]
