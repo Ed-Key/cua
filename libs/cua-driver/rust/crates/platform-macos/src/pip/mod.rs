@@ -1204,10 +1204,6 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
         satisfied,
         claims,
     } = verification;
-    // No frame yet (no action), or the session ended: no panel to tell.
-    if !state.worker.is_live(&key) {
-        return;
-    }
     let count = claims.len();
     let claims: Vec<Claim> = claims
         .into_iter()
@@ -1218,8 +1214,15 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
         .collect();
     tracing::info!(target: "pip", session = %key, pid = target_pid, window, satisfied, claims = count, "PiP verification");
     let worker = state.worker.clone();
+    // Delivered in main-queue order: a panel still here is the session's,
+    // even if `end_session` already ended its epoch (its `end_session_cb`
+    // is queued behind this).
     let Some(panel) = state.panels.get_mut(&key) else {
-        // The session's first frame is still being captured.
+        // No panel: the session's first frame is still being captured (keep
+        // it for the panel), or it never acted or has ended (drop it).
+        if !worker.is_live(&key) {
+            return;
+        }
         state.early.entry(key).or_default().verify(
             target_pid,
             window,
@@ -1243,6 +1246,10 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
     // shown stale and nothing is cleared unseen.
     if let Some(generation) = panel.finale.restart() {
         play_finale(panel, &key, &panel.verdicts.finale(), generation);
+    } else if panel.finale.claims_arrived() {
+        // It landed after the finale for this stretch was over: it gets a
+        // finale of its own (unless the user closed the panel).
+        refresh(state, &key);
     }
 }
 
@@ -1269,11 +1276,12 @@ unsafe fn apply_action(state: &mut State, action: Action) {
         target,
         timestamp_ms,
     } = action;
-    if !state.worker.is_live(&key) {
-        return;
-    }
     let worker = state.worker.clone();
+    // Main-queue order, as for verifications.
     let Some(panel) = state.panels.get_mut(&key) else {
+        if !worker.is_live(&key) {
+            return;
+        }
         state
             .early
             .entry(key)
@@ -1783,7 +1791,12 @@ unsafe fn finish_session(panel: &mut Panel, key: &str, worker: &CaptureWorker) {
     }
     note_finished(panel, key);
     let finale = panel.verdicts.finale();
-    let visible = panel.shown && !panel.dismissed && finale.len() > 0;
+    // Late claims (a verification that finished after the last finale) are
+    // shown even if that finale's fade hid the panel, wherever the panel
+    // would be allowed to show; a user's close is always respected.
+    let late = panel.finale.late();
+    let visible =
+        !panel.dismissed && finale.len() > 0 && (panel.shown || (late && !panel.target_visible));
     let Some(generation) = panel.finale.start(visible) else {
         return;
     };
@@ -2281,6 +2294,17 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
             finish_session(&mut panel, &key, &state.worker);
         }
         if panel.finale.playing() {
+            // Owed late claims can bring a hidden panel back for its finale.
+            if !panel.shown {
+                let others: Vec<usize> = state
+                    .panels
+                    .values()
+                    .chain(state.ending.iter())
+                    .filter_map(|panel| panel.slot)
+                    .collect();
+                place_on_show(&mut panel, others, state.image_size, state.anchor);
+                show(&mut panel);
+            }
             state.ending.push(panel);
         } else {
             close_panel(panel);

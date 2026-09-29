@@ -12,10 +12,11 @@
 //! as a row of chips. Rows come in one by one, then the panel holds and
 //! fades. A new action cancels it.
 //!
-//! Everything here is pure (unit tested). Timestamps are wall-clock ms from
-//! the frames and verifications themselves, so the order they reach the
-//! main queue in (a frame waits for its capture, a verification does not)
-//! never changes the answer.
+//! Everything here is pure (unit tested). Every action, verdict and claim
+//! carries its event time: wall-clock ms from the action or verification
+//! itself. The finished rule and the checklist read the latest by event
+//! time, so the order events reach the main queue in (a frame waits for its
+//! capture, a long verification finishes late) never changes the answer.
 
 use std::collections::{HashMap, VecDeque};
 use std::time::Duration;
@@ -58,8 +59,8 @@ pub(super) struct Verdicts {
     verified: HashMap<u32, (u64, bool)>,
     /// When the session finished, until it acts again.
     session_done: Option<u64>,
-    /// Recent claims, oldest first.
-    claims: VecDeque<Claim>,
+    /// Recent claims with their event times, oldest event first.
+    claims: VecDeque<(u64, Claim)>,
     /// Windows acted in since the last finale, most recent first, with
     /// their titles.
     touched: Vec<(Tag, String)>,
@@ -113,7 +114,12 @@ impl Verdicts {
         {
             self.verified.insert(window, (at_ms, satisfied));
         }
-        self.claims.extend(claims);
+        // Kept in event order (arrival order among equal times), so the
+        // oldest events are the ones forgotten.
+        for claim in claims {
+            let at = self.claims.partition_point(|(event, _)| *event <= at_ms);
+            self.claims.insert(at, (at_ms, claim));
+        }
         while self.claims.len() > CLAIM_MEMORY {
             self.claims.pop_front();
         }
@@ -225,12 +231,15 @@ impl Finale {
     }
 }
 
-/// The checklist for `claims` (oldest first): each label once with its
-/// latest status, the `CHECKLIST_ROWS` most recently claimed, oldest first.
-pub(super) fn checklist<'a>(claims: impl IntoIterator<Item = &'a Claim>) -> Vec<Claim> {
-    let claims: Vec<&Claim> = claims.into_iter().collect();
+/// The checklist for timestamped `claims` (in arrival order): each label
+/// once with its latest status by event time (ties: the later arrival), the
+/// `CHECKLIST_ROWS` most recent labels, oldest first.
+pub(super) fn checklist<'a>(claims: impl IntoIterator<Item = &'a (u64, Claim)>) -> Vec<Claim> {
+    let mut claims: Vec<&(u64, Claim)> = claims.into_iter().collect();
+    // Stable: arrival order breaks ties.
+    claims.sort_by_key(|(at, _)| *at);
     let mut rows: Vec<Claim> = Vec::new();
-    for claim in claims.into_iter().rev() {
+    for (_, claim) in claims.into_iter().rev() {
         if rows.len() == CHECKLIST_ROWS {
             break;
         }
@@ -264,13 +273,28 @@ pub(super) struct FinaleState {
     generation: u64,
     playing: bool,
     played: bool,
+    /// Claims arrived after the finale for this stretch was over (a long
+    /// verification): they are owed a finale of their own.
+    late: bool,
 }
 
 impl FinaleState {
     /// Whether the session just finished: it is no longer active (idle or
     /// ended) and has not finished since its last action.
     pub(super) fn due(&self, active: bool) -> bool {
-        !active && !self.playing && !self.played
+        !active && !self.playing && (!self.played || self.late)
+    }
+
+    /// A verification landed. If the finale for this stretch is already
+    /// over, its claims are late (see `due`): whether they are.
+    pub(super) fn claims_arrived(&mut self) -> bool {
+        self.late |= self.played && !self.playing;
+        self.late
+    }
+
+    /// Claims are waiting for a finale that has not shown them.
+    pub(super) fn late(&self) -> bool {
+        self.late
     }
 
     /// The session finished. The finale plays only if `visible` (the panel
@@ -278,6 +302,7 @@ impl FinaleState {
     /// then the generation to hand to its end timer.
     pub(super) fn start(&mut self, visible: bool) -> Option<u64> {
         self.played = true;
+        self.late = false;
         if !visible {
             return None;
         }
@@ -292,6 +317,7 @@ impl FinaleState {
         let was = self.playing;
         self.playing = false;
         self.played = false;
+        self.late = false;
         self.generation += 1;
         was
     }
@@ -385,7 +411,7 @@ mod tests {
 
     #[test]
     fn the_checklist_keeps_the_latest_status_of_the_five_most_recent_labels() {
-        let claims = [
+        let claims: Vec<(u64, Claim)> = [
             claim("one", Some(true)),
             claim("two", Some(false)),
             claim("three", Some(true)),
@@ -393,7 +419,11 @@ mod tests {
             claim("four", None),
             claim("five", Some(true)),
             claim("six", Some(true)),
-        ];
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(at, claim)| (at as u64 * 10, claim))
+        .collect();
         let rows = checklist(&claims);
         assert_eq!(
             rows,
@@ -407,6 +437,28 @@ mod tests {
             "deduped, most recent five, oldest first; `one` fell off"
         );
         assert!(checklist(&[]).is_empty());
+    }
+
+    #[test]
+    fn the_checklist_and_the_finished_rule_read_the_latest_by_event_time() {
+        // Unsatisfied at 200, then a slow verification from 150 lands late
+        // saying satisfied: both the window and its row stay unsatisfied.
+        let mut verdicts = Verdicts::default();
+        verdicts.act(A, "Notes", 100);
+        verdicts.verify(1, 10, 200, false, vec![claim("done", Some(false))]);
+        verdicts.verify(1, 10, 150, true, vec![claim("done", Some(true))]);
+        assert!(!verdicts.finished(10));
+        assert_eq!(
+            verdicts.finale(),
+            Finale::Checklist(vec![claim("done", Some(false))])
+        );
+        // Rows are ordered by event time too.
+        verdicts.verify(2, 20, 120, true, vec![claim("early", Some(true))]);
+        let Finale::Checklist(rows) = verdicts.finale() else {
+            panic!("claims: a checklist");
+        };
+        let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
+        assert_eq!(labels, ["early", "done"]);
     }
 
     #[test]
@@ -529,6 +581,31 @@ mod tests {
         assert!(!finale.end(first), "the first schedule is stale");
         assert!(finale.playing());
         assert!(finale.end(second));
+    }
+
+    #[test]
+    fn claims_after_the_finale_are_owed_one_of_their_own() {
+        let mut finale = FinaleState::default();
+        // Before the finale: nothing late, the idle finale will show them.
+        assert!(!finale.claims_arrived());
+        let played = finale.start(true).unwrap();
+        // During it: replayed (restart), not late.
+        assert!(!finale.claims_arrived());
+        assert!(finale.end(played));
+        assert!(!finale.due(false), "shown already");
+        // A slow verification lands after it faded: due again.
+        assert!(finale.claims_arrived());
+        assert!(finale.late() && finale.due(false));
+        finale.start(true).unwrap();
+        assert!(!finale.late() && !finale.due(false));
+        // A silent finish (panel hidden) also settles them: no retry loop.
+        finale.claims_arrived();
+        assert_eq!(finale.start(false), None);
+        assert!(!finale.due(false));
+        // A new action makes them part of the next stretch instead.
+        finale.claims_arrived();
+        finale.cancel();
+        assert!(!finale.late());
     }
 
     #[test]
