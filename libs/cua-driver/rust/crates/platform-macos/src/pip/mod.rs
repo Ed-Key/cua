@@ -125,23 +125,43 @@ struct Area {
 }
 
 /// Bottom-left origin for the panel in stacking `slot`. Slot 0's
-/// bottom-right corner sits at `bottom_right`; later slots stack upward, and
-/// a full column wraps to a new column on the left. `visible_top` bounds a
-/// column.
+/// bottom-right corner sits at `bottom_right`. Later slots stack in the
+/// vertical direction with more room from slot 0 (up on ties), and a full
+/// column wraps to a new column toward the side with more room (left on
+/// ties), so the default bottom-right anchor stacks upward then wraps left
+/// and a top-left anchor stacks downward then wraps right. Every frame is
+/// clamped inside `visible`; a full grid overlaps its last slot instead of
+/// going off-screen.
 fn stack_origin(
     bottom_right: (f64, f64),
-    visible_top: f64,
+    visible: Area,
     size: (f64, f64),
     slot: usize,
 ) -> (f64, f64) {
     let (w, h) = size;
-    let step = h + STACK_GAP;
-    let room = visible_top - EDGE_INSET - bottom_right.1 + STACK_GAP;
-    let per_column = ((room / step).floor() as usize).max(1);
+    let (x0, y0) = (bottom_right.0 - w, bottom_right.1);
+    let (step_y, step_x) = (h + STACK_GAP, w + STACK_GAP);
+    // Space left beyond slot 0 in each direction, edge inset included.
+    let up = visible.y + visible.h - EDGE_INSET - (y0 + h);
+    let down = y0 - visible.y - EDGE_INSET;
+    let left = x0 - visible.x - EDGE_INSET;
+    let right = visible.x + visible.w - EDGE_INSET - (x0 + w);
+    let (dir_y, room_y) = if up >= down { (1.0, up) } else { (-1.0, down) };
+    let (dir_x, room_x) = if left >= right { (-1.0, left) } else { (1.0, right) };
+    // Panels that fit in a column / row of columns, slot 0 included.
+    let fit = |room: f64, step: f64| (room.max(0.0) / step).floor() as usize + 1;
+    let (per_column, columns) = (fit(room_y, step_y), fit(room_x, step_x));
+    let slot = slot.min(per_column * columns - 1);
     let (column, row) = (slot / per_column, slot % per_column);
+    let clamp = |v: f64, lo: f64, size: f64, extent: f64| v.min(lo + extent - size).max(lo);
     (
-        bottom_right.0 - w - column as f64 * (w + STACK_GAP),
-        bottom_right.1 + row as f64 * step,
+        clamp(
+            x0 + dir_x * column as f64 * step_x,
+            visible.x,
+            w,
+            visible.w,
+        ),
+        clamp(y0 + dir_y * row as f64 * step_y, visible.y, h, visible.h),
     )
 }
 
@@ -1288,8 +1308,7 @@ unsafe fn slot_origin(
     let size = panel_size(image_size);
     let bottom_right =
         first_slot_bottom_right(area(screen_frame), area(visible_frame), size, anchor);
-    let visible_top = visible_frame.origin.y + visible_frame.size.height;
-    Some(stack_origin(bottom_right, visible_top, size, slot))
+    Some(stack_origin(bottom_right, area(visible_frame), size, slot))
 }
 
 unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Option<Panel> {
@@ -1807,7 +1826,7 @@ mod tests {
         let bottom_right = first_slot_bottom_right(VISIBLE, visible, SIZE, None);
         assert_eq!(bottom_right, (1424.0, 86.0));
         assert_eq!(
-            stack_origin(bottom_right, 875.0, SIZE, 0),
+            stack_origin(bottom_right, visible, SIZE, 0),
             (1424.0 - 336.0, 86.0)
         );
     }
@@ -1829,9 +1848,8 @@ mod tests {
             h: 805.0,
         };
         let bottom_right = first_slot_bottom_right(screen, visible, SIZE, None);
-        let top = visible.y + visible.h;
-        let slot0 = stack_origin(bottom_right, top, SIZE, 0);
-        let slot1 = stack_origin(bottom_right, top, SIZE, 1);
+        let slot0 = stack_origin(bottom_right, visible, SIZE, 0);
+        let slot1 = stack_origin(bottom_right, visible, SIZE, 1);
         assert_eq!(slot0, (1440.0 - 16.0 - 336.0, 70.0 + 16.0));
         assert_eq!(slot1, (slot0.0, slot0.1 + SIZE.1 + STACK_GAP));
         // Slot 0 in CoreGraphics top-left coordinates: bottom edge 16pt above
@@ -1844,7 +1862,7 @@ mod tests {
         let bottom_right = first_slot_bottom_right(VISIBLE, VISIBLE, SIZE, None);
         let top = VISIBLE.y + VISIBLE.h;
         let origins: Vec<_> = (0..4)
-            .map(|slot| stack_origin(bottom_right, top, SIZE, slot))
+            .map(|slot| stack_origin(bottom_right, VISIBLE, SIZE, slot))
             .collect();
         // One column holds three 258pt panels in an 875pt visible frame.
         assert_eq!(
@@ -1876,13 +1894,53 @@ mod tests {
             h: 900.0,
         };
         let bottom_right = first_slot_bottom_right(screen, VISIBLE, SIZE, Some((20, 40)));
-        assert_eq!(
-            stack_origin(bottom_right, 875.0, SIZE, 0),
-            (20.0, 900.0 - 40.0 - 258.0)
-        );
-        // No room above the anchor: the next panel wraps left, never off the top.
-        let second = stack_origin(bottom_right, 875.0, SIZE, 1);
-        assert_eq!(second, (20.0 - SIZE.0 - STACK_GAP, 900.0 - 40.0 - 258.0));
+        let top = 900.0 - 40.0 - 258.0;
+        let origin = |slot| stack_origin(bottom_right, VISIBLE, SIZE, slot);
+        assert_eq!(origin(0), (20.0, top));
+        // No room above the anchor, so the column runs downward: three
+        // panels fit, each fully on screen.
+        assert_eq!(origin(1), (20.0, top - SIZE.1 - STACK_GAP));
+        assert_eq!(origin(2), (20.0, top - 2.0 * (SIZE.1 + STACK_GAP)));
+        // The anchor is in the left half, so the next column is to the right.
+        assert_eq!(origin(3), (20.0 + SIZE.0 + STACK_GAP, top));
+        for slot in 0..4 {
+            let (x, y) = origin(slot);
+            assert!(x >= 0.0 && x + SIZE.0 <= VISIBLE.w, "slot {slot} x {x}");
+            assert!(y >= 0.0 && y + SIZE.1 <= VISIBLE.h, "slot {slot} y {y}");
+        }
+    }
+
+    #[test]
+    fn every_slot_stays_inside_the_visible_frame() {
+        // Default and anchored placements on screens from barely one panel
+        // to large; slots far beyond the grid overlap its last slot.
+        for (w, h) in [(340.0, 262.0), (400.0, 300.0), (700.0, 600.0), (1440.0, 875.0)] {
+            let visible = Area {
+                x: 0.0,
+                y: 70.0,
+                w,
+                h,
+            };
+            let screen = Area {
+                y: 0.0,
+                h: h + 95.0,
+                ..visible
+            };
+            for anchor in [None, Some((20, 40)), Some((5000, 5000))] {
+                let bottom_right = first_slot_bottom_right(screen, visible, SIZE, anchor);
+                for slot in 0..=20 {
+                    let (x, y) = stack_origin(bottom_right, visible, SIZE, slot);
+                    assert!(
+                        x >= visible.x && x + SIZE.0 <= visible.x + visible.w,
+                        "{w}x{h} {anchor:?} slot {slot}: x {x}"
+                    );
+                    assert!(
+                        y >= visible.y && y + SIZE.1 <= visible.y + visible.h,
+                        "{w}x{h} {anchor:?} slot {slot}: y {y}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
