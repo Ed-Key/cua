@@ -6,19 +6,34 @@
 //! finished after last acting in it, unless its latest verification (after
 //! that action) was not satisfied. Finished back windows collapse to chips.
 //!
-//! The finale shows the session's recent verified claims as a checklist
-//! (latest status per label, the five most recent, oldest first; only a
-//! satisfied claim gets a check), or, with no claims, the windows it touched
-//! as a row of chips. Rows come in one by one, then the panel holds and
-//! fades. A new action cancels it.
+//! The finale shows the session's verified claims not yet shown as a
+//! checklist (latest status per label, the five most recent, oldest first;
+//! only a satisfied claim gets a check), or, with none, the windows it
+//! touched as a row of chips. Rows come in one by one, then the panel holds
+//! and fades.
 //!
-//! Everything here is pure (unit tested). Every action, verdict and claim
-//! carries its event time: wall-clock ms from the action or verification
-//! itself. The finished rule and the checklist read the latest by event
-//! time, so the order events reach the main queue in (a frame waits for its
-//! capture, a long verification finishes late) never changes the answer.
+//! ## Event ordering
+//!
+//! Every event carries its event time: wall-clock ms stamped where it
+//! happened (an action when it is pushed, a verification when its
+//! predicates were last observed). Events reach the main queue out of that
+//! order (a frame waits for its capture, which is serialized across
+//! sessions; a verification can run 10 s), so each kind may change only
+//! what this table allows, and evidence is read latest by event time:
+//!
+//! | Event | Verdicts (per window) | Claims (per label) | Lifecycle: finale, idle deadline, user close | Picture and stack |
+//! |---|---|---|---|---|
+//! | Action note (on push) | records the action at its event ms; ends a session finish older than it | none | only if newer than the last applied action: cancels the finale, restarts the idle deadline, lifts a user close | none |
+//! | Captured frame | resolves a pid-only action to its window at the action's event ms (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card, back items, touched windows |
+//! | Verification | latest by event ms per window (an older one never wins) | latest by event ms per label, kept across finales; an older one is ignored | if it brought news: replays a playing finale, or owes a finale when the stretch's finale is over | chips and cards follow the verdicts |
+//! | Idle timer | the session finishes (now) | none | the finale is due once per stretch: plays if the panel is up and not closed (or owed and may show), else settles silently | the panel fades after |
+//! | `end_session` | the session finishes (now) | none | as the idle timer, then the panel closes | the panel leaves the live set |
+//! | Finale timer | none | marks what was displayed as shown; the watermarks stay | ends only the finale of its own generation | the panel fades |
+//! | User close | none | none | closed until an action newer than the close; no finale plays | the panel hides (an ending one closes) |
+//!
+//! Everything here is pure (unit tested, one test per row).
 
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::time::Duration;
 
 use super::Tag;
@@ -27,8 +42,11 @@ use super::Tag;
 pub(super) const CHECKLIST_ROWS: usize = 5;
 /// Chips in the no-claims finale row at most.
 pub(super) const CHIP_ROW: usize = 5;
-/// Claims remembered per session.
-const CLAIM_MEMORY: usize = 32;
+/// Labels whose watermark a session keeps.
+// ponytail: past this many distinct labels the oldest watermark is dropped
+// (an older check of that label could then show again); raise it if agents
+// ever verify that many different things in one session.
+const CLAIM_MEMORY: usize = 256;
 /// Each row starts this long after the one above it.
 pub(super) const STAGGER: Duration = Duration::from_millis(80);
 /// A row fades and slides in over this long; its mark follows.
@@ -45,6 +63,16 @@ pub(super) struct Claim {
     pub(super) satisfied: Option<bool>,
 }
 
+/// A label's latest claim by event time.
+struct ClaimRecord {
+    at_ms: u64,
+    /// Arrival order, breaking ties between equal event times.
+    seq: u64,
+    satisfied: Option<bool>,
+    /// A finale displayed it.
+    shown: bool,
+}
+
 /// A session's evidence about its windows.
 #[derive(Default)]
 pub(super) struct Verdicts {
@@ -55,23 +83,26 @@ pub(super) struct Verdicts {
     acted_pid: HashMap<i32, u64>,
     /// Window -> the pid that owns it, as far as the session has seen.
     pids: HashMap<u32, i32>,
-    /// Window -> when it was last verified, and whether fully satisfied.
+    /// Window -> its latest verification by event time, and whether fully
+    /// satisfied.
     verified: HashMap<u32, (u64, bool)>,
-    /// When the session finished, until it acts again.
+    /// When the session finished, until an action newer than that.
     session_done: Option<u64>,
-    /// Recent claims with their event times, oldest event first.
-    claims: VecDeque<(u64, Claim)>,
-    /// Windows acted in since the last finale, most recent first, with
-    /// their titles.
-    touched: Vec<(Tag, String)>,
+    /// Label -> its latest claim by event time. Never cleared: a finale only
+    /// marks what it displayed as shown.
+    claims: HashMap<String, ClaimRecord>,
+    next_seq: u64,
+    /// Windows acted in, most recent action first, with their titles and
+    /// that action's event time.
+    touched: Vec<(Tag, String, u64)>,
+    /// Touched windows up to this event time were shown by a finale.
+    touched_shown: u64,
 }
 
 impl Verdicts {
     /// The session acted on `target` at `at_ms`: a window, or (pid only)
-    /// every window of that app. Recorded as each action is pushed, before
-    /// and independent of its capture (captures coalesce to the latest per
-    /// session, so a delivered frame is not a record of every action). Also
-    /// ends a session-level finish: the session is working again.
+    /// every window of that app. A session finish older than the action
+    /// ends: the session is working again.
     pub(super) fn record_action(&mut self, target: Tag, at_ms: u64) {
         let bump = |at: &mut u64| *at = (*at).max(at_ms);
         match target {
@@ -84,20 +115,29 @@ impl Verdicts {
             (Some(pid), None) => bump(self.acted_pid.entry(pid).or_default()),
             (None, None) => {}
         }
-        self.session_done = None;
+        if self.session_done.is_some_and(|done| at_ms > done) {
+            self.session_done = None;
+        }
     }
 
-    /// A frame of the session acting in `tag` (titled `title`) at `at_ms`
-    /// was delivered: recorded as an action (again, harmlessly) and as a
-    /// touched window.
+    /// A captured frame of the session acting in `tag` (titled `title`) at
+    /// `at_ms`: its window is resolved (for a pid-only action) and touched.
     pub(super) fn act(&mut self, tag: Tag, title: &str, at_ms: u64) {
         self.record_action(tag, at_ms);
-        self.touched.retain(|(touched, _)| *touched != tag);
-        self.touched.insert(0, (tag, title.to_owned()));
+        let at_ms = self
+            .touched
+            .iter()
+            .find(|(touched, _, _)| *touched == tag)
+            .map_or(at_ms, |(_, _, at)| (*at).max(at_ms));
+        self.touched.retain(|(touched, _, _)| *touched != tag);
+        let index = self.touched.partition_point(|(_, _, at)| *at > at_ms);
+        self.touched.insert(index, (tag, title.to_owned(), at_ms));
         self.touched.truncate(CHIP_ROW);
     }
 
-    /// A `verify_state` on `pid`'s `window` completed at `at_ms`.
+    /// A `verify_state` on `pid`'s `window` whose predicates were observed
+    /// at `at_ms`. Whether it brought news (a verdict or claim at least as
+    /// new as what is known); an older verification changes nothing.
     pub(super) fn verify(
         &mut self,
         pid: i32,
@@ -105,24 +145,48 @@ impl Verdicts {
         at_ms: u64,
         satisfied: bool,
         claims: Vec<Claim>,
-    ) {
+    ) -> bool {
         self.pids.insert(window, pid);
+        let mut news = false;
         if self
             .verified
             .get(&window)
             .is_none_or(|(previous, _)| at_ms >= *previous)
         {
             self.verified.insert(window, (at_ms, satisfied));
+            news = true;
         }
-        // Kept in event order (arrival order among equal times), so the
-        // oldest events are the ones forgotten.
         for claim in claims {
-            let at = self.claims.partition_point(|(event, _)| *event <= at_ms);
-            self.claims.insert(at, (at_ms, claim));
+            if self
+                .claims
+                .get(&claim.label)
+                .is_some_and(|record| record.at_ms > at_ms)
+            {
+                continue;
+            }
+            self.next_seq += 1;
+            self.claims.insert(
+                claim.label,
+                ClaimRecord {
+                    at_ms,
+                    seq: self.next_seq,
+                    satisfied: claim.satisfied,
+                    shown: false,
+                },
+            );
+            news = true;
         }
         while self.claims.len() > CLAIM_MEMORY {
-            self.claims.pop_front();
+            let oldest = self
+                .claims
+                .iter()
+                .min_by_key(|(_, record)| (record.at_ms, record.seq))
+                .map(|(label, _)| label.clone());
+            if let Some(oldest) = oldest {
+                self.claims.remove(&oldest);
+            }
         }
+        news
     }
 
     /// The session finished (went idle, or ended) at `at_ms`.
@@ -146,16 +210,36 @@ impl Verdicts {
         }
     }
 
+    /// The claims not yet shown: each label's latest status by event time,
+    /// the `CHECKLIST_ROWS` most recent, oldest first.
+    fn checklist(&self) -> Vec<Claim> {
+        let mut rows: Vec<(&String, &ClaimRecord)> = self
+            .claims
+            .iter()
+            .filter(|(_, record)| !record.shown)
+            .collect();
+        rows.sort_by_key(|(_, record)| (record.at_ms, record.seq));
+        let skip = rows.len().saturating_sub(CHECKLIST_ROWS);
+        rows.into_iter()
+            .skip(skip)
+            .map(|(label, record)| Claim {
+                label: label.clone(),
+                satisfied: record.satisfied,
+            })
+            .collect()
+    }
+
     /// What the finale shows now.
     pub(super) fn finale(&self) -> Finale {
-        let rows = checklist(&self.claims);
+        let rows = self.checklist();
         if !rows.is_empty() {
             return Finale::Checklist(rows);
         }
         Finale::Chips(
             self.touched
                 .iter()
-                .map(|(tag, title)| FinaleChip {
+                .filter(|(_, _, at)| *at > self.touched_shown)
+                .map(|(tag, title, _)| FinaleChip {
                     tag: *tag,
                     title: title.clone(),
                     finished: tag.1.is_some_and(|window| self.finished(window)),
@@ -164,15 +248,22 @@ impl Verdicts {
         )
     }
 
-    /// A finale ran its course: the next one covers only newer work.
+    /// A finale ran its course: what it displayed is shown. The watermarks
+    /// stay, so older evidence arriving later still loses.
     pub(super) fn finale_shown(&mut self) {
-        self.claims.clear();
-        self.touched.clear();
+        for record in self.claims.values_mut() {
+            record.shown = true;
+        }
+        if let Some((_, _, newest)) = self.touched.first() {
+            self.touched_shown = self.touched_shown.max(*newest);
+        }
     }
 
-    /// Windows touched since the last finale.
-    pub(super) fn touched(&self) -> impl Iterator<Item = &(Tag, String)> {
-        self.touched.iter()
+    /// Windows the session touched (most recent first), with titles.
+    pub(super) fn touched(&self) -> impl Iterator<Item = (Tag, String)> + '_ {
+        self.touched
+            .iter()
+            .map(|(tag, title, _)| (*tag, title.clone()))
     }
 }
 
@@ -231,26 +322,6 @@ impl Finale {
     }
 }
 
-/// The checklist for timestamped `claims` (in arrival order): each label
-/// once with its latest status by event time (ties: the later arrival), the
-/// `CHECKLIST_ROWS` most recent labels, oldest first.
-pub(super) fn checklist<'a>(claims: impl IntoIterator<Item = &'a (u64, Claim)>) -> Vec<Claim> {
-    let mut claims: Vec<&(u64, Claim)> = claims.into_iter().collect();
-    // Stable: arrival order breaks ties.
-    claims.sort_by_key(|(at, _)| *at);
-    let mut rows: Vec<Claim> = Vec::new();
-    for (_, claim) in claims.into_iter().rev() {
-        if rows.len() == CHECKLIST_ROWS {
-            break;
-        }
-        if !rows.iter().any(|row| row.label == claim.label) {
-            rows.push(claim.clone());
-        }
-    }
-    rows.reverse();
-    rows
-}
-
 /// When row `index` of a finale starts to come in, and when its mark
 /// starts to draw (as the row lands), from the start of the finale.
 pub(super) fn row_timing(index: usize) -> (Duration, Duration) {
@@ -266,44 +337,81 @@ pub(super) fn finale_duration(rows: usize) -> Duration {
     }
 }
 
-/// Whether a panel's finale is playing, has played for the current stretch
-/// of activity, and which schedule is current.
+/// A panel's lifecycle (the table's lifecycle column): the last action
+/// applied, whether the user closed the panel, and the finale (playing,
+/// played for this stretch of activity, owed to late news, and which
+/// schedule is current).
 #[derive(Default)]
-pub(super) struct FinaleState {
+pub(super) struct Lifecycle {
+    /// Event time of the newest action applied.
+    last_action_ms: u64,
+    /// Closed by the user since that action.
+    closed: bool,
     generation: u64,
     playing: bool,
     played: bool,
-    /// Claims arrived after the finale for this stretch was over (a long
-    /// verification): they are owed a finale of their own.
+    /// News arrived after the finale for this stretch was over (a long
+    /// verification): it is owed a finale of its own.
     late: bool,
 }
 
-impl FinaleState {
+impl Lifecycle {
+    /// An action at `at_ms` (its note, or a frame whose note never reached
+    /// a panel). Only an action newer than the last applied one resumes the
+    /// session: the finale stops (its end timer goes stale), the user close
+    /// lifts, and the caller restarts the idle deadline; then `Some`
+    /// (whether a finale was playing). An action already applied: `None`,
+    /// nothing changes.
+    pub(super) fn resume(&mut self, at_ms: u64) -> Option<bool> {
+        if at_ms <= self.last_action_ms {
+            return None;
+        }
+        self.last_action_ms = at_ms;
+        let was = self.playing;
+        self.closed = false;
+        self.playing = false;
+        self.played = false;
+        self.late = false;
+        self.generation += 1;
+        Some(was)
+    }
+
+    /// The user closed the panel: it stays closed, and no finale plays,
+    /// until a newer action.
+    pub(super) fn close(&mut self) {
+        self.closed = true;
+    }
+
+    pub(super) fn closed(&self) -> bool {
+        self.closed
+    }
+
     /// Whether the session just finished: it is no longer active (idle or
-    /// ended) and has not finished since its last action.
+    /// ended) and has not finished since its last action, or news is owed
+    /// a finale.
     pub(super) fn due(&self, active: bool) -> bool {
         !active && !self.playing && (!self.played || self.late)
     }
 
-    /// A verification landed. If the finale for this stretch is already
-    /// over, its claims are late (see `due`): whether they are.
-    pub(super) fn claims_arrived(&mut self) -> bool {
+    /// A verification brought news. If the finale for this stretch is
+    /// already over, the news is late (see `due`): whether it is.
+    pub(super) fn news_arrived(&mut self) -> bool {
         self.late |= self.played && !self.playing;
         self.late
     }
 
-    /// Claims are waiting for a finale that has not shown them.
+    /// News is waiting for a finale that has not shown it.
     pub(super) fn late(&self) -> bool {
         self.late
     }
 
     /// The session finished. The finale plays only if `visible` (the panel
-    /// is on screen, not closed by the user, and has something to show):
-    /// then the generation to hand to its end timer.
+    /// is on screen, or owed and may show; something to show) and the user
+    /// has not closed the panel: then the generation for its end timer.
     pub(super) fn start(&mut self, visible: bool) -> Option<u64> {
         self.played = true;
         self.late = false;
-        if !visible {
+        if !visible || self.closed {
             return None;
         }
         self.generation += 1;
@@ -311,20 +419,9 @@ impl FinaleState {
         Some(self.generation)
     }
 
-    /// The session acted: stop a playing finale (whether one was playing)
-    /// and let the next idle play again. Any pending end timer goes stale.
-    pub(super) fn cancel(&mut self) -> bool {
-        let was = self.playing;
-        self.playing = false;
-        self.played = false;
-        self.late = false;
-        self.generation += 1;
-        was
-    }
-
-    /// The finale's content changed while it plays (a verification landed
-    /// late): it starts over under a new generation, and the old end timer
-    /// goes stale. `None` when none is playing.
+    /// The finale's content changed while it plays (news landed): it starts
+    /// over under a new generation, and the old end timer goes stale.
+    /// `None` when none is playing.
     pub(super) fn restart(&mut self) -> Option<u64> {
         if !self.playing {
             return None;
@@ -362,6 +459,105 @@ mod tests {
         }
     }
 
+    fn checklist(verdicts: &Verdicts) -> Vec<Claim> {
+        match verdicts.finale() {
+            Finale::Checklist(rows) => rows,
+            Finale::Chips(_) => Vec::new(),
+        }
+    }
+
+    // ── Row: action note ─────────────────────────────────────────────────
+
+    #[test]
+    fn row_action_note_resumes_only_when_newer_than_the_last_action() {
+        let mut life = Lifecycle::default();
+        assert_eq!(life.resume(100), Some(false));
+        assert_eq!(life.resume(100), None, "the same action again");
+        assert_eq!(life.resume(90), None, "an older action");
+        // A newer action stops a playing finale and lifts a close.
+        let finale = life.start(true).unwrap();
+        life.close();
+        assert_eq!(life.resume(200), Some(true));
+        assert!(!life.playing() && !life.closed());
+        assert!(!life.end(finale), "its end timer is stale");
+        // In the verdicts: it ends an older session finish.
+        let mut verdicts = Verdicts::default();
+        verdicts.record_action(A, 100);
+        verdicts.finish_session(150);
+        assert!(verdicts.finished(10));
+        verdicts.record_action(B, 200);
+        assert!(!verdicts.finished(10), "working again");
+    }
+
+    #[test]
+    fn an_action_whose_frame_was_coalesced_still_reopens_its_window() {
+        // A verified; the action in A is only pushed (its frame is replaced
+        // by B's before capture): the note alone reopens A.
+        let mut verdicts = Verdicts::default();
+        verdicts.act(A, "Notes", 100);
+        verdicts.verify(1, 10, 200, true, vec![]);
+        assert!(verdicts.finished(10));
+        verdicts.record_action(A, 300);
+        verdicts.record_action(B, 310);
+        verdicts.act(B, "Mail", 310);
+        assert!(!verdicts.finished(10));
+    }
+
+    #[test]
+    fn a_pid_only_action_reopens_that_apps_windows() {
+        let mut verdicts = Verdicts::default();
+        verdicts.verify(1, 10, 200, true, vec![]);
+        verdicts.verify(2, 20, 200, true, vec![]);
+        verdicts.record_action((Some(1), None), 300);
+        assert!(!verdicts.finished(10), "app 1 acted on after the check");
+        assert!(verdicts.finished(20), "another app is untouched");
+        verdicts.verify(1, 10, 400, true, vec![]);
+        assert!(verdicts.finished(10));
+    }
+
+    // ── Row: captured frame ──────────────────────────────────────────────
+
+    #[test]
+    fn row_captured_frame_of_an_applied_action_changes_no_lifecycle() {
+        // The capture queue is backlogged past the idle timer: the action
+        // note (t=1000) resumed the session, it went idle and its finale
+        // started at 9000, then the frame of that same action lands.
+        let mut life = Lifecycle::default();
+        let mut verdicts = Verdicts::default();
+        assert!(life.resume(1_000).is_some());
+        verdicts.record_action(A, 1_000);
+        verdicts.finish_session(9_000);
+        let finale = life.start(true).unwrap();
+        // The frame: no lifecycle change, and the session stays finished.
+        assert_eq!(life.resume(1_000), None);
+        verdicts.act(A, "Notes", 1_000);
+        assert!(life.playing(), "the finale keeps playing");
+        assert!(verdicts.finished(10), "the window stays finished");
+        assert!(life.end(finale));
+        assert!(!life.due(false), "no second active stretch");
+        // A frame whose action note never reached a panel (it did not exist
+        // yet) is that action, once.
+        let mut fresh = Lifecycle::default();
+        assert_eq!(fresh.resume(1_000), Some(false));
+    }
+
+    #[test]
+    fn touched_windows_are_most_recent_first_deduped_and_capped() {
+        let mut verdicts = Verdicts::default();
+        for window in 0..8u32 {
+            verdicts.act(
+                (Some(1), Some(window)),
+                &format!("w{window}"),
+                window as u64,
+            );
+        }
+        verdicts.act((Some(1), Some(5)), "w5", 50);
+        let titles: Vec<String> = verdicts.touched().map(|(_, title)| title).collect();
+        assert_eq!(titles, ["w5", "w7", "w6", "w4", "w3"]);
+    }
+
+    // ── Row: verification ────────────────────────────────────────────────
+
     #[test]
     fn a_satisfied_verification_after_the_last_action_finishes_a_window() {
         let mut verdicts = Verdicts::default();
@@ -379,39 +575,27 @@ mod tests {
     }
 
     #[test]
-    fn arrival_order_does_not_matter_only_timestamps() {
-        // The action's frame (pushed at 100) reaches the main queue after the
-        // verification (pushed at 200), because the frame waited for its
-        // capture: the window is still finished.
-        let mut verdicts = Verdicts::default();
-        verdicts.verify(1, 10, 200, true, vec![]);
-        verdicts.act(A, "Notes", 100);
-        assert!(verdicts.finished(10));
-        // An older verification landing late never overrides a newer one.
-        verdicts.verify(1, 10, 150, false, vec![]);
-        assert!(verdicts.finished(10));
-    }
-
-    #[test]
-    fn a_finished_session_finishes_its_windows_unless_a_check_failed() {
+    fn row_verification_older_evidence_never_wins_even_after_a_finale() {
+        // A newer unsatisfied check is displayed and marked shown; then an
+        // older satisfied check (delayed by its screenshot) lands.
         let mut verdicts = Verdicts::default();
         verdicts.act(A, "Notes", 100);
-        verdicts.act(B, "Mail", 110);
-        verdicts.verify(2, 20, 120, false, vec![]);
-        verdicts.finish_session(200);
-        assert!(
-            verdicts.finished(10),
-            "never verified: finished with the session"
-        );
-        assert!(!verdicts.finished(20), "its latest check failed");
-        // The session acting again undoes the session-level finish.
-        verdicts.act(B, "Mail", 300);
+        assert!(verdicts.verify(1, 10, 200, false, vec![claim("saved", Some(false))]));
+        assert_eq!(checklist(&verdicts), [claim("saved", Some(false))]);
+        verdicts.finale_shown();
+        assert!(!verdicts.verify(1, 10, 150, true, vec![claim("saved", Some(true))]));
         assert!(!verdicts.finished(10));
+        assert!(checklist(&verdicts).is_empty(), "no green row");
+        // Newer evidence after the finale is news and shows next time.
+        assert!(verdicts.verify(1, 10, 300, true, vec![claim("saved", Some(true))]));
+        assert!(verdicts.finished(10));
+        assert_eq!(checklist(&verdicts), [claim("saved", Some(true))]);
     }
 
     #[test]
     fn the_checklist_keeps_the_latest_status_of_the_five_most_recent_labels() {
-        let claims: Vec<(u64, Claim)> = [
+        let mut verdicts = Verdicts::default();
+        for (at, row) in [
             claim("one", Some(true)),
             claim("two", Some(false)),
             claim("three", Some(true)),
@@ -422,11 +606,11 @@ mod tests {
         ]
         .into_iter()
         .enumerate()
-        .map(|(at, claim)| (at as u64 * 10, claim))
-        .collect();
-        let rows = checklist(&claims);
+        {
+            verdicts.verify(1, 10, at as u64 * 10, true, vec![row]);
+        }
         assert_eq!(
-            rows,
+            checklist(&verdicts),
             [
                 claim("three", Some(true)),
                 claim("two", Some(true)),
@@ -436,29 +620,71 @@ mod tests {
             ],
             "deduped, most recent five, oldest first; `one` fell off"
         );
-        assert!(checklist(&[]).is_empty());
     }
 
     #[test]
-    fn the_checklist_and_the_finished_rule_read_the_latest_by_event_time() {
-        // Unsatisfied at 200, then a slow verification from 150 lands late
-        // saying satisfied: both the window and its row stay unsatisfied.
+    fn claims_and_verdicts_arriving_out_of_order_read_the_latest_by_event_time() {
         let mut verdicts = Verdicts::default();
         verdicts.act(A, "Notes", 100);
         verdicts.verify(1, 10, 200, false, vec![claim("done", Some(false))]);
         verdicts.verify(1, 10, 150, true, vec![claim("done", Some(true))]);
         assert!(!verdicts.finished(10));
-        assert_eq!(
-            verdicts.finale(),
-            Finale::Checklist(vec![claim("done", Some(false))])
-        );
-        // Rows are ordered by event time too.
+        assert_eq!(checklist(&verdicts), [claim("done", Some(false))]);
         verdicts.verify(2, 20, 120, true, vec![claim("early", Some(true))]);
-        let Finale::Checklist(rows) = verdicts.finale() else {
-            panic!("claims: a checklist");
-        };
-        let labels: Vec<&str> = rows.iter().map(|row| row.label.as_str()).collect();
-        assert_eq!(labels, ["early", "done"]);
+        let labels: Vec<String> = checklist(&verdicts)
+            .into_iter()
+            .map(|row| row.label)
+            .collect();
+        assert_eq!(labels, ["early", "done"], "rows in event order");
+        // The frame of the action (pushed at 100) landing after the check
+        // (at 200) changes nothing.
+        let mut late_frame = Verdicts::default();
+        late_frame.verify(1, 10, 200, true, vec![]);
+        late_frame.act(A, "Notes", 100);
+        assert!(late_frame.finished(10));
+    }
+
+    #[test]
+    fn news_replays_a_playing_finale_or_is_owed_one() {
+        let mut life = Lifecycle::default();
+        life.resume(100);
+        assert_eq!(life.restart(), None, "nothing playing");
+        assert!(!life.news_arrived(), "before the finale: it will show it");
+        let first = life.start(true).unwrap();
+        let second = life.restart().unwrap();
+        assert!(!life.end(first), "replayed: the first schedule is stale");
+        assert!(life.end(second));
+        assert!(!life.due(false), "shown already");
+        assert!(life.news_arrived(), "after it: owed");
+        assert!(life.late() && life.due(false));
+        life.start(true).unwrap();
+        assert!(!life.late() && !life.due(false));
+    }
+
+    // ── Row: idle timer ──────────────────────────────────────────────────
+
+    #[test]
+    fn row_idle_timer_finishes_once_per_stretch_and_plays_only_if_visible() {
+        let mut life = Lifecycle::default();
+        life.resume(100);
+        assert!(!life.due(true), "still active");
+        assert!(life.due(false));
+        // Hidden panel: settles silently, no retry loop.
+        assert_eq!(life.start(false), None);
+        assert!(!life.due(false));
+        // Next stretch: plays.
+        life.resume(200);
+        assert!(life.due(false));
+        assert!(life.start(true).is_some());
+        // The session finishes in the verdicts: windows count as finished,
+        // unless their latest check failed.
+        let mut verdicts = Verdicts::default();
+        verdicts.act(A, "Notes", 100);
+        verdicts.act(B, "Mail", 110);
+        verdicts.verify(2, 20, 120, false, vec![]);
+        verdicts.finish_session(200);
+        assert!(verdicts.finished(10));
+        assert!(!verdicts.finished(20));
     }
 
     #[test]
@@ -466,6 +692,7 @@ mod tests {
         let mut verdicts = Verdicts::default();
         verdicts.act(A, "Notes", 100);
         verdicts.act(B, "Mail", 110);
+        verdicts.verify(2, 20, 120, false, vec![]);
         verdicts.finish_session(200);
         assert_eq!(
             verdicts.finale(),
@@ -473,14 +700,15 @@ mod tests {
                 FinaleChip {
                     tag: B,
                     title: "Mail".into(),
-                    finished: true
+                    finished: false
                 },
                 FinaleChip {
                     tag: A,
                     title: "Notes".into(),
                     finished: true
                 },
-            ])
+            ]),
+            "a check only on finished windows"
         );
         verdicts.verify(
             1,
@@ -492,44 +720,57 @@ mod tests {
         let finale = verdicts.finale();
         assert_eq!(finale.kind(), "checklist");
         assert_eq!(finale.log_rows(), ["unsatisfied: text area holds \"hi\""]);
-        // Once shown, the next finale covers only newer work.
-        verdicts.finale_shown();
-        assert_eq!(verdicts.finale(), Finale::Chips(vec![]));
     }
 
+    // ── Row: end_session ─────────────────────────────────────────────────
+
     #[test]
-    fn a_chip_row_has_a_check_only_for_finished_windows() {
+    fn row_end_session_plays_what_is_owed_and_nothing_twice() {
+        // Ended mid-stretch: the finale is due.
+        let mut life = Lifecycle::default();
+        life.resume(100);
+        assert!(life.due(false));
+        // Ended after the idle finale already played: nothing more is due...
+        let finale = life.start(true).unwrap();
+        assert!(life.end(finale));
+        assert!(!life.due(false));
+        // ...unless a verification brought news after it.
+        life.news_arrived();
+        assert!(life.due(false));
+        // Closed by the user: a due finale settles without playing.
+        life.close();
+        assert_eq!(life.start(true), None);
+    }
+
+    // ── Row: finale timer ────────────────────────────────────────────────
+
+    #[test]
+    fn row_finale_timer_ends_only_its_own_finale_and_marks_what_it_showed() {
+        // A cancelled finale's timer cannot end the next one.
+        let mut life = Lifecycle::default();
+        life.resume(100);
+        let idle = life.start(true).unwrap();
+        life.resume(200);
+        let at_end = life.start(true).unwrap();
+        assert!(!life.end(idle));
+        assert!(life.playing());
+        assert!(life.end(at_end));
+        // Shown: the next finale covers only newer work.
         let mut verdicts = Verdicts::default();
         verdicts.act(A, "Notes", 100);
-        verdicts.act(B, "Mail", 110);
-        verdicts.verify(2, 20, 120, false, vec![]);
-        verdicts.finish_session(200);
+        verdicts.verify(1, 10, 150, true, vec![claim("saved", Some(true))]);
+        verdicts.finale_shown();
+        assert_eq!(verdicts.finale(), Finale::Chips(vec![]));
+        verdicts.act(B, "Mail", 300);
         let Finale::Chips(chips) = verdicts.finale() else {
-            panic!("no claims: chips");
+            panic!("no new claims: chips");
         };
-        let checks: Vec<(&str, bool)> = chips
-            .iter()
-            .map(|chip| (chip.title.as_str(), chip.finished))
-            .collect();
-        assert_eq!(checks, [("Mail", false), ("Notes", true)]);
-    }
-
-    #[test]
-    fn touched_windows_are_most_recent_first_deduped_and_capped() {
-        let mut verdicts = Verdicts::default();
-        for window in 0..8u32 {
-            verdicts.act(
-                (Some(1), Some(window)),
-                &format!("w{window}"),
-                window as u64,
-            );
-        }
-        verdicts.act((Some(1), Some(5)), "w5", 50);
-        let titles: Vec<&str> = verdicts
-            .touched()
-            .map(|(_, title)| title.as_str())
-            .collect();
-        assert_eq!(titles, ["w5", "w7", "w6", "w4", "w3"]);
+        assert_eq!(chips.len(), 1);
+        assert_eq!(chips[0].tag, B);
+        // A late frame of an action before the finale is not new work.
+        verdicts.finale_shown();
+        verdicts.act(A, "Notes", 100);
+        assert_eq!(verdicts.finale(), Finale::Chips(vec![]));
     }
 
     #[test]
@@ -545,109 +786,20 @@ mod tests {
         assert_eq!(finale_duration(0), HOLD);
     }
 
-    #[test]
-    fn an_action_whose_frame_was_coalesced_still_reopens_its_window() {
-        // A verified; then an action in A is pushed, but its frame is
-        // replaced by a later action's (in B) before capture: only the push
-        // records A's action. A is no longer finished.
-        let mut verdicts = Verdicts::default();
-        verdicts.act(A, "Notes", 100);
-        verdicts.verify(1, 10, 200, true, vec![]);
-        assert!(verdicts.finished(10));
-        verdicts.record_action(A, 300);
-        verdicts.record_action(B, 310);
-        verdicts.act(B, "Mail", 310); // the only frame delivered
-        assert!(!verdicts.finished(10));
-    }
+    // ── Row: user close ──────────────────────────────────────────────────
 
     #[test]
-    fn a_pid_only_action_reopens_that_apps_windows() {
-        let mut verdicts = Verdicts::default();
-        verdicts.verify(1, 10, 200, true, vec![]);
-        verdicts.verify(2, 20, 200, true, vec![]);
-        verdicts.record_action((Some(1), None), 300);
-        assert!(!verdicts.finished(10), "app 1 acted on after the check");
-        assert!(verdicts.finished(20), "another app is untouched");
-        verdicts.verify(1, 10, 400, true, vec![]);
-        assert!(verdicts.finished(10));
-    }
-
-    #[test]
-    fn a_late_verification_restarts_the_playing_finale() {
-        let mut finale = FinaleState::default();
-        assert_eq!(finale.restart(), None, "nothing playing");
-        let first = finale.start(true).unwrap();
-        let second = finale.restart().unwrap();
-        assert!(!finale.end(first), "the first schedule is stale");
-        assert!(finale.playing());
-        assert!(finale.end(second));
-    }
-
-    #[test]
-    fn claims_after_the_finale_are_owed_one_of_their_own() {
-        let mut finale = FinaleState::default();
-        // Before the finale: nothing late, the idle finale will show them.
-        assert!(!finale.claims_arrived());
-        let played = finale.start(true).unwrap();
-        // During it: replayed (restart), not late.
-        assert!(!finale.claims_arrived());
-        assert!(finale.end(played));
-        assert!(!finale.due(false), "shown already");
-        // A slow verification lands after it faded: due again.
-        assert!(finale.claims_arrived());
-        assert!(finale.late() && finale.due(false));
-        finale.start(true).unwrap();
-        assert!(!finale.late() && !finale.due(false));
-        // A silent finish (panel hidden) also settles them: no retry loop.
-        finale.claims_arrived();
-        assert_eq!(finale.start(false), None);
-        assert!(!finale.due(false));
-        // A new action makes them part of the next stretch instead.
-        finale.claims_arrived();
-        finale.cancel();
-        assert!(!finale.late());
-    }
-
-    #[test]
-    fn a_cancelled_finales_timer_cannot_end_the_next_one() {
-        // Idle finale, cancelled by an action, then a new finale at session
-        // end before the first timer fires: only the new timer ends it.
-        let mut finale = FinaleState::default();
-        let idle = finale.start(true).unwrap();
-        finale.cancel();
-        let at_end = finale.start(true).unwrap();
-        assert!(
-            !finale.end(idle),
-            "the stale timer must not close the panel"
-        );
-        assert!(finale.playing());
-        assert!(finale.end(at_end));
-    }
-
-    #[test]
-    fn the_finale_plays_once_per_idle_and_a_new_action_cancels_it() {
-        let mut finale = FinaleState::default();
-        assert!(!finale.due(true), "still active");
-        assert!(finale.due(false));
-        let first = finale.start(true).unwrap();
-        assert!(finale.playing());
-        assert!(!finale.due(false), "already playing");
-        // A new action: cancelled, and its end timer is stale.
-        assert!(finale.cancel());
-        assert!(!finale.playing());
-        assert!(!finale.end(first));
-        // The next idle plays again and ends on its own timer.
-        assert!(finale.due(false));
-        let second = finale.start(true).unwrap();
-        assert!(finale.end(second));
-        assert!(!finale.playing());
-        // Finished for this stretch: not again until the session acts.
-        assert!(!finale.due(false));
-        assert!(!finale.cancel(), "nothing was playing");
-        // A hidden panel (or one closed by the user) finishes silently.
-        assert!(finale.due(false));
-        assert_eq!(finale.start(false), None);
-        assert!(!finale.playing());
-        assert!(!finale.due(false));
+    fn row_user_close_holds_until_a_newer_action() {
+        let mut life = Lifecycle::default();
+        life.resume(100);
+        life.close();
+        assert!(life.closed());
+        // The frame of the action before the close does not reopen it.
+        assert_eq!(life.resume(100), None);
+        assert!(life.closed());
+        assert_eq!(life.start(true), None, "no finale while closed");
+        // A newer action does.
+        assert!(life.resume(200).is_some());
+        assert!(!life.closed());
     }
 }

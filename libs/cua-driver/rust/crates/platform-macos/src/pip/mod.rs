@@ -118,7 +118,7 @@ mod live;
 mod stack;
 mod visibility;
 
-use finish::{Claim, Finale, FinaleState, Verdicts};
+use finish::{Claim, Finale, Lifecycle, Verdicts};
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
@@ -287,9 +287,9 @@ fn slot_on_show(others: impl IntoIterator<Item = usize>, dragged: bool) -> Optio
     (!dragged).then(|| free_slot(others))
 }
 
-/// Whether a panel whose last frame arrived at `last_frame` should fade out.
-fn idle_hide_due(last_frame: Instant, now: Instant) -> bool {
-    now.saturating_duration_since(last_frame) >= IDLE_HIDE_AFTER
+/// Whether a panel whose last frame arrived at `last_action` should fade out.
+fn idle_hide_due(last_action: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_action) >= IDLE_HIDE_AFTER
 }
 
 /// A panel shows while its session is active, the user has not closed it
@@ -422,7 +422,7 @@ struct Panel {
     verdicts: Verdicts,
     /// Windows logged as finished (so each is logged once per finish).
     finished_seen: HashSet<u32>,
-    finale: FinaleState,
+    lifecycle: Lifecycle,
     /// The finished-state overlay on the front card, while it is up.
     finale_view: Option<usize>,
     /// Private session key (for logs from callbacks that only have the
@@ -447,10 +447,10 @@ struct Panel {
     dragged: bool,
     /// Origin (AppKit) we last placed the window at.
     placed: (f64, f64),
-    last_frame: Instant,
+    /// When the newest action was applied (the idle deadline counts from
+    /// here).
+    last_action: Instant,
     shown: bool,
-    /// Closed with the x button since the last frame.
-    dismissed: bool,
     /// The target window is fully visible to the user.
     target_visible: bool,
     target: (Option<i32>, Option<u32>),
@@ -1092,13 +1092,9 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
 
     let new_target = (frame.target_pid, frame.target_window_id);
     let now = Instant::now();
-    // A new action cancels a finale in progress: back to live. The overlay
-    // goes whether or not the finale is still playing: one that just ended
-    // is still up during the fade, and this frame re-shows the panel.
-    if panel.finale.cancel() {
-        tracing::info!(target: "pip", session = %key, "PiP finished state cancelled by a new action");
-    }
-    remove_finale_view(panel);
+    // Lifecycle only if this frame's action was not applied already (its
+    // action note normally was; see the table in `finish`).
+    resume(panel, &key, &worker, frame.timestamp_ms);
     // Where: target app icon + window title.
     let title = show_target(panel, frame.target_pid, target_title);
     // The session acted in this window: it becomes the front card (before
@@ -1173,16 +1169,32 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     set_panel_target(panel, &key, &worker, new_target);
     panel.target_visible = target_visible;
     panel.resolved_window = resolved_window;
-    panel.dismissed = false;
-    panel.last_frame = now;
-    state.worker.mark_delivered(&key, panel.last_frame);
     refresh(state, &key);
+}
+
+/// Apply an action's lifecycle (the action note row of the table in
+/// `finish`), once per action: if it is newer than the last applied one,
+/// stop the finale, lift a user close, and restart the idle deadline (and
+/// the poll's) from now. Whether it did.
+unsafe fn resume(panel: &mut Panel, key: &str, worker: &CaptureWorker, at_ms: u64) -> bool {
+    let Some(was_playing) = panel.lifecycle.resume(at_ms) else {
+        return false;
+    };
+    if was_playing {
+        tracing::info!(target: "pip", session = %key, "PiP finished state cancelled by a new action");
+    }
+    // Also a finale that just ended and is still up during the fade.
+    remove_finale_view(panel);
+    let now = Instant::now();
+    panel.last_action = panel.last_action.max(now);
+    worker.mark_delivered(key, now);
     // Small slack so the monotonic check in the callback is past the bar.
     dispatch_to_main_after(
         IDLE_HIDE_AFTER + Duration::from_millis(20),
-        key,
+        key.to_owned(),
         idle_check_cb,
     );
+    true
 }
 
 unsafe extern "C" fn apply_verify_cb(ctx: *mut c_void) {
@@ -1232,8 +1244,9 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
         );
         return;
     };
+    let mut news = false;
     let restacked = restack(panel, &key, &worker, |panel| {
-        panel
+        news = panel
             .verdicts
             .verify(target_pid, window, timestamp_ms, satisfied, claims)
     });
@@ -1241,12 +1254,15 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
     if restacked {
         announce_stack(panel, &key);
     }
-    // A verification that lands while the finale plays (verify_state can
-    // outlast the idle timer) replays it with the new claims, so nothing is
-    // shown stale and nothing is cleared unseen.
-    if let Some(generation) = panel.finale.restart() {
+    // Older than what is known: nothing to show.
+    if !news {
+        return;
+    }
+    // News that lands while the finale plays (verify_state can outlast the
+    // idle timer) replays it, so nothing is shown stale.
+    if let Some(generation) = panel.lifecycle.restart() {
         play_finale(panel, &key, &panel.verdicts.finale(), generation);
-    } else if panel.finale.claims_arrived() {
+    } else if panel.lifecycle.news_arrived() {
         // It landed after the finale for this stretch was over: it gets a
         // finale of its own (unless the user closed the panel).
         refresh(state, &key);
@@ -1289,15 +1305,9 @@ unsafe fn apply_action(state: &mut State, action: Action) {
             .record_action(target, timestamp_ms);
         return;
     };
-    // The session resumed: it is active from this action, not from when its
-    // (possibly slow, possibly coalesced) capture lands. A playing finale
-    // stops here, and the idle timer counts from now.
-    if panel.finale.cancel() {
-        tracing::info!(target: "pip", session = %key, "PiP finished state cancelled by a new action");
-    }
-    remove_finale_view(panel);
-    let now = Instant::now();
-    panel.last_frame = panel.last_frame.max(now);
+    // The session resumed from this action, not from when its (possibly
+    // slow, possibly coalesced) capture lands.
+    resume(panel, &key, &worker, timestamp_ms);
     let restacked = restack(panel, &key, &worker, |panel| {
         panel.verdicts.record_action(target, timestamp_ms)
     });
@@ -1305,12 +1315,6 @@ unsafe fn apply_action(state: &mut State, action: Action) {
     if restacked {
         announce_stack(panel, &key);
     }
-    worker.mark_delivered(&key, now);
-    dispatch_to_main_after(
-        IDLE_HIDE_AFTER + Duration::from_millis(20),
-        key,
-        idle_check_cb,
-    );
 }
 
 /// Log each window of the panel (in its stack or touched since the last
@@ -1321,7 +1325,7 @@ unsafe fn note_finished(panel: &mut Panel, key: &str) {
         .cards()
         .iter()
         .map(|card| (card.key, card.data.title.clone()))
-        .chain(panel.verdicts.touched().cloned())
+        .chain(panel.verdicts.touched())
         .filter_map(|(tag, title)| tag.1.map(|window| (window, title)))
         .collect();
     let mut finished = HashSet::new();
@@ -1600,7 +1604,7 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
             // A pid-only target that now resolves to a (new) window: that
             // window is the front card, labelled as the header already is.
             if let Some(tag) = current_tag(panel.target, panel.resolved_window) {
-                if switch_front(panel, key, &worker, tag, Some(panel.last_frame)) {
+                if switch_front(panel, key, &worker, tag, Some(panel.last_action)) {
                     let title =
                         ns_to_string(msg_send![panel.target_title as *mut AnyObject, stringValue]);
                     let status =
@@ -1717,16 +1721,16 @@ unsafe fn refresh(state: &mut State, key: &str) {
     let Some(panel) = panels.get_mut(key) else {
         return;
     };
-    let active = !idle_hide_due(panel.last_frame, Instant::now());
+    let active = !idle_hide_due(panel.last_action, Instant::now());
     // Gone idle after acting: the session finished. The finale plays if the
     // panel is up; the panel stays up for it whatever else happens.
-    if panel.finale.due(active) {
+    if panel.lifecycle.due(active) {
         finish_session(panel, key, worker);
     }
-    let finale = panel.finale.playing();
+    let finale = panel.lifecycle.playing();
     if panel_should_show(
         active || finale,
-        panel.dismissed,
+        panel.lifecycle.closed(),
         panel.target_visible && !finale,
     ) {
         if !panel.shown {
@@ -1809,10 +1813,9 @@ unsafe fn finish_session(panel: &mut Panel, key: &str, worker: &CaptureWorker) {
     // Late claims (a verification that finished after the last finale) are
     // shown even if that finale's fade hid the panel, wherever the panel
     // would be allowed to show; a user's close is always respected.
-    let late = panel.finale.late();
-    let visible =
-        !panel.dismissed && finale.len() > 0 && (panel.shown || (late && !panel.target_visible));
-    let Some(generation) = panel.finale.start(visible) else {
+    let late = panel.lifecycle.late();
+    let visible = finale.len() > 0 && (panel.shown || (late && !panel.target_visible));
+    let Some(generation) = panel.lifecycle.start(visible) else {
         return;
     };
     play_finale(panel, key, &finale, generation);
@@ -1839,7 +1842,7 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
                 // Only the finale that is playing closes it: an idle finale
                 // cancelled by an action, then a new one started at session
                 // end, leaves a stale timer behind.
-                if state.ending[index].finale.end(generation) {
+                if state.ending[index].lifecycle.end(generation) {
                     close_panel(state.ending.remove(index));
                 }
                 return;
@@ -1849,7 +1852,7 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
                 .iter_mut()
                 .find(|(_, panel)| panel.id == id)
                 .and_then(|(key, panel)| {
-                    panel.finale.end(generation).then(|| {
+                    panel.lifecycle.end(generation).then(|| {
                         panel.verdicts.finale_shown();
                         key.clone()
                     })
@@ -2305,10 +2308,10 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         }
         // Ending is finishing: the finale plays (or keeps playing) if the
         // panel is up, and the panel closes when it is over.
-        if panel.finale.due(false) {
+        if panel.lifecycle.due(false) {
             finish_session(&mut panel, &key, &state.worker);
         }
-        if panel.finale.playing() {
+        if panel.lifecycle.playing() {
             // Owed late claims can bring a hidden panel back for its finale.
             if !panel.shown {
                 let others: Vec<usize> = state
@@ -2445,7 +2448,7 @@ extern "C" fn on_hide(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) 
             .iter_mut()
             .find(|(_, panel)| panel.id == id)
             .map(|(key, panel)| {
-                panel.dismissed = true;
+                panel.lifecycle.close();
                 key.clone()
             })
         else {
@@ -2815,7 +2818,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         trail_motion: Trail::default(),
         verdicts: state.early.remove(key).unwrap_or_default(),
         finished_seen: HashSet::new(),
-        finale: FinaleState::default(),
+        lifecycle: Lifecycle::default(),
         finale_view: None,
         key: key.to_owned(),
         card,
@@ -2827,9 +2830,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         slot: None,
         dragged: remembered.origin.is_some(),
         placed: origin,
-        last_frame: Instant::now(),
+        last_action: Instant::now(),
         shown: false,
-        dismissed: false,
         target_visible: false,
         target: (None, None),
         client: None,
