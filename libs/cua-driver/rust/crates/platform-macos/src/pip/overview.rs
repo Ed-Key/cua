@@ -475,6 +475,34 @@ unsafe fn install_menubar() {
     let _: () = msg_send![button, setTarget: menubar_target() as *mut AnyObject];
     let _: () = msg_send![button, setAction: sel!(pipMenubar:)];
     tracing::info!(target: "pip", "PiP menubar item installed");
+    // Where it landed, once the menu bar has laid it out: WindowServer
+    // lists the item under Control Center, so a check finds it by this line.
+    dispatch_to_main_after(Duration::from_secs(1), button as usize, log_menubar_cb);
+}
+
+unsafe extern "C" fn log_menubar_cb(ctx: *mut c_void) {
+    let button = *Box::from_raw(ctx as *mut usize) as *mut AnyObject;
+    let window: *mut AnyObject = msg_send![button, window];
+    if window.is_null() {
+        tracing::warn!(target: "pip", "PiP menubar item has no window");
+        return;
+    }
+    let frame: NSRect = msg_send![window, frame];
+    let primary_h = primary_screen_height();
+    let at = screen_rect(area_of(frame), (0.0, 0.0), primary_h);
+    tracing::info!(target: "pip", x = at.x, y = at.y, w = at.w, h = at.h, "PiP menubar item at");
+}
+
+/// Height of the primary screen (AppKit's coordinate origin).
+unsafe fn primary_screen_height() -> f64 {
+    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    let count: usize = msg_send![screens, count];
+    if count == 0 {
+        return 0.0;
+    }
+    let screen: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
+    let frame: NSRect = msg_send![screen, frame];
+    frame.size.height
 }
 
 /// The koala mark as a template image at 18 pt with its 2x representation.
@@ -708,7 +736,7 @@ unsafe fn open(state: &mut State, pictures: Vec<GroupPictures>, via: Via) {
     tracing::info!(
         target: "pip",
         groups = %groups_line(&overview.model.groups),
-        via = via.as_str(),
+        via = %via.as_str(),
         "PiP overview shown"
     );
     // Key for Esc and the arrows; a non-activating panel, so the user's
@@ -725,7 +753,7 @@ unsafe fn close(state: &mut State, via: Via) {
     if overview.window != 0 {
         let _: () = msg_send![overview.window as *mut AnyObject, orderOut: std::ptr::null_mut::<AnyObject>()];
     }
-    tracing::info!(target: "pip", via = via.as_str(), "PiP overview closed");
+    tracing::info!(target: "pip", via = %via.as_str(), "PiP overview closed");
 }
 
 /// Where each thumbnail is on screen, for checks.
@@ -739,7 +767,7 @@ unsafe fn log_tiles(overview: &Overview, window: (f64, f64), primary_h: f64) {
             tracing::info!(
                 target: "pip",
                 session = %group.key,
-                window = ?thumb.tag.1,
+                window = thumb.tag.1.unwrap_or(0),
                 title = %thumb.title,
                 finished = thumb.finished,
                 x = at.x, y = at.y, w = at.w, h = at.h,
@@ -1016,7 +1044,7 @@ unsafe fn focus(state: &mut State, group: usize, window: usize) {
     };
     let key = state.overview.model.groups[group].key.clone();
     let (tag, title) = (thumb.tag, thumb.title.clone());
-    tracing::info!(target: "pip", session = %key, window = ?tag.1, title = %title, "PiP overview focus");
+    tracing::info!(target: "pip", session = %key, window = tag.1.unwrap_or(0), title = %title, "PiP overview focus");
     close(state, Via::Focus);
     if let Some(pid) = tag.0 {
         focus_window(pid, tag.1);
