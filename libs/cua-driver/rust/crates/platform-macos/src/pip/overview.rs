@@ -159,26 +159,45 @@ impl Model {
     }
 
     /// Move the selection with an arrow key; the first press selects the
-    /// first thumbnail. Clamped to the thumbnails on screen (`shown` is how
-    /// many each row draws).
+    /// first thumbnail. Only rows that draw a thumbnail take part (`shown`
+    /// is how many each drawn row has; a session with no resolved window
+    /// draws none), and the column clamps to that row's thumbnails.
     pub(super) fn select(&mut self, dir: Dir, shown: &[usize]) -> Option<(usize, usize)> {
-        let rows = shown.iter().filter(|&&n| n > 0).count();
-        if rows == 0 {
+        let rows: Vec<usize> = (0..shown.len()).filter(|&g| shown[g] > 0).collect();
+        let Some(&first) = rows.first() else {
             self.selected = None;
             return None;
-        }
-        let (g, w) = match self.selected {
-            None => (0, 0),
-            Some((g, w)) => match dir {
-                Dir::Left => (g, w.saturating_sub(1)),
-                Dir::Right => (g, w + 1),
-                Dir::Up => (g.saturating_sub(1), w),
-                Dir::Down => (g + 1, w),
-            },
         };
-        let g = g.min(rows - 1);
-        let w = w.min(shown[g].saturating_sub(1));
-        self.selected = Some((g, w));
+        let (g, w) = match self.selected.filter(|&(g, w)| shown.get(g).is_some_and(|&n| w < n)) {
+            None => (first, 0),
+            Some((g, w)) => {
+                let at = rows.iter().position(|&row| row == g).unwrap_or(0);
+                match dir {
+                    Dir::Left => (g, w.saturating_sub(1)),
+                    Dir::Right => (g, (w + 1).min(shown[g] - 1)),
+                    Dir::Up => (rows[at.saturating_sub(1)], w),
+                    Dir::Down => (rows[(at + 1).min(rows.len() - 1)], w),
+                }
+            }
+        };
+        self.selected = Some((g, w.min(shown[g] - 1)));
+        self.selected
+    }
+
+    /// After a rebuild: a selection that is no longer drawn (its row past
+    /// the rows that fit, or its thumbnail behind a "+n more" tile) moves
+    /// to the nearest drawn thumbnail, or clears when nothing is drawn.
+    pub(super) fn clamp(&mut self, shown: &[usize]) -> Option<(usize, usize)> {
+        let Some((g, w)) = self.selected else {
+            return None;
+        };
+        if shown.get(g).is_some_and(|&n| w < n) {
+            return self.selected;
+        }
+        let nearest = (0..shown.len())
+            .filter(|&row| shown[row] > 0)
+            .min_by_key(|&row| (row.abs_diff(g), row));
+        self.selected = nearest.map(|row| (row, w.min(shown[row] - 1)));
         self.selected
     }
 }
@@ -779,6 +798,8 @@ unsafe extern "C" fn poll_cb(ctx: *mut c_void) {
             let frame: NSRect = msg_send![overview.window as *mut AnyObject, frame];
             if overview.model.update(groups) {
                 build(overview, (frame.size.width, frame.size.height), &pictures);
+                let shown = overview.layout.as_ref().map(Layout::shown).unwrap_or_default();
+                overview.model.clamp(&shown);
                 overview.hovered = None;
                 highlight(overview);
             } else {
@@ -1495,6 +1516,64 @@ mod tests {
         let (g, w) = model.selected.unwrap();
         assert_eq!(model.groups[g].windows[w].title, "doc a");
         assert_eq!(model.select(Dir::Down, &[]), None);
+    }
+
+    #[test]
+    fn arrows_skip_rows_with_no_thumbnail_and_reach_every_tile() {
+        // A session with no resolved window draws no thumbnail: row 0 here.
+        let mut model = Model::default();
+        model.toggle(vec![
+            group("none", vec![]),
+            group("two", vec![thumb(1, 10, "a", false), thumb(1, 11, "b", false)]),
+            group("one", vec![thumb(1, 20, "c", false)]),
+        ]);
+        let shown = [0, 2, 1];
+        assert_eq!(model.select(Dir::Down, &shown), Some((1, 0)));
+        assert_eq!(model.select(Dir::Right, &shown), Some((1, 1)));
+        assert_eq!(model.select(Dir::Right, &shown), Some((1, 1)));
+        assert_eq!(model.select(Dir::Down, &shown), Some((2, 0)));
+        assert_eq!(model.select(Dir::Down, &shown), Some((2, 0)));
+        assert_eq!(model.select(Dir::Up, &shown), Some((1, 0)));
+        assert_eq!(model.select(Dir::Up, &shown), Some((1, 0)));
+        assert_eq!(model.select(Dir::Left, &shown), Some((1, 0)));
+        // Return acts on the selected thumbnail: a real one.
+        let (g, w) = model.selected.unwrap();
+        assert_eq!(model.groups[g].windows[w].tag, (Some(1), Some(10)));
+        // With shown = [0, 1] the second row is reachable at once.
+        model.selected = None;
+        assert_eq!(model.select(Dir::Down, &[0, 1]), Some((1, 0)));
+    }
+
+    #[test]
+    fn a_rebuild_moves_a_selection_that_is_no_longer_drawn() {
+        // Row overflow: 4 sessions fit at 1440x875; an alphabetically
+        // earlier 5th arrives and the selected 4th row is pushed off.
+        let mut model = Model::default();
+        let four: Vec<Group> = ["b", "c", "d", "e"].iter().map(|l| group(l, vec![thumb(1, 1, "w", false)])).collect();
+        model.toggle(four.clone());
+        for _ in 0..4 {
+            model.select(Dir::Down, &[1, 1, 1, 1]);
+        }
+        assert_eq!(model.selected, Some((3, 0)));
+        let mut five = vec![group("a", vec![thumb(1, 2, "w", false)])];
+        five.extend(four);
+        assert!(model.update(five.clone()));
+        assert_eq!(model.selected, Some((4, 0)), "the selection followed its session");
+        let counts: Vec<usize> = five.iter().map(|g| g.windows.len()).collect();
+        let shown = layout(SCREEN, &counts).shown();
+        assert!(shown.len() < 5, "the fifth row does not fit: {shown:?}");
+        assert_eq!(model.clamp(&shown), Some((shown.len() - 1, 0)));
+        // The "+n more" tile: the selected 9th thumbnail is behind it.
+        let mut model = Model::default();
+        let wide = vec![group("x", (0..9).map(|i| thumb(1, i, "w", false)).collect())];
+        model.toggle(wide.clone());
+        model.selected = Some((0, 8));
+        let shown = layout(SCREEN, &[9]).shown();
+        assert!(shown[0] < 9);
+        assert_eq!(model.clamp(&shown), Some((0, shown[0] - 1)));
+        // A drawn selection is left alone; nothing drawn clears it.
+        assert_eq!(model.clamp(&shown), Some((0, shown[0] - 1)));
+        assert_eq!(model.clamp(&[0]), None);
     }
 
     #[test]
