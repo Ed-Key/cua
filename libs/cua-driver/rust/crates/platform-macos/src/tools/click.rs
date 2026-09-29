@@ -179,9 +179,8 @@ fn def() -> &'static ToolDef {
             "Click an element or point. Prefer element_token (or element_index + snapshot_id) \
              from get_window_state; it works on background or hidden windows without moving \
              the pointer. Use x,y in get_window_state screenshot pixels only for surfaces \
-             missing from the tree. Background by default. To click and then see the result, \
-             or to click several visible targets, use act_and_read: one call instead of \
-             click plus get_window_state. Details: skill://cua-driver/WORKFLOW.md"
+             missing from the tree. Background by default. \
+             Details: skill://cua-driver/WORKFLOW.md"
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
