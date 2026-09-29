@@ -785,7 +785,7 @@ unsafe extern "C" fn poll_cb(ctx: *mut c_void) {
                 refresh_pictures(overview, &pictures);
             }
             let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-            hover(overview, (mouse.x - frame.origin.x, mouse.y - frame.origin.y));
+            hover(overview, (mouse.x - frame.origin.x, mouse.y - frame.origin.y), "poll");
             dispatch_to_main_after(POLL, generation, poll_cb);
         });
     });
@@ -793,7 +793,7 @@ unsafe extern "C" fn poll_cb(ctx: *mut c_void) {
 
 /// Outline the thumbnail under `point` (host window coordinates), if that
 /// changed.
-unsafe fn hover(overview: &mut Overview, point: (f64, f64)) {
+unsafe fn hover(overview: &mut Overview, point: (f64, f64), via: &str) {
     let Some(layout) = &overview.layout else {
         return;
     };
@@ -803,6 +803,14 @@ unsafe fn hover(overview: &mut Overview, point: (f64, f64)) {
     };
     if hovered != overview.hovered {
         overview.hovered = hovered;
+        let thumb = hovered.and_then(|(g, w)| overview.model.groups.get(g).map(|group| (group, w)));
+        tracing::info!(
+            target: "pip",
+            session = thumb.map_or("", |(group, _)| group.key.as_str()),
+            window = thumb.and_then(|(group, w)| group.windows.get(w)).and_then(|t| t.tag.1).unwrap_or(0),
+            via, x = point.0, y = point.1,
+            "PiP overview hover"
+        );
         highlight(overview);
     }
 }
@@ -919,6 +927,7 @@ unsafe fn build(overview: &mut Overview, screen: (f64, f64), pictures: &[GroupPi
     let glass = glass_background(bounds, body, SHEET_RADIUS);
     let _: () = msg_send![glass, setFrame: ns_rect(layout.sheet)];
     add_subview(content, glass);
+    tracing::info!(target: "pip", rows = layout.rows.len(), tiles = tiles.iter().map(Vec::len).sum::<usize>(), "PiP overview built");
     overview.views = Some(Views {
         glass: glass as usize,
         tiles,
@@ -1210,7 +1219,7 @@ extern "C" fn mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject)
 
 extern "C" fn mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     let point = unsafe { event_point(this, event) };
-    with_state(|state| unsafe { hover(&mut state.overview, point) });
+    with_state(|state| unsafe { hover(&mut state.overview, point, "event") });
 }
 
 extern "C" fn mouse_exited(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
@@ -1294,6 +1303,13 @@ mod tests {
         // The title under it counts too; the sheet's padding does not.
         let title = &layout.rows[1].tiles[0].title;
         assert_eq!(hit(&layout, (title.x + 1.0, title.y + 1.0)), Hit::Tile(1, 0));
+        // Every row's thumbnails, not only the bottom row's.
+        for (g, row) in layout.rows.iter().enumerate() {
+            for (w, tile) in row.tiles.iter().enumerate() {
+                let center = (tile.thumb.x + tile.thumb.w / 2.0, tile.thumb.y + tile.thumb.h / 2.0);
+                assert_eq!(hit(&layout, center), Hit::Tile(g, w), "row {g} tile {w} at {center:?}: {layout:?}");
+            }
+        }
         assert_eq!(hit(&layout, (layout.sheet.x + 2.0, layout.sheet.y + 2.0)), Hit::Sheet);
         assert_eq!(hit(&layout, (0.0, 0.0)), Hit::Outside);
     }
