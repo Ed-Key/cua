@@ -522,6 +522,7 @@ impl Tool for ClickTool {
             // now, before any cursor or input work: an unknown name refuses.
             let action_guard = element_guard.clone();
             let requested = effective_action.clone();
+            let press_row = snapshot_row.clone();
             let resolved_action = tokio::task::spawn_blocking(move || unsafe {
                 let element = action_guard.as_ptr() as AXUIElementRef;
                 let now_reads = ["AXDescription", "AXTitle"]
@@ -748,6 +749,7 @@ impl Tool for ClickTool {
                                     selection_pixel,
                                     &selection_modifiers,
                                     foreground,
+                                    press_row.as_deref(),
                                 )?);
                                 std::thread::sleep(std::time::Duration::from_millis(150));
                                 Ok(())
@@ -794,6 +796,7 @@ impl Tool for ClickTool {
                                 selection_pixel,
                                 &selection_modifiers,
                                 false,
+                                press_row.as_deref(),
                             )
                             .map(|outcome| (outcome, false))
                         }
@@ -870,6 +873,10 @@ impl Tool for ClickTool {
                 }
                 Ok(Err(e)) if e.is::<crate::input::skylight::TargetOccluded>() => {
                     super::pixel_route::foreground_unavailable("click", wid, &e)
+                }
+                Ok(Err(e)) if e.is::<ElementChanged>() => {
+                    let changed = e.downcast_ref::<ElementChanged>().expect("checked above");
+                    element_changed_refusal(changed.idx, &changed.now_reads)
                 }
                 Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1513,6 +1520,7 @@ fn perform_ax_click(
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
+    snapshot_row: Option<&str>,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     let element = element_ptr as AXUIElementRef;
     let action_label = crate::ax::tree::display_action_name(ax_action.to_owned());
@@ -1535,6 +1543,7 @@ fn perform_ax_click(
         .filter_map(|attribute| unsafe { copy_string_attr(element, attribute) })
         .find(|name| !name.trim().is_empty())
         .unwrap_or_default();
+    ensure_names_row(element, idx, snapshot_row)?;
 
     // A plain click on a list row means "make this the selected row". Prove
     // that from the app's own selection instead of trusting a press: AppKit
@@ -1546,7 +1555,7 @@ fn perform_ax_click(
                 &row,
                 element,
                 advertised.iter().any(|action| action == "AXPress"),
-                RowTarget { idx, pid, window_id, role: &role, title: &title },
+                RowTarget { idx, pid, window_id, role: &role, title: &title, snapshot_row },
                 selection_pixel,
                 foreground,
             );
@@ -1913,6 +1922,34 @@ fn still_names_row(snapshot_row: Option<&str>, live_name: &str) -> bool {
     name.is_empty() || snapshot_row.is_none_or(|row| row.contains(name))
 }
 
+/// The element answers with a name its snapshot row did not show.
+#[derive(Debug)]
+struct ElementChanged {
+    idx: usize,
+    now_reads: String,
+}
+
+impl std::fmt::Display for ElementChanged {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "element [{}] now reads \"{}\"", self.idx, self.now_reads)
+    }
+}
+
+impl std::error::Error for ElementChanged {}
+
+/// Refuse to act on an element whose live title or description is not in
+/// the row its token named (the app reused it for other content).
+fn ensure_names_row(element: AXUIElementRef, idx: usize, snapshot_row: Option<&str>) -> anyhow::Result<()> {
+    let changed = ["AXDescription", "AXTitle"]
+        .into_iter()
+        .filter_map(|attribute| unsafe { copy_string_attr(element, attribute) })
+        .find(|name| !still_names_row(snapshot_row, name));
+    match changed {
+        Some(now_reads) => Err(ElementChanged { idx, now_reads }.into()),
+        None => Ok(()),
+    }
+}
+
 fn element_changed_refusal(idx: usize, now_reads: &str) -> ToolResult {
     ToolResult::error(format!(
         "click: element [{idx}] now reads \"{now_reads}\", not what the snapshot showed; \
@@ -1943,6 +1980,7 @@ struct RowTarget<'a> {
     window_id: u32,
     role: &'a str,
     title: &'a str,
+    snapshot_row: Option<&'a str>,
 }
 
 const ROW_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
@@ -1983,7 +2021,7 @@ fn select_row(
     foreground: bool,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     use crate::input::ax_actions::RowKind;
-    let RowTarget { idx, pid, window_id, role, title } = target;
+    let RowTarget { idx, pid, window_id, role, title, snapshot_row } = target;
     let row_role = &row.role;
     let confirmed = |how: &str, via_pixel: bool| {
         Ok((
@@ -2001,6 +2039,9 @@ fn select_row(
         return confirmed("through AX selection", false);
     }
     if element_presses {
+        // The reads above take time in Catalyst; the element must still be
+        // the row the token named when the press goes out.
+        ensure_names_row(element, idx, snapshot_row)?;
         let alive_before = unsafe { crate::ax::bindings::element_is_alive(element) };
         let err = unsafe { crate::ax::bindings::perform_action(element, "AXPress") };
         if err == crate::ax::bindings::kAXErrorSuccess && row_settles_exclusive(row) {
@@ -2010,14 +2051,21 @@ fn select_row(
         if err == crate::ax::bindings::kAXErrorInvalidUIElement {
             anyhow::bail!("AXUIElementPerformAction(AXPress) returned {err}; take a fresh snapshot");
         }
-        let replaced = !row.readable()
-            || if err == crate::ax::bindings::kAXErrorSuccess {
-                !unsafe { crate::ax::bindings::element_is_alive(element) }
-            } else {
-                crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
-                    crate::ax::bindings::element_gone_after_action(element)
-                })
-            };
+        let replaced = if err == crate::ax::bindings::kAXErrorSuccess {
+            !row.readable() || !unsafe { crate::ax::bindings::element_is_alive(element) }
+        } else {
+            crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
+                crate::ax::bindings::element_gone_after_action(element)
+            })
+        };
+        // A failed press on a row that no longer answers: nothing is known,
+        // and no pointer click follows.
+        if err != crate::ax::bindings::kAXErrorSuccess && !replaced && !row.readable() {
+            anyhow::bail!(
+                "AXUIElementPerformAction(AXPress) returned {err} and the row no longer \
+                 answers; take a fresh snapshot"
+            );
+        }
         // The press replaced the element or its row (it navigated or rebuilt
         // the list), or the row no longer answers: the row's coordinates may
         // now hold something else, so no pointer click follows.

@@ -325,8 +325,16 @@ impl Tool for GetWindowStateTool {
                         cua_driver_core::walk_budget::WalkBudget::new(budget_ms, max_elements),
                     )
                 };
+                let started = std::time::Instant::now();
                 let first = walk(timeout_ms);
-                let (tree, first_walk) = match retry_budget(&first.walk) {
+                // A retry repeats the walk's setup (app and window lookup),
+                // which the budget does not bound. When that setup alone was
+                // slow, the app is slow everywhere: return the partial tree
+                // rather than wait twice.
+                let setup_was_slow = started.elapsed().as_millis() as u64
+                    > timeout_ms.saturating_mul(2).max(first.walk.elapsed_ms + timeout_ms);
+                let retry = retry_budget(&first.walk).filter(|_| !setup_was_slow);
+                let (tree, first_walk) = match retry {
                     Some(budget_ms) => {
                         // Release the abandoned walk's element retains.
                         drop(crate::ax::cache::CachedSnapshot::from_nodes(&first.nodes));
