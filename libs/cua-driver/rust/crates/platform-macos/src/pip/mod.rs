@@ -1554,9 +1554,12 @@ unsafe fn raise_card(state: &mut State, id: i64, tag: Tag) {
     // Shown until the poll says otherwise for this window.
     panel.target_visible = false;
     // An ending panel has no live state to refresh (and its key may belong
-    // to a new session's panel by now).
+    // to a new session's panel by now), but its layers must drop the old
+    // window's pixels under the new title.
     if live {
         refresh(state, key);
+    } else {
+        sync_layers(panel);
     }
 }
 

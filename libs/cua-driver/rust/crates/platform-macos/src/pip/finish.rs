@@ -29,7 +29,7 @@
 //! | Idle timer | the session finishes (now) | none | the finale is due once per stretch: plays if the panel is up and not closed (or owed and may show), else settles silently | the panel fades after |
 //! | `end_session` | the session finishes (now) | none | as the idle timer, then the panel closes | the panel leaves the live set |
 //! | Finale timer | none | marks what was displayed as shown; the watermarks stay | ends only the finale of its own generation | the panel fades |
-//! | User close | none | none | closed until an action newer than the close; no finale plays | the panel hides (an ending one closes) |
+//! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not owed news) shows the panel or plays a finale | the panel hides (an ending one closes) |
 //!
 //! Everything here is pure (unit tested, one test per row).
 
@@ -376,10 +376,16 @@ impl Lifecycle {
         Some(was)
     }
 
-    /// The user closed the panel: it stays closed, and no finale plays,
-    /// until a newer action.
+    /// The user closed the panel: any finale ends (its end timer goes
+    /// stale), and the panel stays closed, with no finale, until a newer
+    /// action. The finale counts as played, so `end_session` finds nothing
+    /// due.
     pub(super) fn close(&mut self) {
         self.closed = true;
+        if self.playing {
+            self.playing = false;
+            self.generation += 1;
+        }
     }
 
     pub(super) fn closed(&self) -> bool {
@@ -474,12 +480,15 @@ mod tests {
         assert_eq!(life.resume(100), Some(false));
         assert_eq!(life.resume(100), None, "the same action again");
         assert_eq!(life.resume(90), None, "an older action");
-        // A newer action stops a playing finale and lifts a close.
+        // A newer action stops a playing finale...
         let finale = life.start(true).unwrap();
-        life.close();
         assert_eq!(life.resume(200), Some(true));
-        assert!(!life.playing() && !life.closed());
+        assert!(!life.playing());
         assert!(!life.end(finale), "its end timer is stale");
+        // ...and lifts a close.
+        life.close();
+        assert_eq!(life.resume(300), Some(false));
+        assert!(!life.closed());
         // In the verdicts: it ends an older session finish.
         let mut verdicts = Verdicts::default();
         verdicts.record_action(A, 100);
@@ -787,6 +796,26 @@ mod tests {
     }
 
     // ── Row: user close ──────────────────────────────────────────────────
+
+    #[test]
+    fn row_user_close_during_a_finale_ends_it_and_end_session_cannot_reopen() {
+        let mut life = Lifecycle::default();
+        life.resume(100);
+        let idle = life.start(true).unwrap();
+        life.close();
+        assert!(!life.playing(), "the close ends the finale");
+        assert!(!life.end(idle), "its timer is stale");
+        // end_session before that timer: nothing is due, nothing plays.
+        assert!(!life.due(false));
+        assert_eq!(life.start(true), None);
+        // Owed news cannot bring it back either.
+        life.news_arrived();
+        assert_eq!(life.start(true), None);
+        assert!(!life.playing());
+        // Only a newer action does.
+        assert_eq!(life.resume(200), Some(false));
+        assert!(!life.closed());
+    }
 
     #[test]
     fn row_user_close_holds_until_a_newer_action() {
