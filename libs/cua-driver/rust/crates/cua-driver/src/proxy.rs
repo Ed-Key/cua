@@ -388,6 +388,9 @@ where
                 )
                 .await;
                 if let Some(metadata) = initialize_metadata {
+                    if let Some(name) = metadata.client_name.clone() {
+                        announce_client_name(socket_path, session_id, name);
+                    }
                     observe_proxy_session_started(metadata);
                     session_observed = true;
                 }
@@ -423,6 +426,24 @@ where
     // `session_end(session_id)` once (idempotent). That single path reliably
     // covers the ungraceful-death case the old best-effort exit hook missed.
     Ok(())
+}
+
+/// Tell the daemon which MCP client this session belongs to, so the PiP
+/// preview can show the right app. Fire-and-forget: an older daemon answers
+/// "Unknown method" and nothing else depends on it.
+fn announce_client_name(socket_path: &str, session_id: &str, client_name: String) {
+    let req = DaemonRequest {
+        method: "session_client".into(),
+        name: None,
+        args: Some(serde_json::json!({ "client_name": client_name })),
+        session_id: Some(session_id.to_owned()),
+        observation_origin: None,
+        client_kind: None,
+    };
+    let socket = socket_path.to_owned();
+    tokio::task::spawn_blocking(move || {
+        let _ = send_request(&socket, &req);
+    });
 }
 
 fn proxy_knows_tool(cached_tools_list: &serde_json::Value, name: &str) -> bool {

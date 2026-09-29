@@ -267,7 +267,22 @@ fn maybe_init_pip() {
                             png_bytes: frame.png_bytes,
                             action_label: frame.action_label,
                             timestamp_ms: frame.timestamp_ms,
+                            session_key: frame.session_key,
+                            session_label: frame.session_label,
+                            client_name: frame.client_name,
+                            client_pid: frame.client_pid,
+                            target_pid: frame.target_pid,
+                            target_window_id: frame.target_window_id,
                         });
+                    }
+                }
+            });
+            // Same private key the frames carry, so the ended session's
+            // panel goes away with its cursor and recording.
+            cua_driver_core::session::register_session_end_hook(|session_key| {
+                if let Some(slot) = BACKEND.get() {
+                    if let Some(b) = slot.lock().unwrap().as_ref() {
+                        b.end_session(session_key);
                     }
                 }
             });

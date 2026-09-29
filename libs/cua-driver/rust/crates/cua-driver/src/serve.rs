@@ -1014,6 +1014,8 @@ pub async fn run_serve(
                 let trusted_host_connection =
                     authenticate_embedded_host_connection(&stream).is_ok();
                 let history_cli_executable_path = history_cli_executable_path(&stream).ok();
+                // Only a control connection's peer is recorded (PiP client icon).
+                let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
                 let reg = sdk.clone();
                 let shutdown_tx2 = shutdown_tx.clone();
                 let trusted_resume_registry = trusted_resume_registry.clone();
@@ -1326,6 +1328,9 @@ pub async fn run_serve(
                                         .lock()
                                         .unwrap()
                                         .insert(sid.to_owned());
+                                    if let Some(pid) = peer_pid {
+                                        cua_driver_core::pip_hook::note_client_pid(sid, pid);
+                                    }
                                 }
                                 let resp = DaemonResponse::ok(
                                     serde_json::json!({"session_begin": true})
@@ -1357,6 +1362,22 @@ pub async fn run_serve(
                                     (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
                                 ).await;
                             }
+                            "session_client" => {
+                                // Display-only MCP client name for the PiP
+                                // preview. Never used for policy or telemetry.
+                                if let (Some(sid), Some(name)) = (
+                                    req.session_id.as_deref(),
+                                    req.args.as_ref()
+                                        .and_then(|args| args.get("client_name"))
+                                        .and_then(serde_json::Value::as_str),
+                                ) {
+                                    cua_driver_core::pip_hook::note_client_name(sid, name);
+                                }
+                                let resp = DaemonResponse::ok(serde_json::json!({"session_client": true}));
+                                let _ = writer.write_all(
+                                    (serde_json::to_string(&resp).unwrap() + "\n").as_bytes()
+                                ).await;
+                            }
                             other => {
                                 let resp = DaemonResponse::err(
                                     format!("Unknown method: {other}"), 65
@@ -1380,6 +1401,7 @@ pub async fn run_serve(
                     if let Some(sid) = control_session_id {
                         active_proxy_sessions().lock().unwrap().remove(&sid);
                         reg.end_transport_sessions(&sid);
+                        cua_driver_core::pip_hook::forget_client(&sid);
                     }
                     if let Some(connection) = trusted_session {
                         detach_trusted_connection(&trusted_resume_registry, connection).await;

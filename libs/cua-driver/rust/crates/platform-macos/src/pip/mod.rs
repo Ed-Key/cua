@@ -1,90 +1,215 @@
-//! macOS picture-in-picture preview window.
+//! macOS picture-in-picture preview: one floating glass panel per agent
+//! session.
 //!
-//! Floating NSWindow with an NSImageView showing the most recent
-//! post-action screenshot and an NSTextField with a one-line label
-//! describing the action that produced it.
+//! Each session (keyed by its private runtime session key, the same key the
+//! agent cursor uses) gets its own small panel showing the latest
+//! post-action screenshot of the window it is driving, who is driving
+//! (client app icon + session label), and where (target app icon + window
+//! title). The border takes the session's cursor color so a panel and its
+//! cursor read as one agent.
+//!
+//! ## Never takes focus
+//!
+//! Panels are instances of `CuaPipPanel`, an `NSPanel` subclass whose
+//! `canBecomeKeyWindow` / `canBecomeMainWindow` return NO, created with
+//! `NSWindowStyleMaskNonactivatingPanel` and `becomesKeyOnlyIfNeeded`.
+//! Clicking or dragging one therefore never activates cua-driver or steals
+//! the keyboard from the user's app; buttons use `CuaPipButton`
+//! (`acceptsFirstMouse:` YES) so the first click on a non-key panel acts.
+//! Panels are shown with `orderFrontRegardless`, never `makeKey`.
 //!
 //! ## Threading model
 //!
-//! Mirrors `cursor/overlay.rs`:
+//! Mirrors `cursor/overlay.rs`: AppKit runs on the main thread, which
+//! `cua-driver/src/main.rs` parks in `NSApplication.run()`. `push_frame()`
+//! and `end_session()` are called from arbitrary threads; they box their
+//! payload and post the UI work to the main queue with `dispatch_async_f`.
+//! All panel state lives in `STATE` and is only touched on the main queue
+//! (the mutex exists to make the static `Sync`, not for contention).
 //!
-//! - The MCP/tokio server runs on a background thread.
-//! - AppKit MUST run on the main thread, which `cua-driver/src/main.rs`
-//!   parks in `NSApplication.run()` for the cursor overlay.
-//! - `push_frame()` is called from arbitrary tokio tasks. It packages
-//!   the frame into a heap-allocated `Box` and posts the actual UI
-//!   update onto the main queue via `dispatch_async_f`. The block
-//!   then constructs an `NSImage` from the PNG bytes and calls
-//!   `[imageView setImage:]` + `[label setStringValue:]`.
+//! ## Lifecycle
 //!
-//! ## Window properties
+//! - A session's first frame creates its panel, cascading down from the
+//!   top-right corner of the main screen's visible frame so two agents'
+//!   panels do not overlap. A panel the user dragged keeps its place, and an
+//!   ended session's last position is remembered while the daemon runs.
+//! - 8 s without a new frame for that session: fade out (0.25 s), then
+//!   `orderOut`. The next frame fades it back in.
+//! - The header's close button hides the panel until the session's next
+//!   frame; the focus button brings the target window forward through the
+//!   same code path as the `bring_to_front` tool.
+//! - Session end: fade out, close, release.
 //!
-//! - `NSWindowCollectionBehaviorCanJoinAllSpaces | FullScreenAuxiliary |
-//!    Stationary | Transient | IgnoresCycle`
-//! - `level = .floating` (kCGFloatingWindowLevel, between normal apps
-//!   and dock; high enough to stay visible, low enough not to obscure
-//!   menus or accessibility overlays).
-//! - `setIgnoresMouseEvents(false)` — user can click the red close
-//!   button. Backend cleanup happens on `shutdown()`; closing the
-//!   window manually decouples it from the session as the spec
-//!   requires.
-//! - No activation: `setHidesOnDeactivate(false)` and
-//!   `setBecomesKeyOnlyIfNeeded(true)` so the window never steals
-//!   keyboard focus from the user's frontmost app.
-//!
-//! ## Init lifecycle
-//!
-//! Because the cursor overlay already owns the main thread when
-//! enabled, `start` cannot block on it. Instead it
-//! posts the window-creation block onto the main queue and returns
-//! immediately. The first frame may arrive before the window exists;
-//! that's fine — the push path reads the window pointer from a
-//! `Mutex<Option<usize>>` and silently no-ops until init finishes.
+//! The screenshot is a single `NSImageView`; step 1b swaps it for a live
+//! ScreenCaptureKit layer in the same frame.
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
+use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
+use objc2::{class, msg_send, sel};
+use objc2_foundation::{NSPoint, NSRect, NSSize};
 use pip_preview::{PipBackend, PipConfig, PipFrame};
 
 // ── CGColor objc2 encoding shim ────────────────────────────────────────────
 //
 // `[NSColor CGColor]` returns a `CGColorRef` whose Objective-C type encoding
 // is `^{CGColor=}`. objc2's strict msg_send! enforcement rejects bare
-// `*mut c_void` (`^v`) for both sides of that call. Declare a phantom
-// struct with the matching encoding so we can typed-cast through it
-// without pulling in a wider CGColor binding crate.
+// `*mut c_void` (`^v`), so declare a phantom struct with the matching
+// encoding.
 
 #[repr(C)]
 struct CGColor {
     _opaque: [u8; 0],
 }
 
-// RefEncode supplies an automatic Encode impl for `*mut CGColor` /
-// `*const CGColor` via objc2's blanket — that's the route msg_send! needs
-// for both setting layer.backgroundColor and reading [NSColor CGColor].
-// `ENCODING_REF` is the encoding for one level of indirection, so the
-// pointer wrap goes here (objc encoding `^{CGColor=}`).
 unsafe impl objc2::RefEncode for CGColor {
     const ENCODING_REF: objc2::Encoding =
         objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGColor", &[]));
 }
 
-// ── Native AppKit pointer cell ─────────────────────────────────────────────
-//
-// Window, image view, and label pointers are stashed as `usize` so
-// `Send` works (raw `*mut AnyObject` is `!Send`). The actual deref +
-// `msg_send!` happens only on the main queue inside the dispatched
-// block, so there is no thread-safety hazard from the Send promise.
+// ── Tunables ──────────────────────────────────────────────────────────────
 
-struct NativeHandles {
-    window: usize,
-    image_view: usize,
-    label: usize,
+const IDLE_HIDE_AFTER: Duration = Duration::from_secs(8);
+const FADE: Duration = Duration::from_millis(250);
+const CORNER_RADIUS: f64 = 14.0;
+const BORDER_WIDTH: f64 = 2.0;
+const HEADER_HEIGHT: f64 = 28.0;
+const STATUS_HEIGHT: f64 = 16.0;
+const PAD: f64 = 8.0;
+/// Distance from the screen's visible-frame edge to the first panel.
+const EDGE_INSET: f64 = 16.0;
+/// Gap between stacked panels.
+const STACK_GAP: f64 = 10.0;
+
+// ── Pure placement / timing decisions (unit tested) ───────────────────────
+
+/// Bottom-left-origin rectangle in AppKit screen points.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Area {
+    x: f64,
+    y: f64,
+    w: f64,
+    h: f64,
 }
 
-static HANDLES: Mutex<Option<NativeHandles>> = Mutex::new(None);
+/// Bottom-left origin for the panel in cascade `slot`. Slot 0's top-right
+/// corner sits at `top_right`; later slots stack downward, and a full column
+/// wraps to a new column on the left. `visible_bottom` bounds a column.
+fn cascade_origin(
+    top_right: (f64, f64),
+    visible_bottom: f64,
+    size: (f64, f64),
+    slot: usize,
+) -> (f64, f64) {
+    let (w, h) = size;
+    let step = h + STACK_GAP;
+    let room = top_right.1 - visible_bottom - EDGE_INSET + STACK_GAP;
+    let per_column = ((room / step).floor() as usize).max(1);
+    let (column, row) = (slot / per_column, slot % per_column);
+    (
+        top_right.0 - w - column as f64 * (w + STACK_GAP),
+        top_right.1 - h - row as f64 * step,
+    )
+}
 
-// ── libdispatch glue — same shape as cursor::overlay ──────────────────────
+/// Top-right corner of slot 0: the visible frame's top-right inset by
+/// `EDGE_INSET`, or, when `--experimental-pip-geometry WxH+X+Y` gave a
+/// position, the panel whose top-left is at X,Y (top-left screen origin).
+fn first_slot_top_right(
+    screen: Area,
+    visible: Area,
+    width: f64,
+    anchor: Option<(i32, i32)>,
+) -> (f64, f64) {
+    match anchor {
+        Some((x, y)) => (screen.x + x as f64 + width, screen.y + screen.h - y as f64),
+        None => (
+            visible.x + visible.w - EDGE_INSET,
+            visible.y + visible.h - EDGE_INSET,
+        ),
+    }
+}
+
+/// Lowest cascade slot no live panel occupies.
+fn free_slot(used: impl IntoIterator<Item = usize>) -> usize {
+    let used: std::collections::HashSet<usize> = used.into_iter().collect();
+    (0..).find(|slot| !used.contains(slot)).unwrap_or(0)
+}
+
+/// Whether a panel whose last frame arrived at `last_frame` should fade out.
+fn idle_hide_due(last_frame: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(last_frame) >= IDLE_HIDE_AFTER
+}
+
+/// Short display id for a private session key: drop the runtime namespace,
+/// keep a few characters. Used only in the (invisible) window title.
+fn short_key(key: &str) -> String {
+    let public = key
+        .strip_prefix("__cua_runtime_")
+        .and_then(|rest| rest.split_once(':'))
+        .map_or(key, |(_, public)| public);
+    public.chars().take(12).collect()
+}
+
+/// First word of an MCP client name, lowercased, for matching a running
+/// app: "Claude Code" → "claude", "codex-mcp-client" → "codex".
+fn client_match_token(client_name: &str) -> Option<String> {
+    let token = client_name
+        .split(|c: char| !c.is_alphanumeric())
+        .find(|word| !word.is_empty())?
+        .to_lowercase();
+    (token.len() >= 3).then_some(token)
+}
+
+// ── Panel state (main queue only) ─────────────────────────────────────────
+
+/// Client identity a header was resolved from: (client name, client pid,
+/// public session label).
+type ClientIdentity = (Option<String>, Option<i32>, Option<String>);
+
+/// Native pointers are stored as `usize` so the state is `Send`; they are
+/// only dereferenced on the main queue.
+struct Panel {
+    id: i64,
+    window: usize,
+    image_view: usize,
+    status: usize,
+    client_icon: usize,
+    client_label: usize,
+    target_icon: usize,
+    target_title: usize,
+    slot: usize,
+    last_frame: Instant,
+    shown: bool,
+    target: (Option<i32>, Option<u32>),
+    client: Option<ClientIdentity>,
+}
+
+struct State {
+    image_size: (f64, f64),
+    anchor: Option<(i32, i32)>,
+    panels: HashMap<String, Panel>,
+    /// Last origin of each ended session's panel, kept while the daemon runs.
+    // ponytail: one small entry per ended session; cap it if a daemon ever
+    // sees many thousands of sessions.
+    remembered: HashMap<String, (f64, f64)>,
+    next_id: i64,
+}
+
+static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+fn with_state<R>(f: impl FnOnce(&mut State) -> R) -> Option<R> {
+    STATE
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_mut()
+        .map(f)
+}
+
+// ── libdispatch glue ──────────────────────────────────────────────────────
 
 #[link(name = "System", kind = "framework")]
 extern "C" {
@@ -94,29 +219,79 @@ extern "C" {
         context: *mut c_void,
         work: unsafe extern "C" fn(*mut c_void),
     );
+    fn dispatch_time(when: u64, delta: i64) -> u64;
+    fn dispatch_after_f(
+        when: u64,
+        queue: *const c_void,
+        context: *mut c_void,
+        work: unsafe extern "C" fn(*mut c_void),
+    );
+}
+
+const DISPATCH_TIME_NOW: u64 = 0;
+
+fn main_queue() -> *const c_void {
+    &raw const _dispatch_main_q as *const c_void
 }
 
 fn dispatch_to_main<T: Send + 'static>(payload: T, cb: unsafe extern "C" fn(*mut c_void)) {
-    let boxed = Box::new(payload);
-    unsafe {
-        let main_queue = &raw const _dispatch_main_q as *const c_void;
-        dispatch_async_f(main_queue, Box::into_raw(boxed) as *mut c_void, cb);
-    }
+    let boxed = Box::into_raw(Box::new(payload)) as *mut c_void;
+    unsafe { dispatch_async_f(main_queue(), boxed, cb) };
 }
 
-// ── Backend impl ──────────────────────────────────────────────────────────
+fn dispatch_to_main_after<T: Send + 'static>(
+    delay: Duration,
+    payload: T,
+    cb: unsafe extern "C" fn(*mut c_void),
+) {
+    let boxed = Box::into_raw(Box::new(payload)) as *mut c_void;
+    let delta = delay.as_nanos().min(i64::MAX as u128) as i64;
+    unsafe {
+        dispatch_after_f(
+            dispatch_time(DISPATCH_TIME_NOW, delta),
+            main_queue(),
+            boxed,
+            cb,
+        )
+    };
+}
+
+// ── Backend ───────────────────────────────────────────────────────────────
 
 pub struct MacosPipBackend;
 
+struct FrameUpdate {
+    frame: PipFrame,
+    /// Window title (or owning app name) looked up off the main thread.
+    target_title: Option<String>,
+}
+
 impl PipBackend for MacosPipBackend {
     fn push_frame(&self, frame: PipFrame) {
-        // No window yet? Drop the frame silently — start() dispatches
-        // the create block onto the main queue and the very first
-        // tool call can race that block.
-        if HANDLES.lock().unwrap().is_none() {
-            return;
-        }
-        dispatch_to_main(frame, push_frame_cb);
+        // Enumerating WindowServer windows is a synchronous CG call; do it
+        // on the caller's thread, not the UI thread.
+        let target_title = frame
+            .target_window_id
+            .and_then(crate::windows::window_info_by_id)
+            .map(|window| {
+                if window.title.trim().is_empty() {
+                    window.app_name
+                } else {
+                    window.title
+                }
+            })
+            .filter(|title| !title.trim().is_empty());
+        dispatch_to_main(
+            FrameUpdate {
+                frame,
+                target_title,
+            },
+            apply_frame_cb,
+        );
+    }
+
+    fn end_session(&self, session_key: &str) {
+        dispatch_to_main(session_key.to_owned(), end_session_cb);
     }
 
     fn shutdown(self: Box<Self>) {
@@ -124,68 +299,743 @@ impl PipBackend for MacosPipBackend {
     }
 }
 
-unsafe extern "C" fn push_frame_cb(ctx: *mut c_void) {
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
+pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
+    // Panels are created lazily, on the main queue, by each session's first
+    // frame; nothing native happens here.
+    *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(State {
+        image_size: (cfg.geometry.width as f64, cfg.geometry.height as f64),
+        anchor: cfg.geometry.x.zip(cfg.geometry.y),
+        panels: HashMap::new(),
+        remembered: HashMap::new(),
+        next_id: 1,
+    });
+    Ok(Box::new(MacosPipBackend))
+}
 
-    let frame: PipFrame = *Box::from_raw(ctx as *mut PipFrame);
+// ── Main-queue callbacks ──────────────────────────────────────────────────
 
-    let (image_view_ptr, label_ptr) = {
-        let guard = HANDLES.lock().unwrap();
-        match guard.as_ref() {
-            Some(h) => (h.image_view, h.label),
-            None => return,
-        }
-    };
+unsafe extern "C" fn apply_frame_cb(ctx: *mut c_void) {
+    let update: FrameUpdate = *Box::from_raw(ctx as *mut FrameUpdate);
+    objc2::rc::autoreleasepool(|_| {
+        with_state(|state| apply_frame(state, update));
+    });
+}
 
-    // Construct NSData from the PNG bytes, then NSImage from NSData.
-    // `dataWithBytes:length:` copies into a fresh NSData so the input
-    // `Vec<u8>` can be freed at the end of this block.
-    let png_ptr = frame.png_bytes.as_ptr() as *const c_void;
-    let png_len = frame.png_bytes.len();
-    let ns_data: *mut AnyObject = msg_send![
-        class!(NSData),
-        dataWithBytes: png_ptr
-        length: png_len
-    ];
-    if ns_data.is_null() {
+unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
+    let FrameUpdate {
+        frame,
+        target_title,
+    } = update;
+    let key = frame.session_key.clone();
+    if !state.panels.contains_key(&key) {
+        let Some(panel) = create_panel(state, &key, frame.session_label.as_deref()) else {
+            return;
+        };
+        state.panels.insert(key.clone(), panel);
+    }
+    let Some(panel) = state.panels.get_mut(&key) else {
         return;
-    }
-    let img: *mut AnyObject = {
-        let alloc: *mut AnyObject = msg_send![class!(NSImage), alloc];
-        msg_send![alloc, initWithData: ns_data]
     };
-    if !img.is_null() {
-        let image_view = image_view_ptr as *mut AnyObject;
-        let _: () = msg_send![image_view, setImage: img];
-    }
 
-    // Update the label. NSString::stringWithUTF8String requires NUL
-    // termination; copy into a CString so we hand a clean buffer.
-    if let Ok(cstr) = std::ffi::CString::new(frame.action_label) {
-        let ns_str: *mut AnyObject = msg_send![
-            class!(NSString),
-            stringWithUTF8String: cstr.as_ptr() as *const u8
-        ];
-        if !ns_str.is_null() {
-            let label = label_ptr as *mut AnyObject;
-            let _: () = msg_send![label, setStringValue: ns_str];
+    // Screenshot. `dataWithBytes:length:` copies, so the Vec can drop.
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: frame.png_bytes.as_ptr() as *const c_void
+        length: frame.png_bytes.len()
+    ];
+    if !data.is_null() {
+        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+        let image: *mut AnyObject = msg_send![image, initWithData: data];
+        if !image.is_null() {
+            let _: () = msg_send![panel.image_view as *mut AnyObject, setImage: image];
+            let _: () = msg_send![image, release];
         }
     }
+    set_text(panel.status, &frame.action_label);
+
+    // Who: resolve the client icon + label only when the identity changes.
+    let client = (
+        frame.client_name.clone(),
+        frame.client_pid,
+        frame.session_label.clone(),
+    );
+    if panel.client.as_ref() != Some(&client) {
+        let icon = client_icon(frame.client_name.as_deref(), frame.client_pid);
+        let _: () = msg_send![panel.client_icon as *mut AnyObject, setImage: icon];
+        let label = frame
+            .session_label
+            .as_deref()
+            .or(frame.client_name.as_deref())
+            .unwrap_or("agent");
+        set_text(panel.client_label, label);
+        layout_header(panel);
+        panel.client = Some(client);
+    }
+
+    // Where: target app icon + window title.
+    let app: *mut AnyObject = match frame.target_pid {
+        Some(pid) => msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ],
+        None => std::ptr::null_mut(),
+    };
+    let app_icon: *mut AnyObject = if app.is_null() {
+        std::ptr::null_mut()
+    } else {
+        msg_send![app, icon]
+    };
+    let _: () = msg_send![panel.target_icon as *mut AnyObject, setImage: app_icon];
+    let title = target_title.or_else(|| {
+        if app.is_null() {
+            return None;
+        }
+        let name: *mut AnyObject = msg_send![app, localizedName];
+        ns_to_string(name)
+    });
+    set_text(panel.target_title, title.as_deref().unwrap_or(""));
+    panel.target = (frame.target_pid, frame.target_window_id);
+
+    panel.last_frame = Instant::now();
+    show(panel);
+    // Small slack so the monotonic check in the callback is past the bar.
+    dispatch_to_main_after(
+        IDLE_HIDE_AFTER + Duration::from_millis(20),
+        key,
+        idle_check_cb,
+    );
+}
+
+unsafe extern "C" fn idle_check_cb(ctx: *mut c_void) {
+    let key: String = *Box::from_raw(ctx as *mut String);
+    with_state(|state| {
+        if let Some(panel) = state.panels.get_mut(&key) {
+            if panel.shown && idle_hide_due(panel.last_frame, Instant::now()) {
+                hide(panel, &key);
+            }
+        }
+    });
+}
+
+/// Fade completion: order the panel out unless a frame re-showed it.
+unsafe extern "C" fn order_out_cb(ctx: *mut c_void) {
+    let key: String = *Box::from_raw(ctx as *mut String);
+    with_state(|state| {
+        if let Some(panel) = state.panels.get(&key) {
+            if !panel.shown {
+                let _: () = msg_send![
+                    panel.window as *mut AnyObject,
+                    orderOut: std::ptr::null_mut::<AnyObject>()
+                ];
+            }
+        }
+    });
+}
+
+unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
+    let key: String = *Box::from_raw(ctx as *mut String);
+    with_state(|state| {
+        let Some(panel) = state.panels.remove(&key) else {
+            return;
+        };
+        let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
+        state
+            .remembered
+            .insert(key, (frame.origin.x, frame.origin.y));
+        animate_alpha(panel.window, 0.0);
+        dispatch_to_main_after(FADE, panel.window, close_window_cb);
+    });
+}
+
+unsafe extern "C" fn close_window_cb(ctx: *mut c_void) {
+    let window = *Box::from_raw(ctx as *mut usize) as *mut AnyObject;
+    close_window(window);
 }
 
 unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
-    use objc2::msg_send;
-    use objc2::runtime::AnyObject;
+    let panels = with_state(|state| std::mem::take(&mut state.panels)).unwrap_or_default();
+    for panel in panels.into_values() {
+        close_window(panel.window as *mut AnyObject);
+    }
+}
 
-    let handles = HANDLES.lock().unwrap().take();
-    if let Some(h) = handles {
-        let win = h.window as *mut AnyObject;
-        if !win.is_null() {
-            let _: () = msg_send![win, orderOut: std::ptr::null_mut::<AnyObject>()];
-            let _: () = msg_send![win, close];
+unsafe fn close_window(window: *mut AnyObject) {
+    let _: () = msg_send![window, orderOut: std::ptr::null_mut::<AnyObject>()];
+    let _: () = msg_send![window, close];
+    // Balances the alloc in `create_panel` (releasedWhenClosed is NO).
+    let _: () = msg_send![window, release];
+}
+
+// ── Show / hide ───────────────────────────────────────────────────────────
+
+unsafe fn show(panel: &mut Panel) {
+    if panel.shown {
+        return;
+    }
+    panel.shown = true;
+    let window = panel.window as *mut AnyObject;
+    let visible: bool = msg_send![window, isVisible];
+    if !visible {
+        let _: () = msg_send![window, setAlphaValue: 0.0_f64];
+    }
+    // Never makeKey: the user's app keeps keyboard focus.
+    let _: () = msg_send![window, orderFrontRegardless];
+    animate_alpha(panel.window, 1.0);
+}
+
+unsafe fn hide(panel: &mut Panel, key: &str) {
+    if !panel.shown {
+        return;
+    }
+    panel.shown = false;
+    animate_alpha(panel.window, 0.0);
+    dispatch_to_main_after(FADE, key.to_owned(), order_out_cb);
+}
+
+unsafe fn animate_alpha(window: usize, alpha: f64) {
+    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+    let _: () = msg_send![context, setDuration: FADE.as_secs_f64()];
+    let animator: *mut AnyObject = msg_send![window as *mut AnyObject, animator];
+    let _: () = msg_send![animator, setAlphaValue: alpha];
+    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+}
+
+// ── Header buttons and ObjC classes ───────────────────────────────────────
+
+extern "C" fn on_focus(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
+    let id: i64 = unsafe { msg_send![sender, tag] };
+    let target = with_state(|state| {
+        state
+            .panels
+            .values()
+            .find(|panel| panel.id == id)
+            .map(|panel| panel.target)
+    })
+    .flatten();
+    let Some((Some(pid), window_id)) = target else {
+        return;
+    };
+    // bring_to_front polls for up to ~1 s; keep the UI thread free.
+    std::thread::spawn(move || {
+        let mut args = serde_json::json!({ "pid": pid });
+        if let Some(window_id) = window_id {
+            args["window_id"] = window_id.into();
+        }
+        let result = crate::tools::bring_to_front::bring_to_front_blocking(args);
+        if result.is_error == Some(true) {
+            tracing::info!(target: "pip", pid, ?window_id, "PiP focus was not verified");
+        }
+    });
+}
+
+extern "C" fn on_hide(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
+    let id: i64 = unsafe { msg_send![sender, tag] };
+    with_state(|state| {
+        if let Some((key, panel)) = state.panels.iter_mut().find(|(_, panel)| panel.id == id) {
+            unsafe { hide(panel, key) };
+        }
+    });
+}
+
+extern "C" fn returns_no(_this: *mut AnyObject, _cmd: Sel) -> Bool {
+    Bool::NO
+}
+
+extern "C" fn accepts_first_mouse(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    _event: *mut AnyObject,
+) -> Bool {
+    Bool::YES
+}
+
+/// Register an Objective-C class; callers memoise (one registration per
+/// process).
+fn register_class(
+    name: &str,
+    superclass: &AnyClass,
+    add: impl FnOnce(&mut objc2::declare::ClassBuilder),
+) -> &'static AnyClass {
+    let mut builder = objc2::declare::ClassBuilder::new(name, superclass)
+        .unwrap_or_else(|| panic!("{name} already registered"));
+    add(&mut builder);
+    builder.register()
+}
+
+/// `NSPanel` that can never become key or main.
+fn panel_class() -> &'static AnyClass {
+    static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
+    CLASS.get_or_init(|| {
+        register_class("CuaPipPanel", class!(NSPanel), |builder| unsafe {
+            builder.add_method(
+                sel!(canBecomeKeyWindow),
+                returns_no as extern "C" fn(_, _) -> _,
+            );
+            builder.add_method(
+                sel!(canBecomeMainWindow),
+                returns_no as extern "C" fn(_, _) -> _,
+            );
+        })
+    })
+}
+
+/// `NSButton` that acts on the first click into a non-key panel.
+fn button_class() -> &'static AnyClass {
+    static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
+    CLASS.get_or_init(|| {
+        register_class("CuaPipButton", class!(NSButton), |builder| unsafe {
+            builder.add_method(
+                sel!(acceptsFirstMouse:),
+                accepts_first_mouse as extern "C" fn(_, _, _) -> _,
+            );
+        })
+    })
+}
+
+/// Shared target object for every panel's header buttons (lives forever).
+fn button_target() -> usize {
+    static TARGET: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *TARGET.get_or_init(|| {
+        let class = register_class("CuaPipTarget", class!(NSObject), |builder| unsafe {
+            builder.add_method(sel!(pipFocus:), on_focus as extern "C" fn(_, _, _));
+            builder.add_method(sel!(pipHide:), on_hide as extern "C" fn(_, _, _));
+        });
+        let target: *mut AnyObject = unsafe { msg_send![class, new] };
+        target as usize
+    })
+}
+
+// ── Panel construction ────────────────────────────────────────────────────
+
+unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Option<Panel> {
+    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+    if screen.is_null() {
+        return None; // headless (CI): no panels, daemon keeps running
+    }
+    let screen_frame: NSRect = msg_send![screen, frame];
+    let visible_frame: NSRect = msg_send![screen, visibleFrame];
+    let area = |r: NSRect| Area {
+        x: r.origin.x,
+        y: r.origin.y,
+        w: r.size.width,
+        h: r.size.height,
+    };
+
+    let (image_w, image_h) = state.image_size;
+    let width = image_w + 2.0 * PAD;
+    let height = HEADER_HEIGHT + 4.0 + image_h + 4.0 + STATUS_HEIGHT + 6.0;
+    let slot = free_slot(state.panels.values().map(|panel| panel.slot));
+    let origin = state.remembered.get(key).copied().unwrap_or_else(|| {
+        let top_right =
+            first_slot_top_right(area(screen_frame), area(visible_frame), width, state.anchor);
+        cascade_origin(top_right, visible_frame.origin.y, (width, height), slot)
+    });
+    let rect = NSRect::new(NSPoint::new(origin.0, origin.1), NSSize::new(width, height));
+
+    // NSWindowStyleMaskBorderless (0) | NSWindowStyleMaskNonactivatingPanel (1 << 7)
+    let style_mask: u64 = 1 << 7;
+    let window: *mut AnyObject = msg_send![panel_class(), alloc];
+    let window: *mut AnyObject = msg_send![
+        window,
+        initWithContentRect: rect
+        styleMask: style_mask
+        backing: 2u64
+        defer: false
+    ];
+    if window.is_null() {
+        return None;
+    }
+    let _: () = msg_send![window, setReleasedWhenClosed: false];
+    let _: () = msg_send![window, setFloatingPanel: true];
+    let _: () = msg_send![window, setLevel: 3i64]; // NSFloatingWindowLevel
+    let _: () = msg_send![window, setBecomesKeyOnlyIfNeeded: true];
+    // NSPanel hides when its app deactivates by default; cua-driver is never
+    // the active app, so that would hide the panel at once.
+    let _: () = msg_send![window, setHidesOnDeactivate: false];
+    // CanJoinAllSpaces (1 << 0) | IgnoresCycle (1 << 6) | FullScreenAuxiliary (1 << 8)
+    let behavior: u64 = (1 << 0) | (1 << 6) | (1 << 8);
+    let _: () = msg_send![window, setCollectionBehavior: behavior];
+    let _: () = msg_send![window, setMovableByWindowBackground: true];
+    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
+    let _: () = msg_send![window, setBackgroundColor: clear];
+    let _: () = msg_send![window, setOpaque: false];
+    let _: () = msg_send![window, setHasShadow: true];
+    let title = format!(
+        "cua PiP · {}",
+        label.map(str::to_owned).unwrap_or_else(|| short_key(key))
+    );
+    let _: () = msg_send![window, setTitle: ns_string(&title)];
+
+    let [r, g, b, _] = cursor_overlay::session_fill_rgba(key);
+    let session_color = |alpha: f64| -> *mut AnyObject {
+        msg_send![
+            class!(NSColor),
+            colorWithSRGBRed: r as f64 / 255.0
+            green: g as f64 / 255.0
+            blue: b as f64 / 255.0
+            alpha: alpha
+        ]
+    };
+
+    // Content view: rounded, with the session-colored border. A layer's
+    // border composites above its sublayers, so it rims the glass.
+    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
+    let content_view: *mut AnyObject = msg_send![window, contentView];
+    let _: () = msg_send![content_view, setWantsLayer: true];
+    let content_layer: *mut AnyObject = msg_send![content_view, layer];
+    let _: () = msg_send![content_layer, setCornerRadius: CORNER_RADIUS];
+    let _: () = msg_send![content_layer, setBorderWidth: BORDER_WIDTH];
+    let border_cg: *mut CGColor = msg_send![session_color(1.0), CGColor];
+    let _: () = msg_send![content_layer, setBorderColor: border_cg];
+
+    // Everything visible sits in `body`, hosted by the glass background.
+    let body = new_view(class!(NSView), bounds);
+    let background = glass_background(bounds, body);
+    add_subview(content_view, background);
+
+    // Header strip: a faint wash of the session color inside the glass.
+    let header = new_view(
+        class!(NSView),
+        NSRect::new(
+            NSPoint::new(0.0, height - HEADER_HEIGHT),
+            NSSize::new(width, HEADER_HEIGHT),
+        ),
+    );
+    let _: () = msg_send![header, setWantsLayer: true];
+    let header_layer: *mut AnyObject = msg_send![header, layer];
+    let wash_cg: *mut CGColor = msg_send![session_color(0.16), CGColor];
+    let _: () = msg_send![header_layer, setBackgroundColor: wash_cg];
+
+    let icon_y = (HEADER_HEIGHT - 16.0) / 2.0;
+    let client_icon = new_icon_view(NSRect::new(
+        NSPoint::new(10.0, icon_y),
+        NSSize::new(16.0, 16.0),
+    ));
+    let client_label = new_label(
+        NSRect::new(NSPoint::new(32.0, icon_y), NSSize::new(110.0, 16.0)),
+        12.0,
+        0.23, // NSFontWeightMedium
+        false,
+    );
+    let close_x = width - 8.0 - 20.0;
+    let focus_x = close_x - 2.0 - 20.0;
+    let id = state.next_id;
+    state.next_id += 1;
+    let focus = new_button(
+        "arrow.up.forward.app",
+        "Bring this window forward",
+        sel!(pipFocus:),
+        id,
+        NSRect::new(NSPoint::new(focus_x, 4.0), NSSize::new(20.0, 20.0)),
+    );
+    let close = new_button(
+        "xmark",
+        "Hide until this agent's next action",
+        sel!(pipHide:),
+        id,
+        NSRect::new(NSPoint::new(close_x, 4.0), NSSize::new(20.0, 20.0)),
+    );
+    let target_icon = new_icon_view(NSRect::new(
+        NSPoint::new(150.0, icon_y),
+        NSSize::new(16.0, 16.0),
+    ));
+    let target_title = new_label(
+        NSRect::new(
+            NSPoint::new(170.0, icon_y),
+            NSSize::new(focus_x - 4.0 - 170.0, 16.0),
+        ),
+        11.0,
+        0.0,
+        true,
+    );
+    for view in [
+        client_icon,
+        client_label,
+        target_icon,
+        target_title,
+        focus,
+        close,
+    ] {
+        let _: () = msg_send![header, addSubview: view];
+    }
+    add_subview(body, header);
+
+    // Screenshot well. Kept as the single view a live layer replaces (1b).
+    let image_view = new_view(
+        class!(NSImageView),
+        NSRect::new(
+            NSPoint::new(PAD, 6.0 + STATUS_HEIGHT + 4.0),
+            NSSize::new(image_w, image_h),
+        ),
+    );
+    let _: () = msg_send![image_view, setImageScaling: 3u64]; // proportionally up or down
+    let _: () = msg_send![image_view, setWantsLayer: true];
+    let image_layer: *mut AnyObject = msg_send![image_view, layer];
+    let _: () = msg_send![image_layer, setCornerRadius: 8.0_f64];
+    let _: () = msg_send![image_layer, setMasksToBounds: true];
+    let well: *mut AnyObject = msg_send![
+        class!(NSColor),
+        colorWithSRGBRed: 0.0_f64
+        green: 0.0_f64
+        blue: 0.0_f64
+        alpha: 0.22_f64
+    ];
+    let well_cg: *mut CGColor = msg_send![well, CGColor];
+    let _: () = msg_send![image_layer, setBackgroundColor: well_cg];
+    add_subview(body, image_view);
+
+    let status = new_label(
+        NSRect::new(
+            NSPoint::new(PAD + 2.0, 6.0),
+            NSSize::new(image_w - 4.0, STATUS_HEIGHT),
+        ),
+        11.0,
+        0.0,
+        true,
+    );
+    let _: () = msg_send![body, addSubview: status];
+
+    Some(Panel {
+        id,
+        window: window as usize,
+        image_view: image_view as usize,
+        status: status as usize,
+        client_icon: client_icon as usize,
+        client_label: client_label as usize,
+        target_icon: target_icon as usize,
+        target_title: target_title as usize,
+        slot,
+        last_frame: Instant::now(),
+        shown: false,
+        target: (None, None),
+        client: None,
+    })
+}
+
+/// Liquid Glass (`NSGlassEffectView`, macOS 26) hosting `body`, or an
+/// `NSVisualEffectView` HUD material on older systems. Rounded either way.
+/// Takes ownership of `body`; returns an owned (+1) view.
+unsafe fn glass_background(bounds: NSRect, body: *mut AnyObject) -> *mut AnyObject {
+    // Width + height sizable, so the body tracks the background.
+    let _: () = msg_send![body, setAutoresizingMask: 18u64];
+    if let Some(glass_class) = AnyClass::get("NSGlassEffectView") {
+        let glass = new_view(glass_class, bounds);
+        let _: () = msg_send![glass, setCornerRadius: CORNER_RADIUS];
+        let _: () = msg_send![glass, setContentView: body];
+        let _: () = msg_send![body, release];
+        return glass;
+    }
+    let effect = new_view(class!(NSVisualEffectView), bounds);
+    let _: () = msg_send![effect, setMaterial: 13i64]; // HUDWindow
+    let _: () = msg_send![effect, setBlendingMode: 0i64]; // behindWindow
+    let _: () = msg_send![effect, setState: 1i64]; // active
+    let _: () = msg_send![effect, setWantsLayer: true];
+    let layer: *mut AnyObject = msg_send![effect, layer];
+    let _: () = msg_send![layer, setCornerRadius: CORNER_RADIUS];
+    let _: () = msg_send![layer, setMasksToBounds: true];
+    add_subview(effect, body);
+    effect
+}
+
+/// Size the client label to its text and put the target group right after
+/// it, keeping the title's right edge where it was.
+unsafe fn layout_header(panel: &Panel) {
+    let y = (HEADER_HEIGHT - 16.0) / 2.0;
+    let label = panel.client_label as *mut AnyObject;
+    let _: () = msg_send![label, sizeToFit];
+    let fitted: NSRect = msg_send![label, frame];
+    let label_w = fitted.size.width.min(120.0);
+    let _: () = msg_send![
+        label,
+        setFrame: NSRect::new(NSPoint::new(32.0, y), NSSize::new(label_w, 16.0))
+    ];
+    let title = panel.target_title as *mut AnyObject;
+    let title_frame: NSRect = msg_send![title, frame];
+    let right = title_frame.origin.x + title_frame.size.width;
+    let icon_x = 32.0 + label_w + 10.0;
+    let _: () = msg_send![
+        panel.target_icon as *mut AnyObject,
+        setFrame: NSRect::new(NSPoint::new(icon_x, y), NSSize::new(16.0, 16.0))
+    ];
+    let title_x = icon_x + 20.0;
+    let _: () = msg_send![
+        title,
+        setFrame: NSRect::new(
+            NSPoint::new(title_x, y),
+            NSSize::new((right - title_x).max(0.0), 16.0)
+        )
+    ];
+}
+
+// ── Small AppKit helpers ──────────────────────────────────────────────────
+
+/// `[[class alloc] initWithFrame:]`, owned (+1) by the caller.
+unsafe fn new_view(class: &AnyClass, frame: NSRect) -> *mut AnyObject {
+    let view: *mut AnyObject = msg_send![class, alloc];
+    msg_send![view, initWithFrame: frame]
+}
+
+/// Add an owned `child` and hand its ownership to `parent`.
+unsafe fn add_subview(parent: *mut AnyObject, child: *mut AnyObject) {
+    let _: () = msg_send![parent, addSubview: child];
+    let _: () = msg_send![child, release];
+}
+
+/// Aspect-fit icon view (autoreleased).
+unsafe fn new_icon_view(frame: NSRect) -> *mut AnyObject {
+    let view = new_view(class!(NSImageView), frame);
+    let _: () = msg_send![view, setImageScaling: 3u64];
+    let _: *mut AnyObject = msg_send![view, autorelease];
+    view
+}
+
+/// One-line, non-selectable, tail-truncating label (autoreleased).
+unsafe fn new_label(frame: NSRect, size: f64, weight: f64, secondary: bool) -> *mut AnyObject {
+    let label: *mut AnyObject = msg_send![class!(NSTextField), labelWithString: ns_string("")];
+    let _: () = msg_send![label, setFrame: frame];
+    let _: () = msg_send![label, setSelectable: false];
+    let _: () = msg_send![label, setLineBreakMode: 4u64]; // byTruncatingTail
+    let _: () = msg_send![label, setMaximumNumberOfLines: 1i64];
+    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: size weight: weight];
+    let _: () = msg_send![label, setFont: font];
+    let color: *mut AnyObject = if secondary {
+        msg_send![class!(NSColor), secondaryLabelColor]
+    } else {
+        msg_send![class!(NSColor), labelColor]
+    };
+    let _: () = msg_send![label, setTextColor: color];
+    label
+}
+
+/// Borderless SF Symbol button wired to the shared target (autoreleased).
+unsafe fn new_button(
+    symbol: &str,
+    tooltip: &str,
+    action: Sel,
+    tag: i64,
+    frame: NSRect,
+) -> *mut AnyObject {
+    let image = symbol_image(symbol);
+    let target = button_target() as *mut AnyObject;
+    let button: *mut AnyObject = msg_send![
+        button_class(),
+        buttonWithImage: image
+        target: target
+        action: action
+    ];
+    let _: () = msg_send![button, setFrame: frame];
+    let _: () = msg_send![button, setBordered: false];
+    let _: () = msg_send![button, setImagePosition: 1u64]; // imageOnly
+    let _: () = msg_send![button, setTag: tag];
+    let _: () = msg_send![button, setToolTip: ns_string(tooltip)];
+    let tint: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+    let _: () = msg_send![button, setContentTintColor: tint];
+    let config: *mut AnyObject = msg_send![
+        class!(NSImageSymbolConfiguration),
+        configurationWithPointSize: 12.0_f64
+        weight: 0.23_f64
+    ];
+    let _: () = msg_send![button, setSymbolConfiguration: config];
+    button
+}
+
+unsafe fn symbol_image(name: &str) -> *mut AnyObject {
+    msg_send![
+        class!(NSImage),
+        imageWithSystemSymbolName: ns_string(name)
+        accessibilityDescription: std::ptr::null_mut::<AnyObject>()
+    ]
+}
+
+/// The MCP client's app icon: a regular running app whose name or bundle id
+/// matches the client name, else the first regular app among the ancestors
+/// of the process that opened the MCP connection, else an SF Symbol.
+unsafe fn client_icon(client_name: Option<&str>, client_pid: Option<i32>) -> *mut AnyObject {
+    let regular = |app: *mut AnyObject| -> bool {
+        if app.is_null() {
+            return false;
+        }
+        let policy: i64 = msg_send![app, activationPolicy];
+        policy == 0 // NSApplicationActivationPolicyRegular
+    };
+    if let Some(token) = client_name.and_then(client_match_token) {
+        let workspace: *mut AnyObject = msg_send![class!(NSWorkspace), sharedWorkspace];
+        let apps: *mut AnyObject = msg_send![workspace, runningApplications];
+        let count: usize = msg_send![apps, count];
+        for index in 0..count {
+            let app: *mut AnyObject = msg_send![apps, objectAtIndex: index];
+            if !regular(app) {
+                continue;
+            }
+            let name: *mut AnyObject = msg_send![app, localizedName];
+            let bundle: *mut AnyObject = msg_send![app, bundleIdentifier];
+            let matches = ns_to_string(name)
+                .is_some_and(|name| name.to_lowercase().starts_with(&token))
+                || ns_to_string(bundle).is_some_and(|id| id.to_lowercase().contains(&token));
+            if matches {
+                return msg_send![app, icon];
+            }
         }
     }
+    let mut pid = client_pid.unwrap_or(0);
+    for _ in 0..16 {
+        if pid <= 1 {
+            break;
+        }
+        let app: *mut AnyObject = msg_send![
+            class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        if regular(app) {
+            return msg_send![app, icon];
+        }
+        pid = parent_pid(pid).unwrap_or(0);
+    }
+    symbol_image("cursorarrow.rays")
+}
+
+fn parent_pid(pid: i32) -> Option<i32> {
+    let mut info: libc::proc_bsdinfo = unsafe { std::mem::zeroed() };
+    let size = std::mem::size_of::<libc::proc_bsdinfo>() as i32;
+    let read = unsafe {
+        libc::proc_pidinfo(
+            pid,
+            libc::PROC_PIDTBSDINFO,
+            0,
+            &mut info as *mut libc::proc_bsdinfo as *mut c_void,
+            size,
+        )
+    };
+    (read == size).then_some(info.pbi_ppid as i32)
+}
+
+unsafe fn set_text(label: usize, text: &str) {
+    let _: () = msg_send![label as *mut AnyObject, setStringValue: ns_string(text)];
+}
+
+/// Autoreleased NSString (interior NULs dropped).
+unsafe fn ns_string(text: &str) -> *mut AnyObject {
+    let cstring = std::ffi::CString::new(text.replace('\0', "")).unwrap_or_default();
+    msg_send![
+        class!(NSString),
+        stringWithUTF8String: cstring.as_ptr() as *const u8
+    ]
+}
+
+unsafe fn ns_to_string(string: *mut AnyObject) -> Option<String> {
+    if string.is_null() {
+        return None;
+    }
+    let utf8: *const u8 = msg_send![string, UTF8String];
+    if utf8.is_null() {
+        return None;
+    }
+    Some(
+        std::ffi::CStr::from_ptr(utf8.cast())
+            .to_string_lossy()
+            .into_owned(),
+    )
 }
 
 // ── AppKit main loop helper for Serve mode ───────────────────────────────
@@ -201,9 +1051,6 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
 /// `std::process::exit` when it finishes, which tears down NSApp at
 /// the same time.
 pub fn run_appkit_main_loop() {
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
-
     let _mtm = objc2_foundation::MainThreadMarker::new()
         .expect("run_appkit_main_loop must be called from the main thread");
     unsafe {
@@ -217,203 +1064,103 @@ pub fn run_appkit_main_loop() {
     }
 }
 
-pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
-    // Window construction must happen on the main thread. We hand
-    // off via dispatch_async_f and return immediately — the first
-    // few frames may be dropped while init races, which is fine
-    // for a live-preview UX.
-    let cfg_clone = cfg.clone();
-    dispatch_to_main(cfg_clone, init_cb);
-    Ok(Box::new(MacosPipBackend))
-}
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-unsafe extern "C" fn init_cb(ctx: *mut c_void) {
-    use objc2::runtime::AnyObject;
-    use objc2::{class, msg_send};
-    use objc2_foundation::{NSPoint, NSRect, NSSize};
+    const VISIBLE: Area = Area {
+        x: 0.0,
+        y: 0.0,
+        w: 1440.0,
+        h: 875.0,
+    };
+    const SIZE: (f64, f64) = (336.0, 258.0);
 
-    let cfg: PipConfig = *Box::from_raw(ctx as *mut PipConfig);
-
-    // Idempotency guard — `start()` should only be called once per
-    // process, but cheap to defend against duplicate calls.
-    if HANDLES.lock().unwrap().is_some() {
-        return;
+    #[test]
+    fn first_panel_sits_in_the_top_right_corner() {
+        let top_right = first_slot_top_right(VISIBLE, VISIBLE, SIZE.0, None);
+        assert_eq!(top_right, (1424.0, 859.0));
+        assert_eq!(
+            cascade_origin(top_right, VISIBLE.y, SIZE, 0),
+            (1424.0 - 336.0, 859.0 - 258.0)
+        );
     }
 
-    // ── Resolve geometry ──
-    // AppKit windows use a bottom-left origin in screen coordinates.
-    // The CLI flag uses a top-left X11-style origin (since that's the
-    // mental model agents have for screenshots). Flip Y here so a
-    // `+0+0` flag puts the window in the top-left corner.
-    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
-    if screen.is_null() {
-        // Headless environment (CI) — skip silently. The daemon keeps
-        // running without a PiP window.
-        return;
-    }
-    let screen_frame: NSRect = msg_send![screen, frame];
-
-    let w = cfg.geometry.width as f64;
-    let h = cfg.geometry.height as f64;
-    // Default placement: top-right corner with a 24pt inset, mirroring
-    // the macOS conventions for floating utility windows.
-    let inset = 24.0_f64;
-    let (top_left_x, top_left_y) = match (cfg.geometry.x, cfg.geometry.y) {
-        (Some(x), Some(y)) => (x as f64, y as f64),
-        _ => (screen_frame.size.width - w - inset, inset),
-    };
-    // Convert top-left → bottom-left for AppKit.
-    let bottom_y = screen_frame.size.height - top_left_y - h;
-    let rect = NSRect::new(NSPoint::new(top_left_x, bottom_y), NSSize::new(w, h));
-
-    // ── NSWindow ──
-    // Borderless so the image owns the whole rectangle. No close button
-    // / title bar — the window is owned by the daemon session lifecycle.
-    // The rounded-corner look comes from a CALayer-backed content view
-    // with cornerRadius + masksToBounds; the window itself stays
-    // transparent outside the rounded rect.
-    //   NSWindowStyleMaskBorderless = 0
-    let style_mask: u64 = 0;
-    let backing_store_buffered: u64 = 2;
-    let win: *mut AnyObject = {
-        let alloc: *mut AnyObject = msg_send![class!(NSWindow), alloc];
-        msg_send![
-            alloc,
-            initWithContentRect: rect
-            styleMask: style_mask
-            backing: backing_store_buffered
-            defer: false
-        ]
-    };
-    if win.is_null() {
-        return;
-    }
-
-    // Transparent backing so the corners outside the CALayer-clipped
-    // content view show whatever's underneath — gives the floating-pill
-    // look. The shadow comes from AppKit's default `hasShadow: true`.
-    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-    let _: () = msg_send![win, setBackgroundColor: clear];
-    let _: () = msg_send![win, setOpaque: false];
-    let _: () = msg_send![win, setHasShadow: true];
-    // Draggable from anywhere since there's no title bar.
-    let _: () = msg_send![win, setMovableByWindowBackground: true];
-
-    // Floating window level (NSFloatingWindowLevel = 3).
-    let _: () = msg_send![win, setLevel: 3i64];
-
-    // Collection behavior: visible across all spaces, no Mission
-    // Control affordance, never the main / key window.
-    // 1<<0 CanJoinAllSpaces | 1<<4 Stationary | 1<<8 FullScreenAuxiliary
-    // 1<<6 Transient | 1<<7 IgnoresCycle
-    let behavior: u64 = (1 << 0) | (1 << 4) | (1 << 8) | (1 << 6) | (1 << 7);
-    let _: () = msg_send![win, setCollectionBehavior: behavior];
-
-    let _: () = msg_send![win, setReleasedWhenClosed: false];
-    let _: () = msg_send![win, setHidesOnDeactivate: false];
-
-    // ── Content view: rounded-corner black backing ──
-    // wantsLayer + masksToBounds clips the image view to the rounded
-    // rect. The backing CALayer color shows wherever the (proportionally
-    // scaled) image leaves gaps above/below or left/right.
-    let content_view: *mut AnyObject = msg_send![win, contentView];
-    let _: () = msg_send![content_view, setWantsLayer: true];
-    let content_layer: *mut AnyObject = msg_send![content_view, layer];
-    let _: () = msg_send![content_layer, setCornerRadius: 12.0_f64];
-    let _: () = msg_send![content_layer, setMasksToBounds: true];
-    let black: *mut AnyObject = msg_send![
-        class!(NSColor),
-        colorWithCalibratedRed: 0.0_f64
-        green: 0.0_f64
-        blue: 0.0_f64
-        alpha: 1.0_f64
-    ];
-    let black_cg: *mut CGColor = msg_send![black, CGColor];
-    let _: () = msg_send![content_layer, setBackgroundColor: black_cg];
-
-    // ── NSImageView: fills the entire content view ──
-    let image_rect = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h));
-    let image_view: *mut AnyObject = {
-        let alloc: *mut AnyObject = msg_send![class!(NSImageView), alloc];
-        msg_send![alloc, initWithFrame: image_rect]
-    };
-    // NSImageScaleProportionallyUpOrDown = 3 (preserve aspect ratio).
-    // AppKit types this as NSUInteger — passing signed i64 triggers
-    // an objc2 type-encoding panic on macOS 26+.
-    let _: () = msg_send![image_view, setImageScaling: 3u64];
-
-    // ── Label overlay: pill at bottom-center ──
-    // Container NSView with semi-transparent black backing + rounded
-    // corners (half its height for a fully rounded pill). NSTextField
-    // sits inside, centered, white text on the dark backing.
-    let pill_height = 22.0_f64;
-    let pill_inset_x = 16.0_f64;
-    let pill_inset_bottom = 10.0_f64;
-    let pill_w = (w - pill_inset_x * 2.0).max(60.0);
-    let pill_rect = NSRect::new(
-        NSPoint::new(pill_inset_x, pill_inset_bottom),
-        NSSize::new(pill_w, pill_height),
-    );
-    let pill: *mut AnyObject = {
-        let alloc: *mut AnyObject = msg_send![class!(NSView), alloc];
-        msg_send![alloc, initWithFrame: pill_rect]
-    };
-    let _: () = msg_send![pill, setWantsLayer: true];
-    let pill_layer: *mut AnyObject = msg_send![pill, layer];
-    let _: () = msg_send![pill_layer, setCornerRadius: pill_height / 2.0];
-    let _: () = msg_send![pill_layer, setMasksToBounds: true];
-    let pill_bg: *mut AnyObject = msg_send![
-        class!(NSColor),
-        colorWithCalibratedRed: 0.0_f64
-        green: 0.0_f64
-        blue: 0.0_f64
-        alpha: 0.62_f64
-    ];
-    let pill_bg_cg: *mut CGColor = msg_send![pill_bg, CGColor];
-    let _: () = msg_send![pill_layer, setBackgroundColor: pill_bg_cg];
-
-    // NSTextField inside the pill — horizontal padding via frame inset.
-    let label_rect = NSRect::new(
-        NSPoint::new(10.0, 0.0),
-        NSSize::new(pill_w - 20.0, pill_height),
-    );
-    let label: *mut AnyObject = {
-        let alloc: *mut AnyObject = msg_send![class!(NSTextField), alloc];
-        msg_send![alloc, initWithFrame: label_rect]
-    };
-    let _: () = msg_send![label, setBezeled: false];
-    let _: () = msg_send![label, setDrawsBackground: false];
-    let _: () = msg_send![label, setEditable: false];
-    let _: () = msg_send![label, setSelectable: false];
-    // NSTextAlignment.center = 2 (NSInteger).
-    let _: () = msg_send![label, setAlignment: 2i64];
-    let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
-    let _: () = msg_send![label, setTextColor: white];
-    let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: 11.0_f64];
-    let _: () = msg_send![label, setFont: font];
-    // Initial placeholder text — overwritten on the first frame.
-    if let Ok(cstr) = std::ffi::CString::new("waiting for first action…") {
-        let ns_str: *mut AnyObject = msg_send![
-            class!(NSString),
-            stringWithUTF8String: cstr.as_ptr() as *const u8
-        ];
-        if !ns_str.is_null() {
-            let _: () = msg_send![label, setStringValue: ns_str];
+    #[test]
+    fn later_panels_stack_downward_without_overlap_then_wrap_left() {
+        let top_right = first_slot_top_right(VISIBLE, VISIBLE, SIZE.0, None);
+        let origins: Vec<_> = (0..4)
+            .map(|slot| cascade_origin(top_right, VISIBLE.y, SIZE, slot))
+            .collect();
+        // One column holds three 258pt panels in an 875pt visible frame.
+        assert_eq!(
+            origins[1],
+            (origins[0].0, origins[0].1 - SIZE.1 - STACK_GAP)
+        );
+        assert_eq!(origins[2].0, origins[0].0);
+        assert!(origins[2].1 >= VISIBLE.y);
+        assert_eq!(
+            origins[3],
+            (origins[0].0 - SIZE.0 - STACK_GAP, origins[0].1)
+        );
+        // No two panels overlap.
+        for (i, a) in origins.iter().enumerate() {
+            for b in &origins[i + 1..] {
+                let apart_x = (a.0 - b.0).abs() >= SIZE.0;
+                let apart_y = (a.1 - b.1).abs() >= SIZE.1;
+                assert!(apart_x || apart_y, "{a:?} overlaps {b:?}");
+            }
         }
     }
 
-    let _: () = msg_send![content_view, addSubview: image_view];
-    let _: () = msg_send![pill, addSubview: label];
-    let _: () = msg_send![content_view, addSubview: pill];
+    #[test]
+    fn geometry_anchor_places_first_panel_top_left() {
+        let screen = Area {
+            x: 0.0,
+            y: 0.0,
+            w: 1440.0,
+            h: 900.0,
+        };
+        let top_right = first_slot_top_right(screen, VISIBLE, SIZE.0, Some((20, 40)));
+        assert_eq!(
+            cascade_origin(top_right, VISIBLE.y, SIZE, 0),
+            (20.0, 900.0 - 40.0 - 258.0)
+        );
+    }
 
-    // Show the window without making it key or activating the app.
-    let _: () = msg_send![win, orderFrontRegardless];
+    #[test]
+    fn free_slot_reuses_the_lowest_gap() {
+        assert_eq!(free_slot([]), 0);
+        assert_eq!(free_slot([0, 1, 2]), 3);
+        assert_eq!(free_slot([0, 2]), 1);
+    }
 
-    *HANDLES.lock().unwrap() = Some(NativeHandles {
-        window: win as usize,
-        image_view: image_view as usize,
-        label: label as usize,
-    });
+    #[test]
+    fn idle_hide_after_eight_quiet_seconds() {
+        let start = Instant::now();
+        assert!(!idle_hide_due(start, start));
+        assert!(!idle_hide_due(start, start + Duration::from_millis(7_999)));
+        assert!(idle_hide_due(start, start + IDLE_HIDE_AFTER));
+        // A newer frame than `now` is never idle.
+        assert!(!idle_hide_due(start + Duration::from_secs(1), start));
+    }
 
-    tracing::info!(target: "pip", "PiP window initialised ({}x{})", cfg.geometry.width, cfg.geometry.height);
+    #[test]
+    fn short_key_drops_runtime_namespace() {
+        assert_eq!(
+            short_key("__cua_runtime_0123456789abcdef0123456789abcdef:research-run-long"),
+            "research-run"
+        );
+        assert_eq!(short_key("default"), "default");
+    }
+
+    #[test]
+    fn client_names_reduce_to_an_app_token() {
+        assert_eq!(client_match_token("Claude Code").as_deref(), Some("claude"));
+        assert_eq!(
+            client_match_token("codex-mcp-client").as_deref(),
+            Some("codex")
+        );
+        assert_eq!(client_match_token("ab"), None);
+    }
 }
