@@ -23,7 +23,7 @@ use std::time::{Duration, Instant};
 
 use cursor_overlay::Spring;
 
-use super::{Area, HEADER_HEIGHT};
+use super::Area;
 
 /// Front card plus up to three back items (cards and chips together).
 pub(super) const MAX_CARDS: usize = 4;
@@ -563,21 +563,30 @@ pub(super) const BOTTOM: u8 = 1 << 2;
 pub(super) const RIGHT: u8 = 1 << 3;
 
 /// Where a press on the panel landed, for logs: "margin", "back-card",
-/// "corner" or "edge" (the front card's resize band), "header", "body".
+/// "corner" or "edge" (the front card's resize band), "bar" (the hover bar
+/// above the front card, when it is up), "body".
 pub(super) fn press_region(
     point: (f64, f64),
     depth: Option<usize>,
     edges: u8,
     front: Area,
+    bar: Option<Area>,
 ) -> &'static str {
+    let _ = front;
     match depth {
         None => "margin",
         Some(0) if edges.count_ones() == 2 => "corner",
         Some(0) if edges != 0 => "edge",
-        Some(0) if point.1 >= front.y + front.h - HEADER_HEIGHT => "header",
+        Some(0) if bar.is_some_and(|bar| contains(&bar, point)) => "bar",
         Some(0) => "body",
         Some(_) => "back-card",
     }
+}
+
+/// The item a press on `point` lands on when the hover bar is `bar`: the
+/// bar counts as the front card (a drag), else `item`.
+pub(super) fn pressed_item(point: (f64, f64), item: Option<usize>, bar: Option<Area>) -> Option<usize> {
+    item.or_else(|| bar.filter(|bar| contains(bar, point)).map(|_| 0))
 }
 
 /// Which edges of the front card `point` is on (0 = none): within
@@ -654,71 +663,94 @@ pub(super) fn resize_settled(changed: Instant, now: Instant) -> bool {
     now.saturating_duration_since(changed) >= RESIZE_DEBOUNCE
 }
 
-// ── Header layout ─────────────────────────────────────────────────────────
+// ── Hover bar ─────────────────────────────────────────────────────────────
 
-/// Frames (in the header's coordinates) of the header's views.
+/// The bar that appears above the front card on hover: its height, how far
+/// it overlaps the card's top edge (the rest protrudes above), and how much
+/// narrower than the card it is on each side.
+pub(super) const BAR_HEIGHT: f64 = 30.0;
+pub(super) const BAR_OVERLAP: f64 = 6.0;
+pub(super) const BAR_INSET: f64 = 12.0;
+/// The bar fades in this fast on hover and out this long after the pointer
+/// leaves the card and the bar.
+pub(super) const BAR_FADE_IN: Duration = Duration::from_millis(150);
+pub(super) const BAR_FADE_OUT: Duration = Duration::from_millis(250);
+/// The bar's buttons: solid circles this big.
+pub(super) const BAR_BUTTON: f64 = 22.0;
+pub(super) const BAR_ICON: f64 = 18.0;
+pub(super) const BAR_DOT: f64 = 6.0;
+
+/// Where the bar sits for a front card at `card` (panel coordinates) with
+/// `room_above` points of screen above the card's top: attached to the top
+/// edge, protruding above it, unless there is no room, when it sits just
+/// inside the card's top instead.
+pub(super) fn bar_frame(card: Area, room_above: f64) -> Area {
+    let w = (card.w - 2.0 * BAR_INSET).max(0.0);
+    let top = card.y + card.h;
+    let protrude = BAR_HEIGHT - BAR_OVERLAP;
+    let y = if room_above >= protrude {
+        top - BAR_OVERLAP
+    } else {
+        top - BAR_HEIGHT
+    };
+    Area {
+        x: card.x + (card.w - w) / 2.0,
+        y,
+        w,
+        h: BAR_HEIGHT,
+    }
+}
+
+/// Frames (in the bar's coordinates) of the bar's views: client icon, the
+/// session-color dot, the (truncating) window title, and the two buttons
+/// pinned right.
 #[derive(Debug, Clone, Copy, PartialEq)]
-pub(super) struct HeaderLayout {
+pub(super) struct BarLayout {
     pub(super) client_icon: Area,
-    pub(super) client_label: Area,
-    pub(super) target_icon: Area,
-    pub(super) target_title: Area,
+    pub(super) dot: Area,
+    pub(super) title: Area,
     pub(super) focus: Area,
     pub(super) close: Area,
 }
 
-/// Client icon size in the header (icon first: it says who is driving).
-pub(super) const CLIENT_ICON: f64 = 18.0;
-
-/// Header layout for a card `width` wide whose client label wants
-/// `label_width` (0 when the label is hidden). The buttons are pinned
-/// right; the client label gets at most 120 pt and 40% of the room left of
-/// them, and the (truncating) target title takes the rest, so every view
-/// stays inside the header at any width.
-pub(super) fn header_layout(width: f64, label_width: f64) -> HeaderLayout {
-    let y = (HEADER_HEIGHT - 16.0) / 2.0;
-    let icon = |x: f64| Area {
-        x,
-        y,
-        w: 16.0,
-        h: 16.0,
-    };
-    let close_x = width - 6.0 - 20.0;
-    let focus_x = close_x - 2.0 - 20.0;
-    let label_x = 8.0 + CLIENT_ICON + 6.0;
-    let room = (focus_x - 4.0 - label_x).max(0.0);
-    let label_w = label_width.min(120.0).min(room * 0.4).max(0.0);
-    // No gap after a hidden label.
-    let target_x = label_x + if label_w > 0.0 { label_w + 8.0 } else { 0.0 };
-    let title_x = target_x + 20.0;
-    let button = |x: f64| Area {
-        x,
-        y: (HEADER_HEIGHT - 20.0) / 2.0,
-        w: 20.0,
-        h: 20.0,
-    };
-    HeaderLayout {
+pub(super) fn bar_layout(width: f64) -> BarLayout {
+    let button_y = (BAR_HEIGHT - BAR_BUTTON) / 2.0;
+    let close_x = width - 6.0 - BAR_BUTTON;
+    let focus_x = close_x - 4.0 - BAR_BUTTON;
+    let icon_x = 8.0;
+    let dot_x = icon_x + BAR_ICON + 5.0;
+    let title_x = dot_x + BAR_DOT + 6.0;
+    BarLayout {
         client_icon: Area {
-            x: 8.0,
-            y: (HEADER_HEIGHT - CLIENT_ICON) / 2.0,
-            w: CLIENT_ICON,
-            h: CLIENT_ICON,
+            x: icon_x,
+            y: (BAR_HEIGHT - BAR_ICON) / 2.0,
+            w: BAR_ICON,
+            h: BAR_ICON,
         },
-        client_label: Area {
-            x: label_x,
-            y,
-            w: label_w,
-            h: 16.0,
+        dot: Area {
+            x: dot_x,
+            y: (BAR_HEIGHT - BAR_DOT) / 2.0,
+            w: BAR_DOT,
+            h: BAR_DOT,
         },
-        target_icon: icon(target_x),
-        target_title: Area {
+        title: Area {
             x: title_x,
-            y,
-            w: (focus_x - 4.0 - title_x).max(0.0),
+            y: (BAR_HEIGHT - 16.0) / 2.0,
+            w: (focus_x - 6.0 - title_x).max(0.0),
             h: 16.0,
         },
-        focus: button(focus_x),
-        close: button(close_x),
+        focus: Area {
+            x: focus_x,
+            y: button_y,
+            w: BAR_BUTTON,
+            h: BAR_BUTTON,
+        },
+        close: Area {
+            x: close_x,
+            y: button_y,
+            w: BAR_BUTTON,
+            h: BAR_BUTTON,
+        },
     }
 }
 
@@ -1231,16 +1263,24 @@ mod tests {
             } else {
                 0
             };
-            press_region(point, depth, edges, front)
+            press_region(point, depth, edges, front, None)
         };
         // 3 pt inside the window's bottom-right corner: the front card's
         // resize corner (this press used to fall through the panel).
         assert_eq!(region((front.x + front.w - 3.0, 3.0)), "corner");
         assert_eq!(region((front.x + front.w - 3.0, front.h / 2.0)), "edge");
-        assert_eq!(region((front.x + front.w / 2.0, front.h - 12.0)), "header");
+        assert_eq!(region((front.x + front.w / 2.0, front.h - 12.0)), "body");
         assert_eq!(region((front.x + front.w / 2.0, front.h / 2.0)), "body");
         assert_eq!(region((front.x + 40.0, front.h + 7.0)), "back-card");
         assert_eq!(region((1.0, 1.0)), "margin");
+        // The hover bar protrudes above the front card: a press there is
+        // the front card's (a drag), and logged as "bar".
+        let bar = bar_frame(front, 100.0);
+        let on_bar = (bar.x + bar.w / 2.0, bar.y + bar.h - 2.0);
+        assert_eq!(pressed(on_bar, &layout[..1], &frames[..1]), None);
+        assert_eq!(pressed_item(on_bar, None, Some(bar)), Some(0));
+        assert_eq!(press_region(on_bar, Some(0), 0, front, Some(bar)), "bar");
+        assert_eq!(pressed_item((1.0, 1.0), None, Some(bar)), None);
     }
 
     #[test]
@@ -1253,29 +1293,36 @@ mod tests {
     }
 
     #[test]
-    fn the_header_fits_at_every_width_with_buttons_pinned_right() {
-        for width in [MIN_CARD.0, 280.0, 336.0, 600.0, 1200.0] {
-            for label in [0.0, 60.0, 400.0] {
-                let layout = header_layout(width, label);
-                let views = [
-                    layout.client_icon,
-                    layout.client_label,
-                    layout.target_icon,
-                    layout.target_title,
-                ];
-                for view in views {
-                    assert!(view.w >= 0.0 && view.x >= 0.0, "{width} {label}: {view:?}");
-                    assert!(
-                        view.x + view.w <= layout.focus.x,
-                        "{width} {label}: {view:?} under focus"
-                    );
-                }
-                assert_eq!(layout.close.x + layout.close.w, width - 6.0);
-                assert!(layout.focus.x + layout.focus.w <= layout.close.x);
-                assert!(layout.client_label.w <= 120.0);
+    fn the_bar_sits_above_the_card_and_drops_inside_at_the_screen_top() {
+        let front = rest_frame(CARD, 0);
+        let above = bar_frame(front, 100.0);
+        // Narrower than the card, centered, overlapping its top edge by
+        // BAR_OVERLAP and protruding the rest.
+        assert_eq!(above.w, front.w - 2.0 * BAR_INSET);
+        assert_eq!(above.x, front.x + BAR_INSET);
+        assert_eq!(above.y, front.y + front.h - BAR_OVERLAP);
+        assert_eq!(above.y + above.h, front.y + front.h + BAR_HEIGHT - BAR_OVERLAP);
+        // Exactly enough room above still protrudes; less drops it inside.
+        assert_eq!(bar_frame(front, BAR_HEIGHT - BAR_OVERLAP).y, above.y);
+        let inside = bar_frame(front, 10.0);
+        assert_eq!(inside.y + inside.h, front.y + front.h);
+        assert_eq!(inside.w, above.w);
+    }
+
+    #[test]
+    fn the_bar_fits_at_every_width_with_buttons_pinned_right() {
+        for width in [MIN_CARD.0 - 2.0 * BAR_INSET, 200.0, 296.0, 600.0, 1200.0] {
+            let layout = bar_layout(width);
+            for view in [layout.client_icon, layout.dot, layout.title] {
+                assert!(view.w >= 0.0 && view.x >= 0.0, "{width}: {view:?}");
+                assert!(view.x + view.w <= layout.focus.x, "{width}: {view:?} under focus");
+                assert!(view.y >= 0.0 && view.y + view.h <= BAR_HEIGHT);
             }
+            assert_eq!(layout.close.x + layout.close.w, width - 6.0);
+            assert!(layout.focus.x + layout.focus.w <= layout.close.x);
+            assert_eq!(layout.close.w, BAR_BUTTON);
         }
         // The title keeps usable room at the minimum width.
-        assert!(header_layout(MIN_CARD.0, 400.0).target_title.w >= 50.0);
+        assert!(bar_layout(MIN_CARD.0 - 2.0 * BAR_INSET).title.w >= 80.0);
     }
 }

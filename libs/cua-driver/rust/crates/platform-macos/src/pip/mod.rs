@@ -2,11 +2,11 @@
 //! session.
 //!
 //! Each session (keyed by its private runtime session key, the same key the
-//! agent cursor uses) gets its own small panel showing the latest
-//! post-action screenshot of the window it is driving, who is driving
-//! (client app icon + session label), and where (target app icon + window
-//! title). The border takes the session's cursor color so a panel and its
-//! cursor read as one agent.
+//! agent cursor uses) gets its own small panel: the live picture of the
+//! window it is driving, with rounded corners and a shadow and nothing
+//! else, like Codex's. Hovering it brings up a frosted glass bar above the
+//! card with who is driving (client app icon, a dot in the session's
+//! cursor color), the window title, and Focus and Close.
 //!
 //! ## Never takes focus
 //!
@@ -129,10 +129,10 @@ use finish::{
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
-    back_cards, card_size, deck_size, item_at, max_card, own_pixels, panel_point, resize_edges,
-    resize_settled, resize_window, slot_frame, to_window, window_origin, window_size, CardStack,
-    Motion, Slot, Trail, CHIP_REACH, DRAG_SLOP, GLASS_SPACING, MAX_CARDS, MIN_CARD,
-    RESIZE_DEBOUNCE, VIEWS,
+    back_cards, bar_frame, bar_layout, card_size, deck_size, item_at, max_card, own_pixels,
+    panel_point, pressed_item, resize_edges, resize_settled, resize_window, slot_frame, to_window,
+    window_origin, window_size, CardStack, Motion, Slot, Trail, BAR_BUTTON, BAR_FADE_IN,
+    BAR_FADE_OUT, CHIP_REACH, DRAG_SLOP, GLASS_SPACING, MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, VIEWS,
 };
 
 // ── CGColor objc2 encoding shim ────────────────────────────────────────────
@@ -184,30 +184,16 @@ extern "C" {
 
 const IDLE_HIDE_AFTER: Duration = Duration::from_secs(8);
 const FADE: Duration = Duration::from_millis(200);
-const CORNER_RADIUS: f64 = 16.0;
-const HEADER_HEIGHT: f64 = 24.0;
-const PAD: f64 = 6.0;
-/// Radius of the image well (and a back card's still): concentric with the
-/// card's corners.
-const WELL_RADIUS: f64 = CORNER_RADIUS - PAD;
-/// The session-colored glow around the front card (and each chip): where
-/// the agent's color lives, instead of a border.
-const HALO_RADIUS: f64 = 14.0;
-/// Peak opacity of the drawn glow, right at the glass edge (the strokes
-/// add up to about two thirds of this); on screen it is scaled by the halo
-/// layer's opacity, which breathes between these two values while the
-/// session acts and is 0 at rest, so the glow peaks at about 0.2.
-const HALO_OPACITY: f64 = 1.0;
-const HALO_BREATH: (f64, f64) = (0.2, 0.35);
-const HALO_BREATH_PERIOD: Duration = Duration::from_millis(2400);
-/// The action caption inside the well: its height, how long it stays after
-/// an action, and its fade.
-const CAPTION_HEIGHT: f64 = 20.0;
-const CAPTION_HOLD: Duration = Duration::from_millis(1200);
-const CAPTION_FADE: Duration = Duration::from_millis(300);
+/// The front card is the live picture itself: continuous rounded corners,
+/// a window shadow, no frame. Its chrome (client, title, buttons) is a
+/// glass bar above it that shows on hover (see `stack::bar_frame`).
+const CORNER_RADIUS: f64 = 14.0;
+/// No chrome around the picture: the well is the card.
+const PAD: f64 = 0.0;
+const WELL_RADIUS: f64 = CORNER_RADIUS;
 /// Distance from the screen's visible-frame edge to the first panel.
 const EDGE_INSET: f64 = 16.0;
-/// Gap between stacked panels (room for a breathing halo).
+/// Gap between stacked panels.
 const STACK_GAP: f64 = 12.0;
 /// How often active sessions re-check whether their window is fully visible.
 const VISIBILITY_POLL: Duration = Duration::from_millis(500);
@@ -433,18 +419,20 @@ struct Panel {
     /// frame", centered.
     placeholder: usize,
     placeholder_icon: usize,
-    /// The action caption inside the well's bottom, and its label.
-    caption: usize,
-    status: usize,
+    /// The label of the latest action (for a card going behind).
+    action: String,
+    /// The hover bar above the front card and its views.
+    bar: usize,
+    bar_shown: bool,
+    /// Bumped by every hover change, so a scheduled hide of the bar knows
+    /// whether the pointer came back meanwhile.
+    hover_gen: u64,
     client_icon: usize,
-    client_label: usize,
     target_icon: usize,
     target_title: usize,
-    /// The front card's view (it holds everything above) and the views
-    /// laid out with its size.
+    /// The front card's view (it holds the picture, the cursor sprite, the
+    /// placeholder and any finale overlay).
     front_view: usize,
-    glass: usize,
-    header: usize,
     focus: usize,
     close: usize,
     /// Back card views, depth 1 first.
@@ -454,16 +442,7 @@ struct Panel {
     /// Each view's hit plate (see `new_hit_plate`), indexed like
     /// `Slot::view`, framed and hidden with its view.
     plates: [usize; VIEWS],
-    /// The front card's halo (see `new_halo`), the size its glow image was
-    /// drawn for, that retained `CGImage`, and whether it is breathing
-    /// (the session is acting).
-    halo: usize,
-    halo_size: (f64, f64),
-    halo_image: usize,
-    acting: bool,
-    /// The front card's content view (inside its glass): everything the
-    /// card shows, the finale overlay included, lives here.
-    body: usize,
+
     /// Windows the session acted in, front card first.
     cards: CardStack<Tag, CardInfo>,
     /// Where each item of `cards` is drawn, front first (at least the
@@ -1294,8 +1273,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
             let _: () = msg_send![image, release];
         }
     }
-    set_text(panel.status, &frame.action_label);
-    flash_caption(panel);
+    panel.action = frame.action_label.clone();
 
     // Who: resolve the client icon + label only when the identity changes.
     let client = (
@@ -1306,14 +1284,6 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     if panel.client.as_ref() != Some(&client) {
         let icon = client_icon(frame.client_name.as_deref(), frame.client_pid);
         let _: () = msg_send![panel.client_icon as *mut AnyObject, setImage: icon];
-        let label = frame
-            .session_label
-            .as_deref()
-            .or(frame.client_name.as_deref())
-            .unwrap_or("agent");
-        set_text(panel.client_label, label);
-        panel.laid_out = (0.0, 0.0);
-        apply_card_frames(panel);
         panel.client = Some(client);
     }
 
@@ -1334,19 +1304,6 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     refresh(state, &key);
 }
 
-/// Show or hide the session label in the header, relaying out when it
-/// changes.
-unsafe fn show_client_label(panel: &mut Panel, shown: bool) {
-    let label = panel.client_label as *mut AnyObject;
-    let hidden: bool = msg_send![label, isHidden];
-    if hidden != shown {
-        return;
-    }
-    let _: () = msg_send![label, setHidden: !shown];
-    panel.laid_out = (0.0, 0.0);
-    apply_card_frames(panel);
-}
-
 /// Apply an action's lifecycle (the action note row of the table in
 /// `finish`), once per action: if it is newer than the last applied one,
 /// stop the finale, lift a user close, and restart the idle deadline (and
@@ -1361,7 +1318,6 @@ unsafe fn resume(panel: &mut Panel, key: &str, worker: &CaptureWorker, at_ms: u6
     // Also a finale that just ended and is still up during the fade.
     remove_finale_view(panel);
     panel.after_finale = false;
-    set_acting(panel, true);
     let now = Instant::now();
     panel.last_action = panel.last_action.max(now);
     worker.mark_delivered(key, now);
@@ -1738,8 +1694,7 @@ unsafe fn raise_card(state: &mut State, id: i64, tag: Tag) {
         None => return,
     };
     show_target(panel, pid, Some(title));
-    set_text(panel.status, &status);
-    flash_caption(panel);
+    panel.action = status;
     announce_stack(panel, key);
     if live {
         set_panel_target(panel, key, &worker, tag);
@@ -1812,12 +1767,11 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
                 if switch_front(panel, key, &worker, tag, Some(panel.last_action)) {
                     let title =
                         ns_to_string(msg_send![panel.target_title as *mut AnyObject, stringValue]);
-                    let status =
-                        ns_to_string(msg_send![panel.status as *mut AnyObject, stringValue]);
+                    let status = panel.action.clone();
                     if let Some(front) = panel.cards.front_mut() {
                         front.data.title = title.unwrap_or_default();
                         front.data.pid = tag.0;
-                        front.data.status = status.unwrap_or_default();
+                        front.data.status = status;
                     }
                     restacked = true;
                 }
@@ -1923,16 +1877,9 @@ unsafe fn refresh(state: &mut State, key: &str) {
         .chain(ending.iter())
         .filter_map(|panel| panel.slot)
         .collect();
-    // The session label shows only when another shown panel has the same
-    // client (icon and color no longer tell them apart).
-    let client = panels.get(key).and_then(|panel| panel.client.as_ref().map(|c| c.0.clone()));
-    let ambiguous = panels
-        .iter()
-        .any(|(other, panel)| other.as_str() != key && panel.shown && panel.client.as_ref().map(|c| c.0.clone()) == client);
     let Some(panel) = panels.get_mut(key) else {
         return;
     };
-    show_client_label(panel, ambiguous);
     let active = !idle_hide_due(panel.last_action, Instant::now());
     // Gone idle after acting: the session finished. The finale plays if the
     // panel is up; the panel stays up for it whatever else happens.
@@ -1940,9 +1887,6 @@ unsafe fn refresh(state: &mut State, key: &str) {
         finish_session(panel, key, worker);
     }
     let finale = panel.lifecycle.playing();
-    if !active || finale {
-        set_acting(panel, false);
-    }
     if panel_should_show(
         active || finale,
         panel.lifecycle.closed(),
@@ -2286,7 +2230,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
             }
         }
     }
-    let _: () = msg_send![panel.body as *mut AnyObject, addSubview: overlay];
+    let _: () = msg_send![panel.front_view as *mut AnyObject, addSubview: overlay];
     let _: () = msg_send![overlay, release];
     panel.finale_view = Some(overlay as usize);
 }
@@ -2584,10 +2528,7 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         };
         // The cursor is gone with the session.
         set_cursor_image(&mut panel, 0);
-        if panel.halo_image != 0 {
-            CGImageRelease(panel.halo_image as *mut c_void);
-            panel.halo_image = 0;
-        }
+
         let _: () = msg_send![panel.cursor_layer as *mut AnyObject, setHidden: true];
         state.streams.request(&key, Request::Stop);
         let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
@@ -2817,9 +2758,9 @@ fn button_target() -> usize {
 
 // ── Panel construction ────────────────────────────────────────────────────
 
-/// Height of the front card around its image well: the header above it and
-/// the pad above and below.
-const CARD_CHROME_HEIGHT: f64 = HEADER_HEIGHT + 2.0 * PAD;
+/// Height of the front card around its image well: none, the picture is
+/// the card.
+const CARD_CHROME_HEIGHT: f64 = 2.0 * PAD;
 /// The empty well's icon, and the width of its line of text.
 const PLACEHOLDER_ICON: f64 = 32.0;
 const PLACEHOLDER_W: f64 = 200.0;
@@ -2834,130 +2775,6 @@ unsafe fn session_ns_color(key: &str) -> *mut AnyObject {
         blue: b as f64 / 255.0
         alpha: 1.0_f64
     ]
-}
-
-/// A halo view in `parent`: a hosted layer that shows a glow image (see
-/// `halo_image`) at opacity 0 until the session acts.
-unsafe fn new_halo(parent: *mut AnyObject) -> usize {
-    let view = new_view(decor_view_class(), NSRect::ZERO);
-    let layer = host_layer(view);
-    let _: () = msg_send![layer, setContentsGravity: ns_string("resize")];
-    let _: () = msg_send![layer, setContentsScale: backing_scale()];
-    let _: () = msg_send![layer, setOpacity: 0.0_f32];
-    add_subview(parent, view);
-    view as usize
-}
-
-/// Put the halo around the front card at `frame` (window coordinates),
-/// redrawing its glow when the size changed.
-unsafe fn place_halo(panel: &mut Panel, frame: Area) {
-    let view = panel.halo;
-    set_frame(
-        view,
-        Area {
-            x: frame.x - HALO_RADIUS,
-            y: frame.y - HALO_RADIUS,
-            w: frame.w + 2.0 * HALO_RADIUS,
-            h: frame.h + 2.0 * HALO_RADIUS,
-        },
-    );
-    if panel.halo_size == (frame.w, frame.h) {
-        return;
-    }
-    panel.halo_size = (frame.w, frame.h);
-    let [r, g, b, _] = cursor_overlay::session_fill_rgba(&panel.key);
-    let image = halo_image((frame.w, frame.h), CORNER_RADIUS, [r, g, b], backing_scale()).unwrap_or(0);
-    let layer: *mut AnyObject = msg_send![view as *mut AnyObject, layer];
-    let _: () = msg_send![layer, setContents: image as *mut AnyObject];
-    let old = std::mem::replace(&mut panel.halo_image, image);
-    if old != 0 {
-        CGImageRelease(old as *mut c_void);
-    }
-}
-
-/// Breathe the halo while the session acts (opacity swinging between
-/// `HALO_BREATH.0` and `.1`), or fade it out. Identity is quiet at rest:
-/// plain glass, no glow.
-unsafe fn set_acting(panel: &mut Panel, acting: bool) {
-    if panel.acting == acting {
-        return;
-    }
-    panel.acting = acting;
-    let layer: *mut AnyObject = msg_send![panel.halo as *mut AnyObject, layer];
-    let _: () = msg_send![layer, removeAnimationForKey: ns_string("breathe")];
-    if !acting {
-        let _: () = msg_send![layer, setOpacity: 0.0_f32];
-        return;
-    }
-    let (low, high) = HALO_BREATH;
-    let _: () = msg_send![layer, setOpacity: low as f32];
-    let breathe: *mut AnyObject = msg_send![
-        class!(CABasicAnimation),
-        animationWithKeyPath: ns_string("opacity")
-    ];
-    let ease: *mut AnyObject = msg_send![
-        class!(CAMediaTimingFunction),
-        functionWithName: ns_string("easeInEaseOut")
-    ];
-    let _: () = msg_send![breathe, setTimingFunction: ease];
-    let from: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: low];
-    let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: high];
-    let _: () = msg_send![breathe, setFromValue: from];
-    let _: () = msg_send![breathe, setToValue: to];
-    let _: () = msg_send![breathe, setDuration: HALO_BREATH_PERIOD.as_secs_f64() / 2.0];
-    let _: () = msg_send![breathe, setAutoreverses: true];
-    let _: () = msg_send![breathe, setRepeatCount: f32::INFINITY];
-    let _: () = msg_send![layer, addAnimation: breathe forKey: ns_string("breathe")];
-}
-
-/// A rounded rect of `size` and `radius` at `(x, y)` as a tiny-skia path.
-fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
-    let r = radius.min(w / 2.0).min(h / 2.0);
-    let k = 0.552_284_8 * r;
-    let mut pb = tiny_skia::PathBuilder::new();
-    pb.move_to(x + r, y);
-    pb.line_to(x + w - r, y);
-    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
-    pb.line_to(x + w, y + h - r);
-    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
-    pb.line_to(x + r, y + h);
-    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
-    pb.line_to(x, y + r);
-    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
-    pb.close();
-    pb.finish()
-}
-
-/// The glow around a rounded rect of `size` and `radius` in `rgb`, as a
-/// retained `CGImage` (`HALO_RADIUS` wider on every side, at `scale`
-/// pixels per point): strokes of growing width along the edge add up to a
-/// soft falloff, and the shape's inside is cleared so the glass stays
-/// untinted.
-fn halo_image(size: (f64, f64), radius: f64, rgb: [u8; 3], scale: f64) -> Option<usize> {
-    let s = scale as f32;
-    let pad = HALO_RADIUS as f32 * s;
-    let (w, h) = (size.0 as f32 * s, size.1 as f32 * s);
-    let mut pm = tiny_skia::Pixmap::new((w + 2.0 * pad).ceil() as u32, (h + 2.0 * pad).ceil() as u32)?;
-    let path = rounded_rect(pad, pad, w, h, radius as f32 * s)?;
-    // Each stroke is wider and fainter than the last: they all overlap at
-    // the edge (which reaches about `HALO_OPACITY`) and thin out to
-    // nothing `HALO_RADIUS` away.
-    let steps = 12;
-    for step in 1..=steps {
-        let mut paint = tiny_skia::Paint::default();
-        let weight = 2.0 * (1.0 - (step - 1) as f64 / steps as f64) / steps as f64;
-        paint.set_color_rgba8(rgb[0], rgb[1], rgb[2], (HALO_OPACITY * weight * 255.0).round() as u8);
-        paint.anti_alias = true;
-        let stroke = tiny_skia::Stroke {
-            width: 2.0 * pad * step as f32 / steps as f32,
-            ..Default::default()
-        };
-        pm.stroke_path(&path, &paint, &stroke, tiny_skia::Transform::identity(), None);
-    }
-    let mut clear = tiny_skia::Paint::default();
-    clear.blend_mode = tiny_skia::BlendMode::Clear;
-    pm.fill_path(&path, &clear, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
-    crate::cursor::overlay::pixmap_to_cgimage(&pm)
 }
 
 /// Front card size in points for an image well of `image_size`.
@@ -2988,6 +2805,9 @@ fn ns_rect(area: Area) -> NSRect {
 
 unsafe fn set_frame(view: usize, area: Area) {
     let _: () = msg_send![view as *mut AnyObject, setFrame: ns_rect(area)];
+    if let Some(circle) = BUTTON_CIRCLES.with(|map| map.borrow().get(&view).copied()) {
+        let _: () = msg_send![circle as *mut AnyObject, setFrame: ns_rect(area)];
+    }
 }
 
 /// AppKit origin of the panel window in cascade `slot` on the main screen
@@ -3073,109 +2893,54 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let deck = glass_container(stack_view, bounds);
     let chips: Vec<ChipView> = (1..MAX_CARDS).map(|_| new_chip(deck, true)).collect();
 
-    // Front card: glass with a session-colored halo (a shadow of the card's
-    // outline, so it glows outside the glass and hides under it), no
-    // border. The system draws the edge highlight.
+    // Front card: the picture itself, with continuous rounded corners and
+    // the window's shadow; a faint dark backing shows only while it is
+    // empty. Its chrome is the hover bar below.
     let front_view = new_view(card_view_class(), ns_rect(slot_frame(card, Slot::Front, 0)));
-    let _: () = msg_send![front_view, setWantsLayer: true];
-    // MouseEnteredAndExited (0x01) | MouseMoved (0x02) | ActiveAlways (0x80)
-    // | InVisibleRect (0x200): hover-revealed buttons and resize cursors
-    // over a non-key panel, only over the card itself.
-    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
-    let tracking: *mut AnyObject = msg_send![
-        tracking,
-        initWithRect: NSRect::ZERO
-        options: 0x283u64
-        owner: front_view
-        userInfo: std::ptr::null_mut::<AnyObject>()
+    let card_layer = host_layer(front_view);
+    let _: () = msg_send![card_layer, setCornerRadius: CORNER_RADIUS];
+    let _: () = msg_send![card_layer, setCornerCurve: ns_string("continuous")];
+    let _: () = msg_send![card_layer, setMasksToBounds: true];
+    let backing: *mut AnyObject = msg_send![
+        class!(NSColor),
+        colorWithSRGBRed: 0.0_f64
+        green: 0.0_f64
+        blue: 0.0_f64
+        alpha: 0.28_f64
     ];
-    let _: () = msg_send![front_view, addTrackingArea: tracking];
-    let _: () = msg_send![tracking, release];
+    let backing: *mut CGColor = msg_send![backing, CGColor];
+    let _: () = msg_send![card_layer, setBackgroundColor: backing];
+    // MouseEnteredAndExited (0x01) | MouseMoved (0x02) | ActiveAlways (0x80)
+    // | InVisibleRect (0x200): the hover bar and resize cursors over a
+    // non-key panel, only over the card itself.
+    add_tracking(front_view);
 
-    // Everything visible sits in `body`, hosted by the glass background.
-    // `layout_front` sizes it all.
-    let card_bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(card.0, card.1));
-    let body = new_view(class!(NSView), card_bounds);
-    let glass = glass_background(card_bounds, body, CORNER_RADIUS);
-    let _: () = msg_send![front_view, addSubview: glass];
-    let _: () = msg_send![glass, release];
-
-    // Header: client icon first, then the target; text only when needed.
-    let header = new_view(class!(NSView), NSRect::ZERO);
-    let client_icon = new_icon_view(NSRect::ZERO);
-    // The session label shows only when two shown panels share a client
-    // (see `refresh`), in the session color.
-    let client_label = new_label(NSRect::ZERO, 11.0, 0.23, false); // NSFontWeightMedium
-    let _: () = msg_send![client_label, setTextColor: session_ns_color(key)];
-    let _: () = msg_send![client_label, setHidden: true];
-    let id = state.next_id;
-    state.next_id += 1;
-    let focus = new_button(
-        "arrow.up.forward.app",
-        "Bring this window forward",
-        sel!(pipFocus:),
-        id,
-        NSRect::ZERO,
-    );
-    let close = new_button(
-        "xmark",
-        "Hide until this agent's next action",
-        sel!(pipHide:),
-        id,
-        NSRect::ZERO,
-    );
-    // Revealed on hover.
-    let _: () = msg_send![focus, setAlphaValue: 0.0_f64];
-    let _: () = msg_send![close, setAlphaValue: 0.0_f64];
-    let target_icon = new_icon_view(NSRect::ZERO);
-    let target_title = new_label(NSRect::ZERO, 11.0, 0.0, false);
-    for view in [
-        client_icon,
-        client_label,
-        target_icon,
-        target_title,
-        focus,
-        close,
-    ] {
-        let _: () = msg_send![header, addSubview: view];
-    }
-    let _: () = msg_send![body, addSubview: header];
-    let _: () = msg_send![header, release];
-
-    // Screenshot well: the latest still, straight on the glass.
+    // Screenshot well: the latest still.
     let image_view = new_view(class!(NSImageView), NSRect::ZERO);
     let _: () = msg_send![image_view, setImageScaling: 3u64]; // proportionally up or down
-    let _: () = msg_send![image_view, setWantsLayer: true];
-    let image_layer: *mut AnyObject = msg_send![image_view, layer];
-    let _: () = msg_send![image_layer, setCornerRadius: WELL_RADIUS];
-    let _: () = msg_send![image_layer, setMasksToBounds: true];
-    add_subview(body, image_view);
+    add_subview(front_view, image_view);
 
     // Live mirror over the well: a layer-hosting view whose layer shows
     // ScreenCaptureKit frames, hidden until the first one arrives.
     let live_view = new_view(class!(NSView), NSRect::ZERO);
     let live_layer: *mut AnyObject = msg_send![class!(CALayer), layer];
     let _: () = msg_send![live_layer, setContentsGravity: ns_string("resizeAspect")];
-    let _: () = msg_send![live_layer, setCornerRadius: WELL_RADIUS];
-    let _: () = msg_send![live_layer, setMasksToBounds: true];
     // setLayer before setWantsLayer: the view hosts this layer as is.
     let _: () = msg_send![live_view, setLayer: live_layer];
     let _: () = msg_send![live_view, setWantsLayer: true];
     let _: () = msg_send![live_view, setHidden: true];
-    add_subview(body, live_view);
+    add_subview(front_view, live_view);
 
     // The agent cursor's sprite, clipped to the well, above the pixels.
     let cursor_view = new_view(decor_view_class(), NSRect::ZERO);
-    let _: () = msg_send![cursor_view, setWantsLayer: true];
-    let clip_layer: *mut AnyObject = msg_send![cursor_view, layer];
+    let clip_layer = host_layer(cursor_view);
     let _: () = msg_send![clip_layer, setMasksToBounds: true];
-    let _: () = msg_send![clip_layer, setCornerRadius: WELL_RADIUS];
     let cursor_layer: *mut AnyObject = msg_send![class!(CALayer), layer];
     let _: () = msg_send![cursor_layer, setContentsGravity: ns_string("resize")];
     let _: () = msg_send![cursor_layer, setContentsScale: backing_scale()];
     let _: () = msg_send![cursor_layer, setHidden: true];
     let _: () = msg_send![clip_layer, addSublayer: cursor_layer];
-    add_subview(body, cursor_view);
+    add_subview(front_view, cursor_view);
 
     // The empty well: the target's icon, dimmed, over a quiet line.
     let placeholder = new_view(decor_view_class(), NSRect::ZERO);
@@ -3195,52 +2960,45 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let _: () = msg_send![placeholder_text, setAlignment: 2isize]; // NSTextAlignmentCenter (NSInteger)
     let _: () = msg_send![placeholder, addSubview: placeholder_text];
     let _: () = msg_send![placeholder, setHidden: true];
-    add_subview(body, placeholder);
-
-    // The action caption: white on a soft dark gradient inside the well's
-    // bottom, shown for a moment after each action.
-    let caption = new_view(decor_view_class(), NSRect::ZERO);
-    let _: () = msg_send![caption, setWantsLayer: true];
-    let gradient: *mut AnyObject = msg_send![class!(CAGradientLayer), layer];
-    let clear: *mut AnyObject = msg_send![class!(NSColor), clearColor];
-    let clear: *mut CGColor = msg_send![clear, CGColor];
-    let dark: *mut AnyObject = msg_send![
-        class!(NSColor),
-        colorWithSRGBRed: 0.0_f64
-        green: 0.0_f64
-        blue: 0.0_f64
-        alpha: 0.55_f64
-    ];
-    let dark: *mut CGColor = msg_send![dark, CGColor];
-    // `arrayWithObjects:count:` takes a pointer to a C array of ids.
-    let stops: [*mut AnyObject; 2] = [dark as *mut AnyObject, clear as *mut AnyObject];
-    let colors: *mut AnyObject = msg_send![
-        class!(NSArray),
-        arrayWithObjects: stops.as_ptr()
-        count: 2usize
-    ];
-    let _: () = msg_send![gradient, setColors: colors];
-    // Bottom (dark) to top (clear): the layer's y axis points up.
-    let _: () = msg_send![gradient, setStartPoint: NSPoint::new(0.5, 0.0)];
-    let _: () = msg_send![gradient, setEndPoint: NSPoint::new(0.5, 1.0)];
-    let _: () = msg_send![caption, setLayer: gradient];
-    let _: () = msg_send![caption, setWantsLayer: true];
-    let caption_layer: *mut AnyObject = msg_send![caption, layer];
-    let _: () = msg_send![caption_layer, setCornerRadius: WELL_RADIUS];
-    let _: () = msg_send![caption_layer, setMasksToBounds: true];
-    let _: () = msg_send![caption_layer, setOpacity: 0.0_f32];
-    let status = new_label(NSRect::ZERO, 11.0, 0.23, false);
-    let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
-    let _: () = msg_send![status, setTextColor: white];
-    let _: () = msg_send![caption, addSubview: status];
-    add_subview(body, caption);
+    add_subview(front_view, placeholder);
     add_subview(deck, front_view);
 
-    // The halo: the session color as a soft glow just outside the front
-    // card while the session acts. A drawn image in a layer above the glass
-    // container (a layer shadow renders nowhere in this window), clear
-    // inside the shape, invisible at rest.
-    let halo = new_halo(stack_view);
+    // The hover bar: frosted glass above the card holding the client icon,
+    // a session-color dot, the window title and the two buttons.
+    let id = state.next_id;
+    state.next_id += 1;
+    let bar = new_view(bar_view_class(), NSRect::ZERO);
+    add_tracking(bar);
+    let bar_body = new_view(class!(NSView), NSRect::ZERO);
+    let client_icon = new_icon_view(NSRect::ZERO);
+    let _: () = msg_send![client_icon, setContentTintColor: white_color()];
+    let dot = new_view(decor_view_class(), NSRect::ZERO);
+    let dot_layer = host_layer(dot);
+    let _: () = msg_send![dot_layer, setCornerRadius: stack::BAR_DOT / 2.0];
+    let session: *mut AnyObject = session_ns_color(key);
+    let session: *mut CGColor = msg_send![session, CGColor];
+    let _: () = msg_send![dot_layer, setBackgroundColor: session];
+    let target_icon = new_icon_view(NSRect::ZERO);
+    let _: () = msg_send![target_icon, setHidden: true];
+    let target_title = new_label(NSRect::ZERO, 12.0, 0.23, false);
+    let focus = new_button(
+        bar_body,
+        "arrow.up.forward",
+        "Bring this window forward",
+        sel!(pipFocus:),
+        id,
+    );
+    let close = new_button(bar_body, "xmark", "Hide until this agent's next action", sel!(pipHide:), id);
+    for view in [client_icon, target_icon, target_title] {
+        let _: () = msg_send![bar_body, addSubview: view];
+    }
+    add_subview(bar_body, dot);
+    let bar_glass = glass_background(NSRect::ZERO, bar_body, stack::BAR_HEIGHT / 2.0);
+    let _: () = msg_send![bar_glass, setAutoresizingMask: 18u64];
+    add_subview(bar, bar_glass);
+    let _: () = msg_send![bar, setHidden: true];
+    let _: () = msg_send![bar, setAlphaValue: 0.0_f64];
+    add_subview(stack_view, bar);
 
     let mut panel = Panel {
         id,
@@ -3261,25 +3019,19 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         resolved_window: None,
         placeholder: placeholder as usize,
         placeholder_icon: placeholder_icon as usize,
-        caption: caption as usize,
-        status: status as usize,
+        action: String::new(),
+        bar: bar as usize,
+        bar_shown: false,
+        hover_gen: 0,
         client_icon: client_icon as usize,
-        client_label: client_label as usize,
         target_icon: target_icon as usize,
         target_title: target_title as usize,
         front_view: front_view as usize,
-        glass: glass as usize,
-        header: header as usize,
         focus: focus as usize,
         close: close as usize,
         backs: backs.try_into().ok()?,
         chips: chips.try_into().ok()?,
         plates,
-        halo,
-        halo_size: (0.0, 0.0),
-        halo_image: 0,
-        acting: false,
-        body: body as usize,
         cards: CardStack::new(),
         layout: vec![Slot::Front],
         motion: Default::default(),
@@ -3541,51 +3293,12 @@ unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
 }
 
 /// Lay the front card's views out for a card of `size` (nothing to do when
-/// they already are): header across the top, the image well below it with
-/// the caption inside its bottom edge.
+/// they already are): the picture fills the card.
 unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
     if panel.laid_out == (w, h) {
         return;
     }
     panel.laid_out = (w, h);
-    set_frame(
-        panel.glass,
-        Area {
-            x: 0.0,
-            y: 0.0,
-            w,
-            h,
-        },
-    );
-    set_frame(
-        panel.header,
-        Area {
-            x: 0.0,
-            y: h - HEADER_HEIGHT,
-            w,
-            h: HEADER_HEIGHT,
-        },
-    );
-    let label = panel.client_label as *mut AnyObject;
-    let hidden: bool = msg_send![label, isHidden];
-    let label_w = if hidden {
-        0.0
-    } else {
-        let _: () = msg_send![label, sizeToFit];
-        let fitted: NSRect = msg_send![label, frame];
-        fitted.size.width
-    };
-    let layout = stack::header_layout(w, label_w);
-    for (view, area) in [
-        (panel.client_icon, layout.client_icon),
-        (panel.client_label, layout.client_label),
-        (panel.target_icon, layout.target_icon),
-        (panel.target_title, layout.target_title),
-        (panel.focus, layout.focus),
-        (panel.close, layout.close),
-    ] {
-        set_frame(view, area);
-    }
     let (well_w, well_h) = well_size((w, h));
     let well = Area {
         x: PAD,
@@ -3615,38 +3328,138 @@ unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
             h: PLACEHOLDER_ICON,
         },
     );
-    set_frame(
-        panel.caption,
-        Area {
-            x: well.x,
-            y: well.y,
-            w: well_w,
-            h: CAPTION_HEIGHT.min(well_h),
-        },
-    );
-    set_frame(
-        panel.status,
-        Area {
-            x: 8.0,
-            y: 2.0,
-            w: (well_w - 16.0).max(0.0),
-            h: 16.0,
-        },
-    );
 }
 
-/// Show the action caption, then fade it after `CAPTION_HOLD`. A new
-/// action restarts the clock.
-unsafe fn flash_caption(panel: &Panel) {
-    let layer: *mut AnyObject = msg_send![panel.caption as *mut AnyObject, layer];
-    let begin = CACurrentMediaTime() + CAPTION_HOLD.as_secs_f64();
-    let _: () = msg_send![layer, removeAnimationForKey: ns_string("caption")];
-    let fade: *mut AnyObject = msg_send![
-        class!(CABasicAnimation),
-        animationWithKeyPath: ns_string("opacity")
+/// Put the hover bar above the front card drawn at `front` (window
+/// coordinates), inside the card's top when the screen has no room above.
+unsafe fn place_bar(panel: &mut Panel, front: Area) {
+    let window = panel.window as *mut AnyObject;
+    let frame: NSRect = msg_send![window, frame];
+    let room_above = visible_frame_of(window)
+        .map_or(f64::INFINITY, |visible| {
+            visible.y + visible.h - (frame.origin.y + front.y + front.h)
+        });
+    let bar = bar_frame(front, room_above);
+    set_frame(panel.bar, bar);
+    let layout = bar_layout(bar.w);
+    let glass: *mut AnyObject = msg_send![panel.bar as *mut AnyObject, subviews];
+    let glass: *mut AnyObject = msg_send![glass, firstObject];
+    let _: () = msg_send![
+        glass,
+        setFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(bar.w, bar.h))
     ];
-    configure_animation(fade, 1.0, 0.0, begin, CAPTION_FADE.as_secs_f64());
-    let _: () = msg_send![layer, addAnimation: fade forKey: ns_string("caption")];
+    let body: *mut AnyObject = bar_body(panel.bar);
+    let views: *mut AnyObject = msg_send![body, subviews];
+    let count: usize = msg_send![views, count];
+    for index in 0..count {
+        let view: *mut AnyObject = msg_send![views, objectAtIndex: index];
+        let is_dot: bool = msg_send![view, isKindOfClass: decor_view_class()];
+        if is_dot {
+            set_frame(view as usize, layout.dot);
+        }
+    }
+    for (view, area) in [
+        (panel.client_icon, layout.client_icon),
+        (panel.target_title, layout.title),
+        (panel.focus, layout.focus),
+        (panel.close, layout.close),
+    ] {
+        set_frame(view, area);
+    }
+}
+
+/// The bar's content view (inside its glass).
+unsafe fn bar_body(bar: usize) -> *mut AnyObject {
+    let glass: *mut AnyObject = msg_send![bar as *mut AnyObject, subviews];
+    let glass: *mut AnyObject = msg_send![glass, firstObject];
+    let responds: bool = msg_send![glass, respondsToSelector: sel!(contentView)];
+    if responds {
+        msg_send![glass, contentView]
+    } else {
+        let subviews: *mut AnyObject = msg_send![glass, subviews];
+        msg_send![subviews, firstObject]
+    }
+}
+
+/// The bar's current frame (window coordinates) while it is up.
+unsafe fn bar_area(panel: &Panel) -> Option<Area> {
+    if !panel.bar_shown {
+        return None;
+    }
+    let frame: NSRect = msg_send![panel.bar as *mut AnyObject, frame];
+    Some(area_of(frame))
+}
+
+/// The pointer entered (`inside`) or left the card or its bar: show the
+/// bar at once, or hide it `BAR_FADE_OUT` after the pointer left both.
+unsafe fn hover(panel: &mut Panel, inside: bool) {
+    panel.hover_gen += 1;
+    if inside {
+        if !panel.bar_shown {
+            panel.bar_shown = true;
+            let _: () = msg_send![panel.bar as *mut AnyObject, setHidden: false];
+            animate_view_alpha(panel.bar, 1.0, BAR_FADE_IN);
+        }
+        return;
+    }
+    dispatch_to_main_after(BAR_FADE_OUT, (panel.id, panel.hover_gen), bar_hide_cb);
+}
+
+unsafe extern "C" fn bar_hide_cb(ctx: *mut c_void) {
+    let (id, generation) = *Box::from_raw(ctx as *mut (i64, u64));
+    with_state(|state| {
+        let Some(panel) = panel_by_id(state, id) else {
+            return;
+        };
+        // The pointer came back meanwhile.
+        if panel.hover_gen != generation || !panel.bar_shown {
+            return;
+        }
+        panel.bar_shown = false;
+        animate_view_alpha(panel.bar, 0.0, BAR_FADE_OUT);
+        dispatch_to_main_after(BAR_FADE_OUT, (id, generation), bar_hidden_cb);
+    });
+}
+
+/// The fade-out is over: take the bar out of hit testing.
+unsafe extern "C" fn bar_hidden_cb(ctx: *mut c_void) {
+    let (id, generation) = *Box::from_raw(ctx as *mut (i64, u64));
+    with_state(|state| {
+        let Some(panel) = panel_by_id(state, id) else {
+            return;
+        };
+        if panel.hover_gen == generation && !panel.bar_shown {
+            let _: () = msg_send![panel.bar as *mut AnyObject, setHidden: true];
+        }
+    });
+}
+
+unsafe fn animate_view_alpha(view: usize, alpha: f64, over: Duration) {
+    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+    let _: () = msg_send![context, setDuration: over.as_secs_f64()];
+    let animator: *mut AnyObject = msg_send![view as *mut AnyObject, animator];
+    let _: () = msg_send![animator, setAlphaValue: alpha];
+    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+}
+
+/// A tracking area on `view` for hover (entered and exited, moved) that
+/// works over a non-key panel.
+unsafe fn add_tracking(view: *mut AnyObject) {
+    let tracking: *mut AnyObject = msg_send![class!(NSTrackingArea), alloc];
+    let tracking: *mut AnyObject = msg_send![
+        tracking,
+        initWithRect: NSRect::ZERO
+        options: 0x283u64
+        owner: view
+        userInfo: std::ptr::null_mut::<AnyObject>()
+    ];
+    let _: () = msg_send![view, addTrackingArea: tracking];
+    let _: () = msg_send![tracking, release];
+}
+
+unsafe fn white_color() -> *mut AnyObject {
+    msg_send![class!(NSColor), whiteColor]
 }
 
 /// Where the view for `slot` settles, in panel coordinates: its resting
@@ -3706,12 +3519,10 @@ unsafe fn apply_card_frames(panel: &mut Panel) {
         let placed = to_window(view_frame(panel, slot, cards));
         set_frame(card_view(panel, slot), placed);
         set_frame(panel.plates[slot.view()], placed);
-        if slot == Slot::Front {
-            place_halo(panel, placed);
-        }
     }
     let front = view_frame(panel, Slot::Front, cards);
     layout_front(panel, (front.w, front.h));
+    place_bar(panel, to_window(front));
     // The window shadow follows the items' outline once they are at rest.
     if !panel.motion.iter().any(Motion::moving) && !panel.trail_motion.moving() {
         let _: () = msg_send![panel.window as *mut AnyObject, invalidateShadow];
@@ -3913,7 +3724,11 @@ extern "C" fn stack_hit_test(this: *mut AnyObject, _cmd: Sel, point: NSPoint) ->
         let over_card = try_with_state(|state| {
             panel_for(state, window).is_some_and(|panel| {
                 let point = panel_point((local.x, local.y));
-                item_at(point, &panel.layout, &item_frames(panel)).is_some()
+                let bar = bar_area(panel).map(|bar| {
+                    let (x, y) = panel_point((bar.x, bar.y));
+                    Area { x, y, ..bar }
+                });
+                pressed_item(point, item_at(point, &panel.layout, &item_frames(panel)), bar).is_some()
             })
         });
         // Busy state (a re-entrant call): keep the press.
@@ -3940,7 +3755,11 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
             let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
             let point = panel_point(point);
             let frames = item_frames(panel);
-            let item = item_at(point, &panel.layout, &frames);
+            let bar = bar_area(panel).map(|bar| {
+                let (x, y) = panel_point((bar.x, bar.y));
+                Area { x, y, ..bar }
+            });
+            let item = pressed_item(point, item_at(point, &panel.layout, &frames), bar);
             let edges = if item == Some(0) {
                 resize_edges(point, frames[0])
             } else {
@@ -3950,7 +3769,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
                 .filter(|item| *item > 0)
                 .and_then(|item| panel.cards.cards().get(item))
                 .map(|card| card.key);
-            let region = stack::press_region(point, item, edges, frames[0]);
+            let region = stack::press_region(point, item, edges, frames[0], bar);
             tracing::info!(target: "pip", session = %key, region, x = point.0, y = point.1, "PiP panel press");
             state.gesture = Some(Gesture {
                 id,
@@ -4060,32 +3879,24 @@ extern "C" fn card_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
 }
 
 extern "C" fn card_mouse_entered(this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    unsafe { reveal_buttons(this, true) };
+    unsafe { hover_from(this, true) };
 }
 
 extern "C" fn card_mouse_exited(this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
     unsafe {
         set_resize_cursor(0);
-        reveal_buttons(this, false);
+        hover_from(this, false);
     }
 }
 
-/// Fade the header buttons of the card `view` in or out.
-unsafe fn reveal_buttons(view: *mut AnyObject, shown: bool) {
+/// A hover change on the card `view` or its bar.
+unsafe fn hover_from(view: *mut AnyObject, inside: bool) {
     let window = window_of(view);
-    let buttons = try_with_state(|state| panel_for(state, window).map(|panel| (panel.focus, panel.close)));
-    let Some((focus, close)) = buttons.flatten() else {
-        return;
-    };
-    let alpha = if shown { 1.0 } else { 0.0 };
-    let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
-    let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: 0.15_f64];
-    for button in [focus, close] {
-        let animator: *mut AnyObject = msg_send![button as *mut AnyObject, animator];
-        let _: () = msg_send![animator, setAlphaValue: alpha];
-    }
-    let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+    try_with_state(|state| {
+        if let Some(panel) = panel_for(state, window) {
+            hover(panel, inside);
+        }
+    });
 }
 
 /// The frame-resize cursor for `edges` (macOS 15+), else the arrow.
@@ -4210,8 +4021,26 @@ fn decor_view_class() -> &'static AnyClass {
     })
 }
 
-/// The front card's view: owns the tracking area that reveals the header
-/// buttons and sets resize cursors. Presses fall through to the stack view.
+/// The hover bar's view: its tracking area keeps the bar up while the
+/// pointer is over it. Presses fall through to the stack view.
+fn bar_view_class() -> &'static AnyClass {
+    static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
+    CLASS.get_or_init(|| {
+        register_class("CuaPipBar", class!(NSView), |builder| unsafe {
+            builder.add_method(
+                sel!(mouseEntered:),
+                card_mouse_entered as extern "C" fn(_, _, _),
+            );
+            builder.add_method(
+                sel!(mouseExited:),
+                card_mouse_exited as extern "C" fn(_, _, _),
+            );
+        })
+    })
+}
+
+/// The front card's view: owns the tracking area that reveals the hover
+/// bar and sets resize cursors. Presses fall through to the stack view.
 fn card_view_class() -> &'static AnyClass {
     static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
     CLASS.get_or_init(|| {
@@ -4300,13 +4129,16 @@ unsafe fn text_shadow() -> *mut AnyObject {
     shadow
 }
 
-/// Borderless SF Symbol button wired to the shared target (autoreleased).
+/// A round button in `parent`: a white SF Symbol on a solid dark circle
+/// (legible on any backdrop), wired to the shared target. Returns the
+/// button (owned by `parent`); its frame is set by `place_bar`, and the
+/// circle under it follows through autoresizing.
 unsafe fn new_button(
+    parent: *mut AnyObject,
     symbol: &str,
     tooltip: &str,
     action: Sel,
     tag: i64,
-    frame: NSRect,
 ) -> *mut AnyObject {
     let image = symbol_image(symbol);
     let target = button_target() as *mut AnyObject;
@@ -4316,20 +4148,42 @@ unsafe fn new_button(
         target: target
         action: action
     ];
-    let _: () = msg_send![button, setFrame: frame];
     let _: () = msg_send![button, setBordered: false];
     let _: () = msg_send![button, setImagePosition: 1u64]; // imageOnly
     let _: () = msg_send![button, setTag: tag];
     let _: () = msg_send![button, setToolTip: ns_string(tooltip)];
-    let tint: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
-    let _: () = msg_send![button, setContentTintColor: tint];
+    let _: () = msg_send![button, setContentTintColor: white_color()];
     let config: *mut AnyObject = msg_send![
         class!(NSImageSymbolConfiguration),
-        configurationWithPointSize: 12.0_f64
-        weight: 0.23_f64
+        configurationWithPointSize: 11.0_f64
+        weight: 0.4_f64 // NSFontWeightSemibold
     ];
     let _: () = msg_send![button, setSymbolConfiguration: config];
+    // The circle: a decor view under the button with the same frame.
+    let circle = new_view(decor_view_class(), NSRect::ZERO);
+    let layer = host_layer(circle);
+    let _: () = msg_send![layer, setCornerRadius: BAR_BUTTON / 2.0];
+    let fill: *mut AnyObject = msg_send![
+        class!(NSColor),
+        colorWithSRGBRed: 0.0_f64
+        green: 0.0_f64
+        blue: 0.0_f64
+        alpha: 0.65_f64
+    ];
+    let fill: *mut CGColor = msg_send![fill, CGColor];
+    let _: () = msg_send![layer, setBackgroundColor: fill];
+    add_subview(parent, circle);
+    let _: () = msg_send![parent, addSubview: button];
+    // The circle follows the button: it is its backing, so keep them in
+    // step wherever the button is framed.
+    let _: () = msg_send![button, setWantsLayer: true];
+    BUTTON_CIRCLES.with(|map| map.borrow_mut().insert(button as usize, circle as usize));
     button
+}
+
+thread_local! {
+    /// Each button's backing circle (main thread only).
+    static BUTTON_CIRCLES: std::cell::RefCell<HashMap<usize, usize>> = std::cell::RefCell::new(HashMap::new());
 }
 
 unsafe fn symbol_image(name: &str) -> *mut AnyObject {
