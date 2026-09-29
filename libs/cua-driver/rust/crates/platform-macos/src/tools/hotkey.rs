@@ -457,30 +457,19 @@ impl Tool for HotkeyTool {
                 } else {
                     ""
                 };
-                // A combo is never read-back-verifiable. On the background rung,
-                // point the agent at the foreground escalation for menu shortcuts
-                // an app drops in the background — same contract as type_text.
-                let mut structured = serde_json::json!({
-                    "path": if fg { "key_events_fg" } else { "key_events" },
-                    "verified": false,
-                    "effect": "unverifiable",
-                });
-                if !fg && window_id.is_some() {
-                    structured["escalation"] = serde_json::json!({
-                        "recommended": "foreground",
-                        "reason": "a background combo didn't land? menu key-equivalents \
-                                   often need the window fronted — re-call with \
-                                   delivery_mode:\"foreground\". (To type into a field, \
-                                   pixel-click to focus then type_text instead.)"
-                    });
-                }
+                // A combo is never read-back-verifiable, and a delivered combo
+                // is not evidence of a missed one: no escalation. Resending a
+                // navigation or toggle chord that did land repeats it, so the
+                // next step is a read.
+                let structured = delivered_structured(fg);
                 // Apps often drop a background menu shortcut (TextEdit ignores
                 // Cmd+S); invoke_menu runs the same command by path.
                 let menu_hint = if !fg && cmd_chord {
-                    " A background menu shortcut can be ignored; if its effect is missing, \
-                     run the same command with invoke_menu, e.g. path [\"File\",\"Save\"]."
+                    " Read the window before sending it again: only if a fresh read shows its \
+                     effect missing, run the same command with invoke_menu, e.g. path \
+                     [\"File\",\"Save\"]."
                 } else {
-                    ""
+                    " Read the window before sending it again."
                 };
                 ToolResult::text(format!(
                     "Pressed {key_display} on pid {pid}{label}.{menu_hint}{}",
@@ -494,9 +483,31 @@ impl Tool for HotkeyTool {
     }
 }
 
+/// Structured result of a delivered combo: unverifiable, and never an
+/// escalation, since delivery is no evidence the combo was missed.
+fn delivered_structured(foreground: bool) -> Value {
+    serde_json::json!({
+        "path": if foreground { "key_events_fg" } else { "key_events" },
+        "verified": false,
+        "effect": "unverifiable",
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A background combo that was delivered carried a "resend it in the
+    /// foreground" hint, and an agent resent navigation chords that had
+    /// landed. Delivery alone must not suggest a resend.
+    #[test]
+    fn a_delivered_combo_suggests_no_resend() {
+        for foreground in [false, true] {
+            let structured = delivered_structured(foreground);
+            assert!(structured.get("escalation").is_none());
+            assert_eq!(structured["effect"], "unverifiable");
+        }
+    }
 
     #[test]
     fn hotkey_contract_accepts_snapshot_bound_ax_targets() {

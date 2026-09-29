@@ -578,6 +578,12 @@
               "null"
             ]
           },
+          "idempotent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -1011,6 +1017,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "idempotent": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -2674,6 +2686,12 @@
               "null"
             ]
           },
+          "idempotent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -2875,6 +2893,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "idempotent": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -3522,6 +3546,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "idempotent": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -4278,6 +4308,12 @@
               "null"
             ]
           },
+          "idempotent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -4688,6 +4724,12 @@
                           },
                           "type": [
                             "array",
+                            "null"
+                          ]
+                        },
+                        "idempotent": {
+                          "type": [
+                            "boolean",
                             "null"
                           ]
                         },
@@ -5169,6 +5211,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "idempotent": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
@@ -5689,6 +5737,12 @@
               "null"
             ]
           },
+          "idempotent": {
+            "type": [
+              "boolean",
+              "null"
+            ]
+          },
           "route": {
             "enum": [
               "accessibility",
@@ -6072,6 +6126,12 @@
             },
             "type": [
               "array",
+              "null"
+            ]
+          },
+          "idempotent": {
+            "type": [
+              "boolean",
               "null"
             ]
           },
