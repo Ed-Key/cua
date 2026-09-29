@@ -32,8 +32,17 @@
 //! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not owed news) shows the panel or plays a finale | the panel hides (an ending one closes) |
 //! | Cursor update (the overlay's render thread, once per rendered frame, carrying the cursor's animated screen point, the window its last action targeted, and whether its click pulse is on) | none | none | none | only the front card's cursor sprite, and only while the cursor's window is the displayed one (a raised back card, or a new target whose capture is pending, hides it): it moves to the point mapped into the well from the target window's last known frame, looked up for that window (a raised card's window has none until the poll finds it) (see `cursor`), is re-placed when that frame, the displayed target or the well changes, and hides while the cursor is off that window, disabled or faded, or the panel has no frame; the first update of each click pulse that lands in the well logs "PiP cursor" once |
 //!
+//! | Overview open (menu bar item or the shortcut) | none | none | none | none: the overview (see `overview`) is a read-only view of every live panel's stack (front card first, finished windows badged), hidden panels included; it never makes the daemon the active app |
+//! | Overview close (Esc, a click outside the sheet, the shortcut or the menu bar item again) | none | none | none | none: only the overview goes away |
+//! | Overview focus click (a thumbnail, or Return on the selected one) | none | none | none: the window comes forward through the same path as the panel's Focus button (`bring_to_front`) | none: the overview closes first |
+//! | Session acting while the overview is open | as the action note and captured frame rows | as those rows | as those rows | as those rows; the overview follows the stack on its next poll (a new front card, a new title) |
+//! | Session ending or finishing while the overview is open | as the idle timer and `end_session` rows | as those rows | as those rows | as those rows; the overview drops an ended session's group and badges a finished window on its next poll, and shows its empty line when no live session is left |
+//! | A window closing while the overview is open | as the captured frame row (the stack prunes it) | none | none | as that row; the overview drops the thumbnail on its next poll |
+//! | Panel hidden or closed by the user while the overview is open | none | none | as the user close row | as that row; the overview keeps the session's group (a hidden panel is still a live session) |
+//!
 //! Everything here is pure (unit tested, one test per row); the cursor
-//! row's logic and test live in `cursor`.
+//! row's logic and test live in `cursor`, the overview rows' in
+//! `overview`.
 
 use std::collections::HashMap;
 use std::time::Duration;
