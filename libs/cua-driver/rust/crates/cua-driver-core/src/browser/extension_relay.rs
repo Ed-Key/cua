@@ -149,6 +149,25 @@ fn tab_holders() -> &'static Mutex<HashMap<(u64, i64), usize>> {
     HOLDERS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+/// Ownership rule for a tab's debugger attachment (one per tab, shared by
+/// every relay connection on the link):
+///
+/// - A connection reserves the tab (counts as a holder) *before* it asks the
+///   extension to attach, so a last holder closing meanwhile does not detach
+///   a tab that is about to be adopted.
+/// - Reserving and attaching, and releasing and the last-holder detach, run
+///   under one gate per (link, tab). The extension handles a tab's requests
+///   in order, so whichever step takes the gate first finishes, including its
+///   detach, before the other decides anything.
+/// - A connection that closes owns the release of every tab it reserved,
+///   including one whose attach is still in flight; the attach then finds
+///   its connection closed and returns an error without adopting the tab.
+fn attach_gates() -> &'static super::keyed_gates::KeyedGates<(u64, i64)> {
+    static GATES: std::sync::OnceLock<super::keyed_gates::KeyedGates<(u64, i64)>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(super::keyed_gates::KeyedGates::new)
+}
+
 /// Count one more holder of `tab`.
 fn hold_tab(link: u64, tab: i64) {
     *tab_holders().lock().unwrap().entry((link, tab)).or_default() += 1;
@@ -183,9 +202,41 @@ impl Session {
     async fn release_held_tabs(&self) {
         let tabs = self.held_tabs.lock().unwrap().take().unwrap_or_default();
         for tab in tabs {
+            let _gate = attach_gates().lock((self.link, tab)).await;
             release_tab(self.link, tab);
             self.detach_if_unheld(tab).await;
         }
+    }
+
+    /// Reserve `tab` for this connection, then attach. See [`attach_gates`].
+    async fn attach_tab(&self, tab: i64, color: &Value) -> Result<(), (i64, String)> {
+        let _gate = attach_gates().lock((self.link, tab)).await;
+        let newly_reserved = match self.held_tabs.lock().unwrap().as_mut() {
+            Some(held) => {
+                let new = held.insert(tab);
+                if new {
+                    hold_tab(self.link, tab);
+                }
+                new
+            }
+            None => return Err((-32001, "the relay connection closed".to_owned())),
+        };
+        let attached = self
+            .request("debugger.attach", json!({ "tabId": tab, "sessionColor": color }))
+            .await;
+        if self.held_tabs.lock().unwrap().is_none() {
+            // Closed while attaching: the closing path releases the
+            // reservation (it waits for this gate) and detaches.
+            return Err((-32001, "the connection closed while attaching".to_owned()));
+        }
+        if attached.is_err() && newly_reserved {
+            if let Some(held) = self.held_tabs.lock().unwrap().as_mut() {
+                held.remove(&tab);
+            }
+            release_tab(self.link, tab);
+            self.detach_if_unheld(tab).await;
+        }
+        attached.map(drop)
     }
 
     async fn detach_if_unheld(&self, tab: i64) {
@@ -360,27 +411,7 @@ impl Session {
             "Target.attachToTarget" => {
                 let tab = self.tab_of_target(target_id()).await?;
                 let color = params.get("cuaSessionColor").cloned().unwrap_or(Value::Null);
-                self.request("debugger.attach", json!({ "tabId": tab, "sessionColor": color }))
-                    .await?;
-                // Ownership rule: an attachment belongs to the connection
-                // that requested it only if that connection is still open
-                // when the attach completes. One that completes after the
-                // connection closed belongs to no one, so it is released
-                // here exactly as a closing connection releases its tabs:
-                // detached unless another connection holds the tab.
-                let adopted = match self.held_tabs.lock().unwrap().as_mut() {
-                    Some(held) => {
-                        if held.insert(tab) {
-                            hold_tab(self.link, tab);
-                        }
-                        true
-                    }
-                    None => false,
-                };
-                if !adopted {
-                    self.detach_if_unheld(tab).await;
-                    return Err((-32001, "the connection closed while attaching".to_owned()));
-                }
+                self.attach_tab(tab, &color).await?;
                 let session = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
                 let mut routes = self.routes.lock().unwrap();
                 routes.sessions.insert(session.clone(), tab);
@@ -627,55 +658,130 @@ mod tests {
         }
     }
 
+    /// A fake extension that answers every request, except that it holds
+    /// back its answer to debugger.attach until the test releases it.
     #[cfg(unix)]
-    #[tokio::test]
-    async fn the_debugger_is_detached_when_the_last_connection_holding_the_tab_closes() {
+    fn gated_extension(
+        mut extension: tokio::net::UnixStream,
+    ) -> (mpsc::UnboundedReceiver<Value>, mpsc::UnboundedSender<()>) {
         use tokio::io::AsyncWriteExt;
-        let (bridge, mut extension, _dir) = extension_bridge::tests::connected().await;
-        let link = bridge.links()[0].link;
-        let session = |bridge: Arc<ExtensionBridge>| {
-            let session = Session {
-                link,
-                bridge,
-                routes: Arc::new(Mutex::new(Routes::default())),
-                held_tabs: Mutex::new(Some(Default::default())),
-            };
-            session.routes.lock().unwrap().targets.insert("T".to_owned(), 9);
-            session
-        };
-        let (first, second) = (session(bridge.clone()), session(bridge));
-        let (seen_tx, mut seen) = mpsc::unbounded_channel::<Value>();
+        let (seen_tx, seen) = mpsc::unbounded_channel::<Value>();
+        let (release_tx, mut release) = mpsc::unbounded_channel::<()>();
         tokio::spawn(async move {
             loop {
                 let request = extension_bridge::tests::read_frame(&mut extension).await;
+                seen_tx.send(request.clone()).unwrap();
+                if request["method"] == "debugger.attach" {
+                    release.recv().await;
+                }
                 let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":{}});
                 extension.write_all(&extension_bridge::frame(&reply)).await.unwrap();
-                seen_tx.send(request).unwrap();
             }
         });
+        (seen, release_tx)
+    }
+
+    #[cfg(unix)]
+    fn relay_session(bridge: Arc<ExtensionBridge>, link: u64, tab: i64) -> Arc<Session> {
+        let session = Session {
+            link,
+            bridge,
+            routes: Arc::new(Mutex::new(Routes::default())),
+            held_tabs: Mutex::new(Some(Default::default())),
+        };
+        session.routes.lock().unwrap().targets.insert("T".to_owned(), tab);
+        Arc::new(session)
+    }
+
+    async fn next_method(seen: &mut mpsc::UnboundedReceiver<Value>) -> String {
+        seen.recv().await.unwrap()["method"].as_str().unwrap().to_owned()
+    }
+
+    fn quiet(seen: &mut mpsc::UnboundedReceiver<Value>) -> bool {
+        seen.try_recv().is_err()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pending_attach_keeps_the_tab_when_the_last_holder_closes() {
+        let (bridge, extension, _dir) = extension_bridge::tests::connected().await;
+        let link = bridge.links()[0].link;
+        let (mut seen, release) = gated_extension(extension);
         let attach = json!({ "targetId": "T", "flatten": true });
-        for session in [&first, &second, &first] {
-            session.root("Target.attachToTarget", &attach).await.unwrap();
-            assert_eq!(seen.recv().await.unwrap()["method"], "debugger.attach");
-        }
-        // One connection closing leaves the tab attached for the other.
-        first.release_held_tabs().await;
-        assert!(seen.try_recv().is_err(), "no detach while a connection holds the tab");
-        // An attach that completes after its connection closed is nobody's:
-        // refused, and left attached only because the other connection holds it.
-        assert!(first.root("Target.attachToTarget", &attach).await.is_err());
-        assert_eq!(seen.recv().await.unwrap()["method"], "debugger.attach");
-        assert!(seen.try_recv().is_err(), "the other connection still holds the tab");
-        second.release_held_tabs().await;
-        let detach = seen.recv().await.unwrap();
-        assert_eq!(detach["method"], "debugger.detach");
-        assert_eq!(detach["params"]["tabId"], 9);
-        assert!(tab_holders().lock().unwrap().get(&(link, 9)).is_none());
-        // With no holder left, such a late attachment is detached at once.
-        assert!(second.root("Target.attachToTarget", &attach).await.is_err());
-        assert_eq!(seen.recv().await.unwrap()["method"], "debugger.attach");
-        let detach = seen.recv().await.unwrap();
-        assert_eq!(detach["method"], "debugger.detach");
-        assert_eq!(detach["params"]["tabId"], 9);
+        let (a, b) = (relay_session(bridge.clone(), link, 11), relay_session(bridge, link, 11));
+
+        let a_attach = tokio::spawn({
+            let a = a.clone();
+            let attach = attach.clone();
+            async move { a.root("Target.attachToTarget", &attach).await }
+        });
+        assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        release.send(()).unwrap();
+        a_attach.await.unwrap().unwrap();
+
+        // B's attach is in flight; then A, the only holder, closes.
+        let b_attach = tokio::spawn({
+            let b = b.clone();
+            let attach = attach.clone();
+            async move { b.root("Target.attachToTarget", &attach).await }
+        });
+        assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        let a_close = tokio::spawn({
+            let a = a.clone();
+            async move { a.release_held_tabs().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+        b_attach.await.unwrap().expect("B adopts the tab");
+        a_close.await.unwrap();
+        assert!(quiet(&mut seen), "no detach while B holds the tab");
+
+        // The other ordering: the last holder closes first, then an attach.
+        b.release_held_tabs().await;
+        assert_eq!(next_method(&mut seen).await, "debugger.detach");
+        let a2 = relay_session(a.bridge.clone(), link, 11);
+        let a2_attach = tokio::spawn({
+            let a2 = a2.clone();
+            async move { a2.root("Target.attachToTarget", &attach).await }
+        });
+        assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        release.send(()).unwrap();
+        a2_attach.await.unwrap().expect("attach after the detach holds the tab");
+        assert_eq!(tab_holders().lock().unwrap().get(&(link, 11)), Some(&1));
+        a2.release_held_tabs().await;
+        assert_eq!(next_method(&mut seen).await, "debugger.detach");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_connection_closing_during_its_own_attach_releases_the_tab() {
+        let (bridge, extension, _dir) = extension_bridge::tests::connected().await;
+        let link = bridge.links()[0].link;
+        let (mut seen, release) = gated_extension(extension);
+        let a = relay_session(bridge, link, 12);
+        let attach = tokio::spawn({
+            let a = a.clone();
+            async move {
+                a.root("Target.attachToTarget", &json!({ "targetId": "T", "flatten": true }))
+                    .await
+            }
+        });
+        assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        let close = tokio::spawn({
+            let a = a.clone();
+            async move { a.release_held_tabs().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+        assert!(attach.await.unwrap().is_err(), "a closed connection adopts nothing");
+        close.await.unwrap();
+        assert_eq!(next_method(&mut seen).await, "debugger.detach");
+        assert!(tab_holders().lock().unwrap().get(&(link, 12)).is_none());
+        // A connection already closed refuses before attaching at all.
+        assert!(a
+            .root("Target.attachToTarget", &json!({ "targetId": "T", "flatten": true }))
+            .await
+            .is_err());
+        assert!(quiet(&mut seen));
     }
 }
