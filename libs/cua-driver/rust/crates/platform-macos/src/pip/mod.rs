@@ -189,9 +189,14 @@ const PAD: f64 = 6.0;
 const WELL_RADIUS: f64 = CORNER_RADIUS - PAD;
 /// The session-colored glow around the front card (and each chip): where
 /// the agent's color lives, instead of a border.
-const HALO_RADIUS: f64 = 10.0;
-/// Peak opacity of the glow, right at the glass edge.
-const HALO_OPACITY: f64 = 0.4;
+const HALO_RADIUS: f64 = 14.0;
+/// Peak opacity of the drawn glow, right at the glass edge (the strokes
+/// add up to about two thirds of this); on screen it is scaled by the halo
+/// layer's opacity, which breathes between these two values while the
+/// session acts and is 0 at rest, so the glow peaks at about 0.2.
+const HALO_OPACITY: f64 = 1.0;
+const HALO_BREATH: (f64, f64) = (0.2, 0.35);
+const HALO_BREATH_PERIOD: Duration = Duration::from_millis(2400);
 /// The action caption inside the well: its height, how long it stays after
 /// an action, and its fade.
 const CAPTION_HEIGHT: f64 = 20.0;
@@ -199,7 +204,7 @@ const CAPTION_HOLD: Duration = Duration::from_millis(1200);
 const CAPTION_FADE: Duration = Duration::from_millis(300);
 /// Distance from the screen's visible-frame edge to the first panel.
 const EDGE_INSET: f64 = 16.0;
-/// Gap between stacked panels (their halos must not touch).
+/// Gap between stacked panels (room for a breathing halo).
 const STACK_GAP: f64 = 12.0;
 /// How often active sessions re-check whether their window is fully visible.
 const VISIBILITY_POLL: Duration = Duration::from_millis(500);
@@ -446,12 +451,13 @@ struct Panel {
     /// Each view's hit plate (see `new_hit_plate`), indexed like
     /// `Slot::view`, framed and hidden with its view.
     plates: [usize; VIEWS],
-    /// Each view's halo (see `new_halo`), indexed like `plates`; 0 for
-    /// back cards, which have none. With the size each halo's glow image
-    /// was drawn for, and that retained `CGImage`.
-    halos: [usize; VIEWS],
-    halo_sizes: [(f64, f64); VIEWS],
-    halo_images: [usize; VIEWS],
+    /// The front card's halo (see `new_halo`), the size its glow image was
+    /// drawn for, that retained `CGImage`, and whether it is breathing
+    /// (the session is acting).
+    halo: usize,
+    halo_size: (f64, f64),
+    halo_image: usize,
+    acting: bool,
     /// The front card's content view (inside its glass): everything the
     /// card shows, the finale overlay included, lives here.
     body: usize,
@@ -1352,6 +1358,7 @@ unsafe fn resume(panel: &mut Panel, key: &str, worker: &CaptureWorker, at_ms: u6
     // Also a finale that just ended and is still up during the fade.
     remove_finale_view(panel);
     panel.after_finale = false;
+    set_acting(panel, true);
     let now = Instant::now();
     panel.last_action = panel.last_action.max(now);
     worker.mark_delivered(key, now);
@@ -1930,6 +1937,9 @@ unsafe fn refresh(state: &mut State, key: &str) {
         finish_session(panel, key, worker);
     }
     let finale = panel.lifecycle.playing();
+    if !active || finale {
+        set_acting(panel, false);
+    }
     if panel_should_show(
         active || finale,
         panel.lifecycle.closed(),
@@ -2550,11 +2560,9 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         };
         // The cursor is gone with the session.
         set_cursor_image(&mut panel, 0);
-        for image in &mut panel.halo_images {
-            if *image != 0 {
-                CGImageRelease(*image as *mut c_void);
-                *image = 0;
-            }
+        if panel.halo_image != 0 {
+            CGImageRelease(panel.halo_image as *mut c_void);
+            panel.halo_image = 0;
         }
         let _: () = msg_send![panel.cursor_layer as *mut AnyObject, setHidden: true];
         state.streams.request(&key, Request::Stop);
@@ -2805,22 +2813,21 @@ unsafe fn session_ns_color(key: &str) -> *mut AnyObject {
 }
 
 /// A halo view in `parent`: a hosted layer that shows a glow image (see
-/// `halo_image`), hidden until placed.
+/// `halo_image`) at opacity 0 until the session acts.
 unsafe fn new_halo(parent: *mut AnyObject) -> usize {
     let view = new_view(class!(NSView), NSRect::ZERO);
     let layer = host_layer(view);
     let _: () = msg_send![layer, setContentsGravity: ns_string("resize")];
     let _: () = msg_send![layer, setContentsScale: backing_scale()];
-    let _: () = msg_send![view, setHidden: true];
+    let _: () = msg_send![layer, setOpacity: 0.0_f32];
     add_subview(parent, view);
     view as usize
 }
 
-/// Put halo `index` of `panel` around a glass shape of `frame` (window
-/// coordinates) with corner `radius`, redrawing its glow when the size
-/// changed.
-unsafe fn place_halo(panel: &mut Panel, index: usize, frame: Area, radius: f64) {
-    let view = panel.halos[index];
+/// Put the halo around the front card at `frame` (window coordinates),
+/// redrawing its glow when the size changed.
+unsafe fn place_halo(panel: &mut Panel, frame: Area) {
+    let view = panel.halo;
     set_frame(
         view,
         Area {
@@ -2830,18 +2837,53 @@ unsafe fn place_halo(panel: &mut Panel, index: usize, frame: Area, radius: f64) 
             h: frame.h + 2.0 * HALO_RADIUS,
         },
     );
-    if panel.halo_sizes[index] == (frame.w, frame.h) {
+    if panel.halo_size == (frame.w, frame.h) {
         return;
     }
-    panel.halo_sizes[index] = (frame.w, frame.h);
+    panel.halo_size = (frame.w, frame.h);
     let [r, g, b, _] = cursor_overlay::session_fill_rgba(&panel.key);
-    let image = halo_image((frame.w, frame.h), radius, [r, g, b], backing_scale()).unwrap_or(0);
+    let image = halo_image((frame.w, frame.h), CORNER_RADIUS, [r, g, b], backing_scale()).unwrap_or(0);
     let layer: *mut AnyObject = msg_send![view as *mut AnyObject, layer];
     let _: () = msg_send![layer, setContents: image as *mut AnyObject];
-    let old = std::mem::replace(&mut panel.halo_images[index], image);
+    let old = std::mem::replace(&mut panel.halo_image, image);
     if old != 0 {
         CGImageRelease(old as *mut c_void);
     }
+}
+
+/// Breathe the halo while the session acts (opacity swinging between
+/// `HALO_BREATH.0` and `.1`), or fade it out. Identity is quiet at rest:
+/// plain glass, no glow.
+unsafe fn set_acting(panel: &mut Panel, acting: bool) {
+    if panel.acting == acting {
+        return;
+    }
+    panel.acting = acting;
+    let layer: *mut AnyObject = msg_send![panel.halo as *mut AnyObject, layer];
+    let _: () = msg_send![layer, removeAnimationForKey: ns_string("breathe")];
+    if !acting {
+        let _: () = msg_send![layer, setOpacity: 0.0_f32];
+        return;
+    }
+    let (low, high) = HALO_BREATH;
+    let _: () = msg_send![layer, setOpacity: low as f32];
+    let breathe: *mut AnyObject = msg_send![
+        class!(CABasicAnimation),
+        animationWithKeyPath: ns_string("opacity")
+    ];
+    let ease: *mut AnyObject = msg_send![
+        class!(CAMediaTimingFunction),
+        functionWithName: ns_string("easeInEaseOut")
+    ];
+    let _: () = msg_send![breathe, setTimingFunction: ease];
+    let from: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: low];
+    let to: *mut AnyObject = msg_send![class!(NSNumber), numberWithDouble: high];
+    let _: () = msg_send![breathe, setFromValue: from];
+    let _: () = msg_send![breathe, setToValue: to];
+    let _: () = msg_send![breathe, setDuration: HALO_BREATH_PERIOD.as_secs_f64() / 2.0];
+    let _: () = msg_send![breathe, setAutoreverses: true];
+    let _: () = msg_send![breathe, setRepeatCount: f32::INFINITY];
+    let _: () = msg_send![layer, addAnimation: breathe forKey: ns_string("breathe")];
 }
 
 /// A rounded rect of `size` and `radius` at `(x, y)` as a tiny-skia path.
@@ -3170,15 +3212,11 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     add_subview(body, caption);
     add_subview(deck, front_view);
 
-    // Halos: the session color as a glow just outside the front card and
-    // each chip. Drawn images in layers above the glass container (a layer
-    // shadow renders nowhere in this window), clear inside the shape.
-    let mut halos = [0usize; VIEWS];
-    for (index, halo_view) in halos.iter_mut().enumerate() {
-        if index == 0 || index >= MAX_CARDS {
-            *halo_view = new_halo(stack_view);
-        }
-    }
+    // The halo: the session color as a soft glow just outside the front
+    // card while the session acts. A drawn image in a layer above the glass
+    // container (a layer shadow renders nowhere in this window), clear
+    // inside the shape, invisible at rest.
+    let halo = new_halo(stack_view);
 
     let mut panel = Panel {
         id,
@@ -3213,9 +3251,10 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         backs: backs.try_into().ok()?,
         chips: chips.try_into().ok()?,
         plates,
-        halos,
-        halo_sizes: [(0.0, 0.0); VIEWS],
-        halo_images: [0; VIEWS],
+        halo,
+        halo_size: (0.0, 0.0),
+        halo_image: 0,
+        acting: false,
         body: body as usize,
         cards: CardStack::new(),
         layout: vec![Slot::Front],
@@ -3243,7 +3282,6 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         target: (None, None),
         client: None,
     };
-    let _: () = msg_send![panel.halos[0] as *mut AnyObject, setHidden: false];
     apply_card_frames(&mut panel);
     render_backs(&mut panel);
     Some(panel)
@@ -3647,19 +3685,8 @@ unsafe fn apply_card_frames(panel: &mut Panel) {
         let placed = to_window(view_frame(panel, slot, cards));
         set_frame(card_view(panel, slot), placed);
         set_frame(panel.plates[slot.view()], placed);
-        match slot {
-            Slot::Front => place_halo(panel, 0, placed, CORNER_RADIUS),
-            Slot::Chip(_) => {
-                // Around the circle, not the badge's overhang.
-                let circle = Area {
-                    x: placed.x,
-                    y: placed.y + stack::CHIP_H - stack::CHIP,
-                    w: stack::CHIP,
-                    h: stack::CHIP,
-                };
-                place_halo(panel, slot.view(), circle, stack::CHIP / 2.0);
-            }
-            Slot::Card(_) => {}
+        if slot == Slot::Front {
+            place_halo(panel, placed);
         }
     }
     let front = view_frame(panel, Slot::Front, cards);
@@ -3721,9 +3748,6 @@ unsafe fn render_backs(panel: &mut Panel) {
         };
         let _: () = msg_send![view as *mut AnyObject, setHidden: !used[index]];
         let _: () = msg_send![panel.plates[index] as *mut AnyObject, setHidden: !used[index]];
-        if panel.halos[index] != 0 {
-            let _: () = msg_send![panel.halos[index] as *mut AnyObject, setHidden: !used[index]];
-        }
         if !used[index] {
             panel.motion[index] = Motion::default();
         }
