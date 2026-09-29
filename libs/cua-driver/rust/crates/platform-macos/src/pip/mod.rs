@@ -424,12 +424,12 @@ struct Panel {
     /// The hover bar above the front card and its views.
     bar: usize,
     bar_shown: bool,
-    /// How many of the card's and the bar's tracking areas hold the
-    /// pointer (moving from the card into the bar leaves one and enters the
-    /// other), and a count bumped by every hover change, so a scheduled hide
-    /// of the bar knows whether the pointer came back meanwhile.
-    hover_inside: u32,
+    /// Bumped each time the bar starts to show, so the poll that hides it
+    /// (and the step that takes it out of hit testing) knows whether a newer
+    /// showing superseded it.
     hover_gen: u64,
+    /// A pointer poll runs while the panel is shown (see `hover_poll_cb`).
+    hover_polling: bool,
     client_icon: usize,
     /// The session-color dot in the bar, and the solid circles under the
     /// bar's two buttons.
@@ -2623,6 +2623,33 @@ unsafe fn show(panel: &mut Panel) {
     // The back items sit at rest behind the front card.
     panel.trail_motion.snap();
     apply_card_frames(panel);
+    if !panel.hover_polling {
+        panel.hover_polling = true;
+        dispatch_to_main_after(HOVER_POLL, panel.id, hover_poll_cb);
+    }
+}
+
+/// How often a shown panel looks at the pointer for the hover bar.
+const HOVER_POLL: Duration = Duration::from_millis(120);
+
+/// While the panel is shown, show the bar whenever the pointer is over the
+/// card: tracking areas only fire on mouse events, and a pointer warped
+/// into place (a tool's move) sends none.
+unsafe extern "C" fn hover_poll_cb(ctx: *mut c_void) {
+    let id = *Box::from_raw(ctx as *mut i64);
+    with_state(|state| {
+        let Some(panel) = panel_by_id(state, id) else {
+            return;
+        };
+        if !panel.shown {
+            panel.hover_polling = false;
+            return;
+        }
+        if !panel.bar_shown && pointer_over(panel) {
+            show_bar(panel);
+        }
+        dispatch_to_main_after(HOVER_POLL, id, hover_poll_cb);
+    });
 }
 
 unsafe fn hide(panel: &mut Panel, key: &str) {
@@ -3030,8 +3057,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         action: String::new(),
         bar: bar as usize,
         bar_shown: false,
-        hover_inside: 0,
         hover_gen: 0,
+        hover_polling: false,
         client_icon: client_icon as usize,
         dot: dot as usize,
         focus_circle: focus_circle as usize,
@@ -3383,30 +3410,27 @@ unsafe fn bar_area(panel: &Panel) -> Option<Area> {
     Some(area_of(frame))
 }
 
-/// The pointer entered (`inside`) or left the card or its bar: show the
-/// bar at once, or hide it `BAR_FADE_OUT` after the pointer left both
-/// (leaving the card for the bar is not leaving).
+/// The pointer entered (`inside`) or left the card or its bar. Entering
+/// shows the bar; leaving is not trusted (a warped pointer skips events
+/// both ways), the poll started by `show_bar` watches the pointer instead.
 unsafe fn hover(panel: &mut Panel, inside: bool) {
-    panel.hover_gen += 1;
     if inside {
-        panel.hover_inside += 1;
         show_bar(panel);
-        return;
-    }
-    panel.hover_inside = panel.hover_inside.saturating_sub(1);
-    if panel.hover_inside == 0 {
-        dispatch_to_main_after(BAR_FADE_OUT, (panel.id, panel.hover_gen), bar_hide_cb);
     }
 }
 
 /// Fade the bar in (a pointer over the card, whether an entered event or
-/// a move said so: a warped pointer can skip the entered event).
+/// a move said so) and start polling the pointer: the bar hides once it
+/// has been over neither the card nor the bar for `BAR_FADE_OUT`.
 unsafe fn show_bar(panel: &mut Panel) {
-    if !panel.bar_shown {
-        panel.bar_shown = true;
-        let _: () = msg_send![panel.bar as *mut AnyObject, setHidden: false];
-        animate_view_alpha(panel.bar, 1.0, BAR_FADE_IN);
+    if panel.bar_shown {
+        return;
     }
+    panel.bar_shown = true;
+    panel.hover_gen += 1;
+    let _: () = msg_send![panel.bar as *mut AnyObject, setHidden: false];
+    animate_view_alpha(panel.bar, 1.0, BAR_FADE_IN);
+    dispatch_to_main_after(BAR_FADE_OUT, (panel.id, panel.hover_gen), bar_hide_cb);
 }
 
 /// Whether the pointer is over the front card or its bar right now.
@@ -3427,12 +3451,11 @@ unsafe extern "C" fn bar_hide_cb(ctx: *mut c_void) {
         let Some(panel) = panel_by_id(state, id) else {
             return;
         };
-        // The pointer came back meanwhile.
+        // A newer showing has its own poll.
         if panel.hover_gen != generation || !panel.bar_shown {
             return;
         }
-        // Still over the card or the bar (a warped pointer can skip the
-        // entered event): look again later.
+        // Still over the card or the bar: look again later.
         if pointer_over(panel) {
             dispatch_to_main_after(BAR_FADE_OUT, (id, generation), bar_hide_cb);
             return;
