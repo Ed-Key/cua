@@ -522,10 +522,11 @@ struct BackView {
     title: usize,
 }
 
-/// A chip's views: its badge's mark and glyph layers are null when it has
-/// no badge.
+/// A chip's views: its badge's view is 0, and its mark and glyph layers
+/// null, when it has no badge.
 struct ChipView {
     view: usize,
+    badge: usize,
     icon: usize,
     mark: usize,
     glyph: usize,
@@ -1624,7 +1625,7 @@ unsafe fn restack(
         let Some(&slot) = layout.get(index) else {
             continue;
         };
-        let view = card_view(panel, slot);
+        let views = slot_views(panel, slot);
         let rest = slot_frame(panel.card, slot, cards);
         match from {
             Some(from) => {
@@ -1635,12 +1636,16 @@ unsafe fn restack(
                 }
                 let before = old_layout.get(from).copied().unwrap_or(slot);
                 if before != slot {
-                    fade_view(view, before.alpha(), slot.alpha());
+                    for view in views {
+                        fade_view(view, before.alpha(), slot.alpha());
+                    }
                 }
             }
             None => {
                 panel.motion[slot.view()] = Motion::default();
-                let _: () = msg_send![view as *mut AnyObject, setAlphaValue: slot.alpha()];
+                for view in views {
+                    let _: () = msg_send![view as *mut AnyObject, setAlphaValue: slot.alpha()];
+                }
             }
         }
     }
@@ -2246,6 +2251,12 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
             let (per_row, grid_rows) = chip_grid(well_w, chips.len(), CHIP_W, FINALE_CHIP_GAP);
             let block_h = grid_rows as f64 * CHIP_H + grid_rows.saturating_sub(1) as f64 * FINALE_CHIP_GAP;
             let block_top = (well_h + block_h) / 2.0;
+            // Badges above every chip's glass (see `new_chip`).
+            let badges = new_view(
+                decor_view_class(),
+                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(well_w, well_h)),
+            );
+            let _: () = msg_send![badges, setAutoresizingMask: 18u64];
             for (index, chip) in chips.iter().enumerate() {
                 let (row, column) = (index / per_row, index % per_row);
                 let in_row = per_row.min(chips.len() - row * per_row) as f64;
@@ -2253,11 +2264,14 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
                 let x = (well_w - row_w) / 2.0 + column as f64 * (CHIP_W + FINALE_CHIP_GAP);
                 let y = block_top - (row + 1) as f64 * CHIP_H - row as f64 * FINALE_CHIP_GAP;
                 // The same chip as in the trail, so one shape means finished.
-                let view = new_chip(overlay, chip.finished);
-                let _: () = msg_send![view.view as *mut AnyObject, setFrameOrigin: NSPoint::new(x, y)];
-                let _: () = msg_send![view.view as *mut AnyObject, setHidden: false];
-                // Flexible margins: stays centered.
-                let _: () = msg_send![view.view as *mut AnyObject, setAutoresizingMask: 1u64 | 4 | 8 | 32];
+                let view = new_chip(overlay, badges, chip.finished);
+                for part in [view.view, view.badge].into_iter().filter(|&part| part != 0) {
+                    let part = part as *mut AnyObject;
+                    let _: () = msg_send![part, setFrameOrigin: NSPoint::new(x, y)];
+                    let _: () = msg_send![part, setHidden: false];
+                    // Flexible margins: stays centered.
+                    let _: () = msg_send![part, setAutoresizingMask: 1u64 | 4 | 8 | 32];
+                }
                 let _: () = msg_send![view.view as *mut AnyObject, setToolTip: ns_string(&chip.title)];
                 let app: *mut AnyObject = match chip.tag.0 {
                     Some(pid) => msg_send![
@@ -2268,15 +2282,21 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
                 };
                 let _: () = msg_send![view.icon as *mut AnyObject, setImage: app_icon(app)];
                 let view_layer: *mut AnyObject = msg_send![view.view as *mut AnyObject, layer];
-                animate_row(
-                    view_layer,
-                    view.mark as *mut AnyObject,
-                    view.glyph as *mut AnyObject,
-                    index,
-                    start,
-                    (0.0, -6.0),
-                );
+                animate_row(view_layer, std::ptr::null_mut(), std::ptr::null_mut(), index, start, (0.0, -6.0));
+                if view.badge != 0 {
+                    // The badge comes in with its chip, then its check pops.
+                    let badge_layer: *mut AnyObject = msg_send![view.badge as *mut AnyObject, layer];
+                    animate_row(
+                        badge_layer,
+                        view.mark as *mut AnyObject,
+                        view.glyph as *mut AnyObject,
+                        index,
+                        start,
+                        (0.0, -6.0),
+                    );
+                }
             }
+            add_subview(overlay, badges);
         }
     }
     let _: () = msg_send![panel.front_view as *mut AnyObject, addSubview: overlay];
@@ -2970,7 +2990,12 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     // The chips and the front card share one glass container: a resting
     // chip fuses into the card, a lagging one pulls free.
     let deck = glass_container(stack_view, bounds);
-    let chips: Vec<ChipView> = (1..MAX_CARDS).map(|_| new_chip(deck, true)).collect();
+    // Their badges sit above the container: glass there draws over its
+    // non-glass siblings, so a badge in the deck would sit under the rim.
+    let badges = new_view(decor_view_class(), bounds);
+    let _: () = msg_send![badges, setAutoresizingMask: 18u64];
+    add_subview(stack_view, badges);
+    let chips: Vec<ChipView> = (1..MAX_CARDS).map(|_| new_chip(deck, badges, true)).collect();
 
     // Front card: the picture itself, with continuous rounded corners and
     // the window's shadow; a faint dark backing shows only while it is
@@ -3321,11 +3346,15 @@ unsafe fn glass_container(parent: *mut AnyObject, bounds: NSRect) -> *mut AnyObj
 }
 
 /// A chip inside `parent`: a glass circle holding the app icon, with a
-/// green check badge (white ring) on its lower right when `finished`. Its
-/// parts stay centered (flexible margins) while the chip's frame springs
-/// from where its window was drawn. Hidden until used; the window title is
-/// its tooltip.
-unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
+/// green check badge (white ring) on its lower right when `finished`. The
+/// badge is its own view in `badges`, which must sit above `parent`'s glass
+/// (glass draws over non-glass siblings in its container, so a badge next
+/// to the circle would sit under its rim); it has the chip's frame, and
+/// whoever places, hides or fades the chip does the same to it. Its parts
+/// stay centered (flexible margins) while the chip's frame springs from
+/// where its window was drawn. Hidden until used; the window title is its
+/// tooltip.
+unsafe fn new_chip(parent: *mut AnyObject, badges: *mut AnyObject, finished: bool) -> ChipView {
     use stack::{CHIP, CHIP_BADGE, CHIP_BADGE_RING, CHIP_H, CHIP_ICON, CHIP_W};
     // NSViewMinXMargin 1 | MaxXMargin 4 | MinYMargin 8 | MaxYMargin 32.
     const CENTERED: u64 = 1 | 4 | 8 | 32;
@@ -3353,9 +3382,17 @@ unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
     add_subview(view, glass);
 
     let (mut mark, mut glyph) = (std::ptr::null_mut(), std::ptr::null_mut());
+    let mut host: *mut AnyObject = std::ptr::null_mut();
     if finished {
+        // The badge's own view, in `badges` (above the glass, so the circle
+        // never cuts it), with the chip's frame so it moves with the chip.
+        host = new_view(
+            decor_view_class(),
+            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP_W, CHIP_H)),
+        );
+        host_layer(host);
         let badge = new_view(
-            class!(NSView),
+            decor_view_class(),
             NSRect::new(
                 NSPoint::new(circle.origin.x + CHIP - CHIP_BADGE + 3.0, circle.origin.y - 3.0),
                 NSSize::new(CHIP_BADGE, CHIP_BADGE),
@@ -3369,13 +3406,16 @@ unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
         let _: () = msg_send![mark, setBorderColor: white];
         let _: () = msg_send![badge_layer, addSublayer: mark];
         let _: () = msg_send![badge, setAutoresizingMask: CENTERED];
-        add_subview(view, badge);
+        add_subview(host, badge);
+        let _: () = msg_send![host, setHidden: true];
+        add_subview(badges, host);
     }
 
     let _: () = msg_send![view, setHidden: true];
     add_subview(parent, view);
     ChipView {
         view: view as usize,
+        badge: host as usize,
         icon: icon as usize,
         mark: mark as usize,
         glyph: glyph as usize,
@@ -3604,12 +3644,16 @@ fn settle_frames(panel: &Panel) -> Vec<Area> {
         .collect()
 }
 
-/// The view that draws `slot`.
-fn card_view(panel: &Panel, slot: Slot) -> usize {
+/// The views that draw `slot`: its view, and a chip's badge (which lives
+/// above the glass container; see `new_chip`).
+fn slot_views(panel: &Panel, slot: Slot) -> Vec<usize> {
     match slot {
-        Slot::Front => panel.front_view,
-        Slot::Card(depth) => panel.backs[depth - 1].view,
-        Slot::Chip(row) => panel.chips[row].view,
+        Slot::Front => vec![panel.front_view],
+        Slot::Card(depth) => vec![panel.backs[depth - 1].view],
+        Slot::Chip(row) => {
+            let chip = &panel.chips[row];
+            [chip.view, chip.badge].into_iter().filter(|&view| view != 0).collect()
+        }
     }
 }
 
@@ -3618,7 +3662,9 @@ unsafe fn apply_card_frames(panel: &mut Panel) {
     let cards = back_cards(&panel.layout);
     for slot in panel.layout.clone() {
         let placed = to_window(view_frame(panel, slot, cards));
-        set_frame(card_view(panel, slot), placed);
+        for view in slot_views(panel, slot) {
+            set_frame(view, placed);
+        }
         set_frame(panel.plates[slot.view()], placed);
     }
     let front = view_frame(panel, Slot::Front, cards);
@@ -3675,11 +3721,14 @@ unsafe fn render_backs(panel: &mut Panel) {
         }
     }
     for index in 1..VIEWS {
-        let view = match index {
-            depth if depth < MAX_CARDS => panel.backs[depth - 1].view,
-            row => panel.chips[row - MAX_CARDS].view,
+        let (view, badge) = match index {
+            depth if depth < MAX_CARDS => (panel.backs[depth - 1].view, 0),
+            row => (panel.chips[row - MAX_CARDS].view, panel.chips[row - MAX_CARDS].badge),
         };
         let _: () = msg_send![view as *mut AnyObject, setHidden: !used[index]];
+        if badge != 0 {
+            let _: () = msg_send![badge as *mut AnyObject, setHidden: !used[index]];
+        }
         let _: () = msg_send![panel.plates[index] as *mut AnyObject, setHidden: !used[index]];
         if !used[index] {
             panel.motion[index] = Motion::default();
