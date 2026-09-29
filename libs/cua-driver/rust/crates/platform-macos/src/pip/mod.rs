@@ -25,9 +25,12 @@
 //! is called from the tool dispatcher and only enqueues: frames carry no
 //! pixels. A dedicated `cua-pip-capture` thread (never the main thread or
 //! a tokio worker) captures the newest queued frame per session through
-//! `recording::screenshot_for`, bounded by a 1.5 s timeout (on timeout the
-//! panel keeps its previous image and only the header/status update), then
-//! posts the UI work to the main queue with `dispatch_async_f`.
+//! `recording::screenshot_for`, bounded by a 1.5 s timeout, then posts the
+//! UI work to the main queue with `dispatch_async_f`. A failed or timed-out
+//! capture keeps the previous image only if it was of the same window;
+//! otherwise the panel shows "Preview unavailable". Frames carry their
+//! session's epoch, and a frame whose session ended while it was being
+//! captured is dropped instead of re-creating the panel.
 //! All panel state lives in `STATE` and is only touched on the main queue
 //! (the mutex exists to make the static `Sync`, not for contention).
 //!
@@ -148,6 +151,32 @@ fn idle_hide_due(last_frame: Instant, now: Instant) -> bool {
     now.saturating_duration_since(last_frame) >= IDLE_HIDE_AFTER
 }
 
+/// A captured frame is applied only if its session is still in the epoch
+/// the frame was pushed in. `None` means the session has ended.
+fn should_apply(frame_epoch: u64, current_epoch: Option<u64>) -> bool {
+    current_epoch == Some(frame_epoch)
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum ImageUpdate {
+    Replace,
+    Keep,
+    /// Blank the image and show "Preview unavailable".
+    Clear,
+}
+
+/// A failed capture keeps the old image only when it shows the same target;
+/// otherwise the panel would show one window's pixels as another's preview.
+fn image_after_capture(prev_target: Target, new_target: Target, capture_ok: bool) -> ImageUpdate {
+    if capture_ok {
+        ImageUpdate::Replace
+    } else if prev_target == new_target {
+        ImageUpdate::Keep
+    } else {
+        ImageUpdate::Clear
+    }
+}
+
 /// Short display id for a private session key: drop the runtime namespace,
 /// keep a few characters. Used only in the (invisible) window title.
 fn short_key(key: &str) -> String {
@@ -180,6 +209,8 @@ struct Panel {
     id: i64,
     window: usize,
     image_view: usize,
+    /// "Preview unavailable", centered over the image well.
+    placeholder: usize,
     status: usize,
     client_icon: usize,
     client_label: usize,
@@ -201,6 +232,7 @@ struct State {
     // sees many thousands of sessions.
     remembered: HashMap<String, (f64, f64)>,
     next_id: i64,
+    worker: Arc<CaptureWorker>,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -304,12 +336,42 @@ impl<T> LatestPerSession<T> {
     }
 }
 
+/// Epoch of each live session. A session's first frame starts a new epoch
+/// and ending it drops the entry, so a session that ends and restarts under
+/// the same key never matches frames from its earlier life.
+#[derive(Default)]
+struct SessionEpochs {
+    live: HashMap<String, u64>,
+    next: u64,
+}
+
+impl SessionEpochs {
+    fn stamp(&mut self, key: &str) -> u64 {
+        if let Some(&epoch) = self.live.get(key) {
+            return epoch;
+        }
+        self.next += 1;
+        self.live.insert(key.to_owned(), self.next);
+        self.next
+    }
+
+    fn end(&mut self, key: &str) {
+        self.live.remove(key);
+    }
+
+    fn current(&self, key: &str) -> Option<u64> {
+        self.live.get(key).copied()
+    }
+}
+
 /// (pid, window_id) of a capture target.
 type Target = (Option<i32>, Option<u32>);
 type CaptureFn = dyn Fn(Target) -> Option<Vec<u8>> + Send + Sync;
 
 struct CaptureWorker {
-    queue: Mutex<LatestPerSession<PipFrame>>,
+    /// Each frame with the epoch its session was in when it was pushed.
+    queue: Mutex<LatestPerSession<(PipFrame, u64)>>,
+    epochs: Mutex<SessionEpochs>,
     ready: Condvar,
     capture: Arc<CaptureFn>,
     timeout: Duration,
@@ -322,10 +384,11 @@ impl CaptureWorker {
     fn start(
         capture: Arc<CaptureFn>,
         timeout: Duration,
-        deliver: impl Fn(PipFrame, Option<Vec<u8>>) + Send + 'static,
+        deliver: impl Fn(PipFrame, u64, Option<Vec<u8>>) + Send + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         let worker = Arc::new(Self {
             queue: Mutex::new(LatestPerSession::new()),
+            epochs: Mutex::new(SessionEpochs::default()),
             ready: Condvar::new(),
             capture,
             timeout,
@@ -335,24 +398,32 @@ impl CaptureWorker {
         std::thread::Builder::new()
             .name("cua-pip-capture".into())
             .spawn(move || loop {
-                let frame = looping.next();
+                let (frame, epoch) = looping.next();
                 let png = looping.capture_bounded((frame.target_pid, frame.target_window_id));
-                deliver(frame, png);
+                deliver(frame, epoch, png);
             })?;
         Ok(worker)
     }
 
     /// Enqueue only; never captures, never blocks on a capture.
     fn push(&self, frame: PipFrame) {
-        lock(&self.queue).push(frame.session_key.clone(), frame);
+        let epoch = lock(&self.epochs).stamp(&frame.session_key);
+        lock(&self.queue).push(frame.session_key.clone(), (frame, epoch));
         self.ready.notify_one();
     }
 
+    /// Drop the session's queued frame and end its epoch, so a capture
+    /// already running for it is discarded on delivery.
     fn forget(&self, session_key: &str) {
+        lock(&self.epochs).end(session_key);
         lock(&self.queue).remove(session_key);
     }
 
-    fn next(&self) -> PipFrame {
+    fn is_current(&self, session_key: &str, epoch: u64) -> bool {
+        should_apply(epoch, lock(&self.epochs).current(session_key))
+    }
+
+    fn next(&self) -> (PipFrame, u64) {
         let mut queue = lock(&self.queue);
         loop {
             if let Some((_, frame)) = queue.pop() {
@@ -363,8 +434,8 @@ impl CaptureWorker {
     }
 
     /// Capture `target` on a helper thread, waiting at most `timeout`.
-    /// `None` (keep the previous image) on timeout, failure, or while an
-    /// earlier capture of the same target is still stuck.
+    /// `None` on timeout, failure, or while an earlier capture of the same
+    /// target is still stuck.
     fn capture_bounded(&self, target: Target) -> Option<Vec<u8>> {
         if !lock(&self.in_flight).insert(target) {
             return None;
@@ -410,7 +481,8 @@ pub struct MacosPipBackend {
 
 struct FrameUpdate {
     frame: PipFrame,
-    /// Fresh screenshot, or `None` to keep the panel's previous image.
+    epoch: u64,
+    /// Fresh screenshot, or `None` when the capture failed or timed out.
     png: Option<Vec<u8>>,
     /// Window title (or owning app name), looked up on the capture worker.
     target_title: Option<String>,
@@ -422,8 +494,6 @@ impl PipBackend for MacosPipBackend {
     }
 
     fn end_session(&self, session_key: &str) {
-        // ponytail: a capture already running for this session can still
-        // deliver after this and re-create its panel, which then idle-hides.
         self.worker.forget(session_key);
         dispatch_to_main(session_key.to_owned(), end_session_cb);
     }
@@ -435,7 +505,7 @@ impl PipBackend for MacosPipBackend {
 
 /// Runs on the capture worker: look up the window title (a synchronous
 /// WindowServer call) and hand the update to the main queue.
-fn deliver_to_main(frame: PipFrame, png: Option<Vec<u8>>) {
+fn deliver_to_main(frame: PipFrame, epoch: u64, png: Option<Vec<u8>>) {
     let target_title = frame
         .target_window_id
         .and_then(crate::windows::window_info_by_id)
@@ -450,6 +520,7 @@ fn deliver_to_main(frame: PipFrame, png: Option<Vec<u8>>) {
     dispatch_to_main(
         FrameUpdate {
             frame,
+            epoch,
             png,
             target_title,
         },
@@ -458,15 +529,6 @@ fn deliver_to_main(frame: PipFrame, png: Option<Vec<u8>>) {
 }
 
 pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
-    // Panels are created lazily, on the main queue, by each session's first
-    // frame; nothing native happens here.
-    *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(State {
-        image_size: (cfg.geometry.width as f64, cfg.geometry.height as f64),
-        anchor: cfg.geometry.x.zip(cfg.geometry.y),
-        panels: HashMap::new(),
-        remembered: HashMap::new(),
-        next_id: 1,
-    });
     let capture: Arc<CaptureFn> = Arc::new(|target: Target| {
         let window_id = capture_window(target, |pid| {
             crate::windows::resolve_main_window_id(pid).ok()
@@ -475,6 +537,16 @@ pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         cua_driver_core::recording::screenshot_for(Some(u64::from(window_id)), None)
     });
     let worker = CaptureWorker::start(capture, CAPTURE_TIMEOUT, deliver_to_main)?;
+    // Panels are created lazily, on the main queue, by each session's first
+    // frame; nothing native happens here.
+    *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(State {
+        image_size: (cfg.geometry.width as f64, cfg.geometry.height as f64),
+        anchor: cfg.geometry.x.zip(cfg.geometry.y),
+        panels: HashMap::new(),
+        remembered: HashMap::new(),
+        next_id: 1,
+        worker: worker.clone(),
+    });
     Ok(Box::new(MacosPipBackend { worker }))
 }
 
@@ -490,10 +562,16 @@ unsafe extern "C" fn apply_frame_cb(ctx: *mut c_void) {
 unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     let FrameUpdate {
         frame,
+        epoch,
         png,
         target_title,
     } = update;
     let key = frame.session_key.clone();
+    // Checked here, on the main queue, so a delivery already queued behind
+    // `end_session` is dropped too.
+    if !state.worker.is_current(&key, epoch) {
+        return;
+    }
     if !state.panels.contains_key(&key) {
         let Some(panel) = create_panel(state, &key, frame.session_label.as_deref()) else {
             return;
@@ -504,21 +582,34 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
         return;
     };
 
-    // Screenshot, when this update has one; otherwise keep the last image.
-    // `dataWithBytes:length:` copies, so the Vec can drop.
-    if let Some(png) = png {
-        let data: *mut AnyObject = msg_send![
-            class!(NSData),
-            dataWithBytes: png.as_ptr() as *const c_void
-            length: png.len()
-        ];
-        if !data.is_null() {
-            let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-            let image: *mut AnyObject = msg_send![image, initWithData: data];
+    let new_target = (frame.target_pid, frame.target_window_id);
+    let image_view = panel.image_view as *mut AnyObject;
+    let placeholder = panel.placeholder as *mut AnyObject;
+    match image_after_capture(panel.target, new_target, png.is_some()) {
+        ImageUpdate::Replace => {
+            // `dataWithBytes:length:` copies, so the Vec can drop.
+            let png = png.unwrap_or_default();
+            let data: *mut AnyObject = msg_send![
+                class!(NSData),
+                dataWithBytes: png.as_ptr() as *const c_void
+                length: png.len()
+            ];
+            let image: *mut AnyObject = if data.is_null() {
+                std::ptr::null_mut()
+            } else {
+                let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+                msg_send![image, initWithData: data]
+            };
+            let _: () = msg_send![image_view, setImage: image];
+            let _: () = msg_send![placeholder, setHidden: !image.is_null()];
             if !image.is_null() {
-                let _: () = msg_send![panel.image_view as *mut AnyObject, setImage: image];
                 let _: () = msg_send![image, release];
             }
+        }
+        ImageUpdate::Keep => {}
+        ImageUpdate::Clear => {
+            let _: () = msg_send![image_view, setImage: std::ptr::null_mut::<AnyObject>()];
+            let _: () = msg_send![placeholder, setHidden: false];
         }
     }
     set_text(panel.status, &frame.action_label);
@@ -564,7 +655,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
         ns_to_string(name)
     });
     set_text(panel.target_title, title.as_deref().unwrap_or(""));
-    panel.target = (frame.target_pid, frame.target_window_id);
+    panel.target = new_target;
 
     panel.last_frame = Instant::now();
     show(panel);
@@ -955,6 +1046,24 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let _: () = msg_send![image_layer, setBackgroundColor: well_cg];
     add_subview(body, image_view);
 
+    let placeholder = new_label(NSRect::ZERO, 11.0, 0.0, true);
+    set_text(placeholder as usize, "Preview unavailable");
+    let _: () = msg_send![placeholder, sizeToFit];
+    let fitted: NSRect = msg_send![placeholder, frame];
+    let (text_w, text_h) = (fitted.size.width.min(image_w), fitted.size.height);
+    let _: () = msg_send![
+        placeholder,
+        setFrame: NSRect::new(
+            NSPoint::new(
+                PAD + (image_w - text_w) / 2.0,
+                6.0 + STATUS_HEIGHT + 4.0 + (image_h - text_h) / 2.0,
+            ),
+            NSSize::new(text_w, text_h),
+        )
+    ];
+    let _: () = msg_send![placeholder, setHidden: true];
+    let _: () = msg_send![body, addSubview: placeholder];
+
     let status = new_label(
         NSRect::new(
             NSPoint::new(PAD + 2.0, 6.0),
@@ -970,6 +1079,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         id,
         window: window as usize,
         image_view: image_view as usize,
+        placeholder: placeholder as usize,
         status: status as usize,
         client_icon: client_icon as usize,
         client_label: client_label as usize,
@@ -1337,16 +1447,83 @@ mod tests {
         }
     }
 
-    type Delivered = mpsc::Receiver<(String, Option<Vec<u8>>)>;
+    type Delivered = mpsc::Receiver<(String, u64, Option<Vec<u8>>)>;
 
     fn worker(capture: Arc<CaptureFn>, timeout: Duration) -> (Arc<CaptureWorker>, Delivered) {
         let (sender, delivered) = mpsc::channel();
         let sender = Mutex::new(sender);
-        let worker = CaptureWorker::start(capture, timeout, move |frame, png| {
-            let _ = lock(&sender).send((frame.action_label, png));
+        let worker = CaptureWorker::start(capture, timeout, move |frame, epoch, png| {
+            let _ = lock(&sender).send((frame.action_label, epoch, png));
         })
         .unwrap();
         (worker, delivered)
+    }
+
+    /// Next delivery as (action label, png), ignoring the epoch.
+    fn recv(delivered: &Delivered) -> (String, Option<Vec<u8>>) {
+        let (label, _, png) = delivered.recv_timeout(Duration::from_secs(5)).unwrap();
+        (label, png)
+    }
+
+    #[test]
+    fn frames_apply_only_in_their_sessions_current_epoch() {
+        assert!(should_apply(3, Some(3)));
+        assert!(!should_apply(3, Some(4)));
+        assert!(!should_apply(3, None));
+
+        let mut epochs = SessionEpochs::default();
+        let first = epochs.stamp("s");
+        assert_eq!(epochs.stamp("s"), first);
+        epochs.end("s");
+        assert_eq!(epochs.current("s"), None);
+        let restarted = epochs.stamp("s");
+        assert_ne!(restarted, first);
+        assert!(!should_apply(first, epochs.current("s")));
+        assert!(should_apply(restarted, epochs.current("s")));
+    }
+
+    #[test]
+    fn a_capture_in_flight_when_its_session_ends_is_discarded() {
+        let (started_tx, started) = mpsc::channel::<()>();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let (started_tx, release_rx) = (Mutex::new(started_tx), Mutex::new(release_rx));
+        let capture: Arc<CaptureFn> = Arc::new(move |_| {
+            let _ = lock(&started_tx).send(());
+            let _ = lock(&release_rx).recv();
+            Some(vec![1])
+        });
+        let (worker, delivered) = worker(capture, Duration::from_secs(5));
+
+        worker.push(frame("s", "before end"));
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        worker.forget("s"); // end_session while the capture runs
+        release.send(()).unwrap();
+        let (label, epoch, _) = delivered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(label, "before end");
+        assert!(!worker.is_current("s", epoch));
+
+        // The same key starting again gets a fresh epoch that does apply.
+        worker.push(frame("s", "restarted"));
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        let (label, epoch, _) = delivered.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert_eq!(label, "restarted");
+        assert!(worker.is_current("s", epoch));
+    }
+
+    #[test]
+    fn a_failed_capture_keeps_the_image_only_for_the_same_window() {
+        let a = (Some(42), Some(7));
+        let b = (Some(42), Some(8));
+        assert_eq!(image_after_capture(a, a, true), ImageUpdate::Replace);
+        assert_eq!(image_after_capture(a, b, true), ImageUpdate::Replace);
+        assert_eq!(image_after_capture(a, a, false), ImageUpdate::Keep);
+        assert_eq!(image_after_capture(a, b, false), ImageUpdate::Clear);
+        // A new panel whose first capture fails shows the placeholder.
+        assert_eq!(
+            image_after_capture((None, None), a, false),
+            ImageUpdate::Clear
+        );
     }
 
     #[test]
@@ -1399,16 +1576,10 @@ mod tests {
         assert!(pushing.elapsed() < Duration::from_secs(1));
 
         release.send(()).unwrap();
-        assert_eq!(
-            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
-            ("first".to_owned(), Some(vec![1]))
-        );
+        assert_eq!(recv(&delivered), ("first".to_owned(), Some(vec![1])));
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         release.send(()).unwrap();
-        assert_eq!(
-            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
-            ("third".to_owned(), Some(vec![1]))
-        );
+        assert_eq!(recv(&delivered), ("third".to_owned(), Some(vec![1])));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
@@ -1426,15 +1597,9 @@ mod tests {
         let (worker, delivered) = worker(capture, Duration::from_millis(50));
 
         worker.push(frame("s", "first"));
-        assert_eq!(
-            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
-            ("first".to_owned(), None)
-        );
+        assert_eq!(recv(&delivered), ("first".to_owned(), None));
         worker.push(frame("s", "second"));
-        assert_eq!(
-            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
-            ("second".to_owned(), None)
-        );
+        assert_eq!(recv(&delivered), ("second".to_owned(), None));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
