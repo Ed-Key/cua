@@ -162,6 +162,10 @@ impl Tool for PidOnlyWindowTargetGuard {
             .await
     }
 
+    async fn resolve_target(&self, args: &mut Value) {
+        self.inner.resolve_target(args).await
+    }
+
     async fn invoke(&self, mut args: Value) -> ToolResult {
         // A windowless desktop-scope action needs no pid window. A desktop-
         // scope action that names a pid still resolves that pid's window (the

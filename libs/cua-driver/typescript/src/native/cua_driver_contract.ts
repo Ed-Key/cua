@@ -2970,8 +2970,16 @@ const FfiConverterTypeGetSessionStateInput = (() => {
 })();
 
 export type GetWindowStateInput = {
-    pid: number,
-    windowId: bigint,
+    /**
+     * Pass with window_id, or pass app instead of both.
+     */
+    pid?: number,
+    windowId?: bigint,
+    /**
+     * App name or bundle id; reads its only window on the current Space. Use
+     * pid + window_id when it has several. macOS only.
+     */
+    app?: string,
     session?: string,
     query?: string,
     /**
@@ -3018,6 +3026,9 @@ export type GetWindowStateInput = {
  */
 export const GetWindowStateInput = (() => {
     const defaults = () => ({
+        pid: undefined,
+        windowId: undefined,
+        app: undefined,
         queryContext: undefined,
         diff: undefined,
         elementFields: undefined,
@@ -3038,8 +3049,9 @@ const FfiConverterTypeGetWindowStateInput = (() => {
     class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
         read(from: RustBuffer): TypeName {
             return {
-                pid: FfiConverterUInt32.read(from),
-                windowId: FfiConverterUInt64.read(from),
+                pid: FfiConverterOptionalUInt32.read(from),
+                windowId: FfiConverterOptionalUInt64.read(from),
+                app: FfiConverterOptionalString.read(from),
                 session: FfiConverterOptionalString.read(from),
                 query: FfiConverterOptionalString.read(from),
                 queryContext: FfiConverterOptionalBoolean.read(from),
@@ -3056,8 +3068,9 @@ const FfiConverterTypeGetWindowStateInput = (() => {
             };
         }
         write(value: TypeName, into: RustBuffer): void {
-            FfiConverterUInt32.write(value.pid, into);
-            FfiConverterUInt64.write(value.windowId, into);
+            FfiConverterOptionalUInt32.write(value.pid, into);
+            FfiConverterOptionalUInt64.write(value.windowId, into);
+            FfiConverterOptionalString.write(value.app, into);
             FfiConverterOptionalString.write(value.session, into);
             FfiConverterOptionalString.write(value.query, into);
             FfiConverterOptionalBoolean.write(value.queryContext, into);
@@ -3073,8 +3086,9 @@ const FfiConverterTypeGetWindowStateInput = (() => {
             FfiConverterOptionalUInt32.write(value.timeoutMs, into);
         }
         allocationSize(value: TypeName): number {
-            return FfiConverterUInt32.allocationSize(value.pid) +
-             FfiConverterUInt64.allocationSize(value.windowId) +
+            return FfiConverterOptionalUInt32.allocationSize(value.pid) +
+             FfiConverterOptionalUInt64.allocationSize(value.windowId) +
+             FfiConverterOptionalString.allocationSize(value.app) +
              FfiConverterOptionalString.allocationSize(value.session) +
              FfiConverterOptionalString.allocationSize(value.query) +
              FfiConverterOptionalBoolean.allocationSize(value.queryContext) +

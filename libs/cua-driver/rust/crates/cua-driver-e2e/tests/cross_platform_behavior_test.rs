@@ -848,8 +848,9 @@ fn delivered_observation() -> Observation {
 
 fn sdk_window_input(fixture: &Fixture) -> GetWindowStateInput {
     GetWindowStateInput {
-        pid: fixture.pid,
-        window_id: fixture.wid,
+        pid: Some(fixture.pid),
+        window_id: Some(fixture.wid),
+        app: None,
         session: None,
         query: None,
         query_context: None,

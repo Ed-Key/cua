@@ -87,10 +87,21 @@ impl ToolInput for ListWindowsInput {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct GetWindowStateInput {
+    /// Pass with window_id, or pass app instead of both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "pid_schema")]
-    pub pid: u32,
+    #[uniffi(default = None)]
+    pub pid: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "positive_integer_schema")]
-    pub window_id: u64,
+    #[uniffi(default = None)]
+    pub window_id: Option<u64>,
+    /// App name or bundle id; reads its only window on the current Space. Use
+    /// pid + window_id when it has several. macOS only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    #[uniffi(default = None)]
+    pub app: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "string_schema")]
     pub session: Option<String>,
@@ -168,7 +179,12 @@ fn timeout_ms_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
 impl ToolInput for GetWindowStateInput {
     const TOOL_NAME: &'static str = "get_window_state";
     fn validate(&self) -> Result<(), String> {
-        if self.pid == 0 || self.window_id == 0 {
+        window_state_target_form(
+            self.app.as_deref(),
+            self.pid.is_some(),
+            self.window_id.is_some(),
+        )?;
+        if self.pid == Some(0) || self.window_id == Some(0) {
             return Err("window observation requires positive process and window IDs".into());
         }
         if [self.max_elements, self.max_depth, self.max_dimension].contains(&Some(0)) {
@@ -192,6 +208,23 @@ impl ToolInput for GetWindowStateInput {
             return Err("window observation requires accessibility or screenshot capture".into());
         }
         Ok(())
+    }
+}
+
+/// `get_window_state` takes exactly one target form: `app` alone, or `pid` +
+/// `window_id`. Shared by the typed contract and the live macOS tool so both
+/// refuse the same way.
+pub fn window_state_target_form(
+    app: Option<&str>,
+    has_pid: bool,
+    has_window_id: bool,
+) -> Result<(), String> {
+    match (app, has_pid, has_window_id) {
+        (Some(app), false, false) if !app.trim().is_empty() => Ok(()),
+        (Some(_), false, false) => Err("app must be a nonblank app name or bundle id".into()),
+        (Some(_), _, _) => Err("pass either app, or pid + window_id, not both".into()),
+        (None, true, true) => Ok(()),
+        (None, _, _) => Err("get_window_state needs app, or pid + window_id".into()),
     }
 }
 
@@ -627,6 +660,35 @@ mod tests {
             "pid": 7, "window_id": 9, "element_fields": "all"
         }))
         .is_err());
+    }
+
+    #[test]
+    fn get_window_state_takes_app_alone_or_pid_and_window_id() {
+        let parse = |value| serde_json::from_value::<GetWindowStateInput>(value).unwrap();
+        parse(json!({"app": "TextEdit"})).validate().unwrap();
+        parse(json!({"app": "com.apple.TextEdit"}))
+            .validate()
+            .unwrap();
+        parse(json!({"pid": 7, "window_id": 9})).validate().unwrap();
+        for (value, error) in [
+            (
+                json!({"app": "TextEdit", "pid": 7, "window_id": 9}),
+                "not both",
+            ),
+            (json!({"app": "TextEdit", "pid": 7}), "not both"),
+            (json!({}), "needs app, or pid + window_id"),
+            (json!({"pid": 7}), "needs app, or pid + window_id"),
+            (json!({"window_id": 9}), "needs app, or pid + window_id"),
+            (json!({"app": "  "}), "nonblank"),
+            (json!({"pid": 0, "window_id": 9}), "positive"),
+        ] {
+            let got = parse(value.clone()).validate().unwrap_err();
+            assert!(got.contains(error), "{value}: {got}");
+        }
+        let schema = GetWindowStateInput::input_schema();
+        let required = schema["required"].as_array().cloned().unwrap_or_default();
+        assert!(!required.contains(&json!("pid")) && !required.contains(&json!("window_id")));
+        assert_eq!(schema["properties"]["app"]["type"], "string");
     }
 
     #[test]

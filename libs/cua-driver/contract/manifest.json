@@ -1905,6 +1905,10 @@
       "input_schema": {
         "additionalProperties": false,
         "properties": {
+          "app": {
+            "description": "App name or bundle id; reads its only window on the current Space. Use\npid + window_id when it has several. macOS only.",
+            "type": "string"
+          },
           "diff": {
             "description": "macOS only. Default true: after the first look at a window, return only\nrows added, changed, or removed since the previous look by this session.\nFalse forces the full outline.",
             "type": "boolean"
@@ -1942,6 +1946,7 @@
             "type": "integer"
           },
           "pid": {
+            "description": "Pass with window_id, or pass app instead of both.",
             "maximum": 4294967295,
             "minimum": 1,
             "type": "integer"
@@ -1970,10 +1975,7 @@
             "type": "integer"
           }
         },
-        "required": [
-          "pid",
-          "window_id"
-        ],
+        "required": [],
         "type": "object"
       },
       "success_output_schema": {

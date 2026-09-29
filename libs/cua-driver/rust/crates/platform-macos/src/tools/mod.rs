@@ -678,6 +678,9 @@ pub struct ToolState {
     /// the previous look to publishing the new one, so two overlapping looks
     /// cannot both number a new row from the same `next_id`.
     look_locks: std::sync::Mutex<HashMap<(i32, u64), Arc<tokio::sync::Mutex<()>>>>,
+    /// The last `background_input` report each session was sent per window.
+    pub(crate) background_input_sent:
+        std::sync::Mutex<HashMap<get_window_state::BackgroundInputKey, serde_json::Value>>,
 }
 
 impl ToolState {
@@ -733,6 +736,7 @@ impl ToolState {
             host_owns_permission_ux,
             host_bundle_id,
             look_locks: std::sync::Mutex::new(HashMap::new()),
+            background_input_sent: std::sync::Mutex::new(HashMap::new()),
         }
     }
 }

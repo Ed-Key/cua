@@ -17,6 +17,8 @@ Skip a route whose prerequisite is demonstrably absent: no valid window image me
 
 Discover running applications and their windows before assuming a remembered PID still exists. Use `launch_app` when the user requests or implies launch. Select the intended window from its returned `windows` or `list_windows({pid})`; never blindly take the first item.
 
+On macOS, a running app with one window on the current Space can be read in one call: `get_window_state({app})` takes its name or bundle id. With several windows it refuses and lists each `window_id` and title; pass the chosen `pid` + `window_id`.
+
 A cold launch may return a process before a window appears. Retry bounded window discovery, not repeated launches. Empty discovery does not prove the process exited. For closure, absence from `list_windows` proves no listed windows, not process termination.
 
 Choose the target on each action:

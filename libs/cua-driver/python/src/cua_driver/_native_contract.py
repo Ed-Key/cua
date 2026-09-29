@@ -4511,9 +4511,19 @@ class _UniffiFfiConverterTypeGetSessionStateInput(_UniffiConverterRustBuffer):
 
 @dataclass
 class GetWindowStateInput:
-    def __init__(self, *, pid:int, window_id:int, session:typing.Optional[str], query:typing.Optional[str], query_context:typing.Optional[bool] = _DEFAULT, diff:typing.Optional[bool] = _DEFAULT, element_fields:typing.Optional[ElementFields] = _DEFAULT, include_accessibility_tree:typing.Optional[bool], include_screenshot:typing.Optional[bool], screenshot_out_file:typing.Optional[str], max_elements:typing.Optional[int], max_depth:typing.Optional[int], max_dimension:typing.Optional[int], max_image_dimension:typing.Optional[int], timeout_ms:typing.Optional[int] = _DEFAULT):
-        self.pid = pid
-        self.window_id = window_id
+    def __init__(self, *, pid:typing.Optional[int] = _DEFAULT, window_id:typing.Optional[int] = _DEFAULT, app:typing.Optional[str] = _DEFAULT, session:typing.Optional[str], query:typing.Optional[str], query_context:typing.Optional[bool] = _DEFAULT, diff:typing.Optional[bool] = _DEFAULT, element_fields:typing.Optional[ElementFields] = _DEFAULT, include_accessibility_tree:typing.Optional[bool], include_screenshot:typing.Optional[bool], screenshot_out_file:typing.Optional[str], max_elements:typing.Optional[int], max_depth:typing.Optional[int], max_dimension:typing.Optional[int], max_image_dimension:typing.Optional[int], timeout_ms:typing.Optional[int] = _DEFAULT):
+        if pid is _DEFAULT:
+            self.pid = None
+        else:
+            self.pid = pid
+        if window_id is _DEFAULT:
+            self.window_id = None
+        else:
+            self.window_id = window_id
+        if app is _DEFAULT:
+            self.app = None
+        else:
+            self.app = app
         self.session = session
         self.query = query
         if query_context is _DEFAULT:
@@ -4544,11 +4554,13 @@ class GetWindowStateInput:
 
 
     def __str__(self):
-        return "GetWindowStateInput(pid={}, window_id={}, session={}, query={}, query_context={}, diff={}, element_fields={}, include_accessibility_tree={}, include_screenshot={}, screenshot_out_file={}, max_elements={}, max_depth={}, max_dimension={}, max_image_dimension={}, timeout_ms={})".format(self.pid, self.window_id, self.session, self.query, self.query_context, self.diff, self.element_fields, self.include_accessibility_tree, self.include_screenshot, self.screenshot_out_file, self.max_elements, self.max_depth, self.max_dimension, self.max_image_dimension, self.timeout_ms)
+        return "GetWindowStateInput(pid={}, window_id={}, app={}, session={}, query={}, query_context={}, diff={}, element_fields={}, include_accessibility_tree={}, include_screenshot={}, screenshot_out_file={}, max_elements={}, max_depth={}, max_dimension={}, max_image_dimension={}, timeout_ms={})".format(self.pid, self.window_id, self.app, self.session, self.query, self.query_context, self.diff, self.element_fields, self.include_accessibility_tree, self.include_screenshot, self.screenshot_out_file, self.max_elements, self.max_depth, self.max_dimension, self.max_image_dimension, self.timeout_ms)
     def __eq__(self, other):
         if self.pid != other.pid:
             return False
         if self.window_id != other.window_id:
+            return False
+        if self.app != other.app:
             return False
         if self.session != other.session:
             return False
@@ -4582,8 +4594,9 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
     @staticmethod
     def read(buf):
         return GetWindowStateInput(
-            pid=_UniffiFfiConverterUInt32.read(buf),
-            window_id=_UniffiFfiConverterUInt64.read(buf),
+            pid=_UniffiFfiConverterOptionalUInt32.read(buf),
+            window_id=_UniffiFfiConverterOptionalUInt64.read(buf),
+            app=_UniffiFfiConverterOptionalString.read(buf),
             session=_UniffiFfiConverterOptionalString.read(buf),
             query=_UniffiFfiConverterOptionalString.read(buf),
             query_context=_UniffiFfiConverterOptionalBoolean.read(buf),
@@ -4601,8 +4614,9 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
 
     @staticmethod
     def check_lower(value):
-        _UniffiFfiConverterUInt32.check_lower(value.pid)
-        _UniffiFfiConverterUInt64.check_lower(value.window_id)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.pid)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.window_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.app)
         _UniffiFfiConverterOptionalString.check_lower(value.session)
         _UniffiFfiConverterOptionalString.check_lower(value.query)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.query_context)
@@ -4619,8 +4633,9 @@ class _UniffiFfiConverterTypeGetWindowStateInput(_UniffiConverterRustBuffer):
 
     @staticmethod
     def write(value, buf):
-        _UniffiFfiConverterUInt32.write(value.pid, buf)
-        _UniffiFfiConverterUInt64.write(value.window_id, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.pid, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.window_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.app, buf)
         _UniffiFfiConverterOptionalString.write(value.session, buf)
         _UniffiFfiConverterOptionalString.write(value.query, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.query_context, buf)
