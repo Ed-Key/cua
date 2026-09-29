@@ -143,6 +143,249 @@ pub fn push_pip_frame(frame: PipHookFrame) {
     }
 }
 
+// ── Verification events ───────────────────────────────────────────────────
+//
+// A `verify_state` result reaches the PiP as a list of short, human-readable
+// claims ("text area holds \"hello\"") with their status. Labels are built
+// here, on the dispatcher side, from the predicate the caller wrote, so
+// observed values (which may be secrets) never cross the hook at all.
+
+/// One predicate of a `verify_state` call, for display.
+pub struct PipHookClaim {
+    /// At most `CLAIM_MAX_CHARS` characters; never holds a secure field's value.
+    pub label: String,
+    /// `Some(true)` satisfied, `Some(false)` unsatisfied, `None` unknown.
+    pub satisfied: Option<bool>,
+}
+
+/// A completed `verify_state` call by an agent session.
+pub struct PipHookVerification {
+    pub timestamp_ms: u64,
+    pub session_key: String,
+    pub target_pid: i32,
+    pub target_window_id: u32,
+    /// The call as a whole was satisfied (every predicate, stably).
+    pub satisfied: bool,
+    pub claims: Vec<PipHookClaim>,
+}
+
+type PipVerifyFnBox = Box<dyn Fn(PipHookVerification) + Send + Sync>;
+static PIP_VERIFY_FN: OnceLock<PipVerifyFnBox> = OnceLock::new();
+
+/// Register the platform-side verification callback (non-blocking: it only
+/// enqueues). `main.rs` calls this once next to `set_pip_push_fn`.
+pub fn set_pip_verify_fn(f: impl Fn(PipHookVerification) + Send + Sync + 'static) {
+    let _ = PIP_VERIFY_FN.set(Box::new(f));
+}
+
+/// Push a verification to the PiP. No-op when no backend is registered.
+pub fn push_pip_verification(verification: PipHookVerification) {
+    if let Some(f) = PIP_VERIFY_FN.get() {
+        f(verification);
+    }
+}
+
+/// Longest claim label, in characters.
+pub const CLAIM_MAX_CHARS: usize = 40;
+/// Longest quoted value or element label inside a claim.
+const QUOTE_MAX_CHARS: usize = 16;
+
+/// Build the PiP event for a finished `verify_state` call, from the frame
+/// identity the dispatcher built (`pip_frame`), the public input and the
+/// structured output. `None` for calls no panel would show (not an agent
+/// session) and for malformed input/output.
+pub fn verification_event(
+    frame: PipHookFrame,
+    input: &serde_json::Value,
+    output: Option<&serde_json::Value>,
+) -> Option<PipHookVerification> {
+    if !pip_frame_wanted("verify_state", &frame) {
+        return None;
+    }
+    let expect: Vec<cua_driver_contract::StatePredicate> =
+        serde_json::from_value(input.get("expect")?.clone()).ok()?;
+    let output = output?;
+    let outcomes = output.get("predicates")?.as_array()?;
+    let claims = expect
+        .iter()
+        .enumerate()
+        .map(|(index, predicate)| {
+            let outcome = outcomes.iter().find(|outcome| {
+                outcome.get("index").and_then(|i| i.as_u64()) == Some(index as u64)
+            });
+            let satisfied = match outcome
+                .and_then(|o| o.get("status"))
+                .and_then(|s| s.as_str())
+            {
+                Some("satisfied") => Some(true),
+                Some("unsatisfied") => Some(false),
+                _ => None,
+            };
+            // The observed element (bounded JSON) only feeds the secure-field
+            // check; none of its values reach the label.
+            let observed = outcome
+                .and_then(|o| o.get("observed_json"))
+                .and_then(|j| j.as_str())
+                .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok());
+            PipHookClaim {
+                label: claim_label(predicate, observed.as_ref()),
+                satisfied,
+            }
+        })
+        .collect();
+    Some(PipHookVerification {
+        timestamp_ms: frame.timestamp_ms,
+        session_key: frame.session_key,
+        target_pid: frame.target_pid?,
+        target_window_id: frame.target_window_id?,
+        satisfied: output.get("status").and_then(|s| s.as_str()) == Some("satisfied"),
+        claims,
+    })
+}
+
+/// A short, human-readable label for one predicate, at most
+/// `CLAIM_MAX_CHARS` characters: `text area holds "hello"`, `"Save" button
+/// visible`, `window open`. A value is shown only for fields that are not
+/// secure (by role or by a password-like label, on the selector or the
+/// observed element).
+pub fn claim_label(
+    predicate: &cua_driver_contract::StatePredicate,
+    observed: Option<&serde_json::Value>,
+) -> String {
+    let label = match (&predicate.window, &predicate.element) {
+        (Some(window), None) => window_label(window),
+        (None, Some(element)) => element_label(element, observed),
+        _ => "state check".to_owned(),
+    };
+    clip(&label, CLAIM_MAX_CHARS)
+}
+
+fn window_label(window: &cua_driver_contract::WindowPredicate) -> String {
+    match (&window.bounds, window.exists) {
+        (Some(b), _) => format!(
+            "window at {:.0},{:.0} {:.0}\u{d7}{:.0}",
+            b.x, b.y, b.width, b.height
+        ),
+        (None, Some(false)) => "window closed".to_owned(),
+        (None, _) => "window open".to_owned(),
+    }
+}
+
+fn element_label(
+    element: &cua_driver_contract::ElementPredicate,
+    observed: Option<&serde_json::Value>,
+) -> String {
+    let selector = &element.selector;
+    let observed_str = |key: &str| observed.and_then(|o| o.get(key)).and_then(|v| v.as_str());
+    let secure = [
+        selector.role.as_deref(),
+        selector.label_contains.as_deref(),
+        observed_str("role"),
+        observed_str("subrole"),
+        observed_str("label"),
+    ]
+    .into_iter()
+    .flatten()
+    .any(looks_secure);
+    let role = selector.role.as_deref().map(role_noun);
+    let subject = match (selector.label_contains.as_deref(), role) {
+        (Some(label), Some(role)) => format!("{} {role}", quote(label)),
+        (Some(label), None) => quote(label),
+        (None, Some(role)) => role,
+        (None, None) => "element".to_owned(),
+    };
+    let mut clauses = Vec::new();
+    if let Some(value) = &element.value_equals {
+        clauses.push(if secure {
+            "value matches".to_owned()
+        } else {
+            format!("holds {}", quote(value))
+        });
+    }
+    match element.selected {
+        Some(true) => clauses.push("selected".to_owned()),
+        Some(false) => clauses.push("not selected".to_owned()),
+        None => {}
+    }
+    match element.enabled {
+        Some(true) => clauses.push("enabled".to_owned()),
+        Some(false) => clauses.push("disabled".to_owned()),
+        None => {}
+    }
+    // The selected text itself is never shown.
+    if let Some(selection) = &element.text_selection {
+        clauses.push(if selection.length == 0 {
+            format!("caret at {}", selection.location)
+        } else {
+            format!("{} chars selected", selection.length)
+        });
+    }
+    if clauses.is_empty() {
+        clauses.push("visible".to_owned());
+    }
+    format!("{subject} {}", clauses.join(", "))
+}
+
+/// Roles and labels that mark a field whose value must never be shown.
+fn looks_secure(text: &str) -> bool {
+    let text = text.to_lowercase();
+    [
+        "secure",
+        "password",
+        "passcode",
+        "passphrase",
+        "secret",
+        "token",
+        "api key",
+        "cvv",
+        "otp",
+    ]
+    .iter()
+    .any(|word| text.contains(word))
+}
+
+/// `AXTextArea` -> "text area", `AXPopUpButton` -> "pop-up button".
+fn role_noun(role: &str) -> String {
+    let bare = role.strip_prefix("AX").unwrap_or(role);
+    let mut words = String::new();
+    for (i, c) in bare.chars().enumerate() {
+        if c == '_' || c == '-' || c == ' ' {
+            words.push(' ');
+        } else if c.is_uppercase() && i > 0 && !words.ends_with(' ') {
+            words.push(' ');
+            words.extend(c.to_lowercase());
+        } else {
+            words.extend(c.to_lowercase());
+        }
+    }
+    match words.trim() {
+        "push button" | "pushbutton" => "button".to_owned(),
+        "check box" => "checkbox".to_owned(),
+        "pop up button" => "pop-up button".to_owned(),
+        "static text" => "text".to_owned(),
+        other => other.to_owned(),
+    }
+}
+
+/// `"value"`, control characters flattened, clipped to `QUOTE_MAX_CHARS`.
+fn quote(text: &str) -> String {
+    let flat: String = text
+        .chars()
+        .map(|c| if c.is_control() { ' ' } else { c })
+        .collect();
+    format!("\"{}\"", clip(flat.trim(), QUOTE_MAX_CHARS))
+}
+
+/// `text` cut to at most `max` characters, ending in an ellipsis when cut.
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_owned();
+    }
+    let mut cut: String = text.chars().take(max.saturating_sub(1)).collect();
+    cut.push('\u{2026}');
+    cut
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -199,5 +442,143 @@ mod tests {
             "type_text",
             &frame(Some("alpha"), None, Some(1))
         ));
+    }
+
+    fn predicate(json: serde_json::Value) -> cua_driver_contract::StatePredicate {
+        serde_json::from_value(json).unwrap()
+    }
+
+    fn label(json: serde_json::Value) -> String {
+        claim_label(&predicate(json), None)
+    }
+
+    #[test]
+    fn claim_labels_read_as_short_plain_sentences() {
+        assert_eq!(
+            label(
+                serde_json::json!({"element": {"selector": {"role": "AXTextArea"}, "value_equals": "hello"}})
+            ),
+            "text area holds \"hello\""
+        );
+        assert_eq!(
+            label(
+                serde_json::json!({"element": {"selector": {"role": "AXButton", "label_contains": "Save"}, "exists": true}})
+            ),
+            "\"Save\" button visible"
+        );
+        assert_eq!(
+            label(
+                serde_json::json!({"element": {"selector": {"label_contains": "Bold"}, "selected": true}})
+            ),
+            "\"Bold\" selected"
+        );
+        assert_eq!(
+            label(
+                serde_json::json!({"element": {"selector": {"role": "AXCheckBox"}, "enabled": false}})
+            ),
+            "checkbox disabled"
+        );
+        assert_eq!(
+            label(
+                serde_json::json!({"element": {"selector": {"role": "AXTextField"},
+                "text_selection": {"location": 3, "length": 0}}})
+            ),
+            "text field caret at 3"
+        );
+        assert_eq!(
+            label(serde_json::json!({"window": {"exists": true}})),
+            "window open"
+        );
+        assert_eq!(
+            label(serde_json::json!({"window": {"exists": false}})),
+            "window closed"
+        );
+        assert_eq!(
+            label(
+                serde_json::json!({"window": {"bounds": {"x": 10, "y": 20, "width": 800, "height": 600}}})
+            ),
+            "window at 10,20 800\u{d7}600"
+        );
+    }
+
+    #[test]
+    fn claim_labels_are_truncated_and_never_show_selected_text() {
+        let long = label(serde_json::json!({"element": {
+            "selector": {"role": "AXTextArea", "label_contains": "A very long field label"},
+            "value_equals": "a long value that goes on and on\nwith a newline"}}));
+        assert!(long.chars().count() <= CLAIM_MAX_CHARS, "{long}");
+        assert!(long.ends_with('\u{2026}'), "{long}");
+        assert!(!long.contains('\n'));
+        let selection = label(
+            serde_json::json!({"element": {"selector": {"role": "AXTextArea"},
+            "text_selection": {"location": 0, "length": 6, "text": "secret"}}}),
+        );
+        assert_eq!(selection, "text area 6 chars selected");
+    }
+
+    #[test]
+    fn secure_field_values_never_reach_a_label() {
+        for (json, observed) in [
+            // By the selector's role or label.
+            (
+                serde_json::json!({"element": {"selector": {"role": "AXSecureTextField"}, "value_equals": "hunter2"}}),
+                None,
+            ),
+            (
+                serde_json::json!({"element": {"selector": {"label_contains": "Password"}, "value_equals": "hunter2"}}),
+                None,
+            ),
+            // By what the check matched: a plain selector on a secure field.
+            (
+                serde_json::json!({"element": {"selector": {"role": "AXTextField"}, "value_equals": "hunter2"}}),
+                Some(serde_json::json!({"role": "AXTextField", "subrole": "AXSecureTextField"})),
+            ),
+            (
+                serde_json::json!({"element": {"selector": {"role": "AXTextField"}, "value_equals": "hunter2"}}),
+                Some(serde_json::json!({"role": "AXTextField", "label": "API token"})),
+            ),
+        ] {
+            let text = claim_label(&predicate(json), observed.as_ref());
+            assert!(!text.contains("hunter2"), "{text}");
+            assert!(text.ends_with("value matches"), "{text}");
+        }
+    }
+
+    #[test]
+    fn a_verification_event_carries_each_claim_with_its_status() {
+        let mut agent = frame(Some("alpha"), None, Some(42));
+        agent.target_window_id = Some(7);
+        let input = serde_json::json!({"pid": 42, "window_id": 7, "expect": [
+            {"element": {"selector": {"role": "AXTextArea"}, "value_equals": "hi"}},
+            {"window": {"exists": true}},
+            {"element": {"selector": {"role": "AXButton", "label_contains": "Send"}, "enabled": true}},
+        ]});
+        let output = serde_json::json!({"status": "unsatisfied", "stable": false, "elapsed_ms": 5,
+            "samples": 1, "predicates": [
+            {"index": 0, "status": "satisfied", "unknown_reason": null,
+             "observed_json": "{\"role\":\"AXTextArea\",\"value\":\"hi\"}"},
+            {"index": 1, "status": "unsatisfied", "unknown_reason": null, "observed_json": null},
+            {"index": 2, "status": "unknown", "unknown_reason": "multi_match", "observed_json": null},
+        ]});
+        let event = verification_event(agent, &input, Some(&output)).unwrap();
+        assert_eq!((event.target_pid, event.target_window_id), (42, 7));
+        assert!(!event.satisfied);
+        let claims: Vec<(&str, Option<bool>)> = event
+            .claims
+            .iter()
+            .map(|claim| (claim.label.as_str(), claim.satisfied))
+            .collect();
+        assert_eq!(
+            claims,
+            [
+                ("text area holds \"hi\"", Some(true)),
+                ("window open", Some(false)),
+                ("\"Send\" button enabled", None),
+            ]
+        );
+        // A one-shot call (no label, no client) gets no event.
+        let mut anonymous = frame(None, None, Some(42));
+        anonymous.target_window_id = Some(7);
+        assert!(verification_event(anonymous, &input, Some(&output)).is_none());
     }
 }

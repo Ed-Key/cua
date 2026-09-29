@@ -307,6 +307,27 @@ fn maybe_init_pip() {
                     }
                 }
             });
+            cua_driver_core::pip_hook::set_pip_verify_fn(|verification| {
+                if let Some(slot) = BACKEND.get() {
+                    if let Some(b) = slot.lock().unwrap().as_ref() {
+                        b.push_verification(pip_preview::PipVerification {
+                            timestamp_ms: verification.timestamp_ms,
+                            session_key: verification.session_key,
+                            target_pid: verification.target_pid,
+                            target_window_id: verification.target_window_id,
+                            satisfied: verification.satisfied,
+                            claims: verification
+                                .claims
+                                .into_iter()
+                                .map(|claim| pip_preview::PipClaim {
+                                    label: claim.label,
+                                    satisfied: claim.satisfied,
+                                })
+                                .collect(),
+                        });
+                    }
+                }
+            });
             // Same private key the frames carry, so the ended session's
             // panel goes away with its cursor and recording.
             cua_driver_core::session::register_session_end_hook(|session_key| {

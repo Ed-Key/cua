@@ -1790,6 +1790,19 @@ impl ToolRegistry {
                 pip_hook::push_pip_frame(frame);
             }
         }
+        // A finished verify_state reaches the PiP as labelled claims. Built
+        // from what this call already holds and only enqueued, so verification
+        // never waits on the PiP.
+        if pip_hook::pip_enabled() && name == "verify_state" && result.is_error != Some(true) {
+            let frame = pip_frame(name, &args, &public_args, &runtime_prefix);
+            if let Some(event) = pip_hook::verification_event(
+                frame,
+                &public_args,
+                result.structured_content.as_ref(),
+            ) {
+                pip_hook::push_pip_verification(event);
+            }
+        }
 
         result
     }

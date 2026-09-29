@@ -272,6 +272,30 @@ pub struct PipFrame {
     pub target_window_id: Option<u32>,
 }
 
+/// One predicate of a `verify_state` call, for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PipClaim {
+    /// Short human-readable label (at most 40 characters, never a secure
+    /// field's value), e.g. `text area holds "hello"`.
+    pub label: String,
+    /// `Some(true)` satisfied, `Some(false)` unsatisfied, `None` unknown.
+    pub satisfied: Option<bool>,
+}
+
+/// A completed `verify_state` call by an agent session. Like `PipFrame`,
+/// identity and labels only.
+#[derive(Debug, Clone)]
+pub struct PipVerification {
+    /// Wall-clock ms since the Unix epoch, same clock as `PipFrame`.
+    pub timestamp_ms: u64,
+    pub session_key: String,
+    pub target_pid: i32,
+    pub target_window_id: u32,
+    /// Every predicate was satisfied, stably.
+    pub satisfied: bool,
+    pub claims: Vec<PipClaim>,
+}
+
 /// A live PiP window. Owned by `main.rs` for the lifetime of the
 /// process; `shutdown()` consumes it and closes the window.
 pub trait PipBackend: Send + Sync {
@@ -280,6 +304,9 @@ pub trait PipBackend: Send + Sync {
     /// its UI toolkit requires (the macOS impl dispatches to the main
     /// queue via `dispatch_async`).
     fn push_frame(&self, frame: PipFrame);
+
+    /// A `verify_state` call finished. Non-blocking, like `push_frame`.
+    fn push_verification(&self, _verification: PipVerification) {}
 
     /// The session with this private key ended: drop its panel.
     fn end_session(&self, _session_key: &str) {}
