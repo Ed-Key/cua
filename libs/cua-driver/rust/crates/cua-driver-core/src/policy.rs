@@ -107,6 +107,24 @@ impl PolicyEngine {
         }
     }
 
+    /// Whether this policy can allow or deny `tool` depending on which window
+    /// (`pid` / `window_id`) it targets. A YAML policy is inspected; a Rego
+    /// policy is opaque, so it conservatively counts as target-dependent.
+    pub fn constrains_target(&self, tool: &str) -> bool {
+        let tool = canonical_tool_name(tool);
+        match self {
+            #[cfg(feature = "yaml")]
+            Self::Yaml(policy) => policy.constrains_target(tool),
+            #[cfg(feature = "rego")]
+            Self::Rego(_) => true,
+            #[cfg(not(any(feature = "yaml", feature = "rego")))]
+            Self::Disabled => {
+                let _ = tool;
+                true
+            }
+        }
+    }
+
     /// Returns `true` when the tool should appear in `tools/list`.
     ///
     /// For YAML policies a tool is potentially listable when it is not
@@ -129,6 +147,10 @@ impl PolicyEngine {
         }
     }
 }
+
+/// Arguments that name a concrete window. A policy that constrains any of them
+/// for a tool scopes that tool to particular targets.
+const TARGET_ARGS: [&str; 2] = ["pid", "window_id"];
 
 fn canonical_tool_name(tool: &str) -> &str {
     match tool {
@@ -310,6 +332,35 @@ pub fn authorize_tool_call(tool: &str, args: &Value) -> Result<(), Authorization
     authorize_policy_layers(tool, args, layers)
 }
 
+/// Proxy-side check for a call whose target is a shorthand (get_window_state's
+/// `app`) that only the daemon's registry can resolve to pid + window_id.
+///
+/// The proxy cannot judge the resolved window, so any layer that scopes the
+/// tool by target refuses the call outright; the caller must resolve the
+/// window itself (list_windows) and pass pid + window_id. Otherwise the
+/// ordinary tool-level check applies. The check is never skipped.
+pub fn authorize_unresolved_target_call(
+    tool: &str,
+    args: &Value,
+) -> Result<(), AuthorizationError> {
+    let managed = configured_managed_policy()
+        .map_err(|message| AuthorizationError::Loading(format!("managed policy: {message}")))?;
+    let user = configured_policy()
+        .map_err(|message| AuthorizationError::Loading(format!("user policy: {message}")))?;
+    if [managed, user]
+        .into_iter()
+        .flatten()
+        .any(|policy| policy.constrains_target(tool))
+    {
+        return Err(AuthorizationError::Denied(
+            "app targeting is unavailable under this proxy's window-scoped policy; \
+             call list_windows and pass pid + window_id"
+                .to_owned(),
+        ));
+    }
+    authorize_tool_call(tool, args)
+}
+
 /// Returns `true` when the tool should be advertised in `tools/list`.
 ///
 /// Unlike [`authorize_tool_call`], this does not require a full argument set:
@@ -413,6 +464,22 @@ impl YamlPolicy {
             "tool '{tool}' argument constraints were not satisfied: {}",
             failures.join("; ")
         ))
+    }
+
+    fn constrains_target(&self, tool: &str) -> bool {
+        if self.denied_tools.iter().any(|denied| denied == tool)
+            || self.allowed_tools.iter().any(|allowed| allowed == tool)
+        {
+            return false;
+        }
+        self.rules
+            .iter()
+            .filter(|rule| rule.tool == tool)
+            .any(|rule| {
+                TARGET_ARGS
+                    .iter()
+                    .any(|arg| rule.constraints.contains_key(*arg))
+            })
     }
 
     /// Returns `true` when the tool is not explicitly denied and has at least
