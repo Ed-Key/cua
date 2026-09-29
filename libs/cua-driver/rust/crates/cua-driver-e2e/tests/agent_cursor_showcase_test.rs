@@ -633,19 +633,42 @@ mod pixel_oracle_tests {
     const CURSOR_X: f64 = 200.0;
     const CURSOR_Y: f64 = 150.0;
 
+    /// Where the artwork centre must be, in image pixels, for the tip to sit
+    /// on the cursor point: at the neutral 45 degree heading the canvas is
+    /// not rotated, so the centre sits the hotspot's offset from the canvas
+    /// centre (64, 64) away, scaled from canvas units to points. With the
+    /// default hotspot (46, 30) that is (18, 34) * 21/128 = (2.95, 5.58) pt,
+    /// right of and below the tip. The painted tip landing on that hotspot
+    /// is checked by cursor-overlay's `the_hotspot_lands_on_the_target_at_any_heading`.
+    fn tip_on_target_anchor(scale_x: f64, scale_y: f64) -> (i64, i64) {
+        let [hx, hy] = cursor_overlay::embedded_default_theme().hotspot;
+        let points = f64::from(cursor_overlay::DISPLAY_SIZE) / 128.0;
+        let x = CURSOR_X + (64.0 - f64::from(hx)) * points;
+        let y = CURSOR_Y + (64.0 - f64::from(hy)) * points;
+        ((x * scale_x).round() as i64, (y * scale_y).round() as i64)
+    }
+
     #[test]
     fn accepts_colocated_pointer_and_badge_at_1x() {
-        assert_colocated_overlay(400, 300, 400.0, 300.0, (211, 161));
+        let anchor = tip_on_target_anchor(1.0, 1.0);
+        assert_eq!(anchor, (203, 156));
+        assert_colocated_overlay(400, 300, 400.0, 300.0, anchor);
     }
 
     #[test]
     fn accepts_colocated_pointer_and_badge_at_2x() {
-        assert_colocated_overlay(800, 600, 400.0, 300.0, (423, 323));
+        assert_colocated_overlay(800, 600, 400.0, 300.0, tip_on_target_anchor(2.0, 2.0));
     }
 
     #[test]
     fn accepts_colocated_pointer_and_badge_at_fractional_unequal_scale() {
-        assert_colocated_overlay(500, 525, 400.0, 300.0, (264, 282));
+        assert_colocated_overlay(
+            500,
+            525,
+            400.0,
+            300.0,
+            tip_on_target_anchor(500.0 / 400.0, 525.0 / 300.0),
+        );
     }
 
     #[test]
