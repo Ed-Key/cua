@@ -25,10 +25,10 @@
 //! |---|---|---|---|---|
 //! | Action note (on push) | records the action at its event ms, and the window it touched (identity and app, titled with the app name until a frame names it); ends a session finish older than it | none | only if newer than the last applied action: cancels the finale, restarts the idle deadline, lifts a user close | none |
 //! | Captured frame | resolves a pid-only action to its window at the action's event ms (replacing that action's app-only chip) and names the touched window (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card, back items, window titles |
-//! | Verification | latest by event ms per window (an older one never wins) | latest by event ms per label, kept across finales; an older one is ignored | if it brought news: replays a playing finale, or owes a finale when the stretch's finale is over | chips and cards follow the verdicts |
+//! | Verification | latest by event ms per window (an older one never wins) | latest by event ms per predicate (its identity on its window, not its display label, which may collide: two predicates with one label are two rows), kept across finales; an older one is ignored | if it brought news: replays a playing finale, or owes a finale when the stretch's finale is over | chips and cards follow the verdicts |
 //! | Idle timer | the session finishes (now) | none | the finale is due once per stretch: plays if the panel is up and not closed (or owed and may show), else settles silently | the panel fades after |
 //! | `end_session` | the session finishes (now) | none | as the idle timer, then the panel closes | the panel leaves the live set |
-//! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim, and each touched window a chip or checklist stood for, at its event time then); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades |
+//! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim by predicate, and each touched window a chip or checklist stood for by its action: app and event time, so it holds when the window resolves meanwhile); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades |
 //! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not owed news) shows the panel or plays a finale | the panel hides (an ending one closes) |
 //!
 //! Everything here is pure (unit tested, one test per row).
@@ -58,13 +58,17 @@ pub(super) const HOLD: Duration = Duration::from_millis(2500);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Claim {
+    /// The predicate's identity on its window (opaque, from the hook):
+    /// claims are tracked by it. Labels are display only and may collide.
+    pub(super) id: u64,
     pub(super) label: String,
     /// `Some(true)` satisfied, `Some(false)` unsatisfied, `None` unknown.
     pub(super) satisfied: Option<bool>,
 }
 
-/// A label's latest claim by event time.
+/// A predicate's latest claim by event time.
 struct ClaimRecord {
+    label: String,
     at_ms: u64,
     /// Arrival order, breaking ties between equal event times.
     seq: u64,
@@ -90,7 +94,7 @@ pub(super) struct Verdicts {
     session_done: Option<u64>,
     /// Label -> its latest claim by event time. Never cleared: a finale only
     /// marks what it displayed as shown.
-    claims: HashMap<String, ClaimRecord>,
+    claims: HashMap<u64, ClaimRecord>,
     next_seq: u64,
     /// Windows acted in, most recent action first.
     touched: Vec<Touched>,
@@ -214,15 +218,16 @@ impl Verdicts {
         for claim in claims {
             if self
                 .claims
-                .get(&claim.label)
+                .get(&claim.id)
                 .is_some_and(|record| record.at_ms > at_ms)
             {
                 continue;
             }
             self.next_seq += 1;
             self.claims.insert(
-                claim.label,
+                claim.id,
                 ClaimRecord {
+                    label: claim.label,
                     at_ms,
                     seq: self.next_seq,
                     satisfied: claim.satisfied,
@@ -236,7 +241,7 @@ impl Verdicts {
                 .claims
                 .iter()
                 .min_by_key(|(_, record)| (record.at_ms, record.seq))
-                .map(|(label, _)| label.clone());
+                .map(|(id, _)| *id);
             if let Some(oldest) = oldest {
                 self.claims.remove(&oldest);
             }
@@ -274,10 +279,11 @@ impl Verdicts {
     pub(super) fn finale(&self) -> Finale {
         let windows: Vec<&Touched> = self.touched.iter().filter(|t| !t.shown).collect();
         let window_marks = windows.iter().map(|touched| Displayed::Window {
-            tag: touched.tag,
+            pid: touched.tag.0,
+            window: touched.tag.1,
             at_ms: touched.at_ms,
         });
-        let mut claims: Vec<(&String, &ClaimRecord)> = self
+        let mut claims: Vec<(&u64, &ClaimRecord)> = self
             .claims
             .iter()
             .filter(|(_, record)| !record.shown)
@@ -289,16 +295,17 @@ impl Verdicts {
                 rows: Rows::Checklist(
                     claims
                         .iter()
-                        .map(|(label, record)| Claim {
-                            label: (*label).clone(),
+                        .map(|(id, record)| Claim {
+                            id: **id,
+                            label: record.label.clone(),
                             satisfied: record.satisfied,
                         })
                         .collect(),
                 ),
                 displayed: claims
                     .iter()
-                    .map(|(label, record)| Displayed::Claim {
-                        label: (*label).clone(),
+                    .map(|(id, record)| Displayed::Claim {
+                        id: **id,
                         at_ms: record.at_ms,
                         seq: record.seq,
                     })
@@ -328,16 +335,22 @@ impl Verdicts {
     pub(super) fn finale_shown(&mut self, finale: &Finale) {
         for displayed in &finale.displayed {
             match displayed {
-                Displayed::Claim { label, at_ms, seq } => {
-                    if let Some(record) = self.claims.get_mut(label) {
+                Displayed::Claim { id, at_ms, seq } => {
+                    if let Some(record) = self.claims.get_mut(id) {
                         if record.at_ms == *at_ms && record.seq == *seq {
                             record.shown = true;
                         }
                     }
                 }
-                Displayed::Window { tag, at_ms } => {
-                    if let Some(touched) = self.touched.iter_mut().find(|t| t.tag == *tag) {
-                        if touched.at_ms == *at_ms {
+                // By the action (its app and event time), so a pid-only
+                // action resolved to its window while this played is still
+                // the entry it displayed.
+                Displayed::Window { pid, window, at_ms } => {
+                    for touched in &mut self.touched {
+                        if touched.at_ms == *at_ms
+                            && touched.tag.0 == *pid
+                            && (window.is_none() || touched.tag.1 == *window)
+                        {
                             touched.shown = true;
                         }
                     }
@@ -372,8 +385,15 @@ pub(super) enum Rows {
 /// One item a finale displays, as of the event it displays it with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Displayed {
-    Claim { label: String, at_ms: u64, seq: u64 },
-    Window { tag: Tag, at_ms: u64 },
+    /// A predicate's claim, as of its event time and arrival.
+    Claim { id: u64, at_ms: u64, seq: u64 },
+    /// A touched window as of the action that touched it: its app and event
+    /// time (the window may be unresolved yet).
+    Window {
+        pid: Option<i32>,
+        window: Option<u32>,
+        at_ms: u64,
+    },
 }
 
 /// A finale as built: its rows, and what they display (for `finale_shown`).
@@ -560,8 +580,14 @@ mod tests {
     const A: Tag = (Some(1), Some(10));
     const B: Tag = (Some(2), Some(20));
 
+    /// A claim whose predicate identity follows its label (one predicate
+    /// per label), as most tests want.
     fn claim(label: &str, satisfied: Option<bool>) -> Claim {
+        let id = label.bytes().fold(0xcbf2_9ce4_8422_2325_u64, |hash, byte| {
+            (hash ^ u64::from(byte)).wrapping_mul(0x100_0000_01b3)
+        });
         Claim {
+            id,
             label: label.to_owned(),
             satisfied,
         }
@@ -807,6 +833,27 @@ mod tests {
         assert!(!life.late() && !life.due(false));
     }
 
+    #[test]
+    fn row_verification_predicates_sharing_a_label_never_merge() {
+        // Two different predicates whose truncated labels collide: the pass
+        // of one never turns the other's failure green.
+        let label = "text area holds \"abcdefghijklmno\u{2026}\"";
+        let first = Claim {
+            id: 1,
+            label: label.into(),
+            satisfied: Some(false),
+        };
+        let second = Claim {
+            id: 2,
+            label: label.into(),
+            satisfied: Some(true),
+        };
+        let mut verdicts = Verdicts::default();
+        verdicts.verify(1, 10, 100, false, vec![first.clone()]);
+        verdicts.verify(1, 10, 200, true, vec![second.clone()]);
+        assert_eq!(checklist(&verdicts), [first, second], "both rows show");
+    }
+
     // ── Row: idle timer ──────────────────────────────────────────────────
 
     #[test]
@@ -970,6 +1017,23 @@ mod tests {
             checklist(&verdicts),
             [claim("saved", Some(true)), claim("sent", Some(true))]
         );
+    }
+
+    #[test]
+    fn row_finale_timer_keeps_an_action_shown_when_its_window_resolves_meanwhile() {
+        // A pid-only action shows as an app chip; while that finale plays,
+        // the backlogged capture resolves it to its window. The timer still
+        // marks it shown: it does not replay in the next stretch.
+        let mut verdicts = Verdicts::default();
+        verdicts.note_action((Some(3), None), 100, "Safari");
+        let playing = verdicts.finale();
+        assert_eq!(playing.len(), 1);
+        verdicts.act((Some(3), Some(30)), "Docs", 100);
+        verdicts.finale_shown(&playing);
+        assert_eq!(verdicts.finale().rows, Rows::Chips(vec![]));
+        // A newer action in that app is still new work.
+        verdicts.act((Some(3), Some(30)), "Docs", 200);
+        assert_eq!(verdicts.finale().len(), 1);
     }
 
     #[test]

@@ -152,6 +152,9 @@ pub fn push_pip_frame(frame: PipHookFrame) {
 
 /// One predicate of a `verify_state` call, for display.
 pub struct PipHookClaim {
+    /// Which predicate this is (see `predicate_id`): claims are tracked by
+    /// it, the label is display only. Opaque; never logged.
+    pub id: u64,
     /// At most `CLAIM_MAX_CHARS` characters; never holds a secure field's value.
     pub label: String,
     /// `Some(true)` satisfied, `Some(false)` unsatisfied, `None` unknown.
@@ -209,6 +212,7 @@ pub fn verification_event(
     if !pip_frame_wanted("verify_state", &frame) {
         return None;
     }
+    let target = (frame.target_pid, frame.target_window_id);
     let expect: Vec<cua_driver_contract::StatePredicate> =
         serde_json::from_value(input.get("expect")?.clone()).ok()?;
     let output = output?;
@@ -235,6 +239,7 @@ pub fn verification_event(
                 .and_then(|j| j.as_str())
                 .and_then(|j| serde_json::from_str::<serde_json::Value>(j).ok());
             PipHookClaim {
+                id: predicate_id(target, predicate),
                 label: claim_label(predicate, observed.as_ref()),
                 satisfied,
             }
@@ -254,6 +259,28 @@ pub fn verification_event(
         satisfied: output.get("status").and_then(|s| s.as_str()) == Some("satisfied"),
         claims,
     })
+}
+
+/// A predicate's identity, scoped to its target window: equal for the same
+/// predicate on the same window, distinct for different ones even when
+/// their (truncated) labels collide. A keyed hash of the canonical
+/// predicate JSON with a per-process random key, so the value it covers
+/// (possibly a secret) cannot be recovered or matched offline; it never
+/// leaves the process and is never logged.
+pub fn predicate_id(
+    target: (Option<i32>, Option<u32>),
+    predicate: &cua_driver_contract::StatePredicate,
+) -> u64 {
+    use std::hash::{BuildHasher, Hash, Hasher};
+    static KEY: OnceLock<std::collections::hash_map::RandomState> = OnceLock::new();
+    let mut hasher = KEY
+        .get_or_init(std::collections::hash_map::RandomState::new)
+        .build_hasher();
+    target.hash(&mut hasher);
+    serde_json::to_string(predicate)
+        .unwrap_or_default()
+        .hash(&mut hasher);
+    hasher.finish()
 }
 
 /// A short, human-readable label for one predicate, at most
@@ -687,5 +714,28 @@ mod tests {
         // A text area can never be secure: its value shows.
         let area = event_for("AXTextArea", "hello");
         assert_eq!(area.claims[0].label, "text area holds \"hello\"");
+    }
+
+    #[test]
+    fn claims_are_identified_by_predicate_and_window_not_by_their_label() {
+        let first = predicate(
+            serde_json::json!({"element": {"selector": {"role": "AXTextArea"},
+            "value_equals": "abcdefghijklmnop-first"}}),
+        );
+        let second = predicate(
+            serde_json::json!({"element": {"selector": {"role": "AXTextArea"},
+            "value_equals": "abcdefghijklmnop-second"}}),
+        );
+        // The truncated labels collide...
+        assert_eq!(claim_label(&first, None), claim_label(&second, None));
+        // ...the identities do not.
+        let window = (Some(42), Some(7));
+        assert_ne!(predicate_id(window, &first), predicate_id(window, &second));
+        // Stable for the same predicate on the same window, scoped by window.
+        assert_eq!(predicate_id(window, &first), predicate_id(window, &first));
+        assert_ne!(
+            predicate_id(window, &first),
+            predicate_id((Some(42), Some(8)), &first)
+        );
     }
 }

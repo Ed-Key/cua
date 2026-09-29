@@ -275,6 +275,9 @@ pub struct PipFrame {
 /// One predicate of a `verify_state` call, for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PipClaim {
+    /// Opaque identity of the predicate on its window: claims are tracked
+    /// by it, the label is display only. Never logged.
+    pub id: u64,
     /// Short human-readable label (at most 40 characters, never a secure
     /// field's value), e.g. `text area holds "hello"`.
     pub label: String,

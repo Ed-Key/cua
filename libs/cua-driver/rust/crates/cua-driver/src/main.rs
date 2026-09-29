@@ -320,6 +320,7 @@ fn maybe_init_pip() {
                                 .claims
                                 .into_iter()
                                 .map(|claim| pip_preview::PipClaim {
+                                    id: claim.id,
                                     label: claim.label,
                                     satisfied: claim.satisfied,
                                 })

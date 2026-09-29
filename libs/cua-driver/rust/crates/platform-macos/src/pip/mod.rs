@@ -1222,6 +1222,7 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
     let claims: Vec<Claim> = claims
         .into_iter()
         .map(|claim| Claim {
+            id: claim.id,
             label: claim.label,
             satisfied: claim.satisfied,
         })
