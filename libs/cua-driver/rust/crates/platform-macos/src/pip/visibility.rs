@@ -83,6 +83,17 @@ pub(super) fn snapshot() -> (Vec<WindowInfo>, Vec<Area>) {
     (crate::windows::composited_windows(), displays)
 }
 
+/// Every window WindowServer knows, on screen or off (any Space, minimized
+/// included). `None` when the lookup failed: an empty answer is that, not
+/// every window closing.
+pub(super) fn known_windows() -> Option<std::collections::HashSet<u32>> {
+    let known: std::collections::HashSet<u32> = crate::windows::all_windows_any_layer()
+        .iter()
+        .map(|window| window.window_id)
+        .collect();
+    (!known.is_empty()).then_some(known)
+}
+
 /// The frame of `window` in `windows` (CoreGraphics, top-left origin),
 /// tagged with that window's id so it is never taken for another's.
 pub(super) fn frame_of(windows: &[WindowInfo], window: Option<u32>) -> Option<(u32, Area)> {

@@ -117,6 +117,7 @@ use pip_preview::{PipBackend, PipConfig, PipFrame};
 mod cursor;
 mod finish;
 mod live;
+mod overview;
 mod stack;
 mod visibility;
 
@@ -604,6 +605,8 @@ struct State {
     streams: Arc<Streams>,
     next_stream_generation: u64,
     gesture: Option<Gesture>,
+    /// The all-agents overview (see `overview`).
+    overview: overview::Overview,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -1045,16 +1048,11 @@ fn poll_visibility(worker: &CaptureWorker) {
         // Every window WindowServer knows (any Space, minimized included),
         // only when some back card needs checking. An empty answer is a
         // failed lookup, not every window closing.
-        let known: Option<HashSet<u32>> = active
+        let known = active
             .iter()
             .any(|(_, _, watched)| !watched.is_empty())
-            .then(|| {
-                crate::windows::all_windows_any_layer()
-                    .iter()
-                    .map(|window| window.window_id)
-                    .collect()
-            })
-            .filter(|known: &HashSet<u32>| !known.is_empty());
+            .then(visibility::known_windows)
+            .flatten();
         for (key, target, watched) in active {
             let visible = visibility::target_fully_visible(target, &windows, &displays, own_pid);
             let resolved_window = resolve_target_window(target);
@@ -1245,12 +1243,21 @@ pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         streams,
         next_stream_generation: 0,
         gesture: None,
+        overview: overview::Overview::default(),
     });
     CURSOR_SINK.store(true, std::sync::atomic::Ordering::Relaxed);
+    // The menu bar item and the overview shortcut need AppKit on the main
+    // thread: install them once the main run loop drains its queue.
+    dispatch_to_main((), install_overview_cb);
     Ok(Box::new(MacosPipBackend { worker }))
 }
 
 // ── Main-queue callbacks ──────────────────────────────────────────────────
+
+unsafe extern "C" fn install_overview_cb(ctx: *mut c_void) {
+    drop(Box::from_raw(ctx as *mut ()));
+    objc2::rc::autoreleasepool(|_| overview::install());
+}
 
 unsafe extern "C" fn apply_frame_cb(ctx: *mut c_void) {
     let update: FrameUpdate = *Box::from_raw(ctx as *mut FrameUpdate);
@@ -2758,6 +2765,13 @@ extern "C" fn on_focus(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject)
     let Some((Some(pid), window_id)) = target else {
         return;
     };
+    focus_window(pid, window_id);
+}
+
+/// Bring a window (or the app's front window) forward through the same
+/// path as the `bring_to_front` tool. The panel's Focus button and the
+/// overview's focus click both come here.
+fn focus_window(pid: i32, window_id: Option<u32>) {
     // bring_to_front polls for up to ~1 s; keep the UI thread free.
     std::thread::spawn(move || {
         let mut args = serde_json::json!({ "pid": pid });
