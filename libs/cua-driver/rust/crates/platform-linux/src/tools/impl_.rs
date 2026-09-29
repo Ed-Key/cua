@@ -1066,9 +1066,10 @@ impl Tool for GetWindowStateTool {
                 popup's own AT-SPI toplevel so its menu items get element indices \
                 (then click them by element_index). Omitting window_id while a popup \
                 of this pid is open walks that popup.".into(),
-            input_schema: json!({"type":"object","required":["pid"],"properties":{
+            input_schema: json!({"type":"object","properties":{
                 "session": cua_driver_core::tool_schema::session_schema(),
                 "pid":{"type":"integer"},
+                "app":{"type":"string","description":"macOS only: app name or bundle id. Other platforms refuse it; pass pid + window_id."},
                 "window_id":{"type":"integer","description":"Native window identifier from list_windows, or the `popup.window_id` a click / right_click result named (an open context menu / popover; its menu items then get element indices). Omitted: the pid's open popup menu when one is mapped, else its focused / active / largest window."},
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_accessibility_tree":{"type":"boolean",
@@ -1091,6 +1092,11 @@ impl Tool for GetWindowStateTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        if args.get("app").is_some() {
+            return ToolResult::error(
+                "app targeting is macOS-only for now; pass pid + window_id from list_windows.",
+            );
+        }
         let pid = match args.require_u32("pid") {
             Ok(v) => v,
             Err(e) => return e,

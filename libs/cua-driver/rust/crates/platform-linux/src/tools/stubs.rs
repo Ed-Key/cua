@@ -100,7 +100,7 @@ stub_tool!(
      screenshot — ground on both and cross-check (the tree lies on some surfaces). \
      Choose the modality at ACTION time: an element ax action (element_index) or an \
      element px action (x,y) off the screenshot. capture_mode is deprecated and ignored.",
-    serde_json::json!({"type":"object","required":["pid","window_id"],"properties":{"session": cua_driver_core::tool_schema::session_schema(),"pid":{"type":"integer"},"window_id":{"type":"integer"},"query":{"type":"string"},"include_screenshot":{"type":"boolean","description":"Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return tree only (the cheap path for re-indexing before an element ax action)."},"capture_mode": cua_driver_core::capture_mode::capture_mode_schema()},"additionalProperties":false})
+    serde_json::json!({"type":"object","properties":{"session": cua_driver_core::tool_schema::session_schema(),"pid":{"type":"integer"},"window_id":{"type":"integer"},"app":{"type":"string","description":"macOS only: app name or bundle id. Other platforms refuse it; pass pid + window_id."},"query":{"type":"string"},"include_screenshot":{"type":"boolean","description":"Default true — returns a grounding screenshot alongside the tree. Set false to skip the grab and return tree only (the cheap path for re-indexing before an element ax action)."},"capture_mode": cua_driver_core::capture_mode::capture_mode_schema()},"additionalProperties":false})
 );
 
 stub_tool!(

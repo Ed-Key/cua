@@ -364,7 +364,7 @@ fn agent_instructions() -> String {
     let (tree_kind, platform_skill_pointer) = if cfg!(target_os = "macos") {
         (
             "AX (Accessibility)",
-            "MACOS.md (no-foreground contract, AXMenuBar navigation, SkyLight click dispatch)",
+            "MACOS.md (no-foreground contract, AXMenuBar, SkyLight clicks)",
         )
     } else if cfg!(target_os = "windows") {
         (
@@ -376,6 +376,13 @@ fn agent_instructions() -> String {
             "AT-SPI",
             "LINUX.md (X11/Wayland status, AT-SPI bus, BETA-level support)",
         )
+    };
+
+    // App-name targeting in get_window_state is macOS-only for now.
+    let read_step = if cfg!(target_os = "macos") {
+        "Single-window app: `get_window_state(app)`. Else `launch_app`/`list_windows`, then `get_window_state(pid, window_id)`."
+    } else {
+        "`launch_app`, then `get_window_state(pid, window_id)`."
     };
 
     // act_and_read is registered only on macOS; elsewhere keep the one-action step.
@@ -392,11 +399,11 @@ For non-GUI outcomes, prefer a client-provided app API/SDK, headless/background 
 
 On continuation/recent-work, when available, call `history_status`; if ready, make one bounded initial `history_query` before broad discovery; otherwise continue.
 
-For app/window outcomes, use the narrowest semantic Cua route first: `set_window_frame` plus `list_windows` readback for geometry, typed browser tools for supported page content, and clipboard tools for clipboard state. Then climb through background `element_index` ({tree_kind}), background pixels, foreground delivery, and desktop fallback. Never advance on transport success alone.
+For app/window outcomes, use the narrowest semantic Cua route first: `set_window_frame` plus `list_windows` readback for geometry, typed browser tools for supported page content, and clipboard tools for clipboard state. Then climb: background `element_index` ({tree_kind}), background pixels, foreground delivery, desktop fallback. Never advance on transport success alone.
 
 Workflow per task:
 0. `start_session` is optional. For multi-call work, prefer a short `session` label and repeat it on every call that accepts it. Unnamed calls use the transport's implicit session. Only `start_session` revives an ended name; `end_session` explicitly cleans up.
-1. `launch_app`, then `get_window_state(pid, window_id)`.
+1. {read_step}
 2. {act_step}
 3. `verify_state(pid, window_id, expect)` checks bounded postconditions. `unknown` is not success; `include_screenshot:true` lets the multimodal agent judge visual evidence.
 
@@ -510,6 +517,17 @@ mod agent_instruction_tests {
             instructions.split_whitespace().count() <= 200,
             "initialize instructions should stay within the documented context budget"
         );
+    }
+
+    #[test]
+    fn macos_instructions_offer_app_targeting_within_budget() {
+        let instructions = agent_instructions();
+        if cfg!(target_os = "macos") {
+            assert!(instructions.contains("Single-window app: `get_window_state(app)`"));
+        }
+        assert!(instructions.contains("then `get_window_state(pid, window_id)`"));
+        let words = instructions.split_whitespace().count();
+        assert!(words <= 200, "instructions are {words} words");
     }
 
     #[test]

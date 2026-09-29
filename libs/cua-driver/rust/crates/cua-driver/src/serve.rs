@@ -487,7 +487,13 @@ async fn invoke_daemon_tool(
     // Evaluate before registry lookup so a deny-by-default policy does not leak
     // whether an unapproved name happens to be registered. This also preserves
     // the MCP policy contract now that every call passes through the daemon.
-    if let Err(error) = cua_driver_core::authorization::authorize_tool_call(&tool_name, &args) {
+    let early =
+        if cua_driver_core::authorization::authorized_after_target_resolution(&tool_name, &args) {
+            Ok(())
+        } else {
+            cua_driver_core::authorization::authorize_tool_call(&tool_name, &args).map(drop)
+        };
+    if let Err(error) = early {
         observe_daemon_error(observation, 1);
         return DaemonResponse::err(error.to_string(), 1);
     }

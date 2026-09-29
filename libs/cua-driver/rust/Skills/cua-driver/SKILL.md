@@ -39,7 +39,7 @@ Operate one exact target, observe its state, act once, and verify the user's pos
 | ----------------------------------------- | ----------------------------------------------------------------------------------------------------- | ----------------------------------------------------- |
 | Check installation and capabilities       | `cua-driver --version`, `status`, `doctor`, `describe <tool>`; MCP `tools/list`                       | [Runtime](RUNTIME.md)                                 |
 | Find or open the requested app            | `list_apps`, `list_windows`, `launch_app`                                                             | Current platform guide below                          |
-| Observe one window                        | `get_window_state({pid, window_id})`                                                                  | [Workflow](WORKFLOW.md)                               |
+| Observe one window                        | `get_window_state({pid, window_id})`, or `{app}` for a single-window app on macOS                     | [Workflow](WORKFLOW.md)                               |
 | Act on a control                          | `click` / `type_text` with a fresh `element_token` and exact window target                            | [Workflow](WORKFLOW.md)                               |
 | Use pixels when semantics cannot reach it | Fresh target screenshot, then `x,y` on the same target                                                | [Workflow](WORKFLOW.md)                               |
 | Verify the outcome                        | `verify_state({pid, window_id, expect})` or a fresh snapshot read by the agent                        | [Workflow](WORKFLOW.md)                               |

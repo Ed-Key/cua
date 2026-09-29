@@ -5,6 +5,7 @@ use cua_driver_core::{
     tool::{Tool, ToolDef},
 };
 use serde_json::Value;
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use super::ToolState;
@@ -21,6 +22,9 @@ impl GetWindowStateTool {
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+/// Total time `get_window_state(app)` spends reading the app's AX windows.
+const AX_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Slack past `timeout_ms` before the walk task is abandoned: one in-flight AX
 /// call may still be waiting on its messaging timeout.
 const AX_WALK_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -28,17 +32,17 @@ const AX_WALK_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_se
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_window_state".into(),
-        description: "Read one window (pid, window_id): accessibility rows with element_token \
-            and element_index, plus a screenshot whose pixels are the x,y space for pixel \
+        description: "Read one window (pid, window_id, or app for its only window): \
+            accessibility rows with element_token and element_index, plus a screenshot whose pixels are the x,y space for pixel \
             actions. On macOS later looks return only changed rows (diff); pair element_index \
             with the latest snapshot_id. Details: skill://cua-driver/WORKFLOW.md".into(),
         input_schema: serde_json::json!({
             "type": "object",
-            "required": ["pid", "window_id"],
             "properties": {
                 "session": cua_driver_core::tool_schema::session_schema(),
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": { "type": "integer", "description": "Window ID from list_windows." },
+                "app": { "type": "string", "description": "App name or bundle id; reads its only window on the current Space. Use pid + window_id when it has several." },
                 "query": { "type": "string", "description": "Case-insensitive filter: matching rows plus ancestors; indices unchanged." },
                 "query_context": { "type": "boolean", "default": false, "description": "With query, also keep every row under each match." },
                 "diff": { "type": "boolean", "default": true, "description": "Return only rows changed since this session's last look; false forces the full outline. macOS only." },
@@ -123,14 +127,36 @@ impl Tool for GetWindowStateTool {
         def()
     }
 
+    /// `app` that names exactly one window becomes that pid + window_id
+    /// before authorization, so policy and consent judge the real window.
+    /// Otherwise the call stays as `app`, is authorized like an unfiltered
+    /// window listing, and carries the refusal for `invoke` to return. The
+    /// lookup runs only here, so `invoke` never reads a window that
+    /// authorization did not see.
+    async fn resolve_target(&self, args: &mut Value) {
+        if args.get("app").is_none() {
+            return;
+        }
+        let resolved = window_target(args).await;
+        let Some(fields) = args.as_object_mut() else {
+            return;
+        };
+        match resolved {
+            Ok((pid, window_id)) => {
+                fields.remove("app");
+                fields.insert("pid".into(), pid.into());
+                fields.insert("window_id".into(), window_id.into());
+            }
+            Err(refusal) => {
+                fields.insert(APP_REFUSAL_ARG.into(), stored_refusal(refusal));
+            }
+        }
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        let pid = match args.require_i32("pid") {
-            Ok(v) => v,
-            Err(e) => return e,
-        };
-        let window_id = match args.require_u32("window_id") {
-            Ok(v) => v,
+        let (pid, window_id) = match invoke_target(&args).await {
+            Ok(target) => target,
             Err(e) => return e,
         };
 
@@ -816,8 +842,23 @@ impl Tool for GetWindowStateTool {
                 )
             })
             .await;
+            // Sent once per (session, window) while unchanged: every copy is
+            // re-read by the model on every later turn. diff:false is a full
+            // look and repeats it; verify_state's internal look neither shows
+            // it to the model nor counts as sent.
             if let Ok(report) = report {
-                structured["background_input"] = report;
+                let full_look = args.get("diff") == Some(&Value::Bool(false));
+                let key = (session_id.clone(), pid, window_id);
+                if observation_only
+                    || background_input_is_news(
+                        &mut self.state.background_input_sent.lock().unwrap(),
+                        key,
+                        &report,
+                        full_look,
+                    )
+                {
+                    structured["background_input"] = report;
+                }
             }
         }
         if let Some((sw, sh)) = screenshot_dims {
@@ -874,6 +915,301 @@ impl Tool for GetWindowStateTool {
             action_record: None,
         }
     }
+}
+
+/// The (pid, window_id) this call reads: given directly, or the only window of
+/// `app` that the default `list_windows` would show.
+async fn window_target(args: &Value) -> Result<(i32, u32), ToolResult> {
+    use cua_driver_core::tool_args::ArgsExt;
+    let app = args.opt_str("app");
+    cua_driver_contract::window_state_target_form(
+        app.as_deref(),
+        args.get("pid").is_some(),
+        args.get("window_id").is_some(),
+    )
+    .map_err(ToolResult::error)?;
+    let Some(app) = app else {
+        return Ok((args.require_i32("pid")?, args.require_u32("window_id")?));
+    };
+    let wanted = app.clone();
+    let (apps, windows, ax_titles) = tokio::task::spawn_blocking(move || {
+        let apps = crate::apps::list_running_apps();
+        let ax_titles = ax_window_titles(&app_pids(&wanted, &apps));
+        (apps, crate::windows::visible_windows(), ax_titles)
+    })
+    .await
+    .map_err(|e| ToolResult::error(format!("app lookup failed: {e}")))?;
+    select_app_window(&app, &apps, &windows, &ax_titles)
+}
+
+/// Private argument that carries a failed `app` lookup from `resolve_target`
+/// to `invoke`. Clients cannot send it: the registry strips underscore
+/// arguments before `resolve_target` runs.
+const APP_REFUSAL_ARG: &str = "_app_resolution_refusal";
+
+fn stored_refusal(refusal: ToolResult) -> Value {
+    let message = refusal.content.iter().find_map(|c| match c {
+        Content::Text { text, .. } => Some(text.clone()),
+        _ => None,
+    });
+    serde_json::json!({"message": message, "structured": refusal.structured_content})
+}
+
+/// The target `invoke` reads. `app` is resolved only by `resolve_target`,
+/// before authorization; here it is either that stored refusal or, on a path
+/// that skipped resolution, refused outright.
+async fn invoke_target(args: &Value) -> Result<(i32, u32), ToolResult> {
+    if let Some(stored) = args.get(APP_REFUSAL_ARG) {
+        let message = stored["message"].as_str().unwrap_or("app lookup failed");
+        let refusal = ToolResult::error(message);
+        return Err(match stored.get("structured").filter(|s| !s.is_null()) {
+            Some(structured) => refusal.with_structured(structured.clone()),
+            None => refusal,
+        });
+    }
+    if args.get("app").is_some() {
+        return Err(ToolResult::error(
+            "app was not resolved before authorization; call list_windows and pass \
+             pid + window_id.",
+        )
+        .with_structured(serde_json::json!({
+            "code": "app_not_resolved",
+            "suggestion": "call list_windows and pass pid + window_id"
+        })));
+    }
+    window_target(args).await
+}
+
+/// Pids of the running apps whose name (any case) or exact bundle id is `app`.
+fn app_pids(app: &str, apps: &[crate::apps::AppInfo]) -> Vec<i32> {
+    let app = app.trim();
+    let wanted = app.to_lowercase();
+    apps.iter()
+        .filter(|a| a.name.to_lowercase() == wanted || a.bundle_id.as_deref() == Some(app))
+        .map(|a| a.pid)
+        .collect()
+}
+
+/// CG window id -> AXTitle ("" when it has none) for every AX window of `pids`.
+/// Empty when Accessibility is not granted. The whole lookup is bounded by
+/// `AX_LOOKUP_BUDGET`; a pid not finished in time contributes nothing, so its
+/// windows fall back to CG titles.
+fn ax_window_titles(pids: &[i32]) -> HashMap<u32, String> {
+    use crate::ax::bindings::{
+        ax_get_window_id_checked, copy_ax_windows, copy_string_attr, AXUIElementCreateApplication,
+        AXUIElementRef, AXUIElementSetMessagingTimeout,
+    };
+    use core_foundation::base::{CFRelease, CFTypeRef};
+    let deadline = std::time::Instant::now() + AX_LOOKUP_BUDGET;
+    // AX messaging timeouts are per element, so each one gets what is left.
+    let bound = |element: AXUIElementRef| -> bool {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let _ = unsafe { AXUIElementSetMessagingTimeout(element, left.as_secs_f32().max(0.05)) };
+        true
+    };
+    let mut titles = HashMap::new();
+    for &pid in pids {
+        let mut reads = Vec::new();
+        unsafe {
+            let app = AXUIElementCreateApplication(pid);
+            if app.is_null() {
+                continue;
+            }
+            let windows = if bound(app) {
+                copy_ax_windows(app)
+            } else {
+                Vec::new()
+            };
+            for window in windows {
+                let read = if bound(window) {
+                    ax_get_window_id_checked(window)
+                        .map(|id| {
+                            id.map(|id| {
+                                (id, copy_string_attr(window, "AXTitle").unwrap_or_default())
+                            })
+                        })
+                        .map_err(drop)
+                } else {
+                    Err(())
+                };
+                reads.push(read);
+                CFRelease(window as CFTypeRef);
+            }
+            CFRelease(app as CFTypeRef);
+        }
+        let in_time = std::time::Instant::now() < deadline;
+        titles.extend(complete_ax_windows(reads, in_time).unwrap_or_default());
+    }
+    titles
+}
+
+/// One process's AX windows, or `None` when any window id read failed or the
+/// deadline cut the lookup short. Partial data would hide that process's
+/// other windows, so it falls back to CG titles instead. `Ok(None)` is a
+/// window with no CG window (not composited) and is simply skipped.
+fn complete_ax_windows(
+    reads: Vec<Result<Option<(u32, String)>, ()>>,
+    in_time: bool,
+) -> Option<Vec<(u32, String)>> {
+    if !in_time {
+        return None;
+    }
+    reads
+        .into_iter()
+        .filter_map(Result::transpose)
+        .collect::<Result<_, _>>()
+        .ok()
+}
+
+/// Pick `app`'s window among `windows` (the default `list_windows` set:
+/// current Space, on screen, layer 0). `ax_titles` maps CG window ids to the
+/// app's AX windows and their AXTitle. A window with an AX window is a
+/// candidate, titled from AX (CG titles are redacted without Screen
+/// Recording); surfaces with none, such as Chrome's toolbar strips, are not.
+/// For a process with no AX windows (Accessibility not granted, or the lookup
+/// timed out), its titled CG windows are the candidates. A process with
+/// on-screen windows and no candidate refuses the whole lookup, and several
+/// candidates are refused rather than guessed.
+fn select_app_window(
+    app: &str,
+    apps: &[crate::apps::AppInfo],
+    windows: &[crate::windows::WindowInfo],
+    ax_titles: &HashMap<u32, String>,
+) -> Result<(i32, u32), ToolResult> {
+    let app = app.trim();
+    let pids = app_pids(app, apps);
+    if pids.is_empty() {
+        return Err(ToolResult::error(format!(
+            "no running app named \"{app}\" (match the app name or bundle id from list_apps). \
+             Call launch_app, or list_windows to find the window."
+        ))
+        .with_structured(serde_json::json!({
+            "code": "app_not_running",
+            "app": app,
+            "suggestion": "call launch_app, or list_windows to find the window"
+        })));
+    }
+    let app_windows: Vec<&crate::windows::WindowInfo> =
+        windows.iter().filter(|w| pids.contains(&w.pid)).collect();
+    // Per process: one instance's AX windows must not hide another instance
+    // whose AX lookup failed or timed out.
+    let ax_pids: Vec<i32> = app_windows
+        .iter()
+        .filter(|w| ax_titles.contains_key(&w.window_id))
+        .map(|w| w.pid)
+        .collect();
+    let mut candidates: Vec<(&crate::windows::WindowInfo, &str)> = app_windows
+        .iter()
+        .filter_map(|w| {
+            let ax_title = ax_titles.get(&w.window_id).map(|t| t.trim());
+            let title = ax_title.filter(|t| !t.is_empty()).unwrap_or(w.title.trim());
+            match ax_title {
+                Some(_) => Some((*w, title)),
+                None if !ax_pids.contains(&w.pid) && !title.is_empty() => Some((*w, title)),
+                None => None,
+            }
+        })
+        .collect();
+    // A process with on-screen windows but no candidate could hide the real
+    // target, so no other instance's window is picked in its place.
+    let mut unidentified: Vec<i32> = app_windows
+        .iter()
+        .map(|w| w.pid)
+        .filter(|pid| !candidates.iter().any(|(w, _)| w.pid == *pid))
+        .collect();
+    unidentified.sort_unstable();
+    unidentified.dedup();
+    if !unidentified.is_empty() {
+        let pid_list: Vec<String> = unidentified.iter().map(i32::to_string).collect();
+        return Err(ToolResult::error(format!(
+            "\"{app}\" has on-screen windows that could not be identified (pid {}). This may \
+             be a permission limit (Accessibility or Screen Recording not granted; see \
+             check_permissions). Call list_windows and pass pid + window_id.",
+            pid_list.join(", ")
+        ))
+        .with_structured(serde_json::json!({
+            "code": "app_window_unidentified",
+            "app": app,
+            "pids": unidentified,
+            "suggestion": "call check_permissions, or list_windows and pass pid + window_id"
+        })));
+    }
+    candidates.sort_by(|a, b| b.0.z_index.cmp(&a.0.z_index));
+    match candidates.as_slice() {
+        [(only, _)] => Ok((only.pid, only.window_id)),
+        [] => Err(ToolResult::error(format!(
+            "\"{app}\" has no on-screen window on the current Space. Call launch_app to \
+             open one, or list_windows to find it."
+        ))
+        .with_structured(serde_json::json!({
+            "code": "app_window_not_found",
+            "app": app,
+            "suggestion": "call launch_app, or list_windows to find the window"
+        }))),
+        several => {
+            let lines: Vec<String> = several
+                .iter()
+                .map(|(w, title)| format!("window_id {} (pid {}): {title}", w.window_id, w.pid))
+                .collect();
+            Err(ToolResult::error(format!(
+                "\"{app}\" has {} windows on the current Space; pass pid + window_id for one:\n{}",
+                several.len(),
+                lines.join("\n")
+            ))
+            .with_structured(serde_json::json!({
+                "code": "app_window_ambiguous",
+                "app": app,
+                "candidates": several
+                    .iter()
+                    .map(|(w, title)| serde_json::json!({
+                        "window_id": w.window_id,
+                        "pid": w.pid,
+                        "title": title
+                    }))
+                    .collect::<Vec<_>>(),
+                "suggestion": "pass pid + window_id for one of the candidates"
+            })))
+        }
+    }
+}
+
+/// (session, pid, window_id): the scope a `background_input` report is sent
+/// once for. The session is the runtime `_session_id` the registry injects
+/// (the transport's implicit session, or the named one), the same key the
+/// snapshot diff baseline uses, so a second client still gets its own copy.
+pub(crate) type BackgroundInputKey = (Option<String>, i32, u32);
+
+pub(crate) type BackgroundInputSent = std::sync::Mutex<HashMap<BackgroundInputKey, Value>>;
+
+/// Forget what an ended session was sent, so a session restarted under the
+/// same name gets `background_input` again on its first read.
+pub(crate) fn retire_background_input(sent: &BackgroundInputSent, session_id: &str) {
+    sent.lock()
+        .unwrap()
+        .retain(|(session, _, _), _| session.as_deref() != Some(session_id));
+}
+
+/// Whether this look should carry `report`: the first for its key, a changed
+/// report, or a full look. Records what was sent.
+fn background_input_is_news(
+    sent: &mut HashMap<BackgroundInputKey, Value>,
+    key: BackgroundInputKey,
+    report: &Value,
+    full_look: bool,
+) -> bool {
+    if !full_look && sent.get(&key) == Some(report) {
+        return false;
+    }
+    // ponytail: wholesale reset bounds memory across closed windows; each key
+    // then re-sends once. Ended sessions are retired by the session-end hook.
+    if sent.len() >= 512 && !sent.contains_key(&key) {
+        sent.clear();
+    }
+    sent.insert(key, report.clone());
+    true
 }
 
 /// Turn an unresolvable window scope into a structured refusal, or `None` when
@@ -1322,9 +1658,10 @@ mod window_scope_contract_tests {
     }
 
     /// The capture-only fold-in: get_window_state advertises the new
-    /// `include_accessibility_tree` / `max_dimension` controls, keeps pid +
-    /// window_id required (schema not loosened), and documents the degenerate
-    /// both-false case on the include_accessibility_tree property.
+    /// `include_accessibility_tree` / `max_dimension` controls and documents
+    /// the degenerate both-false case on the include_accessibility_tree
+    /// property. pid + window_id are not schema-required because `app` is the
+    /// other target form; the tool checks the form at runtime.
     #[test]
     fn schema_advertises_capture_only_controls() {
         let d = def();
@@ -1338,22 +1675,375 @@ mod window_scope_contract_tests {
             "schema must advertise max_dimension"
         );
         assert_eq!(props["max_image_dimension"]["minimum"], 0);
-        let required: Vec<&str> = d.input_schema["required"]
-            .as_array()
-            .expect("required array")
-            .iter()
-            .map(|v| v.as_str().unwrap())
-            .collect();
         assert!(
-            required.contains(&"pid") && required.contains(&"window_id"),
-            "pid and window_id must stay required: {required:?}"
+            d.input_schema.get("required").is_none(),
+            "pid + window_id and app are alternatives, so none is schema-required"
         );
+        assert_eq!(props["app"]["type"], "string");
         assert!(
             props["include_accessibility_tree"]["description"]
                 .as_str()
                 .unwrap()
                 .contains("include_screenshot:false"),
             "include_accessibility_tree must document the both-false error"
+        );
+    }
+}
+
+#[cfg(test)]
+mod app_target_tests {
+    use super::*;
+
+    fn app(name: &str, pid: i32, bundle_id: &str) -> crate::apps::AppInfo {
+        crate::apps::AppInfo {
+            name: name.into(),
+            pid,
+            bundle_id: Some(bundle_id.into()),
+            running: true,
+            active: false,
+            launch_path: None,
+            kind: None,
+            last_used: None,
+        }
+    }
+
+    fn window(window_id: u32, pid: i32, title: &str, z_index: usize) -> crate::windows::WindowInfo {
+        crate::windows::WindowInfo {
+            window_id,
+            pid,
+            app_name: String::new(),
+            title: title.into(),
+            bounds: crate::windows::WindowBounds {
+                x: 0.,
+                y: 0.,
+                width: 800.,
+                height: 600.,
+            },
+            layer: 0,
+            z_index,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: Some(true),
+            space_ids: None,
+        }
+    }
+
+    fn refusal(result: Result<(i32, u32), ToolResult>) -> (String, Value) {
+        let result = result.expect_err("must refuse");
+        assert_eq!(result.is_error, Some(true));
+        let text = format!("{:?}", result.content);
+        (text, result.structured_content.expect("structured refusal"))
+    }
+
+    fn no_ax() -> HashMap<u32, String> {
+        HashMap::new()
+    }
+
+    fn ax(entries: &[(u32, &str)]) -> HashMap<u32, String> {
+        entries.iter().map(|(id, t)| (*id, t.to_string())).collect()
+    }
+
+    #[test]
+    fn one_titled_window_is_the_target() {
+        let apps = [
+            app("Google Chrome", 10, "com.google.Chrome"),
+            app("TextEdit", 20, "com.apple.TextEdit"),
+        ];
+        // Without AX windows, Chrome's untitled toolbar strips are not candidates.
+        let windows = [
+            window(1, 10, "", 3),
+            window(2, 10, "Docs", 2),
+            window(3, 20, "Untitled", 1),
+        ];
+        assert_eq!(
+            select_app_window("google chrome", &apps, &windows, &no_ax()).unwrap(),
+            (10, 2)
+        );
+        assert_eq!(
+            select_app_window("com.apple.TextEdit", &apps, &windows, &no_ax()).unwrap(),
+            (20, 3)
+        );
+        // Bundle ids match exactly, names ignore case only.
+        assert!(select_app_window("com.apple.textedit", &apps, &windows, &no_ax()).is_err());
+        assert!(select_app_window("Chrome", &apps, &windows, &no_ax()).is_err());
+    }
+
+    /// Without Screen Recording every CG title is empty; AX still names the
+    /// real window, and toolbar strips have no AX window.
+    #[test]
+    fn redacted_cg_titles_resolve_through_ax_windows() {
+        let apps = [app("Google Chrome", 10, "com.google.Chrome")];
+        let windows = [
+            window(1, 10, "", 3),
+            window(2, 10, "", 2),
+            window(5, 10, "", 1),
+        ];
+        assert_eq!(
+            select_app_window("Google Chrome", &apps, &windows, &ax(&[(2, "Docs")])).unwrap(),
+            (10, 2)
+        );
+        // An AX window with an empty AXTitle is still a real window.
+        assert_eq!(
+            select_app_window("Google Chrome", &apps, &windows, &ax(&[(5, "")])).unwrap(),
+            (10, 5)
+        );
+    }
+
+    #[test]
+    fn titled_cg_surfaces_without_an_ax_window_are_ignored() {
+        let apps = [app("Google Chrome", 10, "com.google.Chrome")];
+        let windows = [window(1, 10, "Strip", 3), window(2, 10, "Docs", 2)];
+        assert_eq!(
+            select_app_window("Google Chrome", &apps, &windows, &ax(&[(2, "Docs")])).unwrap(),
+            (10, 2)
+        );
+    }
+
+    #[test]
+    fn two_ax_windows_are_listed_with_ax_titles() {
+        let apps = [app("TextEdit", 20, "com.apple.TextEdit")];
+        let windows = [
+            window(3, 20, "", 1),
+            window(4, 20, "", 2),
+            window(6, 20, "", 3),
+        ];
+        let (text, s) = refusal(select_app_window(
+            "TextEdit",
+            &apps,
+            &windows,
+            &ax(&[(3, "A.txt"), (4, "B.txt")]),
+        ));
+        assert_eq!(s["code"], "app_window_ambiguous");
+        assert_eq!(
+            s["candidates"],
+            serde_json::json!([
+                {"window_id": 4, "pid": 20, "title": "B.txt"},
+                {"window_id": 3, "pid": 20, "title": "A.txt"}
+            ])
+        );
+        assert!(text.contains("window_id 3 (pid 20): A.txt"), "{text}");
+    }
+
+    /// One instance's AX windows must not hide another instance whose AX
+    /// lookup came back empty: its titled CG window still counts.
+    #[test]
+    fn ax_fallback_is_decided_per_process() {
+        let apps = [
+            app("TextEdit", 20, "com.apple.TextEdit"),
+            app("TextEdit", 21, "com.apple.TextEdit"),
+        ];
+        let windows = [
+            window(3, 20, "", 1),
+            window(7, 20, "", 3),
+            window(4, 21, "B.txt", 2),
+        ];
+        let (_, s) = refusal(select_app_window(
+            "TextEdit",
+            &apps,
+            &windows,
+            &ax(&[(3, "A.txt")]),
+        ));
+        assert_eq!(s["code"], "app_window_ambiguous");
+        assert_eq!(
+            s["candidates"],
+            serde_json::json!([
+                {"window_id": 4, "pid": 21, "title": "B.txt"},
+                {"window_id": 3, "pid": 20, "title": "A.txt"}
+            ])
+        );
+    }
+
+    /// A process whose AX window-id reads did not all succeed has no AX data,
+    /// so its titled CG windows still count.
+    #[test]
+    fn incomplete_ax_reads_fall_back_to_cg_titles() {
+        let full = complete_ax_windows(vec![Ok(Some((3, "A.txt".into()))), Ok(None)], true);
+        assert_eq!(full, Some(vec![(3, "A.txt".to_owned())]));
+        assert_eq!(
+            complete_ax_windows(vec![Ok(Some((3, "A.txt".into())))], false),
+            None
+        );
+        let failed = complete_ax_windows(vec![Ok(Some((5, "C.txt".into()))), Err(())], true);
+        assert_eq!(failed, None);
+
+        let apps = [
+            app("TextEdit", 20, "com.apple.TextEdit"),
+            app("TextEdit", 21, "com.apple.TextEdit"),
+        ];
+        let windows = [
+            window(3, 20, "", 1),
+            window(5, 21, "C.txt", 2),
+            window(6, 21, "D.txt", 3),
+        ];
+        let ax_titles: HashMap<u32, String> = full.into_iter().chain(failed).flatten().collect();
+        let (_, s) = refusal(select_app_window("TextEdit", &apps, &windows, &ax_titles));
+        assert_eq!(s["code"], "app_window_ambiguous");
+        assert_eq!(
+            s["candidates"],
+            serde_json::json!([
+                {"window_id": 6, "pid": 21, "title": "D.txt"},
+                {"window_id": 5, "pid": 21, "title": "C.txt"},
+                {"window_id": 3, "pid": 20, "title": "A.txt"}
+            ])
+        );
+    }
+
+    /// A lookup that failed before authorization is what invoke returns; it
+    /// does not look again, so a window that appears or closes in between is
+    /// never read unauthorized. (No such TextEdit windows exist live.)
+    #[tokio::test]
+    async fn invoke_returns_the_resolution_refusal_without_looking_again() {
+        let apps = [app("TextEdit", 20, "com.apple.TextEdit")];
+        let windows = [window(3, 20, "A.txt", 1), window(4, 20, "B.txt", 2)];
+        let ambiguous = select_app_window("TextEdit", &apps, &windows, &no_ax()).unwrap_err();
+        let args = serde_json::json!({
+            "app": "TextEdit",
+            APP_REFUSAL_ARG: stored_refusal(ambiguous),
+        });
+        let (text, s) = refusal(invoke_target(&args).await);
+        assert_eq!(s["code"], "app_window_ambiguous");
+        assert_eq!(s["candidates"].as_array().unwrap().len(), 2);
+        assert!(text.contains("window_id 3 (pid 20): A.txt"), "{text}");
+
+        // A path that skipped resolve_target is refused, not resolved here.
+        let (_, s) = refusal(invoke_target(&serde_json::json!({"app": "TextEdit"})).await);
+        assert_eq!(s["code"], "app_not_resolved");
+    }
+
+    /// Two instances, Screen Recording off (CG titles empty), AX data only for
+    /// pid 20: pid 21's window cannot be identified, so pid 20's window is not
+    /// picked in its place.
+    #[test]
+    fn an_unidentified_instance_refuses_the_whole_lookup() {
+        let apps = [
+            app("TextEdit", 20, "com.apple.TextEdit"),
+            app("TextEdit", 21, "com.apple.TextEdit"),
+        ];
+        let windows = [window(3, 20, "", 1), window(4, 21, "", 2)];
+        let (text, s) = refusal(select_app_window(
+            "TextEdit",
+            &apps,
+            &windows,
+            &ax(&[(3, "A.txt")]),
+        ));
+        assert_eq!(s["code"], "app_window_unidentified");
+        assert_eq!(s["pids"], serde_json::json!([21]));
+        assert!(text.contains("pid 21"), "{text}");
+    }
+
+    #[test]
+    fn no_window_or_no_app_is_refused_with_a_next_step() {
+        let apps = [app("TextEdit", 20, "com.apple.TextEdit")];
+        let (text, s) = refusal(select_app_window("TextEdit", &apps, &[], &no_ax()));
+        assert_eq!(s["code"], "app_window_not_found");
+        assert!(text.contains("launch_app") && text.contains("list_windows"));
+        let (text, s) = refusal(select_app_window("Notes", &apps, &[], &no_ax()));
+        assert_eq!(s["code"], "app_not_running");
+        assert!(text.contains("launch_app") && text.contains("list_windows"));
+    }
+
+    /// Windows exist but neither AX nor CG titles identify one: say it may be
+    /// permissions instead of telling the agent to launch an open app.
+    #[test]
+    fn unidentifiable_windows_point_at_permissions() {
+        let apps = [app("TextEdit", 20, "com.apple.TextEdit")];
+        let (text, s) = refusal(select_app_window(
+            "TextEdit",
+            &apps,
+            &[window(9, 20, "", 0)],
+            &no_ax(),
+        ));
+        assert_eq!(s["code"], "app_window_unidentified");
+        assert!(
+            text.contains("permission") && !text.contains("launch_app"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn several_windows_are_listed_not_guessed() {
+        // Two running instances with the same name pool their windows.
+        let apps = [
+            app("TextEdit", 20, "com.apple.TextEdit"),
+            app("TextEdit", 21, "com.apple.TextEdit"),
+        ];
+        let windows = [window(3, 20, "A.txt", 1), window(4, 21, "B.txt", 2)];
+        let (text, s) = refusal(select_app_window("TextEdit", &apps, &windows, &no_ax()));
+        assert_eq!(s["code"], "app_window_ambiguous");
+        assert_eq!(
+            s["candidates"],
+            serde_json::json!([
+                {"window_id": 4, "pid": 21, "title": "B.txt"},
+                {"window_id": 3, "pid": 20, "title": "A.txt"}
+            ])
+        );
+        assert!(text.contains("window_id 3 (pid 20): A.txt"), "{text}");
+        assert!(text.contains("pass pid + window_id"), "{text}");
+    }
+
+    #[test]
+    fn ended_session_gets_background_input_again() {
+        let sent = BackgroundInputSent::default();
+        let report = serde_json::json!({"routes": []});
+        let key = |s: &str| (Some(s.to_owned()), 7, 9);
+        assert!(background_input_is_news(
+            &mut sent.lock().unwrap(),
+            key("a"),
+            &report,
+            false
+        ));
+        assert!(background_input_is_news(
+            &mut sent.lock().unwrap(),
+            key("b"),
+            &report,
+            false
+        ));
+        retire_background_input(&sent, "a");
+        assert!(
+            background_input_is_news(&mut sent.lock().unwrap(), key("a"), &report, false),
+            "restarted session's first read"
+        );
+        assert!(
+            !background_input_is_news(&mut sent.lock().unwrap(), key("b"), &report, false),
+            "other session untouched"
+        );
+    }
+
+    #[test]
+    fn background_input_is_sent_once_per_session_and_window() {
+        let mut sent = HashMap::new();
+        let key = |session: &str| (Some(session.to_owned()), 7, 9);
+        let report =
+            serde_json::json!({"routes": [{"route": "accessibility", "status": "available"}]});
+        let changed =
+            serde_json::json!({"routes": [{"route": "accessibility", "status": "refused"}]});
+        assert!(
+            background_input_is_news(&mut sent, key("a"), &report, false),
+            "first read"
+        );
+        assert!(
+            !background_input_is_news(&mut sent, key("a"), &report, false),
+            "unchanged"
+        );
+        assert!(
+            background_input_is_news(&mut sent, key("a"), &report, true),
+            "diff:false"
+        );
+        assert!(
+            background_input_is_news(&mut sent, key("b"), &report, false),
+            "other session"
+        );
+        assert!(
+            background_input_is_news(&mut sent, (Some("a".into()), 7, 10), &report, false),
+            "other window"
+        );
+        assert!(
+            background_input_is_news(&mut sent, key("a"), &changed, false),
+            "changed"
+        );
+        assert!(
+            !background_input_is_news(&mut sent, key("a"), &changed, false),
+            "unchanged again"
         );
     }
 }

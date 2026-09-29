@@ -559,6 +559,13 @@ pub trait Tool: Send + Sync {
         }
     }
 
+    /// Rewrite a shorthand target (for example get_window_state's `app`) into
+    /// the exact `pid` / `window_id` fields before policy, hard invariants and
+    /// consent read them, so they judge the real target. Leave `args` alone
+    /// when the shorthand does not name exactly one target; `invoke` then
+    /// explains why, after authorization.
+    async fn resolve_target(&self, _args: &mut Value) {}
+
     async fn invoke(&self, args: Value) -> ToolResult;
 }
 
@@ -1140,6 +1147,7 @@ impl ToolRegistry {
         // After target normalization: a typed `target` has become pid/window_id
         // and is left alone.
         crate::element_cache::fill_target_from_element_token(&mut args);
+        tool.resolve_target(&mut args).await;
         if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {
             return result;
         }
@@ -3282,6 +3290,116 @@ mod runtime_isolation_tests {
             self.hits.fetch_add(1, Ordering::SeqCst);
             crate::protocol::ToolResult::text("probe ran")
         }
+    }
+
+    /// A tool whose shorthand resolves to this very process.
+    struct SelfTargetProbe {
+        hits: Arc<AtomicUsize>,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for SelfTargetProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn resolve_target(&self, args: &mut serde_json::Value) {
+            if args.as_object_mut().unwrap().remove("app").is_some() {
+                args["pid"] = serde_json::json!(std::process::id());
+                args["window_id"] = serde_json::json!(1);
+            }
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            crate::protocol::ToolResult::text("probe ran")
+        }
+    }
+
+    /// Policy sees the target a shorthand resolves to: get_window_state(app)
+    /// naming the driver itself hits the same self-target refusal as its pid.
+    #[tokio::test]
+    async fn resolved_shorthand_target_is_authorized_as_the_real_target() {
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(SelfTargetProbe {
+            hits: hits.clone(),
+            def: super::ToolDef {
+                name: "get_window_state".into(),
+                description: "self-target probe".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let result = registry
+            .invoke("get_window_state", serde_json::json!({"app": "Cua Driver"}))
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            format!("{:?}", result.content).contains("its own authorization process"),
+            "{:?}",
+            result.content
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 0);
+    }
+
+    /// Records the arguments resolve_target and invoke receive.
+    struct ReservedArgProbe {
+        seen: Arc<Mutex<Vec<serde_json::Value>>>,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for ReservedArgProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn resolve_target(&self, args: &mut serde_json::Value) {
+            self.seen.lock().unwrap().push(args.clone());
+            args["_resolution"] = serde_json::json!("from resolve_target");
+        }
+
+        async fn invoke(&self, args: serde_json::Value) -> crate::protocol::ToolResult {
+            self.seen.lock().unwrap().push(args);
+            crate::protocol::ToolResult::text("probe ran")
+        }
+    }
+
+    /// resolve_target may hand invoke a private argument (get_window_state's
+    /// stored app refusal) only because a caller cannot send one: the
+    /// registry strips underscore arguments before resolve_target runs, and
+    /// passes what resolve_target added through to invoke.
+    #[tokio::test]
+    async fn resolve_target_sees_no_caller_reserved_arguments() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ReservedArgProbe {
+            seen: seen.clone(),
+            def: super::ToolDef {
+                name: "get_window_state".into(),
+                description: "reserved argument probe".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        registry
+            .invoke(
+                "get_window_state",
+                serde_json::json!({"app": "X", "_resolution": "forged"}),
+            )
+            .await;
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], serde_json::json!({"app": "X"}));
+        assert_eq!(seen[1]["_resolution"], "from resolve_target");
     }
 
     fn replay_registry(hits: Arc<AtomicUsize>) -> Arc<super::ToolRegistry> {
