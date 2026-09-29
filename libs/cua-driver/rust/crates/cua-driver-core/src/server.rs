@@ -919,7 +919,14 @@ async fn dispatch_request(
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
             Ok(mut call) => {
                 crate::tool_args::sanitize_reserved_args(&mut call.args);
-                if let Err(error) = authorize_tool_call(&call.name, &call.args) {
+                let early = if crate::authorization::authorized_after_target_resolution(
+                    &call.name, &call.args,
+                ) {
+                    Ok(())
+                } else {
+                    authorize_tool_call(&call.name, &call.args).map(drop)
+                };
+                if let Err(error) = early {
                     return Response::ok(
                         id,
                         conforming_tool_result(
@@ -1690,5 +1697,125 @@ mod observation_tests {
             ToolOperation::BrowserSnapshotSemanticV2.as_str(),
             "browser_snapshot_semantic_v2"
         );
+    }
+}
+
+#[cfg(test)]
+mod target_resolution_authorization_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// Resolves `app: "Probe"` to pid 7 + window 9; any other app stays as is.
+    struct AppProbe {
+        hits: Arc<AtomicUsize>,
+        def: crate::tool::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::tool::Tool for AppProbe {
+        fn def(&self) -> &crate::tool::ToolDef {
+            &self.def
+        }
+
+        async fn resolve_target(&self, args: &mut serde_json::Value) {
+            if args["app"] == "Probe" {
+                let fields = args.as_object_mut().unwrap();
+                fields.remove("app");
+                fields.insert("pid".into(), 7.into());
+                fields.insert("window_id".into(), 9.into());
+            }
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            self.hits.fetch_add(1, Ordering::SeqCst);
+            crate::protocol::ToolResult::text("probe ran")
+        }
+    }
+
+    async fn call(registry: &crate::tool::ToolRegistry, app: &str) -> serde_json::Value {
+        let request: Request = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": "get_window_state", "arguments": {"app": app}}
+        }))
+        .unwrap();
+        let response = handle_request(request, serde_json::json!(1), registry).await;
+        serde_json::to_value(response).unwrap()["result"].clone()
+    }
+
+    /// Either refusal shape: the transport's early check or the registry's.
+    fn denied(result: &serde_json::Value) -> bool {
+        let s = &result["structuredContent"];
+        s["code"] == "permission_denied" || s["refusal"]["code"] == "permission_denied"
+    }
+
+    /// Under a policy that allows get_window_state only for pid 7, an `app`
+    /// call that resolves to pid 7 runs through MCP dispatch, as it does
+    /// through direct registry dispatch. One that does not resolve is still
+    /// refused by the registry's authorization.
+    #[tokio::test]
+    async fn mcp_dispatch_authorizes_the_resolved_app_target() {
+        const CHILD_ENV: &str = "CUA_DRIVER_APP_TARGET_POLICY_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_none() {
+            // Policy is process-wide and loaded once; run in a child process.
+            let directory = tempfile::tempdir().unwrap();
+            let policy = directory.path().join("pid.yaml");
+            std::fs::write(
+                &policy,
+                "allow:\n  rules:\n    - tool: get_window_state\n      constraints:\n        pid: { min: 7, max: 7 }\n",
+            )
+            .unwrap();
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "server::target_resolution_authorization_tests::mcp_dispatch_authorizes_the_resolved_app_target",
+                    "--nocapture",
+                ])
+                .env(CHILD_ENV, "1")
+                .env(crate::policy::POLICY_FILE_ENV, &policy)
+                .env_remove(crate::policy::MANAGED_POLICY_FILE_ENV)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            return;
+        }
+
+        let hits = Arc::new(AtomicUsize::new(0));
+        let mut registry = crate::tool::ToolRegistry::new();
+        registry.register(Box::new(AppProbe {
+            hits: hits.clone(),
+            def: crate::tool::ToolDef {
+                name: "get_window_state".into(),
+                description: "app target probe".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+
+        // The probe's bare text fails the output schema; only whether it ran
+        // matters here.
+        let result = call(&registry, "Probe").await;
+        assert!(!denied(&result), "{result}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        let result = call(&registry, "Elsewhere").await;
+        assert!(denied(&result), "{result}");
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn only_shorthand_calls_wait_for_resolution() {
+        use crate::authorization::authorized_after_target_resolution as deferred;
+        use serde_json::json;
+        assert!(deferred("get_window_state", &json!({"app": "X"})));
+        assert!(!deferred("get_window_state", &json!({"pid": 7})));
+        assert!(!deferred("launch_app", &json!({"app": "X"})));
     }
 }

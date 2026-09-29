@@ -29,6 +29,8 @@ check `describe <tool>` there.
 
 ## get_window_state
 
+- Target with `pid` + `window_id`, or on macOS with `app` alone (app name, any case, or exact bundle id). `app` reads the app's only titled window on the current Space. It fails with `app_not_running`, `app_window_not_found`, or `app_window_ambiguous` (which lists `candidates` with `window_id`, `pid`, and `title`). Other platforms refuse `app`.
+- macOS `background_input` (the per-route background capability report) comes on the first read of a window in a session and again when it changes or on `diff:false`; otherwise it is omitted because it is unchanged.
 - Returns `tree_markdown`, the window's tree as text with actionable rows tagged `[N]` (their `element_index`). On macOS the default `element_fields:"none"` omits `structuredContent.elements`; the tree's first line reads `element_token = <snapshot_id>:<index>`, so row `[N]` has token `<snapshot_id>:N`. Pass `element_fields:"compact"` or `"full"` to get element records. Other platforms always return `elements`.
 - Record fields: `element_index`, `element_token`, `role`, `label`, `value` (the element's AXValue; use it to check what a field holds), `actions` (AX action names, omitted when empty), and `screenshot_frame`. Compact records omit `frame`, `parent_index`, `depth`, `enabled` when true, and `selected` when false; `element_fields:"full"` returns every field.
 - `include_accessibility_tree:false` skips the tree walk and returns the screenshot plus `window_bounds`, `screenshot_scale`, `screenshot_width`/`screenshot_height`, `app_name`, and `window_title` (the capture-only path, for example a live preview). Setting both `include_accessibility_tree:false` and `include_screenshot:false` is an error.

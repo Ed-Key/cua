@@ -19,7 +19,9 @@
 use std::sync::Arc;
 
 use cua_driver_core::mcp_wire::{self, ProtocolSession};
-use cua_driver_core::policy::{authorize_tool_call, validate_configured_policy};
+use cua_driver_core::policy::{
+    authorize_tool_call, authorize_unresolved_target_call, validate_configured_policy,
+};
 use cua_driver_core::protocol::{initialize_result, Request, Response};
 use cua_driver_core::server::{
     observe_proxy_session_started, observe_proxy_tool_completed, tool_observation_timer,
@@ -894,7 +896,17 @@ async fn handle_proxy_tool_request(
         "tools/call" => match req.tool_call() {
             Err(e) => Response::error(id, -32602, format!("Invalid params: {e}")),
             Ok(call) => {
-                if let Err(error) = authorize_tool_call(&call.name, &call.args) {
+                // The proxy cannot resolve target shorthands, so it must not
+                // skip its own policy for them: it refuses when the policy is
+                // window-scoped and otherwise applies the tool-level check.
+                let early = if cua_driver_core::authorization::authorized_after_target_resolution(
+                    &call.name, &call.args,
+                ) {
+                    authorize_unresolved_target_call(&call.name, &call.args)
+                } else {
+                    authorize_tool_call(&call.name, &call.args)
+                };
+                if let Err(error) = early {
                     return proxy_tool_result_response(
                         id,
                         cua_driver_core::mcp_result::conforming_proxy_tool_result(
@@ -1184,6 +1196,116 @@ mod tests {
             .contains("explicitly denied"));
     }
 
+    /// Policy configuration is process-wide and immutable, so each policy case
+    /// re-runs its own test in a child process that loads `policy`. Returns
+    /// `true` in the child (run the body) and `false` in the parent, after
+    /// asserting that the child passed.
+    fn in_policy_child(test: &str, policy: &str) -> bool {
+        const CHILD_ENV: &str = "CUA_DRIVER_PROXY_APP_TARGET_TEST_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            return true;
+        }
+        let directory = tempfile::tempdir().expect("temporary policy directory");
+        let path = directory.path().join("policy.yaml");
+        std::fs::write(&path, policy).expect("write policy");
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", &format!("proxy::tests::{test}"), "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .env(cua_driver_core::policy::POLICY_FILE_ENV, &path)
+            .env_remove(cua_driver_core::policy::MANAGED_POLICY_FILE_ENV)
+            .output()
+            .expect("run isolated policy test");
+        assert!(
+            output.status.success(),
+            "isolated {test} failed: {}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        false
+    }
+
+    /// Send `get_window_state {app}` through the proxy. `Err(text)` is a
+    /// proxy-side refusal (never forwarded); `Ok(())` means the proxy
+    /// connected to the daemon socket.
+    #[cfg(unix)]
+    async fn proxy_app_call() -> Result<(), String> {
+        let directory = tempfile::tempdir().expect("temporary socket directory");
+        let socket = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind test daemon");
+        let request = serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 7, "method": "tools/call",
+            "params": {"name": "get_window_state", "arguments": {"app": "Safari"}}
+        }))
+        .expect("valid tool request");
+        let cached_tools = Arc::new(serde_json::json!({"tools": [{"name": "get_window_state"}]}));
+        let response = handle_proxy_request(
+            request,
+            serde_json::json!(7),
+            socket.to_str().unwrap(),
+            &cached_tools,
+            "app-target-test-session",
+            false,
+        );
+        tokio::select! {
+            response = response => {
+                let value = serde_json::to_value(response).expect("serialize response");
+                assert_eq!(value["result"]["structuredContent"]["code"], "permission_denied", "{value}");
+                Err(value["result"]["content"][0]["text"].as_str().unwrap().to_owned())
+            }
+            connection = listener.accept() => {
+                drop(connection);
+                Ok(())
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_refuses_app_target_under_window_scoped_policy() {
+        let policy = "allow:\n  rules:\n    - tool: get_window_state\n      constraints:\n        pid: {allowed: [7]}\n";
+        if !in_policy_child(
+            "proxy_refuses_app_target_under_window_scoped_policy",
+            policy,
+        ) {
+            return;
+        }
+        let refusal = proxy_app_call()
+            .await
+            .expect_err("must be refused, not forwarded");
+        assert!(refusal.contains(
+            "app targeting is unavailable under this proxy's window-scoped policy; call list_windows and pass pid + window_id"
+        ), "{refusal}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_forwards_app_target_without_target_restriction() {
+        if !in_policy_child(
+            "proxy_forwards_app_target_without_target_restriction",
+            "allow:\n  tools: [get_window_state]\n",
+        ) {
+            return;
+        }
+        proxy_app_call()
+            .await
+            .expect("must be forwarded to the daemon");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn proxy_still_denies_app_target_when_tool_is_denied() {
+        if !in_policy_child(
+            "proxy_still_denies_app_target_when_tool_is_denied",
+            "deny:\n  tools: [get_window_state]\n",
+        ) {
+            return;
+        }
+        let refusal = proxy_app_call()
+            .await
+            .expect_err("must be denied, not forwarded");
+        assert!(refusal.contains("explicitly denied"), "{refusal}");
+    }
+
     #[test]
     fn control_disconnect_exits_with_stdin_open() {
         const CHILD_ENV: &str = "CUA_TEST_MCP_CONTROL_STDIN_CHILD";
@@ -1365,7 +1487,11 @@ mod tests {
         )
         .await
         .unwrap();
-        let list = output.split(|b| *b == b'\n').filter(|l| !l.is_empty()).nth(1).unwrap();
+        let list = output
+            .split(|b| *b == b'\n')
+            .filter(|l| !l.is_empty())
+            .nth(1)
+            .unwrap();
         let response: serde_json::Value = serde_json::from_slice(list).unwrap();
         let tools = &response["result"]["tools"];
         assert_eq!(

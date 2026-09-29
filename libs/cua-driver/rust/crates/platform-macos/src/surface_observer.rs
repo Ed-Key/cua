@@ -496,6 +496,10 @@ impl Tool for SurfaceNoted {
             .await
     }
 
+    async fn resolve_target(&self, args: &mut Value) {
+        self.inner.resolve_target(args).await
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         if self.role != Role::Read {
             crate::window_change_detector::end_lingering_focus_guards();
@@ -1015,6 +1019,11 @@ mod tests {
         fn def(&self) -> &ToolDef {
             &self.def
         }
+        async fn resolve_target(&self, args: &mut Value) {
+            if args.as_object_mut().unwrap().remove("app").is_some() {
+                args["pid"] = serde_json::json!(7);
+            }
+        }
         async fn invoke(&self, _args: Value) -> ToolResult {
             self.started.notify_one();
             if let Some(gate) = &self.gate {
@@ -1040,6 +1049,16 @@ mod tests {
             started: started.clone(),
         };
         (Box::new(tool), started)
+    }
+
+    /// Policy runs on the resolved target, so the wrapper must pass
+    /// get_window_state's `app` resolution through.
+    #[tokio::test]
+    async fn wrappers_forward_target_resolution() {
+        let (look, _) = probe("get_window_state", None);
+        let mut args = serde_json::json!({"app": "TextEdit"});
+        read(look).resolve_target(&mut args).await;
+        assert_eq!(args, serde_json::json!({"pid": 7}));
     }
 
     /// A read of the same app must not consume the note while an action on
