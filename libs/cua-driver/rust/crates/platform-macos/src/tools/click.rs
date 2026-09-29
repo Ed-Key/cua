@@ -2006,16 +2006,21 @@ fn select_row(
         if err == crate::ax::bindings::kAXErrorSuccess && row_settles_exclusive(row) {
             return confirmed("with AXPress", false);
         }
-        let replaced = if err == crate::ax::bindings::kAXErrorSuccess {
-            !row.readable() || !unsafe { crate::ax::bindings::element_is_alive(element) }
-        } else {
-            crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
-                crate::ax::bindings::element_gone_after_action(element)
-            })
-        };
+        // A stale handle fails before anything happens: report that.
+        if err == crate::ax::bindings::kAXErrorInvalidUIElement {
+            anyhow::bail!("AXUIElementPerformAction(AXPress) returned {err}; take a fresh snapshot");
+        }
+        let replaced = !row.readable()
+            || if err == crate::ax::bindings::kAXErrorSuccess {
+                !unsafe { crate::ax::bindings::element_is_alive(element) }
+            } else {
+                crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
+                    crate::ax::bindings::element_gone_after_action(element)
+                })
+            };
         // The press replaced the element or its row (it navigated or rebuilt
-        // the list): the row's coordinates may now hold something else, so
-        // no pointer click follows.
+        // the list), or the row no longer answers: the row's coordinates may
+        // now hold something else, so no pointer click follows.
         if replaced {
             return Ok((
                 format!(
@@ -2028,10 +2033,6 @@ fn select_row(
                 false,
                 false,
             ));
-        }
-        // A stale handle fails before anything happens: report that.
-        if err == crate::ax::bindings::kAXErrorInvalidUIElement {
-            anyhow::bail!("AXUIElementPerformAction(AXPress) returned {err}; take a fresh snapshot");
         }
     }
     // The caller resolves the row's pixel target; without one there is no

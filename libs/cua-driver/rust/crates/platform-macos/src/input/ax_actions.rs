@@ -125,6 +125,8 @@ unsafe fn scan_selection(
     row: Option<AXUIElementRef>,
 ) -> (usize, usize, bool, bool) {
     let deadline = std::time::Instant::now() + SCAN_BUDGET;
+    // The list read is bounded too; the container keeps its action timeout.
+    AXUIElementSetMessagingTimeout(parent, 0.5);
     let (children, mut complete) =
         match crate::ax::bindings::copy_element_array_attr_checked(parent, "AXRows", 20_000) {
             Ok(rows) => (rows, true),
@@ -133,10 +135,13 @@ unsafe fn scan_selection(
                 (children, !failed)
             }
         };
+    AXUIElementSetMessagingTimeout(parent, crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS);
     complete &= children.len() <= MAX_SCANNED_PEERS;
     let (mut selectable, mut others, mut any) = (0, 0, false);
     for (at, child) in children.into_iter().enumerate() {
-        if at < MAX_SCANNED_PEERS && complete {
+        // Read the first peers even when the list is too long to prove
+        // anything: they still show whether a selection model exists.
+        if at < MAX_SCANNED_PEERS {
             if std::time::Instant::now() >= deadline {
                 complete = false;
             } else {
@@ -150,13 +155,17 @@ unsafe fn scan_selection(
                     Ok(value) => {
                         let selected =
                             crate::ax::bindings::coerce_binary_value(value.as_CFTypeRef());
-                        if let Some(selected) = selected {
-                            selectable += 1;
-                            any |= selected;
-                            let is_row = row.is_some_and(|row| {
-                                CFEqual(child as CFTypeRef, row as CFTypeRef) != 0
-                            });
-                            others += usize::from(selected && !is_row);
+                        match selected {
+                            Some(selected) => {
+                                selectable += 1;
+                                any |= selected;
+                                let is_row = row.is_some_and(|row| {
+                                    CFEqual(child as CFTypeRef, row as CFTypeRef) != 0
+                                });
+                                others += usize::from(selected && !is_row);
+                            }
+                            // A selection value that is neither on nor off.
+                            None => complete = false,
                         }
                     }
                     // Not a selectable child (a column, a header).
