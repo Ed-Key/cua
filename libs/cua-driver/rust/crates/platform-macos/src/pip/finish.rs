@@ -8,9 +8,9 @@
 //!
 //! The finale shows the session's verified claims not yet shown as a
 //! checklist (latest status per label, the five most recent, oldest first;
-//! only a satisfied claim gets a check), or, with none, the windows it
-//! touched as a row of chips. Rows come in one by one, then the panel holds
-//! and fades.
+//! only a satisfied claim gets a check) under a "Verified n of m" line, or,
+//! with none, the windows it touched as a row of chips. Rows come in one by
+//! one, then the panel holds and fades.
 //!
 //! ## Event ordering
 //!
@@ -47,14 +47,15 @@ pub(super) const CHIP_ROW: usize = 5;
 // (an older check of that label could then show again); raise it if agents
 // ever verify that many different things in one session.
 const CLAIM_MEMORY: usize = 256;
-/// Each row starts this long after the one above it.
-pub(super) const STAGGER: Duration = Duration::from_millis(80);
+/// Each row starts this long after the one above it: quick, but each row
+/// still lands on its own.
+pub(super) const STAGGER: Duration = Duration::from_millis(70);
 /// A row fades and slides in over this long; its mark follows.
 pub(super) const ROW_IN: Duration = Duration::from_millis(150);
 /// A mark draws (and pops) over this long.
-pub(super) const MARK_IN: Duration = Duration::from_millis(200);
+pub(super) const MARK_IN: Duration = Duration::from_millis(180);
 /// The finished state stays up this long once every row is in.
-pub(super) const HOLD: Duration = Duration::from_millis(2500);
+pub(super) const HOLD: Duration = Duration::from_millis(2000);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Claim {
@@ -415,6 +416,18 @@ impl Finale {
         match &self.rows {
             Rows::Checklist(rows) => rows.len(),
             Rows::Chips(chips) => chips.len(),
+        }
+    }
+
+    /// The checklist's caption: "Verified n of m" (m rows, n satisfied);
+    /// `None` for chips.
+    pub(super) fn caption(&self) -> Option<String> {
+        match &self.rows {
+            Rows::Checklist(rows) => {
+                let satisfied = rows.iter().filter(|row| row.satisfied == Some(true)).count();
+                Some(format!("Verified {satisfied} of {}", rows.len()))
+            }
+            Rows::Chips(_) => None,
         }
     }
 
@@ -913,6 +926,12 @@ mod tests {
         let finale = verdicts.finale();
         assert_eq!(finale.kind(), "checklist");
         assert_eq!(finale.log_rows(), ["unsatisfied: text area holds \"hi\""]);
+        assert_eq!(finale.caption().as_deref(), Some("Verified 0 of 1"));
+        verdicts.verify(1, 10, 400, true, vec![claim("saved", Some(true))]);
+        assert_eq!(verdicts.finale().caption().as_deref(), Some("Verified 1 of 2"));
+        let mut chips = Verdicts::default();
+        chips.act(A, "Notes", 100);
+        assert_eq!(chips.finale().caption(), None);
     }
 
     // ── Row: end_session ─────────────────────────────────────────────────
@@ -1037,15 +1056,15 @@ mod tests {
     }
 
     #[test]
-    fn rows_come_in_80_ms_apart_and_the_panel_holds_before_fading() {
+    fn rows_come_in_70_ms_apart_and_the_panel_holds_before_fading() {
         assert_eq!(row_timing(0), (Duration::ZERO, ROW_IN));
         assert_eq!(
             row_timing(3),
-            (Duration::from_millis(240), Duration::from_millis(390))
+            (Duration::from_millis(210), Duration::from_millis(360))
         );
-        // Five rows: last row in at 320 ms, its mark lands at 470 + 200 ms,
-        // then the 2.5 s hold.
-        assert_eq!(finale_duration(5), Duration::from_millis(3170));
+        // Five rows: last row in at 280 ms, its mark lands at 430 + 180 ms,
+        // then the 2 s hold: about 2.6 s in all.
+        assert_eq!(finale_duration(5), Duration::from_millis(2610));
         assert_eq!(finale_duration(0), HOLD);
     }
 

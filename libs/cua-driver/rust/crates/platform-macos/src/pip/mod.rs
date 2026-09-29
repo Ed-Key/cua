@@ -449,6 +449,8 @@ struct Panel {
     finale_view: Option<usize>,
     /// The finale that overlay displays: its timer marks exactly this shown.
     displayed: Option<Finale>,
+    /// The next hide follows a finale: it fades slower.
+    after_finale: bool,
     /// Private session key (for logs from callbacks that only have the
     /// panel).
     key: String,
@@ -489,10 +491,13 @@ struct BackView {
     title: usize,
 }
 
-/// A chip's views.
+/// A chip's views: its badge's mark and glyph layers are null when it has
+/// no badge.
 struct ChipView {
     view: usize,
     icon: usize,
+    mark: usize,
+    glyph: usize,
 }
 
 /// What a card shows besides live pixels, kept so a window that goes behind
@@ -1215,6 +1220,7 @@ unsafe fn resume(panel: &mut Panel, key: &str, worker: &CaptureWorker, at_ms: u6
     }
     // Also a finale that just ended and is still up during the fade.
     remove_finale_view(panel);
+    panel.after_finale = false;
     let now = Instant::now();
     panel.last_action = panel.last_action.max(now);
     worker.mark_delivered(key, now);
@@ -1904,7 +1910,7 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
                 // cancelled by an action, then a new one started at session
                 // end, leaves a stale timer behind.
                 if state.ending[index].lifecycle.end(generation) {
-                    close_panel(state.ending.remove(index));
+                    close_panel(state.ending.remove(index), FINALE_FADE);
                 }
                 return;
             }
@@ -1917,6 +1923,7 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
                         if let Some(finale) = panel.displayed.take() {
                             panel.verdicts.finale_shown(&finale);
                         }
+                        panel.after_finale = true;
                         key.clone()
                     })
                 });
@@ -1935,14 +1942,28 @@ unsafe fn remove_finale_view(panel: &mut Panel) {
     }
 }
 
-/// Height of a checklist row.
-const ROW_HEIGHT: f64 = 22.0;
-/// Size of a checklist mark, and of a finale chip's app icon.
-const MARK_SIZE: f64 = 15.0;
-const FINALE_ICON: f64 = 28.0;
+/// Height of a checklist row (a glass capsule), and the gap between rows.
+const ROW_HEIGHT: f64 = 26.0;
+const ROW_GAP: f64 = 4.0;
+/// Inset of the rows from the well's left edge, and of a row's content
+/// from its capsule.
+const ROW_INSET: f64 = 14.0;
+const ROW_PAD: f64 = 10.0;
+/// Size of a checklist mark.
+const MARK_SIZE: f64 = 16.0;
+/// The "Verified n of m" line above the rows: its height and the gap under it.
+const CAPTION_LINE: f64 = 14.0;
+const CAPTION_GAP: f64 = 8.0;
+/// Gap between finale chips.
+const FINALE_CHIP_GAP: f64 = 12.0;
+/// The scrim under the finale.
+const SCRIM_ALPHA: f64 = 0.6;
+/// The panel fades slower after a finale than after going idle.
+const FINALE_FADE: Duration = Duration::from_millis(400);
 
 /// Put the finale over the front card's image well: a dark scrim with the
-/// checklist rows (or the touched windows' chips) animating in one by one.
+/// checklist rows (glass capsules under a "Verified n of m" line) or the
+/// touched windows' chips animating in one by one.
 unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
     remove_finale_view(panel);
     let (well_w, well_h) = well_size(panel.card);
@@ -1962,85 +1983,114 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
         colorWithSRGBRed: 0.0_f64
         green: 0.0_f64
         blue: 0.0_f64
-        alpha: 0.66_f64
+        alpha: SCRIM_ALPHA
     ];
     let scrim: *mut CGColor = msg_send![scrim, CGColor];
     let _: () = msg_send![layer, setBackgroundColor: scrim];
     let _: () = msg_send![layer, setCornerRadius: WELL_RADIUS];
+    let _: () = msg_send![layer, setMasksToBounds: true];
     let _: () = msg_send![overlay, setAutoresizingMask: 18u64];
     let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
     let start = CACurrentMediaTime();
     match &finale.rows {
         Rows::Checklist(rows) => {
-            let top = (well_h + rows.len() as f64 * ROW_HEIGHT) / 2.0;
-            for (index, row) in rows.iter().enumerate() {
-                let view = new_view(
-                    class!(NSView),
-                    ns_rect(Area {
-                        x: 0.0,
-                        y: top - (index + 1) as f64 * ROW_HEIGHT,
-                        w: well_w,
-                        h: ROW_HEIGHT,
-                    }),
+            let pitch = ROW_HEIGHT + ROW_GAP;
+            let total = CAPTION_LINE + CAPTION_GAP + rows.len() as f64 * pitch - ROW_GAP;
+            let top = (well_h + total) / 2.0;
+            // Width sizable, flexible top and bottom: stays centered.
+            const ROW_MASK: u64 = 2 | 8 | 32;
+            if let Some(text) = finale.caption() {
+                let caption = new_label(
+                    NSRect::new(
+                        NSPoint::new(ROW_INSET + ROW_PAD, top - CAPTION_LINE),
+                        NSSize::new((well_w - 2.0 * ROW_INSET).max(0.0), CAPTION_LINE),
+                    ),
+                    11.0,
+                    0.23,
+                    false,
                 );
-                let _: () = msg_send![view, setWantsLayer: true];
-                // Width sizable, flexible top and bottom: stays centered.
-                let _: () = msg_send![view, setAutoresizingMask: 2u64 | 8 | 32];
+                let dim: *mut AnyObject = msg_send![white, colorWithAlphaComponent: 0.7_f64];
+                let _: () = msg_send![caption, setTextColor: dim];
+                let _: () = msg_send![caption, setAutoresizingMask: ROW_MASK];
+                set_text(caption as usize, &text);
+                let _: () = msg_send![caption, setWantsLayer: true];
+                let caption_layer: *mut AnyObject = msg_send![caption, layer];
+                animate_row(caption_layer, std::ptr::null_mut(), std::ptr::null_mut(), 0, start, (-10.0, 0.0));
+                let _: () = msg_send![overlay, addSubview: caption];
+            }
+            let rows_top = top - CAPTION_LINE - CAPTION_GAP;
+            for (index, row) in rows.iter().enumerate() {
                 let kind = match row.satisfied {
                     Some(true) => Mark::Check,
                     Some(false) => Mark::Warning,
                     None => Mark::Unknown,
                 };
+                let label = new_label(NSRect::ZERO, 13.0, 0.0, false);
+                let alpha = match row.satisfied {
+                    Some(true) => 1.0,
+                    Some(false) => 0.8,
+                    None => 0.6,
+                };
+                let color: *mut AnyObject = msg_send![white, colorWithAlphaComponent: alpha];
+                let _: () = msg_send![label, setTextColor: color];
+                set_text(label as usize, &row.label);
+                let _: () = msg_send![label, sizeToFit];
+                let fitted: NSRect = msg_send![label, frame];
+                let text_x = ROW_PAD + MARK_SIZE + 8.0;
+                let max_w = (well_w - 2.0 * ROW_INSET).max(0.0);
+                let row_w = (text_x + fitted.size.width + ROW_PAD).min(max_w);
+                let _: () = msg_send![
+                    label,
+                    setFrame: NSRect::new(
+                        NSPoint::new(text_x, (ROW_HEIGHT - 16.0) / 2.0),
+                        NSSize::new((row_w - text_x - ROW_PAD).max(0.0), 16.0)
+                    )
+                ];
+                // The row: a glass capsule sized to its text, in a plain
+                // view that carries the animation.
+                let frame = NSRect::new(
+                    NSPoint::new(ROW_INSET, rows_top - (index + 1) as f64 * pitch + ROW_GAP),
+                    NSSize::new(row_w, ROW_HEIGHT),
+                );
+                let view = new_view(class!(NSView), frame);
+                let _: () = msg_send![view, setWantsLayer: true];
+                let _: () = msg_send![view, setAutoresizingMask: 8u64 | 32];
+                let bounds = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
+                let body = new_view(class!(NSView), bounds);
+                let _: () = msg_send![body, setWantsLayer: true];
                 let (mark, glyph) = new_mark(MARK_SIZE, kind);
                 let _: () = msg_send![
                     mark,
                     setFrame: NSRect::new(
-                        NSPoint::new(12.0, (ROW_HEIGHT - MARK_SIZE) / 2.0),
+                        NSPoint::new(ROW_PAD, (ROW_HEIGHT - MARK_SIZE) / 2.0),
                         NSSize::new(MARK_SIZE, MARK_SIZE)
                     )
                 ];
-                let label = new_label(
-                    NSRect::new(
-                        NSPoint::new(12.0 + MARK_SIZE + 8.0, (ROW_HEIGHT - 16.0) / 2.0),
-                        NSSize::new((well_w - 44.0).max(0.0), 16.0),
-                    ),
-                    12.0,
-                    0.23,
-                    false,
-                );
-                let _: () = msg_send![label, setTextColor: white];
-                let _: () = msg_send![label, setAutoresizingMask: 2u64];
-                set_text(label as usize, &row.label);
-                let _: () = msg_send![view, addSubview: label];
+                let body_layer: *mut AnyObject = msg_send![body, layer];
+                let _: () = msg_send![body_layer, addSublayer: mark];
+                let _: () = msg_send![body, addSubview: label];
+                add_subview(view, glass_background(bounds, body, ROW_HEIGHT / 2.0));
                 let view_layer: *mut AnyObject = msg_send![view, layer];
-                let _: () = msg_send![view_layer, addSublayer: mark];
-                animate_row(view_layer, mark, glyph, index, start, (-8.0, 0.0));
+                animate_row(view_layer, mark, glyph, index, start, (-10.0, 0.0));
                 add_subview(overlay, view);
             }
         }
         Rows::Chips(chips) => {
-            let gap = 10.0;
+            use stack::{CHIP_H, CHIP_W};
             let count = chips.len() as f64;
-            let total = count * FINALE_ICON + (count - 1.0).max(0.0) * gap;
-            let (x0, y) = ((well_w - total) / 2.0, (well_h - FINALE_ICON) / 2.0);
+            let total = count * CHIP_W + (count - 1.0).max(0.0) * FINALE_CHIP_GAP;
+            let (x0, y) = ((well_w - total) / 2.0, (well_h - CHIP_H) / 2.0);
             for (index, chip) in chips.iter().enumerate() {
-                let view = new_view(
-                    class!(NSView),
-                    ns_rect(Area {
-                        x: x0 + index as f64 * (FINALE_ICON + gap),
-                        y,
-                        w: FINALE_ICON,
-                        h: FINALE_ICON,
-                    }),
-                );
-                let _: () = msg_send![view, setWantsLayer: true];
+                // The same chip as in the trail, so one shape means finished.
+                let view = new_chip(overlay, chip.finished);
+                let _: () = msg_send![
+                    view.view as *mut AnyObject,
+                    setFrameOrigin: NSPoint::new(x0 + index as f64 * (CHIP_W + FINALE_CHIP_GAP), y)
+                ];
+                let _: () = msg_send![view.view as *mut AnyObject, setHidden: false];
                 // Flexible margins: stays centered.
-                let _: () = msg_send![view, setAutoresizingMask: 1u64 | 4 | 8 | 32];
-                let _: () = msg_send![view as *mut AnyObject, setToolTip: ns_string(&chip.title)];
-                let icon = new_icon_view(NSRect::new(
-                    NSPoint::new(0.0, 0.0),
-                    NSSize::new(FINALE_ICON, FINALE_ICON),
-                ));
+                let _: () = msg_send![view.view as *mut AnyObject, setAutoresizingMask: 1u64 | 4 | 8 | 32];
+                let _: () = msg_send![view.view as *mut AnyObject, setToolTip: ns_string(&chip.title)];
                 let app: *mut AnyObject = match chip.tag.0 {
                     Some(pid) => msg_send![
                         class!(NSRunningApplication),
@@ -2048,27 +2098,16 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
                     ],
                     None => std::ptr::null_mut(),
                 };
-                let _: () = msg_send![icon, setImage: app_icon(app)];
-                let _: () = msg_send![view, addSubview: icon];
-                let view_layer: *mut AnyObject = msg_send![view, layer];
-                // A check only on a finished window's chip.
-                let (mark, glyph) = if chip.finished {
-                    let size = 13.0;
-                    let (mark, glyph) = new_mark(size, Mark::Check);
-                    let _: () = msg_send![
-                        mark,
-                        setFrame: NSRect::new(
-                            NSPoint::new(FINALE_ICON - size + 3.0, -3.0),
-                            NSSize::new(size, size)
-                        )
-                    ];
-                    let _: () = msg_send![view_layer, addSublayer: mark];
-                    (mark, glyph)
-                } else {
-                    (std::ptr::null_mut(), std::ptr::null_mut())
-                };
-                animate_row(view_layer, mark, glyph, index, start, (0.0, -6.0));
-                add_subview(overlay, view);
+                let _: () = msg_send![view.icon as *mut AnyObject, setImage: app_icon(app)];
+                let view_layer: *mut AnyObject = msg_send![view.view as *mut AnyObject, layer];
+                animate_row(
+                    view_layer,
+                    view.mark as *mut AnyObject,
+                    view.glyph as *mut AnyObject,
+                    index,
+                    start,
+                    (0.0, -6.0),
+                );
             }
         }
     }
@@ -2387,15 +2426,15 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
             }
             state.ending.push(panel);
         } else {
-            close_panel(panel);
+            close_panel(panel, FADE);
         }
     });
 }
 
-/// Fade the panel out, then close it.
-unsafe fn close_panel(panel: Panel) {
-    animate_alpha(panel.window, 0.0);
-    dispatch_to_main_after(FADE, panel.window, close_window_cb);
+/// Fade the panel out over `fade`, then close it.
+unsafe fn close_panel(panel: Panel, fade: Duration) {
+    animate_alpha_over(panel.window, 0.0, fade);
+    dispatch_to_main_after(fade, panel.window, close_window_cb);
 }
 
 unsafe extern "C" fn close_window_cb(ctx: *mut c_void) {
@@ -2450,14 +2489,23 @@ unsafe fn hide(panel: &mut Panel, key: &str) {
         return;
     }
     panel.shown = false;
-    animate_alpha(panel.window, 0.0);
-    dispatch_to_main_after(FADE, key.to_owned(), order_out_cb);
+    let fade = if std::mem::take(&mut panel.after_finale) {
+        FINALE_FADE
+    } else {
+        FADE
+    };
+    animate_alpha_over(panel.window, 0.0, fade);
+    dispatch_to_main_after(fade, key.to_owned(), order_out_cb);
 }
 
 unsafe fn animate_alpha(window: usize, alpha: f64) {
+    animate_alpha_over(window, alpha, FADE);
+}
+
+unsafe fn animate_alpha_over(window: usize, alpha: f64, fade: Duration) {
     let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
     let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
-    let _: () = msg_send![context, setDuration: FADE.as_secs_f64()];
+    let _: () = msg_send![context, setDuration: fade.as_secs_f64()];
     let animator: *mut AnyObject = msg_send![window as *mut AnyObject, animator];
     let _: () = msg_send![animator, setAlphaValue: alpha];
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
@@ -2489,7 +2537,7 @@ extern "C" fn on_hide(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) 
     with_state(|state| {
         // An ended session's panel playing its finale: close it now.
         if let Some(index) = state.ending.iter().position(|panel| panel.id == id) {
-            unsafe { close_panel(state.ending.remove(index)) };
+            unsafe { close_panel(state.ending.remove(index), FADE) };
             return;
         }
         let Some(key) = state
@@ -2869,12 +2917,13 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         alpha: 0.55_f64
     ];
     let dark: *mut CGColor = msg_send![dark, CGColor];
+    // `arrayWithObjects:count:` takes a pointer to a C array of ids.
+    let stops: [*mut AnyObject; 2] = [dark as *mut AnyObject, clear as *mut AnyObject];
     let colors: *mut AnyObject = msg_send![
         class!(NSArray),
-        arrayWithObjects: dark as *mut AnyObject
-        count: 1usize
+        arrayWithObjects: stops.as_ptr()
+        count: 2usize
     ];
-    let colors: *mut AnyObject = msg_send![colors, arrayByAddingObject: clear as *mut AnyObject];
     let _: () = msg_send![gradient, setColors: colors];
     // Bottom (dark) to top (clear): the layer's y axis points up.
     let _: () = msg_send![gradient, setStartPoint: NSPoint::new(0.5, 0.0)];
@@ -2928,6 +2977,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         lifecycle: Lifecycle::default(),
         finale_view: None,
         displayed: None,
+        after_finale: false,
         key: key.to_owned(),
         card,
         laid_out: (0.0, 0.0),
@@ -3153,6 +3203,7 @@ unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
     let _: () = msg_send![glass, setAutoresizingMask: CENTERED];
     add_subview(view, glass);
 
+    let (mut mark, mut glyph) = (std::ptr::null_mut(), std::ptr::null_mut());
     if finished {
         let badge = new_view(
             class!(NSView),
@@ -3163,7 +3214,7 @@ unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
         );
         let _: () = msg_send![badge, setWantsLayer: true];
         let badge_layer: *mut AnyObject = msg_send![badge, layer];
-        let (mark, _) = new_mark(CHIP_BADGE, Mark::Check);
+        (mark, glyph) = new_mark(CHIP_BADGE, Mark::Check);
         let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
         let white: *mut CGColor = msg_send![white, CGColor];
         let _: () = msg_send![mark, setBorderWidth: CHIP_BADGE_RING];
@@ -3178,6 +3229,8 @@ unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
     ChipView {
         view: view as usize,
         icon: icon as usize,
+        mark: mark as usize,
+        glyph: glyph as usize,
     }
 }
 
