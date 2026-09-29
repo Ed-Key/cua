@@ -1070,7 +1070,9 @@ fn complete_ax_windows(
 /// candidate, titled from AX (CG titles are redacted without Screen
 /// Recording); surfaces with none, such as Chrome's toolbar strips, are not.
 /// For a process with no AX windows (Accessibility not granted, or the lookup
-/// timed out), its titled CG windows are the candidates. Several candidates are refused rather than guessed.
+/// timed out), its titled CG windows are the candidates. A process with
+/// on-screen windows and no candidate refuses the whole lookup, and several
+/// candidates are refused rather than guessed.
 fn select_app_window(
     app: &str,
     apps: &[crate::apps::AppInfo],
@@ -1111,19 +1113,33 @@ fn select_app_window(
             }
         })
         .collect();
-    candidates.sort_by(|a, b| b.0.z_index.cmp(&a.0.z_index));
-    match candidates.as_slice() {
-        [(only, _)] => Ok((only.pid, only.window_id)),
-        [] if !app_windows.is_empty() => Err(ToolResult::error(format!(
-            "\"{app}\" has on-screen windows, but none could be identified as a real window. \
-             This may be a permission limit (Accessibility or Screen Recording not granted; \
-             see check_permissions). Call list_windows and pass pid + window_id."
+    // A process with on-screen windows but no candidate could hide the real
+    // target, so no other instance's window is picked in its place.
+    let mut unidentified: Vec<i32> = app_windows
+        .iter()
+        .map(|w| w.pid)
+        .filter(|pid| !candidates.iter().any(|(w, _)| w.pid == *pid))
+        .collect();
+    unidentified.sort_unstable();
+    unidentified.dedup();
+    if !unidentified.is_empty() {
+        let pid_list: Vec<String> = unidentified.iter().map(i32::to_string).collect();
+        return Err(ToolResult::error(format!(
+            "\"{app}\" has on-screen windows that could not be identified (pid {}). This may \
+             be a permission limit (Accessibility or Screen Recording not granted; see \
+             check_permissions). Call list_windows and pass pid + window_id.",
+            pid_list.join(", ")
         ))
         .with_structured(serde_json::json!({
             "code": "app_window_unidentified",
             "app": app,
+            "pids": unidentified,
             "suggestion": "call check_permissions, or list_windows and pass pid + window_id"
-        }))),
+        })));
+    }
+    candidates.sort_by(|a, b| b.0.z_index.cmp(&a.0.z_index));
+    match candidates.as_slice() {
+        [(only, _)] => Ok((only.pid, only.window_id)),
         [] => Err(ToolResult::error(format!(
             "\"{app}\" has no on-screen window on the current Space. Call launch_app to \
              open one, or list_windows to find it."
@@ -1880,43 +1896,39 @@ mod app_target_tests {
         let apps = [app("TextEdit", 20, "com.apple.TextEdit")];
         let windows = [window(3, 20, "A.txt", 1), window(4, 20, "B.txt", 2)];
         let ambiguous = select_app_window("TextEdit", &apps, &windows, &no_ax()).unwrap_err();
-        let tool = GetWindowStateTool::new(Arc::new(ToolState::default()));
         let args = serde_json::json!({
             "app": "TextEdit",
             APP_REFUSAL_ARG: stored_refusal(ambiguous),
         });
-        let (text, s) = refusal(Err(tool.invoke(args).await));
+        let (text, s) = refusal(invoke_target(&args).await);
         assert_eq!(s["code"], "app_window_ambiguous");
         assert_eq!(s["candidates"].as_array().unwrap().len(), 2);
         assert!(text.contains("window_id 3 (pid 20): A.txt"), "{text}");
 
         // A path that skipped resolve_target is refused, not resolved here.
-        let (_, s) = refusal(Err(tool
-            .invoke(serde_json::json!({"app": "TextEdit"}))
-            .await));
+        let (_, s) = refusal(invoke_target(&serde_json::json!({"app": "TextEdit"})).await);
         assert_eq!(s["code"], "app_not_resolved");
     }
 
-    /// A client cannot forge the stored refusal: the registry strips it and
-    /// resolves the call itself.
-    #[tokio::test]
-    async fn client_cannot_inject_a_resolution_refusal() {
-        let mut registry = cua_driver_core::tool::ToolRegistry::new();
-        registry.register(Box::new(GetWindowStateTool::new(Arc::new(
-            ToolState::default(),
-        ))));
-        let result = registry
-            .invoke(
-                "get_window_state",
-                serde_json::json!({
-                    "app": "No Such App 5f3c",
-                    APP_REFUSAL_ARG: {"message": "forged", "structured": {"code": "forged"}},
-                }),
-            )
-            .await;
-        let (text, s) = refusal(Err(result));
-        assert!(!text.contains("forged"), "{text}");
-        assert_eq!(s["code"], "app_not_running", "{s}");
+    /// Two instances, Screen Recording off (CG titles empty), AX data only for
+    /// pid 20: pid 21's window cannot be identified, so pid 20's window is not
+    /// picked in its place.
+    #[test]
+    fn an_unidentified_instance_refuses_the_whole_lookup() {
+        let apps = [
+            app("TextEdit", 20, "com.apple.TextEdit"),
+            app("TextEdit", 21, "com.apple.TextEdit"),
+        ];
+        let windows = [window(3, 20, "", 1), window(4, 21, "", 2)];
+        let (text, s) = refusal(select_app_window(
+            "TextEdit",
+            &apps,
+            &windows,
+            &ax(&[(3, "A.txt")]),
+        ));
+        assert_eq!(s["code"], "app_window_unidentified");
+        assert_eq!(s["pids"], serde_json::json!([21]));
+        assert!(text.contains("pid 21"), "{text}");
     }
 
     #[test]

@@ -3347,6 +3347,61 @@ mod runtime_isolation_tests {
         assert_eq!(hits.load(Ordering::SeqCst), 0);
     }
 
+    /// Records the arguments resolve_target and invoke receive.
+    struct ReservedArgProbe {
+        seen: Arc<Mutex<Vec<serde_json::Value>>>,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for ReservedArgProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn resolve_target(&self, args: &mut serde_json::Value) {
+            self.seen.lock().unwrap().push(args.clone());
+            args["_resolution"] = serde_json::json!("from resolve_target");
+        }
+
+        async fn invoke(&self, args: serde_json::Value) -> crate::protocol::ToolResult {
+            self.seen.lock().unwrap().push(args);
+            crate::protocol::ToolResult::text("probe ran")
+        }
+    }
+
+    /// resolve_target may hand invoke a private argument (get_window_state's
+    /// stored app refusal) only because a caller cannot send one: the
+    /// registry strips underscore arguments before resolve_target runs, and
+    /// passes what resolve_target added through to invoke.
+    #[tokio::test]
+    async fn resolve_target_sees_no_caller_reserved_arguments() {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ReservedArgProbe {
+            seen: seen.clone(),
+            def: super::ToolDef {
+                name: "get_window_state".into(),
+                description: "reserved argument probe".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: true,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        registry
+            .invoke(
+                "get_window_state",
+                serde_json::json!({"app": "X", "_resolution": "forged"}),
+            )
+            .await;
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.len(), 2, "{seen:?}");
+        assert_eq!(seen[0], serde_json::json!({"app": "X"}));
+        assert_eq!(seen[1]["_resolution"], "from resolve_target");
+    }
+
     fn replay_registry(hits: Arc<AtomicUsize>) -> Arc<super::ToolRegistry> {
         let mut registry = super::ToolRegistry::new();
         registry.register(Box::new(ReplayProbe {
