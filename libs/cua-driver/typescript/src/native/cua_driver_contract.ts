@@ -148,7 +148,13 @@ export enum ElementFields {
     /**
      * Every field.
      */
-    Full
+    Full,
+    /**
+     * Omit the `elements` array; address elements by tree index with
+     * `element_token` = `<snapshot_id>:<index>` or `element_index` +
+     * `snapshot_id`. The macOS default.
+     */
+    None
 }
 
 const FfiConverterTypeElementFields = (() => {
@@ -159,6 +165,7 @@ const FfiConverterTypeElementFields = (() => {
             switch (ordinalConverter.read(from)) {
                 case 1: return ElementFields.Compact;
                 case 2: return ElementFields.Full;
+                case 3: return ElementFields.None;
                 default: throw new UniffiInternalError.UnexpectedEnumCase();
             }
         }
@@ -166,6 +173,7 @@ const FfiConverterTypeElementFields = (() => {
             switch (value) {
                 case ElementFields.Compact: return ordinalConverter.write(1, into);
                 case ElementFields.Full: return ordinalConverter.write(2, into);
+                case ElementFields.None: return ordinalConverter.write(3, into);
             }
         }
         allocationSize(value: TypeName): number {
@@ -182,7 +190,7 @@ export type ActionReadObservation = {
     maxElements?: number,
     maxDepth?: number,
     /**
-     * Passed to get_window_state: "compact" (default) or "full" element records.
+     * Passed to get_window_state: "none" (default, tree only), "compact" or "full" element records.
      */
     elementFields?: ElementFields
 }
@@ -2979,10 +2987,11 @@ export type GetWindowStateInput = {
      */
     diff?: boolean,
     /**
-     * macOS only. "compact" (default) omits per-element frame, depth and
-     * parent_index, omits enabled when true and selected when false, and
-     * drops the _note; "full" returns every field. Other platforms accept
-     * and ignore it and always return full records.
+     * macOS only. "none" (default) omits the elements array (tokens are
+     * `<snapshot_id>:<index>` from the tree); "compact" omits per-element
+     * frame, depth and parent_index, omits enabled when true and selected
+     * when false, and drops the _note; "full" returns every field. Other
+     * platforms accept and ignore it and always return full records.
      */
     elementFields?: ElementFields,
     includeAccessibilityTree?: boolean,

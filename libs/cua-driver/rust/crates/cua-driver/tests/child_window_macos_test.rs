@@ -84,7 +84,7 @@ fn wait_for_journal(fixture: &Fixture, needle: &str) -> String {
 fn snapshot(driver: &mut McpDriver, pid: u32, window_id: u32) -> ToolResponse {
     let result = driver.call(
         "get_window_state",
-        serde_json::json!({"pid": pid, "window_id": window_id, "include_screenshot": false, "diff": false}),
+        serde_json::json!({"pid": pid, "window_id": window_id, "include_screenshot": false, "diff": false, "element_fields": "compact"}),
     );
     assert!(!result.is_error(), "get_window_state failed: {}", result.text());
     result

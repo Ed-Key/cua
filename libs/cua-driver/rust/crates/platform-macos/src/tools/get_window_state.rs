@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use cua_driver_contract::ElementFields;
 use cua_driver_core::{
     protocol::{Content, ToolResult},
     tool::{Tool, ToolDef},
@@ -260,11 +261,14 @@ impl Tool for GetWindowStateTool {
             Some(serde_json::Value::Bool(false)) => false,
             Some(_) => return ToolResult::error("diff must be a boolean"),
         };
-        let full_elements = match args.get("element_fields").map(|v| v.as_str()) {
-            None | Some(Some("compact")) => false,
-            Some(Some("full")) => true,
+        let element_fields = match args.get("element_fields").map(|v| v.as_str()) {
+            None | Some(Some("none")) => ElementFields::None,
+            Some(Some("compact")) => ElementFields::Compact,
+            Some(Some("full")) => ElementFields::Full,
             Some(_) => {
-                return ToolResult::error("element_fields must be \"compact\" or \"full\"")
+                return ToolResult::error(
+                    "element_fields must be \"none\", \"compact\" or \"full\"",
+                )
             }
         };
 
@@ -486,7 +490,7 @@ impl Tool for GetWindowStateTool {
                 max_elements,
                 max_depth,
                 screenshot: screenshot_transform,
-                full_elements,
+                element_fields,
             };
             let mut next_id = prior.as_ref().map_or(0, |p| p.next_id);
             match prior.as_ref() {
@@ -529,6 +533,50 @@ impl Tool for GetWindowStateTool {
             owner
         });
 
+        let element_count = tree_result
+            .as_ref()
+            .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
+            .unwrap_or(0);
+        // A screenshot-only look publishes no actionable rows, but it must not
+        // erase the window's numbering history: the next tree look would start
+        // at zero and hand a vanished row's number to another control.
+        let snapshot_payload = prepared_snapshot.or_else(|| {
+            screenshot_resize_scale.is_some().then(|| match prior {
+                Some(p) => p.into_history_payload(),
+                None => crate::ax::cache::CachedSnapshot::from_nodes(&[]),
+            })
+        });
+        let snapshot_id = snapshot_payload
+            .filter(|_| scope_matched && !observation_only)
+            .and_then(|payload| {
+                self.state.element_cache.publish_for_session(
+                    pid,
+                    u64::from(window_id),
+                    payload,
+                    session_id.as_deref(),
+                    screenshot_resize_scale,
+                )
+            });
+        if let Some(snapshot_id) = snapshot_id {
+            self.state
+                .zoom_registry
+                .retire_replaced(pid, u64::from(window_id), snapshot_id);
+        }
+        let snapshot_handle = snapshot_id.map(|sid| {
+            cua_driver_core::element_token::token_for(sid, 0)
+                .trim_end_matches(":0")
+                .to_string()
+        });
+        // Without element records the tree is the only index, so it says how
+        // to form a token from any row.
+        if let (ElementFields::None, Some(handle), Some(r)) = (
+            element_fields,
+            snapshot_handle.as_deref(),
+            tree_result.as_mut(),
+        ) {
+            prepend_token_hint(&mut r.tree_markdown, handle);
+        }
+
         // Build response.
         let mut content: Vec<Content> = Vec::new();
 
@@ -566,40 +614,11 @@ impl Tool for GetWindowStateTool {
             );
         }
 
-        let element_count = tree_result
-            .as_ref()
-            .map(|r| r.nodes.iter().filter(|n| n.element_index.is_some()).count())
-            .unwrap_or(0);
         let tree_md = tree_result
             .as_ref()
             .map(|r| r.tree_markdown.clone())
             .unwrap_or_default();
 
-        // A screenshot-only look publishes no actionable rows, but it must not
-        // erase the window's numbering history: the next tree look would start
-        // at zero and hand a vanished row's number to another control.
-        let snapshot_payload = prepared_snapshot.or_else(|| {
-            screenshot_resize_scale.is_some().then(|| match prior {
-                Some(p) => p.into_history_payload(),
-                None => crate::ax::cache::CachedSnapshot::from_nodes(&[]),
-            })
-        });
-        let snapshot_id = snapshot_payload
-            .filter(|_| scope_matched && !observation_only)
-            .and_then(|payload| {
-                self.state.element_cache.publish_for_session(
-                    pid,
-                    u64::from(window_id),
-                    payload,
-                    session_id.as_deref(),
-                    screenshot_resize_scale,
-                )
-            });
-        if let Some(snapshot_id) = snapshot_id {
-            self.state
-                .zoom_registry
-                .retire_replaced(pid, u64::from(window_id), snapshot_id);
-        }
         let capture_id = match (snapshot_id, screenshot.as_ref()) {
             (Some(_), Some((png, _, width, height, native_width, native_height, _, _))) => {
                 match self.state.capture_bindings.publish_window(
@@ -700,9 +719,7 @@ impl Tool for GetWindowStateTool {
                 Issue #22865: use `max_elements` / `max_depth` to bound the \
                 AX walk on apps with very large trees."
         });
-        if !full_elements {
-            compact_elements(&mut structured);
-        }
+        project_elements(&mut structured, element_fields);
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
         }
@@ -732,11 +749,8 @@ impl Tool for GetWindowStateTool {
         // embedded in every `element_token` emitted in `elements[]` above.
         // Additive — old consumers ignore it. Absent when no snapshot was
         // registered (unresolved window scope).
-        if let Some(sid) = snapshot_id {
-            structured["snapshot_id"] =
-                serde_json::json!(cua_driver_core::element_token::token_for(sid, 0)
-                    .trim_end_matches(":0")
-                    .to_string());
+        if let Some(handle) = snapshot_handle {
+            structured["snapshot_id"] = serde_json::json!(handle);
         }
         if let Some(capture_id) = capture_id {
             structured["capture_id"] = serde_json::json!(capture_id);
@@ -1139,6 +1153,26 @@ fn diff_baseline<'a>(
             && p.session == *session
             && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
     })
+}
+
+/// Apply the `element_fields` projection: "none" drops the records (and the
+/// `_note` recommending them), "compact" trims them, "full" keeps them.
+fn project_elements(structured: &mut Value, fields: ElementFields) {
+    match fields {
+        ElementFields::Full => {}
+        ElementFields::Compact => compact_elements(structured),
+        ElementFields::None => {
+            if let Some(map) = structured.as_object_mut() {
+                map.remove("elements");
+                map.remove("_note");
+            }
+        }
+    }
+}
+
+/// First line of a "none" tree: how to turn a row's `[index]` into a token.
+fn prepend_token_hint(tree_markdown: &mut String, snapshot_handle: &str) {
+    tree_markdown.insert_str(0, &format!("element_token = {snapshot_handle}:<index>\n"));
 }
 
 /// The `element_fields:"compact"` projection. Agents re-read every result on
@@ -2010,38 +2044,67 @@ mod tests {
     #[test]
     fn schema_advertises_element_fields() {
         let property = &def().input_schema["properties"]["element_fields"];
-        assert_eq!(property["enum"], json!(["compact", "full"]));
+        assert_eq!(property["enum"], json!(["none", "compact", "full"]));
         assert!(property["description"]
             .as_str()
             .unwrap()
-            .contains("compact\" (default)"));
+            .contains("none\" (default)"));
+    }
+
+    #[test]
+    fn none_projection_omits_elements_and_keeps_the_tree() {
+        let mut structured = compact_fixture();
+        project_elements(&mut structured, ElementFields::None);
+        assert!(structured.get("elements").is_none());
+        assert!(structured.get("_note").is_none());
+        assert_eq!(structured["tree_markdown"], "- AXGroup");
+        assert_eq!(structured["window_id"], 9);
+        let mut compact = compact_fixture();
+        project_elements(&mut compact, ElementFields::Compact);
+        assert_eq!(compact["elements"].as_array().unwrap().len(), 3);
+    }
+
+    #[test]
+    fn none_tree_names_the_token_form() {
+        let mut tree = "- [0] AXButton (Save)".to_owned();
+        prepend_token_hint(&mut tree, "s0000000d");
+        assert_eq!(
+            tree,
+            "element_token = s0000000d:<index>\n- [0] AXButton (Save)"
+        );
     }
 
     #[test]
     fn switching_element_fields_forces_a_full_look() {
         let nodes = vec![node(Some(0), "AXButton", Some("Save"), 1, None, None, vec![])];
-        let compact = crate::ax::cache::LookBounds {
-            max_elements: 10,
-            max_depth: 5,
-            ..Default::default()
-        };
-        let prior = crate::ax::cache::PriorLook {
-            elements: Vec::new(),
-            rows: crate::ax::diff::rows_of(&nodes),
-            next_id: 1,
-            bounds: compact,
-            session: Some("s".into()),
-            full_delivered: true,
-        };
         let session = Some("s".to_owned());
-        assert!(diff_baseline(Some(&prior), &compact, &session).is_some());
-        let full = crate::ax::cache::LookBounds {
-            full_elements: true,
-            ..compact
-        };
-        assert!(
-            diff_baseline(Some(&prior), &full, &session).is_none(),
-            "a full request after a compact look must not diff against compact rows"
-        );
+        let all = [ElementFields::None, ElementFields::Compact, ElementFields::Full];
+        for before in all {
+            let prior_bounds = crate::ax::cache::LookBounds {
+                max_elements: 10,
+                max_depth: 5,
+                element_fields: before,
+                ..Default::default()
+            };
+            let prior = crate::ax::cache::PriorLook {
+                elements: Vec::new(),
+                rows: crate::ax::diff::rows_of(&nodes),
+                next_id: 1,
+                bounds: prior_bounds,
+                session: Some("s".into()),
+                full_delivered: true,
+            };
+            for after in all {
+                let bounds = crate::ax::cache::LookBounds {
+                    element_fields: after,
+                    ..prior_bounds
+                };
+                assert_eq!(
+                    diff_baseline(Some(&prior), &bounds, &session).is_some(),
+                    before == after,
+                    "{before:?} -> {after:?} must diff only when the projection is unchanged"
+                );
+            }
+        }
     }
 }

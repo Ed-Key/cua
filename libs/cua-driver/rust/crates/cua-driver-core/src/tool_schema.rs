@@ -138,9 +138,9 @@ pub fn timeout_ms_schema() -> Value {
 pub fn element_fields_schema() -> Value {
     json!({
         "type": "string",
-        "enum": ["compact", "full"],
-        "description": "macOS: \"compact\" (default) omits frame, depth, parent_index and default \
-            flags; \"full\" returns every field. Other platforms return full records."
+        "enum": ["none", "compact", "full"],
+        "description": "macOS: \"none\" (default) omits elements (token = <snapshot_id>:<index>), \
+            \"compact\" trims records, \"full\" returns every field. Other platforms return full records."
     })
 }
 

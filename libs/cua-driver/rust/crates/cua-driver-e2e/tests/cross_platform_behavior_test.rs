@@ -28,8 +28,8 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cua_driver_contract::{
-    ActionTarget, ClickInput, ClickPosition, GetWindowStateInput, InputDeliveryMode, ListAppsInput,
-    ListWindowsInput, WindowStateOutput,
+    ActionTarget, ClickInput, ClickPosition, ElementFields, GetWindowStateInput, InputDeliveryMode,
+    ListAppsInput, ListWindowsInput, WindowStateOutput,
 };
 use cua_driver_sdk::{CuaDriver, DriverError};
 use cua_driver_testkit::ax::{element_index_by_id, element_index_containing};
@@ -854,7 +854,8 @@ fn sdk_window_input(fixture: &Fixture) -> GetWindowStateInput {
         query: None,
         query_context: None,
         diff: None,
-        element_fields: None,
+        // sdk_click_token reads the typed element records.
+        element_fields: Some(ElementFields::Compact),
         include_accessibility_tree: Some(true),
         include_screenshot: Some(false),
         screenshot_out_file: None,

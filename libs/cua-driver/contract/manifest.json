@@ -71,8 +71,9 @@
             },
             "properties": {
               "element_fields": {
-                "description": "Passed to get_window_state: \"compact\" (default) or \"full\" element records.",
+                "description": "Passed to get_window_state: \"none\" (default, tree only), \"compact\" or \"full\" element records.",
                 "enum": [
+                  "none",
                   "compact",
                   "full"
                 ],
@@ -1909,8 +1910,9 @@
             "type": "boolean"
           },
           "element_fields": {
-            "description": "macOS only. \"compact\" (default) omits per-element frame, depth and\nparent_index, omits enabled when true and selected when false, and\ndrops the _note; \"full\" returns every field. Other platforms accept\nand ignore it and always return full records.",
+            "description": "macOS only. \"none\" (default) omits the elements array (tokens are\n`<snapshot_id>:<index>` from the tree); \"compact\" omits per-element\nframe, depth and parent_index, omits enabled when true and selected\nwhen false, and drops the _note; \"full\" returns every field. Other\nplatforms accept and ignore it and always return full records.",
             "enum": [
+              "none",
               "compact",
               "full"
             ],

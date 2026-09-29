@@ -60,7 +60,7 @@ fn inner_icon_token(driver: &mut McpDriver, pid: u64, window_id: u64) -> String 
     loop {
         let state: ToolResponse = driver.call(
             "get_window_state",
-            serde_json::json!({"pid": pid, "window_id": window_id, "include_screenshot": false, "diff": false, "timeout_ms": 4000}),
+            serde_json::json!({"pid": pid, "window_id": window_id, "include_screenshot": false, "diff": false, "timeout_ms": 4000, "element_fields": "compact"}),
         );
         if let Some(token) = state.structured()["elements"].as_array().and_then(|elements| {
             elements
@@ -123,7 +123,7 @@ fn note_icon(driver: &mut McpDriver, pid: u64, window_id: u64) -> (bool, f64, f6
     loop {
         let state: ToolResponse = driver.call(
             "get_window_state",
-            serde_json::json!({"pid": pid, "window_id": window_id, "diff": false, "timeout_ms": 4000}),
+            serde_json::json!({"pid": pid, "window_id": window_id, "diff": false, "timeout_ms": 4000, "element_fields": "compact"}),
         );
         if let Some(icon) = state.structured()["elements"].as_array().and_then(|elements| {
             elements.iter().find(|e| e["label"] == "note.txt" && e["role"] == "AXImage").cloned()

@@ -71,8 +71,8 @@ pub struct LookBounds {
     pub max_elements: usize,
     pub max_depth: usize,
     pub screenshot: Option<ScreenshotTransform>,
-    /// `element_fields:"full"`; false for the compact default.
-    pub full_elements: bool,
+    /// The `element_fields` projection; every pair of projections differs.
+    pub element_fields: cua_driver_contract::ElementFields,
 }
 
 /// The latest look at one window. Besides owning the element handles that
