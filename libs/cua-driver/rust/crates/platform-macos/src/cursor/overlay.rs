@@ -1011,7 +1011,8 @@ fn render_loop(
                         .unwrap_or_else(|| tiny_skia::Pixmap::new(1, 1).unwrap());
                     let backing_scale_f32 = scale as f32;
                     note_overlay_frame(map.cursors.values().any(cursor_may_paint));
-                    for (_k, rs) in &map.cursors {
+                    let feed_pip = crate::pip::cursor_sink_enabled();
+                    for (k, rs) in &map.cursors {
                         let focus = rs.focus_rect.map(|rect| FocusRect {
                             rect,
                             t: rs.focus_rect_t,
@@ -1024,6 +1025,9 @@ fn render_loop(
                             focus,
                             backing_scale_f32,
                         );
+                        if feed_pip {
+                            crate::pip::push_cursor(pip_cursor_update(k, rs, scale));
+                        }
                     }
                     pm
                 } else {
@@ -1044,6 +1048,57 @@ fn render_loop(
                 std::thread::sleep(remaining);
             }
         }
+    }
+}
+
+/// This frame of one cursor for its session's PiP panel: the same arrow
+/// the overlay just painted (theme, tint, pulse, heading, idle fade), on
+/// its own small pixmap centered on the anchor, without the session badge.
+fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::CursorUpdate {
+    let core = &rs.core;
+    let shown = core.cfg.enabled
+        && core.visible
+        && !core.pinned_target_off_workspace
+        && core.pos.0 >= -100.0
+        && core.idle_alpha >= 0.004;
+    let image = shown
+        .then(|| {
+            let side = (crate::pip::SPRITE_BOX * scale).round().max(1.0) as u32;
+            let mut pm = tiny_skia::Pixmap::new(side, side)?;
+            let anchor = (side as f32) / 2.0;
+            let fill = cursor_overlay::session_fill_rgba(&core.cfg.cursor_id);
+            match core.theme.as_deref() {
+                Some(theme) => cursor_overlay::paint_compiled_theme_with_tint(
+                    &mut pm,
+                    theme,
+                    &core.visual,
+                    anchor,
+                    anchor,
+                    core.heading as f32,
+                    scale as f32,
+                    core.idle_alpha as f32,
+                    (theme.id == cursor_overlay::DEFAULT_THEME_ID).then_some(fill),
+                ),
+                None => cursor_overlay::theme::paint_default_theme_with_fill(
+                    &mut pm,
+                    &core.visual,
+                    anchor,
+                    anchor,
+                    core.heading as f32,
+                    scale as f32,
+                    core.idle_alpha as f32,
+                    fill,
+                ),
+            }
+            pixmap_to_cgimage(&pm)
+        })
+        .flatten();
+    crate::pip::CursorUpdate {
+        key: key.to_owned(),
+        x: core.pos.0,
+        y: core.pos.1,
+        pulsing: core.click_t.is_some(),
+        image,
     }
 }
 
@@ -1261,7 +1316,7 @@ impl ZOrderEnforcer for MacZOrderEnforcer {
 
 /// Create a `CGImage` from a `tiny_skia::Pixmap` (premultiplied RGBA).
 /// Returns a `+1` retained pointer that the caller must release.
-fn pixmap_to_cgimage(pixmap: &tiny_skia::Pixmap) -> Option<usize> {
+pub(crate) fn pixmap_to_cgimage(pixmap: &tiny_skia::Pixmap) -> Option<usize> {
     let w = pixmap.width() as usize;
     let h = pixmap.height() as usize;
     if w == 0 || h == 0 {

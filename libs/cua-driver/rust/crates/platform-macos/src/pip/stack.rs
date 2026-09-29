@@ -60,7 +60,7 @@ pub(super) const CHIP_H: f64 = CHIP + 4.0;
 /// resting chip sits just inside the glass container's merge distance, so
 /// it fuses with the front card like liquid and separates when it lags).
 const CHIP_ROW_GAP: f64 = 6.0;
-const CHIP_GAP: f64 = 10.0;
+const CHIP_GAP: f64 = 6.0;
 /// Glass views closer than this merge into one shape.
 pub(super) const GLASS_SPACING: f64 = 14.0;
 /// The chip column's width, left of the deck.

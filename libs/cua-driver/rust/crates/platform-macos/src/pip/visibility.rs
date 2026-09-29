@@ -83,6 +83,15 @@ pub(super) fn snapshot() -> (Vec<WindowInfo>, Vec<Area>) {
     (crate::windows::composited_windows(), displays)
 }
 
+/// The frame of `window` in `windows` (CoreGraphics, top-left origin).
+pub(super) fn frame_of(windows: &[WindowInfo], window: Option<u32>) -> Option<Area> {
+    let id = window?;
+    windows
+        .iter()
+        .find(|candidate| candidate.window_id == id)
+        .map(area)
+}
+
 fn area(window: &WindowInfo) -> Area {
     Area {
         x: window.bounds.x,

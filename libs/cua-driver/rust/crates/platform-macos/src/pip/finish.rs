@@ -30,8 +30,10 @@
 //! | `end_session` | the session finishes (now) | none | as the idle timer, then the panel closes | the panel leaves the live set |
 //! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim by predicate, and each touched window a chip or checklist stood for by its action: app and event time, so it holds when the window resolves meanwhile); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades |
 //! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not owed news) shows the panel or plays a finale | the panel hides (an ending one closes) |
+//! | Cursor update (the overlay's render thread, once per rendered frame, carrying the cursor's animated screen point and whether its click pulse is on) | none | none | none | only the front card's cursor sprite: it moves to the point mapped into the well from the target window's last known frame (see `cursor`), and hides while the cursor is off that window, disabled or faded, or the panel has no frame; the first update of each click pulse that lands in the well logs "PiP cursor" once |
 //!
-//! Everything here is pure (unit tested, one test per row).
+//! Everything here is pure (unit tested, one test per row); the cursor
+//! row's logic and test live in `cursor`.
 
 use std::collections::HashMap;
 use std::time::Duration;
