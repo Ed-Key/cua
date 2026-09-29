@@ -1300,7 +1300,8 @@ pub fn fire_session_end(session_id: &str) -> bool {
 }
 
 fn fire_session_end_for_owner(session_id: &str, owner_transport: Option<&str>) -> bool {
-    let first_fire = mark_session_ended(session_id, owner_transport, SessionEndReason::Unknown);
+    let (first_fire, _) =
+        mark_session_ended(session_id, owner_transport, SessionEndReason::Unknown);
     if first_fire {
         initialize_session_cleanup(session_id);
     }
@@ -1313,16 +1314,21 @@ fn fire_session_end_for_owner(session_id: &str, owner_transport: Option<&str>) -
 /// Hooks run after this short critical section. Keeping this transition under
 /// the same lock order as dispatch admission prevents a racing first action
 /// from recreating a record immediately before or after termination.
+///
+/// Returns whether this call wrote the tombstone, and whether the ended
+/// episode is eligible to be recreated on its owner's next call (an idle end
+/// of a live record). Eligibility is NOT published here; see
+/// [`publish_idle_revival`].
 fn mark_session_ended(
     session_id: &str,
     owner_transport: Option<&str>,
     reason: SessionEndReason,
-) -> bool {
+) -> (bool, bool) {
     activity().lock().unwrap().remove(session_id);
     let mut ended = ended_sessions().lock().unwrap();
     let record = lifecycle_records().lock().unwrap().remove(session_id);
-    // A session reclaimed for inactivity, named or not, is recreated on its
-    // owner transport's next call. Every other end reason keeps the
+    // A session reclaimed for inactivity, named or not, may be recreated on
+    // its owner transport's next call. Every other end reason keeps the
     // resurrection guard until an explicit start_session.
     let idle_owned = reason == SessionEndReason::IdleTimeout && record.is_some();
     let mut idle_ended = idle_ended_sessions().lock().unwrap();
@@ -1337,7 +1343,7 @@ fn mark_session_ended(
                     .insert(session_id.to_owned(), reason);
             }
         }
-        false
+        (false, false)
     } else {
         ended.insert(
             session_id.to_owned(),
@@ -1350,12 +1356,28 @@ fn mark_session_ended(
             .lock()
             .unwrap()
             .insert(session_id.to_owned(), reason);
-        if idle_owned {
-            idle_ended.insert(session_id.to_owned());
-        } else {
-            idle_ended.remove(session_id);
-        }
-        true
+        idle_ended.remove(session_id);
+        (true, idle_owned)
+    }
+}
+
+/// Make an idle-ended episode recreatable by its owner's next call.
+///
+/// Ordering rule: revival eligibility is published only after the ended
+/// episode's cleanup is registered ([`initialize_session_cleanup`]).
+/// Admission of a recreating call treats "no cleanup entry" as "cleanup
+/// complete", so publishing earlier would let a racing call start a new
+/// episode whose state the old episode's cleanup then tears down. The
+/// owner-exit reclaim follows the same rule. A terminal end (explicit,
+/// transport exit, revocation) that lands in between wins: the tombstone's
+/// reason is no longer the idle timeout, so nothing is published.
+fn publish_idle_revival(session_id: &str) {
+    let ended = ended_sessions().lock().unwrap();
+    let mut idle_ended = idle_ended_sessions().lock().unwrap();
+    let still_idle = ended.contains_key(session_id)
+        && ended_reasons().lock().unwrap().get(session_id) == Some(&SessionEndReason::IdleTimeout);
+    if still_idle {
+        idle_ended.insert(session_id.to_owned());
     }
 }
 
@@ -1739,7 +1761,7 @@ fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
 }
 
 fn finish_session_end(session_id: &str, reason: SessionEndReason) {
-    let first_fire = mark_session_ended(session_id, None, reason);
+    let (first_fire, idle_revivable) = mark_session_ended(session_id, None, reason);
     let mut cursor_readers = CURSOR_OUTCOME_READERS
         .get()
         .map(|readers| {
@@ -1773,6 +1795,9 @@ fn finish_session_end(session_id: &str, reason: SessionEndReason) {
                 .lock()
                 .unwrap()
                 .insert(session_id.to_owned());
+        }
+        if idle_revivable {
+            publish_idle_revival(session_id);
         }
     }
     let _ = retry_session_cleanup(session_id);
@@ -2465,6 +2490,48 @@ mod tests {
         assert!(revive_session(&implicit));
         end_session(&named);
         assert!(revive_session(&named));
+    }
+
+    #[test]
+    fn idle_revival_is_published_only_after_cleanup_is_registered() {
+        let pid = std::process::id();
+        let id = format!("idle-publish-order-{pid}");
+        let begin = |owner: &str| {
+            begin_session_dispatch(
+                &id,
+                Some("quiet"),
+                owner,
+                false,
+                SessionTransport::McpStdio,
+                SessionClientKind::Mcp,
+            )
+        };
+        drop(begin("owner").unwrap());
+        // The sweep has written the tombstone but not registered cleanup yet:
+        // a racing call from the owner must not be admitted.
+        assert_eq!(
+            mark_session_ended(&id, None, SessionEndReason::IdleTimeout),
+            (true, true)
+        );
+        assert!(!recreates_on_next_call(&id, "owner"));
+        assert_eq!(begin("owner").err(), Some("session has ended"));
+        initialize_session_cleanup(&id);
+        publish_idle_revival(&id);
+        assert!(recreates_on_next_call(&id, "owner"));
+        drop(begin("owner").expect("recreated after cleanup registration"));
+
+        // A terminal end between the tombstone and publication wins.
+        drop(begin("owner").unwrap());
+        assert_eq!(
+            mark_session_ended(&id, None, SessionEndReason::IdleTimeout),
+            (true, true)
+        );
+        mark_session_ended(&id, None, SessionEndReason::Explicit);
+        initialize_session_cleanup(&id);
+        publish_idle_revival(&id);
+        assert!(!recreates_on_next_call(&id, "owner"));
+        assert_eq!(session_end_reason(&id), Some(SessionEndReason::Explicit));
+        assert!(revive_session(&id));
     }
 
     #[test]
