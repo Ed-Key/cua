@@ -22,6 +22,9 @@ impl GetWindowStateTool {
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+/// Total time `get_window_state(app)` spends reading the app's AX windows.
+const AX_LOOKUP_BUDGET: std::time::Duration = std::time::Duration::from_millis(1500);
+
 /// Slack past `timeout_ms` before the walk task is abandoned: one in-flight AX
 /// call may still be waiting on its messaging timeout.
 const AX_WALK_BACKSTOP_GRACE: std::time::Duration = std::time::Duration::from_secs(5);
@@ -941,28 +944,54 @@ fn app_pids(app: &str, apps: &[crate::apps::AppInfo]) -> Vec<i32> {
 }
 
 /// CG window id -> AXTitle ("" when it has none) for every AX window of `pids`.
-/// Empty when Accessibility is not granted.
+/// Empty when Accessibility is not granted. The whole lookup is bounded by
+/// `AX_LOOKUP_BUDGET`; a pid not finished in time contributes nothing, so its
+/// windows fall back to CG titles.
 fn ax_window_titles(pids: &[i32]) -> HashMap<u32, String> {
     use crate::ax::bindings::{
         ax_get_window_id, copy_ax_windows, copy_string_attr, AXUIElementCreateApplication,
-        AXUIElementSetMessagingTimeout,
+        AXUIElementRef, AXUIElementSetMessagingTimeout,
     };
     use core_foundation::base::{CFRelease, CFTypeRef};
+    let deadline = std::time::Instant::now() + AX_LOOKUP_BUDGET;
+    // AX messaging timeouts are per element, so each one gets what is left.
+    let bound = |element: AXUIElementRef| -> bool {
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            return false;
+        }
+        let _ = unsafe { AXUIElementSetMessagingTimeout(element, left.as_secs_f32().max(0.05)) };
+        true
+    };
     let mut titles = HashMap::new();
     for &pid in pids {
+        let mut pid_titles = Vec::new();
+        let mut finished = true;
         unsafe {
             let app = AXUIElementCreateApplication(pid);
             if app.is_null() {
                 continue;
             }
-            let _ = AXUIElementSetMessagingTimeout(app, 1.0);
-            for window in copy_ax_windows(app) {
-                if let Some(id) = ax_get_window_id(window) {
-                    titles.insert(id, copy_string_attr(window, "AXTitle").unwrap_or_default());
+            let windows = if bound(app) {
+                copy_ax_windows(app)
+            } else {
+                Vec::new()
+            };
+            for window in windows {
+                finished = finished && bound(window);
+                if finished {
+                    if let Some(id) = ax_get_window_id(window) {
+                        let title = copy_string_attr(window, "AXTitle").unwrap_or_default();
+                        pid_titles.push((id, title));
+                    }
                 }
                 CFRelease(window as CFTypeRef);
             }
             CFRelease(app as CFTypeRef);
+        }
+        // A read that ran into the deadline may be partial: keep none of it.
+        if finished && std::time::Instant::now() < deadline {
+            titles.extend(pid_titles);
         }
     }
     titles
@@ -973,8 +1002,8 @@ fn ax_window_titles(pids: &[i32]) -> HashMap<u32, String> {
 /// app's AX windows and their AXTitle. A window with an AX window is a
 /// candidate, titled from AX (CG titles are redacted without Screen
 /// Recording); surfaces with none, such as Chrome's toolbar strips, are not.
-/// Without any AX windows (Accessibility not granted), titled CG windows are
-/// the candidates. Several candidates are refused rather than guessed.
+/// For a process with no AX windows (Accessibility not granted, or the lookup
+/// timed out), its titled CG windows are the candidates. Several candidates are refused rather than guessed.
 fn select_app_window(
     app: &str,
     apps: &[crate::apps::AppInfo],
@@ -996,9 +1025,13 @@ fn select_app_window(
     }
     let app_windows: Vec<&crate::windows::WindowInfo> =
         windows.iter().filter(|w| pids.contains(&w.pid)).collect();
-    let ax_known = app_windows
+    // Per process: one instance's AX windows must not hide another instance
+    // whose AX lookup failed or timed out.
+    let ax_pids: Vec<i32> = app_windows
         .iter()
-        .any(|w| ax_titles.contains_key(&w.window_id));
+        .filter(|w| ax_titles.contains_key(&w.window_id))
+        .map(|w| w.pid)
+        .collect();
     let mut candidates: Vec<(&crate::windows::WindowInfo, &str)> = app_windows
         .iter()
         .filter_map(|w| {
@@ -1006,7 +1039,7 @@ fn select_app_window(
             let title = ax_title.filter(|t| !t.is_empty()).unwrap_or(w.title.trim());
             match ax_title {
                 Some(_) => Some((*w, title)),
-                None if !ax_known && !title.is_empty() => Some((*w, title)),
+                None if !ax_pids.contains(&w.pid) && !title.is_empty() => Some((*w, title)),
                 None => None,
             }
         })
@@ -1706,6 +1739,35 @@ mod app_target_tests {
             ])
         );
         assert!(text.contains("window_id 3 (pid 20): A.txt"), "{text}");
+    }
+
+    /// One instance's AX windows must not hide another instance whose AX
+    /// lookup came back empty: its titled CG window still counts.
+    #[test]
+    fn ax_fallback_is_decided_per_process() {
+        let apps = [
+            app("TextEdit", 20, "com.apple.TextEdit"),
+            app("TextEdit", 21, "com.apple.TextEdit"),
+        ];
+        let windows = [
+            window(3, 20, "", 1),
+            window(7, 20, "", 3),
+            window(4, 21, "B.txt", 2),
+        ];
+        let (_, s) = refusal(select_app_window(
+            "TextEdit",
+            &apps,
+            &windows,
+            &ax(&[(3, "A.txt")]),
+        ));
+        assert_eq!(s["code"], "app_window_ambiguous");
+        assert_eq!(
+            s["candidates"],
+            serde_json::json!([
+                {"window_id": 4, "pid": 21, "title": "B.txt"},
+                {"window_id": 3, "pid": 20, "title": "A.txt"}
+            ])
+        );
     }
 
     #[test]
