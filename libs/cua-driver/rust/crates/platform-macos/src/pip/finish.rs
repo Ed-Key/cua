@@ -49,6 +49,11 @@ pub(super) struct Claim {
 pub(super) struct Verdicts {
     /// Window -> when the session last acted in it.
     acted: HashMap<u32, u64>,
+    /// Pid -> when the session last acted on it without naming a window
+    /// (reopens every window of that app).
+    acted_pid: HashMap<i32, u64>,
+    /// Window -> the pid that owns it, as far as the session has seen.
+    pids: HashMap<u32, i32>,
     /// Window -> when it was last verified, and whether fully satisfied.
     verified: HashMap<u32, (u64, bool)>,
     /// When the session finished, until it acts again.
@@ -61,21 +66,46 @@ pub(super) struct Verdicts {
 }
 
 impl Verdicts {
-    /// The session acted in `tag` (titled `title`) at `at_ms`. Also ends a
-    /// session-level finish: the session is working again.
-    pub(super) fn act(&mut self, tag: Tag, title: &str, at_ms: u64) {
-        if let Some(window) = tag.1 {
-            let acted = self.acted.entry(window).or_default();
-            *acted = (*acted).max(at_ms);
+    /// The session acted on `target` at `at_ms`: a window, or (pid only)
+    /// every window of that app. Recorded as each action is pushed, before
+    /// and independent of its capture (captures coalesce to the latest per
+    /// session, so a delivered frame is not a record of every action). Also
+    /// ends a session-level finish: the session is working again.
+    pub(super) fn record_action(&mut self, target: Tag, at_ms: u64) {
+        let bump = |at: &mut u64| *at = (*at).max(at_ms);
+        match target {
+            (pid, Some(window)) => {
+                bump(self.acted.entry(window).or_default());
+                if let Some(pid) = pid {
+                    self.pids.insert(window, pid);
+                }
+            }
+            (Some(pid), None) => bump(self.acted_pid.entry(pid).or_default()),
+            (None, None) => {}
         }
         self.session_done = None;
+    }
+
+    /// A frame of the session acting in `tag` (titled `title`) at `at_ms`
+    /// was delivered: recorded as an action (again, harmlessly) and as a
+    /// touched window.
+    pub(super) fn act(&mut self, tag: Tag, title: &str, at_ms: u64) {
+        self.record_action(tag, at_ms);
         self.touched.retain(|(touched, _)| *touched != tag);
         self.touched.insert(0, (tag, title.to_owned()));
         self.touched.truncate(CHIP_ROW);
     }
 
-    /// A `verify_state` on `window` completed at `at_ms`.
-    pub(super) fn verify(&mut self, window: u32, at_ms: u64, satisfied: bool, claims: Vec<Claim>) {
+    /// A `verify_state` on `pid`'s `window` completed at `at_ms`.
+    pub(super) fn verify(
+        &mut self,
+        pid: i32,
+        window: u32,
+        at_ms: u64,
+        satisfied: bool,
+        claims: Vec<Claim>,
+    ) {
+        self.pids.insert(window, pid);
         if self
             .verified
             .get(&window)
@@ -96,7 +126,13 @@ impl Verdicts {
 
     /// The finished rule (see the module docs).
     pub(super) fn finished(&self, window: u32) -> bool {
-        let acted = self.acted.get(&window).copied().unwrap_or(0);
+        let by_pid = self
+            .pids
+            .get(&window)
+            .and_then(|pid| self.acted_pid.get(pid))
+            .copied()
+            .unwrap_or(0);
+        let acted = self.acted.get(&window).copied().unwrap_or(0).max(by_pid);
         match self.verified.get(&window) {
             // The latest evidence since the last action decides.
             Some(&(at, satisfied)) if at >= acted => satisfied,
@@ -260,6 +296,17 @@ impl FinaleState {
         was
     }
 
+    /// The finale's content changed while it plays (a verification landed
+    /// late): it starts over under a new generation, and the old end timer
+    /// goes stale. `None` when none is playing.
+    pub(super) fn restart(&mut self) -> Option<u64> {
+        if !self.playing {
+            return None;
+        }
+        self.generation += 1;
+        Some(self.generation)
+    }
+
     /// The end timer of `generation` fired: whether that finale was still
     /// playing (and now is over).
     pub(super) fn end(&mut self, generation: u64) -> bool {
@@ -294,14 +341,14 @@ mod tests {
         let mut verdicts = Verdicts::default();
         verdicts.act(A, "Notes", 100);
         assert!(!verdicts.finished(10));
-        verdicts.verify(10, 200, true, vec![]);
+        verdicts.verify(1, 10, 200, true, vec![]);
         assert!(verdicts.finished(10));
         // Acting in it again reopens it; a failed check keeps it open.
         verdicts.act(A, "Notes", 300);
         assert!(!verdicts.finished(10));
-        verdicts.verify(10, 400, false, vec![]);
+        verdicts.verify(1, 10, 400, false, vec![]);
         assert!(!verdicts.finished(10));
-        verdicts.verify(10, 500, true, vec![]);
+        verdicts.verify(1, 10, 500, true, vec![]);
         assert!(verdicts.finished(10));
     }
 
@@ -311,11 +358,11 @@ mod tests {
         // verification (pushed at 200), because the frame waited for its
         // capture: the window is still finished.
         let mut verdicts = Verdicts::default();
-        verdicts.verify(10, 200, true, vec![]);
+        verdicts.verify(1, 10, 200, true, vec![]);
         verdicts.act(A, "Notes", 100);
         assert!(verdicts.finished(10));
         // An older verification landing late never overrides a newer one.
-        verdicts.verify(10, 150, false, vec![]);
+        verdicts.verify(1, 10, 150, false, vec![]);
         assert!(verdicts.finished(10));
     }
 
@@ -324,7 +371,7 @@ mod tests {
         let mut verdicts = Verdicts::default();
         verdicts.act(A, "Notes", 100);
         verdicts.act(B, "Mail", 110);
-        verdicts.verify(20, 120, false, vec![]);
+        verdicts.verify(2, 20, 120, false, vec![]);
         verdicts.finish_session(200);
         assert!(
             verdicts.finished(10),
@@ -384,6 +431,7 @@ mod tests {
             ])
         );
         verdicts.verify(
+            1,
             10,
             300,
             false,
@@ -402,7 +450,7 @@ mod tests {
         let mut verdicts = Verdicts::default();
         verdicts.act(A, "Notes", 100);
         verdicts.act(B, "Mail", 110);
-        verdicts.verify(20, 120, false, vec![]);
+        verdicts.verify(2, 20, 120, false, vec![]);
         verdicts.finish_session(200);
         let Finale::Chips(chips) = verdicts.finale() else {
             panic!("no claims: chips");
@@ -443,6 +491,44 @@ mod tests {
         // then the 2.5 s hold.
         assert_eq!(finale_duration(5), Duration::from_millis(3170));
         assert_eq!(finale_duration(0), HOLD);
+    }
+
+    #[test]
+    fn an_action_whose_frame_was_coalesced_still_reopens_its_window() {
+        // A verified; then an action in A is pushed, but its frame is
+        // replaced by a later action's (in B) before capture: only the push
+        // records A's action. A is no longer finished.
+        let mut verdicts = Verdicts::default();
+        verdicts.act(A, "Notes", 100);
+        verdicts.verify(1, 10, 200, true, vec![]);
+        assert!(verdicts.finished(10));
+        verdicts.record_action(A, 300);
+        verdicts.record_action(B, 310);
+        verdicts.act(B, "Mail", 310); // the only frame delivered
+        assert!(!verdicts.finished(10));
+    }
+
+    #[test]
+    fn a_pid_only_action_reopens_that_apps_windows() {
+        let mut verdicts = Verdicts::default();
+        verdicts.verify(1, 10, 200, true, vec![]);
+        verdicts.verify(2, 20, 200, true, vec![]);
+        verdicts.record_action((Some(1), None), 300);
+        assert!(!verdicts.finished(10), "app 1 acted on after the check");
+        assert!(verdicts.finished(20), "another app is untouched");
+        verdicts.verify(1, 10, 400, true, vec![]);
+        assert!(verdicts.finished(10));
+    }
+
+    #[test]
+    fn a_late_verification_restarts_the_playing_finale() {
+        let mut finale = FinaleState::default();
+        assert_eq!(finale.restart(), None, "nothing playing");
+        let first = finale.start(true).unwrap();
+        let second = finale.restart().unwrap();
+        assert!(!finale.end(first), "the first schedule is stale");
+        assert!(finale.playing());
+        assert!(finale.end(second));
     }
 
     #[test]

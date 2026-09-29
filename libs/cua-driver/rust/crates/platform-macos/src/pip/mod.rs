@@ -514,7 +514,8 @@ struct Remembered {
 
 /// A mouse press on a panel, until it is released.
 struct Gesture {
-    key: String,
+    /// The pressed panel's id (it may be a live or an ending panel).
+    id: i64,
     /// Pointer (screen points) and window frame at the press.
     mouse: (f64, f64),
     start: Area,
@@ -908,7 +909,16 @@ struct VisibilityUpdate {
 
 impl PipBackend for MacosPipBackend {
     fn push_frame(&self, frame: PipFrame) {
+        // The action itself goes straight to the main queue: the capture
+        // queue keeps only a session's latest frame, so a coalesced frame
+        // must not take the record of its action with it.
+        let action = Action {
+            key: frame.session_key.clone(),
+            target: (frame.target_pid, frame.target_window_id),
+            timestamp_ms: frame.timestamp_ms,
+        };
         self.worker.push(frame);
+        dispatch_to_main(action, apply_action_cb);
     }
 
     /// Straight to the main queue: never waits on a capture, and the
@@ -1210,17 +1220,69 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
     let worker = state.worker.clone();
     let Some(panel) = state.panels.get_mut(&key) else {
         // The session's first frame is still being captured.
-        state
-            .early
-            .entry(key)
-            .or_default()
-            .verify(window, timestamp_ms, satisfied, claims);
+        state.early.entry(key).or_default().verify(
+            target_pid,
+            window,
+            timestamp_ms,
+            satisfied,
+            claims,
+        );
         return;
     };
     let restacked = restack(panel, &key, &worker, |panel| {
         panel
             .verdicts
-            .verify(window, timestamp_ms, satisfied, claims)
+            .verify(target_pid, window, timestamp_ms, satisfied, claims)
+    });
+    note_finished(panel, &key);
+    if restacked {
+        announce_stack(panel, &key);
+    }
+    // A verification that lands while the finale plays (verify_state can
+    // outlast the idle timer) replays it with the new claims, so nothing is
+    // shown stale and nothing is cleared unseen.
+    if let Some(generation) = panel.finale.restart() {
+        play_finale(panel, &key, &panel.verdicts.finale(), generation);
+    }
+}
+
+/// An action as it was pushed, before its capture.
+struct Action {
+    key: String,
+    target: Target,
+    timestamp_ms: u64,
+}
+
+unsafe extern "C" fn apply_action_cb(ctx: *mut c_void) {
+    let action: Action = *Box::from_raw(ctx as *mut Action);
+    objc2::rc::autoreleasepool(|_| {
+        with_state(|state| apply_action(state, action));
+    });
+}
+
+/// Record an action in the session's verdicts (a finished window it acts
+/// in is no longer finished), whether or not its frame survives the
+/// capture queue.
+unsafe fn apply_action(state: &mut State, action: Action) {
+    let Action {
+        key,
+        target,
+        timestamp_ms,
+    } = action;
+    if !state.worker.is_live(&key) {
+        return;
+    }
+    let worker = state.worker.clone();
+    let Some(panel) = state.panels.get_mut(&key) else {
+        state
+            .early
+            .entry(key)
+            .or_default()
+            .record_action(target, timestamp_ms);
+        return;
+    };
+    let restacked = restack(panel, &key, &worker, |panel| {
+        panel.verdicts.record_action(target, timestamp_ms)
     });
     note_finished(panel, &key);
     if restacked {
@@ -1433,11 +1495,14 @@ unsafe fn announce_stack(panel: &Panel, key: &str) {
 /// The user clicked a back card: bring it to the front and point the panel
 /// (header, live stream, focus button, visibility) at its window until the
 /// session's next frame. Never focuses the window itself.
-unsafe fn raise_card(state: &mut State, key: &str, tag: Tag) {
+unsafe fn raise_card(state: &mut State, id: i64, tag: Tag) {
     let worker = state.worker.clone();
-    let Some(panel) = state.panels.get_mut(key) else {
+    let live = state.panels.values().any(|panel| panel.id == id);
+    let Some(panel) = panel_by_id(state, id) else {
         return;
     };
+    let key = panel.key.clone();
+    let key = key.as_str();
     if !switch_front(panel, key, &worker, tag, None) {
         return;
     }
@@ -1452,11 +1517,20 @@ unsafe fn raise_card(state: &mut State, key: &str, tag: Tag) {
     show_target(panel, pid, Some(title));
     set_text(panel.status, &status);
     announce_stack(panel, key);
-    set_panel_target(panel, key, &worker, tag);
+    if live {
+        set_panel_target(panel, key, &worker, tag);
+    } else {
+        // Ended: the poll (and any new session under this key) is not ours.
+        panel.target = tag;
+    }
     panel.resolved_window = tag.1;
     // Shown until the poll says otherwise for this window.
     panel.target_visible = false;
-    refresh(state, key);
+    // An ending panel has no live state to refresh (and its key may belong
+    // to a new session's panel by now).
+    if live {
+        refresh(state, key);
+    }
 }
 
 /// The only place the panel's displayed target changes: the visibility
@@ -1713,8 +1787,13 @@ unsafe fn finish_session(panel: &mut Panel, key: &str, worker: &CaptureWorker) {
     let Some(generation) = panel.finale.start(visible) else {
         return;
     };
+    play_finale(panel, key, &finale, generation);
+}
+
+/// Show `finale` (from the top) and time its end under `generation`.
+unsafe fn play_finale(panel: &mut Panel, key: &str, finale: &Finale, generation: u64) {
     tracing::info!(target: "pip", session = %key, rows = ?finale.log_rows(), kind = %finale.kind(), "PiP finished state");
-    show_finale_view(panel, &finale);
+    show_finale_view(panel, finale);
     dispatch_to_main_after(
         finish::finale_duration(finale.len()),
         (panel.id, generation),
@@ -2297,14 +2376,7 @@ unsafe fn animate_alpha(window: usize, alpha: f64) {
 
 extern "C" fn on_focus(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
     let id: i64 = unsafe { msg_send![sender, tag] };
-    let target = with_state(|state| {
-        state
-            .panels
-            .values()
-            .find(|panel| panel.id == id)
-            .map(|panel| panel.target)
-    })
-    .flatten();
+    let target = with_state(|state| panel_by_id(state, id).map(|panel| panel.target)).flatten();
     let Some((Some(pid), window_id)) = target else {
         return;
     };
@@ -2324,6 +2396,11 @@ extern "C" fn on_focus(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject)
 extern "C" fn on_hide(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
     let id: i64 = unsafe { msg_send![sender, tag] };
     with_state(|state| {
+        // An ended session's panel playing its finale: close it now.
+        if let Some(index) = state.ending.iter().position(|panel| panel.id == id) {
+            unsafe { close_panel(state.ending.remove(index)) };
+            return;
+        }
         let Some(key) = state
             .panels
             .iter_mut()
@@ -3232,17 +3309,27 @@ unsafe extern "C" fn tick_cb(ctx: *mut c_void) {
 // needs to become key. Resizing sets the window frame outside the state
 // lock: AppKit calls `setFrameSize:` synchronously, which lays the cards out.
 
-/// The key and panel whose panel or trail window is `window`, and whether
-/// it is the trail.
-fn panel_for(state: &mut State, window: usize) -> Option<(&String, &mut Panel, bool)> {
+/// The panel (live, or ended and playing its finale) whose panel or trail
+/// window is `window`, and whether it is the trail.
+fn panel_for(state: &mut State, window: usize) -> Option<(&mut Panel, bool)> {
     state
         .panels
-        .iter_mut()
-        .find(|(_, panel)| panel.window == window || panel.trail.window == window)
-        .map(|(key, panel)| {
+        .values_mut()
+        .chain(state.ending.iter_mut())
+        .find(|panel| panel.window == window || panel.trail.window == window)
+        .map(|panel| {
             let trail = panel.trail.window == window;
-            (key, panel, trail)
+            (panel, trail)
         })
+}
+
+/// The panel (live or ending) with `id`.
+fn panel_by_id(state: &mut State, id: i64) -> Option<&mut Panel> {
+    state
+        .panels
+        .values_mut()
+        .chain(state.ending.iter_mut())
+        .find(|panel| panel.id == id)
 }
 
 /// A point in a panel's or trail's content view, in panel coordinates.
@@ -3290,7 +3377,7 @@ extern "C" fn stack_hit_test(this: *mut AnyObject, _cmd: Sel, point: NSPoint) ->
         let local: NSPoint = msg_send![this, convertPoint: point fromView: superview];
         let window = window_of(this);
         let over_card = try_with_state(|state| {
-            panel_for(state, window).is_some_and(|(_, panel, in_trail)| {
+            panel_for(state, window).is_some_and(|(panel, in_trail)| {
                 let point = panel_point((local.x, local.y), in_trail);
                 item_at(point, &panel.layout, &item_frames(panel), in_trail).is_some()
             })
@@ -3312,9 +3399,10 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
         let max = visible_frame_of(window as *mut AnyObject)
             .map_or(MIN_CARD, |visible| max_card((visible.w, visible.h)));
         with_state(|state| {
-            let Some((key, panel, in_trail)) = panel_for(state, window) else {
+            let Some((panel, in_trail)) = panel_for(state, window) else {
                 return;
             };
+            let (key, id) = (panel.key.clone(), panel.id);
             // A drag moves the panel, whichever window was pressed.
             let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
             let point = panel_point(point, in_trail);
@@ -3331,9 +3419,8 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
                 .map(|card| card.key);
             let region = stack::press_region(point, item, edges, frames[0]);
             tracing::info!(target: "pip", session = %key, region, x = point.0, y = point.1, "PiP panel press");
-            let key = key.clone();
             state.gesture = Some(Gesture {
-                key,
+                id,
                 mouse,
                 start: area_of(frame),
                 origin: (frame.origin.x, frame.origin.y),
@@ -3351,10 +3438,16 @@ extern "C" fn stack_mouse_dragged(_this: *mut AnyObject, _cmd: Sel, _event: *mut
         let mouse = mouse_location();
         let resize = with_state(|state| {
             let State {
-                gesture, panels, ..
+                gesture,
+                panels,
+                ending,
+                ..
             } = state;
             let gesture = gesture.as_mut()?;
-            let panel = panels.get_mut(&gesture.key)?;
+            let panel = panels
+                .values_mut()
+                .chain(ending.iter_mut())
+                .find(|panel| panel.id == gesture.id)?;
             let delta = (mouse.0 - gesture.mouse.0, mouse.1 - gesture.mouse.1);
             if gesture.edges != 0 {
                 let frame = resize_window(gesture.start, gesture.edges, delta, gesture.max);
@@ -3382,7 +3475,7 @@ extern "C" fn stack_mouse_dragged(_this: *mut AnyObject, _cmd: Sel, _event: *mut
             let _: () = msg_send![window as *mut AnyObject, setFrame: ns_rect(frame) display: true];
             // The trail follows the resized panel at once (no lag).
             with_state(|state| {
-                if let Some((_, panel, _)) = panel_for(state, window) {
+                if let Some((panel, _)) = panel_for(state, window) {
                     panel.trail_motion.snap();
                     sync_trail(panel);
                 }
@@ -3396,7 +3489,7 @@ extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyO
         let Some(gesture) = state.gesture.take() else {
             return;
         };
-        let Some(panel) = state.panels.get_mut(&gesture.key) else {
+        let Some(panel) = panel_by_id(state, gesture.id) else {
             return;
         };
         if gesture.moved {
@@ -3412,7 +3505,7 @@ extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyO
         // window is still behind the front card.
         let pressed = gesture.pressed.filter(|_| gesture.edges == 0);
         if let Some(tag) = stack::click_target(pressed, &panel.cards.keys()) {
-            unsafe { raise_card(state, &gesture.key, tag) };
+            unsafe { raise_card(state, gesture.id, tag) };
         }
     });
 }
@@ -3422,7 +3515,7 @@ extern "C" fn stack_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut Any
         let window = window_of(this);
         let point = event_point(this, event);
         let edges = try_with_state(|state| {
-            panel_for(state, window).map(|(_, panel, _)| {
+            panel_for(state, window).map(|(panel, _)| {
                 resize_edges(
                     point,
                     view_frame(panel, Slot::Front, back_cards(&panel.layout)),
@@ -3476,9 +3569,10 @@ extern "C" fn stack_set_frame_size(this: *mut AnyObject, _cmd: Sel, size: NSSize
 /// The panel window is now `size`: lay the cards out for the new front card
 /// and resize the live stream once the size settles.
 unsafe fn on_resized(state: &mut State, window: usize, size: (f64, f64)) {
-    let Some((key, panel, false)) = panel_for(state, window) else {
+    let Some((panel, false)) = panel_for(state, window) else {
         return;
     };
+    let key = panel.key.clone();
     let card = card_size(size);
     if card == panel.card || card.0 <= 0.0 || card.1 <= 0.0 {
         return;
@@ -3492,7 +3586,7 @@ unsafe fn on_resized(state: &mut State, window: usize, size: (f64, f64)) {
     panel.well_changed = Instant::now();
     dispatch_to_main_after(
         RESIZE_DEBOUNCE + Duration::from_millis(5),
-        key.clone(),
+        key,
         resize_settle_cb,
     );
 }

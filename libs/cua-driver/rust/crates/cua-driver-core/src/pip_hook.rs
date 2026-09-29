@@ -277,16 +277,25 @@ fn element_label(
 ) -> String {
     let selector = &element.selector;
     let observed_str = |key: &str| observed.and_then(|o| o.get(key)).and_then(|v| v.as_str());
-    let secure = [
-        selector.role.as_deref(),
-        selector.label_contains.as_deref(),
-        observed_str("role"),
-        observed_str("subrole"),
-        observed_str("label"),
-    ]
-    .into_iter()
-    .flatten()
-    .any(looks_secure);
+    // Fail closed: the expected value is shown only when the matched
+    // element's role can never be a secure field. A secure field is often
+    // role AXTextField with subrole AXSecureTextField, and the subrole is not
+    // in the observation, so a text field (or an unknown role) never shows
+    // its value. A password-like label hides it even on a safe role.
+    let role_known_safe = observed_str("role")
+        .or(selector.role.as_deref())
+        .is_some_and(never_secure_role);
+    let secure = !role_known_safe
+        || [
+            selector.role.as_deref(),
+            selector.label_contains.as_deref(),
+            observed_str("role"),
+            observed_str("subrole"),
+            observed_str("label"),
+        ]
+        .into_iter()
+        .flatten()
+        .any(looks_secure);
     let role = selector.role.as_deref().map(role_noun);
     let subject = match (selector.label_contains.as_deref(), role) {
         (Some(label), Some(role)) => format!("{} {role}", quote(label)),
@@ -324,6 +333,28 @@ fn element_label(
         clauses.push("visible".to_owned());
     }
     format!("{subject} {}", clauses.join(", "))
+}
+
+/// Roles whose value can never be a secure field's (normalized like the
+/// evaluator's role match: letters and digits, lowercase, no `AX`). Text
+/// fields and combo boxes are not here: either can be secure.
+fn never_secure_role(role: &str) -> bool {
+    let normalized: String = role
+        .chars()
+        .filter(char::is_ascii_alphanumeric)
+        .flat_map(|c| c.to_lowercase())
+        .collect();
+    matches!(
+        normalized.strip_prefix("ax").unwrap_or(&normalized),
+        "textarea"
+            | "statictext"
+            | "checkbox"
+            | "radiobutton"
+            | "popupbutton"
+            | "slider"
+            | "button"
+            | "pushbutton"
+    )
 }
 
 /// Roles and labels that mark a field whose value must never be shown.
@@ -533,6 +564,25 @@ mod tests {
                 serde_json::json!({"element": {"selector": {"role": "AXTextField"}, "value_equals": "hunter2"}}),
                 Some(serde_json::json!({"role": "AXTextField", "subrole": "AXSecureTextField"})),
             ),
+            // Fail closed: a text field (maybe secure, subrole unseen), a
+            // combo box, and no role at all never show the value.
+            (
+                serde_json::json!({"element": {"selector": {"role": "AXTextField"}, "value_equals": "hunter2"}}),
+                None,
+            ),
+            (
+                serde_json::json!({"element": {"selector": {"role": "AXComboBox"}, "value_equals": "hunter2"}}),
+                None,
+            ),
+            (
+                serde_json::json!({"element": {"selector": {"label_contains": "Name"}, "value_equals": "hunter2"}}),
+                None,
+            ),
+            // A safe-looking selector whose match is a text field.
+            (
+                serde_json::json!({"element": {"selector": {"label_contains": "Name"}, "value_equals": "hunter2"}}),
+                Some(serde_json::json!({"role": "AXTextField", "label": "Name"})),
+            ),
             (
                 serde_json::json!({"element": {"selector": {"role": "AXTextField"}, "value_equals": "hunter2"}}),
                 Some(serde_json::json!({"role": "AXTextField", "label": "API token"})),
@@ -580,5 +630,45 @@ mod tests {
         let mut anonymous = frame(None, None, Some(42));
         anonymous.target_window_id = Some(7);
         assert!(verification_event(anonymous, &input, Some(&output)).is_none());
+    }
+
+    #[test]
+    fn a_secure_field_matched_through_the_real_evaluator_never_shows_its_value() {
+        // What get_window_state reports for an NSSecureTextField: role
+        // AXTextField, no subrole. Run the predicate through the production
+        // evaluator and output projection, then build the PiP event.
+        use crate::expectation::{evaluate_predicates, ObservationSnapshot};
+        let snapshot = |role: &str, value: &str| ObservationSnapshot {
+            window: Some(serde_json::json!({"window_id": 7, "pid": 42})),
+            elements: Some(vec![serde_json::json!({
+                "element_index": 0, "role": role, "label": "", "value": value
+            })]),
+            element_source_trusted: true,
+            elements_complete: true,
+        };
+        let event_for = |role: &str, value: &str| {
+            let input = serde_json::json!({"pid": 42, "window_id": 7, "expect": [
+                {"element": {"selector": {"role": role}, "value_equals": value}}]});
+            let expect: Vec<cua_driver_contract::StatePredicate> =
+                serde_json::from_value(input["expect"].clone()).unwrap();
+            let outcomes = evaluate_predicates(&expect, &snapshot(role, value));
+            let output = serde_json::to_value(cua_driver_contract::VerifyStateOutput {
+                status: outcomes[0].status,
+                stable: true,
+                elapsed_ms: 1,
+                samples: 2,
+                predicates: outcomes,
+            })
+            .unwrap();
+            let mut agent = frame(Some("alpha"), None, Some(42));
+            agent.target_window_id = Some(7);
+            verification_event(agent, &input, Some(&output)).unwrap()
+        };
+        let secure = event_for("AXTextField", "hunter2");
+        assert_eq!(secure.claims[0].satisfied, Some(true));
+        assert_eq!(secure.claims[0].label, "text field value matches");
+        // A text area can never be secure: its value shows.
+        let area = event_for("AXTextArea", "hello");
+        assert_eq!(area.claims[0].label, "text area holds \"hello\"");
     }
 }
