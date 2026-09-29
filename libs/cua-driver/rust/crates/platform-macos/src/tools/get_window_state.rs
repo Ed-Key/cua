@@ -129,24 +129,33 @@ impl Tool for GetWindowStateTool {
 
     /// `app` that names exactly one window becomes that pid + window_id
     /// before authorization, so policy and consent judge the real window.
-    /// Zero or several matches stay as `app`: the call is then authorized like
-    /// an unfiltered window listing, and `invoke` lists the candidates.
+    /// Otherwise the call stays as `app`, is authorized like an unfiltered
+    /// window listing, and carries the refusal for `invoke` to return. The
+    /// lookup runs only here, so `invoke` never reads a window that
+    /// authorization did not see.
     async fn resolve_target(&self, args: &mut Value) {
         if args.get("app").is_none() {
             return;
         }
-        if let Ok((pid, window_id)) = window_target(args).await {
-            if let Some(fields) = args.as_object_mut() {
+        let resolved = window_target(args).await;
+        let Some(fields) = args.as_object_mut() else {
+            return;
+        };
+        match resolved {
+            Ok((pid, window_id)) => {
                 fields.remove("app");
                 fields.insert("pid".into(), pid.into());
                 fields.insert("window_id".into(), window_id.into());
+            }
+            Err(refusal) => {
+                fields.insert(APP_REFUSAL_ARG.into(), stored_refusal(refusal));
             }
         }
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        let (pid, window_id) = match window_target(&args).await {
+        let (pid, window_id) = match invoke_target(&args).await {
             Ok(target) => target,
             Err(e) => return e,
         };
@@ -931,6 +940,44 @@ async fn window_target(args: &Value) -> Result<(i32, u32), ToolResult> {
     .await
     .map_err(|e| ToolResult::error(format!("app lookup failed: {e}")))?;
     select_app_window(&app, &apps, &windows, &ax_titles)
+}
+
+/// Private argument that carries a failed `app` lookup from `resolve_target`
+/// to `invoke`. Clients cannot send it: the registry strips underscore
+/// arguments before `resolve_target` runs.
+const APP_REFUSAL_ARG: &str = "_app_resolution_refusal";
+
+fn stored_refusal(refusal: ToolResult) -> Value {
+    let message = refusal.content.iter().find_map(|c| match c {
+        Content::Text { text, .. } => Some(text.clone()),
+        _ => None,
+    });
+    serde_json::json!({"message": message, "structured": refusal.structured_content})
+}
+
+/// The target `invoke` reads. `app` is resolved only by `resolve_target`,
+/// before authorization; here it is either that stored refusal or, on a path
+/// that skipped resolution, refused outright.
+async fn invoke_target(args: &Value) -> Result<(i32, u32), ToolResult> {
+    if let Some(stored) = args.get(APP_REFUSAL_ARG) {
+        let message = stored["message"].as_str().unwrap_or("app lookup failed");
+        let refusal = ToolResult::error(message);
+        return Err(match stored.get("structured").filter(|s| !s.is_null()) {
+            Some(structured) => refusal.with_structured(structured.clone()),
+            None => refusal,
+        });
+    }
+    if args.get("app").is_some() {
+        return Err(ToolResult::error(
+            "app was not resolved before authorization; call list_windows and pass \
+             pid + window_id.",
+        )
+        .with_structured(serde_json::json!({
+            "code": "app_not_resolved",
+            "suggestion": "call list_windows and pass pid + window_id"
+        })));
+    }
+    window_target(args).await
 }
 
 /// Pids of the running apps whose name (any case) or exact bundle id is `app`.
@@ -1823,6 +1870,53 @@ mod app_target_tests {
                 {"window_id": 3, "pid": 20, "title": "A.txt"}
             ])
         );
+    }
+
+    /// A lookup that failed before authorization is what invoke returns; it
+    /// does not look again, so a window that appears or closes in between is
+    /// never read unauthorized. (No such TextEdit windows exist live.)
+    #[tokio::test]
+    async fn invoke_returns_the_resolution_refusal_without_looking_again() {
+        let apps = [app("TextEdit", 20, "com.apple.TextEdit")];
+        let windows = [window(3, 20, "A.txt", 1), window(4, 20, "B.txt", 2)];
+        let ambiguous = select_app_window("TextEdit", &apps, &windows, &no_ax()).unwrap_err();
+        let tool = GetWindowStateTool::new(Arc::new(ToolState::default()));
+        let args = serde_json::json!({
+            "app": "TextEdit",
+            APP_REFUSAL_ARG: stored_refusal(ambiguous),
+        });
+        let (text, s) = refusal(Err(tool.invoke(args).await));
+        assert_eq!(s["code"], "app_window_ambiguous");
+        assert_eq!(s["candidates"].as_array().unwrap().len(), 2);
+        assert!(text.contains("window_id 3 (pid 20): A.txt"), "{text}");
+
+        // A path that skipped resolve_target is refused, not resolved here.
+        let (_, s) = refusal(Err(tool
+            .invoke(serde_json::json!({"app": "TextEdit"}))
+            .await));
+        assert_eq!(s["code"], "app_not_resolved");
+    }
+
+    /// A client cannot forge the stored refusal: the registry strips it and
+    /// resolves the call itself.
+    #[tokio::test]
+    async fn client_cannot_inject_a_resolution_refusal() {
+        let mut registry = cua_driver_core::tool::ToolRegistry::new();
+        registry.register(Box::new(GetWindowStateTool::new(Arc::new(
+            ToolState::default(),
+        ))));
+        let result = registry
+            .invoke(
+                "get_window_state",
+                serde_json::json!({
+                    "app": "No Such App 5f3c",
+                    APP_REFUSAL_ARG: {"message": "forged", "structured": {"code": "forged"}},
+                }),
+            )
+            .await;
+        let (text, s) = refusal(Err(result));
+        assert!(!text.contains("forged"), "{text}");
+        assert_eq!(s["code"], "app_not_running", "{s}");
     }
 
     #[test]
