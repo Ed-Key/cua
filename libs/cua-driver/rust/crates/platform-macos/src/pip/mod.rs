@@ -424,10 +424,18 @@ struct Panel {
     /// The hover bar above the front card and its views.
     bar: usize,
     bar_shown: bool,
-    /// Bumped by every hover change, so a scheduled hide of the bar knows
-    /// whether the pointer came back meanwhile.
+    /// How many of the card's and the bar's tracking areas hold the
+    /// pointer (moving from the card into the bar leaves one and enters the
+    /// other), and a count bumped by every hover change, so a scheduled hide
+    /// of the bar knows whether the pointer came back meanwhile.
+    hover_inside: u32,
     hover_gen: u64,
     client_icon: usize,
+    /// The session-color dot in the bar, and the solid circles under the
+    /// bar's two buttons.
+    dot: usize,
+    focus_circle: usize,
+    close_circle: usize,
     target_icon: usize,
     target_title: usize,
     /// The front card's view (it holds the picture, the cursor sprite, the
@@ -2805,9 +2813,6 @@ fn ns_rect(area: Area) -> NSRect {
 
 unsafe fn set_frame(view: usize, area: Area) {
     let _: () = msg_send![view as *mut AnyObject, setFrame: ns_rect(area)];
-    if let Some(circle) = BUTTON_CIRCLES.with(|map| map.borrow().get(&view).copied()) {
-        let _: () = msg_send![circle as *mut AnyObject, setFrame: ns_rect(area)];
-    }
 }
 
 /// AppKit origin of the panel window in cascade `slot` on the main screen
@@ -2981,14 +2986,15 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let target_icon = new_icon_view(NSRect::ZERO);
     let _: () = msg_send![target_icon, setHidden: true];
     let target_title = new_label(NSRect::ZERO, 12.0, 0.23, false);
-    let focus = new_button(
+    let (focus, focus_circle) = new_button(
         bar_body,
         "arrow.up.forward",
         "Bring this window forward",
         sel!(pipFocus:),
         id,
     );
-    let close = new_button(bar_body, "xmark", "Hide until this agent's next action", sel!(pipHide:), id);
+    let (close, close_circle) =
+        new_button(bar_body, "xmark", "Hide until this agent's next action", sel!(pipHide:), id);
     for view in [client_icon, target_icon, target_title] {
         let _: () = msg_send![bar_body, addSubview: view];
     }
@@ -3022,8 +3028,12 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         action: String::new(),
         bar: bar as usize,
         bar_shown: false,
+        hover_inside: 0,
         hover_gen: 0,
         client_icon: client_icon as usize,
+        dot: dot as usize,
+        focus_circle: focus_circle as usize,
+        close_circle: close_circle as usize,
         target_icon: target_icon as usize,
         target_title: target_title as usize,
         front_view: front_view as usize,
@@ -3348,36 +3358,16 @@ unsafe fn place_bar(panel: &mut Panel, front: Area) {
         glass,
         setFrame: NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(bar.w, bar.h))
     ];
-    let body: *mut AnyObject = bar_body(panel.bar);
-    let views: *mut AnyObject = msg_send![body, subviews];
-    let count: usize = msg_send![views, count];
-    for index in 0..count {
-        let view: *mut AnyObject = msg_send![views, objectAtIndex: index];
-        let is_dot: bool = msg_send![view, isKindOfClass: decor_view_class()];
-        if is_dot {
-            set_frame(view as usize, layout.dot);
-        }
-    }
     for (view, area) in [
         (panel.client_icon, layout.client_icon),
+        (panel.dot, layout.dot),
         (panel.target_title, layout.title),
         (panel.focus, layout.focus),
+        (panel.focus_circle, layout.focus),
         (panel.close, layout.close),
+        (panel.close_circle, layout.close),
     ] {
         set_frame(view, area);
-    }
-}
-
-/// The bar's content view (inside its glass).
-unsafe fn bar_body(bar: usize) -> *mut AnyObject {
-    let glass: *mut AnyObject = msg_send![bar as *mut AnyObject, subviews];
-    let glass: *mut AnyObject = msg_send![glass, firstObject];
-    let responds: bool = msg_send![glass, respondsToSelector: sel!(contentView)];
-    if responds {
-        msg_send![glass, contentView]
-    } else {
-        let subviews: *mut AnyObject = msg_send![glass, subviews];
-        msg_send![subviews, firstObject]
     }
 }
 
@@ -3391,10 +3381,12 @@ unsafe fn bar_area(panel: &Panel) -> Option<Area> {
 }
 
 /// The pointer entered (`inside`) or left the card or its bar: show the
-/// bar at once, or hide it `BAR_FADE_OUT` after the pointer left both.
+/// bar at once, or hide it `BAR_FADE_OUT` after the pointer left both
+/// (leaving the card for the bar is not leaving).
 unsafe fn hover(panel: &mut Panel, inside: bool) {
     panel.hover_gen += 1;
     if inside {
+        panel.hover_inside += 1;
         if !panel.bar_shown {
             panel.bar_shown = true;
             let _: () = msg_send![panel.bar as *mut AnyObject, setHidden: false];
@@ -3402,7 +3394,10 @@ unsafe fn hover(panel: &mut Panel, inside: bool) {
         }
         return;
     }
-    dispatch_to_main_after(BAR_FADE_OUT, (panel.id, panel.hover_gen), bar_hide_cb);
+    panel.hover_inside = panel.hover_inside.saturating_sub(1);
+    if panel.hover_inside == 0 {
+        dispatch_to_main_after(BAR_FADE_OUT, (panel.id, panel.hover_gen), bar_hide_cb);
+    }
 }
 
 unsafe extern "C" fn bar_hide_cb(ctx: *mut c_void) {
@@ -4131,15 +4126,15 @@ unsafe fn text_shadow() -> *mut AnyObject {
 
 /// A round button in `parent`: a white SF Symbol on a solid dark circle
 /// (legible on any backdrop), wired to the shared target. Returns the
-/// button (owned by `parent`); its frame is set by `place_bar`, and the
-/// circle under it follows through autoresizing.
+/// button and its circle (both owned by `parent`); `place_bar` frames
+/// them together.
 unsafe fn new_button(
     parent: *mut AnyObject,
     symbol: &str,
     tooltip: &str,
     action: Sel,
     tag: i64,
-) -> *mut AnyObject {
+) -> (*mut AnyObject, *mut AnyObject) {
     let image = symbol_image(symbol);
     let target = button_target() as *mut AnyObject;
     let button: *mut AnyObject = msg_send![
@@ -4174,16 +4169,7 @@ unsafe fn new_button(
     let _: () = msg_send![layer, setBackgroundColor: fill];
     add_subview(parent, circle);
     let _: () = msg_send![parent, addSubview: button];
-    // The circle follows the button: it is its backing, so keep them in
-    // step wherever the button is framed.
-    let _: () = msg_send![button, setWantsLayer: true];
-    BUTTON_CIRCLES.with(|map| map.borrow_mut().insert(button as usize, circle as usize));
-    button
-}
-
-thread_local! {
-    /// Each button's backing circle (main thread only).
-    static BUTTON_CIRCLES: std::cell::RefCell<HashMap<usize, usize>> = std::cell::RefCell::new(HashMap::new());
+    (button, circle)
 }
 
 unsafe fn symbol_image(name: &str) -> *mut AnyObject {
