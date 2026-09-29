@@ -1797,6 +1797,7 @@ impl ToolRegistry {
             let frame = pip_frame(name, &args, &public_args, &runtime_prefix);
             if let Some(event) = pip_hook::verification_event(
                 frame,
+                start_ms,
                 &public_args,
                 result.structured_content.as_ref(),
             ) {

@@ -1289,6 +1289,15 @@ unsafe fn apply_action(state: &mut State, action: Action) {
             .record_action(target, timestamp_ms);
         return;
     };
+    // The session resumed: it is active from this action, not from when its
+    // (possibly slow, possibly coalesced) capture lands. A playing finale
+    // stops here, and the idle timer counts from now.
+    if panel.finale.cancel() {
+        tracing::info!(target: "pip", session = %key, "PiP finished state cancelled by a new action");
+    }
+    remove_finale_view(panel);
+    let now = Instant::now();
+    panel.last_frame = panel.last_frame.max(now);
     let restacked = restack(panel, &key, &worker, |panel| {
         panel.verdicts.record_action(target, timestamp_ms)
     });
@@ -1296,6 +1305,12 @@ unsafe fn apply_action(state: &mut State, action: Action) {
     if restacked {
         announce_stack(panel, &key);
     }
+    worker.mark_delivered(&key, now);
+    dispatch_to_main_after(
+        IDLE_HIDE_AFTER + Duration::from_millis(20),
+        key,
+        idle_check_cb,
+    );
 }
 
 /// Log each window of the panel (in its stack or touched since the last

@@ -191,11 +191,18 @@ pub const CLAIM_MAX_CHARS: usize = 40;
 const QUOTE_MAX_CHARS: usize = 16;
 
 /// Build the PiP event for a finished `verify_state` call, from the frame
-/// identity the dispatcher built (`pip_frame`), the public input and the
-/// structured output. `None` for calls no panel would show (not an agent
-/// session) and for malformed input/output.
+/// identity the dispatcher built (`pip_frame`), when the call started
+/// (`started_ms`), the public input and the structured output. `None` for
+/// calls no panel would show (not an agent session) and for malformed
+/// input/output.
+///
+/// The event is stamped with when its predicates were last observed,
+/// `started_ms + elapsed_ms` (the output's `elapsed_ms` stops at the final
+/// sample, before any screenshot is taken), not when the call returned: an
+/// action that lands during the screenshot is newer than this evidence.
 pub fn verification_event(
     frame: PipHookFrame,
+    started_ms: u64,
     input: &serde_json::Value,
     output: Option<&serde_json::Value>,
 ) -> Option<PipHookVerification> {
@@ -233,8 +240,14 @@ pub fn verification_event(
             }
         })
         .collect();
+    let observed_ms = output
+        .get("elapsed_ms")
+        .and_then(|elapsed| elapsed.as_u64())
+        .map_or(frame.timestamp_ms, |elapsed| {
+            started_ms.saturating_add(elapsed).min(frame.timestamp_ms)
+        });
     Some(PipHookVerification {
-        timestamp_ms: frame.timestamp_ms,
+        timestamp_ms: observed_ms,
         session_key: frame.session_key,
         target_pid: frame.target_pid?,
         target_window_id: frame.target_window_id?,
@@ -610,7 +623,11 @@ mod tests {
             {"index": 1, "status": "unsatisfied", "unknown_reason": null, "observed_json": null},
             {"index": 2, "status": "unknown", "unknown_reason": "multi_match", "observed_json": null},
         ]});
-        let event = verification_event(agent, &input, Some(&output)).unwrap();
+        agent.timestamp_ms = 10_000;
+        let event = verification_event(agent, 1_000, &input, Some(&output)).unwrap();
+        // Stamped when the predicates were observed (start + elapsed_ms),
+        // not when the call returned (after an include_screenshot capture).
+        assert_eq!(event.timestamp_ms, 1_005);
         assert_eq!((event.target_pid, event.target_window_id), (42, 7));
         assert!(!event.satisfied);
         let claims: Vec<(&str, Option<bool>)> = event
@@ -629,7 +646,7 @@ mod tests {
         // A one-shot call (no label, no client) gets no event.
         let mut anonymous = frame(None, None, Some(42));
         anonymous.target_window_id = Some(7);
-        assert!(verification_event(anonymous, &input, Some(&output)).is_none());
+        assert!(verification_event(anonymous, 0, &input, Some(&output)).is_none());
     }
 
     #[test]
@@ -662,7 +679,7 @@ mod tests {
             .unwrap();
             let mut agent = frame(Some("alpha"), None, Some(42));
             agent.target_window_id = Some(7);
-            verification_event(agent, &input, Some(&output)).unwrap()
+            verification_event(agent, 0, &input, Some(&output)).unwrap()
         };
         let secure = event_for("AXTextField", "hunter2");
         assert_eq!(secure.claims[0].satisfied, Some(true));
