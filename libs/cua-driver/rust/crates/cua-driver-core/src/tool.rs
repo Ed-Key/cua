@@ -16,7 +16,7 @@ thread_local! {
 use crate::{
     pip_hook,
     protocol::{Content, ToolResult},
-    recording::{now_ms, screenshot_for, RecordingSession},
+    recording::{now_ms, RecordingSession},
     recording_tools::{
         GetRecordingStateTool, ReplayRegistrySlot, ReplayTrajectoryTool, StartRecordingTool,
         StopRecordingTool,
@@ -1770,24 +1770,14 @@ impl ToolRegistry {
             );
         }
 
-        // Experimental PiP push — only when --experimental-pip is on argv
-        // (otherwise `pip_enabled()` is false and we skip the screenshot
-        // entirely to avoid wasted capture work). We push for the same set
-        // of action tools the recording pipeline cares about (non-read-only,
-        // not the recording-control meta-tools) so the live view matches
-        // what the recorder would have captured for the turn.
+        // Experimental PiP push — only when --experimental-pip is on argv.
+        // We push for the same set of action tools the recording pipeline
+        // cares about (non-read-only, not the recording-control meta-tools).
+        // Only identity crosses here: the backend captures the target on
+        // its own worker, so a slow or stuck capture never delays this
+        // action's result.
         if pip_hook::pip_enabled() && should_record && !private_consent_turn {
-            let window_id = args.opt_u64("window_id");
-            let pid = args.opt_i64("pid");
-            if let Some(png_bytes) = screenshot_for(window_id, pid) {
-                pip_hook::push_pip_frame(pip_frame(
-                    name,
-                    &args,
-                    &public_args,
-                    &runtime_prefix,
-                    png_bytes,
-                ));
-            }
+            pip_hook::push_pip_frame(pip_frame(name, &args, &public_args, &runtime_prefix));
         }
 
         result
@@ -5221,7 +5211,6 @@ fn pip_frame(
     args: &Value,
     public_args: &Value,
     runtime_prefix: &str,
-    png_bytes: Vec<u8>,
 ) -> pip_hook::PipHookFrame {
     let str_arg = |key: &str| {
         args.get(key)
@@ -5234,7 +5223,6 @@ fn pip_frame(
         })
         .unwrap_or_default();
     pip_hook::PipHookFrame {
-        png_bytes,
         action_label: synthesize_action_label(tool_name, public_args),
         timestamp_ms: now_ms(),
         session_key: str_arg("_session_id").unwrap_or("default").to_owned(),
@@ -5311,7 +5299,7 @@ mod capability_tests {
             "_transport_session_id": format!("{prefix}proxy-1"),
         });
         let public = serde_json::json!({"pid": 42, "window_id": 7, "element_index": 3});
-        let frame = pip_frame("click", &args, &public, prefix, vec![1]);
+        let frame = pip_frame("click", &args, &public, prefix);
         assert_eq!(frame.session_key, format!("{prefix}research"));
         assert_eq!(frame.session_label.as_deref(), Some("research"));
         assert_eq!(frame.target_pid, Some(42));
@@ -5319,9 +5307,18 @@ mod capability_tests {
         assert_eq!(frame.action_label, "click: element_index=3");
 
         // No session at all (one-shot CLI) shares the classic default panel.
-        let bare = pip_frame("click", &serde_json::json!({}), &public, prefix, vec![]);
+        let bare = pip_frame("click", &serde_json::json!({}), &public, prefix);
         assert_eq!(bare.session_key, "default");
         assert!(bare.session_label.is_none() && bare.target_pid.is_none());
+    }
+
+    #[test]
+    fn pip_push_path_never_captures() {
+        let prefix = "__cua_runtime_0123456789abcdef0123456789abcdef:";
+        let args = serde_json::json!({"pid": 42, "window_id": 7});
+        let before = crate::recording::screenshot_calls_on_this_thread();
+        pip_hook::push_pip_frame(pip_frame("click", &args, &args, prefix));
+        assert_eq!(crate::recording::screenshot_calls_on_this_thread(), before);
     }
 
     #[test]

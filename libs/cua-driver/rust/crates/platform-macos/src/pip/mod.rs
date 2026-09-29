@@ -22,8 +22,12 @@
 //!
 //! Mirrors `cursor/overlay.rs`: AppKit runs on the main thread, which
 //! `cua-driver/src/main.rs` parks in `NSApplication.run()`. `push_frame()`
-//! and `end_session()` are called from arbitrary threads; they box their
-//! payload and post the UI work to the main queue with `dispatch_async_f`.
+//! is called from the tool dispatcher and only enqueues: frames carry no
+//! pixels. A dedicated `cua-pip-capture` thread (never the main thread or
+//! a tokio worker) captures the newest queued frame per session through
+//! `recording::screenshot_for`, bounded by a 1.5 s timeout (on timeout the
+//! panel keeps its previous image and only the header/status update), then
+//! posts the UI work to the main queue with `dispatch_async_f`.
 //! All panel state lives in `STATE` and is only touched on the main queue
 //! (the mutex exists to make the static `Sync`, not for contention).
 //!
@@ -43,9 +47,9 @@
 //! The screenshot is a single `NSImageView`; step 1b swaps it for a live
 //! ScreenCaptureKit layer in the same frame.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
-use std::sync::Mutex;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
@@ -256,47 +260,190 @@ fn dispatch_to_main_after<T: Send + 'static>(
     };
 }
 
+// ── Capture worker ────────────────────────────────────────────────────────
+//
+// Frames arrive without pixels (the dispatcher must never capture inside an
+// action). One worker thread captures each session's target through the
+// shared `recording::screenshot_for`, with a hard per-capture timeout, and
+// only for the newest frame a session has queued.
+
+const CAPTURE_TIMEOUT: Duration = Duration::from_millis(1500);
+
+/// Latest pending item per session, sessions served in arrival order. A
+/// newer item for a queued session replaces the older one in place.
+struct LatestPerSession<T> {
+    order: VecDeque<String>,
+    latest: HashMap<String, T>,
+}
+
+impl<T> LatestPerSession<T> {
+    fn new() -> Self {
+        Self {
+            order: VecDeque::new(),
+            latest: HashMap::new(),
+        }
+    }
+
+    fn push(&mut self, key: String, item: T) {
+        if self.latest.insert(key.clone(), item).is_none() {
+            self.order.push_back(key);
+        }
+    }
+
+    fn pop(&mut self) -> Option<(String, T)> {
+        while let Some(key) = self.order.pop_front() {
+            if let Some(item) = self.latest.remove(&key) {
+                return Some((key, item));
+            }
+        }
+        None
+    }
+
+    fn remove(&mut self, key: &str) {
+        self.latest.remove(key);
+    }
+}
+
+/// (pid, window_id) of a capture target.
+type Target = (Option<i32>, Option<u32>);
+type CaptureFn = dyn Fn(Target) -> Option<Vec<u8>> + Send + Sync;
+
+struct CaptureWorker {
+    queue: Mutex<LatestPerSession<PipFrame>>,
+    ready: Condvar,
+    capture: Arc<CaptureFn>,
+    timeout: Duration,
+    /// Targets with a capture still running, including ones that timed out.
+    /// A stuck target gets no second capture thread until the first returns.
+    in_flight: Arc<Mutex<HashSet<Target>>>,
+}
+
+impl CaptureWorker {
+    fn start(
+        capture: Arc<CaptureFn>,
+        timeout: Duration,
+        deliver: impl Fn(PipFrame, Option<Vec<u8>>) + Send + 'static,
+    ) -> anyhow::Result<Arc<Self>> {
+        let worker = Arc::new(Self {
+            queue: Mutex::new(LatestPerSession::new()),
+            ready: Condvar::new(),
+            capture,
+            timeout,
+            in_flight: Arc::new(Mutex::new(HashSet::new())),
+        });
+        let looping = worker.clone();
+        std::thread::Builder::new()
+            .name("cua-pip-capture".into())
+            .spawn(move || loop {
+                let frame = looping.next();
+                let png = looping.capture_bounded((frame.target_pid, frame.target_window_id));
+                deliver(frame, png);
+            })?;
+        Ok(worker)
+    }
+
+    /// Enqueue only; never captures, never blocks on a capture.
+    fn push(&self, frame: PipFrame) {
+        lock(&self.queue).push(frame.session_key.clone(), frame);
+        self.ready.notify_one();
+    }
+
+    fn forget(&self, session_key: &str) {
+        lock(&self.queue).remove(session_key);
+    }
+
+    fn next(&self) -> PipFrame {
+        let mut queue = lock(&self.queue);
+        loop {
+            if let Some((_, frame)) = queue.pop() {
+                return frame;
+            }
+            queue = self.ready.wait(queue).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
+    /// Capture `target` on a helper thread, waiting at most `timeout`.
+    /// `None` (keep the previous image) on timeout, failure, or while an
+    /// earlier capture of the same target is still stuck.
+    fn capture_bounded(&self, target: Target) -> Option<Vec<u8>> {
+        if !lock(&self.in_flight).insert(target) {
+            return None;
+        }
+        let (sender, receiver) = mpsc::sync_channel(1);
+        let capture = self.capture.clone();
+        let in_flight = self.in_flight.clone();
+        let spawned = std::thread::Builder::new()
+            .name("cua-pip-shot".into())
+            .spawn(move || {
+                let png = capture(target);
+                lock(&in_flight).remove(&target);
+                let _ = sender.send(png);
+            });
+        if spawned.is_err() {
+            lock(&self.in_flight).remove(&target);
+            return None;
+        }
+        receiver.recv_timeout(self.timeout).ok().flatten()
+    }
+}
+
+fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(|e| e.into_inner())
+}
+
 // ── Backend ───────────────────────────────────────────────────────────────
 
-pub struct MacosPipBackend;
+pub struct MacosPipBackend {
+    worker: Arc<CaptureWorker>,
+}
 
 struct FrameUpdate {
     frame: PipFrame,
-    /// Window title (or owning app name) looked up off the main thread.
+    /// Fresh screenshot, or `None` to keep the panel's previous image.
+    png: Option<Vec<u8>>,
+    /// Window title (or owning app name), looked up on the capture worker.
     target_title: Option<String>,
 }
 
 impl PipBackend for MacosPipBackend {
     fn push_frame(&self, frame: PipFrame) {
-        // Enumerating WindowServer windows is a synchronous CG call; do it
-        // on the caller's thread, not the UI thread.
-        let target_title = frame
-            .target_window_id
-            .and_then(crate::windows::window_info_by_id)
-            .map(|window| {
-                if window.title.trim().is_empty() {
-                    window.app_name
-                } else {
-                    window.title
-                }
-            })
-            .filter(|title| !title.trim().is_empty());
-        dispatch_to_main(
-            FrameUpdate {
-                frame,
-                target_title,
-            },
-            apply_frame_cb,
-        );
+        self.worker.push(frame);
     }
 
     fn end_session(&self, session_key: &str) {
+        // ponytail: a capture already running for this session can still
+        // deliver after this and re-create its panel, which then idle-hides.
+        self.worker.forget(session_key);
         dispatch_to_main(session_key.to_owned(), end_session_cb);
     }
 
     fn shutdown(self: Box<Self>) {
         dispatch_to_main((), shutdown_cb);
     }
+}
+
+/// Runs on the capture worker: look up the window title (a synchronous
+/// WindowServer call) and hand the update to the main queue.
+fn deliver_to_main(frame: PipFrame, png: Option<Vec<u8>>) {
+    let target_title = frame
+        .target_window_id
+        .and_then(crate::windows::window_info_by_id)
+        .map(|window| {
+            if window.title.trim().is_empty() {
+                window.app_name
+            } else {
+                window.title
+            }
+        })
+        .filter(|title| !title.trim().is_empty());
+    dispatch_to_main(
+        FrameUpdate {
+            frame,
+            png,
+            target_title,
+        },
+        apply_frame_cb,
+    );
 }
 
 pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
@@ -309,7 +456,11 @@ pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         remembered: HashMap::new(),
         next_id: 1,
     });
-    Ok(Box::new(MacosPipBackend))
+    let capture: Arc<CaptureFn> = Arc::new(|(pid, window_id): Target| {
+        cua_driver_core::recording::screenshot_for(window_id.map(u64::from), pid.map(i64::from))
+    });
+    let worker = CaptureWorker::start(capture, CAPTURE_TIMEOUT, deliver_to_main)?;
+    Ok(Box::new(MacosPipBackend { worker }))
 }
 
 // ── Main-queue callbacks ──────────────────────────────────────────────────
@@ -324,6 +475,7 @@ unsafe extern "C" fn apply_frame_cb(ctx: *mut c_void) {
 unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     let FrameUpdate {
         frame,
+        png,
         target_title,
     } = update;
     let key = frame.session_key.clone();
@@ -337,18 +489,21 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
         return;
     };
 
-    // Screenshot. `dataWithBytes:length:` copies, so the Vec can drop.
-    let data: *mut AnyObject = msg_send![
-        class!(NSData),
-        dataWithBytes: frame.png_bytes.as_ptr() as *const c_void
-        length: frame.png_bytes.len()
-    ];
-    if !data.is_null() {
-        let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-        let image: *mut AnyObject = msg_send![image, initWithData: data];
-        if !image.is_null() {
-            let _: () = msg_send![panel.image_view as *mut AnyObject, setImage: image];
-            let _: () = msg_send![image, release];
+    // Screenshot, when this update has one; otherwise keep the last image.
+    // `dataWithBytes:length:` copies, so the Vec can drop.
+    if let Some(png) = png {
+        let data: *mut AnyObject = msg_send![
+            class!(NSData),
+            dataWithBytes: png.as_ptr() as *const c_void
+            length: png.len()
+        ];
+        if !data.is_null() {
+            let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+            let image: *mut AnyObject = msg_send![image, initWithData: data];
+            if !image.is_null() {
+                let _: () = msg_send![panel.image_view as *mut AnyObject, setImage: image];
+                let _: () = msg_send![image, release];
+            }
         }
     }
     set_text(panel.status, &frame.action_label);
@@ -1152,6 +1307,108 @@ mod tests {
             "research-run"
         );
         assert_eq!(short_key("default"), "default");
+    }
+
+    fn frame(session: &str, label: &str) -> PipFrame {
+        PipFrame {
+            action_label: label.into(),
+            timestamp_ms: 0,
+            session_key: session.into(),
+            session_label: None,
+            client_name: None,
+            client_pid: None,
+            target_pid: Some(42),
+            target_window_id: Some(7),
+        }
+    }
+
+    type Delivered = mpsc::Receiver<(String, Option<Vec<u8>>)>;
+
+    fn worker(capture: Arc<CaptureFn>, timeout: Duration) -> (Arc<CaptureWorker>, Delivered) {
+        let (sender, delivered) = mpsc::channel();
+        let sender = Mutex::new(sender);
+        let worker = CaptureWorker::start(capture, timeout, move |frame, png| {
+            let _ = lock(&sender).send((frame.action_label, png));
+        })
+        .unwrap();
+        (worker, delivered)
+    }
+
+    #[test]
+    fn latest_per_session_keeps_only_the_newest_item() {
+        let mut queue = LatestPerSession::new();
+        queue.push("a".into(), 1);
+        queue.push("b".into(), 2);
+        queue.push("a".into(), 3);
+        assert_eq!(queue.pop(), Some(("a".into(), 3)));
+        assert_eq!(queue.pop(), Some(("b".into(), 2)));
+        assert_eq!(queue.pop(), None);
+        queue.push("c".into(), 4);
+        queue.remove("c");
+        assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn push_never_captures_and_captures_coalesce_to_the_latest_frame() {
+        let (started_tx, started) = mpsc::channel::<()>();
+        let (release, release_rx) = mpsc::channel::<()>();
+        let (started_tx, release_rx) = (Mutex::new(started_tx), Mutex::new(release_rx));
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let capture: Arc<CaptureFn> = Arc::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = lock(&started_tx).send(());
+            let _ = lock(&release_rx).recv();
+            Some(vec![1])
+        });
+        let (worker, delivered) = worker(capture, Duration::from_secs(5));
+
+        let pushing = Instant::now();
+        worker.push(frame("s", "first"));
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        // The capture of "first" is blocked; pushes still return at once.
+        worker.push(frame("s", "second"));
+        worker.push(frame("s", "third"));
+        assert!(pushing.elapsed() < Duration::from_secs(1));
+
+        release.send(()).unwrap();
+        assert_eq!(
+            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ("first".to_owned(), Some(vec![1]))
+        );
+        started.recv_timeout(Duration::from_secs(5)).unwrap();
+        release.send(()).unwrap();
+        assert_eq!(
+            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ("third".to_owned(), Some(vec![1]))
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn a_stuck_capture_times_out_and_is_not_retried_while_stuck() {
+        let (_hold, stuck) = mpsc::channel::<()>();
+        let stuck = Mutex::new(stuck);
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let capture: Arc<CaptureFn> = Arc::new(move |_| {
+            counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let _ = lock(&stuck).recv(); // never answered
+            Some(vec![1])
+        });
+        let (worker, delivered) = worker(capture, Duration::from_millis(50));
+
+        worker.push(frame("s", "first"));
+        assert_eq!(
+            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ("first".to_owned(), None)
+        );
+        worker.push(frame("s", "second"));
+        assert_eq!(
+            delivered.recv_timeout(Duration::from_secs(5)).unwrap(),
+            ("second".to_owned(), None)
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

@@ -8,10 +8,10 @@
 //! a thin shim so `tool.rs` doesn't need to know about `pip-preview`
 //! directly and we keep the dependency graph one-directional.
 //!
-//! The PNG bytes pushed through here come from the existing
-//! `SCREENSHOT_FN` callback (the same source `screenshot.png` uses in
-//! the recording pipeline), so PiP shows exactly what the recorder
-//! captures.
+//! Frames carry identity only, never pixels: the dispatcher must not
+//! capture inside an action's own dispatch. Backends capture the target
+//! on their own worker through `recording::screenshot_for` (the same
+//! `SCREENSHOT_FN` the recorder uses).
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
@@ -21,7 +21,6 @@ use std::sync::{Mutex, OnceLock};
 /// from importing `pip-preview` (the dependency would be circular once
 /// platform backends pull both crates in).
 pub struct PipHookFrame {
-    pub png_bytes: Vec<u8>,
     pub action_label: String,
     pub timestamp_ms: u64,
     /// Private runtime session key (`_session_id`, or "default"). Keys the

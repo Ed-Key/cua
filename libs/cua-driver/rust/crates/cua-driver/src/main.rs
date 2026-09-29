@@ -264,7 +264,6 @@ fn maybe_init_pip() {
                 if let Some(slot) = BACKEND.get() {
                     if let Some(b) = slot.lock().unwrap().as_ref() {
                         b.push_frame(pip_preview::PipFrame {
-                            png_bytes: frame.png_bytes,
                             action_label: frame.action_label,
                             timestamp_ms: frame.timestamp_ms,
                             session_key: frame.session_key,

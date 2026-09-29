@@ -1014,8 +1014,6 @@ pub async fn run_serve(
                 let trusted_host_connection =
                     authenticate_embedded_host_connection(&stream).is_ok();
                 let history_cli_executable_path = history_cli_executable_path(&stream).ok();
-                // Only a control connection's peer is recorded (PiP client icon).
-                let peer_pid = stream.peer_cred().ok().and_then(|cred| cred.pid());
                 let reg = sdk.clone();
                 let shutdown_tx2 = shutdown_tx.clone();
                 let trusted_resume_registry = trusted_resume_registry.clone();
@@ -1328,8 +1326,20 @@ pub async fn run_serve(
                                         .lock()
                                         .unwrap()
                                         .insert(sid.to_owned());
-                                    if let Some(pid) = peer_pid {
-                                        cua_driver_core::pip_hook::note_client_pid(sid, pid);
+                                    // PiP client icon only. A failed read is
+                                    // logged and ignored; it never affects the
+                                    // connection. Skipped when PiP is off.
+                                    if cua_driver_core::pip_hook::pip_enabled() {
+                                        match writer.as_ref().peer_cred() {
+                                            Ok(cred) => {
+                                                if let Some(pid) = cred.pid() {
+                                                    cua_driver_core::pip_hook::note_client_pid(sid, pid);
+                                                }
+                                            }
+                                            Err(error) => tracing::debug!(
+                                                "PiP: control peer pid unavailable: {error}"
+                                            ),
+                                        }
                                     }
                                 }
                                 let resp = DaemonResponse::ok(
