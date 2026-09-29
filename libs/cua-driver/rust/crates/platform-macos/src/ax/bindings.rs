@@ -315,7 +315,7 @@ pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option
     None
 }
 
-unsafe fn coerce_binary_value(value: CFTypeRef) -> Option<bool> {
+pub(crate) unsafe fn coerce_binary_value(value: CFTypeRef) -> Option<bool> {
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
     let type_id = core_foundation::base::CFGetTypeID(value);
@@ -752,19 +752,30 @@ pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_children_reporting(element: AXUIElementRef) -> (Vec<AXUIElementRef>, bool) {
+    let (children, error) = copy_children_error(element);
+    (children, error.is_some())
+}
+
+/// [`copy_children`], plus the error when the read itself failed
+/// (`kAXErrorCannotComplete` when the app did not answer in time).
+///
+/// # Safety
+///
+/// `element` must be valid, and the caller must release every returned element.
+pub unsafe fn copy_children_error(element: AXUIElementRef) -> (Vec<AXUIElementRef>, Option<AXError>) {
     let attr = CFStr::new("AXChildren");
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err == kAXErrorNoValue || err == kAXErrorAttributeUnsupported {
-        return (vec![], false);
+        return (vec![], None);
     }
     if err != kAXErrorSuccess || value.is_null() {
-        return (vec![], true);
+        return (vec![], Some(if err == kAXErrorSuccess { kAXErrorFailure } else { err }));
     }
     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
         CFRelease(value);
-        return (vec![], true);
+        return (vec![], Some(kAXErrorFailure));
     }
     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
     let ax_type_id = AXUIElementGetTypeID();
@@ -780,7 +791,7 @@ pub unsafe fn copy_children_reporting(element: AXUIElementRef) -> (Vec<AXUIEleme
             }
         })
         .collect();
-    (children, false)
+    (children, None)
 }
 
 /// Copy an AX element-valued attribute. The returned element is retained and

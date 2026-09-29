@@ -498,8 +498,11 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let (children, failed) = copy_children_reporting(element);
-        sightings.child_read_failed |= failed;
+        let (children, error) = copy_children_error(element);
+        sightings.child_read_failed |= error.is_some();
+        if error == Some(kAXErrorCannotComplete) {
+            budget.skip();
+        }
         for child in children {
             walk_element(
                 child,
@@ -574,8 +577,11 @@ unsafe fn walk_element(
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let (children, failed) = copy_children_reporting(element);
-        sightings.child_read_failed |= failed;
+        let (children, error) = copy_children_error(element);
+        sightings.child_read_failed |= error.is_some();
+        if error == Some(kAXErrorCannotComplete) {
+            budget.skip();
+        }
         for child in children {
             walk_element(
                 child,
@@ -718,8 +724,12 @@ unsafe fn walk_element(
     let position = nodes.len();
     nodes.push(node);
 
-    let (children, failed) = copy_children_reporting(element);
-    sightings.child_read_failed |= failed;
+    let (children, error) = copy_children_error(element);
+    sightings.child_read_failed |= error.is_some();
+    // A subtree the app did not answer for in time is missing: count it.
+    if error == Some(kAXErrorCannotComplete) {
+        budget.skip();
+    }
     for child in children {
         walk_element(
             child,
@@ -734,6 +744,11 @@ unsafe fn walk_element(
             max_depth,
         );
         CFRelease(child as CFTypeRef);
+    }
+    // The cache keeps this element for actions: give it back the action
+    // timeout, since a messaging timeout stays on the object.
+    if is_actionable {
+        set_messaging_timeout(element);
     }
 }
 

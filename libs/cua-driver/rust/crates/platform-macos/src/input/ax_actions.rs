@@ -109,16 +109,23 @@ impl RowReadback {
     }
 }
 
+/// Longest a selection scan may take; past it the scan is incomplete.
+const SCAN_BUDGET: std::time::Duration = std::time::Duration::from_millis(1000);
+/// Bound for one peer read during a scan.
+const PEER_READ_TIMEOUT_SECONDS: f32 = 0.25;
+
 /// Selection among `parent`'s children (its rows, for a table), one
 /// AXSelected read per child: (selectable children, selected ones other than
 /// `row`, whether any is selected, whether the list is complete). The list
-/// is incomplete when the children could not be read or there were more
-/// than `MAX_SCANNED_PEERS`.
+/// is incomplete when the children could not be read, there were more than
+/// `MAX_SCANNED_PEERS`, a child's selection could not be read (not just
+/// unsupported), or the scan ran past `SCAN_BUDGET`.
 unsafe fn scan_selection(
     parent: AXUIElementRef,
     row: Option<AXUIElementRef>,
 ) -> (usize, usize, bool, bool) {
-    let (children, complete) =
+    let deadline = std::time::Instant::now() + SCAN_BUDGET;
+    let (children, mut complete) =
         match crate::ax::bindings::copy_element_array_attr_checked(parent, "AXRows", 20_000) {
             Ok(rows) => (rows, true),
             Err(_) => {
@@ -126,16 +133,36 @@ unsafe fn scan_selection(
                 (children, !failed)
             }
         };
-    let complete = complete && children.len() <= MAX_SCANNED_PEERS;
+    complete &= children.len() <= MAX_SCANNED_PEERS;
     let (mut selectable, mut others, mut any) = (0, 0, false);
     for (at, child) in children.into_iter().enumerate() {
-        if at < MAX_SCANNED_PEERS {
-            if let Some(selected) = copy_bool_attr(child, "AXSelected") {
-                selectable += 1;
-                any |= selected;
-                let is_row =
-                    row.is_some_and(|row| CFEqual(child as CFTypeRef, row as CFTypeRef) != 0);
-                others += usize::from(selected && !is_row);
+        if at < MAX_SCANNED_PEERS && complete {
+            if std::time::Instant::now() >= deadline {
+                complete = false;
+            } else {
+                AXUIElementSetMessagingTimeout(child, PEER_READ_TIMEOUT_SECONDS);
+                let read = crate::ax::bindings::copy_attribute_checked(child, "AXSelected");
+                AXUIElementSetMessagingTimeout(
+                    child,
+                    crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS,
+                );
+                match read {
+                    Ok(value) => {
+                        let selected =
+                            crate::ax::bindings::coerce_binary_value(value.as_CFTypeRef());
+                        if let Some(selected) = selected {
+                            selectable += 1;
+                            any |= selected;
+                            let is_row = row.is_some_and(|row| {
+                                CFEqual(child as CFTypeRef, row as CFTypeRef) != 0
+                            });
+                            others += usize::from(selected && !is_row);
+                        }
+                    }
+                    // Not a selectable child (a column, a header).
+                    Err(kAXErrorAttributeUnsupported | kAXErrorNoValue) => {}
+                    Err(_) => complete = false,
+                }
             }
         }
         CFRelease(child as CFTypeRef);

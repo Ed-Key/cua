@@ -2006,18 +2006,22 @@ fn select_row(
         if err == crate::ax::bindings::kAXErrorSuccess && row_settles_exclusive(row) {
             return confirmed("with AXPress", false);
         }
-        // The press replaced the element (it navigated or rebuilt the list):
-        // the row's coordinates may now hold something else, so no pointer
-        // click follows.
-        if crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
-            crate::ax::bindings::element_gone_after_action(element)
-        }) || !row.readable()
-        {
+        let replaced = if err == crate::ax::bindings::kAXErrorSuccess {
+            !row.readable() || !unsafe { crate::ax::bindings::element_is_alive(element) }
+        } else {
+            crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
+                crate::ax::bindings::element_gone_after_action(element)
+            })
+        };
+        // The press replaced the element or its row (it navigated or rebuilt
+        // the list): the row's coordinates may now hold something else, so
+        // no pointer click follows.
+        if replaced {
             return Ok((
                 format!(
-                    "✅ Performed AXPress on [{idx}] {role} \"{title}\"; the row can no longer \
-                     be read back (the press replaced it). Take a fresh snapshot before acting \
-                     again: do not retry this click."
+                    "✅ Performed AXPress on [{idx}] {role} \"{title}\"; the element or its row \
+                     was replaced, so the selection cannot be read back. Take a fresh snapshot \
+                     before acting again: do not retry this click."
                 ),
                 false,
                 false,
@@ -2025,10 +2029,18 @@ fn select_row(
                 false,
             ));
         }
+        // A stale handle fails before anything happens: report that.
+        if err == crate::ax::bindings::kAXErrorInvalidUIElement {
+            anyhow::bail!("AXUIElementPerformAction(AXPress) returned {err}; take a fresh snapshot");
+        }
     }
     // The caller resolves the row's pixel target; without one there is no
-    // pointer rung.
-    let pointer_target = pixel;
+    // pointer rung. The row must still be where that target was taken.
+    let pointer_target = pixel.filter(|point| {
+        row.center().is_some_and(|(x, y)| {
+            (x - point.screen_x).abs() <= 2.0 && (y - point.screen_y).abs() <= 2.0
+        })
+    });
     if let Some(point) = pointer_target {
         crate::input::mouse::click_at_xy_with_window_local(
             pid,

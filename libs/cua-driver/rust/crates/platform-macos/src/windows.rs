@@ -116,6 +116,16 @@ pub(crate) fn composited_windows() -> Vec<WindowInfo> {
 /// meant for an app; smaller chrome (the menu bar, a menu, a banner) does.
 const SYSTEM_LAYER: i32 = 20;
 
+/// Owners of display-sized, click-through chrome windows. Any other app's
+/// display-sized window above the normal level (a full-screen overlay) takes
+/// the click and is an occluder.
+fn is_system_chrome(app_name: &str) -> bool {
+    matches!(
+        app_name,
+        "Dock" | "Notification Center" | "Window Server" | "Control Center" | "WindowManager"
+    )
+}
+
 /// Who a pointer event at a screen point reaches.
 #[derive(Debug)]
 pub(crate) enum PointOwner<'a> {
@@ -162,7 +172,7 @@ pub(crate) fn point_owner<'a>(
         {
             return PointOwner::Target;
         }
-        if window.layer >= SYSTEM_LAYER && covers_a_display(b) {
+        if window.layer >= SYSTEM_LAYER && covers_a_display(b) && is_system_chrome(&window.app_name) {
             continue;
         }
         return PointOwner::Other(window);
@@ -510,7 +520,7 @@ mod tests {
         const TARGET: u32 = 10;
         let belongs = |id: u32| id == TARGET || id == 11; // 11: the target's sheet
         let cursor = at(1, 7, 0, (0.0, 0.0, 2000.0, 2000.0)); // the driver's own overlay
-        let dock = at(2, 50, 20, (0.0, 0.0, 2000.0, 2000.0));
+        let dock = WindowInfo { app_name: "Dock".into(), ..at(2, 50, 20, (0.0, 0.0, 2000.0, 2000.0)) };
         let finder = at(3, 60, 0, (300.0, 300.0, 400.0, 300.0));
         let target = at(TARGET, 40, 0, (200.0, 200.0, 800.0, 600.0));
         let windows = [cursor.clone(), dock.clone(), finder.clone(), target.clone()];
@@ -537,6 +547,13 @@ mod tests {
         assert!(matches!(
             point_owner(&windows, &SCREENS, (900.0, 10.0), 40, 7, belongs),
             PointOwner::Other(WindowInfo { window_id: 4, .. })
+        ));
+        // Another app's full-screen overlay above the normal level takes clicks.
+        let overlay = at(6, 70, 25, (0.0, 0.0, 2000.0, 2000.0));
+        let windows = [overlay, target.clone()];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, belongs),
+            PointOwner::Other(WindowInfo { window_id: 6, .. })
         ));
         // Another window of the same app that is not the target's covers it.
         let other_own = at(13, 40, 0, (300.0, 300.0, 400.0, 300.0));

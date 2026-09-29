@@ -157,12 +157,16 @@ impl WalkOutcome {
         }
     }
 
+    /// Cut short by a budget, or missing the subtrees of nodes that did not
+    /// answer.
     pub fn truncated(&self) -> bool {
-        self.stop.is_some()
+        self.stop.is_some() || self.nodes_skipped > 0
     }
 
     pub fn reason(&self) -> Option<&'static str> {
-        self.stop.map(WalkStop::as_str)
+        self.stop
+            .map(WalkStop::as_str)
+            .or((self.nodes_skipped > 0).then_some("app_unresponsive"))
     }
 
     /// Write the shared walk fields into a `get_window_state` payload.
@@ -287,6 +291,9 @@ mod tests {
         // A walk that skipped its first unanswered reads also stalled.
         let skipped = WalkOutcome { nodes_skipped: 1, ..outcome(None, 1000, 1) };
         assert_eq!(retry_timeout_ms(&skipped), Some(4000));
+        // Missing subtrees are a partial tree, never a complete one.
+        assert!(skipped.truncated());
+        assert_eq!(skipped.reason(), Some("app_unresponsive"));
 
         // The per-read bound grows with the budget, so a retry waits longer.
         assert_eq!(WalkBudget::new(1000, 10).read_timeout_secs(), 0.25);
