@@ -741,14 +741,12 @@ fn main() {
 
             // Keep the main thread alive for the daemon.
             //
-            // PiP needs the AppKit main run loop to process the
-            // dispatch_async_f calls that push frames into NSImageView;
-            // park main in NSApplication.run() when --experimental-pip is
-            // on. Otherwise just join the serve thread so the process
-            // stays up as long as the daemon does.
-            if pip_cfg.enabled {
-                platform_macos::pip::run_appkit_main_loop();
-            } else if cursor_cfg.enabled {
+            // The overlay's loop is checked first: it is the only consumer of
+            // the cursor command channel (actions wait on it), and its
+            // NSApplication run loop also drains the main-queue blocks PiP
+            // posts. Running PiP's own loop while the cursor is on starved
+            // that channel and hung every action.
+            if cursor_cfg.enabled {
                 // Render the agent-cursor overlay: park the main thread in the
                 // AppKit run loop so the overlay NSWindow draws. `run_on_main_thread`
                 // self-guards on `has_graphic_access()` and returns immediately
@@ -757,6 +755,10 @@ fn main() {
                 // on its background thread regardless.
                 platform_macos::cursor::overlay::run_on_main_thread();
                 let _ = serve_handle.join();
+            } else if pip_cfg.enabled {
+                // PiP needs the AppKit run loop to process the dispatch_async_f
+                // calls that update its panels.
+                platform_macos::pip::run_appkit_main_loop();
             } else {
                 // No overlay: still run a main run loop, or macOS never
                 // delivers the activation notices focus protection needs.
