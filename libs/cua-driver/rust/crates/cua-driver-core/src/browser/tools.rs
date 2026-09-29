@@ -1320,6 +1320,163 @@ const FOCUS_EMULATION_READY_CHECK: &str = "function() { \
     return document.hasFocus() && active === this; \
 }";
 
+// What an editable node holds, read on the node itself: an input's or
+// textarea's value and selection, or a contenteditable's text.
+const READ_EDIT_STATE: &str = "function() { \
+    const field = this.tagName === 'INPUT' || this.tagName === 'TEXTAREA'; \
+    let start = null, end = null; \
+    if (field) { try { start = this.selectionStart; end = this.selectionEnd; } catch (e) {} } \
+    return { value: field ? String(this.value) : String(this.innerText || ''), start: start, \
+        end: end, field: field, \
+        password: this.tagName === 'INPUT' && (this.type || '').toLowerCase() === 'password' }; \
+}";
+
+// Set an input's or textarea's value the way frameworks observe: through the
+// prototype's native setter (a plain `el.value = x` is swallowed by React's
+// value tracker), then input and change events. Uses the node's own window so
+// it works inside iframes.
+const SET_VALUE_WITH_EVENTS: &str = "function(value) { \
+    const view = this.ownerDocument.defaultView; \
+    const proto = this.tagName === 'INPUT' ? view.HTMLInputElement.prototype : \
+        this.tagName === 'TEXTAREA' ? view.HTMLTextAreaElement.prototype : null; \
+    if (!proto) return false; \
+    Object.getOwnPropertyDescriptor(proto, 'value').set.call(this, value); \
+    this.dispatchEvent(new view.Event('input', { bubbles: true })); \
+    this.dispatchEvent(new view.Event('change', { bubbles: true })); \
+    return true; \
+}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditState {
+    value: String,
+    /// Selection in UTF-16 code units; `None` where the input type has no
+    /// selection API (email, number).
+    start: Option<usize>,
+    end: Option<usize>,
+    /// An input or textarea, as opposed to a contenteditable element.
+    field: bool,
+    password: bool,
+}
+
+async fn read_edit_state(conn: &CdpConnection, cdp: &str, object_id: &str) -> Option<EditState> {
+    let read = conn
+        .call(
+            Some(cdp),
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": READ_EDIT_STATE,
+                "returnByValue": true,
+            }),
+        )
+        .await
+        .ok()?;
+    let state = &read["result"]["value"];
+    Some(EditState {
+        value: state.get("value")?.as_str()?.to_owned(),
+        start: state["start"].as_u64().map(|n| n as usize),
+        end: state["end"].as_u64().map(|n| n as usize),
+        field: state["field"].as_bool().unwrap_or(false),
+        password: state["password"].as_bool().unwrap_or(false),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Readback {
+    Confirmed(String),
+    Mismatch {
+        actual: String,
+        expected: Option<String>,
+    },
+    Unverifiable,
+}
+
+/// What an input or textarea should hold after `text` lands at its selection
+/// (or replaces it). `None` for contenteditable, whose text is not a plain
+/// splice of what was typed.
+fn expected_field_value(before: &EditState, text: &str, replace: bool) -> Option<String> {
+    if !before.field {
+        return None;
+    }
+    if replace {
+        return Some(text.to_owned());
+    }
+    let units: Vec<u16> = before.value.encode_utf16().collect();
+    // Without a selection API the caret a focus leaves is at the end.
+    let (start, end) = match (before.start, before.end) {
+        (Some(start), Some(end)) if start <= end && end <= units.len() => (start, end),
+        _ => (units.len(), units.len()),
+    };
+    let mut expected = String::from_utf16_lossy(&units[..start]);
+    expected.push_str(text);
+    expected.push_str(&String::from_utf16_lossy(&units[end..]));
+    Some(expected)
+}
+
+fn judge_edit(before: &EditState, after: &EditState, text: &str, replace: bool) -> Readback {
+    let expected = expected_field_value(before, text, replace);
+    let landed = match expected.as_deref() {
+        Some(expected) => after.value == expected,
+        None if replace && text.is_empty() => after.value.trim().is_empty(),
+        None => after.value.contains(text) && (text.is_empty() || after.value != before.value),
+    };
+    if landed {
+        Readback::Confirmed(after.value.clone())
+    } else {
+        Readback::Mismatch {
+            actual: after.value.clone(),
+            expected,
+        }
+    }
+}
+
+/// Read the node back until it holds what the input should have produced,
+/// for up to half a second (frameworks may re-render after the input event).
+async fn await_edit_readback(
+    conn: &CdpConnection,
+    cdp: &str,
+    object_id: &str,
+    before: &EditState,
+    text: &str,
+    replace: bool,
+) -> Readback {
+    let mut judged = Readback::Unverifiable;
+    for attempt in 0..10 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let Some(after) = read_edit_state(conn, cdp, object_id).await else {
+            return judged;
+        };
+        judged = judge_edit(before, &after, text, replace);
+        if matches!(judged, Readback::Confirmed(_)) {
+            break;
+        }
+    }
+    judged
+}
+
+const SHOWN_VALUE_CHARS: usize = 200;
+
+fn truncate_value(value: &str) -> String {
+    if value.chars().count() <= SHOWN_VALUE_CHARS {
+        value.to_owned()
+    } else {
+        let mut shown: String = value.chars().take(SHOWN_VALUE_CHARS).collect();
+        shown.push('…');
+        shown
+    }
+}
+
+/// A value for a message: quoted, shortened, never a password.
+fn shown_value(value: &str, password: bool) -> String {
+    if password {
+        format!("{} character(s) (a password; not shown)", value.chars().count())
+    } else {
+        serde_json::to_string(&truncate_value(value)).unwrap_or_default()
+    }
+}
+
 // Select the element's whole content so the next insertion replaces it instead
 // of appending. Returns the number of characters selected, or -1 when the node
 // is not a shape we know how to select. Selection is the only clearing path
@@ -1470,6 +1627,7 @@ impl BrowserTypeTool {
             name: "browser_type".into(),
             description: "Type text into an editable page ref of a bound tab. Appends at the \
                 caret unless replace:true, which replaces the content (empty text clears it). \
+                Reads the field back: confirmed, or an error with the value it holds. \
                 Refused for heuristic bindings."
                 .into(),
             input_schema: json!({
@@ -1482,9 +1640,9 @@ impl BrowserTypeTool {
                     "ref": schema_ref(),
                     "mode": {
                         "type": "string",
-                        "enum": ["insert_text", "keystrokes"],
+                        "enum": ["insert_text", "keystrokes", "set_value"],
                         "default": "insert_text",
-                        "description": "insert_text: one bulk insert. keystrokes: per-character key events."
+                        "description": "insert_text: one bulk insert. keystrokes: per-character key events. set_value: set an input or textarea through its native value setter and fire input and change (React-safe; replaces the value)."
                     },
                     "replace": {
                         "type": "boolean",
@@ -1548,9 +1706,9 @@ impl Tool for BrowserTypeTool {
             Err(e) => return e,
         };
         let mode = args.opt_str("mode").unwrap_or_else(|| "insert_text".into());
-        if mode != "insert_text" && mode != "keystrokes" {
+        if !matches!(mode.as_str(), "insert_text" | "keystrokes" | "set_value") {
             return ToolResult::error(format!(
-                "mode must be \"insert_text\" or \"keystrokes\", got {mode:?}"
+                "mode must be \"insert_text\", \"keystrokes\", or \"set_value\", got {mode:?}"
             ));
         }
         let replace = args.opt_bool("replace").unwrap_or(false);
@@ -1701,7 +1859,40 @@ impl Tool for BrowserTypeTool {
 
         let requested_chars = text.chars().count();
         let mut replaced_chars = 0usize;
-        let (typed, delivered_chars) = if mode == "insert_text" {
+        // What the field held before any input, for the read-back below.
+        let before = read_edit_state(conn, cdp, &object_id).await;
+        let replaces = replace || mode == "set_value";
+        let (typed, delivered_chars) = if mode == "set_value" {
+            match conn
+                .call(
+                    Some(cdp),
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id,
+                        "functionDeclaration": SET_VALUE_WITH_EVENTS,
+                        "arguments": [{ "value": text }],
+                        "returnByValue": true,
+                    }),
+                )
+                .await
+            {
+                Ok(value) if value["result"]["value"].as_bool() == Some(true) => {
+                    replaced_chars = before
+                        .as_ref()
+                        .map_or(0, |state| state.value.chars().count());
+                    (Ok(()), requested_chars)
+                }
+                Ok(_) => {
+                    return BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserActionUnavailable,
+                        "mode set_value needs an input or textarea ref; use insert_text or \
+                         keystrokes for other editable elements",
+                    )
+                    .to_tool_result()
+                }
+                Err(error) => (Err(error), 0),
+            }
+        } else if mode == "insert_text" {
             if replace {
                 if let Err(detail) =
                     enter_focus_emulation(conn, cdp, entry.backend_node_id, &object_id).await
@@ -1991,8 +2182,77 @@ impl Tool for BrowserTypeTool {
             (result, delivered)
         };
 
+        if typed.is_ok() {
+            if let Some(before) = before.as_ref() {
+                match await_edit_readback(conn, cdp, &object_id, before, &text, replaces).await {
+                    Readback::Mismatch { actual, expected } => {
+                        let shown = shown_value(&actual, before.password);
+                        return ToolResult::error(format!(
+                            "typed {requested_chars} char(s) into {tab_id}, but the field now \
+                             holds {shown}{}: the page changed or rejected the input. Read the \
+                             page before typing again.",
+                            expected
+                                .as_deref()
+                                .map(|expected| format!(
+                                    " instead of {}",
+                                    shown_value(expected, before.password)
+                                ))
+                                .unwrap_or_default()
+                        ))
+                        .with_structured(json!({
+                            "code": "browser_type_mismatch",
+                            "effect": "mismatch",
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "ref": ext_ref,
+                            "mode": mode,
+                            "requested_chars": requested_chars,
+                            "delivered_chars": delivered_chars,
+                            "value": (!before.password).then(|| truncate_value(&actual)),
+                            "expected": expected
+                                .filter(|_| !before.password)
+                                .map(|expected| truncate_value(&expected)),
+                        }));
+                    }
+                    Readback::Confirmed(actual) => {
+                        let shown = shown_value(&actual, before.password);
+                        let summary = if replaces {
+                            format!(
+                                "typed {requested_chars} char(s) into {tab_id}, replacing \
+                                 {replaced_chars} char(s); the field now holds {shown}"
+                            )
+                        } else {
+                            format!(
+                                "typed {requested_chars} char(s) into {tab_id}; the field now \
+                                 holds {shown}"
+                            )
+                        };
+                        return ToolResult::text(summary).with_structured(json!({
+                            "status": "ok",
+                            "effect": "confirmed",
+                            "evidence": [{
+                                "kind": "browser_readback",
+                                "detail": format!("the field holds {shown}"),
+                            }],
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "ref": ext_ref,
+                            "frame": entry.frame.kind.as_str(),
+                            "mode": mode,
+                            "chars": requested_chars,
+                            "requested_chars": requested_chars,
+                            "delivered_chars": delivered_chars,
+                            "replace": replaces,
+                            "replaced_chars": replaced_chars,
+                            "value": (!before.password).then(|| truncate_value(&actual)),
+                        }));
+                    }
+                    Readback::Unverifiable => {}
+                }
+            }
+        }
         match typed {
-            Ok(()) => ToolResult::text(if replace {
+            Ok(()) => ToolResult::text(if replaces {
                 format!(
                     "typed {requested_chars} char(s) into {tab_id}, replacing \
                      {replaced_chars} char(s)"
@@ -2013,7 +2273,7 @@ impl Tool for BrowserTypeTool {
                 // Report what was displaced, not just what was sent: a caller
                 // that asked to replace needs to distinguish "set an empty
                 // field" from "overwrote something" without re-reading the page.
-                "replace": replace,
+                "replace": replaces,
                 "replaced_chars": replaced_chars,
             })),
             Err(e) => BrowserRefusal::new(
@@ -2444,6 +2704,85 @@ impl Tool for BrowserSetInputFilesTool {
 
 #[cfg(test)]
 mod tests {
+    fn edit(value: &str, start: Option<usize>, end: Option<usize>, field: bool) -> EditState {
+        EditState {
+            value: value.to_owned(),
+            start,
+            end,
+            field,
+            password: false,
+        }
+    }
+
+    #[test]
+    fn typed_text_is_expected_at_the_selection_or_the_end() {
+        // Caret after "ab" in "abcd", replacing "c".
+        assert_eq!(
+            expected_field_value(&edit("abcd", Some(2), Some(3), true), "X", false).as_deref(),
+            Some("abXd")
+        );
+        // Email inputs have no selection API: the focused caret is at the end.
+        assert_eq!(
+            expected_field_value(&edit("a@", None, None, true), "b.c", false).as_deref(),
+            Some("a@b.c")
+        );
+        // Selections are UTF-16 offsets.
+        assert_eq!(
+            expected_field_value(&edit("😀z", Some(2), Some(2), true), "y", false).as_deref(),
+            Some("😀yz")
+        );
+        assert_eq!(
+            expected_field_value(&edit("old", Some(3), Some(3), true), "new", true).as_deref(),
+            Some("new")
+        );
+        assert_eq!(expected_field_value(&edit("x", None, None, false), "y", false), None);
+    }
+
+    #[test]
+    fn a_field_that_changes_the_input_is_a_mismatch() {
+        let before = edit("", None, None, true);
+        assert_eq!(
+            judge_edit(&before, &edit("1234", None, None, true), "12ab34", false),
+            Readback::Mismatch {
+                actual: "1234".into(),
+                expected: Some("12ab34".into())
+            }
+        );
+        assert_eq!(
+            judge_edit(&before, &edit("ada@x.io", None, None, true), "ada@x.io", false),
+            Readback::Confirmed("ada@x.io".into())
+        );
+        // A React-controlled field that reset itself holds nothing.
+        assert!(matches!(
+            judge_edit(&before, &edit("", None, None, true), "ada@x.io", false),
+            Readback::Mismatch { .. }
+        ));
+        // Contenteditable: the text must appear and the content must change.
+        let rich = edit("Hello", None, None, false);
+        assert_eq!(
+            judge_edit(&rich, &edit("Hello world", None, None, false), " world", false),
+            Readback::Confirmed("Hello world".into())
+        );
+        assert!(matches!(
+            judge_edit(&rich, &edit("Hello", None, None, false), "Hello", false),
+            Readback::Mismatch { .. }
+        ));
+        assert_eq!(
+            judge_edit(&rich, &edit("\n", None, None, false), "", true),
+            Readback::Confirmed("\n".into())
+        );
+    }
+
+    #[test]
+    fn passwords_are_never_shown() {
+        assert_eq!(
+            shown_value("hunter2", true),
+            "7 character(s) (a password; not shown)"
+        );
+        assert_eq!(shown_value("a\"b", false), "\"a\\\"b\"");
+        assert_eq!(truncate_value(&"x".repeat(250)).chars().count(), 201);
+    }
+
     use super::*;
     use crate::browser::platform::{BrowserPlatform, PrepareOutcome, PrepareRequest};
     use crate::browser::types::{

@@ -418,8 +418,13 @@ browser_type
 the page requires per-character key events. Both modes insert at the current
 selection. When a field already contains text, pass `"replace":true` to select
 its complete value first. Passing an empty `text` with `replace:true` clears
-the field while preserving normal input events. Inspect the live schema when
-in doubt:
+the field while preserving normal input events. `set_value` replaces an input's
+or textarea's value through the element's native value setter and fires
+`input` and `change`, which controlled React fields accept; use it when typed
+text does not stick. Every mode reads the field back afterwards: a confirmed
+result says what the field holds, and a field that changed or rejected the
+input returns an error with `effect: "mismatch"` and the value it holds. Read
+the page before typing again. Inspect the live schema when in doubt:
 
 ```bash
 cua-driver describe browser_type

@@ -78,6 +78,12 @@ struct FixtureState {
     viewport_css_width: f64,
     viewport_css_height: f64,
     tab_visible: bool,
+    /// A simulated input field behind every editable ref: `None` keeps the
+    /// fixture's plain `true` answers, so reads cannot be verified.
+    field_value: Option<String>,
+    /// The simulated field keeps digits only, like a controlled React input
+    /// that rejects letters.
+    field_digits_only: bool,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -109,6 +115,8 @@ impl Default for FixtureState {
             viewport_css_width: 800.0,
             viewport_css_height: 600.0,
             tab_visible: true,
+            field_value: None,
+            field_digits_only: false,
             calls: Vec::new(),
         }
     }
@@ -728,14 +736,47 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     MockReply::ok(json!({}))
                 }
             }
-            "DOM.focus"
-            | "Emulation.setFocusEmulationEnabled"
-            | "Input.dispatchMouseEvent"
-            | "Input.insertText" => MockReply::ok(json!({})),
+            "Input.insertText" => {
+                let digits_only = st.field_digits_only;
+                if let Some(value) = st.field_value.as_mut() {
+                    value.extend(
+                        call.params["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .chars()
+                            .filter(|ch| !digits_only || ch.is_ascii_digit()),
+                    );
+                }
+                MockReply::ok(json!({}))
+            }
+            "DOM.focus" | "Emulation.setFocusEmulationEnabled" | "Input.dispatchMouseEvent" => {
+                MockReply::ok(json!({}))
+            }
             "DOM.resolveNode" => MockReply::ok(json!({
                 "object": { "objectId": format!("obj-{}", call.params["backendNodeId"]) }
             })),
-            "Runtime.callFunctionOn" => MockReply::ok(json!({ "result": { "value": true } })),
+            "Runtime.callFunctionOn" => {
+                let function = call.params["functionDeclaration"].as_str().unwrap_or_default();
+                let digits_only = st.field_digits_only;
+                match st.field_value.as_mut() {
+                    Some(value) if function.contains("selectionStart") => MockReply::ok(json!({
+                        "result": { "value": {
+                            "value": value.clone(), "start": null, "end": null,
+                            "field": true, "password": false,
+                        } }
+                    })),
+                    Some(value) if function.contains("getOwnPropertyDescriptor") => {
+                        *value = call.params["arguments"][0]["value"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .chars()
+                            .filter(|ch| !digits_only || ch.is_ascii_digit())
+                            .collect();
+                        MockReply::ok(json!({ "result": { "value": true } }))
+                    }
+                    _ => MockReply::ok(json!({ "result": { "value": true } })),
+                }
+            }
             other => MockReply::method_not_found(other),
         }
     })
@@ -2827,6 +2868,76 @@ async fn typing_into_composed_shadow_input_uses_the_tab_session() {
     );
     assert!(recorded_calls(&f, "Page.bringToFront").is_empty());
     assert!(recorded_calls(&f, "Target.activateTarget").is_empty());
+}
+
+#[tokio::test]
+async fn typing_reports_what_the_field_holds_afterwards() {
+    let f = fixture_with(|state| state.field_value = Some("ada".into())).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "@x.io", "session": SESSION
+        }))
+        .await;
+    let s = structured(&typed);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["effect"], "confirmed");
+    assert_eq!(s["value"], "ada@x.io");
+    assert_eq!(s["evidence"][0]["kind"], "browser_readback");
+}
+
+#[tokio::test]
+async fn a_field_that_rejects_input_is_reported_as_a_mismatch() {
+    let f = fixture_with(|state| {
+        state.field_value = Some(String::new());
+        state.field_digits_only = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "12ab34", "session": SESSION
+        }))
+        .await;
+    assert_eq!(typed.is_error, Some(true));
+    let s = structured(&typed);
+    assert_eq!(s["code"], "browser_type_mismatch", "{s}");
+    assert_eq!(s["effect"], "mismatch");
+    assert_eq!(s["value"], "1234");
+    assert_eq!(s["expected"], "12ab34");
+}
+
+#[tokio::test]
+async fn set_value_uses_the_native_setter_and_verifies() {
+    let f = fixture_with(|state| state.field_value = Some("old".into())).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let set = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "new", "mode": "set_value", "session": SESSION
+        }))
+        .await;
+    let s = structured(&set);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["effect"], "confirmed");
+    assert_eq!(s["value"], "new");
+    assert_eq!(s["replaced_chars"], 3);
+    assert!(recorded_calls(&f, "Input.insertText").is_empty());
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn").iter().any(|(_, params)| {
+        params["arguments"][0]["value"] == "new"
+            && params["functionDeclaration"]
+                .as_str()
+                .unwrap()
+                .contains("dispatchEvent(new view.Event('input'")
+    }));
 }
 
 #[tokio::test]
