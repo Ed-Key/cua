@@ -566,9 +566,10 @@ impl Tool for ClickTool {
                 let result = tokio::task::spawn_blocking(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     if foreground && !m.is_empty() {
-                        crate::input::skylight::with_foreground_hid_activation(
+                        crate::input::skylight::with_foreground_pointer_activation(
                             pid as libc::pid_t,
                             wid,
+                            (cx, cy),
                             || {
                                 crate::input::mouse::click_at_xy_desktop_with_modifiers_preserving_cursor(
                                     cx, cy, 1, "middle", &m,
@@ -586,6 +587,9 @@ impl Tool for ClickTool {
                          (background CGEvent; not driver-verified — confirm via screenshot)."
                     ))
                     .with_structured(serde_json::json!({ "path": "cgevent", "verified": false, "effect": "unverifiable" })),
+                    Ok(Err(e)) if e.is::<crate::input::skylight::TargetOccluded>() => {
+                        super::pixel_route::foreground_unavailable("Middle-click", wid, &e)
+                    }
                     Ok(Err(e)) => ToolResult::error(format!("Middle-click failed: {e}")),
                     Err(e)     => ToolResult::error(format!("Task error: {e}")),
                 };
@@ -735,11 +739,24 @@ impl Tool for ClickTool {
                                 Ok(())
                             };
                             let fronted = if has_modifiers {
-                                crate::input::skylight::with_foreground_hid_activation(
-                                    pid as libc::pid_t,
-                                    wid,
-                                    action,
-                                )?;
+                                match selection_pixel {
+                                    // The modified click is a HID pointer
+                                    // event at the item: it must reach the
+                                    // target, not a window covering it.
+                                    Some(point) => {
+                                        crate::input::skylight::with_foreground_pointer_activation(
+                                            pid as libc::pid_t,
+                                            wid,
+                                            (point.screen_x, point.screen_y),
+                                            action,
+                                        )?
+                                    }
+                                    None => crate::input::skylight::with_foreground_hid_activation(
+                                        pid as libc::pid_t,
+                                        wid,
+                                        action,
+                                    )?,
+                                }
                                 true
                             } else {
                                 crate::input::skylight::with_foreground_assist(
@@ -836,6 +853,9 @@ impl Tool for ClickTool {
                         });
                     }
                     ToolResult::text(msg).with_structured(structured)
+                }
+                Ok(Err(e)) if e.is::<crate::input::skylight::TargetOccluded>() => {
+                    super::pixel_route::foreground_unavailable("click", wid, &e)
                 }
                 Ok(Err(e)) => ToolResult::error(format!("AX action failed: {e}")),
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
@@ -1257,9 +1277,10 @@ impl Tool for ClickTool {
                         // window is AX-focused) or no input is sent.
                         match (route, window_id) {
                             (PixelClickRoute::ForegroundHid, Some(wid)) => {
-                                crate::input::skylight::with_foreground_hid_activation(
+                                crate::input::skylight::with_foreground_pointer_activation(
                                     pid as libc::pid_t,
                                     wid,
+                                    (screen_x, screen_y),
                                     do_click,
                                 )
                             }
@@ -1341,7 +1362,7 @@ impl Tool for ClickTool {
                     super::pixel_route::foreground_unavailable(
                         button_label,
                         window_id.unwrap_or_default(),
-                        &e.to_string(),
+                        &e,
                     )
                 }
                 Ok(Err(e)) => ToolResult::error(format!("{button_label} failed: {e}")),

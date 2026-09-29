@@ -110,6 +110,52 @@ pub(crate) fn composited_windows() -> Vec<WindowInfo> {
     .windows
 }
 
+/// CGWindow layers from here up are system chrome (Dock 20, main menu 24,
+/// status items 25, pop-up menus 101). The Dock and menu bar own
+/// screen-sized transparent windows that never take a click meant for an app.
+const SYSTEM_LAYER: i32 = 20;
+
+/// Who a pointer event at a screen point reaches.
+#[derive(Debug)]
+pub(crate) enum PointOwner<'a> {
+    /// The target window, a window of its own (a sheet, a child window), or
+    /// one of the target app's menus.
+    Target,
+    /// Another window is topmost at the point.
+    Other(&'a WindowInfo),
+    /// No window at the point.
+    Nothing,
+}
+
+/// The owner of the topmost window at `(x, y)` in `front_to_back` (composited
+/// on-screen windows in WindowServer order). The driver's own windows (cursor
+/// overlay, PiP panels) and system chrome are transparent to the check.
+pub(crate) fn point_owner<'a>(
+    front_to_back: &'a [WindowInfo],
+    (x, y): (f64, f64),
+    target_pid: i32,
+    own_pid: i32,
+    belongs_to_target: impl Fn(u32) -> bool,
+) -> PointOwner<'a> {
+    for window in front_to_back {
+        let b = &window.bounds;
+        let inside = x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
+        if window.pid == own_pid || !inside {
+            continue;
+        }
+        if belongs_to_target(window.window_id)
+            || (window.pid == target_pid && window.layer >= SYSTEM_LAYER)
+        {
+            return PointOwner::Target;
+        }
+        if window.layer >= SYSTEM_LAYER {
+            continue;
+        }
+        return PointOwner::Other(window);
+    }
+    PointOwner::Nothing
+}
+
 /// Which CGWindow layers an enumeration admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerFilter {
@@ -424,6 +470,54 @@ pub fn resolve_main_window_id(pid: i32) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(window_id: u32, pid: i32, layer: i32, (x, y, width, height): (f64, f64, f64, f64)) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            pid,
+            app_name: format!("app{pid}"),
+            title: String::new(),
+            bounds: WindowBounds { x, y, width, height },
+            layer,
+            z_index: 0,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        }
+    }
+
+    /// The Stocks row was covered by a Finder window: a HID click there
+    /// reached Finder while the result said the target was activated.
+    #[test]
+    fn the_topmost_window_at_a_point_decides_who_gets_a_click() {
+        const TARGET: u32 = 10;
+        let belongs = |id: u32| id == TARGET || id == 11; // 11: the target's sheet
+        let cursor = at(1, 7, 0, (0.0, 0.0, 2000.0, 2000.0)); // the driver's own overlay
+        let dock = at(2, 50, 20, (0.0, 0.0, 2000.0, 2000.0));
+        let finder = at(3, 60, 0, (300.0, 300.0, 400.0, 300.0));
+        let target = at(TARGET, 40, 0, (200.0, 200.0, 800.0, 600.0));
+        let windows = [cursor.clone(), dock.clone(), finder.clone(), target.clone()];
+        assert!(matches!(
+            point_owner(&windows, (400.0, 400.0), 40, 7, belongs),
+            PointOwner::Other(WindowInfo { window_id: 3, .. })
+        ));
+        assert!(matches!(point_owner(&windows, (900.0, 700.0), 40, 7, belongs), PointOwner::Target));
+        assert!(matches!(point_owner(&windows, (100.0, 100.0), 40, 7, belongs), PointOwner::Nothing));
+        // The target's own sheet and its open menu (layer 101) count as the target.
+        let sheet = at(11, 40, 0, (300.0, 300.0, 400.0, 300.0));
+        let menu = at(12, 40, 101, (300.0, 300.0, 200.0, 200.0));
+        let windows = [menu, sheet, finder.clone(), target.clone()];
+        assert!(matches!(point_owner(&windows, (350.0, 350.0), 40, 7, belongs), PointOwner::Target));
+        assert!(matches!(point_owner(&windows, (600.0, 550.0), 40, 7, belongs), PointOwner::Target));
+        // Another window of the same app that is not the target's covers it.
+        let other_own = at(13, 40, 0, (300.0, 300.0, 400.0, 300.0));
+        let windows = [other_own, target];
+        assert!(matches!(
+            point_owner(&windows, (400.0, 400.0), 40, 7, belongs),
+            PointOwner::Other(WindowInfo { window_id: 13, .. })
+        ));
+    }
 
     #[test]
     fn space_membership_checks_all_spaces_for_a_window() {
