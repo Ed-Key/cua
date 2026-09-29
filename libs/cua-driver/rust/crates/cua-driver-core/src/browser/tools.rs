@@ -1479,7 +1479,9 @@ fn shown_value(value: &str, password: bool) -> String {
 
 // Select the element's whole content so the next insertion replaces it instead
 // of appending. Returns the number of characters selected, or -1 when the node
-// is not a shape we know how to select. Selection is the only clearing path
+// is not a shape we know how to select. Input types without a selection API
+// (email, number) are selected with select(), which cannot be confirmed here;
+// the read-back after typing shows whether the value was replaced. Selection is the only clearing path
 // that keeps input semantics intact: assigning `value` directly would skip the
 // beforeinput/input events that frameworks bind their state to.
 const SELECT_ALL_IN_ELEMENT: &str = "function() { \
@@ -1487,6 +1489,7 @@ const SELECT_ALL_IN_ELEMENT: &str = "function() { \
         const value = this.value || ''; \
         try { this.setSelectionRange(0, value.length); } catch (e) { \
             try { this.select(); } catch (_) { return -1; } \
+            if (this.selectionStart === null) return Array.from(value).length; \
         } \
         if (this.selectionStart !== 0 || this.selectionEnd !== value.length) return -1; \
         return Array.from(value).length; \
