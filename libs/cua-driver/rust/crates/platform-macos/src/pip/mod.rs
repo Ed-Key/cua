@@ -191,23 +191,41 @@ fn should_apply(frame_epoch: u64, current_epoch: Option<u64>) -> bool {
     current_epoch == Some(frame_epoch)
 }
 
-#[derive(Debug, Clone, Copy, PartialEq)]
-enum ImageUpdate {
-    Replace,
-    Keep,
-    /// Blank the image and show "Preview unavailable".
-    Clear,
+/// The resolved target (pid, window id) that pixels came from. A pid-only
+/// target is tagged with the window it resolved to when it was captured.
+type Tag = Target;
+
+/// The resolved target a panel is showing now: its window if it names one,
+/// else the window its pid currently resolves to; `None` when unresolved.
+fn current_tag(target: Target, resolved_window: Option<u32>) -> Option<Tag> {
+    match target {
+        (_, Some(_)) => Some(target),
+        (Some(pid), None) => resolved_window.map(|window| (Some(pid), Some(window))),
+        (None, None) => None,
+    }
 }
 
-/// A failed capture keeps the old image only when it shows the same target;
-/// otherwise the panel would show one window's pixels as another's preview.
-fn image_after_capture(prev_target: Target, new_target: Target, capture_ok: bool) -> ImageUpdate {
-    if capture_ok {
-        ImageUpdate::Replace
-    } else if prev_target == new_target {
-        ImageUpdate::Keep
-    } else {
-        ImageUpdate::Clear
+/// Which of the panel's three layers show. The image area only ever shows
+/// pixels captured from the CURRENT resolved target: a layer whose tag is not
+/// the current one is hidden (and its pixels dropped by the caller), and
+/// "Preview unavailable" shows when neither layer qualifies.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Layers {
+    show_still: bool,
+    show_live: bool,
+    show_placeholder: bool,
+}
+
+/// `still_tag` / `live_tag` are `None` when that layer holds no pixels.
+fn visible_layers(current: Option<Tag>, still_tag: Option<Tag>, live_tag: Option<Tag>) -> Layers {
+    let matches = |tag: Option<Tag>| current.is_some() && tag == current;
+    let live = matches(live_tag);
+    let still = matches(still_tag);
+    Layers {
+        show_live: live,
+        // The still is hidden under a live frame.
+        show_still: still && !live,
+        show_placeholder: !live && !still,
     }
 }
 
@@ -249,6 +267,10 @@ struct Panel {
     /// The live frame on screen, held so ScreenCaptureKit does not recycle
     /// its IOSurface while the layer shows it. `None` shows the still.
     live_frame: Option<screencapturekit::CVPixelBuffer>,
+    /// Target the live frame came from (`None` with no live frame).
+    live_tag: Option<Tag>,
+    /// Target the still in `image_view` came from (`None` with no still).
+    still_tag: Option<Tag>,
     /// The panel's stream request and which generation's events still count.
     stream: live::StreamState,
     /// The window a pid-only `target` currently resolves to, as last looked
@@ -422,7 +444,9 @@ impl SessionEpochs {
 
 /// (pid, window_id) of a capture target.
 type Target = (Option<i32>, Option<u32>);
-type CaptureFn = dyn Fn(Target) -> Option<Vec<u8>> + Send + Sync;
+/// A still: the window it was captured from, and its PNG.
+type Shot = (u32, Vec<u8>);
+type CaptureFn = dyn Fn(Target) -> Option<Shot> + Send + Sync;
 
 struct CaptureWorker {
     /// Each frame with the epoch its session was in when it was pushed.
@@ -442,7 +466,7 @@ impl CaptureWorker {
     fn start(
         capture: Arc<CaptureFn>,
         timeout: Duration,
-        deliver: impl Fn(PipFrame, u64, Option<Vec<u8>>) + Send + 'static,
+        deliver: impl Fn(PipFrame, u64, Option<Shot>) + Send + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         let worker = Arc::new(Self {
             queue: Mutex::new(LatestPerSession::new()),
@@ -508,7 +532,7 @@ impl CaptureWorker {
     /// Capture `target` on a helper thread, waiting at most `timeout`.
     /// `None` on timeout, failure, or while an earlier capture of the same
     /// target is still stuck.
-    fn capture_bounded(&self, target: Target) -> Option<Vec<u8>> {
+    fn capture_bounded(&self, target: Target) -> Option<Shot> {
         if !lock(&self.in_flight).insert(target) {
             return None;
         }
@@ -564,7 +588,7 @@ struct FrameUpdate {
     frame: PipFrame,
     epoch: u64,
     /// Fresh screenshot, or `None` when the capture failed or timed out.
-    png: Option<Vec<u8>>,
+    png: Option<Shot>,
     /// Window title (or owning app name), looked up on the capture worker.
     target_title: Option<String>,
     /// Whether the user can already see the whole target window.
@@ -598,7 +622,7 @@ impl PipBackend for MacosPipBackend {
 
 /// Runs on the capture worker: look up the window title and visibility
 /// (synchronous WindowServer calls) and hand the update to the main queue.
-fn deliver_to_main(frame: PipFrame, epoch: u64, png: Option<Vec<u8>>) {
+fn deliver_to_main(frame: PipFrame, epoch: u64, png: Option<Shot>) {
     let (windows, displays) = visibility::snapshot();
     let target_visible = visibility::target_fully_visible(
         (frame.target_pid, frame.target_window_id),
@@ -668,6 +692,7 @@ pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         let window_id = resolve_target_window(target)?;
         // Always window-scoped, so other PiP panels are never in the image.
         cua_driver_core::recording::screenshot_for(Some(u64::from(window_id)), None)
+            .map(|png| (window_id, png))
     });
     let worker = CaptureWorker::start(capture, CAPTURE_TIMEOUT, deliver_to_main)?;
     let streams = Streams::start(deliver_live)?;
@@ -726,32 +751,27 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
 
     let new_target = (frame.target_pid, frame.target_window_id);
     let image_view = panel.image_view as *mut AnyObject;
-    match image_after_capture(panel.target, new_target, png.is_some()) {
-        ImageUpdate::Replace => {
-            // `dataWithBytes:length:` copies, so the Vec can drop.
-            let png = png.unwrap_or_default();
-            let data: *mut AnyObject = msg_send![
-                class!(NSData),
-                dataWithBytes: png.as_ptr() as *const c_void
-                length: png.len()
-            ];
-            let image: *mut AnyObject = if data.is_null() {
-                std::ptr::null_mut()
-            } else {
-                let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
-                msg_send![image, initWithData: data]
-            };
-            let _: () = msg_send![image_view, setImage: image];
-            if !image.is_null() {
-                let _: () = msg_send![image, release];
-            }
-        }
-        ImageUpdate::Keep => {}
-        ImageUpdate::Clear => {
-            let _: () = msg_send![image_view, setImage: std::ptr::null_mut::<AnyObject>()];
+    // A failed capture keeps the old still; `sync_layers` (from `refresh`,
+    // below) drops it unless it is of the panel's current window.
+    if let Some((window, png)) = png {
+        // `dataWithBytes:length:` copies, so the Vec can drop.
+        let data: *mut AnyObject = msg_send![
+            class!(NSData),
+            dataWithBytes: png.as_ptr() as *const c_void
+            length: png.len()
+        ];
+        let image: *mut AnyObject = if data.is_null() {
+            std::ptr::null_mut()
+        } else {
+            let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+            msg_send![image, initWithData: data]
+        };
+        let _: () = msg_send![image_view, setImage: image];
+        panel.still_tag = (!image.is_null()).then_some((frame.target_pid, Some(window)));
+        if !image.is_null() {
+            let _: () = msg_send![image, release];
         }
     }
-    sync_placeholder(panel);
     set_text(panel.status, &frame.action_label);
 
     // Who: resolve the client icon + label only when the identity changes.
@@ -934,6 +954,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
         }
         StreamStep::Keep => {}
     }
+    sync_layers(panel);
 }
 
 /// Whether the window sits somewhere other than where we placed it.
@@ -963,7 +984,8 @@ unsafe fn place_on_show(
     panel.placed = origin;
 }
 
-/// Put a live frame's IOSurface on the live layer.
+/// Put a live frame's IOSurface on the live layer, tagged with the target
+/// of the stream it came from.
 unsafe fn show_live(panel: &mut Panel, frame: screencapturekit::CVPixelBuffer) {
     let Some(surface) = frame.io_surface() else {
         return;
@@ -976,44 +998,68 @@ unsafe fn show_live(panel: &mut Panel, frame: screencapturekit::CVPixelBuffer) {
         setContents: surface.as_ptr() as *mut AnyObject
     ];
     let _: () = msg_send![class!(CATransaction), commit];
-    let _: () = msg_send![panel.live_view as *mut AnyObject, setHidden: false];
     // Replacing the previous frame releases it back to ScreenCaptureKit.
     panel.live_frame = Some(frame);
-    sync_placeholder(panel);
+    panel.live_tag = panel.stream.requested;
+    sync_layers(panel);
 }
 
-/// Remove the live frame so the still screenshot shows again.
-unsafe fn clear_live(panel: &mut Panel) {
+/// Release the live frame and blank the live layer.
+unsafe fn drop_live(panel: &mut Panel) {
+    panel.live_tag = None;
     let Some(frame) = panel.live_frame.take() else {
         return;
     };
-    let _: () = msg_send![panel.live_view as *mut AnyObject, setHidden: true];
     let _: () = msg_send![
         panel.live_layer as *mut AnyObject,
         setContents: std::ptr::null_mut::<AnyObject>()
     ];
     drop(frame);
-    sync_placeholder(panel);
 }
 
-/// "Preview unavailable" shows only when neither a live frame nor a still
-/// is on screen.
-unsafe fn sync_placeholder(panel: &Panel) {
-    let image: *mut AnyObject = msg_send![panel.image_view as *mut AnyObject, image];
-    let covered = panel.live_frame.is_some() || !image.is_null();
-    let _: () = msg_send![panel.placeholder as *mut AnyObject, setHidden: covered];
+/// Remove the live frame so the still screenshot (if current) shows again.
+unsafe fn clear_live(panel: &mut Panel) {
+    drop_live(panel);
+    sync_layers(panel);
+}
+
+/// The one place layer visibility is decided: drop pixels that are not of
+/// the panel's current resolved target, then show what `visible_layers` says.
+/// Call after any change to the target, the still, or the live frame.
+unsafe fn sync_layers(panel: &mut Panel) {
+    let current = current_tag(panel.target, panel.resolved_window);
+    if panel.live_tag.is_some() && panel.live_tag != current {
+        drop_live(panel);
+    }
+    if panel.still_tag.is_some() && panel.still_tag != current {
+        let _: () = msg_send![
+            panel.image_view as *mut AnyObject,
+            setImage: std::ptr::null_mut::<AnyObject>()
+        ];
+        panel.still_tag = None;
+    }
+    let layers = visible_layers(current, panel.still_tag, panel.live_tag);
+    // The image view stays up (its tint is the well) unless live covers it.
+    let _: () = msg_send![panel.image_view as *mut AnyObject, setHidden: layers.show_live];
+    let _: () = msg_send![panel.live_view as *mut AnyObject, setHidden: !layers.show_live];
+    let _: () = msg_send![
+        panel.placeholder as *mut AnyObject,
+        setHidden: !layers.show_placeholder
+    ];
 }
 
 /// Fade completion: order the panel out unless a frame re-showed it.
 unsafe extern "C" fn order_out_cb(ctx: *mut c_void) {
     let key: String = *Box::from_raw(ctx as *mut String);
     with_state(|state| {
-        if let Some(panel) = state.panels.get(&key) {
+        if let Some(panel) = state.panels.get_mut(&key) {
             if !panel.shown {
                 let _: () = msg_send![
                     panel.window as *mut AnyObject,
                     orderOut: std::ptr::null_mut::<AnyObject>()
                 ];
+                // The fade is over: release the retained live frame.
+                clear_live(panel);
             }
         }
     });
@@ -1465,6 +1511,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         live_view: live_view as usize,
         live_layer: live_layer as usize,
         live_frame: None,
+        live_tag: None,
+        still_tag: None,
         stream: live::StreamState::default(),
         resolved_window: None,
         placeholder: placeholder as usize,
@@ -1907,7 +1955,7 @@ mod tests {
         }
     }
 
-    type Delivered = mpsc::Receiver<(String, u64, Option<Vec<u8>>)>;
+    type Delivered = mpsc::Receiver<(String, u64, Option<Shot>)>;
 
     fn worker(capture: Arc<CaptureFn>, timeout: Duration) -> (Arc<CaptureWorker>, Delivered) {
         let (sender, delivered) = mpsc::channel();
@@ -1920,7 +1968,7 @@ mod tests {
     }
 
     /// Next delivery as (action label, png), ignoring the epoch.
-    fn recv(delivered: &Delivered) -> (String, Option<Vec<u8>>) {
+    fn recv(delivered: &Delivered) -> (String, Option<Shot>) {
         let (label, _, png) = delivered.recv_timeout(Duration::from_secs(5)).unwrap();
         (label, png)
     }
@@ -1950,7 +1998,7 @@ mod tests {
         let capture: Arc<CaptureFn> = Arc::new(move |_| {
             let _ = lock(&started_tx).send(());
             let _ = lock(&release_rx).recv();
-            Some(vec![1])
+            Some((7, vec![1]))
         });
         let (worker, delivered) = worker(capture, Duration::from_secs(5));
 
@@ -1971,18 +2019,68 @@ mod tests {
         assert!(worker.is_current("s", epoch));
     }
 
+    const W5: Tag = (Some(42), Some(5));
+    const W6: Tag = (Some(42), Some(6));
+    const SHOW_LIVE: Layers = Layers {
+        show_still: false,
+        show_live: true,
+        show_placeholder: false,
+    };
+    const SHOW_STILL: Layers = Layers {
+        show_still: true,
+        show_live: false,
+        show_placeholder: false,
+    };
+    const SHOW_NOTHING: Layers = Layers {
+        show_still: false,
+        show_live: false,
+        show_placeholder: true,
+    };
+
     #[test]
-    fn a_failed_capture_keeps_the_image_only_for_the_same_window() {
-        let a = (Some(42), Some(7));
-        let b = (Some(42), Some(8));
-        assert_eq!(image_after_capture(a, a, true), ImageUpdate::Replace);
-        assert_eq!(image_after_capture(a, b, true), ImageUpdate::Replace);
-        assert_eq!(image_after_capture(a, a, false), ImageUpdate::Keep);
-        assert_eq!(image_after_capture(a, b, false), ImageUpdate::Clear);
-        // A new panel whose first capture fails shows the placeholder.
+    fn the_current_tag_resolves_a_pid_only_target() {
+        assert_eq!(current_tag((Some(42), Some(5)), None), Some(W5));
+        assert_eq!(current_tag((Some(42), None), Some(6)), Some(W6));
+        assert_eq!(current_tag((Some(42), None), None), None);
+        assert_eq!(current_tag((None, None), Some(6)), None);
+    }
+
+    #[test]
+    fn only_pixels_of_the_current_target_are_shown() {
+        // Matching live only: live.
+        assert_eq!(visible_layers(Some(W5), None, Some(W5)), SHOW_LIVE);
+        // Live from another window: not shown.
+        assert_eq!(visible_layers(Some(W6), None, Some(W5)), SHOW_NOTHING);
+        // Still from another window: placeholder.
+        assert_eq!(visible_layers(Some(W6), Some(W5), None), SHOW_NOTHING);
+        // Matching still alone: still.
+        assert_eq!(visible_layers(Some(W5), Some(W5), None), SHOW_STILL);
+        // Live over a matching still: live only, still hidden under it.
+        assert_eq!(visible_layers(Some(W5), Some(W5), Some(W5)), SHOW_LIVE);
+        // Stale live over a matching still: the still shows, not the live.
+        assert_eq!(visible_layers(Some(W6), Some(W6), Some(W5)), SHOW_STILL);
+        // Live matches but the still is stale (window reshaped): live only.
+        assert_eq!(visible_layers(Some(W6), Some(W5), Some(W6)), SHOW_LIVE);
+        // Nothing captured yet.
+        assert_eq!(visible_layers(Some(W5), None, None), SHOW_NOTHING);
+    }
+
+    #[test]
+    fn an_unresolved_target_shows_nothing_old() {
+        assert_eq!(visible_layers(None, Some(W5), Some(W5)), SHOW_NOTHING);
+    }
+
+    #[test]
+    fn re_showing_after_hide_with_a_different_target_waits_for_a_matching_capture() {
+        // Hidden with W5's still and live retained; the next action targets
+        // pid 43, whose window is unresolved, then window 9.
+        let other = (Some(43), Some(9));
+        assert_eq!(visible_layers(None, Some(W5), Some(W5)), SHOW_NOTHING);
+        assert_eq!(visible_layers(Some(other), Some(W5), Some(W5)), SHOW_NOTHING);
+        // Its own capture arrives and shows.
         assert_eq!(
-            image_after_capture((None, None), a, false),
-            ImageUpdate::Clear
+            visible_layers(Some(other), Some(other), Some(W5)),
+            SHOW_STILL
         );
     }
 
@@ -2023,7 +2121,7 @@ mod tests {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = lock(&started_tx).send(());
             let _ = lock(&release_rx).recv();
-            Some(vec![1])
+            Some((7, vec![1]))
         });
         let (worker, delivered) = worker(capture, Duration::from_secs(5));
 
@@ -2036,10 +2134,10 @@ mod tests {
         assert!(pushing.elapsed() < Duration::from_secs(1));
 
         release.send(()).unwrap();
-        assert_eq!(recv(&delivered), ("first".to_owned(), Some(vec![1])));
+        assert_eq!(recv(&delivered), ("first".to_owned(), Some((7, vec![1]))));
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         release.send(()).unwrap();
-        assert_eq!(recv(&delivered), ("third".to_owned(), Some(vec![1])));
+        assert_eq!(recv(&delivered), ("third".to_owned(), Some((7, vec![1]))));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
@@ -2052,7 +2150,7 @@ mod tests {
         let capture: Arc<CaptureFn> = Arc::new(move |_| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = lock(&stuck).recv(); // never answered
-            Some(vec![1])
+            Some((7, vec![1]))
         });
         let (worker, delivered) = worker(capture, Duration::from_millis(50));
 
