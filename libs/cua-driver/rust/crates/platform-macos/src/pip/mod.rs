@@ -120,7 +120,7 @@ mod live;
 mod stack;
 mod visibility;
 
-use cursor::{cursor_in_well, sprite_placement, sprite_target_matches, Sprite};
+use cursor::{cursor_in_well, sprite_placement, sprite_window, Sprite};
 pub(crate) use cursor::SPRITE_BOX;
 use finish::{
     checklist_fit, chip_grid, row_width, Claim, Finale, Lifecycle, Rows, Verdicts, CAPTION_GAP,
@@ -130,7 +130,7 @@ use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
     back_cards, bar_frame, bar_layout, card_size, deck_size, item_at, max_card, own_pixels,
-    panel_point, pressed_item, resize_edges, resize_settled, resize_window, slot_frame, to_window,
+    panel_point, press_edges, pressed_item, resize_settled, resize_window, slot_frame, to_window,
     window_origin, window_size, CardStack, Motion, Slot, Trail, BAR_BUTTON, BAR_FADE_IN,
     BAR_FADE_OUT, CHIP_REACH, DRAG_SLOP, GLASS_SPACING, MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, VIEWS,
 };
@@ -409,8 +409,9 @@ struct Panel {
     /// The first cursor update was logged.
     cursor_seen: bool,
     /// The target window's frame (CoreGraphics, top-left origin) as last
-    /// looked up off the main thread, for mapping the cursor into the well.
-    target_frame: Option<Area>,
+    /// looked up off the main thread, for mapping the cursor into the well,
+    /// tagged with the id of the window it describes.
+    target_frame: Option<(u32, Area)>,
     /// The live frame on screen, held so ScreenCaptureKit does not recycle
     /// its IOSurface while the layer shows it. `None` shows the still.
     live_frame: Option<screencapturekit::CVPixelBuffer>,
@@ -949,7 +950,7 @@ struct FrameUpdate {
     /// The window a pid-only target resolves to (see `Panel::resolved_window`).
     resolved_window: Option<u32>,
     /// That window's frame (see `Panel::target_frame`).
-    target_frame: Option<Area>,
+    target_frame: Option<(u32, Area)>,
 }
 
 /// A between-frames visibility re-check from the `cua-pip-visibility` thread.
@@ -958,7 +959,7 @@ struct VisibilityUpdate {
     target: Target,
     visible: bool,
     resolved_window: Option<u32>,
-    target_frame: Option<Area>,
+    target_frame: Option<(u32, Area)>,
     /// Back-card windows that no longer exist.
     gone: Vec<u32>,
 }
@@ -1141,10 +1142,12 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
     // under a finale, not over a raised back card or a target whose
     // capture is pending, and only with a window frame to map into.
     let displayed = current_tag(panel.target, panel.resolved_window);
-    let point = match (update.image, panel.target_frame, panel.finale_view) {
-        (Some(_), Some(frame), None) if sprite_target_matches(update.window, displayed) => {
-            cursor_in_well(frame, (update.x, update.y), well)
-        }
+    let point = match (
+        update.image,
+        sprite_window(update.window, displayed, panel.target_frame),
+        panel.finale_view,
+    ) {
+        (Some(_), Some(frame), None) => cursor_in_well(frame, (update.x, update.y), well),
         _ => None,
     };
     let log = panel.sprite.update(point, update.pulsing);
@@ -1180,13 +1183,14 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
 unsafe fn place_sprite(panel: &Panel) {
     let layer = panel.cursor_layer as *mut AnyObject;
     let displayed = current_tag(panel.target, panel.resolved_window);
-    let placement = if panel.finale_view.is_some()
-        || panel.cursor_image == 0
-        || !sprite_target_matches(panel.cursor_window, displayed)
-    {
+    let placement = if panel.finale_view.is_some() || panel.cursor_image == 0 {
         None
     } else {
-        sprite_placement(panel.target_frame, panel.cursor_at, well_size(panel.card))
+        sprite_placement(
+            sprite_window(panel.cursor_window, displayed, panel.target_frame),
+            panel.cursor_at,
+            well_size(panel.card),
+        )
     };
     // The sprite tracks the cursor: no implicit move or fade.
     let _: () = msg_send![class!(CATransaction), begin];
@@ -3910,11 +3914,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
                 Area { x, y, ..bar }
             });
             let item = pressed_item(point, item_at(point, &panel.layout, &frames), bar);
-            let edges = if item == Some(0) {
-                resize_edges(point, frames[0])
-            } else {
-                0
-            };
+            let edges = press_edges(point, item, frames[0], bar);
             let pressed = item
                 .filter(|item| *item > 0)
                 .and_then(|item| panel.cards.cards().get(item))
@@ -4020,7 +4020,12 @@ extern "C" fn card_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
             panel_for(state, window).map(|panel| {
                 show_bar(panel);
                 let front = view_frame(panel, Slot::Front, back_cards(&panel.layout));
-                resize_edges((point.0 + front.x, point.1 + front.y), front)
+                // No resize cursor over the bar: pressing it drags.
+                let bar = bar_area(panel).map(|bar| {
+                    let (x, y) = panel_point((bar.x, bar.y));
+                    Area { x, y, ..bar }
+                });
+                press_edges((point.0 + front.x, point.1 + front.y), Some(0), front, bar)
             })
         })
         .flatten()

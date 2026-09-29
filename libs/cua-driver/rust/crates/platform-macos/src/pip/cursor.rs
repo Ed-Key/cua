@@ -46,16 +46,26 @@ pub(super) fn sprite_frame(point: (f64, f64), well_h: f64) -> Area {
     }
 }
 
-/// Whether the cursor's sprite may show: only when the window the cursor
-/// is working in (`cursor_window`, the window its last action targeted) is
-/// the window the panel displays (`displayed`). A cursor with no target
-/// window, or a panel whose target is unresolved or still the previous
-/// window (its new target's capture pending), shows nothing: the sprite
-/// must never paint over another window's picture.
-pub(super) fn sprite_target_matches(cursor_window: Option<u32>, displayed: Option<Tag>) -> bool {
-    match (cursor_window, displayed) {
-        (Some(window), Some((_, Some(shown)))) => window == shown,
-        _ => false,
+/// The window frame to map the cursor into, or `None` to hide the sprite:
+/// only when the window the cursor is working in (`cursor_window`, the
+/// window its last action targeted) is the window the panel displays
+/// (`displayed`), and the cached `frame` (tagged with its window's id) is
+/// of that window. A cursor with no target window, a panel whose target is
+/// unresolved or still the previous window (its new target's capture
+/// pending), or a frame still describing the previous window (a raised
+/// card before the poll looks its window up) shows nothing: the sprite
+/// must never paint over another window's picture, or with another
+/// window's geometry.
+pub(super) fn sprite_window(
+    cursor_window: Option<u32>,
+    displayed: Option<Tag>,
+    frame: Option<(u32, Area)>,
+) -> Option<Area> {
+    match (cursor_window, displayed, frame) {
+        (Some(window), Some((_, Some(shown))), Some((of, area))) if window == shown && of == shown => {
+            Some(area)
+        }
+        _ => None,
     }
 }
 
@@ -159,18 +169,28 @@ mod tests {
     #[test]
     fn the_sprite_shows_only_over_the_window_the_cursor_works_in() {
         let displayed: Option<Tag> = Some((Some(1), Some(10)));
-        // Matching window: shown.
-        assert!(sprite_target_matches(Some(10), displayed));
+        let frame = Some((10, WINDOW));
+        // Matching window, with its own frame: shown.
+        assert_eq!(sprite_window(Some(10), displayed, frame), Some(WINDOW));
         // The user raised a back card while the agent stays in window 10:
         // hidden, whatever the geometry.
-        assert!(!sprite_target_matches(Some(10), Some((Some(1), Some(20)))));
+        assert_eq!(sprite_window(Some(10), Some((Some(1), Some(20))), frame), None);
         // The agent moved to window 20 but its capture is pending, so the
         // panel still displays 10: hidden until the frame lands.
-        assert!(!sprite_target_matches(Some(20), displayed));
+        assert_eq!(sprite_window(Some(20), displayed, frame), None);
         // No target window known on either side: hidden.
-        assert!(!sprite_target_matches(None, displayed));
-        assert!(!sprite_target_matches(Some(10), Some((Some(1), None))));
-        assert!(!sprite_target_matches(Some(10), None));
+        assert_eq!(sprite_window(None, displayed, frame), None);
+        assert_eq!(sprite_window(Some(10), Some((Some(1), None)), frame), None);
+        assert_eq!(sprite_window(Some(10), None, frame), None);
+        // A raised card that is the cursor's window, while the cached frame
+        // still describes the previous window: hidden until its own frame
+        // lands, never mapped with the old window's bounds.
+        let raised: Option<Tag> = Some((Some(1), Some(20)));
+        assert_eq!(sprite_window(Some(20), raised, frame), None);
+        let own = Area { x: 400.0, ..WINDOW };
+        assert_eq!(sprite_window(Some(20), raised, Some((20, own))), Some(own));
+        // No frame at all: hidden.
+        assert_eq!(sprite_window(Some(10), displayed, None), None);
     }
 
     #[test]

@@ -594,6 +594,18 @@ pub(super) fn pressed_item(point: (f64, f64), item: Option<usize>, bar: Option<A
     item
 }
 
+/// The front card's edges a press on `point` resizes (0 = none): only a
+/// press on the front card (`item` 0), and never one inside the hover bar
+/// `bar` (when shown), which is always a drag handle, even where it
+/// overlaps the card's resize band (its bottom over the card's top edge,
+/// or its top when it drops inside the card near the screen's top).
+pub(super) fn press_edges(point: (f64, f64), item: Option<usize>, front: Area, bar: Option<Area>) -> u8 {
+    if item != Some(0) || bar.is_some_and(|bar| contains(&bar, point)) {
+        return 0;
+    }
+    resize_edges(point, front)
+}
+
 /// Which edges of the front card `point` is on (0 = none): within
 /// `RESIZE_BAND` inside an edge, corners combining two.
 pub(super) fn resize_edges(point: (f64, f64), card: Area) -> u8 {
@@ -1294,6 +1306,25 @@ mod tests {
         assert_eq!(pressed(strip, &layout, &frames), Some(1));
         assert_eq!(pressed_item(strip, Some(1), Some(bar)), Some(0));
         assert_eq!(pressed_item(strip, Some(1), None), Some(1));
+        // The bar's bottom overlaps the card's top resize band: a press
+        // there is a drag, not a resize. Without the bar, it resizes.
+        let overlap = (bar.x + bar.w / 2.0, front.y + front.h - 2.0);
+        assert!(contains(&bar, overlap) && resize_edges(overlap, front) == TOP);
+        assert_eq!(press_edges(overlap, Some(0), front, Some(bar)), 0);
+        assert_eq!(press_region(overlap, Some(0), 0, front, Some(bar)), "bar");
+        assert_eq!(press_edges(overlap, Some(0), front, None), TOP);
+        // Near the screen's top the bar drops inside the card: its top
+        // edge sits in the band too, and still drags.
+        let inside = bar_frame(front, 0.0);
+        let top = (inside.x + inside.w / 2.0, inside.y + inside.h - 1.0);
+        assert!(resize_edges(top, front) == TOP);
+        assert_eq!(press_edges(top, Some(0), front, Some(inside)), 0);
+        // The card's top edge beside the bar still resizes, and a press
+        // off the front card never does.
+        let beside = (front.x + 2.0, front.y + front.h - 2.0);
+        assert!(!contains(&bar, beside));
+        assert_eq!(press_edges(beside, Some(0), front, Some(bar)), TOP | LEFT);
+        assert_eq!(press_edges(overlap, Some(1), front, None), 0);
     }
 
     #[test]
