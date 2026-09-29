@@ -3390,17 +3390,35 @@ unsafe fn hover(panel: &mut Panel, inside: bool) {
     panel.hover_gen += 1;
     if inside {
         panel.hover_inside += 1;
-        if !panel.bar_shown {
-            panel.bar_shown = true;
-            let _: () = msg_send![panel.bar as *mut AnyObject, setHidden: false];
-            animate_view_alpha(panel.bar, 1.0, BAR_FADE_IN);
-        }
+        show_bar(panel);
         return;
     }
     panel.hover_inside = panel.hover_inside.saturating_sub(1);
     if panel.hover_inside == 0 {
         dispatch_to_main_after(BAR_FADE_OUT, (panel.id, panel.hover_gen), bar_hide_cb);
     }
+}
+
+/// Fade the bar in (a pointer over the card, whether an entered event or
+/// a move said so: a warped pointer can skip the entered event).
+unsafe fn show_bar(panel: &mut Panel) {
+    if !panel.bar_shown {
+        panel.bar_shown = true;
+        let _: () = msg_send![panel.bar as *mut AnyObject, setHidden: false];
+        animate_view_alpha(panel.bar, 1.0, BAR_FADE_IN);
+    }
+}
+
+/// Whether the pointer is over the front card or its bar right now.
+unsafe fn pointer_over(panel: &Panel) -> bool {
+    let (mx, my) = mouse_location();
+    let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
+    let point = (mx - frame.origin.x, my - frame.origin.y);
+    let front = to_window(view_frame(panel, Slot::Front, back_cards(&panel.layout)));
+    let inside = |area: Area| {
+        point.0 >= area.x && point.0 <= area.x + area.w && point.1 >= area.y && point.1 <= area.y + area.h
+    };
+    inside(front) || bar_area(panel).is_some_and(inside)
 }
 
 unsafe extern "C" fn bar_hide_cb(ctx: *mut c_void) {
@@ -3411,6 +3429,12 @@ unsafe extern "C" fn bar_hide_cb(ctx: *mut c_void) {
         };
         // The pointer came back meanwhile.
         if panel.hover_gen != generation || !panel.bar_shown {
+            return;
+        }
+        // Still over the card or the bar (a warped pointer can skip the
+        // entered event): look again later.
+        if pointer_over(panel) {
+            dispatch_to_main_after(BAR_FADE_OUT, (id, generation), bar_hide_cb);
             return;
         }
         panel.bar_shown = false;
@@ -3866,6 +3890,7 @@ extern "C" fn card_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
         let point = event_point(this, event);
         let edges = try_with_state(|state| {
             panel_for(state, window).map(|panel| {
+                show_bar(panel);
                 let front = view_frame(panel, Slot::Front, back_cards(&panel.layout));
                 resize_edges((point.0 + front.x, point.1 + front.y), front)
             })
