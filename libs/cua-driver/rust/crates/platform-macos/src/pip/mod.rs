@@ -903,11 +903,38 @@ unsafe extern "C" fn live_event_cb(ctx: *mut c_void) {
                     tracing::info!(target: "pip", session = %key, generation, current = panel.stream.generation(), "PiP live frame from an ended stream dropped");
                     return;
                 }
-                if let Some(frame) = lock(&slot).take() {
-                    if panel.stream.first_frame() {
-                        tracing::info!(target: "pip", session = %key, generation, shown = panel.shown, "PiP live frame shown");
+                panel.stream.frames.events += 1;
+                // Tags before `show_live`, which drops a mismatched frame.
+                let current = current_tag(panel.target, panel.resolved_window);
+                let live = panel.stream.requested;
+                let outcome = match lock(&slot).take() {
+                    Some(frame) => Some(show_live(panel, frame)),
+                    None => None,
+                };
+                let frames = &mut panel.stream.frames;
+                match outcome {
+                    None => frames.empty_slot += 1,
+                    Some(LiveShown::NoSurface) => {
+                        frames.no_iosurface += 1;
+                        if frames.no_iosurface == 1 {
+                            tracing::info!(target: "pip", session = %key, generation, "PiP live frame has no IOSurface");
+                        }
                     }
-                    show_live(panel, frame);
+                    Some(LiveShown::Hidden) => {
+                        frames.hidden_by_tags += 1;
+                        if frames.hidden_by_tags == 1 {
+                            tracing::info!(target: "pip", session = %key, generation, ?current, ?live, still = ?panel.still_tag, "PiP live frame hidden: its tag is not the current target");
+                        }
+                    }
+                    Some(LiveShown::Shown) => {
+                        frames.shown += 1;
+                        if frames.shown == 1 {
+                            tracing::info!(target: "pip", session = %key, generation, shown = panel.shown, "PiP live frame shown");
+                        }
+                    }
+                }
+                if panel.stream.frames.summary_due(Instant::now()) {
+                    tracing::info!(target: "pip", session = %key, generation, shown = panel.shown, frames = ?panel.stream.frames, "PiP live frames on the panel");
                 }
             }
             Event::Ended { key, generation } => {
@@ -920,7 +947,7 @@ unsafe extern "C" fn live_event_cb(ctx: *mut c_void) {
                 // retried until it changes or the panel hides and shows
                 // again; the Stop only releases the stream.
                 let current = panel.stream.end(generation);
-                tracing::info!(target: "pip", session = %key, generation, current, "PiP stream ended");
+                tracing::info!(target: "pip", session = %key, generation, current, frames = ?panel.stream.frames, "PiP stream ended");
                 if !current {
                     return;
                 }
@@ -983,7 +1010,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
         }
         StreamStep::Stop => {
             // The last live frame stays up while the panel fades out.
-            tracing::info!(target: "pip", session = %key, shown = panel.shown, "PiP stream release requested");
+            tracing::info!(target: "pip", session = %key, generation = panel.stream.generation(), shown = panel.shown, frames = ?panel.stream.frames, "PiP stream release requested");
             panel.stream.stop();
             streams.request(key, Request::Stop);
             // A shown panel only stops for a new target it cannot stream:
@@ -1028,11 +1055,21 @@ unsafe fn place_on_show(
     panel.placed = origin;
 }
 
+/// What happened to a live frame handed to the panel.
+enum LiveShown {
+    /// On the live layer and visible.
+    Shown,
+    /// Dropped: its tag is not the panel's current target.
+    Hidden,
+    /// The pixel buffer had no IOSurface to show.
+    NoSurface,
+}
+
 /// Put a live frame's IOSurface on the live layer, tagged with the target
 /// of the stream it came from.
-unsafe fn show_live(panel: &mut Panel, frame: screencapturekit::CVPixelBuffer) {
+unsafe fn show_live(panel: &mut Panel, frame: screencapturekit::CVPixelBuffer) -> LiveShown {
     let Some(surface) = frame.io_surface() else {
-        return;
+        return LiveShown::NoSurface;
     };
     let _: () = msg_send![class!(CATransaction), begin];
     // No implicit cross-fade between frames.
@@ -1045,7 +1082,11 @@ unsafe fn show_live(panel: &mut Panel, frame: screencapturekit::CVPixelBuffer) {
     // Replacing the previous frame releases it back to ScreenCaptureKit.
     panel.live_frame = Some(frame);
     panel.live_tag = panel.stream.requested;
-    sync_layers(panel);
+    if sync_layers(panel).show_live {
+        LiveShown::Shown
+    } else {
+        LiveShown::Hidden
+    }
 }
 
 /// Release the live frame and blank the live layer.
@@ -1070,7 +1111,7 @@ unsafe fn clear_live(panel: &mut Panel) {
 /// The one place layer visibility is decided: drop pixels that are not of
 /// the panel's current resolved target, then show what `visible_layers` says.
 /// Call after any change to the target, the still, or the live frame.
-unsafe fn sync_layers(panel: &mut Panel) {
+unsafe fn sync_layers(panel: &mut Panel) -> Layers {
     let current = current_tag(panel.target, panel.resolved_window);
     if panel.live_tag.is_some() && panel.live_tag != current {
         drop_live(panel);
@@ -1090,6 +1131,7 @@ unsafe fn sync_layers(panel: &mut Panel) {
         panel.placeholder as *mut AnyObject,
         setHidden: !layers.show_placeholder
     ];
+    layers
 }
 
 /// Fade completion: order the panel out unless a frame re-showed it.

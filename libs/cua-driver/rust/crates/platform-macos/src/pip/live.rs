@@ -29,8 +29,8 @@ use std::time::{Duration, Instant};
 
 use screencapturekit::cm::{CMTime, SCFrameStatus};
 use screencapturekit::prelude::{
-    CMSampleBuffer, CMSampleBufferExt, CMSampleBufferSCExt, SCContentFilter, SCShareableContent,
-    SCStream, SCStreamConfiguration, SCStreamOutputType,
+    CMSampleBuffer, CMSampleBufferExt, SCContentFilter, SCShareableContent, SCStream,
+    SCStreamConfiguration, SCStreamOutputType,
 };
 use screencapturekit::stream::delegate_trait::StreamCallbacks;
 use screencapturekit::CVPixelBuffer;
@@ -95,8 +95,8 @@ pub(super) struct StreamState {
     generation: u64,
     /// Image well size (points) the stream was last sized for.
     well: (f64, f64),
-    /// A frame of the current generation has been shown.
-    framed: bool,
+    /// Live frames of the current generation, for logs.
+    pub(super) frames: PanelFrames,
 }
 
 impl StreamState {
@@ -105,17 +105,12 @@ impl StreamState {
         self.requested = Some(target);
         self.generation = generation;
         self.well = well;
-        self.framed = false;
+        self.frames = PanelFrames::default();
     }
 
     /// The current generation's generation number (0 = none), for logs.
     pub(super) fn generation(&self) -> u64 {
         self.generation
-    }
-
-    /// True for the first frame shown of the current generation only.
-    pub(super) fn first_frame(&mut self) -> bool {
-        !std::mem::replace(&mut self.framed, true)
     }
 
     /// Whether a running stream must be reconfigured for a new `well`.
@@ -605,6 +600,163 @@ impl Backend for SckBackend {
     }
 }
 
+/// What the stream does with one sample, by its `SCStreamFrameInfo.status`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum FrameAction {
+    /// Put its pixels on the panel.
+    Show,
+    /// No new pixels (idle, blank, suspended).
+    Skip,
+    /// The stream stopped (window gone): fall back to stills.
+    Ended,
+}
+
+/// Complete and started frames carry new pixels. A frame whose status cannot
+/// be read is shown if it has a pixel buffer rather than silently dropped.
+fn frame_action(status: Option<SCFrameStatus>) -> FrameAction {
+    match status {
+        Some(SCFrameStatus::Complete | SCFrameStatus::Started) | None => FrameAction::Show,
+        Some(SCFrameStatus::Stopped) => FrameAction::Ended,
+        Some(SCFrameStatus::Idle | SCFrameStatus::Blank | SCFrameStatus::Suspended) => {
+            FrameAction::Skip
+        }
+    }
+}
+
+/// A sample's `SCStreamFrameInfo.status`, read through CoreMedia.
+///
+/// Not `CMSampleBufferSCExt::frame_status`: screencapturekit 8.0.1's bridge
+/// casts the attachment (an `NSNumber`) with `as? SCFrameStatus`, which is
+/// always nil, so that returns `None` for every frame.
+fn frame_status(sample: &CMSampleBuffer) -> Option<SCFrameStatus> {
+    use core_foundation::array::{CFArrayGetCount, CFArrayGetValueAtIndex, CFArrayRef};
+    use core_foundation::base::TCFType;
+    use core_foundation::dictionary::{CFDictionaryGetValue, CFDictionaryRef};
+    use core_foundation::number::{CFNumber, CFNumberGetTypeID, CFNumberRef};
+    use core_foundation::string::CFStringRef;
+
+    #[link(name = "CoreMedia", kind = "framework")]
+    extern "C" {
+        fn CMSampleBufferGetSampleAttachmentsArray(
+            sample: *mut std::ffi::c_void,
+            create_if_necessary: u8,
+        ) -> CFArrayRef;
+    }
+    #[link(name = "ScreenCaptureKit", kind = "framework")]
+    extern "C" {
+        static SCStreamFrameInfoStatus: CFStringRef;
+    }
+    // SAFETY: `sample` is a live CMSampleBuffer; the attachments array and
+    // its values follow the get rule (borrowed for the sample's lifetime).
+    unsafe {
+        let attachments = CMSampleBufferGetSampleAttachmentsArray(sample.as_ptr(), 0);
+        if attachments.is_null() || CFArrayGetCount(attachments) < 1 {
+            return None;
+        }
+        let first = CFArrayGetValueAtIndex(attachments, 0) as CFDictionaryRef;
+        if first.is_null() {
+            return None;
+        }
+        let value = CFDictionaryGetValue(first, SCStreamFrameInfoStatus.cast());
+        if value.is_null()
+            || core_foundation::base::CFGetTypeID(value) != CFNumberGetTypeID()
+        {
+            return None;
+        }
+        let raw = CFNumber::wrap_under_get_rule(value as CFNumberRef).to_i32()?;
+        SCFrameStatus::from_raw(raw)
+    }
+}
+
+/// How often a stream (and the panel) logs its frame counts.
+const STATS_EVERY: Duration = Duration::from_secs(2);
+
+/// Frames one stream received on ScreenCaptureKit's queue, by outcome.
+#[derive(Debug, Default)]
+struct FrameStats {
+    received: u64,
+    complete: u64,
+    started: u64,
+    idle_blank_suspended: u64,
+    stopped: u64,
+    status_unreadable: u64,
+    /// Show frames without a pixel buffer.
+    no_buffer: u64,
+    /// Handed to the main queue (the slot was empty).
+    handed_off: u64,
+    /// Replaced a frame the main queue had not taken yet.
+    replaced: u64,
+    last_summary: Option<Instant>,
+}
+
+impl FrameStats {
+    /// Count one frame. Returns true for the stream's first frame.
+    fn count(
+        &mut self,
+        status: Option<SCFrameStatus>,
+        action: FrameAction,
+        handed_off: Option<bool>,
+    ) -> bool {
+        self.received += 1;
+        match status {
+            Some(SCFrameStatus::Complete) => self.complete += 1,
+            Some(SCFrameStatus::Started) => self.started += 1,
+            Some(SCFrameStatus::Stopped) => self.stopped += 1,
+            Some(_) => self.idle_blank_suspended += 1,
+            None => self.status_unreadable += 1,
+        }
+        match (action, handed_off) {
+            (FrameAction::Show, None) => self.no_buffer += 1,
+            (_, Some(true)) => self.handed_off += 1,
+            (_, Some(false)) => self.replaced += 1,
+            _ => {}
+        }
+        self.received == 1
+    }
+
+    fn summary_due(&mut self, now: Instant) -> bool {
+        summary_due(&mut self.last_summary, now)
+    }
+}
+
+/// Whether a periodic summary is due at `now`. The first call only starts
+/// the clock (the first frame has its own line).
+fn summary_due(last: &mut Option<Instant>, now: Instant) -> bool {
+    match *last {
+        Some(at) if now.duration_since(at) < STATS_EVERY => false,
+        Some(_) => {
+            *last = Some(now);
+            true
+        }
+        None => {
+            *last = Some(now);
+            false
+        }
+    }
+}
+
+/// Live frames the main queue got for a panel's current stream, by outcome.
+#[derive(Debug, Default)]
+pub(super) struct PanelFrames {
+    /// Frame events for the current generation.
+    pub(super) events: u64,
+    /// Frames put on the live layer and left visible.
+    pub(super) shown: u64,
+    /// The slot was already empty (nothing to show).
+    pub(super) empty_slot: u64,
+    /// The pixel buffer had no IOSurface.
+    pub(super) no_iosurface: u64,
+    /// Put on the layer but hidden: its tag is not the current target's.
+    pub(super) hidden_by_tags: u64,
+    last_summary: Option<Instant>,
+}
+
+impl PanelFrames {
+    pub(super) fn summary_due(&mut self, now: Instant) -> bool {
+        summary_due(&mut self.last_summary, now)
+    }
+}
+
 /// Build and start a window stream.
 fn open_stream(
     key: &str,
@@ -642,36 +794,45 @@ fn open_stream(
     let slot: FrameSlot = Arc::new(Mutex::new(None));
     let frames = deliver.clone();
     let frame_key = key.to_owned();
+    let stats = Mutex::new(FrameStats::default());
     stream
         .add_output_handler(
             move |sample: CMSampleBuffer, of_type: SCStreamOutputType| {
                 if of_type != SCStreamOutputType::Screen {
                     return;
                 }
-                match sample.frame_status() {
-                    Some(SCFrameStatus::Complete) => {}
+                let status = frame_status(&sample);
+                let action = frame_action(status);
+                let buffer = match action {
+                    FrameAction::Show => sample.image_buffer(),
+                    _ => None,
+                };
+                // Wake the main queue only when the slot was empty; a frame
+                // already waiting there is simply replaced by this newer one.
+                let handed_off =
+                    buffer.map(|buffer| lock(&slot).replace(buffer).is_none());
+                let mut counts = lock(&stats);
+                if counts.count(status, action, handed_off) {
+                    tracing::info!(target: "pip", session = %frame_key, generation, ?status, ?action, ?handed_off, "PiP stream first frame");
+                } else if counts.summary_due(Instant::now()) {
+                    tracing::info!(target: "pip", session = %frame_key, generation, counts = ?*counts, "PiP stream frames");
+                }
+                drop(counts);
+                match (action, handed_off) {
                     // The window is gone: fall back to stills.
-                    Some(SCFrameStatus::Stopped) => {
+                    (FrameAction::Ended, _) => {
                         tracing::info!(target: "pip", session = %frame_key, generation, "PiP live stream window gone (frame status Stopped)");
-                        return frames(Event::Ended {
+                        frames(Event::Ended {
                             key: frame_key.clone(),
                             generation,
                         });
                     }
-                    // Idle/blank/suspended frames carry no new pixels.
-                    _ => return,
-                }
-                let Some(buffer) = sample.image_buffer() else {
-                    return;
-                };
-                // Only wake the main queue when the slot was empty; a frame
-                // already waiting there is simply replaced by this newer one.
-                if lock(&slot).replace(buffer).is_none() {
-                    frames(Event::Frame {
+                    (_, Some(true)) => frames(Event::Frame {
                         key: frame_key.clone(),
                         generation,
                         slot: slot.clone(),
-                    });
+                    }),
+                    _ => {}
                 }
             },
             SCStreamOutputType::Screen,
@@ -841,6 +1002,93 @@ mod tests {
         assert!(
             matches!(streams.next(None).unwrap(), (key, Request::Start { generation: 2, .. }) if key == "t")
         );
+    }
+
+    #[test]
+    fn only_complete_and_started_frames_are_shown_and_stopped_ends() {
+        use SCFrameStatus::*;
+        assert_eq!(frame_action(Some(Complete)), FrameAction::Show);
+        assert_eq!(frame_action(Some(Started)), FrameAction::Show);
+        assert_eq!(frame_action(Some(Stopped)), FrameAction::Ended);
+        for status in [Idle, Blank, Suspended] {
+            assert_eq!(frame_action(Some(status)), FrameAction::Skip);
+        }
+        // An unreadable status must not silently drop a frame with pixels.
+        assert_eq!(frame_action(None), FrameAction::Show);
+    }
+
+    /// A sample buffer carrying the status attachment the way ScreenCaptureKit
+    /// sets it: an NSNumber under `SCStreamFrameInfoStatus`.
+    fn sample_with_status(raw: i32) -> CMSampleBuffer {
+        use core_foundation::base::TCFType;
+        use core_foundation::number::CFNumber;
+        use std::ffi::c_void;
+        #[link(name = "CoreMedia", kind = "framework")]
+        extern "C" {
+            fn CMSampleBufferCreate(
+                allocator: *const c_void,
+                data_buffer: *const c_void,
+                data_ready: u8,
+                make_ready_callback: *const c_void,
+                make_ready_refcon: *const c_void,
+                format_description: *const c_void,
+                num_samples: i64,
+                num_timing_entries: i64,
+                timing_array: *const c_void,
+                num_size_entries: i64,
+                size_array: *const c_void,
+                out: *mut *mut c_void,
+            ) -> i32;
+            fn CMSampleBufferGetSampleAttachmentsArray(
+                sample: *mut c_void,
+                create_if_necessary: u8,
+            ) -> *const c_void;
+        }
+        #[link(name = "ScreenCaptureKit", kind = "framework")]
+        extern "C" {
+            static SCStreamFrameInfoStatus: *const c_void;
+        }
+        unsafe {
+            let mut sample = std::ptr::null_mut();
+            let null = std::ptr::null();
+            let status = CMSampleBufferCreate(
+                null, null, 1, null, null, null, 1, 0, null, 0, null, &mut sample,
+            );
+            assert_eq!(status, 0, "CMSampleBufferCreate");
+            let attachments = CMSampleBufferGetSampleAttachmentsArray(sample, 1);
+            let first = core_foundation::array::CFArrayGetValueAtIndex(attachments.cast(), 0);
+            let number = CFNumber::from(raw);
+            core_foundation::dictionary::CFDictionarySetValue(
+                first as _,
+                SCStreamFrameInfoStatus,
+                number.as_CFTypeRef(),
+            );
+            CMSampleBuffer::from_raw(sample).expect("sample")
+        }
+    }
+
+    #[test]
+    fn frame_status_reads_the_attachment_screencapturekit_sets() {
+        use screencapturekit::prelude::CMSampleBufferSCExt;
+        let complete = sample_with_status(0);
+        assert_eq!(frame_status(&complete), Some(SCFrameStatus::Complete));
+        assert_eq!(frame_status(&sample_with_status(1)), Some(SCFrameStatus::Idle));
+        assert_eq!(frame_status(&sample_with_status(5)), Some(SCFrameStatus::Stopped));
+        // The crate's reader casts the NSNumber to the enum and gets nil, so
+        // it reports no status for every real frame; the old handler then
+        // dropped them all.
+        assert_eq!(complete.frame_status(), None);
+    }
+
+    #[test]
+    fn summaries_start_after_the_first_frame_and_repeat_every_period() {
+        let start = Instant::now();
+        let mut last = None;
+        assert!(!summary_due(&mut last, start));
+        assert!(!summary_due(&mut last, start + STATS_EVERY / 2));
+        assert!(summary_due(&mut last, start + STATS_EVERY));
+        assert!(!summary_due(&mut last, start + STATS_EVERY + STATS_EVERY / 2));
+        assert!(summary_due(&mut last, start + STATS_EVERY * 2));
     }
 
     // ── Worker with a fake ScreenCaptureKit ───────────────────────────────
