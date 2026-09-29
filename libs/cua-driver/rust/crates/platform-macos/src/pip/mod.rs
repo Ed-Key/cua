@@ -122,7 +122,10 @@ mod visibility;
 
 use cursor::{cursor_in_well, sprite_frame, Sprite};
 pub(crate) use cursor::SPRITE_BOX;
-use finish::{Claim, Finale, Lifecycle, Rows, Verdicts};
+use finish::{
+    checklist_fit, chip_grid, Claim, Finale, Lifecycle, Rows, Verdicts, CAPTION_GAP, CAPTION_LINE,
+    MORE_LINE,
+};
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
@@ -2088,18 +2091,12 @@ unsafe fn remove_finale_view(panel: &mut Panel) {
     }
 }
 
-/// Height of a checklist row (a glass capsule), and the gap between rows.
-const ROW_HEIGHT: f64 = 26.0;
-const ROW_GAP: f64 = 4.0;
 /// Inset of the rows from the well's left edge, and of a row's content
 /// from its capsule.
 const ROW_INSET: f64 = 14.0;
 const ROW_PAD: f64 = 10.0;
 /// Size of a checklist mark.
 const MARK_SIZE: f64 = 16.0;
-/// The "Verified n of m" line above the rows: its height and the gap under it.
-const CAPTION_LINE: f64 = 14.0;
-const CAPTION_GAP: f64 = 8.0;
 /// Gap between finale chips.
 const FINALE_CHIP_GAP: f64 = 12.0;
 /// The scrim under the finale, and the white of a row's capsule over it.
@@ -2142,9 +2139,11 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
     let start = CACurrentMediaTime();
     match &finale.rows {
         Rows::Checklist(rows) => {
-            let pitch = ROW_HEIGHT + ROW_GAP;
-            let total = CAPTION_LINE + CAPTION_GAP + rows.len() as f64 * pitch - ROW_GAP;
-            let top = (well_h + total) / 2.0;
+            // Shrunk, or cut with a "+n more" line, to fit the well.
+            let fit = checklist_fit(well_h, rows.len());
+            let (row_h, gap) = (fit.row_height, fit.gap);
+            let pitch = row_h + gap;
+            let top = (well_h + fit.height()) / 2.0;
             // Width sizable, flexible top and bottom: stays centered.
             const ROW_MASK: u64 = 2 | 8 | 32;
             if let Some(text) = finale.caption() {
@@ -2167,7 +2166,29 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
                 let _: () = msg_send![overlay, addSubview: caption];
             }
             let rows_top = top - CAPTION_LINE - CAPTION_GAP;
-            for (index, row) in rows.iter().enumerate() {
+            if fit.hidden > 0 {
+                let more = new_label(
+                    NSRect::new(
+                        NSPoint::new(
+                            ROW_INSET + ROW_PAD,
+                            rows_top - fit.visible as f64 * pitch + gap - MORE_LINE,
+                        ),
+                        NSSize::new((well_w - 2.0 * ROW_INSET).max(0.0), MORE_LINE),
+                    ),
+                    11.0,
+                    0.23,
+                    false,
+                );
+                let dim: *mut AnyObject = msg_send![white, colorWithAlphaComponent: 0.7_f64];
+                let _: () = msg_send![more, setTextColor: dim];
+                let _: () = msg_send![more, setAutoresizingMask: ROW_MASK];
+                set_text(more as usize, &format!("+{} more", fit.hidden));
+                let _: () = msg_send![more, setWantsLayer: true];
+                let more_layer: *mut AnyObject = msg_send![more, layer];
+                animate_row(more_layer, std::ptr::null_mut(), std::ptr::null_mut(), fit.visible, start, (-10.0, 0.0));
+                let _: () = msg_send![overlay, addSubview: more];
+            }
+            for (index, row) in rows.iter().take(fit.visible).enumerate() {
                 let kind = match row.satisfied {
                     Some(true) => Mark::Check,
                     Some(false) => Mark::Warning,
@@ -2190,7 +2211,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
                 let _: () = msg_send![
                     label,
                     setFrame: NSRect::new(
-                        NSPoint::new(text_x, (ROW_HEIGHT - 16.0) / 2.0),
+                        NSPoint::new(text_x, (row_h - 16.0) / 2.0),
                         NSSize::new((row_w - text_x - ROW_PAD).max(0.0), 16.0)
                     )
                 ];
@@ -2199,8 +2220,8 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
                 // NSGlassEffectView nested inside the card's glass renders
                 // nothing (and takes the overlay's scrim with it).
                 let frame = NSRect::new(
-                    NSPoint::new(ROW_INSET, rows_top - (index + 1) as f64 * pitch + ROW_GAP),
-                    NSSize::new(row_w, ROW_HEIGHT),
+                    NSPoint::new(ROW_INSET, rows_top - (index + 1) as f64 * pitch + gap),
+                    NSSize::new(row_w, row_h),
                 );
                 let view = new_view(class!(NSView), frame);
                 let view_layer = host_layer(view);
@@ -2212,11 +2233,11 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
                 let _: () = msg_send![
                     mark,
                     setFrame: NSRect::new(
-                        NSPoint::new(ROW_PAD, (ROW_HEIGHT - MARK_SIZE) / 2.0),
+                        NSPoint::new(ROW_PAD, (row_h - MARK_SIZE) / 2.0),
                         NSSize::new(MARK_SIZE, MARK_SIZE)
                     )
                 ];
-                let _: () = msg_send![body_layer, setCornerRadius: ROW_HEIGHT / 2.0];
+                let _: () = msg_send![body_layer, setCornerRadius: row_h / 2.0];
                 let _: () = msg_send![body_layer, setBackgroundColor: capsule];
                 let _: () = msg_send![body_layer, addSublayer: mark];
                 let _: () = msg_send![body, addSubview: label];
@@ -2228,16 +2249,19 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
         }
         Rows::Chips(chips) => {
             use stack::{CHIP_H, CHIP_W};
-            let count = chips.len() as f64;
-            let total = count * CHIP_W + (count - 1.0).max(0.0) * FINALE_CHIP_GAP;
-            let (x0, y) = ((well_w - total) / 2.0, (well_h - CHIP_H) / 2.0);
+            // Wrapped into rows that fit the well's width, the block centered.
+            let (per_row, grid_rows) = chip_grid(well_w, chips.len(), CHIP_W, FINALE_CHIP_GAP);
+            let block_h = grid_rows as f64 * CHIP_H + grid_rows.saturating_sub(1) as f64 * FINALE_CHIP_GAP;
+            let block_top = (well_h + block_h) / 2.0;
             for (index, chip) in chips.iter().enumerate() {
+                let (row, column) = (index / per_row, index % per_row);
+                let in_row = per_row.min(chips.len() - row * per_row) as f64;
+                let row_w = in_row * CHIP_W + (in_row - 1.0).max(0.0) * FINALE_CHIP_GAP;
+                let x = (well_w - row_w) / 2.0 + column as f64 * (CHIP_W + FINALE_CHIP_GAP);
+                let y = block_top - (row + 1) as f64 * CHIP_H - row as f64 * FINALE_CHIP_GAP;
                 // The same chip as in the trail, so one shape means finished.
                 let view = new_chip(overlay, chip.finished);
-                let _: () = msg_send![
-                    view.view as *mut AnyObject,
-                    setFrameOrigin: NSPoint::new(x0 + index as f64 * (CHIP_W + FINALE_CHIP_GAP), y)
-                ];
+                let _: () = msg_send![view.view as *mut AnyObject, setFrameOrigin: NSPoint::new(x, y)];
                 let _: () = msg_send![view.view as *mut AnyObject, setHidden: false];
                 // Flexible margins: stays centered.
                 let _: () = msg_send![view.view as *mut AnyObject, setAutoresizingMask: 1u64 | 4 | 8 | 32];

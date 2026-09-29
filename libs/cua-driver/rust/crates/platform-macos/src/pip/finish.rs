@@ -58,6 +58,20 @@ pub(super) const ROW_IN: Duration = Duration::from_millis(150);
 pub(super) const MARK_IN: Duration = Duration::from_millis(180);
 /// The finished state stays up this long once every row is in.
 pub(super) const HOLD: Duration = Duration::from_millis(2000);
+/// Room a finale keeps from the well's top and bottom (and its sides, for
+/// chips).
+pub(super) const FINALE_PAD: f64 = 6.0;
+/// A checklist row (a capsule) and the gap between rows, at full size and
+/// at the smallest the finale shrinks them to before it hides rows.
+pub(super) const ROW_HEIGHT: f64 = 26.0;
+pub(super) const ROW_GAP: f64 = 4.0;
+pub(super) const ROW_HEIGHT_MIN: f64 = 20.0;
+pub(super) const ROW_GAP_MIN: f64 = 2.0;
+/// The "Verified n of m" line above the rows and the gap under it.
+pub(super) const CAPTION_LINE: f64 = 14.0;
+pub(super) const CAPTION_GAP: f64 = 6.0;
+/// The "+n more" line under the rows that fit.
+pub(super) const MORE_LINE: f64 = 16.0;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Claim {
@@ -457,6 +471,63 @@ impl Finale {
                 .collect(),
         }
     }
+}
+
+/// How a checklist of `rows` rows fits a well `well_h` tall: at full size
+/// when it can, else with rows and gaps shrunk (down to `ROW_HEIGHT_MIN` /
+/// `ROW_GAP_MIN`), else with only the first `visible` rows and a "+n more"
+/// line counting the rest, so every result is shown or counted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ChecklistFit {
+    pub(super) row_height: f64,
+    pub(super) gap: f64,
+    pub(super) visible: usize,
+    pub(super) hidden: usize,
+}
+
+impl ChecklistFit {
+    /// Height of the whole block: caption, the visible rows, the more line.
+    pub(super) fn height(&self) -> f64 {
+        let rows = self.visible as f64 * self.row_height
+            + (self.visible.saturating_sub(1)) as f64 * self.gap;
+        let more = if self.hidden > 0 { MORE_LINE } else { 0.0 };
+        CAPTION_LINE + CAPTION_GAP + rows + more
+    }
+}
+
+pub(super) fn checklist_fit(well_h: f64, rows: usize) -> ChecklistFit {
+    let available = (well_h - 2.0 * FINALE_PAD).max(0.0);
+    let fit = |row_height, gap, visible, hidden| ChecklistFit {
+        row_height,
+        gap,
+        visible,
+        hidden,
+    };
+    let full = fit(ROW_HEIGHT, ROW_GAP, rows, 0);
+    if full.height() <= available {
+        return full;
+    }
+    let room = available - CAPTION_LINE - CAPTION_GAP;
+    let need = rows as f64 * ROW_HEIGHT + rows.saturating_sub(1) as f64 * ROW_GAP;
+    let scale = (room / need).clamp(0.0, 1.0);
+    let row_height = (ROW_HEIGHT * scale).floor().max(ROW_HEIGHT_MIN);
+    let gap = (ROW_GAP * scale).floor().max(ROW_GAP_MIN);
+    let shrunk = fit(row_height, gap, rows, 0);
+    if shrunk.height() <= available {
+        return shrunk;
+    }
+    // Rows that fit above a "+n more" line (never all of them here).
+    let room = (room - MORE_LINE).max(0.0);
+    let visible = (((room + gap) / (row_height + gap)).floor() as usize).min(rows - 1);
+    fit(row_height, gap, visible, rows - visible)
+}
+
+/// Chips per row when `chips` wrap in a well `well_w` wide, `chip_w` each
+/// and `gap` apart (at least one per row), and how many rows that makes.
+pub(super) fn chip_grid(well_w: f64, chips: usize, chip_w: f64, gap: f64) -> (usize, usize) {
+    let room = (well_w - 2.0 * FINALE_PAD + gap).max(0.0);
+    let per_row = (((room) / (chip_w + gap)).floor() as usize).max(1);
+    (per_row, chips.div_ceil(per_row))
 }
 
 /// When row `index` of a finale starts to come in, and when its mark
@@ -1055,6 +1126,33 @@ mod tests {
         // A newer action in that app is still new work.
         verdicts.act((Some(3), Some(30)), "Docs", 200);
         assert_eq!(verdicts.finale().len(), 1);
+    }
+
+    #[test]
+    fn the_finale_fits_the_well_by_shrinking_rows_then_counting_the_rest() {
+        // The default well (320x200): five rows at full size.
+        let fit = checklist_fit(200.0, 5);
+        assert_eq!(fit, ChecklistFit { row_height: ROW_HEIGHT, gap: ROW_GAP, visible: 5, hidden: 0 });
+        assert!(fit.height() <= 200.0 - 2.0 * FINALE_PAD);
+        // The smallest well (228x144, from MIN_CARD 240x180): five rows
+        // shrink to the floor and all stay visible.
+        let fit = checklist_fit(144.0, 5);
+        assert_eq!(fit.visible, 5);
+        assert_eq!(fit.hidden, 0);
+        assert!(fit.row_height >= ROW_HEIGHT_MIN && fit.row_height < ROW_HEIGHT);
+        assert!(fit.height() <= 144.0 - 2.0 * FINALE_PAD, "{fit:?}");
+        // A well too short even for the floor: the rest is counted.
+        let fit = checklist_fit(100.0, 5);
+        assert_eq!((fit.visible, fit.hidden), (2, 3), "{fit:?}");
+        assert!(fit.height() <= 100.0 - 2.0 * FINALE_PAD, "{fit:?}");
+        assert_eq!(fit.visible + fit.hidden, 5, "every result shown or counted");
+        // One row always fits somewhere.
+        assert_eq!(checklist_fit(10.0, 1).visible + checklist_fit(10.0, 1).hidden, 1);
+        // Chips: five in one row at the default width, wrapped in two at
+        // the smallest.
+        assert_eq!(chip_grid(320.0, 5, 48.0, 12.0), (5, 1));
+        assert_eq!(chip_grid(228.0, 5, 48.0, 12.0), (3, 2));
+        assert_eq!(chip_grid(20.0, 2, 48.0, 12.0), (1, 2));
     }
 
     #[test]
