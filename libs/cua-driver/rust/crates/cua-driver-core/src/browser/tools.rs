@@ -1125,8 +1125,9 @@ impl Tool for BrowserClickTool {
             {
                 Ok(_) => ToolResult::text(format!(
                     "dispatched synthetic DOM click on {} in {tab_id}; application effect not \
-                     verified (trust-gated controls may ignore untrusted events). Refresh page \
-                     state and verify the expected postcondition",
+                     verified (trust-gated controls may ignore untrusted events). Read the page \
+                     with get_browser_state to verify; if the control ignored it, click again \
+                     without input_route to use trusted input",
                     ext_ref.as_deref().unwrap_or("?")
                 ))
                 .with_structured(json!({
@@ -1137,10 +1138,9 @@ impl Tool for BrowserClickTool {
                     "tab_id": tab_id,
                     "ref": ext_ref,
                     "frame": frame_kind,
-                    "escalation": {
-                        "recommended": "page",
-                        "reason": "synthetic DOM dispatch cannot prove control activation; refresh page state and verify the expected postcondition",
-                    },
+                    // No escalation: the page-action target would point at the
+                    // legacy page tool, whose mutations are off by default. The
+                    // summary names the real next step.
                 })),
                 Err(e) => ToolResult::error(format!("DOM click failed: {e}")),
             };

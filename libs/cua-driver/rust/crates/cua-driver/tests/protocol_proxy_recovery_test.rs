@@ -436,7 +436,7 @@ async fn real_proxies_recover_from_control_loss_without_waiting_for_stdin() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn idle_reclaimed_unnamed_session_is_recreated_through_the_daemon() {
+async fn idle_reclaimed_sessions_are_recreated_through_the_daemon() {
     #[cfg(unix)]
     let directory = tempfile::Builder::new()
         .prefix("cua-idle-")
@@ -484,7 +484,12 @@ async fn idle_reclaimed_unnamed_session_is_recreated_through_the_daemon() {
         tokio::time::sleep(Duration::from_millis(250)).await;
     }
 
+    // Both come back for the connection that owned them.
     client.call("get_config", json!({}));
+    client.call("get_config", json!({"session": "named-idle"}));
+
+    // An explicit end stays terminal, says why, and names its recovery.
+    client.call("end_session", json!({"session": "named-idle"}));
     let named = client.request(
         "tools/call",
         json!({"name": "get_config", "arguments": {"session": "named-idle"}}),
@@ -492,8 +497,9 @@ async fn idle_reclaimed_unnamed_session_is_recreated_through_the_daemon() {
     assert_eq!(named["result"]["isError"], true, "{named}");
     let text = named["result"]["content"][0]["text"].as_str().unwrap_or("");
     assert!(
-        text.contains("start_session with session 'named-idle'"),
-        "named refusal must name its working recovery: {named}"
+        text.contains("because end_session ended it")
+            && text.contains("start_session with session 'named-idle'"),
+        "named refusal must say why and name its working recovery: {named}"
     );
     client.call("start_session", json!({"session": "named-idle"}));
     client.call("get_config", json!({"session": "named-idle"}));

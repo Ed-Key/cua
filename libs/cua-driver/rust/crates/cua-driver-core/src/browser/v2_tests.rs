@@ -2698,7 +2698,11 @@ async fn trusted_click_refuses_when_standalone_background_posture_is_unavailable
         .await;
     assert_eq!(structured(&synthetic)["status"], "ok");
     assert_eq!(structured(&synthetic)["effect"], "unverifiable");
-    assert_eq!(structured(&synthetic)["escalation"]["recommended"], "page");
+    assert!(structured(&synthetic).get("escalation").is_none());
+    assert!(synthetic.content.iter().any(|content| matches!(
+        content,
+        crate::protocol::Content::Text { text, .. } if text.contains("get_browser_state")
+    )));
     assert!(synthetic.content.iter().any(|content| matches!(
         content,
         crate::protocol::Content::Text { text, .. }
@@ -2717,11 +2721,8 @@ async fn trusted_click_refuses_when_standalone_background_posture_is_unavailable
     assert_eq!(public["effect"], "unverifiable", "{public}");
     assert_eq!(public["route"], "dom", "{public}");
     assert_eq!(public["delivery"]["mode"], "background", "{public}");
-    assert_eq!(public["escalation"]["target"], "page", "{public}");
-    assert_eq!(
-        public["escalation"]["reason"], "effect_unconfirmed",
-        "{public}"
-    );
+    // No dead-end escalation; the summary names get_browser_state instead.
+    assert!(public.get("escalation").is_none(), "{public}");
     assert!(public.get("status").is_none(), "{public}");
     assert!(!recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
     assert!(recorded_calls(&f, "Page.bringToFront").is_empty());
