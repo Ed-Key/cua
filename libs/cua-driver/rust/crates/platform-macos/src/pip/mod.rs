@@ -79,16 +79,16 @@
 //! the session last acted in its window, or when the window closes.
 //! Shown/hidden still follows the front card's window only.
 //!
-//! The front card is a view inside the panel, which reserves transparent
-//! room above and left of it where back cards rest. Back items live in a
-//! second window, the trail: a borderless non-activating `CuaPipPanel` like
-//! the panel (never key, never main, fades with it, owned by this process so
-//! the visibility checks and window-scoped captures never see it) ordered
-//! just below the panel and widened left for the chip column. Its fully
+//! Every item is a view inside the one panel window, which is the deck (the
+//! front card plus transparent room above and left of it where back cards
+//! rest) with the chip column on its left and `stack::LAG_ROOM` on every
+//! side, so items that trail a drag never leave it. The front card and the
+//! chips share an `NSGlassEffectContainerView`, so a chip fuses into the
+//! card's glass when it rests against it and pulls free as it lags. Fully
 //! transparent pixels let clicks through; items sit on hit plates. The
 //! panel handles its own mouse: a press on a card and a drag moves the
-//! panel while the trail hangs back on a loose spring (see
-//! `stack::TRAIL_OMEGA`) and swings after it, a press in the band just
+//! window while the back items hang back on loose springs (see
+//! `stack::TRAIL_OMEGA`) and swing after it, a press in the band just
 //! inside the front card's edges resizes it (60% of the screen at most,
 //! remembered per session like a dragged position), and a click on a back
 //! item raises it. The live stream is resized to the new well 150 ms after
@@ -122,9 +122,10 @@ use finish::{Claim, Finale, Lifecycle, Rows, Verdicts};
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
-    back_cards, card_size, item_at, max_card, own_pixels, resize_edges, resize_settled,
-    resize_window, slot_frame, trail_frame, window_size, CardStack, Motion, Slot, Trail,
-    CHIP_REACH, DRAG_SLOP, MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, TRAIL_PAD, VIEWS,
+    back_cards, card_size, deck_size, item_at, max_card, own_pixels, panel_point, resize_edges,
+    resize_settled, resize_window, slot_frame, to_window, window_origin, window_size, CardStack,
+    Motion, Slot, Trail, CHIP_REACH, DRAG_SLOP, GLASS_SPACING, MAX_CARDS, MIN_CARD,
+    RESIZE_DEBOUNCE, VIEWS,
 };
 
 // ── CGColor objc2 encoding shim ────────────────────────────────────────────
@@ -177,6 +178,8 @@ const BORDER_WIDTH: f64 = 2.0;
 const HEADER_HEIGHT: f64 = 28.0;
 const STATUS_HEIGHT: f64 = 16.0;
 const PAD: f64 = 8.0;
+/// Radius of the image well (and a back card's still), inside the card's.
+const WELL_RADIUS: f64 = 8.0;
 /// Distance from the screen's visible-frame edge to the first panel.
 const EDGE_INSET: f64 = 16.0;
 /// Gap between stacked panels.
@@ -403,11 +406,12 @@ struct Panel {
     header: usize,
     focus: usize,
     close: usize,
-    /// The trail window and its back item views.
-    trail: TrailViews,
+    /// Back card views, depth 1 first.
+    backs: [BackView; MAX_CARDS - 1],
+    /// Chip views, bottom row first.
+    chips: [ChipView; MAX_CARDS - 1],
     /// Each view's hit plate (see `new_hit_plate`), indexed like
-    /// `Slot::view`, framed and hidden with its view: the front card's in
-    /// the panel, the rest in the trail.
+    /// `Slot::view`, framed and hidden with its view.
     plates: [usize; VIEWS],
     /// Windows the session acted in, front card first.
     cards: CardStack<Tag, CardInfo>,
@@ -416,7 +420,7 @@ struct Panel {
     layout: Vec<Slot>,
     /// Each view's animated offset from its resting frame.
     motion: [Motion; VIEWS],
-    /// The trail window's lag behind the panel.
+    /// The back items' lag behind a dragged panel.
     trail_motion: Trail,
     /// What the session verified and finished.
     verdicts: Verdicts,
@@ -471,14 +475,6 @@ struct BackView {
 struct ChipView {
     view: usize,
     icon: usize,
-    caption: usize,
-}
-
-/// The trail window: back cards (depth 1 first) and chips (bottom first).
-struct TrailViews {
-    window: usize,
-    cards: [BackView; MAX_CARDS - 1],
-    chips: [ChipView; MAX_CARDS - 1],
 }
 
 /// What a card shows besides live pixels, kept so a window that goes behind
@@ -1427,7 +1423,7 @@ unsafe fn restack(
 ) -> bool {
     let old = panel.cards.keys();
     let old_layout = panel.layout.clone();
-    let drawn = item_frames(panel);
+    let drawn = settle_frames(panel);
     change(panel);
     let new = panel.cards.keys();
     let layout = item_slots(panel);
@@ -2210,7 +2206,7 @@ unsafe fn place_on_show(
     let Some(slot) = panel.slot else {
         return;
     };
-    let Some(origin) = slot_origin(window_size(panel_size(image_size)), anchor, slot) else {
+    let Some(origin) = slot_origin(panel_size(image_size), anchor, slot) else {
         return;
     };
     let _: () = msg_send![window, setFrameOrigin: NSPoint::new(origin.0, origin.1)];
@@ -2302,12 +2298,10 @@ unsafe extern "C" fn order_out_cb(ctx: *mut c_void) {
     with_state(|state| {
         if let Some(panel) = state.panels.get_mut(&key) {
             if !panel.shown {
-                for window in [panel.window, panel.trail.window] {
-                    let _: () = msg_send![
-                        window as *mut AnyObject,
-                        orderOut: std::ptr::null_mut::<AnyObject>()
-                    ];
-                }
+                let _: () = msg_send![
+                    panel.window as *mut AnyObject,
+                    orderOut: std::ptr::null_mut::<AnyObject>()
+                ];
                 // The fade is over: release the retained live frame.
                 clear_live(panel);
                 remove_finale_view(panel);
@@ -2357,17 +2351,15 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
     });
 }
 
-/// Fade the panel and its trail out, then close both.
+/// Fade the panel out, then close it.
 unsafe fn close_panel(panel: Panel) {
     animate_alpha(panel.window, 0.0);
-    animate_alpha(panel.trail.window, 0.0);
-    dispatch_to_main_after(FADE, (panel.window, panel.trail.window), close_window_cb);
+    dispatch_to_main_after(FADE, panel.window, close_window_cb);
 }
 
 unsafe extern "C" fn close_window_cb(ctx: *mut c_void) {
-    let (window, trail) = *Box::from_raw(ctx as *mut (usize, usize));
+    let window = *Box::from_raw(ctx as *mut usize);
     close_window(window as *mut AnyObject);
-    close_window(trail as *mut AnyObject);
 }
 
 unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
@@ -2382,7 +2374,6 @@ unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
     .unwrap_or_default();
     for panel in panels {
         close_window(panel.window as *mut AnyObject);
-        close_window(panel.trail.window as *mut AnyObject);
     }
 }
 
@@ -2408,18 +2399,9 @@ unsafe fn show(panel: &mut Panel) {
     // Never makeKey: the user's app keeps keyboard focus.
     let _: () = msg_send![window, orderFrontRegardless];
     animate_alpha(panel.window, 1.0);
-    // The trail sits just below its panel, at rest.
+    // The back items sit at rest behind the front card.
     panel.trail_motion.snap();
-    sync_trail(panel);
-    let trail = panel.trail.window as *mut AnyObject;
-    let trail_visible: bool = msg_send![trail, isVisible];
-    if !trail_visible {
-        let _: () = msg_send![trail, setAlphaValue: 0.0_f64];
-    }
-    let number: isize = msg_send![window, windowNumber];
-    // NSWindowBelow
-    let _: () = msg_send![trail, orderWindow: -1isize relativeTo: number];
-    animate_alpha(panel.trail.window, 1.0);
+    apply_card_frames(panel);
 }
 
 unsafe fn hide(panel: &mut Panel, key: &str) {
@@ -2428,7 +2410,6 @@ unsafe fn hide(panel: &mut Panel, key: &str) {
     }
     panel.shown = false;
     animate_alpha(panel.window, 0.0);
-    animate_alpha(panel.trail.window, 0.0);
     dispatch_to_main_after(FADE, key.to_owned(), order_out_cb);
 }
 
@@ -2588,10 +2569,11 @@ unsafe fn set_frame(view: usize, area: Area) {
     let _: () = msg_send![view as *mut AnyObject, setFrame: ns_rect(area)];
 }
 
-/// AppKit origin of cascade `slot` on the main screen for a panel window of
-/// `size`; `None` when there is no screen (headless).
+/// AppKit origin of the panel window in cascade `slot` on the main screen
+/// for a front card of `card` size (its deck is what is placed); `None`
+/// when there is no screen (headless).
 unsafe fn slot_origin(
-    size: (f64, f64),
+    card: (f64, f64),
     anchor: Option<(i32, i32)>,
     slot: usize,
 ) -> Option<(f64, f64)> {
@@ -2601,13 +2583,13 @@ unsafe fn slot_origin(
     }
     let screen_frame: NSRect = msg_send![screen, frame];
     let visible_frame: NSRect = msg_send![screen, visibleFrame];
-    Some(panel_origin(
+    Some(window_origin(panel_origin(
         area_of(screen_frame),
         area_of(visible_frame),
-        size,
+        deck_size(card),
         anchor,
         slot,
-    ))
+    )))
 }
 
 /// The visible frame of the screen `window` is on (else the main screen's).
@@ -2633,21 +2615,12 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let (width, height) = window_size(card);
     let origin = match remembered.origin {
         Some(origin) => origin,
-        None => slot_origin((width, height), state.anchor, 0)?, // None: headless (CI)
+        None => slot_origin(card, state.anchor, 0)?, // None: headless (CI)
     };
     let rect = NSRect::new(NSPoint::new(origin.0, origin.1), NSSize::new(width, height));
     let window = new_pip_window(rect)?;
     let name = label.map(str::to_owned).unwrap_or_else(|| short_key(key));
     let _: () = msg_send![window, setTitle: ns_string(&format!("cua PiP · {name}"))];
-    let trail_rect = ns_rect(trail_frame(area_of(rect), (0.0, 0.0)));
-    let Some(trail_window) = new_pip_window(trail_rect) else {
-        close_window(window);
-        return None;
-    };
-    let _: () = msg_send![
-        trail_window,
-        setTitle: ns_string(&format!("cua PiP trail · {name}"))
-    ];
 
     let [r, g, b, _] = cursor_overlay::session_fill_rgba(key);
     let session_color = |alpha: f64| -> *mut CGColor {
@@ -2685,39 +2658,23 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     // under every drawn card keeps each press on a card, its corners and
     // resize band included, in this panel. The margin elsewhere stays clear
     // and click-through.
-    let front_plate = new_hit_plate(stack_view);
-
-    // The trail: back items over their hit plates, deepest card first so
-    // depth 1 draws over depth 2, chips on top.
-    let trail_bounds = NSRect::new(NSPoint::new(0.0, 0.0), trail_rect.size);
-    let trail_view = new_view(trail_view_class(), trail_bounds);
-    let _: () = msg_send![trail_window, setContentView: trail_view];
-    let _: () = msg_send![trail_view, release];
-    let mut plates = [front_plate; VIEWS];
-    for plate in &mut plates[1..] {
-        *plate = new_hit_plate(trail_view);
+    let mut plates = [0usize; VIEWS];
+    for plate in &mut plates {
+        *plate = new_hit_plate(stack_view);
     }
+
+    // Back cards, deepest first so depth 1 draws over depth 2, each its own
+    // glass (they overlap the front card, so they must not fuse with it).
     let mut backs: Vec<BackView> = (1..MAX_CARDS)
         .rev()
-        .map(|depth| {
-            new_back_card(
-                trail_view,
-                card,
-                depth,
-                session_color(0.5),
-                session_color(0.16),
-            )
-        })
+        .map(|depth| new_back_card(stack_view, card, depth))
         .collect();
     backs.reverse();
-    let chips: Vec<ChipView> = (1..MAX_CARDS)
-        .map(|_| new_chip(trail_view, session_color(0.6)))
-        .collect();
-    let trail = TrailViews {
-        window: trail_window as usize,
-        cards: backs.try_into().ok()?,
-        chips: chips.try_into().ok()?,
-    };
+
+    // The chips and the front card share one glass container: a resting
+    // chip fuses into the card, a lagging one pulls free.
+    let deck = glass_container(stack_view, bounds);
+    let chips: Vec<ChipView> = (1..MAX_CARDS).map(|_| new_chip(deck, true)).collect();
 
     // Front card: rounded, with the session-colored border. A layer's border
     // composites above its sublayers, so it rims the glass.
@@ -2813,7 +2770,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
 
     let status = new_label(NSRect::ZERO, 11.0, 0.0, true);
     let _: () = msg_send![body, addSubview: status];
-    add_subview(stack_view, front_view);
+    add_subview(deck, front_view);
 
     let mut panel = Panel {
         id,
@@ -2837,7 +2794,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         header: header as usize,
         focus: focus as usize,
         close: close as usize,
-        trail,
+        backs: backs.try_into().ok()?,
+        chips: chips.try_into().ok()?,
         plates,
         cards: CardStack::new(),
         layout: vec![Slot::Front],
@@ -2929,21 +2887,11 @@ unsafe fn new_hit_plate(parent: *mut AnyObject) -> usize {
 /// window title, the part that peeks out) over the window's last still.
 /// Hidden until the stack has a card at its depth. Its views follow the
 /// card's frame through autoresizing.
-unsafe fn new_back_card(
-    parent: *mut AnyObject,
-    card: (f64, f64),
-    depth: usize,
-    border: *mut CGColor,
-    wash: *mut CGColor,
-) -> BackView {
-    let frame = slot_frame(card, Slot::Card(depth), 0);
+unsafe fn new_back_card(parent: *mut AnyObject, card: (f64, f64), depth: usize) -> BackView {
+    let frame = to_window(slot_frame(card, Slot::Card(depth), 0));
     let (w, h) = (frame.w, frame.h);
     let view = new_view(class!(NSView), ns_rect(frame));
     let _: () = msg_send![view, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![view, layer];
-    let _: () = msg_send![layer, setCornerRadius: CORNER_RADIUS];
-    let _: () = msg_send![layer, setBorderWidth: 1.0_f64];
-    let _: () = msg_send![layer, setBorderColor: border];
 
     let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(w, h));
     let body = new_view(class!(NSView), bounds);
@@ -2954,30 +2902,20 @@ unsafe fn new_back_card(
     // Autoresizing: 2 width sizable, 4 max-x margin, 8 min-y margin (pinned
     // to the top), 16 height sizable.
     let strip_y = h - stack::CARD_STEP;
-    let strip = new_view(
-        class!(NSView),
-        NSRect::new(NSPoint::new(0.0, strip_y), NSSize::new(w, stack::CARD_STEP)),
-    );
-    let _: () = msg_send![strip, setWantsLayer: true];
-    let strip_layer: *mut AnyObject = msg_send![strip, layer];
-    let _: () = msg_send![strip_layer, setBackgroundColor: wash];
-    let _: () = msg_send![strip, setAutoresizingMask: 10u64];
-    add_subview(body, strip);
-
     let icon = new_icon_view(NSRect::new(
-        NSPoint::new(10.0, strip_y + 2.0),
-        NSSize::new(10.0, 10.0),
+        NSPoint::new(10.0, strip_y + 1.0),
+        NSSize::new(12.0, 12.0),
     ));
     let _: () = msg_send![icon, setAutoresizingMask: 12u64];
     let _: () = msg_send![body, addSubview: icon];
     let title = new_label(
         NSRect::new(
-            NSPoint::new(24.0, strip_y),
-            NSSize::new((w - 34.0).max(0.0), stack::CARD_STEP - 1.0),
+            NSPoint::new(26.0, strip_y - 1.0),
+            NSSize::new((w - 36.0).max(0.0), stack::CARD_STEP),
         ),
-        10.0,
-        0.0,
-        true,
+        11.0,
+        0.23, // NSFontWeightMedium
+        false,
     );
     let _: () = msg_send![title, setAutoresizingMask: 10u64];
     let _: () = msg_send![body, addSubview: title];
@@ -2985,14 +2923,14 @@ unsafe fn new_back_card(
     let image_view = new_view(
         class!(NSImageView),
         NSRect::new(
-            NSPoint::new(5.0, 5.0),
-            NSSize::new((w - 10.0).max(0.0), (strip_y - 7.0).max(0.0)),
+            NSPoint::new(PAD, PAD),
+            NSSize::new((w - 2.0 * PAD).max(0.0), (strip_y - 2.0 - PAD).max(0.0)),
         ),
     );
     let _: () = msg_send![image_view, setImageScaling: 3u64];
     let _: () = msg_send![image_view, setWantsLayer: true];
     let image_layer: *mut AnyObject = msg_send![image_view, layer];
-    let _: () = msg_send![image_layer, setCornerRadius: 6.0_f64];
+    let _: () = msg_send![image_layer, setCornerRadius: WELL_RADIUS];
     let _: () = msg_send![image_layer, setMasksToBounds: true];
     let _: () = msg_send![image_view, setAutoresizingMask: 18u64];
     add_subview(body, image_view);
@@ -3032,30 +2970,47 @@ unsafe fn glass_background(bounds: NSRect, body: *mut AnyObject, radius: f64) ->
     effect
 }
 
-/// A chip inside `parent` (hidden until the stack has a chip in its row):
-/// a glass circle with a `border` ring holding the app icon, a green check
-/// badge on its lower right, and the window title as a tiny caption under
-/// it. Its parts stay centered (flexible margins) while the chip's frame
-/// springs from where its window was drawn.
-unsafe fn new_chip(parent: *mut AnyObject, border: *mut CGColor) -> ChipView {
-    use stack::{CHIP, CHIP_CAPTION, CHIP_H, CHIP_ICON, CHIP_W};
+/// The glass views inside `parent` merge into one shape when they come
+/// within `GLASS_SPACING` of each other (`NSGlassEffectContainerView`,
+/// macOS 26; a plain view before). Returns the view to put them in
+/// (owned by `parent`).
+unsafe fn glass_container(parent: *mut AnyObject, bounds: NSRect) -> *mut AnyObject {
+    let Some(container_class) = AnyClass::get("NSGlassEffectContainerView") else {
+        let deck = new_view(class!(NSView), bounds);
+        let _: () = msg_send![deck, setAutoresizingMask: 18u64];
+        add_subview(parent, deck);
+        return deck;
+    };
+    let container = new_view(container_class, bounds);
+    let _: () = msg_send![container, setAutoresizingMask: 18u64];
+    let _: () = msg_send![container, setSpacing: GLASS_SPACING];
+    let deck = new_view(class!(NSView), bounds);
+    let _: () = msg_send![deck, setAutoresizingMask: 18u64];
+    let _: () = msg_send![container, setContentView: deck];
+    let _: () = msg_send![deck, release];
+    add_subview(parent, container);
+    deck
+}
+
+/// A chip inside `parent`: a glass circle holding the app icon, with a
+/// green check badge (white ring) on its lower right when `finished`. Its
+/// parts stay centered (flexible margins) while the chip's frame springs
+/// from where its window was drawn. Hidden until used; the window title is
+/// its tooltip.
+unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
+    use stack::{CHIP, CHIP_BADGE, CHIP_BADGE_RING, CHIP_H, CHIP_ICON, CHIP_W};
     // NSViewMinXMargin 1 | MaxXMargin 4 | MinYMargin 8 | MaxYMargin 32.
     const CENTERED: u64 = 1 | 4 | 8 | 32;
     let view = new_view(
         class!(NSView),
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP_W, CHIP_H)),
     );
+    let _: () = msg_send![view, setWantsLayer: true];
+    // The circle sits top-left in the frame; the badge overhangs bottom-right.
     let circle = NSRect::new(
-        NSPoint::new((CHIP_W - CHIP) / 2.0, CHIP_CAPTION + 2.0),
+        NSPoint::new(0.0, CHIP_H - CHIP),
         NSSize::new(CHIP, CHIP),
     );
-    let ring = new_view(class!(NSView), circle);
-    let _: () = msg_send![ring, setWantsLayer: true];
-    let ring_layer: *mut AnyObject = msg_send![ring, layer];
-    let _: () = msg_send![ring_layer, setCornerRadius: CHIP / 2.0];
-    let _: () = msg_send![ring_layer, setBorderWidth: 1.0_f64];
-    let _: () = msg_send![ring_layer, setBorderColor: border];
-    let _: () = msg_send![ring, setAutoresizingMask: CENTERED];
     let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP, CHIP));
     let body = new_view(class!(NSView), bounds);
     let inset = (CHIP - CHIP_ICON) / 2.0;
@@ -3064,43 +3019,36 @@ unsafe fn new_chip(parent: *mut AnyObject, border: *mut CGColor) -> ChipView {
         NSSize::new(CHIP_ICON, CHIP_ICON),
     ));
     let _: () = msg_send![body, addSubview: icon];
-    add_subview(ring, glass_background(bounds, body, CHIP / 2.0));
-    add_subview(view, ring);
+    let glass = glass_background(bounds, body, CHIP / 2.0);
+    let _: () = msg_send![glass, setFrame: circle];
+    let _: () = msg_send![glass, setAutoresizingMask: CENTERED];
+    add_subview(view, glass);
 
-    let badge_size = 15.0;
-    let badge = new_view(
-        class!(NSView),
-        NSRect::new(
-            NSPoint::new(
-                circle.origin.x + CHIP - badge_size + 2.0,
-                circle.origin.y - 2.0,
+    if finished {
+        let badge = new_view(
+            class!(NSView),
+            NSRect::new(
+                NSPoint::new(circle.origin.x + CHIP - CHIP_BADGE + 3.0, circle.origin.y - 3.0),
+                NSSize::new(CHIP_BADGE, CHIP_BADGE),
             ),
-            NSSize::new(badge_size, badge_size),
-        ),
-    );
-    let _: () = msg_send![badge, setWantsLayer: true];
-    let badge_layer: *mut AnyObject = msg_send![badge, layer];
-    let (mark, _) = new_mark(badge_size, Mark::Check);
-    let _: () = msg_send![badge_layer, addSublayer: mark];
-    let _: () = msg_send![badge, setAutoresizingMask: CENTERED];
-    add_subview(view, badge);
-
-    let caption = new_label(
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP_W, CHIP_CAPTION)),
-        9.0,
-        0.0,
-        true,
-    );
-    let _: () = msg_send![caption, setAlignment: 2isize]; // NSTextAlignmentCenter (AppKit; NSInteger)
-    let _: () = msg_send![caption, setAutoresizingMask: 1u64 | 4 | 32];
-    let _: () = msg_send![view, addSubview: caption];
+        );
+        let _: () = msg_send![badge, setWantsLayer: true];
+        let badge_layer: *mut AnyObject = msg_send![badge, layer];
+        let (mark, _) = new_mark(CHIP_BADGE, Mark::Check);
+        let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
+        let white: *mut CGColor = msg_send![white, CGColor];
+        let _: () = msg_send![mark, setBorderWidth: CHIP_BADGE_RING];
+        let _: () = msg_send![mark, setBorderColor: white];
+        let _: () = msg_send![badge_layer, addSublayer: mark];
+        let _: () = msg_send![badge, setAutoresizingMask: CENTERED];
+        add_subview(view, badge);
+    }
 
     let _: () = msg_send![view, setHidden: true];
     add_subview(parent, view);
     ChipView {
         view: view as usize,
         icon: icon as usize,
-        caption: caption as usize,
     }
 }
 
@@ -3176,10 +3124,24 @@ unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
     );
 }
 
-/// Where the view for `slot` is drawn now, in panel coordinates: its
-/// resting frame (with `back_cards` cards in the stack) plus its offset.
-fn view_frame(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
+/// Where the view for `slot` settles, in panel coordinates: its resting
+/// frame (with `back_cards` cards in the stack) plus its restack offset.
+/// Excludes the trail lag, so a restack starts from where the item would
+/// be without it.
+fn settle_frame(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
     panel.motion[slot.view()].frame(slot_frame(panel.card, slot, back_cards))
+}
+
+/// Where the view for `slot` is drawn now: its settle frame moved by the
+/// trail's lag.
+fn view_frame(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
+    let (dx, dy) = panel.trail_motion.offset(slot);
+    let settle = settle_frame(panel, slot, back_cards);
+    Area {
+        x: settle.x + dx,
+        y: settle.y + dy,
+        ..settle
+    }
 }
 
 /// Where each item of the stack is drawn now, front first, in panel
@@ -3193,20 +3155,22 @@ fn item_frames(panel: &Panel) -> Vec<Area> {
         .collect()
 }
 
+/// Where each item of the stack settles, front first, in panel coordinates.
+fn settle_frames(panel: &Panel) -> Vec<Area> {
+    let cards = back_cards(&panel.layout);
+    panel
+        .layout
+        .iter()
+        .map(|slot| settle_frame(panel, *slot, cards))
+        .collect()
+}
+
 /// The view that draws `slot`.
 fn card_view(panel: &Panel, slot: Slot) -> usize {
     match slot {
         Slot::Front => panel.front_view,
-        Slot::Card(depth) => panel.trail.cards[depth - 1].view,
-        Slot::Chip(row) => panel.trail.chips[row].view,
-    }
-}
-
-/// A panel-coordinate frame in the trail window's coordinates.
-fn to_trail(area: Area) -> Area {
-    Area {
-        x: area.x + TRAIL_PAD,
-        ..area
+        Slot::Card(depth) => panel.backs[depth - 1].view,
+        Slot::Chip(row) => panel.chips[row].view,
     }
 }
 
@@ -3214,21 +3178,15 @@ fn to_trail(area: Area) -> Area {
 unsafe fn apply_card_frames(panel: &mut Panel) {
     let cards = back_cards(&panel.layout);
     for slot in panel.layout.clone() {
-        let frame = view_frame(panel, slot, cards);
-        let placed = if slot == Slot::Front {
-            frame
-        } else {
-            to_trail(frame)
-        };
+        let placed = to_window(view_frame(panel, slot, cards));
         set_frame(card_view(panel, slot), placed);
         set_frame(panel.plates[slot.view()], placed);
     }
     let front = view_frame(panel, Slot::Front, cards);
     layout_front(panel, (front.w, front.h));
-    // The window shadows follow the items' outline once they are at rest.
-    if !panel.motion.iter().any(Motion::moving) {
+    // The window shadow follows the items' outline once they are at rest.
+    if !panel.motion.iter().any(Motion::moving) && !panel.trail_motion.moving() {
         let _: () = msg_send![panel.window as *mut AnyObject, invalidateShadow];
-        let _: () = msg_send![panel.trail.window as *mut AnyObject, invalidateShadow];
     }
 }
 
@@ -3252,7 +3210,7 @@ unsafe fn render_backs(panel: &mut Panel) {
         match *slot {
             Slot::Front => {}
             Slot::Card(depth) => {
-                let back = &panel.trail.cards[depth - 1];
+                let back = &panel.backs[depth - 1];
                 set_text(back.title, &card.data.title);
                 let _: () = msg_send![back.icon as *mut AnyObject, setImage: app_of(card.data.pid)];
                 let image = own_pixels(card.key, card.data.still.as_ref())
@@ -3260,14 +3218,14 @@ unsafe fn render_backs(panel: &mut Panel) {
                 let _: () = msg_send![back.image_view as *mut AnyObject, setImage: image];
             }
             Slot::Chip(row) => {
-                let chip = &panel.trail.chips[row];
-                set_text(chip.caption, &card.data.title);
+                let chip = &panel.chips[row];
+                let _: () = msg_send![chip.view as *mut AnyObject, setToolTip: ns_string(&card.data.title)];
                 let _: () = msg_send![chip.icon as *mut AnyObject, setImage: app_of(card.data.pid)];
             }
         }
     }
     for depth in 1..MAX_CARDS {
-        let back = &panel.trail.cards[depth - 1];
+        let back = &panel.backs[depth - 1];
         let slot = Slot::Card(depth);
         if !used[slot.view()] {
             let _: () = msg_send![
@@ -3278,8 +3236,8 @@ unsafe fn render_backs(panel: &mut Panel) {
     }
     for index in 1..VIEWS {
         let view = match index {
-            depth if depth < MAX_CARDS => panel.trail.cards[depth - 1].view,
-            row => panel.trail.chips[row - MAX_CARDS].view,
+            depth if depth < MAX_CARDS => panel.backs[depth - 1].view,
+            row => panel.chips[row - MAX_CARDS].view,
         };
         let _: () = msg_send![view as *mut AnyObject, setHidden: !used[index]];
         let _: () = msg_send![panel.plates[index] as *mut AnyObject, setHidden: !used[index]];
@@ -3287,18 +3245,6 @@ unsafe fn render_backs(panel: &mut Panel) {
             panel.motion[index] = Motion::default();
         }
     }
-}
-
-/// Move the trail window to follow the panel: the panel's frame widened
-/// for chips, offset by the trail's lag.
-unsafe fn sync_trail(panel: &Panel) {
-    let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
-    let trail = trail_frame(area_of(frame), panel.trail_motion.offset());
-    let _: () = msg_send![
-        panel.trail.window as *mut AnyObject,
-        setFrame: ns_rect(trail)
-        display: false
-    ];
 }
 
 /// Log the trail's lag once it has settled after a drag.
@@ -3347,15 +3293,19 @@ unsafe extern "C" fn tick_cb(ctx: *mut c_void) {
         with_state(|state| {
             let mut moving = false;
             for panel in state.panels.values_mut().chain(state.ending.iter_mut()) {
+                let mut stepped = false;
                 if panel.motion.iter().any(Motion::moving) {
                     for motion in &mut panel.motion {
                         moving |= motion.step(dt);
                     }
-                    apply_card_frames(panel);
+                    stepped = true;
                 }
                 if panel.trail_motion.moving() {
                     moving |= panel.trail_motion.step(dt);
-                    sync_trail(panel);
+                    stepped = true;
+                }
+                if stepped {
+                    apply_card_frames(panel);
                     report_trail(panel, now);
                 }
             }
@@ -3378,18 +3328,14 @@ unsafe extern "C" fn tick_cb(ctx: *mut c_void) {
 // needs to become key. Resizing sets the window frame outside the state
 // lock: AppKit calls `setFrameSize:` synchronously, which lays the cards out.
 
-/// The panel (live, or ended and playing its finale) whose panel or trail
-/// window is `window`, and whether it is the trail.
-fn panel_for(state: &mut State, window: usize) -> Option<(&mut Panel, bool)> {
+/// The panel (live, or ended and playing its finale) whose window is
+/// `window`.
+fn panel_for(state: &mut State, window: usize) -> Option<&mut Panel> {
     state
         .panels
         .values_mut()
         .chain(state.ending.iter_mut())
-        .find(|panel| panel.window == window || panel.trail.window == window)
-        .map(|panel| {
-            let trail = panel.trail.window == window;
-            (panel, trail)
-        })
+        .find(|panel| panel.window == window)
 }
 
 /// The panel (live or ending) with `id`.
@@ -3399,15 +3345,6 @@ fn panel_by_id(state: &mut State, id: i64) -> Option<&mut Panel> {
         .values_mut()
         .chain(state.ending.iter_mut())
         .find(|panel| panel.id == id)
-}
-
-/// A point in a panel's or trail's content view, in panel coordinates.
-fn panel_point((x, y): (f64, f64), in_trail: bool) -> (f64, f64) {
-    if in_trail {
-        (x - TRAIL_PAD, y)
-    } else {
-        (x, y)
-    }
 }
 
 /// An event's location in `view`'s coordinates.
@@ -3446,9 +3383,9 @@ extern "C" fn stack_hit_test(this: *mut AnyObject, _cmd: Sel, point: NSPoint) ->
         let local: NSPoint = msg_send![this, convertPoint: point fromView: superview];
         let window = window_of(this);
         let over_card = try_with_state(|state| {
-            panel_for(state, window).is_some_and(|(panel, in_trail)| {
-                let point = panel_point((local.x, local.y), in_trail);
-                item_at(point, &panel.layout, &item_frames(panel), in_trail).is_some()
+            panel_for(state, window).is_some_and(|panel| {
+                let point = panel_point((local.x, local.y));
+                item_at(point, &panel.layout, &item_frames(panel)).is_some()
             })
         });
         // Busy state (a re-entrant call): keep the press.
@@ -3468,15 +3405,14 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
         let max = visible_frame_of(window as *mut AnyObject)
             .map_or(MIN_CARD, |visible| max_card((visible.w, visible.h)));
         with_state(|state| {
-            let Some((panel, in_trail)) = panel_for(state, window) else {
+            let Some(panel) = panel_for(state, window) else {
                 return;
             };
             let (key, id) = (panel.key.clone(), panel.id);
-            // A drag moves the panel, whichever window was pressed.
             let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
-            let point = panel_point(point, in_trail);
+            let point = panel_point(point);
             let frames = item_frames(panel);
-            let item = item_at(point, &panel.layout, &frames, in_trail);
+            let item = item_at(point, &panel.layout, &frames);
             let edges = if item == Some(0) {
                 resize_edges(point, frames[0])
             } else {
@@ -3529,24 +3465,24 @@ extern "C" fn stack_mouse_dragged(_this: *mut AnyObject, _cmd: Sel, _event: *mut
             let origin = (gesture.start.x + delta.0, gesture.start.y + delta.1);
             let step = (origin.0 - gesture.origin.0, origin.1 - gesture.origin.1);
             gesture.origin = origin;
-            // The trail stays put on screen, then swings after the panel.
+            // The back items stay put on screen, then swing after the panel.
             panel.trail_motion.panel_dragged(step);
             let _: () = msg_send![
                 panel.window as *mut AnyObject,
                 setFrameOrigin: NSPoint::new(origin.0, origin.1)
             ];
-            sync_trail(panel);
+            apply_card_frames(panel);
             start_ticking();
             None
         })
         .flatten();
         if let Some((window, frame)) = resize {
             let _: () = msg_send![window as *mut AnyObject, setFrame: ns_rect(frame) display: true];
-            // The trail follows the resized panel at once (no lag).
+            // The back items follow the resized panel at once (no lag).
             with_state(|state| {
-                if let Some((panel, _)) = panel_for(state, window) {
+                if let Some(panel) = panel_for(state, window) {
                     panel.trail_motion.snap();
-                    sync_trail(panel);
+                    apply_card_frames(panel);
                 }
             });
         }
@@ -3584,9 +3520,9 @@ extern "C" fn stack_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut Any
         let window = window_of(this);
         let point = event_point(this, event);
         let edges = try_with_state(|state| {
-            panel_for(state, window).map(|(panel, _)| {
+            panel_for(state, window).map(|panel| {
                 resize_edges(
-                    point,
+                    panel_point(point),
                     view_frame(panel, Slot::Front, back_cards(&panel.layout)),
                 )
             })
@@ -3638,7 +3574,7 @@ extern "C" fn stack_set_frame_size(this: *mut AnyObject, _cmd: Sel, size: NSSize
 /// The panel window is now `size`: lay the cards out for the new front card
 /// and resize the live stream once the size settles.
 unsafe fn on_resized(state: &mut State, window: usize, size: (f64, f64)) {
-    let Some((panel, false)) = panel_for(state, window) else {
+    let Some(panel) = panel_for(state, window) else {
         return;
     };
     let key = panel.key.clone();
@@ -3707,31 +3643,6 @@ fn stack_view_class() -> &'static AnyClass {
                 sel!(setFrameSize:),
                 stack_set_frame_size as extern "C" fn(_, _, _),
             );
-        })
-    })
-}
-
-/// The trail window's content view: holds the back items and takes presses
-/// on them (a click raises, a drag moves the panel); clicks elsewhere pass
-/// through.
-fn trail_view_class() -> &'static AnyClass {
-    static CLASS: std::sync::OnceLock<&'static AnyClass> = std::sync::OnceLock::new();
-    CLASS.get_or_init(|| {
-        register_class("CuaPipTrail", class!(NSView), |builder| unsafe {
-            builder.add_method(
-                sel!(acceptsFirstMouse:),
-                accepts_first_mouse as extern "C" fn(_, _, _) -> _,
-            );
-            builder.add_method(
-                sel!(hitTest:),
-                stack_hit_test as extern "C" fn(_, _, _) -> _,
-            );
-            builder.add_method(sel!(mouseDown:), stack_mouse_down as extern "C" fn(_, _, _));
-            builder.add_method(
-                sel!(mouseDragged:),
-                stack_mouse_dragged as extern "C" fn(_, _, _),
-            );
-            builder.add_method(sel!(mouseUp:), stack_mouse_up as extern "C" fn(_, _, _));
         })
     })
 }
