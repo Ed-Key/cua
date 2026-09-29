@@ -8,9 +8,9 @@
 //!
 //! The finale shows the session's verified claims not yet shown as a
 //! checklist (latest status per label, the five most recent, oldest first;
-//! only a satisfied claim gets a check), or, with none, the windows it
-//! touched as a row of chips. Rows come in one by one, then the panel holds
-//! and fades.
+//! only a satisfied claim gets a check) under a "Verified n of m" line, or,
+//! with none, the windows it touched as a row of chips. Rows come in one by
+//! one, then the panel holds and fades.
 //!
 //! ## Event ordering
 //!
@@ -30,8 +30,10 @@
 //! | `end_session` | the session finishes (now) | none | as the idle timer, then the panel closes | the panel leaves the live set |
 //! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim by predicate, and each touched window a chip or checklist stood for by its action: app and event time, so it holds when the window resolves meanwhile); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades |
 //! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not owed news) shows the panel or plays a finale | the panel hides (an ending one closes) |
+//! | Cursor update (the overlay's render thread, once per rendered frame, carrying the cursor's animated screen point, the window its last action targeted, and whether its click pulse is on) | none | none | none | only the front card's cursor sprite, and only while the cursor's window is the displayed one (a raised back card, or a new target whose capture is pending, hides it): it moves to the point mapped into the well from the target window's last known frame, looked up for that window (a raised card's window has none until the poll finds it) (see `cursor`), is re-placed when that frame, the displayed target or the well changes, and hides while the cursor is off that window, disabled or faded, or the panel has no frame; the first update of each click pulse that lands in the well logs "PiP cursor" once |
 //!
-//! Everything here is pure (unit tested, one test per row).
+//! Everything here is pure (unit tested, one test per row); the cursor
+//! row's logic and test live in `cursor`.
 
 use std::collections::HashMap;
 use std::time::Duration;
@@ -47,14 +49,46 @@ pub(super) const CHIP_ROW: usize = 5;
 // (an older check of that label could then show again); raise it if agents
 // ever verify that many different things in one session.
 const CLAIM_MEMORY: usize = 256;
-/// Each row starts this long after the one above it.
-pub(super) const STAGGER: Duration = Duration::from_millis(80);
+/// Each row starts this long after the one above it: quick, but each row
+/// still lands on its own.
+pub(super) const STAGGER: Duration = Duration::from_millis(70);
 /// A row fades and slides in over this long; its mark follows.
 pub(super) const ROW_IN: Duration = Duration::from_millis(150);
 /// A mark draws (and pops) over this long.
-pub(super) const MARK_IN: Duration = Duration::from_millis(200);
+pub(super) const MARK_IN: Duration = Duration::from_millis(180);
 /// The finished state stays up this long once every row is in.
-pub(super) const HOLD: Duration = Duration::from_millis(2500);
+pub(super) const HOLD: Duration = Duration::from_millis(2000);
+/// Room a finale keeps from the well's top and bottom (and its sides, for
+/// chips).
+pub(super) const FINALE_PAD: f64 = 6.0;
+/// A checklist row (a capsule) and the gap between rows, at full size and
+/// at the smallest the finale shrinks them to before it hides rows.
+pub(super) const ROW_HEIGHT: f64 = 26.0;
+pub(super) const ROW_GAP: f64 = 4.0;
+pub(super) const ROW_HEIGHT_MIN: f64 = 20.0;
+pub(super) const ROW_GAP_MIN: f64 = 2.0;
+/// The "Verified n of m" line above the rows and the gap under it.
+pub(super) const CAPTION_LINE: f64 = 14.0;
+pub(super) const CAPTION_GAP: f64 = 6.0;
+/// The "+n more" line under the rows that fit.
+pub(super) const MORE_LINE: f64 = 16.0;
+/// Inset of the rows from the well's left edge, and of a row's content
+/// from its capsule.
+pub(super) const ROW_INSET: f64 = 14.0;
+pub(super) const ROW_PAD: f64 = 10.0;
+/// Size of a checklist mark.
+pub(super) const MARK_SIZE: f64 = 16.0;
+/// Where a row's label starts in its capsule: after the mark and a gap.
+pub(super) const LABEL_X: f64 = ROW_PAD + MARK_SIZE + 8.0;
+
+/// Width of a checklist capsule for a label `text_w` wide in a well
+/// `well_w` wide: mark, gap and text with the pads, but never wider than
+/// the well allows (the label then truncates with a tail ellipsis). The
+/// finale is laid out again when the well resizes, so a narrowed panel
+/// never clips a row.
+pub(super) fn row_width(text_w: f64, well_w: f64) -> f64 {
+    (LABEL_X + text_w + ROW_PAD).min((well_w - 2.0 * ROW_INSET).max(0.0))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Claim {
@@ -418,6 +452,18 @@ impl Finale {
         }
     }
 
+    /// The checklist's caption: "Verified n of m" (m rows, n satisfied);
+    /// `None` for chips.
+    pub(super) fn caption(&self) -> Option<String> {
+        match &self.rows {
+            Rows::Checklist(rows) => {
+                let satisfied = rows.iter().filter(|row| row.satisfied == Some(true)).count();
+                Some(format!("Verified {satisfied} of {}", rows.len()))
+            }
+            Rows::Chips(_) => None,
+        }
+    }
+
     /// One line per row, for logs: `satisfied: text area holds "hi"`,
     /// `finished: Notes`.
     pub(super) fn log_rows(&self) -> Vec<String> {
@@ -442,6 +488,63 @@ impl Finale {
                 .collect(),
         }
     }
+}
+
+/// How a checklist of `rows` rows fits a well `well_h` tall: at full size
+/// when it can, else with rows and gaps shrunk (down to `ROW_HEIGHT_MIN` /
+/// `ROW_GAP_MIN`), else with only the first `visible` rows and a "+n more"
+/// line counting the rest, so every result is shown or counted.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub(super) struct ChecklistFit {
+    pub(super) row_height: f64,
+    pub(super) gap: f64,
+    pub(super) visible: usize,
+    pub(super) hidden: usize,
+}
+
+impl ChecklistFit {
+    /// Height of the whole block: caption, the visible rows, the more line.
+    pub(super) fn height(&self) -> f64 {
+        let rows = self.visible as f64 * self.row_height
+            + (self.visible.saturating_sub(1)) as f64 * self.gap;
+        let more = if self.hidden > 0 { MORE_LINE } else { 0.0 };
+        CAPTION_LINE + CAPTION_GAP + rows + more
+    }
+}
+
+pub(super) fn checklist_fit(well_h: f64, rows: usize) -> ChecklistFit {
+    let available = (well_h - 2.0 * FINALE_PAD).max(0.0);
+    let fit = |row_height, gap, visible, hidden| ChecklistFit {
+        row_height,
+        gap,
+        visible,
+        hidden,
+    };
+    let full = fit(ROW_HEIGHT, ROW_GAP, rows, 0);
+    if full.height() <= available {
+        return full;
+    }
+    let room = available - CAPTION_LINE - CAPTION_GAP;
+    let need = rows as f64 * ROW_HEIGHT + rows.saturating_sub(1) as f64 * ROW_GAP;
+    let scale = (room / need).clamp(0.0, 1.0);
+    let row_height = (ROW_HEIGHT * scale).floor().max(ROW_HEIGHT_MIN);
+    let gap = (ROW_GAP * scale).floor().max(ROW_GAP_MIN);
+    let shrunk = fit(row_height, gap, rows, 0);
+    if shrunk.height() <= available {
+        return shrunk;
+    }
+    // Rows that fit above a "+n more" line (never all of them here).
+    let room = (room - MORE_LINE).max(0.0);
+    let visible = (((room + gap) / (row_height + gap)).floor() as usize).min(rows - 1);
+    fit(row_height, gap, visible, rows - visible)
+}
+
+/// Chips per row when `chips` wrap in a well `well_w` wide, `chip_w` each
+/// and `gap` apart (at least one per row), and how many rows that makes.
+pub(super) fn chip_grid(well_w: f64, chips: usize, chip_w: f64, gap: f64) -> (usize, usize) {
+    let room = (well_w - 2.0 * FINALE_PAD + gap).max(0.0);
+    let per_row = (((room) / (chip_w + gap)).floor() as usize).max(1);
+    (per_row, chips.div_ceil(per_row))
 }
 
 /// When row `index` of a finale starts to come in, and when its mark
@@ -913,6 +1016,12 @@ mod tests {
         let finale = verdicts.finale();
         assert_eq!(finale.kind(), "checklist");
         assert_eq!(finale.log_rows(), ["unsatisfied: text area holds \"hi\""]);
+        assert_eq!(finale.caption().as_deref(), Some("Verified 0 of 1"));
+        verdicts.verify(1, 10, 400, true, vec![claim("saved", Some(true))]);
+        assert_eq!(verdicts.finale().caption().as_deref(), Some("Verified 1 of 2"));
+        let mut chips = Verdicts::default();
+        chips.act(A, "Notes", 100);
+        assert_eq!(chips.finale().caption(), None);
     }
 
     // ── Row: end_session ─────────────────────────────────────────────────
@@ -1037,15 +1146,57 @@ mod tests {
     }
 
     #[test]
-    fn rows_come_in_80_ms_apart_and_the_panel_holds_before_fading() {
+    fn the_finale_fits_the_well_by_shrinking_rows_then_counting_the_rest() {
+        // The default well (320x200): five rows at full size.
+        let fit = checklist_fit(200.0, 5);
+        assert_eq!(fit, ChecklistFit { row_height: ROW_HEIGHT, gap: ROW_GAP, visible: 5, hidden: 0 });
+        assert!(fit.height() <= 200.0 - 2.0 * FINALE_PAD);
+        // The smallest well (228x144, from MIN_CARD 240x180): five rows
+        // shrink to the floor and all stay visible.
+        let fit = checklist_fit(144.0, 5);
+        assert_eq!(fit.visible, 5);
+        assert_eq!(fit.hidden, 0);
+        assert!(fit.row_height >= ROW_HEIGHT_MIN && fit.row_height < ROW_HEIGHT);
+        assert!(fit.height() <= 144.0 - 2.0 * FINALE_PAD, "{fit:?}");
+        // A well too short even for the floor: the rest is counted.
+        let fit = checklist_fit(100.0, 5);
+        assert_eq!((fit.visible, fit.hidden), (2, 3), "{fit:?}");
+        assert!(fit.height() <= 100.0 - 2.0 * FINALE_PAD, "{fit:?}");
+        assert_eq!(fit.visible + fit.hidden, 5, "every result shown or counted");
+        // One row always fits somewhere.
+        assert_eq!(checklist_fit(10.0, 1).visible + checklist_fit(10.0, 1).hidden, 1);
+        // Chips: five in one row at the default width, wrapped in two at
+        // the smallest.
+        assert_eq!(chip_grid(320.0, 5, 48.0, 12.0), (5, 1));
+        assert_eq!(chip_grid(228.0, 5, 48.0, 12.0), (3, 2));
+        assert_eq!(chip_grid(20.0, 2, 48.0, 12.0), (1, 2));
+    }
+
+    #[test]
+    fn a_narrowed_well_shrinks_each_row_to_fit_and_truncates_its_label() {
+        // A 500 pt row: its label is 500 minus the mark and pads.
+        let text_w = 500.0 - LABEL_X - ROW_PAD;
+        // Full width in a 600 pt well.
+        assert_eq!(row_width(text_w, 600.0), 500.0);
+        // Narrowed to 240: the capsule fits inside the well's insets, and
+        // the label gets less room than its text (a tail ellipsis).
+        let row_w = row_width(text_w, 240.0);
+        assert!(ROW_INSET + row_w <= 240.0 - ROW_INSET, "{row_w}");
+        assert!(row_w - LABEL_X - ROW_PAD < text_w);
+        // A well narrower than its insets: no negative width.
+        assert_eq!(row_width(text_w, 10.0), 0.0);
+    }
+
+    #[test]
+    fn rows_come_in_70_ms_apart_and_the_panel_holds_before_fading() {
         assert_eq!(row_timing(0), (Duration::ZERO, ROW_IN));
         assert_eq!(
             row_timing(3),
-            (Duration::from_millis(240), Duration::from_millis(390))
+            (Duration::from_millis(210), Duration::from_millis(360))
         );
-        // Five rows: last row in at 320 ms, its mark lands at 470 + 200 ms,
-        // then the 2.5 s hold.
-        assert_eq!(finale_duration(5), Duration::from_millis(3170));
+        // Five rows: last row in at 280 ms, its mark lands at 430 + 180 ms,
+        // then the 2 s hold: about 2.6 s in all.
+        assert_eq!(finale_duration(5), Duration::from_millis(2610));
         assert_eq!(finale_duration(0), HOLD);
     }
 
