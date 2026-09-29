@@ -1,5 +1,5 @@
-//! The all-agents overview: a frosted glass sheet centered on the screen
-//! under the pointer, one row per live session (client icon, session name,
+//! The all-agents overview: a frosted glass sheet centered on the active
+//! screen (the one with keyboard focus), one row per live session (client icon, session name,
 //! a dot in the session's color) with that session's windows as thumbnails
 //! (the front card's live or still picture, the back windows' stills,
 //! finished windows badged with a green check). Clicking a thumbnail brings
@@ -493,17 +493,7 @@ unsafe extern "C" fn log_menubar_cb(ctx: *mut c_void) {
     tracing::info!(target: "pip", x = at.x, y = at.y, w = at.w, h = at.h, "PiP menubar item at");
 }
 
-/// Height of the primary screen (AppKit's coordinate origin).
-unsafe fn primary_screen_height() -> f64 {
-    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-    let count: usize = msg_send![screens, count];
-    if count == 0 {
-        return 0.0;
-    }
-    let screen: *mut AnyObject = msg_send![screens, objectAtIndex: 0usize];
-    let frame: NSRect = msg_send![screen, frame];
-    frame.size.height
-}
+
 
 /// The koala mark as a template image at 18 pt with its 2x representation.
 unsafe fn menubar_image() -> *mut AnyObject {
@@ -690,37 +680,33 @@ unsafe fn snapshot(panels: &std::collections::HashMap<String, Panel>) -> (Vec<Gr
     groups.into_iter().unzip()
 }
 
-/// The visible frame of the screen under the pointer (else the main
-/// screen's), and the primary screen's height (for CoreGraphics coordinates
-/// in logs). `None` headless.
-unsafe fn screen_under_pointer() -> Option<(Area, f64)> {
-    let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
-    let count: usize = msg_send![screens, count];
-    let mut chosen: *mut AnyObject = std::ptr::null_mut();
-    let mut primary_h = 0.0;
-    for index in 0..count {
-        let screen: *mut AnyObject = msg_send![screens, objectAtIndex: index];
-        let frame: NSRect = msg_send![screen, frame];
-        if index == 0 {
-            primary_h = frame.size.height;
-        }
-        if contains(&area_of(frame), (mouse.x, mouse.y)) {
-            chosen = screen;
-        }
-    }
-    if chosen.is_null() {
-        chosen = msg_send![class!(NSScreen), mainScreen];
-    }
-    if chosen.is_null() {
+/// The visible frame of the active screen (`mainScreen`: the one with
+/// keyboard focus), and the primary screen's height (for CoreGraphics
+/// coordinates in logs). `None` headless. No walk of `[NSScreen screens]`:
+/// that array is Swift-bridged and its `count` is a signed NSInteger, which
+/// a debug build's message check rejects as NSUInteger.
+unsafe fn active_screen() -> Option<(Area, f64)> {
+    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+    if screen.is_null() {
         return None;
     }
-    let visible: NSRect = msg_send![chosen, visibleFrame];
-    Some((area_of(visible), primary_h))
+    let visible: NSRect = msg_send![screen, visibleFrame];
+    Some((area_of(visible), primary_screen_height()))
+}
+
+/// Height of the primary screen (AppKit's coordinate origin).
+unsafe fn primary_screen_height() -> f64 {
+    let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    let screen: *mut AnyObject = msg_send![screens, firstObject];
+    if screen.is_null() {
+        return 0.0;
+    }
+    let frame: NSRect = msg_send![screen, frame];
+    frame.size.height
 }
 
 unsafe fn open(state: &mut State, pictures: Vec<GroupPictures>, via: Via) {
-    let Some((visible, primary_h)) = screen_under_pointer() else {
+    let Some((visible, primary_h)) = active_screen() else {
         state.overview.model.close();
         return;
     };
@@ -778,7 +764,9 @@ unsafe fn log_tiles(overview: &Overview, window: (f64, f64), primary_h: f64) {
 }
 
 /// Re-read the panels while the sheet is up: rebuild the rows when their
-/// structure changed, refresh the pictures either way.
+/// structure changed, refresh the pictures either way, and look at the
+/// pointer (a pointer warped into place, as a tool's move does, sends no
+/// mouse-moved event; the panel's hover bar polls for the same reason).
 unsafe extern "C" fn poll_cb(ctx: *mut c_void) {
     let generation: u64 = *Box::from_raw(ctx as *mut u64);
     objc2::rc::autoreleasepool(|_| {
@@ -788,17 +776,35 @@ unsafe extern "C" fn poll_cb(ctx: *mut c_void) {
             }
             let (groups, pictures) = snapshot(&state.panels);
             let overview = &mut state.overview;
+            let frame: NSRect = msg_send![overview.window as *mut AnyObject, frame];
             if overview.model.update(groups) {
-                let frame: NSRect = msg_send![overview.window as *mut AnyObject, frame];
                 build(overview, (frame.size.width, frame.size.height), &pictures);
                 overview.hovered = None;
                 highlight(overview);
             } else {
                 refresh_pictures(overview, &pictures);
             }
+            let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+            hover(overview, (mouse.x - frame.origin.x, mouse.y - frame.origin.y));
             dispatch_to_main_after(POLL, generation, poll_cb);
         });
     });
+}
+
+/// Outline the thumbnail under `point` (host window coordinates), if that
+/// changed.
+unsafe fn hover(overview: &mut Overview, point: (f64, f64)) {
+    let Some(layout) = &overview.layout else {
+        return;
+    };
+    let hovered = match hit(layout, point) {
+        Hit::Tile(g, w) => Some((g, w)),
+        _ => None,
+    };
+    if hovered != overview.hovered {
+        overview.hovered = hovered;
+        highlight(overview);
+    }
 }
 
 /// (Re)build the sheet for the model's groups: throw the old glass away
@@ -1204,19 +1210,7 @@ extern "C" fn mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject)
 
 extern "C" fn mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
     let point = unsafe { event_point(this, event) };
-    with_state(|state| unsafe {
-        let Some(layout) = &state.overview.layout else {
-            return;
-        };
-        let hovered = match hit(layout, point) {
-            Hit::Tile(g, w) => Some((g, w)),
-            _ => None,
-        };
-        if hovered != state.overview.hovered {
-            state.overview.hovered = hovered;
-            highlight(&state.overview);
-        }
-    });
+    with_state(|state| unsafe { hover(&mut state.overview, point) });
 }
 
 extern "C" fn mouse_exited(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
