@@ -2976,7 +2976,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     add_tracking(bar);
     let bar_body = new_view(class!(NSView), NSRect::ZERO);
     let client_icon = new_icon_view(NSRect::ZERO);
-    let _: () = msg_send![client_icon, setContentTintColor: white_color()];
+    let icon_tint: *mut AnyObject = msg_send![class!(NSColor), labelColor];
+    let _: () = msg_send![client_icon, setContentTintColor: icon_tint];
     let dot = new_view(decor_view_class(), NSRect::ZERO);
     let dot_layer = host_layer(dot);
     let _: () = msg_send![dot_layer, setCornerRadius: stack::BAR_DOT / 2.0];
@@ -2986,6 +2987,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let target_icon = new_icon_view(NSRect::ZERO);
     let _: () = msg_send![target_icon, setHidden: true];
     let target_title = new_label(NSRect::ZERO, 12.0, 0.23, false);
+    on_glass(target_title, false);
     let (focus, focus_circle) = new_button(
         bar_body,
         "arrow.up.forward",
@@ -3162,6 +3164,7 @@ unsafe fn new_back_card(parent: *mut AnyObject, card: (f64, f64), depth: usize) 
         0.23, // NSFontWeightMedium
         false,
     );
+    on_glass(title, false);
     let _: () = msg_send![title, setAutoresizingMask: 10u64];
     let _: () = msg_send![body, addSubview: title];
 
@@ -4110,6 +4113,19 @@ unsafe fn new_label(frame: NSRect, size: f64, weight: f64, secondary: bool) -> *
     let _: () = msg_send![label, setTextColor: color];
     let _: () = msg_send![label, setShadow: text_shadow()];
     label
+}
+
+/// Text on frosted glass follows the appearance (dark on light glass,
+/// white on dark), like Control Center's labels, with no shadow: white
+/// with a shadow measured 1.06:1 against the light frost.
+unsafe fn on_glass(label: *mut AnyObject, secondary: bool) {
+    let color: *mut AnyObject = if secondary {
+        msg_send![class!(NSColor), secondaryLabelColor]
+    } else {
+        msg_send![class!(NSColor), labelColor]
+    };
+    let _: () = msg_send![label, setTextColor: color];
+    let _: () = msg_send![label, setShadow: std::ptr::null_mut::<AnyObject>()];
 }
 
 /// The soft shadow under white text on glass (autoreleased).
