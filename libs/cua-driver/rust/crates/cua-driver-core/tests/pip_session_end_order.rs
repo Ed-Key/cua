@@ -53,6 +53,11 @@ fn def(name: &str, read_only: bool) -> ToolDef {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn pip_events_of_a_call_reach_the_queue_before_its_session_end() {
+    // Hermetic: a host policy that denies these tools would stop them before
+    // they run. This binary has one test, so clearing the process env before
+    // the policy's first (cached) read is safe.
+    std::env::remove_var(cua_driver_core::policy::POLICY_FILE_ENV);
+    std::env::remove_var(cua_driver_core::policy::MANAGED_POLICY_FILE_ENV);
     pip_hook::set_pip_push_fn(|frame| log(format!("frame {}", frame.session_label.unwrap())));
     pip_hook::set_pip_verify_fn(|verification| {
         let label = verification.claims[0].label.clone();
