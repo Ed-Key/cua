@@ -8,17 +8,14 @@ use cua_driver_testkit::e2e::{
     OracleKind, Scope, Targeting,
 };
 use cua_driver_testkit::{Driver, McpDriver};
-use cursor_overlay::{BADGE_CURSOR_GAP, BADGE_HEIGHT, BADGE_MAX_WIDTH};
+use cursor_overlay::{default_anchor_for_tip, BADGE_CURSOR_GAP, BADGE_HEIGHT, BADGE_MAX_WIDTH};
 use image::RgbaImage;
 
 const CELL_ID: &str = "desktop-agent-cursor-showcase-px";
 const SESSION: &str = "Cursor showcase";
-// MoveTo offsets the artwork centre by a 16-point vector at 45 degrees so the
-// cursor tip lands on the requested coordinate. Each axis moves by 16/sqrt(2),
-// and the session badge follows that artwork centre.
-const CURSOR_ANCHOR_OFFSET_MAGNITUDE: f64 = 16.0;
-const CURSOR_ANCHOR_OFFSET_PER_AXIS: f64 =
-    CURSOR_ANCHOR_OFFSET_MAGNITUDE * std::f64::consts::FRAC_1_SQRT_2;
+// MoveTo offsets the artwork centre so the cursor tip lands on the requested
+// coordinate at the 45 degree end heading (`default_anchor_for_tip`), and
+// the session badge follows that artwork centre.
 const POINTER_ORACLE_RADIUS: f64 = 24.0;
 const BADGE_CURSOR_EXCLUSION: f64 = 34.0;
 
@@ -293,11 +290,12 @@ fn cursor_oracle_regions(
 ) -> CursorOracleRegions {
     let scale_x = f64::from(image_width) / logical_width;
     let scale_y = f64::from(image_height) / logical_height;
-    let anchor_x = (logical_x + CURSOR_ANCHOR_OFFSET_PER_AXIS) * scale_x;
-    let anchor_y = (logical_y + CURSOR_ANCHOR_OFFSET_PER_AXIS) * scale_y;
+    let (anchor_x, anchor_y) =
+        default_anchor_for_tip((logical_x, logical_y), std::f64::consts::FRAC_PI_4);
+    let (anchor_x, anchor_y) = (anchor_x * scale_x, anchor_y * scale_y);
 
-    // The production artwork is 42 points across. A 24-point radius includes
-    // its outline while remaining one logical point above the badge. Floor the
+    // The production artwork is 21 points across. A 24-point radius includes
+    // its outline and glow while remaining one logical point above the badge. Floor the
     // pointer bottom and ceil the badge top so fractional and unequal scales
     // cannot round the two regions onto the same pixel row.
     let pointer = PixelRect {

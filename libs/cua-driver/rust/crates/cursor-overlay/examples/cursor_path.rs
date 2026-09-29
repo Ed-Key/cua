@@ -33,8 +33,8 @@ fn glide(core: &mut RenderStateCore, x: f64, y: f64) -> Move {
         true,
         true,
     );
-    // The planner aims 16 pt past the click point along the end heading.
-    let (x1, y1) = (x + FRAC_PI_4.cos() * 16.0, y + FRAC_PI_4.sin() * 16.0);
+    // The planner aims at the anchor that puts the tip on the click point.
+    let (x1, y1) = cursor_overlay::default_anchor_for_tip((x, y), FRAC_PI_4);
     let dist = (x1 - x0).hypot(y1 - y0);
     let (mut dev, mut t, mut max_turn) = (0.0f64, 0.0, 0.0f64);
     let mut points = vec![(x0, y0)];

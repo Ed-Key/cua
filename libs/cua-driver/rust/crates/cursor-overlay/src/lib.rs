@@ -38,9 +38,10 @@ pub use session_badge::{
     MAX_SESSION_LABEL_CHARS,
 };
 pub use theme::{
-    session_fill_hex, session_fill_rgba, CursorAction, CursorVisualState, DeliveryModifier,
-    PlaybackKind, ReducedMotion, TargetModifier, DEFAULT_CURSOR_FILL, DEFAULT_THEME_ID,
-    DEFAULT_THEME_VERSION, THEME_PROFILE,
+    anchor_for_tip, default_anchor_for_tip, session_fill_hex, session_fill_rgba, CursorAction,
+    CursorVisualState, DeliveryModifier, PlaybackKind, ReducedMotion, TargetModifier,
+    ARROW_HEIGHT, DEFAULT_CURSOR_FILL, DEFAULT_THEME_ID, DEFAULT_THEME_VERSION, DISPLAY_SIZE,
+    THEME_PROFILE,
 };
 pub use theme_artifact::{
     decode_theme, embedded_default_theme, inspect_artifact, list_installed_themes,
@@ -386,15 +387,15 @@ pub enum OverlayCommand {
 /// Build the shared overlay command for one native pointer position.
 ///
 /// Native drag implementations report the actual event coordinate while the
-/// cursor artwork is centred 16 points down-right so its tip lands on that
-/// coordinate. Keeping this transform here prevents platform-specific drag
-/// loops from drifting apart.
+/// cursor artwork is anchored so its tip lands on that coordinate. Keeping
+/// this transform here prevents platform-specific drag loops from drifting
+/// apart.
 pub fn track_pointer_command(x: f64, y: f64) -> OverlayCommand {
-    const CLICK_OFFSET: f64 = 16.0;
     let heading = std::f64::consts::FRAC_PI_4;
+    let (x, y) = theme::default_anchor_for_tip((x, y), heading);
     OverlayCommand::SnapTo {
-        x: x + heading.cos() * CLICK_OFFSET,
-        y: y + heading.sin() * CLICK_OFFSET,
+        x,
+        y,
         heading_radians: Some(heading),
     }
 }
@@ -456,10 +457,12 @@ mod pointer_tracking_tests {
         else {
             panic!("pointer tracking must produce an anchored snap");
         };
-        // The artwork centre sits 16 points down-right of the tip at 45 degrees.
+        // At the neutral 45 degree heading the artwork centre sits right and
+        // below the tip by the hotspot's canvas offset (18, 34) scaled to
+        // points (21/128).
         assert_eq!(heading, std::f64::consts::FRAC_PI_4);
-        assert!((x - 131.313_708_498_984_76).abs() < 1e-9, "x = {x}");
-        assert!((y - 91.313_708_498_984_76).abs() < 1e-9, "y = {y}");
+        assert!((x - 122.953_125).abs() < 1e-9, "x = {x}");
+        assert!((y - 85.578_125).abs() < 1e-9, "y = {y}");
     }
 
     #[test]

@@ -8,8 +8,25 @@
 use super::{Area, Tag};
 
 /// The sprite's pixmap is this many points square, centered on the
-/// cursor's anchor: room for the arrow at any heading and its click pulse.
-pub(crate) const SPRITE_BOX: f64 = 96.0;
+/// arrow's tip: room for the arrow, its glow and its click cue at any
+/// heading (2.3 times the canvas's on-screen size; the tip is at most about
+/// 18 pt from the farthest glow pixel).
+pub(crate) const SPRITE_BOX: f64 = cursor_overlay::DISPLAY_SIZE as f64 * (96.0 / 42.0);
+
+/// The sprite never shrinks the arrow below this many points tall: the
+/// smallest size at which its fill, white outline and heading still read
+/// at a glance on the panel (the outline stays a device pixel wide at 2x).
+const MIN_SPRITE_ARROW: f64 = 10.0;
+
+/// How much the sprite shrinks for a well of `well` size showing the target
+/// window `window`: the preview's own scale (aspect-fit, as `cursor_in_well`
+/// maps points), so the cursor looks like the real one shrunk with the
+/// window, never enlarged past it, and floored so the arrow stays at least
+/// `MIN_SPRITE_ARROW` tall.
+pub(super) fn sprite_scale(window: Area, well: (f64, f64)) -> f64 {
+    let fit = (well.0 / window.w).min(well.1 / window.h);
+    fit.clamp(MIN_SPRITE_ARROW / f64::from(cursor_overlay::ARROW_HEIGHT), 1.0)
+}
 
 /// Where a screen point (CoreGraphics, top-left origin) inside the target
 /// window `window` lands in a well of `well` size that shows the window
@@ -36,13 +53,17 @@ pub(super) fn cursor_in_well(
 
 /// The sprite layer's frame in the well's coordinates (AppKit, bottom-left
 /// origin) for a cursor at `point` (well coordinates, top-left origin) in
-/// a well `well_h` tall: the `SPRITE_BOX` square centered on the point.
-pub(super) fn sprite_frame(point: (f64, f64), well_h: f64) -> Area {
+/// a well `well_h` tall: the `SPRITE_BOX` square, shrunk by `scale`,
+/// centered on the point. The sprite is drawn around the tip, so the layer
+/// stretching it to the frame shrinks the arrow about the tip, which stays
+/// on the point.
+pub(super) fn sprite_frame(point: (f64, f64), well_h: f64, scale: f64) -> Area {
+    let side = SPRITE_BOX * scale;
     Area {
-        x: point.0 - SPRITE_BOX / 2.0,
-        y: well_h - point.1 - SPRITE_BOX / 2.0,
-        w: SPRITE_BOX,
-        h: SPRITE_BOX,
+        x: point.0 - side / 2.0,
+        y: well_h - point.1 - side / 2.0,
+        w: side,
+        h: side,
     }
 }
 
@@ -81,7 +102,8 @@ pub(super) fn sprite_placement(
 ) -> Option<Area> {
     let window = window?;
     let point = point?;
-    cursor_in_well(window, point, well).map(|in_well| sprite_frame(in_well, well.1))
+    cursor_in_well(window, point, well)
+        .map(|in_well| sprite_frame(in_well, well.1, sprite_scale(window, well)))
 }
 
 /// The sprite's state between updates: whether the last update was a
@@ -152,7 +174,7 @@ mod tests {
 
     #[test]
     fn the_sprite_is_a_box_centered_on_the_point_in_appkit_coordinates() {
-        let frame = sprite_frame((160.0, 100.0), 200.0);
+        let frame = sprite_frame((160.0, 100.0), 200.0, 1.0);
         assert_eq!(
             frame,
             Area {
@@ -163,7 +185,63 @@ mod tests {
             }
         );
         // The well's top-left maps to the top-left of the AppKit frame.
-        assert_eq!(sprite_frame((0.0, 0.0), 200.0).y, 200.0 - SPRITE_BOX / 2.0);
+        assert_eq!(sprite_frame((0.0, 0.0), 200.0, 1.0).y, 200.0 - SPRITE_BOX / 2.0);
+        // Scaling shrinks the box about the point, so the tip stays put.
+        let half = sprite_frame((160.0, 100.0), 200.0, 0.5);
+        assert_eq!((half.w, half.h), (SPRITE_BOX / 2.0, SPRITE_BOX / 2.0));
+        assert_eq!(
+            (half.x + half.w / 2.0, half.y + half.h / 2.0),
+            (frame.x + frame.w / 2.0, frame.y + frame.h / 2.0)
+        );
+    }
+
+    #[test]
+    fn the_sprite_shrinks_with_the_preview_down_to_a_readable_arrow() {
+        let floor = MIN_SPRITE_ARROW / f64::from(cursor_overlay::ARROW_HEIGHT);
+        assert!(floor > 0.5 && floor < 1.0, "{floor}");
+        // 800x600 shown in 640x480: the preview is 0.8 scale, and so is the sprite.
+        assert!((sprite_scale(WINDOW, (640.0, 480.0)) - 0.8).abs() < 1e-9);
+        // In 320x200 the preview is a third: below the floor, so the arrow
+        // stays MIN_SPRITE_ARROW tall.
+        let scale = sprite_scale(WINDOW, (320.0, 200.0));
+        assert_eq!(scale, floor);
+        assert!((f64::from(cursor_overlay::ARROW_HEIGHT) * scale - MIN_SPRITE_ARROW).abs() < 1e-9);
+        // A well larger than the window never enlarges the cursor.
+        assert_eq!(sprite_scale(WINDOW, (1600.0, 1200.0)), 1.0);
+    }
+
+    #[test]
+    fn the_sprite_box_centered_on_the_tip_holds_every_action_at_any_heading() {
+        use cursor_overlay::{CursorAction, CursorVisualState};
+        let scale = 2.0;
+        let side = (SPRITE_BOX * scale).round() as u32;
+        let center = f64::from(side) / 2.0;
+        for heading in [0.0, 0.8, std::f64::consts::FRAC_PI_4, 2.4, 3.1, -0.7, -2.3] {
+            // The anchor that puts the tip on the pixmap's center.
+            let (ox, oy) = cursor_overlay::default_anchor_for_tip((0.0, 0.0), heading);
+            for action in CursorAction::ALL {
+                let mut visual = CursorVisualState::default();
+                visual.begin(action, None, None);
+                for t in [0.1, 0.4, 0.7] {
+                    visual.elapsed_secs = action.duration_secs() * t;
+                    let mut pm = tiny_skia::Pixmap::new(side, side).unwrap();
+                    cursor_overlay::theme::paint_default_theme(
+                        &mut pm,
+                        &visual,
+                        (center + ox * scale) as f32,
+                        (center + oy * scale) as f32,
+                        heading as f32,
+                        scale as f32,
+                        1.0,
+                    );
+                    let edge = pm.data().chunks_exact(4).enumerate().any(|(i, px)| {
+                        let (x, y) = (i as u32 % side, i as u32 / side);
+                        px[3] > 4 && (x == 0 || y == 0 || x == side - 1 || y == side - 1)
+                    });
+                    assert!(!edge, "{} at heading {heading}, t {t}: clipped", action.as_str());
+                }
+            }
+        }
     }
 
     #[test]
@@ -209,7 +287,7 @@ mod tests {
         assert_eq!(sprite_placement(Some(far), point, well), None);
         // The well resizes: the sprite is re-placed for the new scale.
         let bigger = sprite_placement(Some(WINDOW), point, (640.0, 400.0)).unwrap();
-        assert!((bigger.x + SPRITE_BOX / 2.0 - 2.0 * (before.x + SPRITE_BOX / 2.0)).abs() < 1e-9);
+        assert!((bigger.x + bigger.w / 2.0 - 2.0 * (before.x + before.w / 2.0)).abs() < 1e-9);
         // No window frame or no cursor point: hidden.
         assert_eq!(sprite_placement(None, point, well), None);
         assert_eq!(sprite_placement(Some(WINDOW), None, well), None);

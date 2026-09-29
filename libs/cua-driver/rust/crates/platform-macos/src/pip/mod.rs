@@ -1094,7 +1094,7 @@ pub(crate) fn cursor_sink_enabled() -> bool {
 }
 
 /// One rendered frame of a session's cursor, from the overlay's render
-/// thread: its animated screen point (CoreGraphics, top-left origin),
+/// thread: its tip's animated screen point (CoreGraphics, top-left origin),
 /// whether its click pulse is on, and its sprite (a retained `CGImage`,
 /// `SPRITE_BOX` points square centered on the point; `None` while the
 /// cursor is hidden, faded or off screen). Ownership of the image passes

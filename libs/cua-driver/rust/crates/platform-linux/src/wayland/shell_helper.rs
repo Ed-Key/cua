@@ -649,7 +649,7 @@ mod tests {
         assert!(EXTENSION_SOURCE.contains("SetCursorState"));
         assert!(EXTENSION_SOURCE.contains("SetCursorColor"));
         assert!(EXTENSION_SOURCE.contains("SetSessionLabel"));
-        assert!(EXTENSION_SOURCE.contains("const DISPLAY_SIZE = 42;"));
+        assert!(EXTENSION_SOURCE.contains("const DISPLAY_SIZE = 21;"));
         assert!(EXTENSION_SOURCE.contains("const GLOW_PADDING = 24;"));
         assert!(EXTENSION_SOURCE.contains("function drawCursorGlowShape"));
         assert!(EXTENSION_SOURCE.contains("function glowPath"));

@@ -1053,7 +1053,9 @@ fn render_loop(
 
 /// This frame of one cursor for its session's PiP panel: the same arrow
 /// the overlay just painted (theme, tint, pulse, heading, idle fade), on
-/// its own small pixmap centered on the anchor, without the session badge.
+/// its own small pixmap centered on the arrow's tip, without the session
+/// badge. Centering on the tip lets the panel shrink the sprite about the
+/// point the cursor is aiming at, so the tip stays on it at any size.
 fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::CursorUpdate {
     let core = &rs.core;
     let shown = core.cfg.enabled
@@ -1066,19 +1068,24 @@ fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::Cur
         && !core.pinned_target_off_workspace
         && core.pos.0 >= -100.0
         && core.idle_alpha >= 0.004;
+    let tip = core.tip();
     let image = shown
         .then(|| {
             let side = (crate::pip::SPRITE_BOX * scale).round().max(1.0) as u32;
             let mut pm = tiny_skia::Pixmap::new(side, side)?;
-            let anchor = (side as f32) / 2.0;
+            let center = f64::from(side) / 2.0;
+            let (anchor_x, anchor_y) = (
+                (center + (core.pos.0 - tip.0) * scale) as f32,
+                (center + (core.pos.1 - tip.1) * scale) as f32,
+            );
             let fill = cursor_overlay::session_fill_rgba(&core.cfg.cursor_id);
             match core.theme.as_deref() {
                 Some(theme) => cursor_overlay::paint_compiled_theme_with_tint(
                     &mut pm,
                     theme,
                     &core.visual,
-                    anchor,
-                    anchor,
+                    anchor_x,
+                    anchor_y,
                     core.heading as f32,
                     scale as f32,
                     core.idle_alpha as f32,
@@ -1087,8 +1094,8 @@ fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::Cur
                 None => cursor_overlay::theme::paint_default_theme_with_fill(
                     &mut pm,
                     &core.visual,
-                    anchor,
-                    anchor,
+                    anchor_x,
+                    anchor_y,
                     core.heading as f32,
                     scale as f32,
                     core.idle_alpha as f32,
@@ -1100,8 +1107,8 @@ fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::Cur
         .flatten();
     crate::pip::CursorUpdate {
         key: key.to_owned(),
-        x: core.pos.0,
-        y: core.pos.1,
+        x: tip.0,
+        y: tip.1,
         // The window the cursor's last action targeted (every window-scoped
         // tool pins the overlay above it).
         window: core.pinned_wid.and_then(|wid| u32::try_from(wid).ok()),

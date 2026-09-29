@@ -17,8 +17,43 @@ pub const DEFAULT_THEME_ID: &str = "cua.default";
 pub const DEFAULT_THEME_VERSION: &str = "2.0.0";
 pub const THEME_PROFILE: &str = "cua-driver-actions-v2";
 pub const CANVAS_SIZE: f32 = 128.0;
-pub const DISPLAY_SIZE: f32 = 42.0;
+/// Points the 128-unit canvas spans on screen. 21 pt puts the arrow (fill
+/// plus white outline, about 13 pt tall) at the size of Open Computer Use's
+/// cursor, whose 252 px reference image is drawn into a 126 pt window with
+/// a 13 pt arrow.
+pub const DISPLAY_SIZE: f32 = 21.0;
+/// Height in points of the arrow's fill-plus-outline silhouette at the
+/// neutral heading: 26 of the 42 pt the canvas used to span (measured by
+/// `arrow_height_matches_the_rendered_silhouette`).
+pub const ARROW_HEIGHT: f32 = DISPLAY_SIZE * (26.0 / 42.0);
 const FLOAT_DURATION_SECS: f32 = 4.0;
+
+/// Where the artwork's anchor (the canvas centre, `RenderStateCore::pos`)
+/// must sit so that the theme's `hotspot` (canvas units) lands on `tip`
+/// when the arrow points along `heading` (radians, y down). The painter
+/// rotates the canvas by `heading - π/4` about the anchor and scales it by
+/// `DISPLAY_SIZE / CANVAS_SIZE`, so the hotspot's offset from the centre
+/// is rotated and scaled the same way, then subtracted.
+pub fn anchor_for_tip(tip: (f64, f64), heading: f64, hotspot: [u16; 2]) -> (f64, f64) {
+    let scale = f64::from(DISPLAY_SIZE / CANVAS_SIZE);
+    let half = f64::from(CANVAS_SIZE / 2.0);
+    let (dx, dy) = (
+        (f64::from(hotspot[0]) - half) * scale,
+        (f64::from(hotspot[1]) - half) * scale,
+    );
+    let (sin, cos) = (heading - std::f64::consts::FRAC_PI_4).sin_cos();
+    (tip.0 - (dx * cos - dy * sin), tip.1 - (dx * sin + dy * cos))
+}
+
+/// `anchor_for_tip` with the embedded default theme's hotspot, for callers
+/// that have no theme in hand (drag tracking, examples).
+pub fn default_anchor_for_tip(tip: (f64, f64), heading: f64) -> (f64, f64) {
+    anchor_for_tip(
+        tip,
+        heading,
+        crate::theme_artifact::embedded_default_theme().hotspot,
+    )
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CursorVisualState {
@@ -193,8 +228,109 @@ mod tests {
     use super::*;
 
     #[test]
-    fn default_theme_uses_compact_42_point_footprint() {
-        assert_eq!(DISPLAY_SIZE, 42.0);
+    fn default_theme_uses_compact_21_point_footprint() {
+        assert_eq!(DISPLAY_SIZE, 21.0);
+    }
+
+    /// Bounds of the pixels `pred` accepts: (x0, y0, x1, y1), inclusive.
+    fn bounds(pixmap: &tiny_skia::Pixmap, pred: &dyn Fn(&[u8]) -> bool) -> (u32, u32, u32, u32) {
+        let mut result = (u32::MAX, u32::MAX, 0, 0);
+        for (index, pixel) in pixmap.data().chunks_exact(4).enumerate() {
+            if pred(pixel) {
+                let x = index as u32 % pixmap.width();
+                let y = index as u32 / pixmap.width();
+                result.0 = result.0.min(x);
+                result.1 = result.1.min(y);
+                result.2 = result.2.max(x);
+                result.3 = result.3.max(y);
+            }
+        }
+        result
+    }
+
+    /// Paint the still default cursor at `heading` with its anchor at
+    /// `anchor`, `scale` pixels per point.
+    fn paint_still(anchor: (f32, f32), heading: f32, scale: f32) -> tiny_skia::Pixmap {
+        let mut pixmap = tiny_skia::Pixmap::new(512, 512).unwrap();
+        let visual = CursorVisualState {
+            reduced_motion: ReducedMotion::On,
+            ..CursorVisualState::default()
+        };
+        paint_default_theme_with_fill(
+            &mut pixmap,
+            &visual,
+            anchor.0,
+            anchor.1,
+            heading,
+            scale,
+            1.0,
+            [12, 34, 56, 255],
+        );
+        pixmap
+    }
+
+    #[test]
+    fn arrow_height_matches_the_rendered_silhouette() {
+        let scale = 4.0;
+        let pixmap = paint_still((256.0, 256.0), std::f32::consts::FRAC_PI_4, scale);
+        let ink = bounds(&pixmap, &|pixel| pixel[3] >= 250);
+        let height = (ink.3 - ink.1 + 1) as f32 / scale;
+        assert!(
+            (height - ARROW_HEIGHT).abs() <= 1.0,
+            "silhouette is {height} pt tall, ARROW_HEIGHT is {ARROW_HEIGHT}"
+        );
+    }
+
+    #[test]
+    fn the_hotspot_lands_on_the_target_at_any_heading() {
+        use std::f64::consts::PI;
+        // Points, painted at `scale` pixels per point.
+        let scale = 4.0f64;
+        let target = (64.0, 64.0);
+        for heading in [PI / 4.0, 0.0, PI / 2.0, 3.0 * PI / 4.0, PI, -PI / 4.0, -2.0] {
+            let anchor = default_anchor_for_tip(target, heading);
+            let pixmap = paint_still(
+                ((anchor.0 * scale) as f32, (anchor.1 * scale) as f32),
+                heading as f32,
+                scale as f32,
+            );
+            // The tip is the outlined pixels farthest along the arrow's axis,
+            // which points back along the heading: the rounded end's extreme
+            // row is a run of pixels, so average the ones within half a
+            // point of the extreme.
+            let (dx, dy) = ((heading + PI).cos(), (heading + PI).sin());
+            let mut ink = Vec::new();
+            for (index, pixel) in pixmap.data().chunks_exact(4).enumerate() {
+                if pixel[3] >= 250 {
+                    let x = f64::from(index as u32 % pixmap.width()) / scale;
+                    let y = f64::from(index as u32 / pixmap.width()) / scale;
+                    ink.push(((x - anchor.0) * dx + (y - anchor.1) * dy, x, y));
+                }
+            }
+            let farthest = ink.iter().map(|p| p.0).fold(f64::MIN, f64::max);
+            let end: Vec<_> = ink.iter().filter(|p| p.0 >= farthest - 0.5).collect();
+            let tip = (
+                end.iter().map(|p| p.1).sum::<f64>() / end.len() as f64,
+                end.iter().map(|p| p.2).sum::<f64>() / end.len() as f64,
+            );
+            let gap = ((tip.0 - target.0).powi(2) + (tip.1 - target.1).powi(2)).sqrt();
+            assert!(gap <= 1.0, "heading {heading}: tip is {gap:.2} pt from the target");
+        }
+    }
+
+    #[test]
+    fn anchor_offset_scales_with_the_display_size_and_rotates_with_the_heading() {
+        // The neutral heading is π/4: no rotation, so the offset is the
+        // hotspot's canvas offset scaled to points.
+        let hotspot = [46, 30];
+        let s = f64::from(DISPLAY_SIZE / CANVAS_SIZE);
+        let (x, y) = anchor_for_tip((100.0, 100.0), std::f64::consts::FRAC_PI_4, hotspot);
+        assert!((x - (100.0 + 18.0 * s)).abs() < 1e-9 && (y - (100.0 + 34.0 * s)).abs() < 1e-9);
+        // A quarter turn swaps the axes.
+        let (x, y) = anchor_for_tip((100.0, 100.0), 3.0 * std::f64::consts::FRAC_PI_4, hotspot);
+        assert!((x - (100.0 - 34.0 * s)).abs() < 1e-9 && (y - (100.0 + 18.0 * s)).abs() < 1e-9);
+        // The canvas centre is its own hotspot.
+        assert_eq!(anchor_for_tip((7.0, 9.0), 1.3, [64, 64]), (7.0, 9.0));
     }
 
     #[test]

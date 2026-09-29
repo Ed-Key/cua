@@ -629,7 +629,9 @@ def semantic_manifest() -> dict[str, Any]:
         "license": "MIT",
         "compatibility": {"profile": "cua-driver-actions-v2", "semantics": 2},
         "canvas": {"width": CANVAS, "height": CANVAS, "fps": FPS},
-        "hotspot": {"x": 55, "y": 30},
+        # The outer edge of the white outline at the arrow's apex: where the
+        # tip visibly lands, not the path's first vertex (55, 30).
+        "hotspot": {"x": 46, "y": 30},
         "actions": actions,
     }
 
