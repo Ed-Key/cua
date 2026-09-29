@@ -353,6 +353,11 @@ pub enum OverlayCommand {
         y: f64,
         heading_radians: Option<f64>,
     },
+    /// Snap the cursor so its tip lands on a native pointer sample at the
+    /// neutral 45 degree heading. The render state resolves the anchor from
+    /// the active theme's hotspot, as it does for `MoveTo`, so a drag sample
+    /// and a glide to the same point put the tip in the same place.
+    TrackPointer { x: f64, y: f64 },
     /// Start the click-press visual.
     ClickPulse { x: f64, y: f64 },
     /// Toggle the held-button visual state.
@@ -386,18 +391,12 @@ pub enum OverlayCommand {
 
 /// Build the shared overlay command for one native pointer position.
 ///
-/// Native drag implementations report the actual event coordinate while the
-/// cursor artwork is anchored so its tip lands on that coordinate. Keeping
-/// this transform here prevents platform-specific drag loops from drifting
-/// apart.
+/// Native drag implementations report the actual event coordinate; the
+/// render state anchors the artwork so its tip lands on that coordinate
+/// (`OverlayCommand::TrackPointer`). Keeping this here prevents
+/// platform-specific drag loops from drifting apart.
 pub fn track_pointer_command(x: f64, y: f64) -> OverlayCommand {
-    let heading = std::f64::consts::FRAC_PI_4;
-    let (x, y) = theme::default_anchor_for_tip((x, y), heading);
-    OverlayCommand::SnapTo {
-        x,
-        y,
-        heading_radians: Some(heading),
-    }
+    OverlayCommand::TrackPointer { x, y }
 }
 
 /// Balance one cursor's visual press even if its action future is dropped.
@@ -449,18 +448,13 @@ mod pointer_tracking_tests {
 
     #[test]
     fn tracked_artwork_keeps_its_tip_on_the_native_pointer() {
-        let OverlayCommand::SnapTo {
-            x,
-            y,
-            heading_radians: Some(heading),
-        } = track_pointer_command(120.0, 80.0)
-        else {
-            panic!("pointer tracking must produce an anchored snap");
-        };
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.apply_command_base(track_pointer_command(120.0, 80.0), false, false);
         // At the neutral 45 degree heading the artwork centre sits right and
-        // below the tip by the hotspot's canvas offset (18, 34) scaled to
-        // points (21/128).
-        assert_eq!(heading, std::f64::consts::FRAC_PI_4);
+        // below the tip by the default hotspot's canvas offset (18, 34)
+        // scaled to points (21/128).
+        assert_eq!(core.heading, std::f64::consts::FRAC_PI_4);
+        let (x, y) = core.pos;
         assert!((x - 122.953_125).abs() < 1e-9, "x = {x}");
         assert!((y - 85.578_125).abs() < 1e-9, "y = {y}");
     }

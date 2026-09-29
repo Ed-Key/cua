@@ -107,12 +107,15 @@ impl RenderStateCore {
     /// The anchor (`pos`) that puts the current theme's hotspot on `tip` at
     /// `heading`; see `theme::anchor_for_tip`.
     pub fn anchor_for_tip(&self, tip: (f64, f64), heading: f64) -> (f64, f64) {
-        let hotspot = self
-            .theme
+        crate::theme::anchor_for_tip(tip, heading, self.hotspot())
+    }
+
+    /// The active theme's hotspot (canvas units), or the embedded default's.
+    pub fn hotspot(&self) -> [u16; 2] {
+        self.theme
             .as_deref()
             .map(|theme| theme.hotspot)
-            .unwrap_or_else(|| crate::embedded_default_theme().hotspot);
-        crate::theme::anchor_for_tip(tip, heading, hotspot)
+            .unwrap_or_else(|| crate::embedded_default_theme().hotspot)
     }
 
     /// Where the artwork's tip is now: the inverse of `anchor_for_tip` at
@@ -697,6 +700,19 @@ impl RenderStateCore {
                     self.reveal_session_badge();
                 }
                 true
+            }
+            OverlayCommand::TrackPointer { x, y } => {
+                let heading = std::f64::consts::FRAC_PI_4;
+                let (x, y) = self.anchor_for_tip((x, y), heading);
+                self.apply_command_base(
+                    OverlayCommand::SnapTo {
+                        x,
+                        y,
+                        heading_radians: Some(heading),
+                    },
+                    move_to_snap_sentinel,
+                    click_pulse_sentinel_only,
+                )
             }
             OverlayCommand::SnapTo {
                 x,
@@ -1487,6 +1503,45 @@ mod backing_scale_tests {
             core.pos = core.anchor_for_tip((300.0, 200.0), heading);
             let (x, y) = core.tip();
             assert!((x - 300.0).abs() < 1e-9 && (y - 200.0).abs() < 1e-9, "{heading}: {x},{y}");
+        }
+    }
+
+    #[test]
+    fn a_drag_sample_at_the_glide_target_keeps_the_tip_fixed_for_any_hotspot() {
+        use std::sync::Arc;
+        for hotspot in [[64, 64], [10, 100], [46, 30]] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            core.motion.idle_hide_ms = 0.0;
+            let mut theme = (*crate::embedded_default_theme()).clone();
+            theme.hotspot = hotspot;
+            core.theme = Some(Arc::new(theme));
+            core.pos = (400.0, 300.0);
+            core.apply_command_base(
+                OverlayCommand::MoveTo {
+                    x: 100.0,
+                    y: 100.0,
+                    end_heading_radians: std::f64::consts::FRAC_PI_4,
+                },
+                true,
+                true,
+            );
+            for _ in 0..4800 {
+                core.tick_motion(1.0 / 240.0);
+                if core.path.is_none() && core.spring.is_none() {
+                    break;
+                }
+            }
+            let glided = core.tip();
+            assert!(
+                (glided.0 - 100.0).abs() < 1e-6 && (glided.1 - 100.0).abs() < 1e-6,
+                "{hotspot:?}: MoveTo left the tip at {glided:?}"
+            );
+            core.apply_command_base(crate::track_pointer_command(100.0, 100.0), true, true);
+            let tracked = core.tip();
+            assert!(
+                (tracked.0 - 100.0).abs() < 1e-9 && (tracked.1 - 100.0).abs() < 1e-9,
+                "{hotspot:?}: the drag sample moved the tip to {tracked:?}"
+            );
         }
     }
 
