@@ -98,6 +98,18 @@ pub(crate) fn all_windows_any_layer() -> Vec<WindowInfo> {
     enumerate_windows(kCGWindowListExcludeDesktopElements, LayerFilter::AnyLayer).windows
 }
 
+/// On-screen windows on every layer that WindowServer composites with a
+/// non-zero alpha, front to back. Only on-screen windows of the current
+/// Space(s) are listed. Used by the PiP preview to decide whether a window
+/// is fully visible to the user.
+pub(crate) fn composited_windows() -> Vec<WindowInfo> {
+    enumerate_windows(
+        kCGWindowListOptionOnScreenOnly | kCGWindowListExcludeDesktopElements,
+        LayerFilter::Composited,
+    )
+    .windows
+}
+
 /// Which CGWindow layers an enumeration admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerFilter {
@@ -105,6 +117,8 @@ enum LayerFilter {
     ZeroOnly,
     /// Every layer, accessory windows included.
     AnyLayer,
+    /// Every layer, minus fully transparent (alpha 0) windows.
+    Composited,
 }
 
 fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
@@ -200,6 +214,9 @@ fn enumerate_windows(options: u32, layers: LayerFilter) -> WindowEnumeration {
 
         // Only include layer-0 windows, unless the caller asked for every layer.
         if layer != 0 && layers == LayerFilter::ZeroOnly {
+            continue;
+        }
+        if layers == LayerFilter::Composited && get_bounds_num(&dict, "kCGWindowAlpha") <= 0.0 {
             continue;
         }
 

@@ -36,19 +36,31 @@
 //!
 //! ## Lifecycle
 //!
-//! - A session's first frame creates its panel, cascading down from the
-//!   top-right corner of the main screen's visible frame so two agents'
-//!   panels do not overlap. A panel the user dragged keeps its place, and an
-//!   ended session's last position is remembered while the daemon runs.
+//! - A session's first frame creates its panel at the bottom-right corner of
+//!   the main screen's visible frame (above the Dock, clear of notification
+//!   banners); later panels stack upward, then wrap to a new column on the
+//!   left, so two agents' panels do not overlap. A panel the user dragged
+//!   keeps its place, and an ended session's last position is remembered
+//!   while the daemon runs.
 //! - 8 s without a new frame for that session: fade out (0.25 s), then
 //!   `orderOut`. The next frame fades it back in.
+//! - While the session's target window is fully visible to the user (see
+//!   `visibility`), the panel stays hidden; it returns when the window is
+//!   covered, moves off screen or to another Space. Every frame carries a
+//!   fresh answer, and a `cua-pip-visibility` thread re-checks active
+//!   sessions every 500 ms between frames.
 //! - The header's close button hides the panel until the session's next
 //!   frame; the focus button brings the target window forward through the
 //!   same code path as the `bring_to_front` tool.
 //! - Session end: fade out, close, release.
 //!
-//! The screenshot is a single `NSImageView`; step 1b swaps it for a live
-//! ScreenCaptureKit layer in the same frame.
+//! ## Live mirror
+//!
+//! While a panel is shown, a ScreenCaptureKit stream of its target window
+//! (see `live`) draws into a layer over the screenshot well. Stills keep
+//! arriving underneath: when no stream can run (no permission, window
+//! gone) or it stops, the layer clears and the still (or "Preview
+//! unavailable") shows through.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
@@ -59,6 +71,11 @@ use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
 use pip_preview::{PipBackend, PipConfig, PipFrame};
+
+mod live;
+mod visibility;
+
+use live::{Event, Request, StreamStep, Streams};
 
 // ── CGColor objc2 encoding shim ────────────────────────────────────────────
 //
@@ -90,10 +107,13 @@ const PAD: f64 = 8.0;
 const EDGE_INSET: f64 = 16.0;
 /// Gap between stacked panels.
 const STACK_GAP: f64 = 10.0;
+/// How often active sessions re-check whether their window is fully visible.
+const VISIBILITY_POLL: Duration = Duration::from_millis(500);
 
 // ── Pure placement / timing decisions (unit tested) ───────────────────────
 
-/// Bottom-left-origin rectangle in AppKit screen points.
+/// Rectangle in screen points (AppKit bottom-left origin for placement,
+/// CoreGraphics top-left origin for window visibility).
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Area {
     x: f64,
@@ -102,41 +122,41 @@ struct Area {
     h: f64,
 }
 
-/// Bottom-left origin for the panel in cascade `slot`. Slot 0's top-right
-/// corner sits at `top_right`; later slots stack downward, and a full column
-/// wraps to a new column on the left. `visible_bottom` bounds a column.
-fn cascade_origin(
-    top_right: (f64, f64),
-    visible_bottom: f64,
+/// Bottom-left origin for the panel in stacking `slot`. Slot 0's
+/// bottom-right corner sits at `bottom_right`; later slots stack upward, and
+/// a full column wraps to a new column on the left. `visible_top` bounds a
+/// column.
+fn stack_origin(
+    bottom_right: (f64, f64),
+    visible_top: f64,
     size: (f64, f64),
     slot: usize,
 ) -> (f64, f64) {
     let (w, h) = size;
     let step = h + STACK_GAP;
-    let room = top_right.1 - visible_bottom - EDGE_INSET + STACK_GAP;
+    let room = visible_top - EDGE_INSET - bottom_right.1 + STACK_GAP;
     let per_column = ((room / step).floor() as usize).max(1);
     let (column, row) = (slot / per_column, slot % per_column);
     (
-        top_right.0 - w - column as f64 * (w + STACK_GAP),
-        top_right.1 - h - row as f64 * step,
+        bottom_right.0 - w - column as f64 * (w + STACK_GAP),
+        bottom_right.1 + row as f64 * step,
     )
 }
 
-/// Top-right corner of slot 0: the visible frame's top-right inset by
-/// `EDGE_INSET`, or, when `--experimental-pip-geometry WxH+X+Y` gave a
-/// position, the panel whose top-left is at X,Y (top-left screen origin).
-fn first_slot_top_right(
+/// Bottom-right corner of slot 0: the visible frame's bottom-right (above
+/// the Dock) inset by `EDGE_INSET`, or, when `--experimental-pip-geometry
+/// WxH+X+Y` gave a position, the panel whose top-left is at X,Y (top-left
+/// screen origin).
+fn first_slot_bottom_right(
     screen: Area,
     visible: Area,
-    width: f64,
+    size: (f64, f64),
     anchor: Option<(i32, i32)>,
 ) -> (f64, f64) {
+    let (w, h) = size;
     match anchor {
-        Some((x, y)) => (screen.x + x as f64 + width, screen.y + screen.h - y as f64),
-        None => (
-            visible.x + visible.w - EDGE_INSET,
-            visible.y + visible.h - EDGE_INSET,
-        ),
+        Some((x, y)) => (screen.x + x as f64 + w, screen.y + screen.h - y as f64 - h),
+        None => (visible.x + visible.w - EDGE_INSET, visible.y + EDGE_INSET),
     }
 }
 
@@ -149,6 +169,12 @@ fn free_slot(used: impl IntoIterator<Item = usize>) -> usize {
 /// Whether a panel whose last frame arrived at `last_frame` should fade out.
 fn idle_hide_due(last_frame: Instant, now: Instant) -> bool {
     now.saturating_duration_since(last_frame) >= IDLE_HIDE_AFTER
+}
+
+/// A panel shows while its session is active, the user has not closed it
+/// since the last frame, and the user cannot already see the window itself.
+fn panel_should_show(active: bool, dismissed: bool, target_fully_visible: bool) -> bool {
+    active && !dismissed && !target_fully_visible
 }
 
 /// A captured frame is applied only if its session is still in the epoch
@@ -209,6 +235,16 @@ struct Panel {
     id: i64,
     window: usize,
     image_view: usize,
+    /// Layer-hosting view over the image well that shows live frames.
+    live_view: usize,
+    live_layer: usize,
+    /// The live frame on screen, held so ScreenCaptureKit does not recycle
+    /// its IOSurface while the layer shows it. `None` shows the still.
+    live_frame: Option<screencapturekit::CVPixelBuffer>,
+    /// Target the panel last asked a stream for (running or failed).
+    stream: Option<Target>,
+    /// Generation of that request; live events from any other are stale.
+    stream_generation: u64,
     /// "Preview unavailable", centered over the image well.
     placeholder: usize,
     status: usize,
@@ -219,6 +255,10 @@ struct Panel {
     slot: usize,
     last_frame: Instant,
     shown: bool,
+    /// Closed with the x button since the last frame.
+    dismissed: bool,
+    /// The target window is fully visible to the user.
+    target_visible: bool,
     target: (Option<i32>, Option<u32>),
     client: Option<ClientIdentity>,
 }
@@ -233,6 +273,8 @@ struct State {
     remembered: HashMap<String, (f64, f64)>,
     next_id: i64,
     worker: Arc<CaptureWorker>,
+    streams: Arc<Streams>,
+    next_stream_generation: u64,
 }
 
 static STATE: Mutex<Option<State>> = Mutex::new(None);
@@ -378,6 +420,8 @@ struct CaptureWorker {
     /// Targets with a capture still running, including ones that timed out.
     /// A stuck target gets no second capture thread until the first returns.
     in_flight: Arc<Mutex<HashSet<Target>>>,
+    /// Each live session's latest target and when its last frame was pushed.
+    active: Mutex<HashMap<String, (Target, Instant)>>,
 }
 
 impl CaptureWorker {
@@ -393,6 +437,7 @@ impl CaptureWorker {
             capture,
             timeout,
             in_flight: Arc::new(Mutex::new(HashSet::new())),
+            active: Mutex::new(HashMap::new()),
         });
         let looping = worker.clone();
         std::thread::Builder::new()
@@ -407,6 +452,8 @@ impl CaptureWorker {
 
     /// Enqueue only; never captures, never blocks on a capture.
     fn push(&self, frame: PipFrame) {
+        let target = (frame.target_pid, frame.target_window_id);
+        lock(&self.active).insert(frame.session_key.clone(), (target, Instant::now()));
         let epoch = lock(&self.epochs).stamp(&frame.session_key);
         lock(&self.queue).push(frame.session_key.clone(), (frame, epoch));
         self.ready.notify_one();
@@ -417,6 +464,17 @@ impl CaptureWorker {
     fn forget(&self, session_key: &str) {
         lock(&self.epochs).end(session_key);
         lock(&self.queue).remove(session_key);
+        lock(&self.active).remove(session_key);
+    }
+
+    /// Sessions that pushed a frame within the idle window, with their
+    /// latest target.
+    fn active_targets(&self, now: Instant) -> Vec<(String, Target)> {
+        lock(&self.active)
+            .iter()
+            .filter(|(_, (_, pushed))| !idle_hide_due(*pushed, now))
+            .map(|(key, (target, _))| (key.clone(), *target))
+            .collect()
     }
 
     fn is_current(&self, session_key: &str, epoch: u64) -> bool {
@@ -486,6 +544,15 @@ struct FrameUpdate {
     png: Option<Vec<u8>>,
     /// Window title (or owning app name), looked up on the capture worker.
     target_title: Option<String>,
+    /// Whether the user can already see the whole target window.
+    target_visible: bool,
+}
+
+/// A between-frames visibility re-check from the `cua-pip-visibility` thread.
+struct VisibilityUpdate {
+    key: String,
+    target: Target,
+    visible: bool,
 }
 
 impl PipBackend for MacosPipBackend {
@@ -503,9 +570,16 @@ impl PipBackend for MacosPipBackend {
     }
 }
 
-/// Runs on the capture worker: look up the window title (a synchronous
-/// WindowServer call) and hand the update to the main queue.
+/// Runs on the capture worker: look up the window title and visibility
+/// (synchronous WindowServer calls) and hand the update to the main queue.
 fn deliver_to_main(frame: PipFrame, epoch: u64, png: Option<Vec<u8>>) {
+    let (windows, displays) = visibility::snapshot();
+    let target_visible = visibility::target_fully_visible(
+        (frame.target_pid, frame.target_window_id),
+        &windows,
+        &displays,
+        std::process::id() as i32,
+    );
     let target_title = frame
         .target_window_id
         .and_then(crate::windows::window_info_by_id)
@@ -523,9 +597,40 @@ fn deliver_to_main(frame: PipFrame, epoch: u64, png: Option<Vec<u8>>) {
             epoch,
             png,
             target_title,
+            target_visible,
         },
         apply_frame_cb,
     );
+}
+
+/// Between frames, re-check every active session's target twice a second
+/// and send the answer to the main queue (which ignores unchanged ones).
+fn poll_visibility(worker: &CaptureWorker) {
+    let own_pid = std::process::id() as i32;
+    loop {
+        std::thread::sleep(VISIBILITY_POLL);
+        let active = worker.active_targets(Instant::now());
+        if active.is_empty() {
+            continue;
+        }
+        let (windows, displays) = visibility::snapshot();
+        for (key, target) in active {
+            let visible = visibility::target_fully_visible(target, &windows, &displays, own_pid);
+            dispatch_to_main(
+                VisibilityUpdate {
+                    key,
+                    target,
+                    visible,
+                },
+                visibility_cb,
+            );
+        }
+    }
+}
+
+/// Runs on ScreenCaptureKit's queue: hand the live event to the main queue.
+fn deliver_live(event: Event) {
+    dispatch_to_main(event, live_event_cb);
 }
 
 pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
@@ -537,6 +642,11 @@ pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         cua_driver_core::recording::screenshot_for(Some(u64::from(window_id)), None)
     });
     let worker = CaptureWorker::start(capture, CAPTURE_TIMEOUT, deliver_to_main)?;
+    let streams = Streams::start(deliver_live)?;
+    let polled = worker.clone();
+    std::thread::Builder::new()
+        .name("cua-pip-visibility".into())
+        .spawn(move || poll_visibility(&polled))?;
     // Panels are created lazily, on the main queue, by each session's first
     // frame; nothing native happens here.
     *STATE.lock().unwrap_or_else(|e| e.into_inner()) = Some(State {
@@ -546,6 +656,8 @@ pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         remembered: HashMap::new(),
         next_id: 1,
         worker: worker.clone(),
+        streams,
+        next_stream_generation: 0,
     });
     Ok(Box::new(MacosPipBackend { worker }))
 }
@@ -565,6 +677,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
         epoch,
         png,
         target_title,
+        target_visible,
     } = update;
     let key = frame.session_key.clone();
     // Checked here, on the main queue, so a delivery already queued behind
@@ -584,7 +697,6 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
 
     let new_target = (frame.target_pid, frame.target_window_id);
     let image_view = panel.image_view as *mut AnyObject;
-    let placeholder = panel.placeholder as *mut AnyObject;
     match image_after_capture(panel.target, new_target, png.is_some()) {
         ImageUpdate::Replace => {
             // `dataWithBytes:length:` copies, so the Vec can drop.
@@ -601,7 +713,6 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
                 msg_send![image, initWithData: data]
             };
             let _: () = msg_send![image_view, setImage: image];
-            let _: () = msg_send![placeholder, setHidden: !image.is_null()];
             if !image.is_null() {
                 let _: () = msg_send![image, release];
             }
@@ -609,9 +720,9 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
         ImageUpdate::Keep => {}
         ImageUpdate::Clear => {
             let _: () = msg_send![image_view, setImage: std::ptr::null_mut::<AnyObject>()];
-            let _: () = msg_send![placeholder, setHidden: false];
         }
     }
+    sync_placeholder(panel);
     set_text(panel.status, &frame.action_label);
 
     // Who: resolve the client icon + label only when the identity changes.
@@ -656,9 +767,10 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     });
     set_text(panel.target_title, title.as_deref().unwrap_or(""));
     panel.target = new_target;
-
+    panel.target_visible = target_visible;
+    panel.dismissed = false;
     panel.last_frame = Instant::now();
-    show(panel);
+    refresh(state, &key);
     // Small slack so the monotonic check in the callback is past the bar.
     dispatch_to_main_after(
         IDLE_HIDE_AFTER + Duration::from_millis(20),
@@ -669,13 +781,145 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
 
 unsafe extern "C" fn idle_check_cb(ctx: *mut c_void) {
     let key: String = *Box::from_raw(ctx as *mut String);
-    with_state(|state| {
-        if let Some(panel) = state.panels.get_mut(&key) {
-            if panel.shown && idle_hide_due(panel.last_frame, Instant::now()) {
-                hide(panel, &key);
+    with_state(|state| refresh(state, &key));
+}
+
+unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
+    let update: VisibilityUpdate = *Box::from_raw(ctx as *mut VisibilityUpdate);
+    objc2::rc::autoreleasepool(|_| {
+        with_state(|state| {
+            let Some(panel) = state.panels.get_mut(&update.key) else {
+                return;
+            };
+            // An answer about an older target, or no change: nothing to do.
+            if panel.target != update.target || panel.target_visible == update.visible {
+                return;
             }
-        }
+            panel.target_visible = update.visible;
+            refresh(state, &update.key);
+        });
     });
+}
+
+unsafe extern "C" fn live_event_cb(ctx: *mut c_void) {
+    let event: Event = *Box::from_raw(ctx as *mut Event);
+    objc2::rc::autoreleasepool(|_| {
+        with_state(|state| match event {
+            Event::Frame {
+                key,
+                generation,
+                slot,
+            } => {
+                let Some(panel) = state.panels.get_mut(&key) else {
+                    return;
+                };
+                if panel.stream_generation != generation {
+                    return;
+                }
+                if let Some(frame) = lock(&slot).take() {
+                    show_live(panel, frame);
+                }
+            }
+            Event::Ended { key, generation } => {
+                let Some(panel) = state.panels.get_mut(&key) else {
+                    return;
+                };
+                if panel.stream_generation != generation {
+                    return;
+                }
+                // Fall back to stills. `panel.stream` stays set, so this
+                // target is not retried until it changes or the panel
+                // hides and shows again; the Stop only releases the stream.
+                clear_live(panel);
+                state.streams.request(&key, Request::Stop);
+            }
+        });
+    });
+}
+
+/// Bring a panel's visibility and live stream in line with its state.
+unsafe fn refresh(state: &mut State, key: &str) {
+    let State {
+        panels,
+        streams,
+        next_stream_generation,
+        image_size,
+        ..
+    } = state;
+    let Some(panel) = panels.get_mut(key) else {
+        return;
+    };
+    let active = !idle_hide_due(panel.last_frame, Instant::now());
+    if panel_should_show(active, panel.dismissed, panel.target_visible) {
+        show(panel);
+    } else {
+        hide(panel, key);
+    }
+    match live::stream_step(panel.shown, panel.target, panel.stream) {
+        StreamStep::Start(target) => {
+            *next_stream_generation += 1;
+            panel.stream = Some(target);
+            panel.stream_generation = *next_stream_generation;
+            // Never show one window's live pixels as another's preview.
+            clear_live(panel);
+            streams.request(
+                key,
+                Request::Start {
+                    generation: panel.stream_generation,
+                    target,
+                    well: *image_size,
+                },
+            );
+        }
+        StreamStep::Stop => {
+            // The last live frame stays up while the panel fades out.
+            panel.stream = None;
+            panel.stream_generation = 0;
+            streams.request(key, Request::Stop);
+        }
+        StreamStep::Keep => {}
+    }
+}
+
+/// Put a live frame's IOSurface on the live layer.
+unsafe fn show_live(panel: &mut Panel, frame: screencapturekit::CVPixelBuffer) {
+    let Some(surface) = frame.io_surface() else {
+        return;
+    };
+    let _: () = msg_send![class!(CATransaction), begin];
+    // No implicit cross-fade between frames.
+    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
+    let _: () = msg_send![
+        panel.live_layer as *mut AnyObject,
+        setContents: surface.as_ptr() as *mut AnyObject
+    ];
+    let _: () = msg_send![class!(CATransaction), commit];
+    let _: () = msg_send![panel.live_view as *mut AnyObject, setHidden: false];
+    // Replacing the previous frame releases it back to ScreenCaptureKit.
+    panel.live_frame = Some(frame);
+    sync_placeholder(panel);
+}
+
+/// Remove the live frame so the still screenshot shows again.
+unsafe fn clear_live(panel: &mut Panel) {
+    let Some(frame) = panel.live_frame.take() else {
+        return;
+    };
+    let _: () = msg_send![panel.live_view as *mut AnyObject, setHidden: true];
+    let _: () = msg_send![
+        panel.live_layer as *mut AnyObject,
+        setContents: std::ptr::null_mut::<AnyObject>()
+    ];
+    drop(frame);
+    sync_placeholder(panel);
+}
+
+/// "Preview unavailable" shows only when neither a live frame nor a still
+/// is on screen.
+unsafe fn sync_placeholder(panel: &Panel) {
+    let image: *mut AnyObject = msg_send![panel.image_view as *mut AnyObject, image];
+    let covered = panel.live_frame.is_some() || !image.is_null();
+    let _: () = msg_send![panel.placeholder as *mut AnyObject, setHidden: covered];
 }
 
 /// Fade completion: order the panel out unless a frame re-showed it.
@@ -699,6 +943,7 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         let Some(panel) = state.panels.remove(&key) else {
             return;
         };
+        state.streams.request(&key, Request::Stop);
         let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
         state
             .remembered
@@ -714,7 +959,13 @@ unsafe extern "C" fn close_window_cb(ctx: *mut c_void) {
 }
 
 unsafe extern "C" fn shutdown_cb(_ctx: *mut c_void) {
-    let panels = with_state(|state| std::mem::take(&mut state.panels)).unwrap_or_default();
+    let panels = with_state(|state| {
+        for key in state.panels.keys() {
+            state.streams.request(key, Request::Stop);
+        }
+        std::mem::take(&mut state.panels)
+    })
+    .unwrap_or_default();
     for panel in panels.into_values() {
         close_window(panel.window as *mut AnyObject);
     }
@@ -793,9 +1044,18 @@ extern "C" fn on_focus(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject)
 extern "C" fn on_hide(_this: *mut AnyObject, _cmd: Sel, sender: *mut AnyObject) {
     let id: i64 = unsafe { msg_send![sender, tag] };
     with_state(|state| {
-        if let Some((key, panel)) = state.panels.iter_mut().find(|(_, panel)| panel.id == id) {
-            unsafe { hide(panel, key) };
-        }
+        let Some(key) = state
+            .panels
+            .iter_mut()
+            .find(|(_, panel)| panel.id == id)
+            .map(|(key, panel)| {
+                panel.dismissed = true;
+                key.clone()
+            })
+        else {
+            return;
+        };
+        unsafe { refresh(state, &key) };
     });
 }
 
@@ -888,9 +1148,14 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let height = HEADER_HEIGHT + 4.0 + image_h + 4.0 + STATUS_HEIGHT + 6.0;
     let slot = free_slot(state.panels.values().map(|panel| panel.slot));
     let origin = state.remembered.get(key).copied().unwrap_or_else(|| {
-        let top_right =
-            first_slot_top_right(area(screen_frame), area(visible_frame), width, state.anchor);
-        cascade_origin(top_right, visible_frame.origin.y, (width, height), slot)
+        let bottom_right = first_slot_bottom_right(
+            area(screen_frame),
+            area(visible_frame),
+            (width, height),
+            state.anchor,
+        );
+        let visible_top = visible_frame.origin.y + visible_frame.size.height;
+        stack_origin(bottom_right, visible_top, (width, height), slot)
     });
     let rect = NSRect::new(NSPoint::new(origin.0, origin.1), NSSize::new(width, height));
 
@@ -1022,7 +1287,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     }
     add_subview(body, header);
 
-    // Screenshot well. Kept as the single view a live layer replaces (1b).
+    // Screenshot well: the latest still.
     let image_view = new_view(
         class!(NSImageView),
         NSRect::new(
@@ -1045,6 +1310,25 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let well_cg: *mut CGColor = msg_send![well, CGColor];
     let _: () = msg_send![image_layer, setBackgroundColor: well_cg];
     add_subview(body, image_view);
+
+    // Live mirror over the well: a layer-hosting view whose layer shows
+    // ScreenCaptureKit frames, hidden until the first one arrives.
+    let live_view = new_view(
+        class!(NSView),
+        NSRect::new(
+            NSPoint::new(PAD, 6.0 + STATUS_HEIGHT + 4.0),
+            NSSize::new(image_w, image_h),
+        ),
+    );
+    let live_layer: *mut AnyObject = msg_send![class!(CALayer), layer];
+    let _: () = msg_send![live_layer, setContentsGravity: ns_string("resizeAspect")];
+    let _: () = msg_send![live_layer, setCornerRadius: 8.0_f64];
+    let _: () = msg_send![live_layer, setMasksToBounds: true];
+    // setLayer before setWantsLayer: the view hosts this layer as is.
+    let _: () = msg_send![live_view, setLayer: live_layer];
+    let _: () = msg_send![live_view, setWantsLayer: true];
+    let _: () = msg_send![live_view, setHidden: true];
+    add_subview(body, live_view);
 
     let placeholder = new_label(NSRect::ZERO, 11.0, 0.0, true);
     set_text(placeholder as usize, "Preview unavailable");
@@ -1079,6 +1363,11 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         id,
         window: window as usize,
         image_view: image_view as usize,
+        live_view: live_view as usize,
+        live_layer: live_layer as usize,
+        live_frame: None,
+        stream: None,
+        stream_generation: 0,
         placeholder: placeholder as usize,
         status: status as usize,
         client_icon: client_icon as usize,
@@ -1088,6 +1377,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         slot,
         last_frame: Instant::now(),
         shown: false,
+        dismissed: false,
+        target_visible: false,
         target: (None, None),
         client: None,
     })
@@ -1357,28 +1648,35 @@ mod tests {
     const SIZE: (f64, f64) = (336.0, 258.0);
 
     #[test]
-    fn first_panel_sits_in_the_top_right_corner() {
-        let top_right = first_slot_top_right(VISIBLE, VISIBLE, SIZE.0, None);
-        assert_eq!(top_right, (1424.0, 859.0));
+    fn first_panel_sits_in_the_bottom_right_corner() {
+        // A visible frame that starts above a 70pt Dock.
+        let visible = Area {
+            y: 70.0,
+            h: 805.0,
+            ..VISIBLE
+        };
+        let bottom_right = first_slot_bottom_right(VISIBLE, visible, SIZE, None);
+        assert_eq!(bottom_right, (1424.0, 86.0));
         assert_eq!(
-            cascade_origin(top_right, VISIBLE.y, SIZE, 0),
-            (1424.0 - 336.0, 859.0 - 258.0)
+            stack_origin(bottom_right, 875.0, SIZE, 0),
+            (1424.0 - 336.0, 86.0)
         );
     }
 
     #[test]
-    fn later_panels_stack_downward_without_overlap_then_wrap_left() {
-        let top_right = first_slot_top_right(VISIBLE, VISIBLE, SIZE.0, None);
+    fn later_panels_stack_upward_without_overlap_then_wrap_left() {
+        let bottom_right = first_slot_bottom_right(VISIBLE, VISIBLE, SIZE, None);
+        let top = VISIBLE.y + VISIBLE.h;
         let origins: Vec<_> = (0..4)
-            .map(|slot| cascade_origin(top_right, VISIBLE.y, SIZE, slot))
+            .map(|slot| stack_origin(bottom_right, top, SIZE, slot))
             .collect();
         // One column holds three 258pt panels in an 875pt visible frame.
         assert_eq!(
             origins[1],
-            (origins[0].0, origins[0].1 - SIZE.1 - STACK_GAP)
+            (origins[0].0, origins[0].1 + SIZE.1 + STACK_GAP)
         );
         assert_eq!(origins[2].0, origins[0].0);
-        assert!(origins[2].1 >= VISIBLE.y);
+        assert!(origins[2].1 + SIZE.1 <= top - EDGE_INSET);
         assert_eq!(
             origins[3],
             (origins[0].0 - SIZE.0 - STACK_GAP, origins[0].1)
@@ -1401,11 +1699,22 @@ mod tests {
             w: 1440.0,
             h: 900.0,
         };
-        let top_right = first_slot_top_right(screen, VISIBLE, SIZE.0, Some((20, 40)));
+        let bottom_right = first_slot_bottom_right(screen, VISIBLE, SIZE, Some((20, 40)));
         assert_eq!(
-            cascade_origin(top_right, VISIBLE.y, SIZE, 0),
+            stack_origin(bottom_right, 875.0, SIZE, 0),
             (20.0, 900.0 - 40.0 - 258.0)
         );
+        // No room above the anchor: the next panel wraps left, never off the top.
+        let second = stack_origin(bottom_right, 875.0, SIZE, 1);
+        assert_eq!(second, (20.0 - SIZE.0 - STACK_GAP, 900.0 - 40.0 - 258.0));
+    }
+
+    #[test]
+    fn panels_show_only_for_active_undismissed_sessions_whose_window_is_not_in_view() {
+        assert!(panel_should_show(true, false, false));
+        assert!(!panel_should_show(false, false, false)); // idle
+        assert!(!panel_should_show(true, true, false)); // closed with x
+        assert!(!panel_should_show(true, false, true)); // window fully visible
     }
 
     #[test]
