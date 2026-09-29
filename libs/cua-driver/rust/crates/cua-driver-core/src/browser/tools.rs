@@ -1423,7 +1423,41 @@ enum EditMode {
 /// after one whitespace normalization applied identically to the whole
 /// candidate and the whole observed value, never to pieces of either, so a
 /// space the requested text itself carries is kept.
+///
+/// Distinguishability rule: a confirmation must tell the accepted outcome
+/// apart from the rejected one. An insertion of non-empty text that leaves
+/// the raw value unchanged, or (for contenteditable) leaves it unchanged
+/// after normalization, and requested contenteditable text that normalizes
+/// to nothing, cannot be confirmed: those verdicts become `Ambiguous`.
 fn judge_edit(before: &EditState, after: &EditState, text: &str, mode: EditMode) -> Readback {
+    let verdict = judge_edit_evidence(before, after, text, mode);
+    let Readback::Confirmed(actual) = verdict else {
+        return verdict;
+    };
+    let unchanged = mode == EditMode::Insert
+        && !text.is_empty()
+        && (after.value == before.value
+            || (!before.field
+                && normalize_rendered(&after.value) == normalize_rendered(&before.value)));
+    let erased_by_normalization = !before.field
+        && !text.is_empty()
+        && normalize_rendered(text).is_empty()
+        && after.value != text;
+    if unchanged || erased_by_normalization {
+        Readback::Ambiguous(actual)
+    } else {
+        Readback::Confirmed(actual)
+    }
+}
+
+/// The postcondition per mode and node kind, before the distinguishability
+/// rule in [`judge_edit`].
+fn judge_edit_evidence(
+    before: &EditState,
+    after: &EditState,
+    text: &str,
+    mode: EditMode,
+) -> Readback {
     if !after.connected {
         return Readback::Detached;
     }
@@ -2949,6 +2983,13 @@ mod tests {
             ("editable append after a space", editable("hello "), editable("hello world"), "world", Insert, Want::Confirmed),
             ("editable selection replaced", editable("hello world"), editable("hello there"), "there", Insert, Want::Ambiguous),
             ("editable autocorrected", editable(""), editable("the"), "teh", Insert, Want::Mismatch(None)),
+            // Normalization cannot tell these apart from a rejected edit.
+            ("editable space into empty", editable(""), editable(""), " ", Insert, Want::Ambiguous),
+            ("editable trailing space dropped", editable("hello"), editable("hello"), " ", Insert, Want::Ambiguous),
+            ("editable trailing space as newline", editable("hello"), editable("hello\n"), " ", Insert, Want::Ambiguous),
+            ("editable replaced with spaces", editable("x"), editable(""), "  ", Replace, Want::Ambiguous),
+            ("field retyped over the same selection", field("abc", Some((0, 3))), field("abc", None), "abc", Insert, Want::Ambiguous),
+            ("field space rejected", field("", Some((0, 0))), field("", None), " ", Insert, Want::Mismatch(Some(" "))),
             ("editable replace, same text", editable("Hello"), editable("Hello"), "Hello", Replace, Want::Confirmed),
             ("editable replace appended", editable("Hello"), editable("Hello world"), "world", Replace, Want::Mismatch(None)),
             ("editable replace", editable("Hello"), editable("world\n"), "world", Replace, Want::Confirmed),
@@ -2968,6 +3009,46 @@ mod tests {
                 _ => false,
             };
             assert!(ok, "{name}: got {got:?}");
+        }
+    }
+
+    #[test]
+    fn a_confirmed_insertion_always_changed_the_value() {
+        let values = ["", " ", "a", "hello", "hello ", "hello\n", "hello world", "ahello"];
+        let texts = [" ", "a", "hello", " world", "  "];
+        for field in [true, false] {
+            for selection in [None, Some((0, 0)), Some((5, 5))] {
+                for before in values {
+                    for after in values {
+                        for text in texts {
+                            let state = |value: &str, selection: Option<(usize, usize)>| EditState {
+                                value: value.to_owned(),
+                                start: selection.map(|(start, _)| start),
+                                end: selection.map(|(_, end)| end),
+                                field,
+                                password: false,
+                                connected: true,
+                            };
+                            let verdict = judge_edit(
+                                &state(before, if field { selection } else { None }),
+                                &state(after, None),
+                                text,
+                                EditMode::Insert,
+                            );
+                            if matches!(verdict, Readback::Confirmed(_)) {
+                                assert_ne!(before, after, "{before:?} -> {after:?} typing {text:?}");
+                                if !field {
+                                    assert_ne!(
+                                        normalize_rendered(before),
+                                        normalize_rendered(after),
+                                        "{before:?} -> {after:?} typing {text:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
         }
     }
 
