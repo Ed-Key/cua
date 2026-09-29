@@ -403,6 +403,13 @@ fn dispatch_shell_helper_command(key: &str, cmd: &OverlayCommand, semantic: bool
         | OverlayCommand::ClickPulse { x, y } => {
             crate::wayland::shell_helper::move_cursor(*x as i32, *y as i32);
         }
+        // The Shell actor mirrors only cua.default, so it takes the default
+        // hotspot's anchor, as the snap it replaces did.
+        OverlayCommand::TrackPointer { x, y } => {
+            let (x, y) =
+                cursor_overlay::default_anchor_for_tip((*x, *y), std::f64::consts::FRAC_PI_4);
+            crate::wayland::shell_helper::move_cursor(x as i32, y as i32);
+        }
         OverlayCommand::BeginAction {
             action,
             delivery,
