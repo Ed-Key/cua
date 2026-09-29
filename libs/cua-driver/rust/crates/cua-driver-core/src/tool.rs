@@ -16,7 +16,7 @@ thread_local! {
 use crate::{
     pip_hook,
     protocol::{Content, ToolResult},
-    recording::{now_ms, screenshot_for, RecordingSession},
+    recording::{now_ms, RecordingSession},
     recording_tools::{
         GetRecordingStateTool, ReplayRegistrySlot, ReplayTrajectoryTool, StartRecordingTool,
         StopRecordingTool,
@@ -1778,22 +1778,16 @@ impl ToolRegistry {
             );
         }
 
-        // Experimental PiP push — only when --experimental-pip is on argv
-        // (otherwise `pip_enabled()` is false and we skip the screenshot
-        // entirely to avoid wasted capture work). We push for the same set
-        // of action tools the recording pipeline cares about (non-read-only,
-        // not the recording-control meta-tools) so the live view matches
-        // what the recorder would have captured for the turn.
+        // Experimental PiP push — only when --experimental-pip is on argv.
+        // We push for the same set of action tools the recording pipeline
+        // cares about (non-read-only, not the recording-control meta-tools).
+        // Only identity crosses here: the backend captures the target on
+        // its own worker, so a slow or stuck capture never delays this
+        // action's result.
         if pip_hook::pip_enabled() && should_record && !private_consent_turn {
-            let window_id = args.opt_u64("window_id");
-            let pid = args.opt_i64("pid");
-            if let Some(png_bytes) = screenshot_for(window_id, pid) {
-                let label = synthesize_action_label(name, &public_args);
-                pip_hook::push_pip_frame(pip_hook::PipHookFrame {
-                    png_bytes,
-                    action_label: label,
-                    timestamp_ms: now_ms(),
-                });
+            let frame = pip_frame(name, &args, &public_args, &runtime_prefix);
+            if pip_hook::pip_frame_wanted(name, &frame) {
+                pip_hook::push_pip_frame(frame);
             }
         }
 
@@ -5330,6 +5324,39 @@ impl Default for ToolRegistry {
 /// Build a short, human-friendly label for the PiP overlay from the
 /// tool name + raw args. Kept under ~60 chars so the macOS NSTextField
 /// has room without truncation at default geometry.
+/// Build a PiP frame from what the dispatcher already holds: the private
+/// session key and public label the runtime namespacing produced, the client
+/// identity recorded for the transport session, and the action target.
+fn pip_frame(
+    tool_name: &str,
+    args: &Value,
+    public_args: &Value,
+    runtime_prefix: &str,
+) -> pip_hook::PipHookFrame {
+    let str_arg = |key: &str| {
+        args.get(key)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let client = str_arg("_transport_session_id")
+        .map(|transport| {
+            pip_hook::client_for(transport.strip_prefix(runtime_prefix).unwrap_or(transport))
+        })
+        .unwrap_or_default();
+    pip_hook::PipHookFrame {
+        action_label: synthesize_action_label(tool_name, public_args),
+        timestamp_ms: now_ms(),
+        session_key: str_arg("_session_id").unwrap_or("default").to_owned(),
+        session_label: str_arg("_public_session_label").map(str::to_owned),
+        client_name: client.name,
+        client_pid: client.pid,
+        target_pid: args.opt_i64("pid").and_then(|pid| i32::try_from(pid).ok()),
+        target_window_id: args
+            .opt_u64("window_id")
+            .and_then(|window_id| u32::try_from(window_id).ok()),
+    }
+}
+
 fn synthesize_action_label(tool_name: &str, args: &Value) -> String {
     let arg = |k: &str| -> Option<String> {
         args.get(k).map(|v| match v {
@@ -5381,6 +5408,39 @@ mod capability_tests {
     //! These belong in cua-driver-core because they cover the shape
     //! of the registry response — no platform code involved.
     use super::*;
+
+    #[test]
+    fn pip_frame_carries_private_key_public_label_and_target() {
+        let prefix = "__cua_runtime_0123456789abcdef0123456789abcdef:";
+        let args = serde_json::json!({
+            "pid": 42,
+            "window_id": 7,
+            "_session_id": format!("{prefix}research"),
+            "_public_session_label": "research",
+            "_transport_session_id": format!("{prefix}proxy-1"),
+        });
+        let public = serde_json::json!({"pid": 42, "window_id": 7, "element_index": 3});
+        let frame = pip_frame("click", &args, &public, prefix);
+        assert_eq!(frame.session_key, format!("{prefix}research"));
+        assert_eq!(frame.session_label.as_deref(), Some("research"));
+        assert_eq!(frame.target_pid, Some(42));
+        assert_eq!(frame.target_window_id, Some(7));
+        assert_eq!(frame.action_label, "click: element_index=3");
+
+        // No session at all (one-shot CLI) shares the classic default panel.
+        let bare = pip_frame("click", &serde_json::json!({}), &public, prefix);
+        assert_eq!(bare.session_key, "default");
+        assert!(bare.session_label.is_none() && bare.target_pid.is_none());
+    }
+
+    #[test]
+    fn pip_push_path_never_captures() {
+        let prefix = "__cua_runtime_0123456789abcdef0123456789abcdef:";
+        let args = serde_json::json!({"pid": 42, "window_id": 7});
+        let before = crate::recording::screenshot_calls_on_this_thread();
+        pip_hook::push_pip_frame(pip_frame("click", &args, &args, prefix));
+        assert_eq!(crate::recording::screenshot_calls_on_this_thread(), before);
+    }
 
     #[test]
     fn browser_prepare_recording_redacts_transport_identity() {

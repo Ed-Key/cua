@@ -71,11 +71,24 @@ pub fn set_classified_screenshot_fn(
     let _ = SCREENSHOT_FN.set(Box::new(f));
 }
 
+#[cfg(test)]
+thread_local! {
+    static SCREENSHOT_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// How many times `screenshot_for` ran on the calling thread (tests only).
+#[cfg(test)]
+pub(crate) fn screenshot_calls_on_this_thread() -> usize {
+    SCREENSHOT_CALLS.with(std::cell::Cell::get)
+}
+
 /// Invoke the registered screenshot callback. Returns `None` when no
 /// callback was registered or when the platform capture failed. Used
-/// by the PiP push hook (and by anything else that wants to share the
+/// by the PiP backends' capture workers (and by anything else that wants to share the
 /// per-turn screenshot pipeline without duplicating the platform glue).
 pub fn screenshot_for(window_id: Option<u64>, pid: Option<i64>) -> Option<Vec<u8>> {
+    #[cfg(test)]
+    SCREENSHOT_CALLS.with(|calls| calls.set(calls.get() + 1));
     SCREENSHOT_FN
         .get()
         .and_then(|capture| capture(window_id, pid).png)

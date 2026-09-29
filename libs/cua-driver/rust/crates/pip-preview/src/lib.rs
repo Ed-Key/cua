@@ -8,7 +8,8 @@
 //! config/types here, platform-specific renderer in each `platform-*`
 //! crate).
 //!
-//! macOS is the first working implementation (NSWindow + NSImageView).
+//! macOS is the first working implementation: one non-activating glass
+//! `NSPanel` per agent session, keyed by `PipFrame::session_key`.
 //! Windows + Linux ship as compile-clean stubs whose `start()` returns
 //! a clear "not yet implemented" error so the rest of the daemon
 //! continues without a PiP window.
@@ -246,19 +247,29 @@ impl PipConfig {
 
 /// A single frame pushed into the PiP window after a tool call lands.
 ///
-/// `png_bytes` are the raw PNG bytes produced by the platform
-/// screenshot callback — the same path that powers `screenshot.png`
-/// in the recording pipeline, so PiP shows exactly what the recorder
-/// sees.
+/// Identity only: the backend captures the target window itself, on its
+/// own worker, so a slow capture never delays the action that produced
+/// the frame.
 #[derive(Debug, Clone)]
 pub struct PipFrame {
-    pub png_bytes: Vec<u8>,
     /// One-line summary shown overlayed on the frame, e.g.
     /// `click element_index=2` or `type_text "hello world"`.
     pub action_label: String,
     /// Wall-clock timestamp (ms since Unix epoch) — used by backends
     /// that want to show "last update Xs ago" in the title bar.
     pub timestamp_ms: u64,
+    /// Private runtime session key ("default" when the call had none).
+    /// Backends key one panel per session on it and derive its color from
+    /// it; it is never displayed.
+    pub session_key: String,
+    /// Public, caller-chosen session label. Display only.
+    pub session_label: Option<String>,
+    /// Self-reported MCP client name from `initialize`.
+    pub client_name: Option<String>,
+    /// A process inside the MCP client's process tree (the stdio proxy).
+    pub client_pid: Option<i32>,
+    pub target_pid: Option<i32>,
+    pub target_window_id: Option<u32>,
 }
 
 /// A live PiP window. Owned by `main.rs` for the lifetime of the
@@ -269,6 +280,9 @@ pub trait PipBackend: Send + Sync {
     /// its UI toolkit requires (the macOS impl dispatches to the main
     /// queue via `dispatch_async`).
     fn push_frame(&self, frame: PipFrame);
+
+    /// The session with this private key ended: drop its panel.
+    fn end_session(&self, _session_key: &str) {}
 
     /// Close the window and release native resources. Called from
     /// `main.rs` on shutdown.

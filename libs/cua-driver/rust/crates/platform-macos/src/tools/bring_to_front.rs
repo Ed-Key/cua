@@ -226,172 +226,174 @@ impl Tool for BringToFrontTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        let pid = match args.get("pid").and_then(Value::as_i64) {
-            Some(p) => match libc::pid_t::try_from(p) {
-                Ok(pid) => pid,
-                Err(_) => {
-                    return ToolResult::error(format!(
-                        "bring_to_front: `pid` {p} is out of range for a process identifier."
-                    ))
-                    .with_structured(json!({
-                        "code": "bring_to_front_pid_out_of_range",
-                        "pid": p,
-                    }));
-                }
-            },
-            None => return ToolResult::error("Missing required integer field: pid"),
-        };
-        let window_id = match args.get("window_id") {
-            Some(value) => match value.as_i64().and_then(|value| u32::try_from(value).ok()) {
-                Some(window_id) if window_id != 0 => Some(window_id),
-                _ => {
-                    return ToolResult::error("bring_to_front: window_id is out of range")
-                        .with_structured(json!({
-                            "code": "bring_to_front_window_id_out_of_range",
-                            "pid": pid,
-                            "window_id": value,
-                            "activated": false,
-                            "request_accepted": false,
-                        }));
-                }
-            },
-            None => None,
-        };
+        bring_to_front_blocking(args)
+    }
+}
 
-        let Some(app) =
-            (unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
-        else {
+/// The whole tool body. It never awaits (it polls with short sleeps), so the
+/// PiP focus button calls it directly from a plain background thread.
+pub(crate) fn bring_to_front_blocking(args: Value) -> ToolResult {
+    let pid = match args.get("pid").and_then(Value::as_i64) {
+        Some(p) => match libc::pid_t::try_from(p) {
+            Ok(pid) => pid,
+            Err(_) => {
+                return ToolResult::error(format!(
+                    "bring_to_front: `pid` {p} is out of range for a process identifier."
+                ))
+                .with_structured(json!({
+                    "code": "bring_to_front_pid_out_of_range",
+                    "pid": p,
+                }));
+            }
+        },
+        None => return ToolResult::error("Missing required integer field: pid"),
+    };
+    let window_id = match args.get("window_id") {
+        Some(value) => match value.as_i64().and_then(|value| u32::try_from(value).ok()) {
+            Some(window_id) if window_id != 0 => Some(window_id),
+            _ => {
+                return ToolResult::error("bring_to_front: window_id is out of range")
+                    .with_structured(json!({
+                        "code": "bring_to_front_window_id_out_of_range",
+                        "pid": pid,
+                        "window_id": value,
+                        "activated": false,
+                        "request_accepted": false,
+                    }));
+            }
+        },
+        None => None,
+    };
+
+    let Some(app) = (unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
+    else {
+        return ToolResult::error(format!(
+            "bring_to_front: no running application for pid {pid} (process not found or exited)."
+        ))
+        .with_structured(json!({
+            "code": "bring_to_front_pid_not_found",
+            "pid": pid,
+            "activated": false,
+            "request_accepted": false,
+        }));
+    };
+
+    if let Some(window_id) = window_id {
+        let Some(window) = crate::windows::window_info_by_id(window_id) else {
             return ToolResult::error(format!(
-                "bring_to_front: no running application for pid {pid} (process not found or exited)."
+                "bring_to_front: window_id {window_id} is stale or unknown."
             ))
             .with_structured(json!({
-                "code": "bring_to_front_pid_not_found",
+                "code": "bring_to_front_window_not_found",
                 "pid": pid,
+                "window_id": window_id,
                 "activated": false,
                 "request_accepted": false,
             }));
         };
-
-        if let Some(window_id) = window_id {
-            let Some(window) = crate::windows::window_info_by_id(window_id) else {
-                return ToolResult::error(format!(
-                    "bring_to_front: window_id {window_id} is stale or unknown."
-                ))
-                .with_structured(json!({
-                    "code": "bring_to_front_window_not_found",
-                    "pid": pid,
-                    "window_id": window_id,
-                    "activated": false,
-                    "request_accepted": false,
-                }));
-            };
-            if window.pid != pid {
-                return ToolResult::error(format!(
-                    "bring_to_front: window_id {window_id} is owned by pid {}, not pid {pid}.",
-                    window.pid
-                ))
-                .with_structured(json!({
-                    "code": "bring_to_front_window_pid_mismatch",
-                    "pid": pid,
-                    "window_id": window_id,
-                    "owner_pid": window.pid,
-                    "activated": false,
-                    "request_accepted": false,
-                }));
-            }
-            if window.layer != 0 {
-                return ToolResult::error(format!(
-                    "bring_to_front: window_id {window_id} is layer {}, not an ordinary layer-0 window.",
-                    window.layer
-                ))
-                .with_structured(json!({
-                    "code": "bring_to_front_window_not_ordinary",
-                    "pid": pid,
-                    "window_id": window_id,
-                    "layer": window.layer,
-                    "activated": false,
-                    "request_accepted": false,
-                }));
-            }
-
-            // The persistent kCPSNoWindows request owns process activation
-            // without broadly ordering every application window. The separate
-            // kCPSUserGenerated sequence then makes only the requested window
-            // native-key. Pair both with public Cocoa activation and re-assert
-            // only the exact AX window below; the three independent
-            // postconditions remain authoritative over every request receipt.
-            let skylight_process_accepted =
-                crate::input::skylight::set_front_process_persistently(pid, window_id);
-            let skylight_exact_accepted =
-                crate::input::skylight::make_exact_window_key(pid, window_id);
-            let cocoa_accepted = unsafe {
-                app.activateWithOptions(
-                    NSApplicationActivationOptions::NSApplicationActivateAllWindows,
-                )
-            };
-            let ax_window_requested = crate::ax::bindings::raise_exact_window(pid, window_id);
-            let path = match (
-                skylight_process_accepted,
-                skylight_exact_accepted,
-                cocoa_accepted,
-                ax_window_requested,
-            ) {
-                (true, true, true, true) => "skylight_process_exact_cocoa_ax",
-                (true, true, _, _) => "skylight_process_exact",
-                (true, false, _, true) => "skylight_process_ax",
-                (true, false, _, false) => "skylight_process",
-                (false, true, true, true) => "skylight_exact_cocoa_ax",
-                (false, true, _, _) => "skylight_exact",
-                (false, false, true, true) => "cocoa_ax",
-                (false, false, true, false) => "cocoa",
-                (false, false, false, true) => "ax",
-                (false, false, false, false) => "none",
-            };
-            let request_accepted = skylight_process_accepted
-                || skylight_exact_accepted
-                || cocoa_accepted
-                || ax_window_requested;
-            return exact_result(
-                pid,
-                window_id,
-                path,
-                request_accepted,
-                wait_for_exact_window(pid, window_id),
-            );
+        if window.pid != pid {
+            return ToolResult::error(format!(
+                "bring_to_front: window_id {window_id} is owned by pid {}, not pid {pid}.",
+                window.pid
+            ))
+            .with_structured(json!({
+                "code": "bring_to_front_window_pid_mismatch",
+                "pid": pid,
+                "window_id": window_id,
+                "owner_pid": window.pid,
+                "activated": false,
+                "request_accepted": false,
+            }));
+        }
+        if window.layer != 0 {
+            return ToolResult::error(format!(
+                "bring_to_front: window_id {window_id} is layer {}, not an ordinary layer-0 window.",
+                window.layer
+            ))
+            .with_structured(json!({
+                "code": "bring_to_front_window_not_ordinary",
+                "pid": pid,
+                "window_id": window_id,
+                "layer": window.layer,
+                "activated": false,
+                "request_accepted": false,
+            }));
         }
 
-        let request_accepted = unsafe {
+        // The persistent kCPSNoWindows request owns process activation
+        // without broadly ordering every application window. The separate
+        // kCPSUserGenerated sequence then makes only the requested window
+        // native-key. Pair both with public Cocoa activation and re-assert
+        // only the exact AX window below; the three independent
+        // postconditions remain authoritative over every request receipt.
+        let skylight_process_accepted =
+            crate::input::skylight::set_front_process_persistently(pid, window_id);
+        let skylight_exact_accepted = crate::input::skylight::make_exact_window_key(pid, window_id);
+        let cocoa_accepted = unsafe {
             app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows)
         };
-        let deadline = Instant::now() + VERIFY_TIMEOUT;
-        let activated = loop {
-            if crate::apps::frontmost_pid() == Some(pid) {
-                break true;
-            }
-            if Instant::now() >= deadline {
-                break false;
-            }
-            std::thread::sleep(VERIFY_POLL);
+        let ax_window_requested = crate::ax::bindings::raise_exact_window(pid, window_id);
+        let path = match (
+            skylight_process_accepted,
+            skylight_exact_accepted,
+            cocoa_accepted,
+            ax_window_requested,
+        ) {
+            (true, true, true, true) => "skylight_process_exact_cocoa_ax",
+            (true, true, _, _) => "skylight_process_exact",
+            (true, false, _, true) => "skylight_process_ax",
+            (true, false, _, false) => "skylight_process",
+            (false, true, true, true) => "skylight_exact_cocoa_ax",
+            (false, true, _, _) => "skylight_exact",
+            (false, false, true, true) => "cocoa_ax",
+            (false, false, true, false) => "cocoa",
+            (false, false, false, true) => "ax",
+            (false, false, false, false) => "none",
         };
-        let structured = json!({
-            "status": if activated { "activated" } else if request_accepted { "partial" } else { "failed" },
-            "code": if activated { "bring_to_front_process_verified" } else { "bring_to_front_process_unverified" },
-            "pid": pid,
-            "window_id": Value::Null,
-            "activated": activated,
-            "path": "cocoa",
-            "request_accepted": request_accepted,
-            "process_activated": activated,
-        });
-        if activated {
-            ToolResult::text(format!("Brought pid {pid} to the foreground."))
-                .with_structured(structured)
-        } else {
-            ToolResult::error(format!(
-                "bring_to_front: pid {pid} did not become frontmost (request_accepted={request_accepted})."
-            ))
-            .with_structured(structured)
+        let request_accepted = skylight_process_accepted
+            || skylight_exact_accepted
+            || cocoa_accepted
+            || ax_window_requested;
+        return exact_result(
+            pid,
+            window_id,
+            path,
+            request_accepted,
+            wait_for_exact_window(pid, window_id),
+        );
+    }
+
+    let request_accepted = unsafe {
+        app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows)
+    };
+    let deadline = Instant::now() + VERIFY_TIMEOUT;
+    let activated = loop {
+        if crate::apps::frontmost_pid() == Some(pid) {
+            break true;
         }
+        if Instant::now() >= deadline {
+            break false;
+        }
+        std::thread::sleep(VERIFY_POLL);
+    };
+    let structured = json!({
+        "status": if activated { "activated" } else if request_accepted { "partial" } else { "failed" },
+        "code": if activated { "bring_to_front_process_verified" } else { "bring_to_front_process_unverified" },
+        "pid": pid,
+        "window_id": Value::Null,
+        "activated": activated,
+        "path": "cocoa",
+        "request_accepted": request_accepted,
+        "process_activated": activated,
+    });
+    if activated {
+        ToolResult::text(format!("Brought pid {pid} to the foreground."))
+            .with_structured(structured)
+    } else {
+        ToolResult::error(format!(
+            "bring_to_front: pid {pid} did not become frontmost (request_accepted={request_accepted})."
+        ))
+        .with_structured(structured)
     }
 }
 

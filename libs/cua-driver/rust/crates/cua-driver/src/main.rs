@@ -45,12 +45,43 @@ mod version_check;
 use std::sync::Arc;
 
 fn init_logging() {
-    use tracing_subscriber::EnvFilter;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::from_env("CUA_LOG").add_directive(tracing::Level::WARN.into()))
+        .with_env_filter(log_filter(&std::env::var("CUA_LOG").unwrap_or_default()))
         .init();
     telemetry::register_stdio_observer();
+}
+
+/// `warn` unless `CUA_LOG` says otherwise. The default goes first because a
+/// later directive for the same target replaces an earlier one, so a bare
+/// `CUA_LOG=info` must come after `warn` to take effect.
+fn log_filter(cua_log: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::builder().parse_lossy(format!("warn,{cua_log}"))
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_filter;
+
+    #[test]
+    fn cua_log_sets_the_level_and_warn_is_the_default() {
+        // Display lists the directives in effect (a replaced one is gone).
+        assert_eq!(log_filter("").to_string(), "warn");
+        assert_eq!(log_filter("info").to_string(), "info");
+        assert_eq!(log_filter("debug").to_string(), "debug");
+        // A target directive keeps warn for everything else.
+        let scoped = log_filter("pip=info").to_string();
+        assert!(scoped.contains("pip=info") && scoped.contains("warn"), "{scoped}");
+    }
+
+    #[test]
+    fn a_default_added_after_cua_log_overrode_it() {
+        // The old construction: the trailing WARN replaced a bare CUA_LOG=info.
+        let old = tracing_subscriber::EnvFilter::builder()
+            .parse_lossy("info")
+            .add_directive(tracing::Level::WARN.into());
+        assert_eq!(old.to_string(), "warn");
+    }
 }
 
 fn configure_startup_permission_mode(
@@ -264,10 +295,24 @@ fn maybe_init_pip() {
                 if let Some(slot) = BACKEND.get() {
                     if let Some(b) = slot.lock().unwrap().as_ref() {
                         b.push_frame(pip_preview::PipFrame {
-                            png_bytes: frame.png_bytes,
                             action_label: frame.action_label,
                             timestamp_ms: frame.timestamp_ms,
+                            session_key: frame.session_key,
+                            session_label: frame.session_label,
+                            client_name: frame.client_name,
+                            client_pid: frame.client_pid,
+                            target_pid: frame.target_pid,
+                            target_window_id: frame.target_window_id,
                         });
+                    }
+                }
+            });
+            // Same private key the frames carry, so the ended session's
+            // panel goes away with its cursor and recording.
+            cua_driver_core::session::register_session_end_hook(|session_key| {
+                if let Some(slot) = BACKEND.get() {
+                    if let Some(b) = slot.lock().unwrap().as_ref() {
+                        b.end_session(session_key);
                     }
                 }
             });
@@ -727,14 +772,12 @@ fn main() {
 
             // Keep the main thread alive for the daemon.
             //
-            // PiP needs the AppKit main run loop to process the
-            // dispatch_async_f calls that push frames into NSImageView;
-            // park main in NSApplication.run() when --experimental-pip is
-            // on. Otherwise just join the serve thread so the process
-            // stays up as long as the daemon does.
-            if pip_cfg.enabled {
-                platform_macos::pip::run_appkit_main_loop();
-            } else if cursor_cfg.enabled {
+            // The overlay's loop is checked first: it is the only consumer of
+            // the cursor command channel (actions wait on it), and its
+            // NSApplication run loop also drains the main-queue blocks PiP
+            // posts. Running PiP's own loop while the cursor is on starved
+            // that channel and hung every action.
+            if cursor_cfg.enabled {
                 // Render the agent-cursor overlay: park the main thread in the
                 // AppKit run loop so the overlay NSWindow draws. `run_on_main_thread`
                 // self-guards on `has_graphic_access()` and returns immediately
@@ -743,6 +786,10 @@ fn main() {
                 // on its background thread regardless.
                 platform_macos::cursor::overlay::run_on_main_thread();
                 let _ = serve_handle.join();
+            } else if pip_cfg.enabled {
+                // PiP needs the AppKit run loop to process the dispatch_async_f
+                // calls that update its panels.
+                platform_macos::pip::run_appkit_main_loop();
             } else {
                 // No overlay: still run a main run loop, or macOS never
                 // delivers the activation notices focus protection needs.
