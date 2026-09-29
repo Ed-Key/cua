@@ -39,9 +39,11 @@
 //! - A session's first frame creates its panel at the bottom-right corner of
 //!   the main screen's visible frame (above the Dock, clear of notification
 //!   banners); later panels stack upward, then wrap to a new column on the
-//!   left, so two agents' panels do not overlap. A panel the user dragged
-//!   keeps its place, and an ended session's last position is remembered
-//!   while the daemon runs.
+//!   left, so two agents' panels do not overlap. Only shown panels hold a
+//!   slot: a hidden panel releases its slot, and every time a panel is shown
+//!   it moves to the lowest free one. A panel the user dragged keeps its
+//!   place and holds no slot, and an ended session's dragged position is
+//!   remembered while the daemon runs.
 //! - 8 s without a new frame for that session: fade out (0.25 s), then
 //!   `orderOut`. The next frame fades it back in.
 //! - While the session's target window is fully visible to the user (see
@@ -166,6 +168,12 @@ fn free_slot(used: impl IntoIterator<Item = usize>) -> usize {
     (0..).find(|slot| !used.contains(slot)).unwrap_or(0)
 }
 
+/// The slot a panel takes when it is shown, given the slots of the other
+/// shown panels. A dragged panel keeps its position and takes none.
+fn slot_on_show(others: impl IntoIterator<Item = usize>, dragged: bool) -> Option<usize> {
+    (!dragged).then(|| free_slot(others))
+}
+
 /// Whether a panel whose last frame arrived at `last_frame` should fade out.
 fn idle_hide_due(last_frame: Instant, now: Instant) -> bool {
     now.saturating_duration_since(last_frame) >= IDLE_HIDE_AFTER
@@ -253,7 +261,12 @@ struct Panel {
     client_label: usize,
     target_icon: usize,
     target_title: usize,
-    slot: usize,
+    /// Cascade slot held while shown; `None` while hidden or dragged.
+    slot: Option<usize>,
+    /// The user moved the panel off the origin we last placed it at.
+    dragged: bool,
+    /// Origin (AppKit) we last placed the window at.
+    placed: (f64, f64),
     last_frame: Instant,
     shown: bool,
     /// Closed with the x button since the last frame.
@@ -268,7 +281,7 @@ struct State {
     image_size: (f64, f64),
     anchor: Option<(i32, i32)>,
     panels: HashMap<String, Panel>,
-    /// Last origin of each ended session's panel, kept while the daemon runs.
+    /// Last origin of each ended session's dragged panel, kept while the daemon runs.
     // ponytail: one small entry per ended session; cap it if a daemon ever
     // sees many thousands of sessions.
     remembered: HashMap<String, (f64, f64)>,
@@ -867,15 +880,26 @@ unsafe fn refresh(state: &mut State, key: &str) {
         streams,
         next_stream_generation,
         image_size,
+        anchor,
         ..
     } = state;
+    let others: Vec<usize> = panels
+        .iter()
+        .filter(|(other, _)| other.as_str() != key)
+        .filter_map(|(_, panel)| panel.slot)
+        .collect();
     let Some(panel) = panels.get_mut(key) else {
         return;
     };
     let active = !idle_hide_due(panel.last_frame, Instant::now());
     if panel_should_show(active, panel.dismissed, panel.target_visible) {
+        if !panel.shown {
+            place_on_show(panel, others, *image_size, *anchor);
+        }
         show(panel);
     } else {
+        // A hidden panel releases its cascade slot.
+        panel.slot = None;
         hide(panel, key);
     }
     match live::stream_step(
@@ -905,6 +929,33 @@ unsafe fn refresh(state: &mut State, key: &str) {
         }
         StreamStep::Keep => {}
     }
+}
+
+/// Whether the window sits somewhere other than where we placed it.
+fn moved_from(here: (f64, f64), placed: (f64, f64)) -> bool {
+    (here.0 - placed.0).abs() > 0.5 || (here.1 - placed.1).abs() > 0.5
+}
+
+/// Called as a hidden panel is about to be shown: take the lowest free
+/// cascade slot and move there, unless the user dragged the panel.
+unsafe fn place_on_show(
+    panel: &mut Panel,
+    others: Vec<usize>,
+    image_size: (f64, f64),
+    anchor: Option<(i32, i32)>,
+) {
+    let window = panel.window as *mut AnyObject;
+    let frame: NSRect = msg_send![window, frame];
+    panel.dragged |= moved_from((frame.origin.x, frame.origin.y), panel.placed);
+    panel.slot = slot_on_show(others, panel.dragged);
+    let Some(slot) = panel.slot else {
+        return;
+    };
+    let Some(origin) = slot_origin(image_size, anchor, slot) else {
+        return;
+    };
+    let _: () = msg_send![window, setFrameOrigin: NSPoint::new(origin.0, origin.1)];
+    panel.placed = origin;
 }
 
 /// Put a live frame's IOSurface on the live layer.
@@ -971,9 +1022,10 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         };
         state.streams.request(&key, Request::Stop);
         let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
-        state
-            .remembered
-            .insert(key, (frame.origin.x, frame.origin.y));
+        let here = (frame.origin.x, frame.origin.y);
+        if panel.dragged || moved_from(here, panel.placed) {
+            state.remembered.insert(key, here);
+        }
         animate_alpha(panel.window, 0.0);
         dispatch_to_main_after(FADE, panel.window, close_window_cb);
     });
@@ -1155,10 +1207,24 @@ fn button_target() -> usize {
 
 // ── Panel construction ────────────────────────────────────────────────────
 
-unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Option<Panel> {
+/// Panel size in points for an image well of `image_size`.
+fn panel_size((image_w, image_h): (f64, f64)) -> (f64, f64) {
+    (
+        image_w + 2.0 * PAD,
+        HEADER_HEIGHT + 4.0 + image_h + 4.0 + STATUS_HEIGHT + 6.0,
+    )
+}
+
+/// AppKit origin of cascade `slot` on the main screen; `None` when there is
+/// no screen (headless).
+unsafe fn slot_origin(
+    image_size: (f64, f64),
+    anchor: Option<(i32, i32)>,
+    slot: usize,
+) -> Option<(f64, f64)> {
     let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
     if screen.is_null() {
-        return None; // headless (CI): no panels, daemon keeps running
+        return None;
     }
     let screen_frame: NSRect = msg_send![screen, frame];
     let visible_frame: NSRect = msg_send![screen, visibleFrame];
@@ -1168,21 +1234,23 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         w: r.size.width,
         h: r.size.height,
     };
+    let size = panel_size(image_size);
+    let bottom_right =
+        first_slot_bottom_right(area(screen_frame), area(visible_frame), size, anchor);
+    let visible_top = visible_frame.origin.y + visible_frame.size.height;
+    Some(stack_origin(bottom_right, visible_top, size, slot))
+}
 
+unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Option<Panel> {
     let (image_w, image_h) = state.image_size;
-    let width = image_w + 2.0 * PAD;
-    let height = HEADER_HEIGHT + 4.0 + image_h + 4.0 + STATUS_HEIGHT + 6.0;
-    let slot = free_slot(state.panels.values().map(|panel| panel.slot));
-    let origin = state.remembered.get(key).copied().unwrap_or_else(|| {
-        let bottom_right = first_slot_bottom_right(
-            area(screen_frame),
-            area(visible_frame),
-            (width, height),
-            state.anchor,
-        );
-        let visible_top = visible_frame.origin.y + visible_frame.size.height;
-        stack_origin(bottom_right, visible_top, (width, height), slot)
-    });
+    let (width, height) = panel_size(state.image_size);
+    // A remembered (dragged) origin is kept; any other panel starts at slot 0
+    // and moves to its real slot when it is shown.
+    let remembered = state.remembered.get(key).copied();
+    let origin = match remembered {
+        Some(origin) => origin,
+        None => slot_origin(state.image_size, state.anchor, 0)?, // None: headless (CI)
+    };
     let rect = NSRect::new(NSPoint::new(origin.0, origin.1), NSSize::new(width, height));
 
     // NSWindowStyleMaskBorderless (0) | NSWindowStyleMaskNonactivatingPanel (1 << 7)
@@ -1400,7 +1468,9 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         client_label: client_label as usize,
         target_icon: target_icon as usize,
         target_title: target_title as usize,
-        slot,
+        slot: None,
+        dragged: remembered.is_some(),
+        placed: origin,
         last_frame: Instant::now(),
         shown: false,
         dismissed: false,
@@ -1775,6 +1845,29 @@ mod tests {
         assert_eq!(free_slot([]), 0);
         assert_eq!(free_slot([0, 1, 2]), 3);
         assert_eq!(free_slot([0, 2]), 1);
+    }
+
+    #[test]
+    fn a_hidden_panels_slot_is_reused_by_the_next_shown_panel() {
+        // alpha is hidden (holds nothing); beta is shown and takes slot 0.
+        assert_eq!(slot_on_show([], false), Some(0));
+        // With alpha shown at 0, beta takes 1.
+        assert_eq!(slot_on_show([0], false), Some(1));
+    }
+
+    #[test]
+    fn re_showing_an_undragged_panel_takes_the_lowest_free_slot() {
+        // It held slot 0 before; meanwhile 0 was taken and 1 freed.
+        assert_eq!(slot_on_show([0, 2], false), Some(1));
+        assert_eq!(slot_on_show([1, 2], false), Some(0));
+    }
+
+    #[test]
+    fn a_dragged_panel_keeps_its_position_and_takes_no_slot() {
+        assert_eq!(slot_on_show([], true), None);
+        assert_eq!(slot_on_show([0, 1], true), None);
+        assert!(moved_from((100.0, 50.0), (1088.0, 86.0)));
+        assert!(!moved_from((1088.2, 86.0), (1088.0, 86.0)));
     }
 
     #[test]
