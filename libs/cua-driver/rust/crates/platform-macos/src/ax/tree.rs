@@ -768,7 +768,7 @@ mod web_content_role_tests {
 /// `Name:Heart\nTarget:0x0\nSelector:(null)`. Only the name carries meaning;
 /// the target and selector are always placeholders. Standard `AX*` names pass
 /// through unchanged.
-fn display_action_name(raw: String) -> String {
+pub(crate) fn display_action_name(raw: String) -> String {
     match raw.strip_prefix("Name:") {
         Some(rest) => rest.split('\n').next().unwrap_or(rest).trim().to_owned(),
         None => raw,

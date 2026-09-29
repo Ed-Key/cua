@@ -507,6 +507,24 @@ impl Tool for ClickTool {
             } else {
                 action.clone()
             };
+            // Match the requested action against what the element advertises
+            // now, before any cursor or input work: an unknown name refuses.
+            let action_guard = element_guard.clone();
+            let requested = effective_action.clone();
+            let resolved_action = tokio::task::spawn_blocking(move || unsafe {
+                resolve_element_action(
+                    &requested,
+                    &copy_action_names(action_guard.as_ptr() as AXUIElementRef),
+                )
+            })
+            .await;
+            let ax_action = match resolved_action {
+                Ok(Ok(ax_action)) => ax_action,
+                Ok(Err(advertised)) => {
+                    return unknown_action_refusal(&effective_action, &advertised)
+                }
+                Err(e) => return ToolResult::error(format!("Task error: {e}")),
+            };
 
             // Animate cursor to element center BEFORE firing AX action,
             // mirroring Swift's `performElementClick` → `animateAndWait(to:)`.
@@ -581,12 +599,16 @@ impl Tool for ClickTool {
             // internally and confirm the result by AX read-back. A text-entry
             // control gets the same fallback at its own center: it has no
             // AXPress, and an AXFocused write can be rejected or clobbered.
-            let selection_center = if effective_action == "press" {
+            let selection_center = if ax_action == "AXPress" {
                 let selection_guard = element_guard.clone();
                 tokio::task::spawn_blocking(move || {
                     let ptr = selection_guard.as_ptr();
-                    crate::input::ax_actions::nearest_container_selection_state(ptr)
-                        .and_then(|_| nearest_selectable_container_center(ptr))
+                    crate::input::ax_actions::RowSelection::capture(ptr)
+                        .and_then(|row| row.center())
+                        .or_else(|| {
+                            crate::input::ax_actions::nearest_container_selection_state(ptr)
+                                .and_then(|_| nearest_selectable_container_center(ptr))
+                        })
                         .or_else(|| {
                             let role = unsafe {
                                 crate::ax::bindings::copy_string_attr(
@@ -680,7 +702,7 @@ impl Tool for ClickTool {
 
             // Run AX work on a blocking thread (can't block async executor).
             // Use `effective_action` so button=right rewrites press → show_menu.
-            let action_clone = effective_action.clone();
+            let action_clone = ax_action.clone();
             // Thread the resolved session cursor key into the blocking AX path
             // so its ShowFocusRect + ClickPulse land on THIS session's cursor,
             // not the shared "default" one (which would light the wrong cursor
@@ -1451,14 +1473,14 @@ fn perform_ax_click(
     idx: usize,
     pid: i32,
     window_id: u32,
-    action_str: &str,
+    ax_action: &str,
     cursor_key: &str,
     selection_pixel: Option<SelectionPixelTarget>,
     modifiers: &[String],
     foreground: bool,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
-    let ax_action = map_action(action_str);
     let element = element_ptr as AXUIElementRef;
+    let action_label = crate::ax::tree::display_action_name(ax_action.to_owned());
 
     // Check the live value immediately before dispatch. Foreground assist can
     // enable menu items that were disabled in the cached snapshot, while a
@@ -1473,29 +1495,29 @@ fn perform_ax_click(
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
     let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
 
-    // A click on an AppKit collection item is frequently represented by a
-    // label child or row that does not advertise AXPress. Prefer a bounded,
-    // read-back-verified AXSelected write over dispatching a known hollow press
-    // or forcing the caller onto a less stable pixel coordinate.
-    if ax_action == "AXPress" && !advertised.iter().any(|action| action == ax_action) {
-        if modifiers.is_empty() {
-            if let Some(selected_role) =
-                crate::input::ax_actions::select_nearest_container(element_ptr)
-            {
-                return Ok((
-                    format!(
-                        "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\"; \
-                         confirmed AXSelected=true."
-                    ),
-                    false,
-                    false,
-                    true,
-                    false,
-                ));
-            }
+    // A plain click on a list row means "make this the selected row". Prove
+    // that from the app's own selection instead of trusting a press: AppKit
+    // takes an AX selection write, Catalyst selects on press or pointer (and
+    // some Catalyst lists toggle rows into a multi-selection on press).
+    if ax_action == "AXPress" && modifiers.is_empty() {
+        if let Some(row) = crate::input::ax_actions::RowSelection::capture(element_ptr) {
+            return select_row(
+                &row,
+                element,
+                advertised.iter().any(|action| action == "AXPress"),
+                RowTarget { idx, pid, window_id, role: &role, title: &title },
+                selection_pixel,
+                foreground,
+            );
         }
+    }
 
-        if let (Some(target), Some(selection)) = (
+    // A click on an AppKit collection item is frequently represented by a
+    // label child that does not advertise AXPress. A modified click on it
+    // is a pointer click at the item, confirmed by read-back.
+    if ax_action == "AXPress" && !advertised.iter().any(|action| action == ax_action) {
+        if let (false, Some(target), Some(selection)) = (
+            modifiers.is_empty(),
             selection_pixel,
             crate::input::ax_actions::capture_nearest_container_selection(element_ptr),
         ) {
@@ -1575,12 +1597,6 @@ fn perform_ax_click(
                 }
                 std::thread::sleep(SELECTION_READBACK_POLL);
             }
-            if modifiers.is_empty() {
-                anyhow::bail!(
-                    "coordinate click did not produce a stable AXSelected transition; \
-                     last_readback={last_observation:?}; retry after a fresh snapshot"
-                );
-            }
             anyhow::bail!(
                 "foreground modified coordinate click did not produce a stable AXSelected \
                  transition while preserving the prior selection; \
@@ -1620,7 +1636,7 @@ fn perform_ax_click(
         // performed but unverified; a retry would act twice.
         return Ok((
             format!(
-                "✅ Performed {ax_action} on [{idx}] {role} \"{title}\"; the element no longer \
+                "✅ Performed {action_label} on [{idx}] {role} \"{title}\"; the element no longer \
                  exists afterwards (the action replaced it; AX returned {err}). Take a fresh \
                  snapshot before acting again: do not retry this action."
             ),
@@ -1631,29 +1647,10 @@ fn perform_ax_click(
         ));
     }
     if err != crate::ax::bindings::kAXErrorSuccess {
-        // Some collection rows claim a click-like action but Finder returns
-        // kAXErrorCannotComplete. Use the same verified selection fallback
-        // before surfacing the dispatch error.
-        if ax_action == "AXPress" && modifiers.is_empty() {
-            if let Some(selected_role) =
-                crate::input::ax_actions::select_nearest_container(element_ptr)
-            {
-                return Ok((
-                    format!(
-                        "✅ Selected nearest {selected_role} for [{idx}] {role} \"{title}\" \
-                         after AXPress returned {err}; confirmed AXSelected=true."
-                    ),
-                    false,
-                    false,
-                    true,
-                    false,
-                ));
-            }
-        }
-        anyhow::bail!("AXUIElementPerformAction({ax_action}) returned {err}");
+        anyhow::bail!("AXUIElementPerformAction({action_label}) returned {err}");
     }
 
-    let mut summary = format!("✅ Performed {ax_action} on [{idx}] {role} \"{title}\".");
+    let mut summary = format!("✅ Performed {action_label} on [{idx}] {role} \"{title}\".");
 
     // AXPopUpButton: list available options, redirect to set_value.
     if role == "AXPopUpButton" {
@@ -1704,7 +1701,7 @@ fn perform_ax_click(
             advertised.join(", ")
         };
         summary.push_str(&format!(
-            "\n⚠️ Element does not advertise {ax_action} (actions: {adv_list}). \
+            "\n⚠️ Element does not advertise {action_label} (actions: {adv_list}). \
              Action may have been a no-op."
         ));
     }
@@ -1738,6 +1735,51 @@ fn perform_ax_click(
 }
 
 #[cfg(test)]
+mod action_name_tests {
+    use super::resolve_element_action;
+
+    fn stocks_row() -> Vec<String> {
+        [
+            "AXPress",
+            "AXCancel",
+            "AXShowMenu",
+            "Name:Toggle price change display\nTarget:0x0\nSelector:(null)",
+            "Name:Move Down\nTarget:0x0\nSelector:(null)",
+        ]
+        .map(String::from)
+        .to_vec()
+    }
+
+    /// Stocks rows advertise UIKit custom actions; the driver pressed the
+    /// row for any unknown name and reported success.
+    #[test]
+    fn custom_actions_match_by_display_name_in_any_case_and_send_the_raw_name() {
+        let raw = "Name:Toggle price change display\nTarget:0x0\nSelector:(null)";
+        for requested in ["toggle price change display", "Toggle Price Change Display", raw] {
+            assert_eq!(resolve_element_action(requested, &stocks_row()).as_deref(), Ok(raw));
+        }
+        assert_eq!(resolve_element_action("cancel", &stocks_row()).as_deref(), Ok("AXCancel"));
+        assert_eq!(resolve_element_action("AXCancel", &stocks_row()).as_deref(), Ok("AXCancel"));
+        assert_eq!(resolve_element_action("press", &stocks_row()).as_deref(), Ok("AXPress"));
+        // Raw names match exactly only.
+        assert!(resolve_element_action(&raw.to_lowercase(), &stocks_row()).is_err());
+    }
+
+    #[test]
+    fn unknown_names_refuse_with_the_advertised_list_and_aliases_keep_working() {
+        let advertised = resolve_element_action("frobnicate", &stocks_row()).unwrap_err();
+        assert_eq!(
+            advertised,
+            ["press", "cancel", "show_menu", "Toggle price change display", "Move Down"]
+                .map(|name| name.replace("show_menu", "showmenu"))
+        );
+        // A documented alias is still sent when the element does not list it.
+        assert_eq!(resolve_element_action("open", &stocks_row()).as_deref(), Ok("AXOpen"));
+        assert_eq!(resolve_element_action("press", &[]).as_deref(), Ok("AXPress"));
+    }
+}
+
+#[cfg(test)]
 mod selection_fallback_tests {
     use super::{selection_pixel_target, selection_readback_confirms};
 
@@ -1766,16 +1808,165 @@ mod selection_fallback_tests {
     }
 }
 
-fn map_action(action: &str) -> &'static str {
-    match action.to_lowercase().as_str() {
+/// The standard AX action a documented `action` alias names.
+fn alias_action(action: &str) -> Option<&'static str> {
+    Some(match action.to_lowercase().as_str() {
         "press" | "click" => "AXPress",
-        "show_menu" | "right_click" => "AXShowMenu",
+        "show_menu" | "right_click" | "rightclick" => "AXShowMenu",
         "pick" => "AXPick",
         "confirm" => "AXConfirm",
         "cancel" => "AXCancel",
         "open" => "AXOpen",
-        _ => "AXPress",
+        _ => return None,
+    })
+}
+
+/// Resolve a click's `action` against the element's advertised action names
+/// (raw, as `AXUIElementCopyActionNames` returns them). An advertised action
+/// matches by its raw name exactly, or by its display name in any case, with
+/// or without the `AX` prefix (`Toggle price change display`, `increment`).
+/// A documented alias whose AX action is not advertised is still sent, as
+/// before, and reported as a suspected no-op. Anything else is refused with
+/// the advertised display names: the old fallback pressed the element
+/// instead and reported success.
+fn resolve_element_action(requested: &str, advertised: &[String]) -> Result<String, Vec<String>> {
+    let alias = alias_action(requested);
+    if let Some(alias) = alias.filter(|alias| advertised.iter().any(|raw| raw == alias)) {
+        return Ok(alias.to_owned());
     }
+    let matched = advertised.iter().find(|raw| {
+        let display = crate::ax::tree::display_action_name((*raw).clone());
+        let bare = display.strip_prefix("AX").unwrap_or(&display);
+        raw.as_str() == requested
+            || requested.eq_ignore_ascii_case(&display)
+            || requested.eq_ignore_ascii_case(bare)
+    });
+    match (matched, alias) {
+        (Some(raw), _) => Ok(raw.clone()),
+        (None, Some(alias)) => Ok(alias.to_owned()),
+        (None, None) => Err(advertised
+            .iter()
+            .map(|raw| {
+                let display = crate::ax::tree::display_action_name(raw.clone());
+                display.strip_prefix("AX").map_or(display.clone(), str::to_lowercase)
+            })
+            .collect()),
+    }
+}
+
+fn unknown_action_refusal(requested: &str, advertised: &[String]) -> ToolResult {
+    ToolResult::error(format!(
+        "click: the element does not advertise the action \"{requested}\". Advertised: {}.",
+        if advertised.is_empty() { "none".to_owned() } else { advertised.join(", ") }
+    ))
+    .with_structured(serde_json::json!({
+        "code": "unknown_action",
+        "effect": "refused",
+        "advertised_actions": advertised,
+    }))
+}
+
+/// The clicked element, for row-selection messages and pointer delivery.
+struct RowTarget<'a> {
+    idx: usize,
+    pid: i32,
+    window_id: u32,
+    role: &'a str,
+    title: &'a str,
+}
+
+const ROW_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
+const ROW_READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+const ROW_READBACK_STABILITY: std::time::Duration = std::time::Duration::from_millis(200);
+
+/// Wait for `row` to become the only selected row and stay so.
+fn row_settles_exclusive(row: &crate::input::ax_actions::RowSelection) -> bool {
+    std::thread::sleep(ROW_READBACK_SETTLE);
+    let deadline = std::time::Instant::now() + ROW_READBACK_TIMEOUT;
+    loop {
+        if row.observe().is_some_and(|seen| seen.exclusive()) {
+            std::thread::sleep(ROW_READBACK_STABILITY);
+            return row.observe().is_some_and(|seen| seen.exclusive());
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(SELECTION_READBACK_POLL);
+    }
+}
+
+/// Make `row` the exclusive selection and prove it: an AX selection write
+/// (AppKit rows), the element's own press, then a pointer click at the row.
+/// Success only when the app reports the row selected and no other row.
+fn select_row(
+    row: &crate::input::ax_actions::RowSelection,
+    element: AXUIElementRef,
+    element_presses: bool,
+    target: RowTarget<'_>,
+    pixel: Option<SelectionPixelTarget>,
+    foreground: bool,
+) -> anyhow::Result<(String, bool, bool, bool, bool)> {
+    use crate::input::ax_actions::RowKind;
+    let RowTarget { idx, pid, window_id, role, title } = target;
+    let row_role = &row.role;
+    let confirmed = |how: &str, via_pixel: bool| {
+        Ok((
+            format!(
+                "✅ Selected {row_role} for [{idx}] {role} \"{title}\" {how}; read back as \
+                 the only selected row."
+            ),
+            false,
+            false,
+            true,
+            via_pixel,
+        ))
+    };
+    if row.kind == RowKind::Native && row.select_via_ax() && row_settles_exclusive(row) {
+        return confirmed("through AX selection", false);
+    }
+    if element_presses {
+        let err = unsafe { crate::ax::bindings::perform_action(element, "AXPress") };
+        if err == crate::ax::bindings::kAXErrorSuccess && row_settles_exclusive(row) {
+            return confirmed("with AXPress", false);
+        }
+    }
+    // The caller resolves the row's pixel target; without one there is no
+    // pointer rung.
+    let pointer_target = pixel;
+    if let Some(point) = pointer_target {
+        crate::input::mouse::click_at_xy_with_window_local(
+            pid,
+            point.screen_x,
+            point.screen_y,
+            point.window_x,
+            point.window_y,
+            window_id,
+            1,
+            &[],
+            crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
+        )?;
+        if row_settles_exclusive(row) {
+            return confirmed("with a pointer click at the row", true);
+        }
+    }
+    let seen = row.observe();
+    anyhow::bail!(
+        "row selection not confirmed for [{idx}] {role} \"{title}\": the app reports \
+         {} (want the row selected and no other). Nothing claimed; take a fresh snapshot{}",
+        match seen {
+            Some(seen) => format!(
+                "the row {}selected with {} other row(s) selected",
+                if seen.target { "" } else { "not " },
+                seen.others
+            ),
+            None => "no readable selection".to_owned(),
+        },
+        if foreground || pointer_target.is_none() {
+            "."
+        } else {
+            ", or click the row by pixel with delivery_mode:\"foreground\"."
+        }
+    )
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────

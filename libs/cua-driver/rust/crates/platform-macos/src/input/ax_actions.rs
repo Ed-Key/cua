@@ -1,7 +1,7 @@
 //! AX action dispatch — the preferred click/interaction path for indexed elements.
 
 use crate::ax::bindings::*;
-use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef};
+use core_foundation::base::{CFEqual, CFRelease, CFRetain, CFTypeRef, TCFType};
 
 const MAX_SELECTION_ANCESTORS: usize = 8;
 
@@ -9,56 +9,262 @@ fn is_selectable_container_role(role: &str) -> bool {
     matches!(role, "AXRow" | "AXCell" | "AXListItem" | "AXImage")
 }
 
-/// Select the nearest list-like element at or above `element_ptr` and confirm
-/// the write through `AXSelected` read-back.
-///
-/// Finder and other AppKit collection views commonly expose an item's label as
-/// an actionable child (`AXTextField`) while the selectable object is its
-/// parent `AXRow`. Neither object necessarily advertises `AXPress`, and Finder
-/// can return `kAXErrorCannotComplete` for a press on the row. A pointer click
-/// selects that row, so the AX equivalent is to set the row's `AXSelected`
-/// attribute rather than treating the failed press as terminal.
-///
-/// Finder icon views expose each selectable file directly as an `AXImage` with
-/// an `AXSelected` attribute, so that role is included alongside the standard
-/// row-like containers. The fallback remains bounded and requires a successful
-/// `AXSelected=true` read-back, so an arbitrary failed image/button press cannot
-/// become a claimed success.
-pub fn select_nearest_container(element_ptr: usize) -> Option<String> {
-    let mut current = element_ptr as AXUIElementRef;
-    let mut owns_current = false;
+/// Clicking one of these means operating the control, never selecting the
+/// row it sits in.
+fn is_control_role(role: &str) -> bool {
+    matches!(
+        role,
+        "AXButton"
+            | "AXCheckBox"
+            | "AXRadioButton"
+            | "AXPopUpButton"
+            | "AXMenuButton"
+            | "AXMenuItem"
+            | "AXLink"
+            | "AXDisclosureTriangle"
+            | "AXSlider"
+            | "AXIncrementor"
+            | "AXComboBox"
+            | "AXTextArea"
+            | "AXSearchField"
+            | "AXSecureTextField"
+    )
+}
 
-    for _ in 0..MAX_SELECTION_ANCESTORS {
-        let role = unsafe { copy_string_attr(current, "AXRole") }.unwrap_or_default();
-        if is_selectable_container_role(&role)
-            && unsafe { copy_bool_attr(current, "AXSelected") }.is_some()
-        {
-            let err = unsafe { set_bool_attr_true(current, "AXSelected") };
-            if err == kAXErrorSuccess
-                && unsafe { copy_bool_attr(current, "AXSelected") } == Some(true)
-            {
-                if owns_current {
-                    unsafe { CFRelease(current as CFTypeRef) };
-                }
-                return Some(role);
+/// One step of the walk from a clicked element up to its window.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RowCandidate {
+    pub role: String,
+    /// The element exposes a readable AXSelected.
+    pub selectable: bool,
+    /// Children of its parent that expose AXSelected, itself included.
+    pub selectable_peers: usize,
+    /// One of those peers (or itself) is selected right now.
+    pub peer_selected: bool,
+}
+
+/// Which step of the chain (clicked element first) is the row a plain click
+/// selects, if any. An AppKit row or list item wins, then a cell or icon;
+/// otherwise a Catalyst row: something selectable among 2+ selectable
+/// siblings, one of which is selected (Catalyst gives every element an
+/// AXSelected, so a selection model is only proven by a selected peer).
+/// A click on a control inside a row is not a row click.
+pub(crate) fn choose_row(chain: &[RowCandidate]) -> Option<(usize, RowKind)> {
+    let clicked = chain.first()?;
+    if is_control_role(&clicked.role) {
+        return None;
+    }
+    let find = |accept: &dyn Fn(&RowCandidate) -> bool| chain.iter().position(|c| c.selectable && accept(c));
+    find(&|c| matches!(c.role.as_str(), "AXRow" | "AXListItem"))
+        .or_else(|| find(&|c| is_selectable_container_role(&c.role)))
+        .map(|at| (at, RowKind::Native))
+        .or_else(|| {
+            find(&|c| c.selectable_peers >= 2 && c.peer_selected).map(|at| (at, RowKind::Catalyst))
+        })
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowKind {
+    /// AppKit / SwiftUI collection row: accepts AX selection writes.
+    Native,
+    /// Catalyst row: ignores AX selection writes; selects on press or pointer.
+    Catalyst,
+}
+
+/// A clicked list row, retained with its container, for exclusive selection
+/// and its read-back.
+pub struct RowSelection {
+    row: AXUIElementRef,
+    container: Option<AXUIElementRef>,
+    pub role: String,
+    pub kind: RowKind,
+}
+
+impl Drop for RowSelection {
+    fn drop(&mut self) {
+        unsafe {
+            CFRelease(self.row as CFTypeRef);
+            if let Some(container) = self.container {
+                CFRelease(container as CFTypeRef);
             }
         }
+    }
+}
 
-        let parent = unsafe { copy_element_attr(current, "AXParent") };
-        if owns_current {
-            unsafe { CFRelease(current as CFTypeRef) };
+/// How many peers a read-back scans at most when the container has no
+/// AXSelectedRows (a Catalyst list shows tens of rows, not thousands).
+const MAX_SCANNED_PEERS: usize = 500;
+
+/// The selection around a row: whether it is selected, and how many other
+/// rows are.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RowReadback {
+    pub target: bool,
+    pub others: usize,
+}
+
+impl RowReadback {
+    pub fn exclusive(self) -> bool {
+        self.target && self.others == 0
+    }
+}
+
+/// The first `MAX_SCANNED_PEERS` children of `parent` (its rows, for a
+/// table) that expose AXSelected. The caller releases them.
+unsafe fn selectable_children(parent: AXUIElementRef) -> Vec<AXUIElementRef> {
+    let rows = crate::ax::bindings::copy_element_array_attr_checked(parent, "AXRows", 20_000)
+        .unwrap_or_else(|_| copy_children(parent));
+    let mut kept = Vec::new();
+    for (at, child) in rows.into_iter().enumerate() {
+        if at < MAX_SCANNED_PEERS && copy_bool_attr(child, "AXSelected").is_some() {
+            kept.push(child);
+        } else {
+            CFRelease(child as CFTypeRef);
         }
-        let Some(parent) = parent else {
-            return None;
-        };
-        current = parent;
-        owns_current = true;
+    }
+    kept
+}
+
+/// (selectable peers, one of them selected) among `parent`'s children.
+unsafe fn peer_selection(parent: AXUIElementRef) -> (usize, bool) {
+    let peers = selectable_children(parent);
+    let selected = peers
+        .iter()
+        .any(|&peer| copy_bool_attr(peer, "AXSelected") == Some(true));
+    let count = peers.len();
+    for peer in peers {
+        CFRelease(peer as CFTypeRef);
+    }
+    (count, selected)
+}
+
+impl RowSelection {
+    /// The row a plain click on `element_ptr` should select, if it sits in a
+    /// list with a readable selection model.
+    pub fn capture(element_ptr: usize) -> Option<Self> {
+        unsafe {
+            let mut chain = Vec::new();
+            let mut elements = Vec::new();
+            let mut current = element_ptr as AXUIElementRef;
+            CFRetain(current as CFTypeRef);
+            for _ in 0..MAX_SELECTION_ANCESTORS {
+                let parent = copy_element_attr(current, "AXParent");
+                chain.push(RowCandidate {
+                    role: copy_string_attr(current, "AXRole").unwrap_or_default(),
+                    selectable: copy_bool_attr(current, "AXSelected").is_some(),
+                    selectable_peers: 0,
+                    peer_selected: false,
+                });
+                elements.push((current, parent));
+                let Some(parent) = parent else { break };
+                if copy_string_attr(parent, "AXRole").as_deref() == Some("AXWindow") {
+                    break;
+                }
+                CFRetain(parent as CFTypeRef);
+                current = parent;
+            }
+            // Peers are read only when no AppKit row claims the click: a
+            // Finder list can hold thousands of rows.
+            let chosen = choose_row(&chain).or_else(|| {
+                for (candidate, (_, parent)) in chain.iter_mut().zip(&elements) {
+                    if let (true, Some(parent)) = (candidate.selectable, parent) {
+                        (candidate.selectable_peers, candidate.peer_selected) =
+                            peer_selection(*parent);
+                    }
+                }
+                choose_row(&chain)
+            });
+            let mut result = None;
+            for (at, (element, parent)) in elements.into_iter().enumerate() {
+                match chosen {
+                    Some((row_at, kind)) if row_at == at => {
+                        result = Some(RowSelection {
+                            row: element,
+                            container: parent,
+                            role: chain[at].role.clone(),
+                            kind,
+                        });
+                    }
+                    _ => {
+                        CFRelease(element as CFTypeRef);
+                        if let Some(parent) = parent {
+                            CFRelease(parent as CFTypeRef);
+                        }
+                    }
+                }
+            }
+            result
+        }
     }
 
-    if owns_current {
-        unsafe { CFRelease(current as CFTypeRef) };
+    /// The row's centre in screen points.
+    pub fn center(&self) -> Option<(f64, f64)> {
+        unsafe { element_screen_rect(self.row) }
+            .map(|rect| (rect[0] + rect[2] / 2.0, rect[1] + rect[3] / 2.0))
     }
-    None
+
+    pub fn observe(&self) -> Option<RowReadback> {
+        unsafe {
+            let target = copy_bool_attr(self.row, "AXSelected")?;
+            let container = self.container?;
+            let others = match crate::ax::bindings::copy_element_array_attr_checked(
+                container,
+                "AXSelectedRows",
+                20_000,
+            ) {
+                Ok(selected) => {
+                    let count = selected
+                        .iter()
+                        .filter(|&&row| CFEqual(row as CFTypeRef, self.row as CFTypeRef) == 0)
+                        .count();
+                    for row in selected {
+                        CFRelease(row as CFTypeRef);
+                    }
+                    count
+                }
+                Err(_) => {
+                    let peers = selectable_children(container);
+                    let count = peers
+                        .iter()
+                        .filter(|&&peer| {
+                            CFEqual(peer as CFTypeRef, self.row as CFTypeRef) == 0
+                                && copy_bool_attr(peer, "AXSelected") == Some(true)
+                        })
+                        .count();
+                    for peer in peers {
+                        CFRelease(peer as CFTypeRef);
+                    }
+                    count
+                }
+            };
+            Some(RowReadback { target, others })
+        }
+    }
+
+    /// Ask for this row as the only selection: the owning table's
+    /// AXSelectedRows when it accepts that, else the row's AXSelected.
+    /// Returns whether the app accepted a write (not whether it took).
+    pub fn select_via_ax(&self) -> bool {
+        unsafe {
+            if let Some(container) = self.container {
+                if attribute_settable(container, "AXSelectedRows") == Some(true) {
+                    let rows = core_foundation::array::CFArray::from_CFTypes(&[
+                        core_foundation::base::CFType::wrap_under_get_rule(self.row as CFTypeRef),
+                    ]);
+                    let name = core_foundation::string::CFString::new("AXSelectedRows");
+                    if AXUIElementSetAttributeValue(
+                        container,
+                        name.as_concrete_TypeRef(),
+                        rows.as_CFTypeRef(),
+                    ) == kAXErrorSuccess
+                    {
+                        return true;
+                    }
+                }
+            }
+            set_bool_attr_true(self.row, "AXSelected") == kAXErrorSuccess
+        }
+    }
 }
 
 /// Read the selection state of the nearest collection-like element without
@@ -217,31 +423,6 @@ pub fn ensure_ax_action_enabled(element_ptr: usize, action: &str) -> anyhow::Res
     ensure_ax_enabled(enabled, action)
 }
 
-/// Perform an AX action on a cached element.
-pub fn perform_ax_action(element_ptr: usize, action: &str) -> anyhow::Result<()> {
-    let ax_action = map_action(action);
-    ensure_ax_action_enabled(element_ptr, ax_action)?;
-    let err = unsafe { perform_action(element_ptr as AXUIElementRef, ax_action) };
-
-    if err == kAXErrorSuccess {
-        Ok(())
-    } else {
-        anyhow::bail!("AXUIElementPerformAction({action}) failed with error {err}")
-    }
-}
-
-fn map_action(action: &str) -> &'static str {
-    match action.to_lowercase().as_str() {
-        "press" | "click" => "AXPress",
-        "show_menu" | "right_click" | "rightclick" => "AXShowMenu",
-        "pick" => "AXPick",
-        "confirm" => "AXConfirm",
-        "cancel" => "AXCancel",
-        "open" => "AXOpen",
-        _ => "AXPress",
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -259,6 +440,60 @@ mod tests {
     fn enabled_or_unreported_state_is_allowed() {
         assert!(ensure_ax_enabled(Some(true), "AXPress").is_ok());
         assert!(ensure_ax_enabled(None, "AXPress").is_ok());
+    }
+
+    fn step(role: &str, selectable: bool, peers: usize, peer_selected: bool) -> RowCandidate {
+        RowCandidate {
+            role: role.into(),
+            selectable,
+            selectable_peers: peers,
+            peer_selected,
+        }
+    }
+
+    #[test]
+    fn a_row_click_finds_the_row_that_owns_the_selection() {
+        // Finder list: name field -> cell (selectable, the row's other cells
+        // are its peers) -> row. The row wins over the cell.
+        let finder = [
+            step("AXTextField", false, 0, false),
+            step("AXCell", true, 4, false),
+            step("AXRow", true, 5, true),
+            step("AXOutline", false, 0, false),
+        ];
+        assert_eq!(choose_row(&finder), Some((2, RowKind::Native)));
+        // System Settings sidebar: label -> row.
+        let settings = [step("AXStaticText", false, 0, false), step("AXRow", true, 36, true)];
+        assert_eq!(choose_row(&settings), Some((1, RowKind::Native)));
+        // Finder icon view: the icon itself.
+        assert_eq!(choose_row(&[step("AXImage", true, 4, false)]), Some((0, RowKind::Native)));
+        // Stocks (Catalyst): the element is selectable but alone in its
+        // wrapper; the wrapper sits among selectable rows, one selected.
+        let stocks = [
+            step("AXGenericElement", true, 1, false),
+            step("AXGroup", true, 11, true),
+            step("AXGroup", true, 3, false),
+        ];
+        assert_eq!(choose_row(&stocks), Some((1, RowKind::Catalyst)));
+    }
+
+    #[test]
+    fn controls_and_unproven_catalyst_lists_are_not_row_clicks() {
+        // A button inside a row operates the button.
+        let button = [step("AXButton", true, 1, false), step("AXRow", true, 5, true)];
+        assert_eq!(choose_row(&button), None);
+        // Catalyst reports AXSelected on everything: without a selected peer
+        // nothing proves a selection model (a toolbar group among groups).
+        let toolbar = [step("AXGenericElement", true, 1, false), step("AXGroup", true, 3, false)];
+        assert_eq!(choose_row(&toolbar), None);
+        assert_eq!(choose_row(&[]), None);
+    }
+
+    #[test]
+    fn only_an_exclusive_selection_confirms_a_row_click() {
+        assert!(RowReadback { target: true, others: 0 }.exclusive());
+        assert!(!RowReadback { target: true, others: 1 }.exclusive(), "additive");
+        assert!(!RowReadback { target: false, others: 0 }.exclusive());
     }
 
     #[test]
