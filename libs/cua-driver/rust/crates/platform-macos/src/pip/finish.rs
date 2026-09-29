@@ -28,7 +28,7 @@
 //! | Verification | latest by event ms per window (an older one never wins) | latest by event ms per label, kept across finales; an older one is ignored | if it brought news: replays a playing finale, or owes a finale when the stretch's finale is over | chips and cards follow the verdicts |
 //! | Idle timer | the session finishes (now) | none | the finale is due once per stretch: plays if the panel is up and not closed (or owed and may show), else settles silently | the panel fades after |
 //! | `end_session` | the session finishes (now) | none | as the idle timer, then the panel closes | the panel leaves the live set |
-//! | Finale timer | none | marks what was displayed as shown; the watermarks stay | ends only the finale of its own generation | the panel fades |
+//! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim, and each touched window a chip or checklist stood for, at its event time then); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades |
 //! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not owed news) shows the panel or plays a finale | the panel hides (an ending one closes) |
 //!
 //! Everything here is pure (unit tested, one test per row).
@@ -92,11 +92,18 @@ pub(super) struct Verdicts {
     /// marks what it displayed as shown.
     claims: HashMap<String, ClaimRecord>,
     next_seq: u64,
-    /// Windows acted in, most recent action first, with their titles and
-    /// that action's event time.
-    touched: Vec<(Tag, String, u64)>,
-    /// Touched windows up to this event time were shown by a finale.
-    touched_shown: u64,
+    /// Windows acted in, most recent action first.
+    touched: Vec<Touched>,
+}
+
+/// A window the session acted in.
+struct Touched {
+    tag: Tag,
+    title: String,
+    /// Event time of the latest action in it.
+    at_ms: u64,
+    /// A finale displayed it as of that action.
+    shown: bool,
 }
 
 impl Verdicts {
@@ -124,14 +131,25 @@ impl Verdicts {
     /// `at_ms`: its window is resolved (for a pid-only action) and touched.
     pub(super) fn act(&mut self, tag: Tag, title: &str, at_ms: u64) {
         self.record_action(tag, at_ms);
-        let at_ms = self
+        // A newer action in a shown window is new work; the frame of an
+        // action already shown is not.
+        let (at_ms, shown) = match self.touched.iter().find(|touched| touched.tag == tag) {
+            Some(known) if known.at_ms >= at_ms => (known.at_ms, known.shown),
+            _ => (at_ms, false),
+        };
+        self.touched.retain(|touched| touched.tag != tag);
+        let index = self
             .touched
-            .iter()
-            .find(|(touched, _, _)| *touched == tag)
-            .map_or(at_ms, |(_, _, at)| (*at).max(at_ms));
-        self.touched.retain(|(touched, _, _)| *touched != tag);
-        let index = self.touched.partition_point(|(_, _, at)| *at > at_ms);
-        self.touched.insert(index, (tag, title.to_owned(), at_ms));
+            .partition_point(|touched| touched.at_ms > at_ms);
+        self.touched.insert(
+            index,
+            Touched {
+                tag,
+                title: title.to_owned(),
+                at_ms,
+                shown,
+            },
+        );
         self.touched.truncate(CHIP_ROW);
     }
 
@@ -210,52 +228,84 @@ impl Verdicts {
         }
     }
 
-    /// The claims not yet shown: each label's latest status by event time,
-    /// the `CHECKLIST_ROWS` most recent, oldest first.
-    fn checklist(&self) -> Vec<Claim> {
-        let mut rows: Vec<(&String, &ClaimRecord)> = self
+    /// What the finale shows now: the claims not yet shown (each label's
+    /// latest status by event time, the `CHECKLIST_ROWS` most recent,
+    /// oldest first), or with none the touched windows not yet shown. It
+    /// records what it displays, as of which event, for `finale_shown`; a
+    /// checklist stands for its stretch's touched windows too (as of now),
+    /// so they do not come back as chips later.
+    pub(super) fn finale(&self) -> Finale {
+        let windows: Vec<&Touched> = self.touched.iter().filter(|t| !t.shown).collect();
+        let window_marks = windows.iter().map(|touched| Displayed::Window {
+            tag: touched.tag,
+            at_ms: touched.at_ms,
+        });
+        let mut claims: Vec<(&String, &ClaimRecord)> = self
             .claims
             .iter()
             .filter(|(_, record)| !record.shown)
             .collect();
-        rows.sort_by_key(|(_, record)| (record.at_ms, record.seq));
-        let skip = rows.len().saturating_sub(CHECKLIST_ROWS);
-        rows.into_iter()
-            .skip(skip)
-            .map(|(label, record)| Claim {
-                label: label.clone(),
-                satisfied: record.satisfied,
-            })
-            .collect()
+        claims.sort_by_key(|(_, record)| (record.at_ms, record.seq));
+        let claims = &claims[claims.len().saturating_sub(CHECKLIST_ROWS)..];
+        if !claims.is_empty() {
+            return Finale {
+                rows: Rows::Checklist(
+                    claims
+                        .iter()
+                        .map(|(label, record)| Claim {
+                            label: (*label).clone(),
+                            satisfied: record.satisfied,
+                        })
+                        .collect(),
+                ),
+                displayed: claims
+                    .iter()
+                    .map(|(label, record)| Displayed::Claim {
+                        label: (*label).clone(),
+                        at_ms: record.at_ms,
+                        seq: record.seq,
+                    })
+                    .chain(window_marks)
+                    .collect(),
+            };
+        }
+        Finale {
+            rows: Rows::Chips(
+                windows
+                    .iter()
+                    .map(|touched| FinaleChip {
+                        tag: touched.tag,
+                        title: touched.title.clone(),
+                        finished: touched.tag.1.is_some_and(|window| self.finished(window)),
+                    })
+                    .collect(),
+            ),
+            displayed: window_marks.collect(),
+        }
     }
 
-    /// What the finale shows now.
-    pub(super) fn finale(&self) -> Finale {
-        let rows = self.checklist();
-        if !rows.is_empty() {
-            return Finale::Checklist(rows);
-        }
-        Finale::Chips(
-            self.touched
-                .iter()
-                .filter(|(_, _, at)| *at > self.touched_shown)
-                .map(|(tag, title, _)| FinaleChip {
-                    tag: *tag,
-                    title: title.clone(),
-                    finished: tag.1.is_some_and(|window| self.finished(window)),
-                })
-                .collect(),
-        )
-    }
-
-    /// A finale ran its course: what it displayed is shown. The watermarks
-    /// stay, so older evidence arriving later still loses.
-    pub(super) fn finale_shown(&mut self) {
-        for record in self.claims.values_mut() {
-            record.shown = true;
-        }
-        if let Some((_, _, newest)) = self.touched.first() {
-            self.touched_shown = self.touched_shown.max(*newest);
+    /// `finale` ran its course: exactly what it displayed is shown, each
+    /// claim and window only as of the event it was displayed with (anything
+    /// newer, or anything that landed while it played, stays unshown). The
+    /// watermarks stay, so older evidence arriving later still loses.
+    pub(super) fn finale_shown(&mut self, finale: &Finale) {
+        for displayed in &finale.displayed {
+            match displayed {
+                Displayed::Claim { label, at_ms, seq } => {
+                    if let Some(record) = self.claims.get_mut(label) {
+                        if record.at_ms == *at_ms && record.seq == *seq {
+                            record.shown = true;
+                        }
+                    }
+                }
+                Displayed::Window { tag, at_ms } => {
+                    if let Some(touched) = self.touched.iter_mut().find(|t| t.tag == *tag) {
+                        if touched.at_ms == *at_ms {
+                            touched.shown = true;
+                        }
+                    }
+                }
+            }
         }
     }
 
@@ -263,7 +313,7 @@ impl Verdicts {
     pub(super) fn touched(&self) -> impl Iterator<Item = (Tag, String)> + '_ {
         self.touched
             .iter()
-            .map(|(tag, title, _)| (*tag, title.clone()))
+            .map(|touched| (touched.tag, touched.title.clone()))
     }
 }
 
@@ -275,32 +325,47 @@ pub(super) struct FinaleChip {
     pub(super) finished: bool,
 }
 
+/// A finale's rows.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) enum Finale {
+pub(super) enum Rows {
     Checklist(Vec<Claim>),
     Chips(Vec<FinaleChip>),
 }
 
+/// One item a finale displays, as of the event it displays it with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Displayed {
+    Claim { label: String, at_ms: u64, seq: u64 },
+    Window { tag: Tag, at_ms: u64 },
+}
+
+/// A finale as built: its rows, and what they display (for `finale_shown`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Finale {
+    pub(super) rows: Rows,
+    displayed: Vec<Displayed>,
+}
+
 impl Finale {
     pub(super) fn kind(&self) -> &'static str {
-        match self {
-            Finale::Checklist(_) => "checklist",
-            Finale::Chips(_) => "chips",
+        match self.rows {
+            Rows::Checklist(_) => "checklist",
+            Rows::Chips(_) => "chips",
         }
     }
 
     pub(super) fn len(&self) -> usize {
-        match self {
-            Finale::Checklist(rows) => rows.len(),
-            Finale::Chips(chips) => chips.len(),
+        match &self.rows {
+            Rows::Checklist(rows) => rows.len(),
+            Rows::Chips(chips) => chips.len(),
         }
     }
 
     /// One line per row, for logs: `satisfied: text area holds "hi"`,
     /// `finished: Notes`.
     pub(super) fn log_rows(&self) -> Vec<String> {
-        match self {
-            Finale::Checklist(rows) => rows
+        match &self.rows {
+            Rows::Checklist(rows) => rows
                 .iter()
                 .map(|row| {
                     let status = match row.satisfied {
@@ -311,7 +376,7 @@ impl Finale {
                     format!("{status}: {}", row.label)
                 })
                 .collect(),
-            Finale::Chips(chips) => chips
+            Rows::Chips(chips) => chips
                 .iter()
                 .map(|chip| {
                     let status = if chip.finished { "finished" } else { "plain" };
@@ -466,9 +531,9 @@ mod tests {
     }
 
     fn checklist(verdicts: &Verdicts) -> Vec<Claim> {
-        match verdicts.finale() {
-            Finale::Checklist(rows) => rows,
-            Finale::Chips(_) => Vec::new(),
+        match verdicts.finale().rows {
+            Rows::Checklist(rows) => rows,
+            Rows::Chips(_) => Vec::new(),
         }
     }
 
@@ -591,7 +656,7 @@ mod tests {
         verdicts.act(A, "Notes", 100);
         assert!(verdicts.verify(1, 10, 200, false, vec![claim("saved", Some(false))]));
         assert_eq!(checklist(&verdicts), [claim("saved", Some(false))]);
-        verdicts.finale_shown();
+        verdicts.finale_shown(&verdicts.finale());
         assert!(!verdicts.verify(1, 10, 150, true, vec![claim("saved", Some(true))]));
         assert!(!verdicts.finished(10));
         assert!(checklist(&verdicts).is_empty(), "no green row");
@@ -704,8 +769,8 @@ mod tests {
         verdicts.verify(2, 20, 120, false, vec![]);
         verdicts.finish_session(200);
         assert_eq!(
-            verdicts.finale(),
-            Finale::Chips(vec![
+            verdicts.finale().rows,
+            Rows::Chips(vec![
                 FinaleChip {
                     tag: B,
                     title: "Mail".into(),
@@ -768,18 +833,71 @@ mod tests {
         let mut verdicts = Verdicts::default();
         verdicts.act(A, "Notes", 100);
         verdicts.verify(1, 10, 150, true, vec![claim("saved", Some(true))]);
-        verdicts.finale_shown();
-        assert_eq!(verdicts.finale(), Finale::Chips(vec![]));
+        verdicts.finale_shown(&verdicts.finale());
+        assert_eq!(verdicts.finale().rows, Rows::Chips(vec![]), "A was shown");
         verdicts.act(B, "Mail", 300);
-        let Finale::Chips(chips) = verdicts.finale() else {
+        let finale = verdicts.finale();
+        let Rows::Chips(chips) = &finale.rows else {
             panic!("no new claims: chips");
         };
         assert_eq!(chips.len(), 1);
         assert_eq!(chips[0].tag, B);
-        // A late frame of an action before the finale is not new work.
-        verdicts.finale_shown();
+        verdicts.finale_shown(&finale);
+        // A late frame of an action already shown is not new work.
         verdicts.act(A, "Notes", 100);
-        assert_eq!(verdicts.finale(), Finale::Chips(vec![]));
+        assert_eq!(verdicts.finale().rows, Rows::Chips(vec![]));
+    }
+
+    #[test]
+    fn row_finale_timer_marks_shown_only_what_its_finale_displayed() {
+        // A chips finale is built showing B; while it plays, the backlogged
+        // capture of an earlier action in A lands. The timer marks B only:
+        // A's chip is still owed to a later finale.
+        let a_window = (Some(1), Some(30));
+        let mut verdicts = Verdicts::default();
+        verdicts.act(B, "Mail", 500);
+        let playing = verdicts.finale();
+        verdicts.act(a_window, "Notes", 400);
+        verdicts.finale_shown(&playing);
+        let Rows::Chips(chips) = verdicts.finale().rows else {
+            panic!("chips");
+        };
+        let tags: Vec<Tag> = chips.iter().map(|chip| chip.tag).collect();
+        assert_eq!(tags, [a_window]);
+        // A checklist stands for the windows touched when it was built, not
+        // for one whose capture lands while it plays.
+        let mut verdicts = Verdicts::default();
+        verdicts.act(B, "Mail", 500);
+        verdicts.verify(2, 20, 550, true, vec![claim("sent", Some(true))]);
+        let playing = verdicts.finale();
+        assert_eq!(playing.kind(), "checklist");
+        verdicts.act(a_window, "Notes", 400);
+        verdicts.finale_shown(&playing);
+        let Rows::Chips(chips) = verdicts.finale().rows else {
+            panic!("chips");
+        };
+        let tags: Vec<Tag> = chips.iter().map(|chip| chip.tag).collect();
+        assert_eq!(tags, [a_window], "B was covered by the checklist");
+        // A newer action in a displayed window during the finale stays
+        // unshown too.
+        let mut verdicts = Verdicts::default();
+        verdicts.act(B, "Mail", 500);
+        let playing = verdicts.finale();
+        verdicts.act(B, "Mail", 600);
+        verdicts.finale_shown(&playing);
+        assert_eq!(verdicts.finale().len(), 1);
+        // Same for claims: a newer claim for a displayed label (or a new
+        // label) that lands before the timer is not marked shown.
+        let mut verdicts = Verdicts::default();
+        verdicts.verify(1, 10, 100, false, vec![claim("saved", Some(false))]);
+        let playing = verdicts.finale();
+        verdicts.verify(1, 10, 200, true, vec![claim("saved", Some(true))]);
+        verdicts.verify(1, 10, 200, true, vec![claim("sent", Some(true))]);
+        verdicts.finale_shown(&playing);
+        assert_eq!(
+            checklist(&verdicts),
+            [claim("saved", Some(true)), claim("sent", Some(true))]
+        );
     }
 
     #[test]

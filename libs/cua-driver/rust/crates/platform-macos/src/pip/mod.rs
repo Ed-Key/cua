@@ -118,7 +118,7 @@ mod live;
 mod stack;
 mod visibility;
 
-use finish::{Claim, Finale, Lifecycle, Verdicts};
+use finish::{Claim, Finale, Lifecycle, Rows, Verdicts};
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
@@ -425,6 +425,8 @@ struct Panel {
     lifecycle: Lifecycle,
     /// The finished-state overlay on the front card, while it is up.
     finale_view: Option<usize>,
+    /// The finale that overlay displays: its timer marks exactly this shown.
+    displayed: Option<Finale>,
     /// Private session key (for logs from callbacks that only have the
     /// panel).
     key: String,
@@ -1828,6 +1830,7 @@ unsafe fn finish_session(panel: &mut Panel, key: &str, worker: &CaptureWorker) {
 unsafe fn play_finale(panel: &mut Panel, key: &str, finale: &Finale, generation: u64) {
     tracing::info!(target: "pip", session = %key, rows = ?finale.log_rows(), kind = %finale.kind(), "PiP finished state");
     show_finale_view(panel, finale);
+    panel.displayed = Some(finale.clone());
     dispatch_to_main_after(
         finish::finale_duration(finale.len()),
         (panel.id, generation),
@@ -1856,7 +1859,9 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
                 .find(|(_, panel)| panel.id == id)
                 .and_then(|(key, panel)| {
                     panel.lifecycle.end(generation).then(|| {
-                        panel.verdicts.finale_shown();
+                        if let Some(finale) = panel.displayed.take() {
+                            panel.verdicts.finale_shown(&finale);
+                        }
                         key.clone()
                     })
                 });
@@ -1869,6 +1874,7 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
 
 /// Take the finale overlay off the front card.
 unsafe fn remove_finale_view(panel: &mut Panel) {
+    panel.displayed = None;
     if let Some(view) = panel.finale_view.take() {
         let _: () = msg_send![view as *mut AnyObject, removeFromSuperview];
     }
@@ -1909,8 +1915,8 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
     let _: () = msg_send![overlay, setAutoresizingMask: 18u64];
     let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
     let start = CACurrentMediaTime();
-    match finale {
-        Finale::Checklist(rows) => {
+    match &finale.rows {
+        Rows::Checklist(rows) => {
             let top = (well_h + rows.len() as f64 * ROW_HEIGHT) / 2.0;
             for (index, row) in rows.iter().enumerate() {
                 let view = new_view(
@@ -1957,7 +1963,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
                 add_subview(overlay, view);
             }
         }
-        Finale::Chips(chips) => {
+        Rows::Chips(chips) => {
             let gap = 10.0;
             let count = chips.len() as f64;
             let total = count * FINALE_ICON + (count - 1.0).max(0.0) * gap;
@@ -2823,6 +2829,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         finished_seen: HashSet::new(),
         lifecycle: Lifecycle::default(),
         finale_view: None,
+        displayed: None,
         key: key.to_owned(),
         card,
         laid_out: (0.0, 0.0),
