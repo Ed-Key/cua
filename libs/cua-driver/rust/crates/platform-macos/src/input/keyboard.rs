@@ -32,18 +32,10 @@ pub fn is_screen_sharing_pid(pid: i32) -> bool {
 
 /// Press and release a single key, delivered to `pid` without stealing focus.
 pub fn press_key(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
-    // Handle "+" / "plus" → Shift+= (US keyboard layout).
-    if key == "+" || key.to_lowercase() == "plus" {
-        let flags = modifier_flags(&["shift"]);
-        let eq_code = key_name_to_code("=")?;
-        post_key(pid, eq_code, true, modifier_flags(modifiers) | flags)?;
-        std::thread::sleep(std::time::Duration::from_millis(8));
-        post_key(pid, eq_code, false, modifier_flags(modifiers) | flags)?;
-        return Ok(());
-    }
-
-    let key_code = key_name_to_code(key)?;
-    let flags = modifier_flags(modifiers);
+    let (key, shift) = resolve_key_name(key);
+    let modifiers = with_shift(modifiers, shift);
+    let key_code = key_name_to_code(&key)?;
+    let flags = modifier_flags(&modifiers);
 
     post_key(pid, key_code, true, flags)?;
     std::thread::sleep(std::time::Duration::from_millis(8));
@@ -123,7 +115,9 @@ pub fn hotkey(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
 pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
     use core_graphics::event::CGEventTapLocation;
 
-    let key_code = key_name_to_code(key)?;
+    let (key, shift) = resolve_key_name(key);
+    let modifiers = with_shift(modifiers, shift);
+    let key_code = key_name_to_code(&key)?;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let mut active_flags = CGEventFlags::CGEventFlagNull;
@@ -398,9 +392,12 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
 pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
     use core_graphics::event::CGEventTapLocation;
 
+    let (key, shift) = resolve_key_name(key);
+    let modifiers = with_shift(modifiers, shift);
+    let key = key.as_str();
     let key_code = key_name_to_code(key)?;
     let mut chord: Vec<(u16, CGEventFlags)> = Vec::new();
-    for modifier in modifiers {
+    for modifier in &modifiers {
         let Some((modifier_code, modifier_flag)) = modifier_key_code_and_flag(modifier) else {
             continue;
         };
@@ -552,7 +549,14 @@ fn physical_key_for_char(ch: char) -> Option<(u16, bool)> {
             .map(|code| (code, false));
     }
 
-    let (base, shift) = match ch {
+    let (base, shift) = us_key_for_char(ch)?;
+    key_name_to_code(base).ok().map(|code| (code, shift))
+}
+
+/// The key that types punctuation `ch` on the standard US layout, and whether
+/// it needs Shift.
+fn us_key_for_char(ch: char) -> Option<(&'static str, bool)> {
+    Some(match ch {
         ' ' => ("space", false),
         '\t' => ("tab", false),
         '\n' | '\r' => ("return", false),
@@ -589,8 +593,68 @@ fn physical_key_for_char(ch: char) -> Option<(u16, bool)> {
         '(' => ("9", true),
         ')' => ("0", true),
         _ => return None,
+    })
+}
+
+/// Resolve a key name to the US-layout base key and whether Shift is needed.
+/// Accepts spelled-out punctuation names (the X keysym vocabulary Linux takes,
+/// so "period", "at", "exclamation" mean the same on both) and shifted glyphs
+/// such as "@". Anything else is returned unchanged.
+pub(crate) fn resolve_key_name(key: &str) -> (String, bool) {
+    let glyph = match key.to_ascii_lowercase().as_str() {
+        "period" | "dot" => '.',
+        "comma" => ',',
+        "minus" | "dash" | "hyphen" => '-',
+        "equal" | "equals" => '=',
+        "slash" => '/',
+        "backslash" => '\\',
+        "semicolon" => ';',
+        "quote" | "apostrophe" => '\'',
+        "grave" | "backtick" => '`',
+        "bracketleft" => '[',
+        "bracketright" => ']',
+        "at" => '@',
+        "exclamation" | "exclam" => '!',
+        "hash" | "numbersign" => '#',
+        "dollar" => '$',
+        "percent" => '%',
+        "caret" | "asciicircum" => '^',
+        "ampersand" => '&',
+        "asterisk" | "star" => '*',
+        "parenleft" => '(',
+        "parenright" => ')',
+        "underscore" => '_',
+        "plus" => '+',
+        "colon" => ':',
+        "question" => '?',
+        "less" => '<',
+        "greater" => '>',
+        "quotedbl" => '"',
+        "braceleft" => '{',
+        "braceright" => '}',
+        "bar" => '|',
+        "tilde" | "asciitilde" => '~',
+        _ => {
+            let mut chars = key.chars();
+            match (chars.next(), chars.next()) {
+                (Some(ch), None) if ch.is_ascii_punctuation() => ch,
+                _ => return (key.to_owned(), false),
+            }
+        }
     };
-    key_name_to_code(base).ok().map(|code| (code, shift))
+    match us_key_for_char(glyph) {
+        Some((base, shift)) => (base.to_owned(), shift),
+        None => (key.to_owned(), false),
+    }
+}
+
+/// `modifiers` plus Shift when `shift` asks for it and it is not there yet.
+fn with_shift<'a>(modifiers: &[&'a str], shift: bool) -> Vec<&'a str> {
+    let mut all = modifiers.to_vec();
+    if shift && !all.iter().any(|m| m.eq_ignore_ascii_case("shift")) {
+        all.push("shift");
+    }
+    all
 }
 
 /// Post a keyboard event to `pid` via SLEventPostToPid (with auth message for
@@ -720,6 +784,57 @@ pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn spelled_out_punctuation_names_resolve_to_us_keys() {
+        for (name, base, shift) in [
+            ("period", ".", false),
+            ("comma", ",", false),
+            ("minus", "-", false),
+            ("equal", "=", false),
+            ("slash", "/", false),
+            ("backslash", "\\", false),
+            ("semicolon", ";", false),
+            ("quote", "'", false),
+            ("grave", "`", false),
+            ("bracketleft", "[", false),
+            ("bracketright", "]", false),
+            ("at", "2", true),
+            ("exclamation", "1", true),
+            ("hash", "3", true),
+            ("dollar", "4", true),
+            ("percent", "5", true),
+            ("caret", "6", true),
+            ("ampersand", "7", true),
+            ("asterisk", "8", true),
+            ("parenleft", "9", true),
+            ("parenright", "0", true),
+            ("underscore", "-", true),
+            ("plus", "=", true),
+            ("Period", ".", false),
+            ("@", "2", true),
+            ("+", "=", true),
+            (".", ".", false),
+        ] {
+            assert_eq!(resolve_key_name(name), (base.to_owned(), shift), "{name}");
+            assert!(key_name_to_code(base).is_ok(), "{name} -> {base}");
+        }
+    }
+
+    #[test]
+    fn other_key_names_pass_through_unchanged() {
+        for name in ["return", "a", "A", "7", "f5", "left", "space", "nosuchkey"] {
+            assert_eq!(resolve_key_name(name), (name.to_owned(), false), "{name}");
+        }
+        assert!(key_name_to_code(&resolve_key_name("nosuchkey").0).is_err());
+    }
+
+    #[test]
+    fn shift_is_added_once() {
+        assert_eq!(with_shift(&["cmd"], true), vec!["cmd", "shift"]);
+        assert_eq!(with_shift(&["Shift"], true), vec!["Shift"]);
+        assert_eq!(with_shift(&["cmd"], false), vec!["cmd"]);
+    }
     use core_graphics::event::CGEventType;
 
     #[test]
