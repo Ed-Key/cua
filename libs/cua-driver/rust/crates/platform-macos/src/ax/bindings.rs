@@ -226,13 +226,33 @@ pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Opti
     if err != kAXErrorSuccess || value.is_null() {
         return None;
     }
-    let cf_string_type_id = CFStr::type_id();
-    if core_foundation::base::CFGetTypeID(value) != cf_string_type_id {
-        CFRelease(value);
-        return None;
+    let text = cf_plain_string(value);
+    CFRelease(value);
+    text
+}
+
+extern "C" {
+    fn CFAttributedStringGetString(string: CFTypeRef) -> CFStringRef;
+}
+
+/// Text of a borrowed `CFString` or `CFAttributedString` (formatted text:
+/// Catalyst and TextKit fields report `AXValue` that way). Anything else is
+/// not text.
+///
+/// # Safety
+///
+/// `value` must be a valid CF object for the duration of the call.
+pub unsafe fn cf_plain_string(value: CFTypeRef) -> Option<String> {
+    use core_foundation::attributed_string::CFAttributedString;
+    let type_id = core_foundation::base::CFGetTypeID(value);
+    if type_id == CFStr::type_id() {
+        return Some(CFStr::wrap_under_get_rule(value as _).to_string());
     }
-    let s = CFStr::wrap_under_create_rule(value as _);
-    Some(s.to_string())
+    if type_id == CFAttributedString::type_id() {
+        let string = CFAttributedStringGetString(value);
+        return (!string.is_null()).then(|| CFStr::wrap_under_get_rule(string).to_string());
+    }
+    None
 }
 
 /// Copy a numeric attribute from an AX element as an `f64`. Returns `None` on
@@ -327,7 +347,7 @@ pub unsafe fn copy_binary_attr(element: AXUIElementRef, attr_name: &str) -> Opti
 /// and the wider structured control-state response.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StringishAttrValue {
-    /// Present only when the source value was a CFString.
+    /// Present only when the source value was text (CFString or CFAttributedString).
     pub string_value: Option<String>,
     /// CFString as-is, CFNumber as text, or CFBoolean as `"1"` / `"0"`.
     pub state_value: String,
@@ -337,14 +357,13 @@ pub struct StringishAttrValue {
 unsafe fn coerce_stringish_value(value: CFTypeRef) -> Option<StringishAttrValue> {
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
-    let type_id = core_foundation::base::CFGetTypeID(value);
-    if type_id == CFStr::type_id() {
-        let string = CFStr::wrap_under_get_rule(value as _).to_string();
+    if let Some(string) = cf_plain_string(value) {
         return Some(StringishAttrValue {
             string_value: Some(string.clone()),
             state_value: string,
         });
     }
+    let type_id = core_foundation::base::CFGetTypeID(value);
     if type_id == CFNumber::type_id() {
         let n = CFNumber::wrap_under_get_rule(value as _);
         let f = n.to_f64()?;
@@ -1096,10 +1115,7 @@ pub(crate) unsafe fn copy_string_attr_checked(
     attribute: &str,
 ) -> Result<String, AXError> {
     let value = copy_attribute_checked(element, attribute)?;
-    if value.type_of() != CFStr::type_id() {
-        return Err(kAXErrorFailure);
-    }
-    Ok(CFStr::wrap_under_get_rule(value.as_CFTypeRef() as _).to_string())
+    cf_plain_string(value.as_CFTypeRef()).ok_or(kAXErrorFailure)
 }
 
 pub(crate) unsafe fn copy_geometry_attr_checked(
@@ -1417,5 +1433,22 @@ mod tests {
         let false_result = unsafe { coerce_stringish_value(false_value.as_CFTypeRef()) }.unwrap();
         assert_eq!(false_result.string_value, None);
         assert_eq!(false_result.state_value, "0");
+    }
+
+    /// Formatted text (Catalyst compose fields, TextKit views) reports its
+    /// AXValue as a CFAttributedString; it must read as its text, not as no
+    /// value.
+    #[test]
+    fn attributed_string_value_reads_as_its_plain_text() {
+        use core_foundation::attributed_string::CFAttributedString;
+        let attributed = CFAttributedString::new(&CFStr::new("Hello from Catalyst"));
+        let copied = unsafe { coerce_stringish_value(attributed.as_CFTypeRef()) }.unwrap();
+        assert_eq!(copied.string_value.as_deref(), Some("Hello from Catalyst"));
+        assert_eq!(copied.state_value, "Hello from Catalyst");
+        assert_eq!(
+            unsafe { cf_plain_string(attributed.as_CFTypeRef()) }.as_deref(),
+            Some("Hello from Catalyst")
+        );
+        assert!(unsafe { cf_plain_string(CFNumber::from(3).as_CFTypeRef()) }.is_none());
     }
 }
