@@ -235,6 +235,46 @@ impl Tool for TypeTextTool {
 
         let element_guard = element_guard.zip(element_index);
 
+        // A Chrome page with cua's extension connected takes page input
+        // through browser_type; refuse before any input, including the px
+        // focus click.
+        let redirect = match (element_guard.as_ref(), px, py) {
+            (Some((guard, _)), _, _) => {
+                super::browser_route::page_input_redirect(
+                    "type_text",
+                    "browser_type",
+                    pid,
+                    window_id,
+                    Some(guard.as_ptr() as usize),
+                )
+                .await
+            }
+            (None, Some(x), Some(y)) if !args.bool_or("from_zoom", false) => {
+                super::browser_route::page_input_redirect_at_pixel(
+                    "type_text",
+                    "browser_type",
+                    pid,
+                    window_id,
+                    x,
+                    y,
+                )
+                .await
+            }
+            (None, _, _) => {
+                super::browser_route::page_input_redirect(
+                    "type_text",
+                    "browser_type",
+                    pid,
+                    window_id,
+                    None,
+                )
+                .await
+            }
+        };
+        if let Some(redirect) = redirect {
+            return redirect;
+        }
+
         // ── Exact-target background gate (macOS background input v1) ──
         // A window-addressed background insert must prove exact delivery
         // before any input — including the px focus click — is sent. The pure
@@ -489,8 +529,9 @@ fn completed_typing_result(
             "The pixel-focus rung already ran, so do not repeat it; verify the \
              result via the screenshot."
         } else {
-            "For a browser tab use the `page` tool (it drives the DOM); for an \
-             embedded web view, re-type with the px form (x,y)."
+            "In Chrome, bind the tab with get_browser_state and type with \
+             browser_type, which the page observes and reads back; for an embedded \
+             web view, re-type with the px form (x,y)."
         };
         (
             "📨 Sent (unverified)",
@@ -524,9 +565,10 @@ fn completed_typing_result(
             s["delivered_chars"] = serde_json::json!(delivered_chars);
         }
         if untrusted_web_readback {
-            // Web-content AXValue read-back. A real browser TAB → the `page`
-            // tool (drives the DOM via CDP) is the reliable rung; an embedded
-            // web view (Electron, no CDP) → the element px action. It's a
+            // Web-content AXValue read-back. A real browser TAB → the typed
+            // browser tools (get_browser_state, browser_type) are the reliable
+            // rung; an embedded web view (Electron, no CDP) → the element px
+            // action. It's a
             // renderer/DOM-focus problem, never a foreground one.
             let escalation = match web_readback_next_rung(electron_web_content, used_pixel_focus) {
                 Some("px") => Some((
@@ -538,15 +580,10 @@ fn completed_typing_result(
                 )),
                 Some("page") => Some((
                     "page",
-                    "Browser web content — AXValue read-back cannot prove that the DOM \
-                     observed the input (and AX type_text on a contenteditable is racy). \
-                     Drive the tab's DOM with the `page` tool: execute_javascript + \
-                     el.value/innerText for a plain input; for a rich-text contenteditable \
-                     (Draft.js/Lexical/Slate-style editors can silently discard a one-shot \
-                     DOM write on their next render) try insert_text first (one CDP call, \
-                     cheap), then type_keystrokes if that also gets discarded (real \
-                     per-character keyboard events, slower but most durable). Or confirm \
-                     via the screenshot.",
+                    "Browser web content: AXValue read-back cannot prove that the page \
+                     observed the input. In Chrome, call get_browser_state (pid, window_id) \
+                     and type with browser_type, which reads the field back (its set_value \
+                     mode suits controlled React inputs). Or confirm via the screenshot.",
                 )),
                 _ => None,
             };
@@ -1340,6 +1377,10 @@ fn type_text_blocking(
             // No window to front — best-effort background keystrokes instead.
             None => (do_type()?, false),
         };
+        let delivered_chars = web_zero_is_unknown(
+            delivered_chars,
+            target_in_web_area(pid, element_ptr_and_idx, window_id),
+        );
         // Only claim the `_fg` path when a front actually happened; when no
         // foregrounding occurred (no window, or SPIs unavailable) these were
         // background keystrokes and `path` must say so honestly.
@@ -1412,6 +1453,21 @@ fn type_text_blocking(
             (ptr, /*owns=*/ true, None)
         }),
     };
+    // A Chromium page ignores an AX text write (the renderer's own state,
+    // such as React's, never changes while AXValue echoes the text), and a
+    // focused element that is not a text control (a web area, a button)
+    // cannot take text at all. Both go straight to key events, which reach
+    // whatever holds keyboard focus the way a user's typing does.
+    let ax_target = ax_target.filter(|&(element, owns, idx_opt)| {
+        let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+        let chromium_page = is_chromium_browser_pid(pid)
+            && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
+        let keep = ax_text_write_first(&role, owns, chromium_page);
+        if !keep && owns {
+            unsafe { CFRelease(element as CFTypeRef) };
+        }
+        keep
+    });
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -1551,6 +1607,10 @@ fn type_text_blocking(
             )
         },
     )?;
+    let delivered_chars = web_zero_is_unknown(
+        delivered_chars,
+        target_in_web_area(pid, element_ptr_and_idx, window_id),
+    );
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
         detail: format!(" via CGEvent ({delay_ms}ms delay)"),
         path: PATH_KEY_EVENTS,
@@ -1559,8 +1619,64 @@ fn type_text_blocking(
     }))
 }
 
+/// Key events into web content whose AXValue did not change: the page may
+/// have taken every key (a combobox moves accessibility focus to a
+/// suggestion, AX lags the renderer), so "0 delivered" would be a false
+/// count. Report it as unknown instead.
+fn web_zero_is_unknown(delivered_chars: Option<usize>, web_content: bool) -> Option<usize> {
+    if web_content && delivered_chars == Some(0) {
+        None
+    } else {
+        delivered_chars
+    }
+}
+
+/// Whether an AX text write is the first rung for a target with AX `role`.
+/// `implicit`: the window's focused element rather than an addressed one.
+fn ax_text_write_first(role: &str, implicit: bool, chromium_page: bool) -> bool {
+    let text_control = matches!(
+        role,
+        "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
+    );
+    !chromium_page && (text_control || !implicit)
+}
+
+/// A Chromium-family browser, not an Electron app (Electron keeps its own
+/// AX rules above).
+fn is_chromium_browser_pid(pid: i32) -> bool {
+    crate::browser::platform::is_chromium(
+        &apps::get_app_name_for_pid(pid).unwrap_or_default(),
+        &apps::bundle_id_for_pid(pid).unwrap_or_default(),
+    ) && !crate::browser::electron_js::ElectronJs::is_electron(pid)
+}
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn an_unchanged_web_value_is_unknown_not_zero() {
+        use super::web_zero_is_unknown;
+        assert_eq!(web_zero_is_unknown(Some(0), true), None);
+        assert_eq!(web_zero_is_unknown(Some(0), false), Some(0));
+        assert_eq!(web_zero_is_unknown(Some(3), true), Some(3));
+        assert_eq!(web_zero_is_unknown(None, true), None);
+    }
+
+    #[test]
+    fn chromium_pages_and_non_text_focus_skip_the_ax_write() {
+        use super::ax_text_write_first;
+        // Native text controls, addressed or focused, keep the AX rung.
+        assert!(ax_text_write_first("AXTextField", false, false));
+        assert!(ax_text_write_first("AXTextArea", true, false));
+        // A Chromium page field goes to key events either way.
+        assert!(!ax_text_write_first("AXTextField", false, true));
+        assert!(!ax_text_write_first("AXComboBox", true, true));
+        // Focus on a web area or a button is not a text target.
+        assert!(!ax_text_write_first("AXWebArea", true, false));
+        assert!(!ax_text_write_first("AXButton", true, false));
+        // An addressed element keeps the caller's choice.
+        assert!(ax_text_write_first("AXGroup", false, false));
+    }
+
     #[test]
     fn typing_insertion_samples_selection_after_existing_focus_preparation() {
         let scope = crate::ax::bindings::test_support::TypingFocusScope::install();

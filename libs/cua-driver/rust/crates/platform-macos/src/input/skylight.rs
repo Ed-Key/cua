@@ -872,6 +872,20 @@ pub fn with_foreground_assist(
         return Ok(false);
     }
 
+    // The exact window is already the key window of the frontmost app:
+    // deliver without re-activating. Re-activating it can clear Chromium's
+    // renderer focus (the field loses the caret and the keys go nowhere),
+    // the same reason `with_foreground_hid_activation` skips it.
+    let focused_window_id = crate::ax::bindings::focused_as_target(
+        crate::ax::bindings::focused_window_id_of_pid(target_pid),
+        target_wid,
+    );
+    if preserves_exact_existing_focus(prev_ok, prev_psn, target_psn, focused_window_id, target_wid)
+    {
+        body()?;
+        return Ok(true);
+    }
+
     let _intentional = crate::focus_steal::allow_intentional_activation(target_pid);
     unsafe { set_front(target_psn.as_ptr() as *const c_void, target_wid, 0x400) };
     // `set_front` moves WindowServer's front process but does not make the

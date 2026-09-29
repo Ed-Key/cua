@@ -472,6 +472,39 @@ impl Tool for ClickTool {
             }));
         }
 
+        // A Chrome page with cua's extension connected takes clicks through
+        // browser_click. Internal focus clicks (the px form of the keyboard
+        // tools) keep their own routing.
+        if action != "focus" {
+            let redirect = match (element_guard.as_ref(), x, y) {
+                (Some(guard), _, _) => {
+                    super::browser_route::page_input_redirect(
+                        "click",
+                        "browser_click",
+                        pid,
+                        window_id,
+                        Some(guard.as_ptr() as usize),
+                    )
+                    .await
+                }
+                (None, Some(x), Some(y)) if !from_zoom && capture_id.is_none() => {
+                    super::browser_route::page_input_redirect_at_pixel(
+                        "click",
+                        "browser_click",
+                        pid,
+                        window_id,
+                        x,
+                        y,
+                    )
+                    .await
+                }
+                _ => None,
+            };
+            if let Some(redirect) = redirect {
+                return redirect;
+            }
+        }
+
         if let (Some(idx), Some(wid), Some(element_guard)) =
             (element_index, window_id, element_guard)
         {

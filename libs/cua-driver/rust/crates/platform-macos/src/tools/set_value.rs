@@ -48,8 +48,9 @@ fn def() -> &'static ToolDef {
         description:
             "Set an element's value (element_token, or element_index + snapshot_id). A popup or \
              select gets the matching option pressed without opening its menu; other elements get \
-             AXValue written (sliders, steppers, date pickers, settable text fields). WebKit \
-             ignores value writes; use type_text for web inputs."
+             AXValue written (sliders, steppers, date pickers, settable text fields). Web pages \
+             ignore value writes: in Chrome use get_browser_state then browser_type, elsewhere \
+             type_text."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -139,6 +140,18 @@ impl Tool for SetValueTool {
         };
 
         let element_ptr = element_guard.as_ptr();
+
+        if let Some(redirect) = super::browser_route::page_input_redirect(
+            "set_value",
+            "browser_type with mode set_value",
+            pid,
+            Some(window_id),
+            Some(element_ptr as usize),
+        )
+        .await
+        {
+            return redirect;
+        }
 
         // set_value is an always-background semantic AX mutation. Re-prove
         // that the retained element still belongs to the requested exact
@@ -325,7 +338,7 @@ fn apply_surface_trust(outcome: &mut SetValueOutcome, ax_echo_surface: bool) {
         outcome.changed = None;
         outcome.detail.push_str(
             " AXValue read-back is not trusted for web content; verify the \
-             renderer via screenshot or use the browser page tools.",
+             page via screenshot, or in Chrome use get_browser_state then browser_type.",
         );
     }
 }
