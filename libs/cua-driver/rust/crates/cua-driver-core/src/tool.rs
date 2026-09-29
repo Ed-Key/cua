@@ -1777,7 +1777,10 @@ impl ToolRegistry {
         // its own worker, so a slow or stuck capture never delays this
         // action's result.
         if pip_hook::pip_enabled() && should_record && !private_consent_turn {
-            pip_hook::push_pip_frame(pip_frame(name, &args, &public_args, &runtime_prefix));
+            let frame = pip_frame(name, &args, &public_args, &runtime_prefix);
+            if pip_hook::pip_frame_wanted(name, &frame) {
+                pip_hook::push_pip_frame(frame);
+            }
         }
 
         result

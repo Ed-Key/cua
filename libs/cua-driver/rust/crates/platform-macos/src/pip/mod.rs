@@ -387,6 +387,17 @@ impl CaptureWorker {
     }
 }
 
+/// The one window a PiP capture may target: the frame's window, else the
+/// pid's frontmost on-screen window, else nothing. Never the whole display
+/// (that would film the PiP panels themselves).
+fn capture_window(target: Target, frontmost_of: impl FnOnce(i32) -> Option<u32>) -> Option<u32> {
+    match target {
+        (_, Some(window_id)) => Some(window_id),
+        (Some(pid), None) => frontmost_of(pid),
+        (None, None) => None,
+    }
+}
+
 fn lock<T>(mutex: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
     mutex.lock().unwrap_or_else(|e| e.into_inner())
 }
@@ -456,8 +467,12 @@ pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         remembered: HashMap::new(),
         next_id: 1,
     });
-    let capture: Arc<CaptureFn> = Arc::new(|(pid, window_id): Target| {
-        cua_driver_core::recording::screenshot_for(window_id.map(u64::from), pid.map(i64::from))
+    let capture: Arc<CaptureFn> = Arc::new(|target: Target| {
+        let window_id = capture_window(target, |pid| {
+            crate::windows::resolve_main_window_id(pid).ok()
+        })?;
+        // Always window-scoped, so other PiP panels are never in the image.
+        cua_driver_core::recording::screenshot_for(Some(u64::from(window_id)), None)
     });
     let worker = CaptureWorker::start(capture, CAPTURE_TIMEOUT, deliver_to_main)?;
     Ok(Box::new(MacosPipBackend { worker }))
@@ -1332,6 +1347,18 @@ mod tests {
         })
         .unwrap();
         (worker, delivered)
+    }
+
+    #[test]
+    fn captures_are_window_scoped_never_the_display() {
+        let none = |_| None;
+        assert_eq!(capture_window((None, None), |_| Some(9)), None);
+        assert_eq!(capture_window((Some(42), None), none), None);
+        assert_eq!(
+            capture_window((Some(42), None), |pid| (pid == 42).then_some(9)),
+            Some(9)
+        );
+        assert_eq!(capture_window((Some(42), Some(7)), |_| Some(9)), Some(7));
     }
 
     #[test]

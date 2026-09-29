@@ -106,9 +106,98 @@ pub fn pip_enabled() -> bool {
     PIP_PUSH_FN.get().is_some()
 }
 
+/// Lifecycle, configuration, recording and other non-GUI tools never
+/// update a panel, even when they happen to carry a pid.
+fn pip_meta_tool(tool_name: &str) -> bool {
+    matches!(
+        tool_name,
+        "start_session"
+            | "end_session"
+            | "escalate_session"
+            | "set_config"
+            | "start_recording"
+            | "stop_recording"
+            | "replay_trajectory"
+            | "install_ffmpeg"
+            | "install_extension"
+            | "kill_app"
+    ) || tool_name.starts_with("get_")
+        || tool_name.starts_with("list_")
+        || tool_name.starts_with("set_agent_cursor")
+}
+
+/// Whether this frame should reach the PiP at all: only GUI actions aimed
+/// at a target (pid or window) by an agent session, meaning one with a
+/// public session label or a known MCP client. One-shot CLI calls and
+/// implicit SDK sessions have neither and get no panel.
+pub fn pip_frame_wanted(tool_name: &str, frame: &PipHookFrame) -> bool {
+    let agent = frame.session_label.is_some() || frame.client_name.is_some();
+    let targeted = frame.target_pid.is_some() || frame.target_window_id.is_some();
+    agent && targeted && !pip_meta_tool(tool_name)
+}
+
 /// Push a frame to the PiP window. No-op when no backend is registered.
 pub fn push_pip_frame(frame: PipHookFrame) {
     if let Some(f) = PIP_PUSH_FN.get() {
         f(frame);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn frame(label: Option<&str>, client: Option<&str>, pid: Option<i32>) -> PipHookFrame {
+        PipHookFrame {
+            action_label: "click".into(),
+            timestamp_ms: 0,
+            session_key: "k".into(),
+            session_label: label.map(str::to_owned),
+            client_name: client.map(str::to_owned),
+            client_pid: None,
+            target_pid: pid,
+            target_window_id: None,
+        }
+    }
+
+    #[test]
+    fn only_labeled_or_client_known_sessions_get_a_panel() {
+        assert!(pip_frame_wanted(
+            "click",
+            &frame(Some("alpha"), None, Some(1))
+        ));
+        assert!(pip_frame_wanted(
+            "click",
+            &frame(None, Some("Claude Code"), Some(1))
+        ));
+        assert!(!pip_frame_wanted("click", &frame(None, None, Some(1))));
+    }
+
+    #[test]
+    fn lifecycle_meta_and_untargeted_calls_get_no_frame() {
+        for tool in [
+            "start_session",
+            "end_session",
+            "get_session_state",
+            "list_sessions",
+            "start_recording",
+            "stop_recording",
+            "set_config",
+            "set_agent_cursor_enabled",
+            "kill_app",
+        ] {
+            assert!(
+                !pip_frame_wanted(tool, &frame(Some("alpha"), None, Some(1))),
+                "{tool}"
+            );
+        }
+        assert!(!pip_frame_wanted(
+            "click",
+            &frame(Some("alpha"), None, None)
+        ));
+        assert!(pip_frame_wanted(
+            "type_text",
+            &frame(Some("alpha"), None, Some(1))
+        ));
     }
 }
