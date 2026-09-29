@@ -49,6 +49,10 @@ const CHIP_ROW_GAP: f64 = 6.0;
 const CHIP_GAP: f64 = 8.0;
 /// The trail window extends this far left of the panel window, for chips.
 pub(super) const TRAIL_PAD: f64 = CHIP_GAP + CHIP_W;
+/// The farthest a chip reaches left of the panel window: with the most back
+/// cards that still leave room for a chip (placement reserves this).
+pub(super) const CHIP_REACH: f64 =
+    CHIP_GAP + CHIP_W - STACK_MARGIN + (MAX_CARDS - 2) as f64 * CARD_STEP;
 /// Smallest front card the user can resize to.
 pub(super) const MIN_CARD: (f64, f64) = (240.0, 180.0);
 /// Largest front card, as a fraction of the screen's visible frame.
@@ -750,6 +754,11 @@ mod tests {
                 }
             }
         }
+        // CHIP_REACH is exactly the farthest any chip reaches left.
+        let reach = (0..MAX_CARDS - 1)
+            .map(|cards| -slot_frame(CARD, Slot::Chip(0), cards).x)
+            .fold(f64::MIN, f64::max);
+        assert_eq!(reach, CHIP_REACH);
         // Three chips fit beside the smallest front card.
         let top = slot_frame(MIN_CARD, Slot::Chip(2), 0);
         assert!(top.y + top.h <= MIN_CARD.1);

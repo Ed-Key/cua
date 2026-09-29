@@ -123,8 +123,8 @@ use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
     back_cards, card_size, item_at, max_card, own_pixels, resize_edges, resize_settled,
-    resize_window, slot_frame, trail_frame, window_size, CardStack, Motion, Slot, Trail, DRAG_SLOP,
-    MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, TRAIL_PAD, VIEWS,
+    resize_window, slot_frame, trail_frame, window_size, CardStack, Motion, Slot, Trail,
+    CHIP_REACH, DRAG_SLOP, MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, TRAIL_PAD, VIEWS,
 };
 
 // ── CGColor objc2 encoding shim ────────────────────────────────────────────
@@ -256,6 +256,23 @@ fn first_slot_bottom_right(
         Some((x, y)) => (screen.x + x as f64 + w, screen.y + screen.h - y as f64 - h),
         None => (visible.x + visible.w - EDGE_INSET, visible.y + EDGE_INSET),
     }
+}
+
+/// Origin of a panel window of `size` in cascade `slot`. Placement works on
+/// the panel's footprint: the window plus the chip column that can reach
+/// `CHIP_REACH` left of it, so chips stay on screen and clear of the
+/// neighbouring column.
+fn panel_origin(
+    screen: Area,
+    visible: Area,
+    size: (f64, f64),
+    anchor: Option<(i32, i32)>,
+    slot: usize,
+) -> (f64, f64) {
+    let footprint = (size.0 + CHIP_REACH, size.1);
+    let bottom_right = first_slot_bottom_right(screen, visible, footprint, anchor);
+    let (x, y) = stack_origin(bottom_right, visible, footprint, slot);
+    (x + CHIP_REACH, y)
 }
 
 /// Lowest cascade slot no live panel occupies.
@@ -1065,11 +1082,13 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
 
     let new_target = (frame.target_pid, frame.target_window_id);
     let now = Instant::now();
-    // A new action cancels a finale in progress: back to live.
+    // A new action cancels a finale in progress: back to live. The overlay
+    // goes whether or not the finale is still playing: one that just ended
+    // is still up during the fade, and this frame re-shows the panel.
     if panel.finale.cancel() {
-        remove_finale_view(panel);
         tracing::info!(target: "pip", session = %key, "PiP finished state cancelled by a new action");
     }
+    remove_finale_view(panel);
     // Where: target app icon + window title.
     let title = show_target(panel, frame.target_pid, target_title);
     // The session acted in this window: it becomes the front card (before
@@ -1582,6 +1601,7 @@ unsafe extern "C" fn live_event_cb(ctx: *mut c_void) {
 unsafe fn refresh(state: &mut State, key: &str) {
     let State {
         panels,
+        ending,
         streams,
         next_stream_generation,
         image_size,
@@ -1589,10 +1609,13 @@ unsafe fn refresh(state: &mut State, key: &str) {
         worker,
         ..
     } = state;
+    // An ended session's panel keeps its slot while its finale is up.
     let others: Vec<usize> = panels
         .iter()
         .filter(|(other, _)| other.as_str() != key)
-        .filter_map(|(_, panel)| panel.slot)
+        .map(|(_, panel)| panel)
+        .chain(ending.iter())
+        .filter_map(|panel| panel.slot)
         .collect();
     let Some(panel) = panels.get_mut(key) else {
         return;
@@ -1706,8 +1729,12 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
     objc2::rc::autoreleasepool(|_| {
         with_state(|state| {
             if let Some(index) = state.ending.iter().position(|panel| panel.id == id) {
-                let panel = state.ending.remove(index);
-                close_panel(panel);
+                // Only the finale that is playing closes it: an idle finale
+                // cancelled by an action, then a new one started at session
+                // end, leaves a stale timer behind.
+                if state.ending[index].finale.end(generation) {
+                    close_panel(state.ending.remove(index));
+                }
                 return;
             }
             let key = state
@@ -2428,12 +2455,11 @@ unsafe fn slot_origin(
     }
     let screen_frame: NSRect = msg_send![screen, frame];
     let visible_frame: NSRect = msg_send![screen, visibleFrame];
-    let bottom_right =
-        first_slot_bottom_right(area_of(screen_frame), area_of(visible_frame), size, anchor);
-    Some(stack_origin(
-        bottom_right,
+    Some(panel_origin(
+        area_of(screen_frame),
         area_of(visible_frame),
         size,
+        anchor,
         slot,
     ))
 }
@@ -3933,6 +3959,51 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn placement_keeps_the_chip_column_on_screen_and_clear_of_other_columns() {
+        let screen = Area {
+            x: 0.0,
+            y: 0.0,
+            w: 1440.0,
+            h: 900.0,
+        };
+        let visible = Area {
+            x: 0.0,
+            y: 70.0,
+            w: 1440.0,
+            h: 805.0,
+        };
+        for anchor in [None, Some((0, 0)), Some((20, 40)), Some((-500, 0))] {
+            let origins: Vec<_> = (0..12)
+                .map(|slot| panel_origin(screen, visible, SIZE, anchor, slot))
+                .collect();
+            for (slot, &(x, y)) in origins.iter().enumerate() {
+                // Chips reach CHIP_REACH left of the window: still on screen.
+                assert!(x - CHIP_REACH >= visible.x, "{anchor:?} slot {slot}: {x}");
+                assert!(
+                    x + SIZE.0 <= visible.x + visible.w,
+                    "{anchor:?} slot {slot}"
+                );
+                assert!(y >= visible.y && y + SIZE.1 <= visible.y + visible.h);
+            }
+            // Distinct slots' footprints (chips included) never overlap.
+            let last = origins
+                .iter()
+                .position(|o| o == origins.last().unwrap())
+                .unwrap();
+            for (i, a) in origins[..=last].iter().enumerate() {
+                for b in &origins[i + 1..=last] {
+                    let apart =
+                        (a.0 - b.0).abs() >= SIZE.0 + CHIP_REACH || (a.1 - b.1).abs() >= SIZE.1;
+                    assert!(apart, "{anchor:?}: {a:?} and {b:?} overlap");
+                }
+            }
+        }
+        // The default corner still puts the window's right edge at the inset.
+        let (x, _) = panel_origin(screen, visible, SIZE, None, 0);
+        assert_eq!(x + SIZE.0, visible.w - EDGE_INSET);
     }
 
     #[test]

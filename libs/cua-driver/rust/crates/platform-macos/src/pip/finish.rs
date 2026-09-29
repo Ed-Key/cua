@@ -446,6 +446,22 @@ mod tests {
     }
 
     #[test]
+    fn a_cancelled_finales_timer_cannot_end_the_next_one() {
+        // Idle finale, cancelled by an action, then a new finale at session
+        // end before the first timer fires: only the new timer ends it.
+        let mut finale = FinaleState::default();
+        let idle = finale.start(true).unwrap();
+        finale.cancel();
+        let at_end = finale.start(true).unwrap();
+        assert!(
+            !finale.end(idle),
+            "the stale timer must not close the panel"
+        );
+        assert!(finale.playing());
+        assert!(finale.end(at_end));
+    }
+
+    #[test]
     fn the_finale_plays_once_per_idle_and_a_new_action_cancels_it() {
         let mut finale = FinaleState::default();
         assert!(!finale.due(true), "still active");
