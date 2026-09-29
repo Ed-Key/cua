@@ -471,7 +471,7 @@ fn begin_session_dispatch_inner(
         // insertion, leaving a tombstoned record that was silently recreated
         // by a racing first action.
         let mut ended = ended_sessions().lock().unwrap();
-        let mut idle_ended = idle_ended_implicit_sessions().lock().unwrap();
+        let mut idle_ended = idle_ended_sessions().lock().unwrap();
         let recreated = ended.contains_key(session_id);
         if recreated
             && !(recreate
@@ -696,7 +696,7 @@ pub fn activate_or_revive_session_for_owner(
         }
         if revived {
             ended.remove(session_id);
-            idle_ended_implicit_sessions()
+            idle_ended_sessions()
                 .lock()
                 .unwrap()
                 .remove(session_id);
@@ -1017,10 +1017,13 @@ static ENDED_SESSIONS: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLo
 /// (see [`reclaim_exited_session`]). A flag only counts while its tombstone
 /// exists; every new tombstone clears it first.
 static OWNER_EXITED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
-/// Tombstoned unnamed transport sessions whose episode ended only because the
+/// Tombstoned sessions, named or unnamed, whose episode ended only because the
 /// idle sweep reclaimed it. Mutated only while holding the `ENDED_SESSIONS`
 /// lock, and meaningful only while the matching tombstone exists.
-static IDLE_ENDED_IMPLICIT_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+static IDLE_ENDED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Why each tombstone was written, for refusal messages. Read only while the
+/// tombstone exists ([`session_end_reason`]); a later end overwrites it.
+static ENDED_REASONS: OnceLock<Mutex<HashMap<String, SessionEndReason>>> = OnceLock::new();
 /// Runtime generations that have received terminal revoke-all.
 ///
 /// This latch is intentionally independent of grants and public session
@@ -1048,8 +1051,12 @@ fn owner_exited_sessions() -> &'static Mutex<HashSet<String>> {
     OWNER_EXITED_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
 }
 
-fn idle_ended_implicit_sessions() -> &'static Mutex<HashSet<String>> {
-    IDLE_ENDED_IMPLICIT_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+fn idle_ended_sessions() -> &'static Mutex<HashSet<String>> {
+    IDLE_ENDED_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn ended_reasons() -> &'static Mutex<HashMap<String, SessionEndReason>> {
+    ENDED_REASONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn suspended_runtime_scopes() -> &'static Mutex<HashSet<String>> {
@@ -1257,10 +1264,15 @@ pub fn release_process_state_for_shutdown() {
         let mut ended = ended.lock().unwrap();
         ended.clear();
         ended.shrink_to_fit();
-        if let Some(idle_ended) = IDLE_ENDED_IMPLICIT_SESSIONS.get() {
+        if let Some(idle_ended) = IDLE_ENDED_SESSIONS.get() {
             let mut idle_ended = idle_ended.lock().unwrap();
             idle_ended.clear();
             idle_ended.shrink_to_fit();
+        }
+        if let Some(reasons) = ENDED_REASONS.get() {
+            let mut reasons = reasons.lock().unwrap();
+            reasons.clear();
+            reasons.shrink_to_fit();
         }
     }
     if let Some(exited) = OWNER_EXITED_SESSIONS.get() {
@@ -1309,18 +1321,21 @@ fn mark_session_ended(
     activity().lock().unwrap().remove(session_id);
     let mut ended = ended_sessions().lock().unwrap();
     let record = lifecycle_records().lock().unwrap().remove(session_id);
-    // Only the transport's own unnamed session, reclaimed for inactivity, is
-    // recreated on its next call. Named sessions and every other end reason
-    // keep the resurrection guard until an explicit start_session.
-    let idle_implicit = reason == SessionEndReason::IdleTimeout
-        && record
-            .as_ref()
-            .is_some_and(|record| record.implicit && record.owner_transport == session_id);
-    let mut idle_ended = idle_ended_implicit_sessions().lock().unwrap();
+    // A session reclaimed for inactivity, named or not, is recreated on its
+    // owner transport's next call. Every other end reason keeps the
+    // resurrection guard until an explicit start_session.
+    let idle_owned = reason == SessionEndReason::IdleTimeout && record.is_some();
+    let mut idle_ended = idle_ended_sessions().lock().unwrap();
     if ended.contains_key(session_id) {
         // A later explicit or transport end makes an idle end terminal.
         if reason != SessionEndReason::IdleTimeout {
             idle_ended.remove(session_id);
+            if reason != SessionEndReason::Unknown {
+                ended_reasons()
+                    .lock()
+                    .unwrap()
+                    .insert(session_id.to_owned(), reason);
+            }
         }
         false
     } else {
@@ -1331,7 +1346,11 @@ fn mark_session_ended(
                 .or(record.map(|record| record.owner_transport)),
         );
         owner_exited_sessions().lock().unwrap().remove(session_id);
-        if idle_implicit {
+        ended_reasons()
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), reason);
+        if idle_owned {
             idle_ended.insert(session_id.to_owned());
         } else {
             idle_ended.remove(session_id);
@@ -1486,10 +1505,14 @@ pub fn forget_ended_sessions_with_prefix(prefix: &str) -> usize {
     let before = ended.len();
     ended.retain(|session, _| !session.starts_with(prefix));
     let forgotten = before - ended.len();
-    idle_ended_implicit_sessions()
+    idle_ended_sessions()
         .lock()
         .unwrap()
         .retain(|session| !session.starts_with(prefix));
+    ended_reasons()
+        .lock()
+        .unwrap()
+        .retain(|session, _| !session.starts_with(prefix));
     drop(ended);
     cleanup_progress()
         .lock()
@@ -1506,22 +1529,52 @@ pub fn is_session_ended(session_id: &str) -> bool {
     ended_sessions().lock().unwrap().contains_key(session_id)
 }
 
-/// Whether an ended lifecycle id is the owner transport's unnamed session,
-/// reclaimed only by the idle sweep, so that transport's next
-/// session-requiring call recreates it instead of being refused. Named
-/// sessions, explicit ends, and transport exits always return `false`.
+/// Whether an ended lifecycle id was reclaimed only by the idle sweep and
+/// `owner_transport` owned it, so that transport's next session-requiring call
+/// recreates it instead of being refused. This holds for named and unnamed
+/// sessions alike. Explicit ends, transport exits, revocations, and every
+/// other transport always return `false`.
 pub fn recreates_on_next_call(session_id: &str, owner_transport: &str) -> bool {
-    if session_id != owner_transport {
-        return false;
-    }
     let ended = ended_sessions().lock().unwrap();
     ended
         .get(session_id)
         .is_some_and(|owner| owner.as_deref() == Some(owner_transport))
-        && idle_ended_implicit_sessions()
+        && idle_ended_sessions()
             .lock()
             .unwrap()
             .contains(session_id)
+}
+
+/// Why an ended session ended, while its tombstone exists. `None` for a live
+/// or unknown id.
+pub fn session_end_reason(session_id: &str) -> Option<SessionEndReason> {
+    let ended = ended_sessions().lock().unwrap();
+    if !ended.contains_key(session_id) {
+        return None;
+    }
+    if owner_exited_sessions().lock().unwrap().contains(session_id) {
+        return Some(SessionEndReason::ProcessExit);
+    }
+    Some(
+        ended_reasons()
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .copied()
+            .unwrap_or(SessionEndReason::Unknown),
+    )
+}
+
+/// The clause a refusal uses to say why a session ended.
+pub fn session_end_explanation(reason: Option<SessionEndReason>) -> &'static str {
+    match reason {
+        Some(SessionEndReason::IdleTimeout) => {
+            "it was idle past the session idle timeout (5 minutes by default)"
+        }
+        Some(SessionEndReason::Explicit) => "end_session ended it",
+        Some(SessionEndReason::ProcessExit) => "the connection that owned it closed",
+        Some(SessionEndReason::Unknown) | None => "the host ended it",
+    }
 }
 
 /// Whether termination has been requested for a runtime-private lifecycle.
@@ -1560,7 +1613,7 @@ pub fn revive_session(session_id: &str) -> bool {
         return false;
     }
     let mut ended = ended_sessions().lock().unwrap();
-    idle_ended_implicit_sessions()
+    idle_ended_sessions()
         .lock()
         .unwrap()
         .remove(session_id);
@@ -1618,7 +1671,7 @@ pub fn revive_session_for_owner(
         None if owner_transport != session_id => Err("session is not available to this transport"),
         _ => {
             ended.remove(session_id);
-            idle_ended_implicit_sessions()
+            idle_ended_sessions()
                 .lock()
                 .unwrap()
                 .remove(session_id);
@@ -2327,7 +2380,7 @@ mod tests {
     }
 
     #[test]
-    fn only_the_owners_unnamed_session_is_recreated_after_an_idle_end() {
+    fn only_the_owner_transport_recreates_an_idle_ended_session() {
         let pid = std::process::id();
         let implicit = format!("idle-recreate-implicit-{pid}");
         let named = format!("idle-recreate-named-{pid}");
@@ -2370,12 +2423,18 @@ mod tests {
             [named.clone()]
         );
 
-        // A named episode keeps its resurrection guard.
-        assert!(!recreates_on_next_call(&named, &named_owner));
+        // A named episode comes back for its owner transport only, and says
+        // why it ended while it is down.
+        assert_eq!(session_end_reason(&named), Some(SessionEndReason::IdleTimeout));
+        assert!(!recreates_on_next_call(&named, "another-transport"));
         assert_eq!(
-            begin(&named, Some("named"), &named_owner).err(),
+            begin(&named, Some("named"), "another-transport").err(),
             Some("session has ended")
         );
+        assert!(recreates_on_next_call(&named, &named_owner));
+        drop(begin(&named, Some("named"), &named_owner).expect("named session recreated"));
+        assert!(!is_session_ended(&named));
+        assert_eq!(session_end_reason(&named), None);
         // Another transport cannot claim the unnamed id.
         assert_eq!(
             begin(&implicit, None, "another-transport").err(),
@@ -2397,12 +2456,14 @@ mod tests {
 
         // An explicit end stays terminal until start_session.
         end_session(&implicit);
+        assert_eq!(session_end_reason(&implicit), Some(SessionEndReason::Explicit));
         assert!(!recreates_on_next_call(&implicit, &implicit));
         assert_eq!(
             begin(&implicit, None, &implicit).err(),
             Some("session has ended")
         );
         assert!(revive_session(&implicit));
+        end_session(&named);
         assert!(revive_session(&named));
     }
 

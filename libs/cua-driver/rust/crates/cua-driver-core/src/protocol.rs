@@ -402,7 +402,7 @@ On continuation/recent-work, when available, call `history_status`; if ready, ma
 For app/window outcomes, use the narrowest semantic Cua route first: `set_window_frame` plus `list_windows` readback for geometry, typed browser tools for supported page content, and clipboard tools for clipboard state. Then climb: background `element_index` ({tree_kind}), background pixels, foreground delivery, desktop fallback. Never advance on transport success alone.
 
 Workflow per task:
-0. `start_session` is optional. For multi-call work, prefer a short `session` label and repeat it on every call that accepts it. Unnamed calls use the transport's implicit session. Only `start_session` revives an ended name; `end_session` explicitly cleans up.
+0. `start_session` is optional. For multi-call work, prefer a short `session` label and repeat it on every call that accepts it. Unnamed calls use the transport's implicit session. Idle names resume; `start_session` revives others; `end_session` cleans up.
 1. {read_step}
 2. {act_step}
 3. `verify_state(pid, window_id, expect)` checks bounded postconditions. `unknown` is not success; `include_screenshot:true` lets the multimodal agent judge visual evidence.
@@ -541,8 +541,8 @@ mod agent_instruction_tests {
         assert!(instructions.contains("prefer a short `session` label"));
         assert!(instructions.contains("repeat it on every call that accepts it"));
         assert!(instructions.contains("transport's implicit session"));
-        assert!(instructions.contains("Only `start_session` revives an ended name"));
-        assert!(instructions.contains("`end_session` explicitly cleans up"));
+        assert!(instructions.contains("Idle names resume; `start_session` revives others"));
+        assert!(instructions.contains("`end_session` cleans up"));
         assert!(
             !instructions.contains("`start_session(session)` once"),
             "initialize instructions must not require explicit session setup"

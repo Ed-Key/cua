@@ -1195,8 +1195,9 @@ impl ToolRegistry {
                 .and_then(Value::as_str)
                 .unwrap_or(session);
             let public_label = args.get("_public_session_label").and_then(Value::as_str);
-            // An unnamed session reclaimed by the idle sweep is recreated at
-            // lifecycle admission below; a label whose owner connection closed
+            // A session reclaimed by the idle sweep is recreated for its own
+            // transport at lifecycle admission below; a label whose owner
+            // connection closed
             // is reclaimed here; every other ended episode refuses with the
             // recovery that actually applies to its identity.
             if !matches!(resolved_name, "start_session" | "end_session")
@@ -1205,7 +1206,8 @@ impl ToolRegistry {
                 && !crate::session::reclaim_exited_session(session, public_label, owner)
             {
                 let message = ended_session_refusal_message(
-                    args.get("_public_session_label").and_then(Value::as_str),
+                    public_label,
+                    crate::session::session_end_reason(session),
                 );
                 let mut result = protected_refusal("session_ended", &message);
                 restore_public_runtime_result(&mut result, &runtime_prefix);
@@ -3752,7 +3754,7 @@ resources:
     }
 
     #[tokio::test]
-    async fn idle_reclaimed_unnamed_session_recreates_and_ended_sessions_name_a_working_recovery() {
+    async fn idle_reclaimed_sessions_recreate_and_ended_sessions_say_why_and_name_a_working_recovery() {
         let hits = Arc::new(AtomicUsize::new(0));
         let mut registry = super::ToolRegistry::new_with_protected_consent_provider(None);
         registry.register(Box::new(ObservationProbe {
@@ -3801,17 +3803,30 @@ resources:
             2
         );
 
-        // The unnamed session comes back on its next call.
+        // Both come back on their own transport's next call.
         assert_ne!(call(serde_json::json!({})).await.is_error, Some(true));
-        assert_eq!(hits.load(Ordering::SeqCst), 3);
+        assert_ne!(
+            call(serde_json::json!({"session": "named"})).await.is_error,
+            Some(true)
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 4);
 
-        // A named session stays refused, and the named recovery works.
+        // An explicitly ended named session stays refused, says why, and the
+        // named recovery works.
+        let ended = registry
+            .invoke_with_context(
+                "end_session",
+                serde_json::json!({"session": "named"}),
+                context.clone(),
+            )
+            .await;
+        assert_ne!(ended.is_error, Some(true), "{ended:?}");
         let named = call(serde_json::json!({"session": "named"})).await;
         assert_eq!(
             refusal(&named),
             (
                 "session_ended".to_owned(),
-                "session 'named' has ended; call start_session with session 'named' to start it again, or use a new session label".to_owned()
+                "session 'named' has ended because end_session ended it; call start_session with session 'named' to start it again, or use a new session label".to_owned()
             )
         );
         let started = registry
@@ -3837,7 +3852,7 @@ resources:
             refusal(&unnamed),
             (
                 "session_ended".to_owned(),
-                "this transport's unnamed session has ended; call start_session without a session label to start a new one".to_owned()
+                "this transport's unnamed session has ended because end_session ended it; call start_session without a session label to start a new one".to_owned()
             )
         );
         let restarted = registry
@@ -3845,7 +3860,7 @@ resources:
             .await;
         assert_ne!(restarted.is_error, Some(true), "{restarted:?}");
         assert_ne!(call(serde_json::json!({})).await.is_error, Some(true));
-        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert_eq!(hits.load(Ordering::SeqCst), 6);
 
         crate::session::revoke_sessions_with_prefix(&prefix);
         crate::session::forget_ended_sessions_with_prefix(&prefix);
@@ -5375,12 +5390,16 @@ fn protected_scope_refusal(message: &str) -> ToolResult {
 /// Recovery text for a call on an ended lifecycle episode. A named session is
 /// restarted by name from its own transport; an unnamed one has no label to
 /// pass, so naming one would only start an unrelated session.
-fn ended_session_refusal_message(public_label: Option<&str>) -> String {
+fn ended_session_refusal_message(
+    public_label: Option<&str>,
+    reason: Option<crate::session::SessionEndReason>,
+) -> String {
+    let why = crate::session::session_end_explanation(reason);
     match public_label {
         Some(label) => format!(
-            "session '{label}' has ended; call start_session with session '{label}' to start it again, or use a new session label"
+            "session '{label}' has ended because {why}; call start_session with session '{label}' to start it again, or use a new session label"
         ),
-        None => "this transport's unnamed session has ended; call start_session without a session label to start a new one".to_owned(),
+        None => format!("this transport's unnamed session has ended because {why}; call start_session without a session label to start a new one"),
     }
 }
 

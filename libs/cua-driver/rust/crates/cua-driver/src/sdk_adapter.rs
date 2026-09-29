@@ -136,9 +136,9 @@ impl SdkAdapter {
             });
         // Core revives a label on start_session, when a new connection
         // reclaims one its closed owner left, and when an idle-reclaimed
-        // unnamed session is recreated on its next call. Follow that
-        // transition itself, whatever the call then returns; an end_session
-        // or revoke tombstone stays until start_session succeeds.
+        // session is recreated on its next call. Follow that transition
+        // itself, whatever the call then returns; an end_session or revoke
+        // tombstone stays until start_session succeeds.
         let revive_sessions = public_sessions.clone();
         let revive_prefix = runtime_prefix.clone();
         let session_revive_hook =
@@ -305,9 +305,9 @@ impl SdkAdapter {
     }
 
     /// Whether the legacy socket must refuse a call on this ended session.
-    /// An unnamed transport session reclaimed by the idle sweep is not
-    /// refused: core recreates it on the call.
-    pub fn is_session_ended(&self, session: &str) -> bool {
+    /// A session the idle sweep reclaimed is not refused for its own
+    /// transport: core recreates it on the call.
+    pub fn is_session_ended(&self, session: &str, transport_session: Option<&str>) -> bool {
         if !self
             .public_sessions
             .lock()
@@ -318,7 +318,20 @@ impl SdkAdapter {
             return false;
         }
         let internal = format!("{}{session}", self.runtime_prefix);
-        !cua_driver_core::session::recreates_on_next_call(&internal, &internal)
+        let owner = format!(
+            "{}{}",
+            self.runtime_prefix,
+            transport_session.unwrap_or(session)
+        );
+        !cua_driver_core::session::recreates_on_next_call(&internal, &owner)
+    }
+
+    /// Why an ended public session ended, for the early refusal message.
+    pub fn session_end_reason(
+        &self,
+        session: &str,
+    ) -> Option<cua_driver_core::session::SessionEndReason> {
+        cua_driver_core::session::session_end_reason(&format!("{}{session}", self.runtime_prefix))
     }
 
     /// Whether a call from `transport_session` may reclaim `session`, ended
@@ -658,7 +671,7 @@ mod tests {
             .await
             .expect("end implicit session");
         assert_ne!(ended["isError"], true);
-        assert!(sdk.is_session_ended(transport_session));
+        assert!(sdk.is_session_ended(transport_session, None));
 
         let revived = sdk
             .invoke_raw("start_session", implicit_args())
@@ -667,7 +680,7 @@ mod tests {
         assert_ne!(revived["isError"], true);
         assert_eq!(revived["structuredContent"]["revived"], true);
         assert!(
-            !sdk.is_session_ended(transport_session),
+            !sdk.is_session_ended(transport_session, None),
             "successful implicit revival must clear the adapter's early tombstone"
         );
 
@@ -759,8 +772,8 @@ mod tests {
         }
         sdk.end_session(revoked).await.expect("operator revoke");
         sdk.end_transport_sessions("owner-a");
-        assert!(sdk.is_session_ended(exited));
-        assert!(sdk.is_session_ended(revoked));
+        assert!(sdk.is_session_ended(exited, None));
+        assert!(sdk.is_session_ended(revoked, None));
 
         assert!(!sdk.is_session_reclaimable(exited, Some("owner-a")));
         assert!(!sdk.is_session_reclaimable(revoked, Some("owner-b")));
@@ -774,7 +787,7 @@ mod tests {
             .expect("failing call");
         assert_eq!(failed["isError"], true, "{failed}");
         assert!(
-            !sdk.is_session_ended(exited),
+            !sdk.is_session_ended(exited, None),
             "the mirror must follow core even when the reclaiming call fails"
         );
         let reused = sdk
@@ -783,9 +796,55 @@ mod tests {
             .expect("reuse exited label");
         assert_ne!(reused["isError"], true, "{reused}");
         assert!(
-            !sdk.is_session_ended(exited),
+            !sdk.is_session_ended(exited, None),
             "a reclaim must clear the adapter's early tombstone"
         );
+
+        sdk.shutdown().await.expect("shutdown");
+    }
+
+    #[tokio::test]
+    async fn an_idle_named_session_comes_back_for_its_own_transport_only() {
+        let _runtime_guard = crate::test_runtime_lock().lock().await;
+        let sdk = SdkAdapter::load(host_driver()).await.expect("SDK adapter");
+        let args = |transport: &str| {
+            json!({
+                "session": "adapter-quiet-label",
+                "_session_id": "adapter-quiet-label",
+                "_transport_session_id": transport,
+            })
+        };
+        let started = sdk
+            .invoke_raw("start_session", args("owner-a"))
+            .await
+            .expect("start session");
+        assert_ne!(started["isError"], true);
+        cua_driver_core::session::evict_idle_with_prefix(
+            std::time::Duration::ZERO,
+            &sdk.runtime_prefix,
+        );
+        assert_eq!(
+            sdk.session_end_reason("adapter-quiet-label"),
+            Some(cua_driver_core::session::SessionEndReason::IdleTimeout)
+        );
+        assert!(sdk.is_session_ended("adapter-quiet-label", Some("owner-b")));
+        assert!(!sdk.is_session_ended("adapter-quiet-label", Some("owner-a")));
+
+        let other = sdk
+            .invoke_raw("get_config", args("owner-b"))
+            .await
+            .expect("call from another transport");
+        assert_eq!(other["isError"], true, "{other}");
+        assert!(
+            other.to_string().contains("idle"),
+            "the refusal says why the session ended: {other}"
+        );
+        let owner = sdk
+            .invoke_raw("get_config", args("owner-a"))
+            .await
+            .expect("call from the owner transport");
+        assert_ne!(owner["isError"], true, "{owner}");
+        assert!(!sdk.is_session_ended("adapter-quiet-label", None));
 
         sdk.shutdown().await.expect("shutdown");
     }

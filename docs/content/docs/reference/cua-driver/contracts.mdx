@@ -47,12 +47,14 @@ visibility only. A call in flight cannot expire, and a completed call refreshes
 the lifecycle timer once. Transport close, explicit end, revocation, and idle
 expiry use the same cleanup hooks.
 
-When idle expiry ends a transport's implicit session, the next unnamed stateful
-call on that transport starts a new implicit session. Cleanup has already run,
-so element tokens and snapshots from the ended session stay invalid; take a new
-snapshot before acting. Other ended sessions stay ended and refuse calls with
-`session_ended` until `start_session` restarts them: pass the label for a named
-session, or omit `session` for the implicit one.
+When idle expiry ends a session, named or implicit, the next stateful call for
+it from the transport that owned it starts a new episode under the same
+identity. Cleanup has already run, so element tokens and snapshots from the
+ended episode stay invalid; take a new snapshot before acting. Calls from any
+other transport, and sessions ended any other way (`end_session`, transport
+close, revocation), refuse with `session_ended` until `start_session` restarts
+them: pass the label for a named session, or omit `session` for the implicit
+one. The refusal says why the session ended.
 
 For multi-call work, prefer a short public `session` label and pass the same
 value on every call that accepts it. Passing it once is not sticky: a later call

@@ -31,9 +31,9 @@ session. Repeated unnamed clicks on the same MCP connection belong to that one
 session; they do not create one session per click. The default idle TTL is five
 minutes, separate from the cursor's visibility timeout. Transport close,
 explicit end, or idle expiry runs the same cleanup path. After idle expiry, the
-next unnamed call starts a new implicit session, while earlier element tokens
-stay stale. A named session that expires stays ended until `start_session`
-restarts it by name.
+connection's next call starts a new episode of the same session, implicit or
+named, while earlier element tokens stay stale. A session ended with
+`end_session` stays ended until `start_session` restarts it.
 
 ### PID-only window targets
 
