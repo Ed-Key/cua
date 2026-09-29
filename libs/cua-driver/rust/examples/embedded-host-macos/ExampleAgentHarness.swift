@@ -161,7 +161,8 @@ log("launch_app(Finder) — pid: \(pid), windows: \(windows.count)")
 let state = call("get_window_state", ["pid": pid, "window_id": windowId])
 let images = (state["content"] as? [[String: Any]] ?? [])
     .filter { $0["type"] as? String == "image" }
-let hasTree = (state["structuredContent"] as? [String: Any])?["elements"] != nil
+let tree = (state["structuredContent"] as? [String: Any])?["tree_markdown"] as? String
+let hasTree = !(tree ?? "").isEmpty
 log("get_window_state(Finder) — tree: \(hasTree ? "ok" : "EMPTY"), " +
     "screenshot: \(images.count) image(s) (want: ≥1)")
 

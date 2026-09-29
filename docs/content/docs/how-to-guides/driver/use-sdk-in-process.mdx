@@ -130,7 +130,7 @@ identity and postcondition for your application.
 import asyncio
 
 from cua_driver import (
-    ActionTarget, ClickButton, ClickInput, ClickPosition, CuaDriver,
+    ActionTarget, ClickButton, ClickInput, ClickPosition, CuaDriver, ElementFields,
     GetWindowStateInput, InputDeliveryMode, ListAppsInput, ListWindowsInput,
 )
 
@@ -159,6 +159,8 @@ async def main() -> None:
             include_accessibility_tree=True, include_screenshot=True,
             screenshot_out_file=None, max_elements=None, max_depth=None,
             max_dimension=None,
+            # macOS omits element records unless asked.
+            element_fields=ElementFields.COMPACT,
         )
 
         async def snapshot():
@@ -197,7 +199,7 @@ asyncio.run(main())
 
 ```ts
 import {
-  ActionTarget, ClickButton, ClickInput, ClickPosition, CuaDriver,
+  ActionTarget, ClickButton, ClickInput, ClickPosition, CuaDriver, ElementFields,
   GetWindowStateInput, InputDeliveryMode, ListAppsInput, ListWindowsInput,
 } from '@trycua/cua-driver';
 
@@ -223,6 +225,8 @@ try {
   const capture = GetWindowStateInput.new({
     pid: app.pid, windowId: window.windowId,
     includeAccessibilityTree: true, includeScreenshot: true,
+    // macOS omits element records unless asked.
+    elementFields: ElementFields.Compact,
   });
   async function snapshot() {
     const state = await driver.getWindowState(capture);

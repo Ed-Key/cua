@@ -65,7 +65,9 @@ impl PendingCapture<(ToolResponse, McpDriver)> {
                     "pid": pid,
                     "window_id": window,
                     "include_screenshot": true,
-                    "screenshot_out_file": path
+                    "screenshot_out_file": path,
+                    // element_token_by_id reads the element records.
+                    "element_fields": "compact"
                 }),
             );
             std::fs::write(
@@ -264,7 +266,7 @@ fn harness_appkit_pending_snapshot_cannot_retarget_token() {
             "get_window_state",
             serde_json::json!({
                 "pid": harness.pid, "window_id": window, "include_screenshot": true,
-                "screenshot_out_file": initial_png
+                "screenshot_out_file": initial_png, "element_fields": "compact"
             }),
         );
         std::fs::write(

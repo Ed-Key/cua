@@ -222,6 +222,9 @@ class BaseDriver:
             session=self.session,
             include_accessibility_tree=True,
             include_screenshot=False,
+            # macOS omits element records unless asked; frame and a false
+            # `selected` appear only in full records.
+            element_fields="full",
         )
         raw_elements = state.get("elements")
         if not isinstance(raw_elements, list):
