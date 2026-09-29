@@ -926,6 +926,11 @@ unsafe fn refresh(state: &mut State, key: &str) {
             // The last live frame stays up while the panel fades out.
             panel.stream.stop();
             streams.request(key, Request::Stop);
+            // A shown panel only stops for a new target it cannot stream:
+            // its old live frame must not sit under the new label.
+            if panel.shown {
+                clear_live(panel);
+            }
         }
         StreamStep::Keep => {}
     }

@@ -51,7 +51,8 @@ pub(super) enum StreamStep {
 /// `requested` is the resolved target the panel last asked a stream for
 /// (running or failed); a failed stream is not retried until the resolved
 /// window changes or the panel hides and shows again. A pid-only target
-/// whose window cannot be resolved right now leaves the stream as it is.
+/// whose window cannot be resolved right now keeps a stream of the same pid
+/// (a transient gap) but stops a stream of any other app.
 pub(super) fn stream_step(
     shown: bool,
     target: Target,
@@ -68,7 +69,7 @@ pub(super) fn stream_step(
     match (wanted, requested) {
         (Some(want), Some(have)) if want == have => StreamStep::Keep,
         (Some(want), _) => StreamStep::Start(want),
-        (None, Some(_)) if !has_target => StreamStep::Stop,
+        (None, Some(have)) if !has_target || target.0 != have.0 => StreamStep::Stop,
         (None, _) => StreamStep::Keep,
     }
 }
@@ -351,10 +352,16 @@ mod tests {
             stream_step(true, PID_ONLY, Some(6), Some(on(5))),
             StreamStep::Start(on(6))
         );
-        // No window to resolve right now: keep what is there, start nothing.
+        // No window to resolve right now: the same app's stream stays.
         assert_eq!(
             stream_step(true, PID_ONLY, None, Some(on(5))),
             StreamStep::Keep
+        );
+        // A different app with no resolvable window must not keep the old
+        // app's live pixels under its label.
+        assert_eq!(
+            stream_step(true, (Some(43), None), None, Some(on(5))),
+            StreamStep::Stop
         );
         assert_eq!(stream_step(true, PID_ONLY, None, None), StreamStep::Keep);
         // A hidden panel still stops.
