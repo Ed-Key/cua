@@ -24,9 +24,11 @@ After editing these files, press the extension's **Reload** button on
 ## What you see
 
 - Chrome's banner: "Cua Driver started debugging this browser", while Cua is
-  attached to a tab. The debugger is released after 20 seconds without a
-  command (not while a JavaScript dialog is open in the tab), which clears the
-  banner.
+  attached to a tab. The debugger stays attached for the whole agent session,
+  so the banner does not come and go between commands. It is released, and
+  the banner cleared, when the session ends (the driver sends a detach once
+  no session holds the tab), when the driver disconnects, when the tab closes,
+  or when you press **Stop**.
 - In the tab Cua is working in: a soft blue glow, a "Cua is working in this
   tab" pill with **Stop**, and the Cua cursor on the tab's favicon.
 - Tabs Cua opens start in the background in a cyan "Cua" tab group.

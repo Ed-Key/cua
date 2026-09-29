@@ -135,6 +135,39 @@ struct Session {
     link: u64,
     bridge: Arc<ExtensionBridge>,
     routes: Arc<Mutex<Routes>>,
+    /// Tabs this connection attached. The extension keeps a tab's debugger
+    /// attached while any connection holds it and detaches once the last
+    /// one closes (the engine drops its connection when the cua session ends).
+    /// `None` once the connection closed, so a late attach holds nothing.
+    held_tabs: Mutex<Option<std::collections::HashSet<i64>>>,
+}
+
+/// How many relay connections hold each (extension link, tab).
+fn tab_holders() -> &'static Mutex<HashMap<(u64, i64), usize>> {
+    static HOLDERS: std::sync::OnceLock<Mutex<HashMap<(u64, i64), usize>>> =
+        std::sync::OnceLock::new();
+    HOLDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Count one more holder of `tab`.
+fn hold_tab(link: u64, tab: i64) {
+    *tab_holders().lock().unwrap().entry((link, tab)).or_default() += 1;
+}
+
+/// Drop one holder of `tab`; true when it was the last.
+fn release_tab(link: u64, tab: i64) -> bool {
+    let mut holders = tab_holders().lock().unwrap();
+    match holders.get_mut(&(link, tab)) {
+        Some(count) if *count > 1 => {
+            *count -= 1;
+            false
+        }
+        Some(_) => {
+            holders.remove(&(link, tab));
+            true
+        }
+        None => false,
+    }
 }
 
 type Reply = Value;
@@ -145,6 +178,21 @@ impl Session {
             link,
             bridge: extension_bridge::global().clone(),
             routes: Arc::new(Mutex::new(Routes::default())),
+            held_tabs: Mutex::new(Some(std::collections::HashSet::new())),
+        }
+    }
+
+    /// The connection closed: let go of its tabs, and detach the debugger
+    /// from each one no other connection holds.
+    async fn release_held_tabs(&self) {
+        let tabs = self.held_tabs.lock().unwrap().take().unwrap_or_default();
+        for tab in tabs {
+            if release_tab(self.link, tab) {
+                let _ = self
+                    .bridge
+                    .request_on(self.link, "debugger.detach", json!({ "tabId": tab }))
+                    .await;
+            }
         }
     }
 
@@ -153,7 +201,7 @@ impl Session {
         let mut events = self.bridge.subscribe();
         let (reply_tx, mut replies) = mpsc::unbounded_channel::<Reply>();
         let this = Arc::new(self);
-        loop {
+        'serve: loop {
             tokio::select! {
                 incoming = stream.next() => {
                     let Some(Ok(message)) = incoming else { break };
@@ -174,16 +222,16 @@ impl Session {
                     // queued; CDP delivers them first, and the engine relies on it.
                     while let Ok(event) = events.try_recv() {
                         for event in this.translate(event) {
-                            if sink.send(Message::Text(event.to_string().into())).await.is_err() { return; }
+                            if sink.send(Message::Text(event.to_string().into())).await.is_err() { break 'serve; }
                         }
                     }
-                    if sink.send(Message::Text(reply.to_string().into())).await.is_err() { return; }
+                    if sink.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
                 }
                 event = events.recv() => {
                     match event {
                         Ok(event) => {
                             for event in this.translate(event) {
-                                if sink.send(Message::Text(event.to_string().into())).await.is_err() { return; }
+                                if sink.send(Message::Text(event.to_string().into())).await.is_err() { break 'serve; }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -192,6 +240,7 @@ impl Session {
                 }
             }
         }
+        this.release_held_tabs().await;
     }
 
     async fn answer(&self, command: Value) -> Reply {
@@ -311,6 +360,11 @@ impl Session {
                 let color = params.get("cuaSessionColor").cloned().unwrap_or(Value::Null);
                 self.request("debugger.attach", json!({ "tabId": tab, "sessionColor": color }))
                     .await?;
+                if let Some(held) = self.held_tabs.lock().unwrap().as_mut() {
+                    if held.insert(tab) {
+                        hold_tab(self.link, tab);
+                    }
+                }
                 let session = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
                 let mut routes = self.routes.lock().unwrap();
                 routes.sessions.insert(session.clone(), tab);
@@ -320,8 +374,8 @@ impl Session {
             "Target.detachFromTarget" => {
                 let session = params.get("sessionId").and_then(Value::as_str).unwrap_or_default();
                 // A relay tab session only stops being routed; the debugger
-                // stays attached for the tab's other sessions (the extension
-                // releases it once the tab is idle).
+                // stays attached until this connection closes and no other
+                // connection holds the tab.
                 {
                     let mut routes = self.routes.lock().unwrap();
                     if let Some(tab) = routes.sessions.remove(session) {
@@ -453,15 +507,16 @@ impl Session {
                     .map(|session| json!({ "method": method, "params": params, "sessionId": session }))
                     .collect()
             }
-            // The extension released an idle debugger. Relay sessions stay
-            // valid (the next command reattaches and replays Page.enable);
-            // only out-of-process iframe sessions died with the attachment.
+            // Older extension builds released an idle debugger. Relay
+            // sessions stay valid (the next command reattaches and replays
+            // Page.enable); only out-of-process iframe sessions died with the
+            // attachment.
             "debugger.released" => {
                 routes.children.retain(|_, owner| *owner != tab);
                 Vec::new()
             }
             "debugger.detached" => {
-                // The debugger left the tab (idle release, tab closed, or the
+                // The debugger left the tab (session done, tab closed, or the
                 // user cancelled): its sessions end; the next operation attaches again.
                 routes.sessions.retain(|_, owner| *owner != tab);
                 let Routes { sessions, colors, .. } = &mut *routes;
@@ -523,6 +578,7 @@ mod tests {
             link: bridge.links()[0].link,
             bridge,
             routes: Arc::new(Mutex::new(Routes::default())),
+            held_tabs: Mutex::new(Some(Default::default())),
         });
         session.routes.lock().unwrap().targets.insert("T".to_owned(), 4);
         // The fake extension answers every request and hands it to the test.
@@ -553,5 +609,49 @@ mod tests {
             assert_eq!(sent["method"], "debugger.send");
             assert_eq!(sent["params"]["sessionColor"], color);
         }
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn the_debugger_is_detached_when_the_last_connection_holding_the_tab_closes() {
+        use tokio::io::AsyncWriteExt;
+        let (bridge, mut extension, _dir) = extension_bridge::tests::connected().await;
+        let link = bridge.links()[0].link;
+        let session = |bridge: Arc<ExtensionBridge>| {
+            let session = Session {
+                link,
+                bridge,
+                routes: Arc::new(Mutex::new(Routes::default())),
+                held_tabs: Mutex::new(Some(Default::default())),
+            };
+            session.routes.lock().unwrap().targets.insert("T".to_owned(), 9);
+            session
+        };
+        let (first, second) = (session(bridge.clone()), session(bridge));
+        let (seen_tx, mut seen) = mpsc::unbounded_channel::<Value>();
+        tokio::spawn(async move {
+            loop {
+                let request = extension_bridge::tests::read_frame(&mut extension).await;
+                let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":{}});
+                extension.write_all(&extension_bridge::frame(&reply)).await.unwrap();
+                seen_tx.send(request).unwrap();
+            }
+        });
+        let attach = json!({ "targetId": "T", "flatten": true });
+        for session in [&first, &second, &first] {
+            session.root("Target.attachToTarget", &attach).await.unwrap();
+            assert_eq!(seen.recv().await.unwrap()["method"], "debugger.attach");
+        }
+        // One connection closing leaves the tab attached for the other.
+        first.release_held_tabs().await;
+        assert!(seen.try_recv().is_err(), "no detach while a connection holds the tab");
+        // A late attach on a closed connection holds nothing.
+        first.root("Target.attachToTarget", &attach).await.unwrap();
+        assert_eq!(seen.recv().await.unwrap()["method"], "debugger.attach");
+        second.release_held_tabs().await;
+        let detach = seen.recv().await.unwrap();
+        assert_eq!(detach["method"], "debugger.detach");
+        assert_eq!(detach["params"]["tabId"], 9);
+        assert!(tab_holders().lock().unwrap().get(&(link, 9)).is_none());
     }
 }
