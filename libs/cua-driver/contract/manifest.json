@@ -2376,6 +2376,14 @@
           "window_change": {
             "additionalProperties": false,
             "properties": {
+              "ignored_windows": {
+                "format": "uint32",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
               "new_windows": {
                 "items": {
                   "additionalProperties": false,
