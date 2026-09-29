@@ -1078,6 +1078,143 @@ mod glide_duration_tests {
 }
 
 #[cfg(test)]
+mod path_straightness_tests {
+    use super::*;
+    use crate::CursorConfig;
+    use std::f64::consts::{FRAC_PI_4, PI};
+
+    struct Glide {
+        max_dev_ratio: f64,
+        secs: f64,
+        start_speed: f64,
+        peak_speed: f64,
+        end_speed: f64,
+    }
+
+    /// Glide a resting cursor 300 pt in direction `angle` and measure the
+    /// rendered path against the straight segment to the planner's target.
+    fn glide(motion: MotionConfig, angle: f64, swift: bool) -> Glide {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.motion = motion;
+        core.motion.idle_hide_ms = 0.0;
+        core.pos = (1000.0, 1000.0);
+        // At rest the arrow points up-left, as after any previous move.
+        core.heading = FRAC_PI_4;
+        let (x0, y0) = core.pos;
+        // MoveTo aims 16 pt past the click point along the end heading; pick
+        // the click point so the planned target sits 300 pt away at `angle`.
+        let (x1, y1) = (x0 + 300.0 * angle.cos(), y0 + 300.0 * angle.sin());
+        core.apply_command_base(
+            OverlayCommand::MoveTo {
+                x: x1 - FRAC_PI_4.cos() * 16.0,
+                y: y1 - FRAC_PI_4.sin() * 16.0,
+                end_heading_radians: FRAC_PI_4,
+            },
+            false,
+            false,
+        );
+        let dt = 1.0 / 240.0;
+        let (mut t, mut dev, mut speeds) = (0.0, 0.0f64, Vec::new());
+        let mut prev = core.pos;
+        loop {
+            let arrived = if swift {
+                core.tick_swift_constants(dt)
+            } else {
+                core.tick_motion(dt)
+            };
+            t += dt;
+            let (px, py) = core.pos;
+            dev = dev.max(((x1 - x0) * (py - y0) - (y1 - y0) * (px - x0)).abs() / 300.0);
+            speeds.push((px - prev.0).hypot(py - prev.1) / dt);
+            prev = core.pos;
+            if arrived || t > 10.0 {
+                break;
+            }
+        }
+        let n = speeds.len();
+        Glide {
+            max_dev_ratio: dev / 300.0,
+            secs: t,
+            start_speed: speeds[..n / 10].iter().sum::<f64>() / (n / 10) as f64,
+            peak_speed: speeds.iter().cloned().fold(0.0, f64::max),
+            end_speed: speeds[n - n / 10..].iter().sum::<f64>() / (n / 10) as f64,
+        }
+    }
+
+    // Codex Computer Use's cursor takes the straight candidate for in-bounds
+    // moves, while visibly curved paths bend by 6% or more of the distance.
+    // 5% separates "straight with a small turn-in" from "curving".
+    const MAX_DEV_RATIO: f64 = 0.05;
+
+    fn directions() -> impl Iterator<Item = f64> {
+        (0..8).map(|i| i as f64 * PI / 4.0)
+    }
+
+    #[test]
+    fn default_glide_is_nearly_straight_on_both_platform_paths() {
+        for swift in [false, true] {
+            for angle in directions() {
+                let g = glide(MotionConfig::default(), angle, swift);
+                assert!(
+                    g.max_dev_ratio <= MAX_DEV_RATIO,
+                    "swift={swift} angle={angle:.2} deviation {:.1}%",
+                    g.max_dev_ratio * 100.0
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn default_glide_keeps_its_duration_and_ease_in_out() {
+        for swift in [false, true] {
+            for angle in directions() {
+                let g = glide(MotionConfig::default(), angle, swift);
+                // A visible glide, not a teleport, and not a slow crawl.
+                assert!(
+                    (0.3..1.0).contains(&g.secs),
+                    "swift={swift} angle={angle:.2} took {:.3}s",
+                    g.secs
+                );
+                // Accelerates out of the start and decelerates into the end.
+                assert!(
+                    g.start_speed < 0.7 * g.peak_speed && g.end_speed < 0.7 * g.peak_speed,
+                    "swift={swift} angle={angle:.2} start {:.0} peak {:.0} end {:.0}",
+                    g.start_speed,
+                    g.peak_speed,
+                    g.end_speed
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn previous_curvy_turn_radius_is_still_selectable_and_curves() {
+        // `set_agent_cursor_motion {"turn_radius": 80}` restores the old style.
+        let curvy = MotionConfig::default().with_overrides(
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(80.0),
+        );
+        assert_eq!(curvy.turn_radius, 80.0);
+        let worst = directions()
+            .map(|a| glide(curvy.clone(), a, true).max_dev_ratio)
+            .fold(0.0, f64::max);
+        assert!(
+            worst > MAX_DEV_RATIO,
+            "worst deviation {:.1}%",
+            worst * 100.0
+        );
+    }
+}
+
+#[cfg(test)]
 mod session_badge_and_action_tests {
     use super::*;
     use crate::{CursorConfig, DeliveryModifier, TargetModifier};

@@ -140,7 +140,8 @@ impl PathPlanner {
     /// Plan a Dubins cursor path from `(x0,y0)` heading `th0` to `(x1,y1)` heading `th1`.
     ///
     /// * `end_visual_heading` — the arrow heading at rest (for the rendered tip).
-    /// * `turn_radius` — minimum turning radius in points (Swift default: 80).
+    /// * `turn_radius` — minimum turning radius in points (`MotionConfig`
+    ///   default: 6; the Swift reference used 80).
     // The flattened start/end poses are part of the cross-language overlay API.
     #[allow(clippy::too_many_arguments)]
     pub fn plan(

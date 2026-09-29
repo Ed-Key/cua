@@ -32,7 +32,11 @@ pub struct MotionConfig {
     /// Minimum cursor speed at end of glide (deceleration floor), pts/sec.
     pub min_end_speed: f64,
     /// Minimum turning radius of the Dubins glide path, in points. Smaller =
-    /// tighter curves. Matches the Swift reference default of 80.
+    /// tighter curves. The glide starts and ends with the arrow at its resting
+    /// angle, so the path bends by up to about twice this radius to turn into
+    /// and out of the straight run. The default of 6 keeps glides nearly
+    /// straight (like Codex Computer Use's cursor); 80, the Swift reference
+    /// value, gives the older sweeping arcs. [1, 1000]
     pub turn_radius: f64,
 }
 
@@ -51,7 +55,7 @@ impl Default for MotionConfig {
             peak_speed: 900.0,
             min_start_speed: 300.0,
             min_end_speed: 200.0,
-            turn_radius: 80.0,
+            turn_radius: 6.0,
         }
     }
 }
