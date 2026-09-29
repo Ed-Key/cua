@@ -2503,11 +2503,7 @@ class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
 
 class ActionTarget:
     """
-    Exact capture/input target selected independently for each action.
-
-    `display_id="primary"` is the portable desktop target in this release.
-    Platforms that cannot address another display reject it explicitly rather
-    than silently changing coordinate spaces.
+    Window or desktop target; the desktop display_id is "primary".
 """
     def __init__(self):
         raise RuntimeError("ActionTarget cannot be instantiated directly")
@@ -4677,9 +4673,7 @@ class _UniffiFfiConverterTypeHotkeyInput(_UniffiConverterRustBuffer):
 @dataclass
 class InvokeMenuInput:
     """
-    Exact, immediate-child application menu path to resolve and invoke through
-    the operating system's accessibility API. Path labels are matched after
-    trimming surrounding whitespace and otherwise remain case-sensitive.
+    Menu path from the menu-bar title to the item; labels are trimmed, case-sensitive.
 """
     def __init__(self, *, pid:int, window_id:int, path:typing.List[str], session:typing.Optional[str]):
         self.pid = pid
@@ -5704,9 +5698,7 @@ class _UniffiFfiConverterTypeParseVisualRegionsOptions(_UniffiConverterRustBuffe
 @dataclass
 class ParseVisualRegionsInput:
     """
-    Parse one immutable screenshot capture. Pass the `capture_id` returned by
-    `get_window_state` or `get_desktop_state`; the Driver capture registry
-    resolves it to the exact pixels and action-coordinate transform.
+    Parse one screenshot capture by the capture_id from get_window_state or get_desktop_state.
 """
     def __init__(self, *, capture_id:str, options:ParseVisualRegionsOptions):
         self.capture_id = capture_id

@@ -128,8 +128,7 @@ pub struct RunSequenceInput {
     pub pid: i64,
     #[schemars(schema_with = "positive_integer_schema")]
     pub window_id: u64,
-    /// For multi-call work, prefer a short public session label and repeat it on every call that
-    /// accepts it. Omit it to use the authenticated transport's implicit lifecycle session.
+    /// Short run label; repeat it on every call. Omit for the implicit session.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -239,7 +238,7 @@ impl ToolOutput for RunSequenceOutput {}
 pub fn contracts() -> Vec<ToolContract> {
     vec![ToolContract {
         name:RunSequenceInput::TOOL_NAME.into(),
-        description:"Run one to eight ordered click/type_text actions against one exact window with background delivery. Each action is followed by the existing verify_state predicates; continue only when satisfied and stable. Stop on unknown, unsatisfied, action refusal, partial delivery or error. Unattempted steps are omitted. No retries, rollback or screenshots. This is not a transaction; a satisfied postcondition does not prove causation. Typed and existing verification request-validation errors reject the whole request before any child. Predicate shapes the verifier classifies unknown remain normal stopped outcomes.".into(),
+        description:"Run 1 to 8 click or type_text steps on one exact window in the background, checking each step's verify_state expect predicates before the next. Stops at the first unknown, unsatisfied, refused, partial, or failed step; no retries or rollback. Details: skill://cua-driver/WORKFLOW.md".into(),
         platforms:vec![Platform::Macos,Platform::Windows,Platform::Linux], aliases:vec![], capabilities:vec!["sequence.run".into()],
         annotations:ToolAnnotations { read_only:false, destructive:true, idempotent:false, open_world:false },
         schema_mode:SchemaMode::PortableSubset, cursor_semantics:None,

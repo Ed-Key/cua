@@ -100,6 +100,7 @@ lifecycle or settings.
 Load on demand; do not reabsorb these into this file:
 
 - [WORKFLOW.md](WORKFLOW.md): route selection, exact targets, observation, coordinates, verification, filesystem and clipboard proof.
+- [TOOLS.md](TOOLS.md): per-tool detail behind the short tool descriptions: result fields, error codes, parameter semantics.
 - [RUNTIME.md](RUNTIME.md): installation checks, CLI/MCP ownership, sessions, authorization, cursor controls, cleanup.
 - Current host only: [MACOS.md](MACOS.md), [WINDOWS.md](WINDOWS.md), or [LINUX.md](LINUX.md). Other platform files may be absent from a host-filtered installation.
 - [BROWSER.md](BROWSER.md): exact page binding and typed browser actions; only when the requested method permits them.

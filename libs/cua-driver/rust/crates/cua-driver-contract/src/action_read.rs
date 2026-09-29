@@ -108,8 +108,7 @@ impl ActionReadStepKind {
 #[serde(deny_unknown_fields)]
 pub struct ActionReadStep {
     pub action: ActionReadStepKind,
-    /// Required for click, set_value and scroll; optional for type_text; not allowed for
-    /// press_key and hotkey.
+    /// Required for click, set_value, scroll; optional for type_text; not for press_key, hotkey.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -172,7 +171,7 @@ pub struct ActionReadStep {
     #[schemars(schema_with = "direction")]
     #[uniffi(default = None)]
     pub direction: Option<ScrollDirection>,
-    /// Scroll only. Omit to retain the scroll tool's line default.
+    /// Scroll only; default line.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -181,7 +180,7 @@ pub struct ActionReadStep {
     #[schemars(schema_with = "granularity")]
     #[uniffi(default = None)]
     pub by: Option<ScrollBy>,
-    /// Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.
+    /// Scroll only, 1 to 50; default 3.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -323,7 +322,7 @@ pub struct ActAndReadInput {
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub value: Option<String>,
-    /// Required only for scroll. Uses the existing background scroll route.
+    /// Required only for scroll.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -332,7 +331,7 @@ pub struct ActAndReadInput {
     #[schemars(schema_with = "direction")]
     #[uniffi(default = None)]
     pub direction: Option<ScrollDirection>,
-    /// Scroll only. Omit to retain the scroll tool's line default.
+    /// Scroll only; default line.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -341,7 +340,7 @@ pub struct ActAndReadInput {
     #[schemars(schema_with = "granularity")]
     #[uniffi(default = None)]
     pub by: Option<ScrollBy>,
-    /// Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.
+    /// Scroll only, 1 to 50; default 3.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -350,8 +349,7 @@ pub struct ActAndReadInput {
     #[schemars(schema_with = "amount")]
     #[uniffi(default = None)]
     pub amount: Option<u32>,
-    /// For multi-call work, prefer a short public session label and repeat it on every call that
-    /// accepts it. Unnamed calls use the transport's implicit session.
+    /// Short run label; repeat it on every call. Omit for the implicit session.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -363,8 +361,7 @@ pub struct ActAndReadInput {
     #[serde(default)]
     #[uniffi(default)]
     pub observe: ActionReadObservation,
-    /// Instead of action: 1 to 8 actions on this window, run in order and stopped at the first
-    /// failure, then one observation.
+    /// Instead of action: 1 to 8 actions run in order, stopping at the first failure.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -491,7 +488,7 @@ impl ToolOutput for ActAndReadOutput {}
 pub fn contracts() -> Vec<ToolContract> {
     vec![ToolContract {
         name: ActAndReadInput::TOOL_NAME.into(),
-        description: "macOS: act, then read the same window's fresh accessibility state in one call. Pass one token-targeted background click, set_value or scroll, or `steps`: up to 8 actions on this window (click, set_value, scroll, type_text, press_key, hotkey), run in order in the background and stopped at the first failure. Use steps for work whose targets are already visible, such as several button presses or a field then its submit button, instead of one call per action. Tree-only by default; observe selects query/context, element_fields (compact by default) and optional screenshot. Returns each child result, including errors and which step stopped. No retries or semantic verification: the fresh read shows what happened. Not a transaction against other clients or user input. Windows and Linux are not yet supported.".into(),
+        description: "macOS: run one token-targeted click, set_value, or scroll, or up to 8 steps (click, set_value, scroll, type_text, press_key, hotkey) in the background, stopping at the first failure, then return a fresh read of the same window. Tree-only unless observe asks for a screenshot. No retries. Details: skill://cua-driver/WORKFLOW.md".into(),
         platforms:vec![Platform::Macos], aliases:vec![], capabilities:vec!["action.read".into()],
         annotations:ToolAnnotations { read_only:false,destructive:true,idempotent:false,open_world:false },
         schema_mode:SchemaMode::CanonicalRuntime,cursor_semantics:None,

@@ -26,16 +26,10 @@ impl BrowserTabsTool {
         Self {
             def: ToolDef {
                 name: "browser_tabs".into(),
-                description: "List and organize the tabs of the user's own Chrome (their \
-                    logged-in profile) through the Cua Driver Chrome extension. Actions: list \
-                    (windows, tabs with title and URL, tab groups), open (a URL in a new tab, in \
-                    the background unless active:true, grouped under \"Cua\"), activate (select a tab in its window \
-                    without raising the window), load (a tab Chrome restored or discarded \
-                    without loading; page reads refuse it until it is loaded), close, move, group (put tabs in a new or \
-                    existing group, optionally naming and coloring it), ungroup, and \
-                    update_group. Tab, window, and group ids come from list, \
-                    with the pid of the Chrome they belong to. Requires the Cua \
-                    Driver extension in Chrome; the error says so when it is not connected."
+                description: "List and organize tabs of the user's own Chrome through the Cua \
+                    Driver Chrome extension: list, open (background, in a \"Cua\" group), \
+                    activate (without raising the window), load (a discarded tab), close, move, \
+                    group, ungroup, update_group. Ids and pid come from list."
                     .into(),
                 input_schema: json!({
                     "type": "object",
@@ -53,13 +47,13 @@ impl BrowserTabsTool {
                         "url": { "type": "string", "description": "URL for open." },
                         "window_id": { "type": "integer", "description": "Window for list (filter), open, move, or a new group." },
                         "index": { "type": "integer", "description": "Position for open or move; -1 or omitted means the end." },
-                        "active": { "type": "boolean", "description": "open: select the new tab. Default false." },
-                        "group": { "type": "boolean", "description": "open: add the tab to the window's \"Cua\" tab group, so the agent's tabs stay together. Default true." },
+                        "active": { "type": "boolean", "default": false, "description": "open: select the new tab." },
+                        "group": { "type": "boolean", "default": true, "description": "open: add the tab to the window's \"Cua\" group." },
                         "group_id": { "type": "integer", "description": "Existing group for group or update_group." },
                         "title": { "type": "string", "description": "Group name for group or update_group." },
                         "color": { "type": "string", "enum": GROUP_COLORS },
                         "collapsed": { "type": "boolean" },
-                        "pid": { "type": "integer", "description": "The Chrome process, from list. Required for every change (not for list)." },
+                        "pid": { "type": "integer", "description": "Chrome pid from list; required for every change." },
                         "session": crate::tool_schema::session_schema()
                     },
                     "required": ["action"],

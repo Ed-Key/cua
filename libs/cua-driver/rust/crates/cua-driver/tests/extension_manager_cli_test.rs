@@ -476,7 +476,7 @@ fn mcp_inventory_exposes_only_the_confirm_gated_extension_installer() {
     assert!(listed.status.success());
     let tools = String::from_utf8_lossy(&listed.stdout);
     assert!(tools
-        .contains("install_extension: Preview or install one Driver-managed optional extension"));
+        .contains("install_extension: Preview or install an optional Driver extension"));
 
     let described = run(&home, &["describe", "install_extension"]);
     assert!(described.status.success());

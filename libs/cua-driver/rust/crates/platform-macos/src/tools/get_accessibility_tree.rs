@@ -29,12 +29,11 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_accessibility_tree".into(),
-        description: "Return a lightweight snapshot of the desktop: running regular apps and \
-             on-screen visible windows with their bounds, z-order, and owner pid.\n\n\
-             For the full AX subtree of a single window (with interactive element indices \
-             you can click by), use `get_window_state` instead — that's the heavy per-window \
-             tool. This one is a fast discovery read that needs no TCC grants."
-            .into(),
+        description:
+            "Fast desktop overview: running regular apps and visible windows with bounds, \
+             z-order, and owner pid. Needs no permissions. For one window's elements use \
+             get_window_state."
+                .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {},

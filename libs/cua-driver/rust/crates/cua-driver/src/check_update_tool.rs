@@ -30,11 +30,9 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "check_for_update".into(),
-        description: "Check the saved stable/nightly Cua Driver channel for a release on GitHub. \
-             Returns current and selected channels, current and latest versions, an `update_available` boolean, \
-             the install one-liner, and the release notes URL. Read-only — never \
-             installs. Pacman-owned Linux executables return package-manager guidance \
-             without checking GitHub. Mirror of `cua-driver check-update --json`."
+        description: "Check the saved stable or nightly channel for a newer Cua Driver release. \
+             Returns versions, update_available, the install command, and the release notes \
+             URL. Read-only; never installs."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",

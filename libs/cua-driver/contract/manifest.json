@@ -9,7 +9,7 @@
   "tools": [
     {
       "name": "act_and_read",
-      "description": "macOS: act, then read the same window's fresh accessibility state in one call. Pass one token-targeted background click, set_value or scroll, or `steps`: up to 8 actions on this window (click, set_value, scroll, type_text, press_key, hotkey), run in order in the background and stopped at the first failure. Use steps for work whose targets are already visible, such as several button presses or a field then its submit button, instead of one call per action. Tree-only by default; observe selects query/context, element_fields (compact by default) and optional screenshot. Returns each child result, including errors and which step stopped. No retries or semantic verification: the fresh read shows what happened. Not a transaction against other clients or user input. Windows and Linux are not yet supported.",
+      "description": "macOS: run one token-targeted click, set_value, or scroll, or up to 8 steps (click, set_value, scroll, type_text, press_key, hotkey) in the background, stopping at the first failure, then return a fresh read of the same window. Tree-only unless observe asks for a screenshot. No retries. Details: skill://cua-driver/WORKFLOW.md",
       "platforms": [
         "macos"
       ],
@@ -36,13 +36,13 @@
             "type": "string"
           },
           "amount": {
-            "description": "Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.",
+            "description": "Scroll only, 1 to 50; default 3.",
             "maximum": 50,
             "minimum": 1,
             "type": "integer"
           },
           "by": {
-            "description": "Scroll only. Omit to retain the scroll tool's line default.",
+            "description": "Scroll only; default line.",
             "enum": [
               "line",
               "page"
@@ -50,7 +50,7 @@
             "type": "string"
           },
           "direction": {
-            "description": "Required only for scroll. Uses the existing background scroll route.",
+            "description": "Required only for scroll.",
             "enum": [
               "up",
               "down",
@@ -109,11 +109,11 @@
             "type": "integer"
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Unnamed calls use the transport's implicit session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "steps": {
-            "description": "Instead of action: 1 to 8 actions on this window, run in order and stopped at the first\nfailure, then one observation.",
+            "description": "Instead of action: 1 to 8 actions run in order, stopping at the first failure.",
             "items": {
               "additionalProperties": false,
               "description": "One action in `steps`. Every step targets the call's pid and window_id.",
@@ -130,13 +130,13 @@
                   "type": "string"
                 },
                 "amount": {
-                  "description": "Scroll only, 1 through 50. Omit to retain the scroll tool's default of 3.",
+                  "description": "Scroll only, 1 to 50; default 3.",
                   "maximum": 50,
                   "minimum": 1,
                   "type": "integer"
                 },
                 "by": {
-                  "description": "Scroll only. Omit to retain the scroll tool's line default.",
+                  "description": "Scroll only; default line.",
                   "enum": [
                     "line",
                     "page"
@@ -154,7 +154,7 @@
                   "type": "string"
                 },
                 "element_token": {
-                  "description": "Required for click, set_value and scroll; optional for type_text; not allowed for\npress_key and hotkey.",
+                  "description": "Required for click, set_value, scroll; optional for type_text; not for press_key, hotkey.",
                   "type": "string"
                 },
                 "key": {
@@ -389,11 +389,11 @@
           },
           "session": {
             "default": null,
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "target": {
-            "description": "Exact capture/input target selected independently for each action.\n\n`display_id=\"primary\"` is the portable desktop target in this release.\nPlatforms that cannot address another display reject it explicitly rather\nthan silently changing coordinate spaces.",
+            "description": "Window or desktop target; the desktop display_id is \"primary\".",
             "oneOf": [
               {
                 "additionalProperties": true,
@@ -604,7 +604,7 @@
     },
     {
       "name": "clipboard_read",
-      "description": "List available system clipboard types and optionally return privacy-sensitive plain text. Clipboard content is never retained in telemetry.",
+      "description": "List the system clipboard's types; include_text also returns its plain text.",
       "platforms": [
         "macos",
         "windows",
@@ -629,11 +629,11 @@
         "properties": {
           "include_text": {
             "default": false,
-            "description": "Return plain-text clipboard content in addition to the available types.\nClipboard content is privacy-sensitive and is never retained in telemetry.",
+            "description": "Also return the plain-text content (privacy-sensitive; never kept in telemetry).",
             "type": "boolean"
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           }
         },
@@ -681,7 +681,7 @@
     },
     {
       "name": "clipboard_write",
-      "description": "Replace the system clipboard with exactly one value: plain text, an image from an absolute local path, or a file URL from an absolute local path. Returns the available types for read-back before paste.",
+      "description": "Replace the system clipboard with one value: text, an image file, or a file URL (absolute paths). Returns the types for read-back before paste.",
       "platforms": [
         "macos",
         "windows",
@@ -708,15 +708,15 @@
         "additionalProperties": false,
         "properties": {
           "file_path": {
-            "description": "Absolute path to a local file to place on the clipboard as a file URL.",
+            "description": "Absolute local file path, placed as a file URL.",
             "type": "string"
           },
           "image_path": {
-            "description": "Absolute path to a local image to place on the clipboard.",
+            "description": "Absolute local image path.",
             "type": "string"
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "text": {
@@ -810,10 +810,10 @@
           },
           "scope": {
             "const": "desktop",
-            "description": "Deprecated flat desktop target retained for wire compatibility."
+            "description": "Deprecated flat desktop target; use target."
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "steps": {
@@ -824,7 +824,7 @@
           "target": {
             "anyOf": [
               {
-                "description": "Exact capture/input target selected independently for each action.\n\n`display_id=\"primary\"` is the portable desktop target in this release.\nPlatforms that cannot address another display reject it explicitly rather\nthan silently changing coordinate spaces.",
+                "description": "Window or desktop target; the desktop display_id is \"primary\".",
                 "oneOf": [
                   {
                     "additionalProperties": true,
@@ -1040,7 +1040,7 @@
     },
     {
       "name": "end_session",
-      "description": "End one visible lifecycle session and run its cursor, recording, configuration, and other cleanup hooks exactly once. Omit `session` to end the authenticated transport's implicit session. Idempotent.",
+      "description": "End a session and run its cursor, recording, and configuration cleanup once. Omit session to end your implicit session. Idempotent.",
       "platforms": [
         "macos",
         "windows",
@@ -1063,7 +1063,7 @@
         "additionalProperties": true,
         "properties": {
           "session": {
-            "description": "Optional public label to end. When omitted, end the caller's attached\nimplicit session.",
+            "description": "Run label to end; omit for your implicit session.",
             "type": "string"
           }
         },
@@ -1089,7 +1089,7 @@
     },
     {
       "name": "escalate_session",
-      "description": "Deprecated compatibility tool for legacy capture-scope sessions. New callers select window or desktop modality on each action. No deescalate_session tool exists.",
+      "description": "Deprecated capture-scope compatibility tool. Select window or desktop on each action instead.",
       "platforms": [
         "macos",
         "windows",
@@ -1460,7 +1460,7 @@
         "additionalProperties": false,
         "properties": {
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           }
         },
@@ -1512,7 +1512,7 @@
         "additionalProperties": false,
         "properties": {
           "max_image_dimension": {
-            "description": "Optional long-edge cap for the returned PNG, in pixels. Omitted or 0\nreturns the full-size capture. When the cap downsizes the image,\ndesktop-scope x/y taken from it are mapped back automatically.",
+            "description": "Long-edge cap for the PNG; 0 is full size. Desktop x,y from it are mapped back.",
             "minimum": 0,
             "type": "integer"
           },
@@ -1521,7 +1521,7 @@
             "type": "string"
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           }
         },
@@ -1642,7 +1642,7 @@
         "additionalProperties": false,
         "properties": {
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           }
         },
@@ -1672,7 +1672,7 @@
     },
     {
       "name": "get_session",
-      "description": "Read content-free lifecycle, cursor, recording, and idle status for one session visible to this authenticated transport. Omit `session` to inspect its implicit session.",
+      "description": "Read one session's lifecycle, cursor, recording, and idle status (no content). Omit session for your implicit session.",
       "platforms": [
         "macos",
         "windows",
@@ -1695,7 +1695,7 @@
         "additionalProperties": true,
         "properties": {
           "session": {
-            "description": "Optional public label. When omitted, inspect the caller's attached\nimplicit session.",
+            "description": "Run label; omit for your implicit session.",
             "type": "string"
           }
         },
@@ -1777,7 +1777,7 @@
     },
     {
       "name": "get_session_state",
-      "description": "Deprecated compatibility alias that reads a live legacy session's capture policy. Use get_session for lifecycle state.",
+      "description": "Deprecated: reads a legacy session's capture policy. Use get_session.",
       "platforms": [
         "macos",
         "windows",
@@ -1800,7 +1800,7 @@
         "additionalProperties": true,
         "properties": {
           "session": {
-            "description": "Optional public label. When omitted, inspect the caller's attached\nimplicit session.",
+            "description": "Run label; omit for your implicit session.",
             "type": "string"
           }
         },
@@ -2481,16 +2481,16 @@
           },
           "scope": {
             "const": "desktop",
-            "description": "Deprecated flat desktop target retained for wire compatibility."
+            "description": "Deprecated flat desktop target; use target."
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "target": {
             "anyOf": [
               {
-                "description": "Exact capture/input target selected independently for each action.\n\n`display_id=\"primary\"` is the portable desktop target in this release.\nPlatforms that cannot address another display reject it explicitly rather\nthan silently changing coordinate spaces.",
+                "description": "Window or desktop target; the desktop display_id is \"primary\".",
                 "oneOf": [
                   {
                     "additionalProperties": true,
@@ -2697,7 +2697,7 @@
     },
     {
       "name": "invoke_menu",
-      "description": "Resolve an exact application-menu path one live native level at a time and invoke its final item through accessibility APIs. Missing, ambiguous, disabled, or structurally mismatched segments fail closed; this tool never falls back to pixels.",
+      "description": "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. On macOS the previous front app is back in front afterward. Details: skill://cua-driver/MACOS.md",
       "platforms": [
         "macos",
         "windows",
@@ -2719,7 +2719,7 @@
       },
       "input_schema": {
         "additionalProperties": false,
-        "description": "Exact, immediate-child application menu path to resolve and invoke through\nthe operating system's accessibility API. Path labels are matched after\ntrimming surrounding whitespace and otherwise remain case-sensitive.",
+        "description": "Menu path from the menu-bar title to the item; labels are trimmed, case-sensitive.",
         "properties": {
           "path": {
             "items": {
@@ -2736,7 +2736,7 @@
             "type": "integer"
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "window_id": {
@@ -2990,7 +2990,7 @@
     },
     {
       "name": "list_sessions",
-      "description": "List content-free lifecycle summaries attached to this authenticated transport lease. It does not enumerate other callers' sessions.",
+      "description": "List this transport's sessions as content-free summaries. Other callers' sessions are not shown.",
       "platforms": [
         "macos",
         "windows",
@@ -3017,7 +3017,7 @@
             "type": "string"
           },
           "limit": {
-            "description": "Maximum number of content-free summaries to return (default 50, max\n100). Ordinary agent transports are scoped to their own lease.",
+            "description": "Maximum summaries to return; default 50, max 100.",
             "format": "uint32",
             "minimum": 0,
             "type": [
@@ -3270,7 +3270,7 @@
                   "type": "integer"
                 },
                 "z_index": {
-                  "description": "Higher values are closer to the front. Null means the provider cannot observe stacking order; callers must not infer an order from array position or treat null as zero.",
+                  "description": "Higher values are closer to the front. Null is unknown; callers must not infer an order from array position.",
                   "type": [
                     "integer",
                     "null"
@@ -3299,7 +3299,7 @@
     },
     {
       "name": "move_cursor",
-      "description": "Move a cursor to (x, y). Exact window targets use get_window_state screenshot pixels; explicit desktop targets use get_desktop_state screenshot pixels. On macOS, window moves affect the agent cursor overlay, desktop moves affect the real OS pointer, and legacy untargeted moves use screen points.",
+      "description": "Move a cursor to x,y: window targets use get_window_state pixels and move the agent cursor; desktop targets use get_desktop_state pixels and move the real pointer (macOS).",
       "platforms": [
         "macos",
         "windows",
@@ -3324,16 +3324,16 @@
         "properties": {
           "scope": {
             "const": "desktop",
-            "description": "Deprecated flat desktop target retained for wire compatibility."
+            "description": "Deprecated flat desktop target; use target."
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "target": {
             "anyOf": [
               {
-                "description": "Exact capture/input target selected independently for each action.\n\n`display_id=\"primary\"` is the portable desktop target in this release.\nPlatforms that cannot address another display reject it explicitly rather\nthan silently changing coordinate spaces.",
+                "description": "Window or desktop target; the desktop display_id is \"primary\".",
                 "oneOf": [
                   {
                     "additionalProperties": true,
@@ -3383,7 +3383,7 @@
                 "type": "null"
               }
             ],
-            "description": "Preferred per-call target. New callers should set this field."
+            "description": "Preferred per-call target."
           },
           "x": {
             "type": "number"
@@ -3548,7 +3548,7 @@
     },
     {
       "name": "parse_visual_regions",
-      "description": "Parse one immutable registered capture into model-neutral text and icon regions.",
+      "description": "Parse a capture_id from get_window_state or get_desktop_state into text and icon regions with action coordinates. Needs the optional perception extension. Details: skill://cua-driver/VISUAL.md",
       "platforms": [
         "macos",
         "windows",
@@ -3570,7 +3570,7 @@
       },
       "input_schema": {
         "additionalProperties": false,
-        "description": "Parse one immutable screenshot capture. Pass the `capture_id` returned by\n`get_window_state` or `get_desktop_state`; the Driver capture registry\nresolves it to the exact pixels and action-coordinate transform.",
+        "description": "Parse one screenshot capture by the capture_id from get_window_state or get_desktop_state.",
         "properties": {
           "capture_id": {
             "minLength": 1,
@@ -4085,16 +4085,16 @@
           },
           "scope": {
             "const": "desktop",
-            "description": "Deprecated flat desktop target retained for wire compatibility."
+            "description": "Deprecated flat desktop target; use target."
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "target": {
             "anyOf": [
               {
-                "description": "Exact capture/input target selected independently for each action.\n\n`display_id=\"primary\"` is the portable desktop target in this release.\nPlatforms that cannot address another display reject it explicitly rather\nthan silently changing coordinate spaces.",
+                "description": "Window or desktop target; the desktop display_id is \"primary\".",
                 "oneOf": [
                   {
                     "additionalProperties": true,
@@ -4301,7 +4301,7 @@
     },
     {
       "name": "run_sequence",
-      "description": "Run one to eight ordered click/type_text actions against one exact window with background delivery. Each action is followed by the existing verify_state predicates; continue only when satisfied and stable. Stop on unknown, unsatisfied, action refusal, partial delivery or error. Unattempted steps are omitted. No retries, rollback or screenshots. This is not a transaction; a satisfied postcondition does not prove causation. Typed and existing verification request-validation errors reject the whole request before any child. Predicate shapes the verifier classifies unknown remain normal stopped outcomes.",
+      "description": "Run 1 to 8 click or type_text steps on one exact window in the background, checking each step's verify_state expect predicates before the next. Stops at the first unknown, unsatisfied, refused, partial, or failed step; no retries or rollback. Details: skill://cua-driver/WORKFLOW.md",
       "platforms": [
         "macos",
         "windows",
@@ -4325,7 +4325,7 @@
             "type": "integer"
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "steps": {
@@ -4365,7 +4365,7 @@
                             ]
                           },
                           "exists": {
-                            "description": "Assert that at least one trusted element matches the selector.\n\nElement walks are not yet exhaustive on every platform, so absence\ncannot be proven. `false` is rejected instead of returning an\nindefinitely-unknown predicate.",
+                            "description": "Must be true: at least one trusted element matches. Absence cannot be proven.",
                             "enum": [
                               true
                             ],
@@ -4971,16 +4971,16 @@
           },
           "scope": {
             "const": "desktop",
-            "description": "Deprecated flat desktop target retained for wire compatibility."
+            "description": "Deprecated flat desktop target; use target."
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "target": {
             "anyOf": [
               {
-                "description": "Exact capture/input target selected independently for each action.\n\n`display_id=\"primary\"` is the portable desktop target in this release.\nPlatforms that cannot address another display reject it explicitly rather\nthan silently changing coordinate spaces.",
+                "description": "Window or desktop target; the desktop display_id is \"primary\".",
                 "oneOf": [
                   {
                     "additionalProperties": true,
@@ -5503,7 +5503,7 @@
     },
     {
       "name": "set_window_frame",
-      "description": "Set one exact top-level window's frame in the desktop-coordinate space reported by list_windows and verify the resulting geometry through an independent readback.",
+      "description": "Set an exact top-level window's frame (list_windows desktop coordinates) and verify it by readback.",
       "platforms": [
         "macos",
         "windows",
@@ -5534,7 +5534,7 @@
             "type": "integer"
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "width": {
@@ -5712,7 +5712,7 @@
     },
     {
       "name": "start_session",
-      "description": "Optionally create or return a lifecycle session before acting. For multi-call work, prefer a short public `session` label and repeat it on every call that accepts it; an omitted value uses the authenticated transport lease's implicit session instead. This tool is optional because an ordinary action can create or reuse a named run directly. Use it to set the initial cursor theme before acting or to revive a public name after it has ended; ordinary actions never revive ended names. `capture_scope` is deprecated compatibility input; new callers select window or desktop modality per action. Idempotent.",
+      "description": "Optional: create or return a session. Pass a short session label and repeat it on every later call; without one, the transport's implicit session is used. Use this to set the initial cursor theme or to revive an ended label; ordinary actions never revive ended labels. Idempotent.",
       "platforms": [
         "macos",
         "windows",
@@ -5736,7 +5736,7 @@
         "additionalProperties": true,
         "properties": {
           "capture_scope": {
-            "description": "Deprecated compatibility policy. New callers select window or desktop\nmodality on each action instead of storing it on the session.",
+            "description": "Deprecated; select window or desktop on each action instead.",
             "enum": [
               "auto",
               "window",
@@ -5745,7 +5745,7 @@
             "type": "string"
           },
           "cursor_theme": {
-            "description": "Optional initial cursor theme. The host applies it before the cursor is\nfirst made visible, avoiding a flash of the default theme.",
+            "description": "Initial cursor theme, applied before the cursor first shows.",
             "properties": {
               "reduced_motion": {
                 "default": "auto",
@@ -5769,7 +5769,7 @@
             ]
           },
           "session": {
-            "description": "Optional stable public label for this run (e.g. \"research-run-1\").\nWhen omitted, the authenticated transport lease's implicit session is\ncreated or returned.",
+            "description": "Optional run label, e.g. \"research-run-1\". Omit for the implicit session.",
             "type": "string"
           }
         },
@@ -5879,16 +5879,16 @@
         "properties": {
           "scope": {
             "const": "desktop",
-            "description": "Deprecated flat desktop target retained for wire compatibility."
+            "description": "Deprecated flat desktop target; use target."
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.",
             "type": "string"
           },
           "target": {
             "anyOf": [
               {
-                "description": "Exact capture/input target selected independently for each action.\n\n`display_id=\"primary\"` is the portable desktop target in this release.\nPlatforms that cannot address another display reject it explicitly rather\nthan silently changing coordinate spaces.",
+                "description": "Window or desktop target; the desktop display_id is \"primary\".",
                 "oneOf": [
                   {
                     "additionalProperties": true,
@@ -6098,7 +6098,7 @@
     },
     {
       "name": "verify_state",
-      "description": "Deterministically verify bounded predicates against one exact window. The driver evaluates structured window/accessibility state and may return the final screenshot as uninterpreted visual evidence for a multimodal caller. Predicate results are satisfied, unsatisfied, or unknown; unknown never implies success. Accessibility projections are conservative: absence remains unknown unless the observed search domain is proven exhaustive.",
+      "description": "Check up to 8 predicates (AND) against one exact window's accessibility state, with a bounded wait and stable samples. Returns satisfied, unsatisfied, or unknown; unknown is not success. include_screenshot returns the final image for you to judge. Details: skill://cua-driver/WORKFLOW.md",
       "platforms": [
         "macos",
         "windows",
@@ -6135,7 +6135,7 @@
                       ]
                     },
                     "exists": {
-                      "description": "Assert that at least one trusted element matches the selector.\n\nElement walks are not yet exhaustive on every platform, so absence\ncannot be proven. `false` is rejected instead of returning an\nindefinitely-unknown predicate.",
+                      "description": "Must be true: at least one trusted element matches. Absence cannot be proven.",
                       "enum": [
                         true
                       ],
@@ -6265,7 +6265,7 @@
             "type": "array"
           },
           "include_screenshot": {
-            "description": "Return the final window screenshot as image content for a multimodal\ncaller. The driver does not interpret that image.",
+            "description": "Return the final window screenshot for you to judge; the driver does not interpret it.",
             "type": [
               "boolean",
               "null"
@@ -6277,7 +6277,7 @@
             "type": "integer"
           },
           "session": {
-            "description": "For multi-call work, prefer a short public session label and repeat it on every call that\naccepts it. Omit it to use the authenticated transport's implicit lifecycle session. This\nfield never selects capture modality or authorization.",
+            "description": "Short run label; repeat it on every call. Omit for the implicit session.\nIt never selects capture modality or authorization.",
             "type": "string"
           },
           "stable_samples": {

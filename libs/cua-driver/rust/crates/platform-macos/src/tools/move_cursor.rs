@@ -65,21 +65,20 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "move_cursor".into(),
-        description: "Move a cursor to (x, y). Exact window targets use get_window_state screenshot \
-            pixels; explicit desktop targets use get_desktop_state screenshot pixels. On macOS, \
-            window moves affect the agent cursor overlay, desktop moves affect the real OS \
-            pointer, and legacy untargeted moves use screen points.".into(),
+        description: "Move a cursor to x,y: window targets use get_window_state pixels and move the \
+            agent cursor; desktop targets use get_desktop_state pixels and move the real \
+            pointer. Untargeted moves use screen points.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["x", "y"],
             "properties": {
-                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
+                "session": cua_driver_core::tool_schema::session_schema(),
                 "x": { "type": "number" },
                 "y": { "type": "number" },
-                "pid": { "type": "integer", "description": "With window_id: aim at that window; x/y are its get_window_state screenshot pixels." },
-                "window_id": { "type": "integer", "description": "With pid: the exact window whose screenshot x/y refer to." },
+                "pid": { "type": "integer", "description": "With window_id, x,y are that window's screenshot pixels." },
+                "window_id": { "type": "integer", "description": "Window whose screenshot x,y refer to." },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window" },
-                "cursor_id": { "type": "string", "description": "Cursor instance to move. Default: 'default'." }
+                "cursor_id": { "type": "string", "default": "default", "description": "Cursor instance to move." }
             },
             "additionalProperties": false
         }),

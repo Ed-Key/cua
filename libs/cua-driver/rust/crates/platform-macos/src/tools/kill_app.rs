@@ -25,11 +25,10 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "kill_app".into(),
-        description: "Force-terminate a process by pid (kill -9 equivalent on macOS / Linux; \
-             taskkill /F equivalent on Windows). Use as escalation when the cooperative \
-             close path (hotkey cmd+q on macOS, click-the-X on Windows) failed to make \
-             the process exit. Unsaved state is lost — prefer the cooperative path first."
-            .into(),
+        description:
+            "Force-terminate a process by pid (kill -9). Unsaved state is lost; try the app's \
+             own quit (cmd+q) first."
+                .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["pid"],

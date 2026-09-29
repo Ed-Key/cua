@@ -23,39 +23,30 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_config".into(),
-        description: "Update cua-driver-rs configuration. Changes to \
-            max_image_dimension take effect immediately. The \
-            experimental_pip keys are persisted to ~/.cua-driver/config.json and \
-            take effect on the next daemon restart (the PiP backend is \
-            initialised once at startup).\n\nNote: capture_mode is a per-call \
-            param (on get_window_state / click), not a stored setting. Capture \
-            modality is selected by each action's target; the old \
-            capture_scope config key is retired.".into(),
+        description: "Update driver configuration. max_image_dimension applies immediately; \
+            experimental_pip keys persist to ~/.cua-driver/config.json and apply on the next \
+            daemon restart.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "key": {
                     "type": "string",
-                    "description": "Name of a single config field to write ({key, value} shape, \
-                        matching the CLI `config set` and the Windows/Linux tools). Pair with `value`. \
-                        Equivalent to passing the field directly."
+                    "description": "One config field to write with value; same as passing the field directly."
                 },
                 "value": {
-                    "description": "New value for `key`. JSON type depends on the key."
+                    "description": "New value for key."
                 },
                 "max_image_dimension": {
                     "type": "integer",
-                    "description": "Max dimension for screenshot resizing (0 = no limit)."
+                    "description": "Screenshot long-edge limit; 0 is no limit."
                 },
                 "experimental_pip": {
                     "type": "boolean",
-                    "description": "Enable the experimental picture-in-picture preview window. \
-                        Applies on next daemon restart."
+                    "description": "Enable the experimental picture-in-picture preview."
                 },
                 "experimental_pip_geometry": {
                     "type": "string",
-                    "description": "PiP window size + optional position in `WxH` or `WxH+X+Y` \
-                        form (e.g. `320x200+24+24`). Applies on next daemon restart."
+                    "description": "Preview size and position, WxH or WxH+X+Y, e.g. 320x200+24+24."
                 }
             },
             "additionalProperties": false

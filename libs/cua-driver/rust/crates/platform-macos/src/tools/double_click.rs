@@ -38,21 +38,19 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "double_click".into(),
         description:
-            "Double-click at (x, y) or on an AX element identified by element_index + window_id.\n\n\
-             AX path (element_index provided): performs `AXOpen` when the element advertises it \
-             (Finder items, openable list rows/cells); otherwise resolves the element's on-screen \
-             center and falls back to a pixel double-click there.\n\n\
-             Pixel path (x, y provided): two down/up pairs ~80 ms apart at the given coordinates."
+            "Double-click an element or point. An element (element_token, or element_index + \
+             snapshot_id) gets AXOpen when it offers one, else a double-click at its center; \
+             x,y are get_window_state screenshot pixels of window_id. Background by default."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["pid"],
             "properties": {
-                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
-                "pid":           { "type": "integer" },
-                "x":             { "type": "number",  "description": "Screen X coordinate (pixel path)." },
-                "y":             { "type": "number",  "description": "Screen Y coordinate (pixel path)." },
-                "window_id":     { "type": "integer", "description": "CGWindowID. Required when element_index is used. Optional when element_token is supplied (the token carries it)." },
+                "session": cua_driver_core::tool_schema::session_schema(),
+                "pid":           { "type": "integer", "description": "Target process ID." },
+                "x":             { "type": "number",  "description": "X in screenshot pixels (pixel path)." },
+                "y":             { "type": "number",  "description": "Y in screenshot pixels (pixel path)." },
+                "window_id":     { "type": "integer", "description": "Target window ID; required with element_index or x,y, carried by element_token." },
                 "element_index": cua_driver_core::tool_schema::element_index_schema(),
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
                 "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),

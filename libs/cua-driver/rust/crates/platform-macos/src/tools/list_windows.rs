@@ -12,30 +12,20 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "list_windows".into(),
-        description: "List layer-0 top-level windows known to WindowServer. Without `pid`, \
-            only windows on the current Space are listed and the response counts the rest; \
-            pass on_screen_only:false to include off-screen windows (minimized, on another \
-            Space, hidden-launched). With `pid`, all of that app's windows are listed. \
-            Use this to find a window_id before calling get_window_state.\n\n\
-            Per-record fields: window_id, pid, app_name, title, bounds \
-            (x/y/width/height, top-left origin), z_index (integer or null; higher values are \
-            closer to the front; null means stacking order is unavailable and callers must not \
-            infer one), is_on_screen, space_ids, current_space_id (the active Space on that \
-            window's display), and on_current_space. The top-level current_space_id is \
-            WindowServer's main/global active Space and can differ from a record's \
-            current_space_id when displays use independent Spaces. To select a frontmost candidate, take the \
-            maximum integer z_index; if every value is null, use an explicit fallback instead of \
-            relying on array order.".into(),
+        description: "List top-level windows (window_id, pid, app_name, title, bounds, z_index). \
+            Without pid, only the current Space's windows are listed; on_screen_only:false adds \
+            the rest. The frontmost has the highest integer z_index; null is unknown, so never \
+            infer order from the array.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "pid": {
                     "type": "integer",
-                    "description": "Optional pid filter. When set, only this pid's windows are returned."
+                    "description": "Only this pid's windows, all of them."
                 },
                 "on_screen_only": {
                     "type": "boolean",
-                    "description": "When true, drop windows not on the current Space. Default true without pid, false with pid."
+                    "description": "Drop windows not on the current Space. Default true without pid, false with pid."
                 }
             },
             "additionalProperties": false

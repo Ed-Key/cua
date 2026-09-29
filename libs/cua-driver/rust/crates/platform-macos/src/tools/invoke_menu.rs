@@ -412,6 +412,7 @@ impl Tool for InvokeMenuTool {
             // stays key: the menu command acts on the key window after this
             // call returns (TextEdit writes a saved document asynchronously),
             // and re-keying a sibling document dropped the save.
+            let mut front_restored = None;
             if let Some(prior_pid) = prior_frontmost.filter(|prior_pid| *prior_pid != pid) {
                 let restored_exact = prior_frontmost_window.is_some_and(|prior_window_id| {
                     focus_exact_window(prior_pid, prior_window_id).is_ok()
@@ -419,15 +420,29 @@ impl Tool for InvokeMenuTool {
                 if !restored_exact {
                     let _ = crate::apps::restore_prior_app(prior_pid);
                 }
+                // Fallback activation is asynchronous and NSWorkspace's frontmost
+                // app can lag it, so confirm within a short bound.
+                let deadline = std::time::Instant::now() + Duration::from_millis(500);
+                let mut restored = crate::apps::frontmost_pid() == Some(prior_pid);
+                while !restored && std::time::Instant::now() < deadline {
+                    std::thread::sleep(Duration::from_millis(20));
+                    restored = crate::apps::frontmost_pid() == Some(prior_pid);
+                }
+                front_restored = Some(restored);
             }
-            result
+            result.map(|()| front_restored)
         })
         .await;
 
         match outcome {
-            Ok(Ok(())) => ToolResult::text(
-                "Resolved the live native menu path and dispatched its final accessibility action; verify the command's semantic effect from fresh state.",
-            )
+            Ok(Ok(front_restored)) => ToolResult::text(format!(
+                "Resolved the live native menu path and dispatched its final accessibility action; verify the command's semantic effect from fresh state.{}",
+                match front_restored {
+                    Some(true) => " The target app was active only for the menu action; the previous front app is front again.",
+                    Some(false) => " The target app was activated for the menu action; the previous front app was not confirmed back in front.",
+                    None => "",
+                }
+            ))
             .with_action_record(
                 ActionExecutionRecord::builder(
                     ActionEffect::Unverifiable,

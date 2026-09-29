@@ -186,9 +186,7 @@ pub struct ParseVisualRegionsOptions {
     pub max_regions: Option<u32>,
 }
 
-/// Parse one immutable screenshot capture. Pass the `capture_id` returned by
-/// `get_window_state` or `get_desktop_state`; the Driver capture registry
-/// resolves it to the exact pixels and action-coordinate transform.
+/// Parse one screenshot capture by the capture_id from get_window_state or get_desktop_state.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ParseVisualRegionsInput {
@@ -399,7 +397,9 @@ pub(crate) fn contracts() -> Vec<ToolContract> {
     vec![ToolContract {
         name: ParseVisualRegionsInput::TOOL_NAME.into(),
         description:
-            "Parse one immutable registered capture into model-neutral text and icon regions."
+            "Parse a capture_id from get_window_state or get_desktop_state into text and icon \
+             regions with action coordinates. Needs the optional perception extension. \
+             Details: skill://cua-driver/VISUAL.md"
                 .into(),
         platforms: ALL_PLATFORMS.to_vec(),
         aliases: Vec::new(),

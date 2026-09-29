@@ -254,38 +254,10 @@ fn def() -> &'static ToolDef {
     static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
     DEF.get_or_init(|| ToolDef {
         name: "page".into(),
-        description: "Legacy browser compatibility tool. Prefer get_browser_state and the \
-            typed browser_* tools for exact targeting, endpoint ownership, and consent. \
-            Read-only get_text and query_dom remain available by default. Mutating actions \
-            require the daemon operator to set CUA_DRIVER_ENABLE_LEGACY_PAGE_MUTATIONS=1 before \
-            daemon startup (restart the daemon after changing it); this escape hatch does not \
-            provide the typed browser surface's exact binding or \
-            existing-profile grant guarantees. Supports \
-            Chrome, Brave, Edge, Safari (via AppleScript on macOS), Electron apps (via CDP), \
-            Chromium/Firefox on Windows (via UIA for read; CDP for execute_javascript when \
-            --remote-debugging-port is set), and WKWebView/Tauri/AT-SPI fallbacks.\n\n\
-            Actions:\n\
-            - execute_javascript: Run JS and return the result.\n\
-            - get_text: Extract visible text from the page.\n\
-            - query_dom: Find elements matching a CSS selector.\n\
-            - click_element: Click a CSS-selected element AND animate the agent cursor \
-              to its on-screen center first (so the user sees what the agent is doing). \
-              Prefer over `execute_javascript('el.click()')` whenever you want visible \
-              cursor feedback.\n\
-            - insert_text: Insert `text` at whatever currently holds DOM focus in one \
-              native operation (CDP Input.insertText) — no synthesized key events, but \
-              more durable than a one-shot execute_javascript write since rich-text \
-              editors already have to treat it like an IME commit. Try this before \
-              type_keystrokes on a contenteditable that discarded an execute_javascript \
-              write. Click/focus the target field first.\n\
-            - type_keystrokes: Type `text` via real per-character keystroke events into \
-              whatever currently holds DOM focus. Slower than insert_text but the most \
-              durable rung — use it when insert_text also gets discarded, or the editor's \
-              own keydown/keyup handlers need to see real keys. Click/focus the target \
-              field first.\n\
-            - enable_javascript_apple_events: macOS-only — patch the browser's \
-              Preferences to allow JS from Apple Events (Chrome/Brave/Edge, requires user \
-              confirmation and a browser restart).".into(),
+        description: "Legacy browser tool; prefer get_browser_state and the browser_* tools. \
+            get_text and query_dom are read-only and always available. Mutating actions need the \
+            operator to set CUA_DRIVER_ENABLE_LEGACY_PAGE_MUTATIONS=1 before daemon start. \
+            Details: skill://cua-driver/TOOLS.md".into(),
         input_schema: serde_json::json!({
             "type": "object",
             // `pid` and `window_id` are required for every action except
@@ -304,21 +276,21 @@ fn def() -> &'static ToolDef {
                 },
                 "selector": {
                     "type": "string",
-                    "description": "CSS selector for click_element (e.g. 'button.submit', '#login a')."
+                    "description": "CSS selector for click_element."
                 },
                 "text": {
                     "type": "string",
-                    "description": "Text to insert or type. Required for insert_text and type_keystrokes. The target field must already have DOM focus (click/focus it first)."
+                    "description": "Text for insert_text or type_keystrokes; the field must already have DOM focus."
                 },
                 "cdp_port": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 65535,
-                    "description": "Optional, for execute_javascript/insert_text/type_keystrokes: use this exact CDP port instead of auto-discovering one from pid. Needed when the port was opened via the browser's own remote-debugging toggle rather than a launch-time flag, since that path may not answer the auto-discovery probe."
+                    "description": "Exact CDP port for execute_javascript, insert_text, and type_keystrokes instead of discovery."
                 },
                 "target_url_contains": {
                     "type": "string",
-                    "description": "Optional, for execute_javascript/insert_text/type_keystrokes: require exactly one browser tab whose URL contains this substring. Use this on a multi-tab browser — there's no built-in link between window_id and which tab a CDP call reaches."
+                    "description": "Require exactly one tab whose URL contains this, for CDP actions on a multi-tab browser."
                 },
                 "javascript": {
                     "type": "string",
@@ -326,7 +298,7 @@ fn def() -> &'static ToolDef {
                 },
                 "css_selector": {
                     "type": "string",
-                    "description": "CSS selector for query_dom (e.g. 'a', 'button', 'input', 'h1'-'h6', 'p', 'img', 'select', '*')."
+                    "description": "CSS selector for query_dom."
                 },
                 "attributes": {
                     "type": "array",
@@ -335,12 +307,11 @@ fn def() -> &'static ToolDef {
                 },
                 "bundle_id": {
                     "type": "string",
-                    "description": "Bundle ID of the browser. Required for enable_javascript_apple_events (macOS only)."
+                    "description": "Browser bundle ID for enable_javascript_apple_events (macOS)."
                 },
                 "user_has_confirmed_enabling": {
                     "type": "boolean",
-                    "description": "Must be true to proceed with enable_javascript_apple_events. \
-                        This will quit and relaunch the browser."
+                    "description": "Must be true for enable_javascript_apple_events, which quits and relaunches the browser."
                 }
             },
             "additionalProperties": false

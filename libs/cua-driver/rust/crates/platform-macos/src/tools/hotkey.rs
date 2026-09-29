@@ -31,55 +31,34 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "hotkey".into(),
         description:
-            "Press a key combination — e.g. `[\"cmd\", \"c\"]` for Copy, \
-             `[\"cmd\", \"shift\", \"4\"]` for screenshot selection. Follows the same \
-             `delivery_mode` ladder as click/type_text — it does NOT raise the \
-             window by default:\n\
-             • `background` (default): post the combo to the target pid WITHOUT \
-               fronting or raising it — uses the macOS 14+ auth-message envelope so \
-               Chromium/Electron accept it as trusted live input. With an AX target, \
-               focus that exact element first. No top-level focus steal. \
-               `window_id` here only targets the combo; it does not raise.\n\
-             • `foreground`: front the exact window, confirm it became key, send \
-               the chord through the foreground HID queue, then restore the prior \
-               frontmost — the explicit escalation for menu-bar shortcuts (Cmd+Z, \
-               Cmd+W) and native Chromium fields such as the omnibox that ignore a \
-               background combo. Fails instead of sending when the window does not \
-               become key. With an AX target or x,y, that field is focused first. \
-               Requires window_id.\n\n\
-             A combo is never driver-verifiable (no read-back) → effect:\"unverifiable\"; \
-             confirm via screenshot. NOTE: a keyboard combo does NOT focus a text \
-             field — to type into a backgrounded Electron input, establish real \
-             renderer focus with a PIXEL click first, then `type_text`. If an app only \
-             accepts paste, call `clipboard_write`, then `clipboard_read` and verify its \
-             types (and text when applicable) before selecting or replacing editor content; \
-             only then send Cmd+V.\n\n\
-             Recognized modifiers: cmd/command, shift, option/alt, ctrl/control, fn. \
-             Non-modifier keys use the same vocabulary as `press_key`. Order: \
-             modifiers first, one non-modifier last."
+            "Press a key chord, modifiers first and one key last, e.g. [\"cmd\",\"c\"]. \
+             Background by default without raising the window; for a menu command such as Cmd+S, \
+             use invoke_menu; the browser omnibox may need delivery_mode \"foreground\". Never read back \
+             (unverifiable), and a chord does not focus a text field. \
+             Details: skill://cua-driver/MACOS.md"
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["keys"],
             "properties": {
-                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
+                "session": cua_driver_core::tool_schema::session_schema(),
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "keys": {
                     "type": "array",
                     "items": { "type": "string" },
                     "minItems": 2,
-                    "description": "Modifier(s) and one non-modifier key, e.g. [\"cmd\", \"c\"]."
+                    "description": "Modifiers (cmd, shift, option/alt, ctrl, fn) then one key."
                 },
-                "x": { "type": "number", "description": "Screenshot-pixel X — the element px action form: pixel-click there to focus, then send the combo (so e.g. Cmd+V pastes into that field). Pass with y. Use for Chromium/Electron surfaces the background combo can't reach." },
-                "y": { "type": "number", "description": "Screenshot-pixel Y (see x)." },
+                "x": { "type": "number", "description": "X in screenshot pixels to click for focus before the chord, e.g. to paste there." },
+                "y": { "type": "number", "description": "Y in the same screenshot pixels." },
                 "window_id": {
                     "type": "integer",
-                    "description": "Target window. Required for delivery_mode:\"foreground\" (the NSMenu activation needs a window). Does NOT itself raise the window — raising is gated on delivery_mode."
+                    "description": "Target window; required for foreground. Never raises it by itself."
                 },
                 "element_index": cua_driver_core::tool_schema::element_index_schema(),
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
                 "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
-                "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Use desktop with no pid/window_id to send the chord to the frontmost application." },
+                "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Legacy frame; prefer target. \"desktop\" with no pid/window_id sends to the frontmost app." },
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema()
             },
             "additionalProperties": false
@@ -218,6 +197,9 @@ impl Tool for HotkeyTool {
             .filter(|k| !is_modifier(k))
             .cloned()
             .collect();
+        let cmd_chord = modifiers
+            .iter()
+            .any(|k| matches!(k.to_ascii_lowercase().as_str(), "cmd" | "command"));
 
         if non_modifiers.is_empty() {
             return ToolResult::error(
@@ -492,8 +474,16 @@ impl Tool for HotkeyTool {
                                    pixel-click to focus then type_text instead.)"
                     });
                 }
+                // Apps often drop a background menu shortcut (TextEdit ignores
+                // Cmd+S); invoke_menu runs the same command by path.
+                let menu_hint = if !fg && cmd_chord {
+                    " A background menu shortcut can be ignored; if its effect is missing, \
+                     run the same command with invoke_menu, e.g. path [\"File\",\"Save\"]."
+                } else {
+                    ""
+                };
                 ToolResult::text(format!(
-                    "Pressed {key_display} on pid {pid}{label}.{}",
+                    "Pressed {key_display} on pid {pid}{label}.{menu_hint}{}",
                     changes.result_suffix()
                 ))
                 .with_structured(structured)

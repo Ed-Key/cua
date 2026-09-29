@@ -28,19 +28,16 @@ const VERIFY_STABLE: Duration = Duration::from_millis(100);
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "bring_to_front".into(),
-        description: "Persistently activate an app and leave it in the foreground. Most input \
-             does not need this; use it only for a focus-proxy surface that must remain \
-             foreground across interactions. With window_id, success means the exact ordinary \
-             macOS window was independently verified as the focused window and first in \
-             WindowServer layer-0 order. Request acceptance alone is reported as a partial \
-             result, never as activation. This DOES steal foreground."
+        description: "Activate an app and leave it frontmost; this steals foreground and most input does \
+             not need it. With window_id, success means that window was verified focused and \
+             frontmost; an accepted request alone is partial."
             .into(),
         input_schema: json!({
             "type": "object",
             "required": ["pid"],
             "properties": {
-                "pid": { "type": "integer" },
-                "window_id": { "type": "integer" }
+                "pid": { "type": "integer", "description": "Target process ID." },
+                "window_id": { "type": "integer", "description": "Window to verify as focused." }
             },
             "additionalProperties": false,
         }),

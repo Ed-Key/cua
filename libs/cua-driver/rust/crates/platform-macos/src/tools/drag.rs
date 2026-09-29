@@ -39,60 +39,54 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "drag".into(),
         description:
-            "Press-drag-release gesture from (from_x, from_y) to (to_x, to_y) in \
-             window-local screenshot pixels — the same space get_window_state returns. \
-             Top-left origin of the target's window.\n\n\
-             Use for: marquee/lasso selection, drag-and-drop, resizing via a handle, \
-             scrubbing a slider, repositioning a panel.\n\n\
-             `duration_ms` (default 500) is the wall-clock budget for the path between \
-             mouse-down and mouse-up; `steps` (default 20) is the number of intermediate \
-             mouseDragged events linearly interpolated along the path. Increase both for \
-             slower, more human drags; decrease for snap gestures.\n\n\
-             `modifier` keys (cmd/shift/option/ctrl) are held across the entire gesture.\n\n\
-             When `from_zoom` is true, coordinates are in the last zoom image for this \
-             pid; the driver maps them back to window coordinates before dispatching."
+            "Press, drag, and release from from_x,from_y to to_x,to_y in get_window_state \
+             screenshot pixels, for selection, drag-and-drop, handles, and sliders. Modifiers \
+             are held for the whole gesture. Background by default."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["from_x", "from_y", "to_x", "to_y"],
             "properties": {
-                "session": { "type": "string", "description": "For multi-call work, prefer a short public session label and repeat it on every call that accepts it. Omit it to use the authenticated transport's implicit lifecycle session." },
+                "session": cua_driver_core::tool_schema::session_schema(),
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": {
                     "type": "integer",
-                    "description": "CGWindowID for the window the pixel coordinates were measured against. Optional only when pid owns exactly one eligible top-level window; otherwise the action refuses with ambiguous_window_target."
+                    "description": "Window the pixels were read from; optional only when pid has one eligible window."
                 },
-                "from_x": { "type": "number", "description": "Drag-start X in window-local screenshot pixels. Top-left origin." },
-                "from_y": { "type": "number", "description": "Drag-start Y in window-local screenshot pixels. Top-left origin." },
-                "to_x": { "type": "number", "description": "Drag-end X in window-local screenshot pixels." },
-                "to_y": { "type": "number", "description": "Drag-end Y in window-local screenshot pixels." },
+                "from_x": { "type": "number", "description": "Start X in screenshot pixels." },
+                "from_y": { "type": "number", "description": "Start Y in screenshot pixels." },
+                "to_x": { "type": "number", "description": "End X in screenshot pixels." },
+                "to_y": { "type": "number", "description": "End Y in screenshot pixels." },
                 "duration_ms": {
                     "type": "integer",
                     "minimum": 0,
                     "maximum": 10000,
-                    "description": "Wall-clock duration of the drag path between mouseDown and mouseUp. Default: 500."
+                    "default": 500,
+                    "description": "Time from press to release."
                 },
                 "steps": {
                     "type": "integer",
                     "minimum": 1,
                     "maximum": 200,
-                    "description": "Number of intermediate mouseDragged events linearly interpolated along the path. Default: 20."
+                    "default": 20,
+                    "description": "Intermediate drag events along the path."
                 },
                 "modifier": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Modifier keys held across the entire gesture: cmd/shift/option/ctrl."
+                    "description": "Modifier keys: cmd, shift, option/alt, ctrl."
                 },
                 "button": {
                     "type": "string",
                     "enum": ["left", "right", "middle"],
-                    "description": "Mouse button used for the drag. Default: left."
+                    "default": "left",
+                    "description": "Mouse button."
                 },
                 "from_zoom": {
                     "type": "boolean",
-                    "description": "When true, coordinates are in the last zoom image for this pid; driver maps back to window coordinates."
+                    "description": "Coordinates are pixels of the last zoom image for this pid."
                 },
-                "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Use desktop with no pid/window_id for native get_desktop_state screenshot coordinates." },
+                "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Legacy frame; prefer target. \"desktop\" with no pid/window_id uses get_desktop_state pixels." },
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema()
             },
             "additionalProperties": false

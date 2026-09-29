@@ -14,55 +14,34 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "launch_app".into(),
         description:
-            "Launch a macOS app in the background — the target does NOT come to the foreground.\n\n\
-             Provide either `bundle_id` (preferred — unambiguous, e.g. `com.apple.calculator`) \
-             or `name` (e.g. \"Calculator\"). If both are given, bundle_id wins.\n\n\
-             Optional `urls` are handed to the app as open targets — for Finder, pass a folder \
-             path to open a backgrounded Finder window there.\n\n\
-             Browser DevTools setup belongs to `browser_prepare`, which can prove that a \
-             separate isolated profile is driver-owned before enabling CDP.\n\n\
-             Optional `webkit_inspector_port`: opens a WebKit inspector server on the specified \
-             port (sets WEBKIT_INSPECTOR_SERVER=127.0.0.1:N + TAURI_WEBVIEW_AUTOMATION=1). \
-             Use this for Tauri/WebKit-based apps.\n\n\
-             Optional `creates_new_application_instance`: when true, forces a new app instance \
-             even if one is already running (passes -n to open). Reach for this when another \
-             agent or session may drive the SAME app concurrently — it returns a fresh pid + \
-             window so each session acts on its own isolated window instead of clobbering one \
-             shared instance. Without it, single-instance apps (Calculator, many utilities) hand \
-             every caller the same window, so two sessions fight over it.\n\n\
-             Optional `additional_arguments`: extra argv strings appended after --args.\n\n\
-             Returns the launched app's pid, bundle_id, name, and a `windows` array \
-             (same shape as `list_windows`) so callers can skip an extra round-trip before \
-             `get_window_state(pid, window_id)`. `launch_state` distinguishes whether the \
-             request was sent, the process is running, and a window is ready. When the \
-             focus-steal belt-and-braces \
-             demotion check ran (target pid ≠ prior frontmost), the response also includes \
-             `self_activation_suppressed: bool` — true if focus stayed with the prior \
-             frontmost, false if the launched app held focus despite the re-demote attempt."
+            "Launch an app in the background without bringing it forward, by bundle_id \
+             (preferred) or name. Returns pid, launch_state, and a windows array (list_windows \
+             shape) for get_window_state. urls opens files or folders in it. For browser \
+             DevTools use browser_prepare."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "bundle_id": {
                     "type": "string",
-                    "description": "App bundle identifier, e.g. com.apple.calculator. Preferred over name."
+                    "description": "Bundle identifier, e.g. com.apple.calculator; wins over name."
                 },
                 "name": {
                     "type": "string",
-                    "description": "App display name. Used only when bundle_id is absent."
+                    "description": "App display name, used when bundle_id is absent."
                 },
                 "urls": {
                     "type": "array",
                     "items": { "type": "string" },
-                    "description": "Optional file paths or URLs to open with the app (e.g. a folder path for Finder)."
+                    "description": "File paths or URLs to open, e.g. a folder for Finder."
                 },
                 "webkit_inspector_port": {
                     "type": "integer",
-                    "description": "Open a WebKit inspector server on this port (sets WEBKIT_INSPECTOR_SERVER env var)."
+                    "description": "Open a WebKit inspector server on this port, for Tauri and WebKit apps."
                 },
                 "creates_new_application_instance": {
                     "type": "boolean",
-                    "description": "When true, force a new app instance even if already running (open -n). Use for concurrent multi-agent/multi-session work so each session gets an isolated instance + window instead of sharing one — on single-instance apps (e.g. Calculator) every caller otherwise gets the same window and the sessions clobber each other."
+                    "description": "Start a separate instance (open -n) so concurrent sessions do not share one window."
                 },
                 "additional_arguments": {
                     "type": "array",
