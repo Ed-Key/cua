@@ -3270,13 +3270,6 @@ unsafe fn new_pip_window(rect: NSRect) -> Option<*mut AnyObject> {
         return None;
     }
     let _: () = msg_send![window, setReleasedWhenClosed: false];
-    // Dark glass with white text, whatever the desktop: the mirrored window
-    // (usually light) sits on a darker vessel, like Control Center.
-    let dark: *mut AnyObject = msg_send![
-        class!(NSAppearance),
-        appearanceNamed: ns_string("NSAppearanceNameDarkAqua")
-    ];
-    let _: () = msg_send![window, setAppearance: dark];
     let _: () = msg_send![window, setFloatingPanel: true];
     let _: () = msg_send![window, setLevel: 3i64]; // NSFloatingWindowLevel
     let _: () = msg_send![window, setBecomesKeyOnlyIfNeeded: true];
@@ -3382,6 +3375,12 @@ unsafe fn glass_background(bounds: NSRect, body: *mut AnyObject, radius: f64) ->
     if let Some(glass_class) = AnyClass::get("NSGlassEffectView") {
         let glass = new_view(glass_class, bounds);
         let _: () = msg_send![glass, setCornerRadius: radius];
+        // The clear style lets the backdrop's colors through (the regular
+        // one reads as a grey slab); text stays legible by its own shadow.
+        let responds: bool = msg_send![glass, respondsToSelector: sel!(setStyle:)];
+        if responds {
+            let _: () = msg_send![glass, setStyle: 1isize]; // NSGlassEffectViewStyleClear
+        }
         let _: () = msg_send![glass, setContentView: body];
         let _: () = msg_send![body, release];
         return glass;
@@ -4211,13 +4210,29 @@ unsafe fn new_label(frame: NSRect, size: f64, weight: f64, secondary: bool) -> *
     let _: () = msg_send![label, setMaximumNumberOfLines: 1i64];
     let font: *mut AnyObject = msg_send![class!(NSFont), systemFontOfSize: size weight: weight];
     let _: () = msg_send![label, setFont: font];
+    // White on glass, like Control Center, legible over any backdrop by
+    // its own soft shadow rather than by darkening the glass.
+    let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
     let color: *mut AnyObject = if secondary {
-        msg_send![class!(NSColor), secondaryLabelColor]
+        msg_send![white, colorWithAlphaComponent: 0.75_f64]
     } else {
-        msg_send![class!(NSColor), labelColor]
+        white
     };
     let _: () = msg_send![label, setTextColor: color];
+    let _: () = msg_send![label, setShadow: text_shadow()];
     label
+}
+
+/// The soft shadow under white text on glass (autoreleased).
+unsafe fn text_shadow() -> *mut AnyObject {
+    let shadow: *mut AnyObject = msg_send![class!(NSShadow), new];
+    let black: *mut AnyObject = msg_send![class!(NSColor), blackColor];
+    let color: *mut AnyObject = msg_send![black, colorWithAlphaComponent: 0.55_f64];
+    let _: () = msg_send![shadow, setShadowColor: color];
+    let _: () = msg_send![shadow, setShadowBlurRadius: 3.0_f64];
+    let _: () = msg_send![shadow, setShadowOffset: NSSize::new(0.0, -1.0)];
+    let _: *mut AnyObject = msg_send![shadow, autorelease];
+    shadow
 }
 
 /// Borderless SF Symbol button wired to the shared target (autoreleased).
@@ -4241,7 +4256,7 @@ unsafe fn new_button(
     let _: () = msg_send![button, setImagePosition: 1u64]; // imageOnly
     let _: () = msg_send![button, setTag: tag];
     let _: () = msg_send![button, setToolTip: ns_string(tooltip)];
-    let tint: *mut AnyObject = msg_send![class!(NSColor), secondaryLabelColor];
+    let tint: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
     let _: () = msg_send![button, setContentTintColor: tint];
     let config: *mut AnyObject = msg_send![
         class!(NSImageSymbolConfiguration),
