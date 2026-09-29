@@ -1097,7 +1097,11 @@ fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::Cur
         key: key.to_owned(),
         x: core.pos.0,
         y: core.pos.1,
-        pulsing: core.click_t.is_some(),
+        // A click: the pulse ring, a held button, or the theme playing its
+        // click animation (an AX press sends no pulse, only the action).
+        pulsing: core.click_t.is_some()
+            || core.pressed
+            || core.visual.resolved_action == cursor_overlay::CursorAction::Click,
         image,
     }
 }

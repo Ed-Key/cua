@@ -71,8 +71,9 @@
 //! items. A back window the session has not finished with is a card, each
 //! `CARD_STEP` up and left of the card in front, showing its last still
 //! (only a still tagged with its own window) under a title strip. A window
-//! it finished with (see `finish`) collapses into a chip: its app icon with
-//! a green check, captioned with its title, in a column left of the cards.
+//! it finished with (see `finish`) collapses into a chip: a glass circle
+//! with its app icon and a green check badge (its title is the tooltip), in
+//! a column left of the cards.
 //! Acting in a back item's window, or clicking it, springs it to the front
 //! and tucks the old front behind; a click only re-targets the panel (never
 //! focuses the window or activates cua-driver). A back item drops 30 s after
@@ -162,12 +163,6 @@ unsafe impl objc2::RefEncode for CGPath {
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
     fn CGPathCreateMutable() -> *mut CGPath;
-    fn CGPathCreateWithRoundedRect(
-        rect: NSRect,
-        corner_width: f64,
-        corner_height: f64,
-        transform: *const c_void,
-    ) -> *mut CGPath;
     fn CGPathMoveToPoint(path: *mut CGPath, transform: *const c_void, x: f64, y: f64);
     fn CGPathAddLineToPoint(path: *mut CGPath, transform: *const c_void, x: f64, y: f64);
     fn CGPathRelease(path: *mut CGPath);
@@ -195,9 +190,8 @@ const WELL_RADIUS: f64 = CORNER_RADIUS - PAD;
 /// The session-colored glow around the front card (and each chip): where
 /// the agent's color lives, instead of a border.
 const HALO_RADIUS: f64 = 10.0;
-const HALO_OPACITY: f64 = 0.9;
-/// Width of the ring that casts the halo.
-const HALO_RING: f64 = 2.0;
+/// Peak opacity of the glow, right at the glass edge.
+const HALO_OPACITY: f64 = 0.4;
 /// The action caption inside the well: its height, how long it stays after
 /// an action, and its fade.
 const CAPTION_HEIGHT: f64 = 20.0;
@@ -410,6 +404,8 @@ struct Panel {
     cursor_layer: usize,
     cursor_image: usize,
     sprite: Sprite,
+    /// The first cursor update was logged.
+    cursor_seen: bool,
     /// The target window's frame (CoreGraphics, top-left origin) as last
     /// looked up off the main thread, for mapping the cursor into the well.
     target_frame: Option<Area>,
@@ -451,8 +447,14 @@ struct Panel {
     /// `Slot::view`, framed and hidden with its view.
     plates: [usize; VIEWS],
     /// Each view's halo (see `new_halo`), indexed like `plates`; 0 for
-    /// back cards, which have none.
+    /// back cards, which have none. With the size each halo's glow image
+    /// was drawn for, and that retained `CGImage`.
     halos: [usize; VIEWS],
+    halo_sizes: [(f64, f64); VIEWS],
+    halo_images: [usize; VIEWS],
+    /// The front card's content view (inside its glass): everything the
+    /// card shows, the finale overlay included, lives here.
+    body: usize,
     /// Windows the session acted in, front card first.
     cards: CardStack<Tag, CardInfo>,
     /// Where each item of `cards` is drawn, front first (at least the
@@ -1130,6 +1132,10 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
         _ => None,
     };
     let log = panel.sprite.update(point, update.pulsing);
+    if !panel.cursor_seen {
+        panel.cursor_seen = true;
+        tracing::info!(target: "pip", session = %update.key, mapped = point.is_some(), image = update.image.is_some(), frame = ?panel.target_frame, "PiP cursor feed started");
+    }
     let layer = panel.cursor_layer as *mut AnyObject;
     let _: () = msg_send![class!(CATransaction), begin];
     let _: () = msg_send![class!(CATransaction), setDisableActions: true];
@@ -2107,8 +2113,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
             h: well_h,
         }),
     );
-    let _: () = msg_send![overlay, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![overlay, layer];
+    let layer = host_layer(overlay);
     let scrim: *mut AnyObject = msg_send![
         class!(NSColor),
         colorWithSRGBRed: 0.0_f64
@@ -2188,11 +2193,11 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
                     NSSize::new(row_w, ROW_HEIGHT),
                 );
                 let view = new_view(class!(NSView), frame);
-                let _: () = msg_send![view, setWantsLayer: true];
+                let view_layer = host_layer(view);
                 let _: () = msg_send![view, setAutoresizingMask: 8u64 | 32];
                 let bounds = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
                 let body = new_view(class!(NSView), bounds);
-                let _: () = msg_send![body, setWantsLayer: true];
+                let body_layer = host_layer(body);
                 let (mark, glyph) = new_mark(MARK_SIZE, kind);
                 let _: () = msg_send![
                     mark,
@@ -2201,14 +2206,12 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
                         NSSize::new(MARK_SIZE, MARK_SIZE)
                     )
                 ];
-                let body_layer: *mut AnyObject = msg_send![body, layer];
                 let _: () = msg_send![body_layer, setCornerRadius: ROW_HEIGHT / 2.0];
                 let _: () = msg_send![body_layer, setBackgroundColor: capsule];
                 let _: () = msg_send![body_layer, addSublayer: mark];
                 let _: () = msg_send![body, addSubview: label];
                 let _: () = msg_send![body, setAutoresizingMask: 18u64];
                 add_subview(view, body);
-                let view_layer: *mut AnyObject = msg_send![view, layer];
                 animate_row(view_layer, mark, glyph, index, start, (-10.0, 0.0));
                 add_subview(overlay, view);
             }
@@ -2249,7 +2252,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
             }
         }
     }
-    let _: () = msg_send![panel.front_view as *mut AnyObject, addSubview: overlay];
+    let _: () = msg_send![panel.body as *mut AnyObject, addSubview: overlay];
     let _: () = msg_send![overlay, release];
     panel.finale_view = Some(overlay as usize);
 }
@@ -2547,6 +2550,12 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         };
         // The cursor is gone with the session.
         set_cursor_image(&mut panel, 0);
+        for image in &mut panel.halo_images {
+            if *image != 0 {
+                CGImageRelease(*image as *mut c_void);
+                *image = 0;
+            }
+        }
         let _: () = msg_send![panel.cursor_layer as *mut AnyObject, setHidden: true];
         state.streams.request(&key, Request::Stop);
         let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
@@ -2795,52 +2804,94 @@ unsafe fn session_ns_color(key: &str) -> *mut AnyObject {
     ]
 }
 
-/// A halo view in `parent`: an empty layer whose shadow, shaped by
-/// `halo_path`, is a soft glow in `color` around the glass it sits under.
-unsafe fn new_halo(parent: *mut AnyObject, color: *mut CGColor) -> usize {
+/// A halo view in `parent`: a hosted layer that shows a glow image (see
+/// `halo_image`), hidden until placed.
+unsafe fn new_halo(parent: *mut AnyObject) -> usize {
     let view = new_view(class!(NSView), NSRect::ZERO);
-    let _: () = msg_send![view, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![view, layer];
-    let _: () = msg_send![layer, setShadowColor: color];
-    let _: () = msg_send![layer, setShadowRadius: HALO_RADIUS];
-    let _: () = msg_send![layer, setShadowOpacity: HALO_OPACITY as f32];
-    let _: () = msg_send![layer, setShadowOffset: NSSize::new(0.0, 0.0)];
-    let _: () = msg_send![layer, setMasksToBounds: false];
+    let layer = host_layer(view);
+    let _: () = msg_send![layer, setContentsGravity: ns_string("resize")];
+    let _: () = msg_send![layer, setContentsScale: backing_scale()];
     let _: () = msg_send![view, setHidden: true];
     add_subview(parent, view);
     view as usize
 }
 
-/// Put the halo `view` under a glass shape of `frame` (window coordinates)
-/// with corner `radius`: its shadow is cast by a thin ring along the
-/// shape's edge, so the glow spreads outward (the part under the glass is
-/// covered) and the shape's interior stays clear.
-unsafe fn place_halo(view: usize, frame: Area, radius: f64) {
-    set_frame(view, frame);
-    let layer: *mut AnyObject = msg_send![view as *mut AnyObject, layer];
-    let outer = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(frame.w, frame.h));
-    let inset = HALO_RING;
-    let inner = NSRect::new(
-        NSPoint::new(inset, inset),
-        NSSize::new((frame.w - 2.0 * inset).max(0.0), (frame.h - 2.0 * inset).max(0.0)),
+/// Put halo `index` of `panel` around a glass shape of `frame` (window
+/// coordinates) with corner `radius`, redrawing its glow when the size
+/// changed.
+unsafe fn place_halo(panel: &mut Panel, index: usize, frame: Area, radius: f64) {
+    let view = panel.halos[index];
+    set_frame(
+        view,
+        Area {
+            x: frame.x - HALO_RADIUS,
+            y: frame.y - HALO_RADIUS,
+            w: frame.w + 2.0 * HALO_RADIUS,
+            h: frame.h + 2.0 * HALO_RADIUS,
+        },
     );
-    let ring: *mut AnyObject = msg_send![
-        class!(NSBezierPath),
-        bezierPathWithRoundedRect: outer
-        xRadius: radius
-        yRadius: radius
-    ];
-    let hole: *mut AnyObject = msg_send![
-        class!(NSBezierPath),
-        bezierPathWithRoundedRect: inner
-        xRadius: (radius - inset).max(0.0)
-        yRadius: (radius - inset).max(0.0)
-    ];
-    // Reversed, so the non-zero rule leaves the interior empty.
-    let hole: *mut AnyObject = msg_send![hole, bezierPathByReversingPath];
-    let _: () = msg_send![ring, appendBezierPath: hole];
-    let path: *mut CGPath = msg_send![ring, CGPath];
-    let _: () = msg_send![layer, setShadowPath: path];
+    if panel.halo_sizes[index] == (frame.w, frame.h) {
+        return;
+    }
+    panel.halo_sizes[index] = (frame.w, frame.h);
+    let [r, g, b, _] = cursor_overlay::session_fill_rgba(&panel.key);
+    let image = halo_image((frame.w, frame.h), radius, [r, g, b], backing_scale()).unwrap_or(0);
+    let layer: *mut AnyObject = msg_send![view as *mut AnyObject, layer];
+    let _: () = msg_send![layer, setContents: image as *mut AnyObject];
+    let old = std::mem::replace(&mut panel.halo_images[index], image);
+    if old != 0 {
+        CGImageRelease(old as *mut c_void);
+    }
+}
+
+/// A rounded rect of `size` and `radius` at `(x, y)` as a tiny-skia path.
+fn rounded_rect(x: f32, y: f32, w: f32, h: f32, radius: f32) -> Option<tiny_skia::Path> {
+    let r = radius.min(w / 2.0).min(h / 2.0);
+    let k = 0.552_284_8 * r;
+    let mut pb = tiny_skia::PathBuilder::new();
+    pb.move_to(x + r, y);
+    pb.line_to(x + w - r, y);
+    pb.cubic_to(x + w - r + k, y, x + w, y + r - k, x + w, y + r);
+    pb.line_to(x + w, y + h - r);
+    pb.cubic_to(x + w, y + h - r + k, x + w - r + k, y + h, x + w - r, y + h);
+    pb.line_to(x + r, y + h);
+    pb.cubic_to(x + r - k, y + h, x, y + h - r + k, x, y + h - r);
+    pb.line_to(x, y + r);
+    pb.cubic_to(x, y + r - k, x + r - k, y, x + r, y);
+    pb.close();
+    pb.finish()
+}
+
+/// The glow around a rounded rect of `size` and `radius` in `rgb`, as a
+/// retained `CGImage` (`HALO_RADIUS` wider on every side, at `scale`
+/// pixels per point): strokes of growing width along the edge add up to a
+/// soft falloff, and the shape's inside is cleared so the glass stays
+/// untinted.
+fn halo_image(size: (f64, f64), radius: f64, rgb: [u8; 3], scale: f64) -> Option<usize> {
+    let s = scale as f32;
+    let pad = HALO_RADIUS as f32 * s;
+    let (w, h) = (size.0 as f32 * s, size.1 as f32 * s);
+    let mut pm = tiny_skia::Pixmap::new((w + 2.0 * pad).ceil() as u32, (h + 2.0 * pad).ceil() as u32)?;
+    let path = rounded_rect(pad, pad, w, h, radius as f32 * s)?;
+    // Each stroke is wider and fainter than the last: they all overlap at
+    // the edge (which reaches about `HALO_OPACITY`) and thin out to
+    // nothing `HALO_RADIUS` away.
+    let steps = 12;
+    for step in 1..=steps {
+        let mut paint = tiny_skia::Paint::default();
+        let weight = 2.0 * (1.0 - (step - 1) as f64 / steps as f64) / steps as f64;
+        paint.set_color_rgba8(rgb[0], rgb[1], rgb[2], (HALO_OPACITY * weight * 255.0).round() as u8);
+        paint.anti_alias = true;
+        let stroke = tiny_skia::Stroke {
+            width: 2.0 * pad * step as f32 / steps as f32,
+            ..Default::default()
+        };
+        pm.stroke_path(&path, &paint, &stroke, tiny_skia::Transform::identity(), None);
+    }
+    let mut clear = tiny_skia::Paint::default();
+    clear.blend_mode = tiny_skia::BlendMode::Clear;
+    pm.fill_path(&path, &clear, tiny_skia::FillRule::Winding, tiny_skia::Transform::identity(), None);
+    crate::cursor::overlay::pixmap_to_cgimage(&pm)
 }
 
 /// Front card size in points for an image well of `image_size`.
@@ -2926,18 +2977,6 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let name = label.map(str::to_owned).unwrap_or_else(|| short_key(key));
     let _: () = msg_send![window, setTitle: ns_string(&format!("cua PiP · {name}"))];
 
-    let [r, g, b, _] = cursor_overlay::session_fill_rgba(key);
-    let session_color = |alpha: f64| -> *mut CGColor {
-        let color: *mut AnyObject = msg_send![
-            class!(NSColor),
-            colorWithSRGBRed: r as f64 / 255.0
-            green: g as f64 / 255.0
-            blue: b as f64 / 255.0
-            alpha: alpha
-        ];
-        msg_send![color, CGColor]
-    };
-
     // Content: a clear view that holds the cards and handles the mouse.
     let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(width, height));
     let stack_view = new_view(stack_view_class(), bounds);
@@ -2953,15 +2992,6 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let mut plates = [0usize; VIEWS];
     for plate in &mut plates {
         *plate = new_hit_plate(stack_view);
-    }
-    // Halos under the front card and the chips: the session color as a
-    // glow around the glass. Separate views below the glass container,
-    // since a layer shadow inside it does not render.
-    let mut halos = [0usize; VIEWS];
-    for (index, halo_view) in halos.iter_mut().enumerate() {
-        if index == 0 || index >= MAX_CARDS {
-            *halo_view = new_halo(stack_view, session_color(1.0));
-        }
     }
 
     // Back cards, deepest first so depth 1 draws over depth 2, each its own
@@ -3140,6 +3170,16 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     add_subview(body, caption);
     add_subview(deck, front_view);
 
+    // Halos: the session color as a glow just outside the front card and
+    // each chip. Drawn images in layers above the glass container (a layer
+    // shadow renders nowhere in this window), clear inside the shape.
+    let mut halos = [0usize; VIEWS];
+    for (index, halo_view) in halos.iter_mut().enumerate() {
+        if index == 0 || index >= MAX_CARDS {
+            *halo_view = new_halo(stack_view);
+        }
+    }
+
     let mut panel = Panel {
         id,
         window: window as usize,
@@ -3150,6 +3190,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         cursor_layer: cursor_layer as usize,
         cursor_image: 0,
         sprite: Sprite::default(),
+        cursor_seen: false,
         target_frame: None,
         live_frame: None,
         live_tag: None,
@@ -3173,6 +3214,9 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         chips: chips.try_into().ok()?,
         plates,
         halos,
+        halo_sizes: [(0.0, 0.0); VIEWS],
+        halo_images: [0; VIEWS],
+        body: body as usize,
         cards: CardStack::new(),
         layout: vec![Slot::Front],
         motion: Default::default(),
@@ -3253,8 +3297,7 @@ unsafe fn new_pip_window(rect: NSRect) -> Option<*mut AnyObject> {
 /// in `parent`, so presses on it are never passed to the window below.
 unsafe fn new_hit_plate(parent: *mut AnyObject) -> usize {
     let plate = new_view(class!(NSView), NSRect::ZERO);
-    let _: () = msg_send![plate, setWantsLayer: true];
-    let layer: *mut AnyObject = msg_send![plate, layer];
+    let layer = host_layer(plate);
     let fill: *mut AnyObject = msg_send![
         class!(NSColor),
         colorWithSRGBRed: 1.0_f64
@@ -3390,7 +3433,7 @@ unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
         class!(NSView),
         NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP_W, CHIP_H)),
     );
-    let _: () = msg_send![view, setWantsLayer: true];
+    host_layer(view);
     // The circle sits top-left in the frame; the badge overhangs bottom-right.
     let circle = NSRect::new(
         NSPoint::new(0.0, CHIP_H - CHIP),
@@ -3418,8 +3461,7 @@ unsafe fn new_chip(parent: *mut AnyObject, finished: bool) -> ChipView {
                 NSSize::new(CHIP_BADGE, CHIP_BADGE),
             ),
         );
-        let _: () = msg_send![badge, setWantsLayer: true];
-        let badge_layer: *mut AnyObject = msg_send![badge, layer];
+        let badge_layer = host_layer(badge);
         (mark, glyph) = new_mark(CHIP_BADGE, Mark::Check);
         let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
         let white: *mut CGColor = msg_send![white, CGColor];
@@ -3607,7 +3649,7 @@ unsafe fn apply_card_frames(panel: &mut Panel) {
         set_frame(card_view(panel, slot), placed);
         set_frame(panel.plates[slot.view()], placed);
         match slot {
-            Slot::Front => place_halo(panel.halos[0], placed, CORNER_RADIUS),
+            Slot::Front => place_halo(panel, 0, placed, CORNER_RADIUS),
             Slot::Chip(_) => {
                 // Around the circle, not the badge's overhang.
                 let circle = Area {
@@ -3616,7 +3658,7 @@ unsafe fn apply_card_frames(panel: &mut Panel) {
                     w: stack::CHIP,
                     h: stack::CHIP,
                 };
-                place_halo(panel.halos[slot.view()], circle, stack::CHIP / 2.0);
+                place_halo(panel, slot.view(), circle, stack::CHIP / 2.0);
             }
             Slot::Card(_) => {}
         }
@@ -4127,6 +4169,18 @@ fn card_view_class() -> &'static AnyClass {
 }
 
 // ── Small AppKit helpers ──────────────────────────────────────────────────
+
+/// Give `view` a layer of our own (`setLayer:` before `setWantsLayer:`, so
+/// the view hosts it as is) and return it. Colors and shadows set on a
+/// layer AppKit creates for a plain view are not kept here (the panel's
+/// scrim, capsules and halos all vanished that way); a hosted layer keeps
+/// them.
+unsafe fn host_layer(view: *mut AnyObject) -> *mut AnyObject {
+    let layer: *mut AnyObject = msg_send![class!(CALayer), layer];
+    let _: () = msg_send![view, setLayer: layer];
+    let _: () = msg_send![view, setWantsLayer: true];
+    layer
+}
 
 /// `[[class alloc] initWithFrame:]`, owned (+1) by the caller.
 unsafe fn new_view(class: &AnyClass, frame: NSRect) -> *mut AnyObject {

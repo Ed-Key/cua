@@ -56,13 +56,14 @@ pub(super) const CHIP_BADGE_RING: f64 = 1.5;
 /// A chip's whole frame: the circle plus the badge's overhang.
 pub(super) const CHIP_W: f64 = CHIP + 4.0;
 pub(super) const CHIP_H: f64 = CHIP + 4.0;
-/// Between chips in the column, and between the column and the cards (a
-/// resting chip sits just inside the glass container's merge distance, so
-/// it fuses with the front card like liquid and separates when it lags).
-const CHIP_ROW_GAP: f64 = 6.0;
-const CHIP_GAP: f64 = 6.0;
+/// Between chips in the column (just past the glass merge distance, so
+/// resting chips stay round), and between the column and the cards (a
+/// resting chip's circle sits inside the merge distance, so it fuses with
+/// the front card like liquid and pulls free when it lags).
+const CHIP_ROW_GAP: f64 = 12.0;
+const CHIP_GAP: f64 = 2.0;
 /// Glass views closer than this merge into one shape.
-pub(super) const GLASS_SPACING: f64 = 14.0;
+pub(super) const GLASS_SPACING: f64 = 11.0;
 /// The chip column's width, left of the deck.
 pub(super) const TRAIL_PAD: f64 = CHIP_GAP + CHIP_W;
 /// Room on every side of the deck for trailing items, inside the window.
