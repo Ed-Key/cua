@@ -10,8 +10,9 @@
 //!
 //! No ScreenCaptureKit call can wedge that thread: opens and resizes run on
 //! helper threads with a bounded wait (a timeout abandons the stream and
-//! reports [`Event::Ended`]), stops are fire and forget, and a stream that
-//! fails to open is retried a few times before the panel gives up on live.
+//! reports [`Event::Ended`]), stops run on their own threads and an open
+//! waits for them at most one call timeout, and a stream that fails to open
+//! is retried a few times before the panel gives up on live.
 //! Each start, stop, resize, retry and timeout logs a `pip` tracing line
 //! with the session key, generation and elapsed time.
 //!
@@ -94,6 +95,8 @@ pub(super) struct StreamState {
     generation: u64,
     /// Image well size (points) the stream was last sized for.
     well: (f64, f64),
+    /// A frame of the current generation has been shown.
+    framed: bool,
 }
 
 impl StreamState {
@@ -102,6 +105,17 @@ impl StreamState {
         self.requested = Some(target);
         self.generation = generation;
         self.well = well;
+        self.framed = false;
+    }
+
+    /// The current generation's generation number (0 = none), for logs.
+    pub(super) fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// True for the first frame shown of the current generation only.
+    pub(super) fn first_frame(&mut self) -> bool {
+        !std::mem::replace(&mut self.framed, true)
     }
 
     /// Whether a running stream must be reconfigured for a new `well`.
@@ -293,6 +307,9 @@ struct Worker<B: Backend> {
     retry_delay: Duration,
     running: HashMap<String, Running<B::Stream>>,
     retries: HashMap<String, Retry>,
+    /// Stops still inside ScreenCaptureKit, by id, with when each began.
+    stops: Arc<(Mutex<HashMap<u64, Instant>>, Condvar)>,
+    next_stop: u64,
 }
 
 impl<B: Backend> Worker<B> {
@@ -305,6 +322,8 @@ impl<B: Backend> Worker<B> {
             retry_delay: RETRY_DELAY,
             running: HashMap::new(),
             retries: HashMap::new(),
+            stops: Arc::default(),
+            next_stop: 0,
         }
     }
 
@@ -356,8 +375,8 @@ impl<B: Backend> Worker<B> {
     }
 
     /// Stop the session's stream without waiting for ScreenCaptureKit: a
-    /// stream whose window is gone can hang in `stopCapture`, and nothing
-    /// depends on it finishing.
+    /// stream whose window is gone can hang in `stopCapture`. The next open
+    /// waits a little for it (see [`Self::settle_stops`]).
     fn stop_running(&mut self, key: &str) {
         let Some(running) = self.running.remove(key) else {
             return;
@@ -365,15 +384,48 @@ impl<B: Backend> Worker<B> {
         let backend = self.backend.clone();
         let (key, generation) = (key.to_owned(), running.generation);
         let stream = running.stream;
+        let id = self.next_stop;
+        self.next_stop += 1;
+        lock(&self.stops.0).insert(id, Instant::now());
+        let stops = self.stops.clone();
+        tracing::info!(target: "pip", session = %key, generation, "PiP stream stopping");
         let spawned = std::thread::Builder::new()
             .name("cua-pip-stop".into())
             .spawn(move || {
                 let started = Instant::now();
                 backend.stop(&stream);
+                lock(&stops.0).remove(&id);
+                stops.1.notify_all();
                 tracing::info!(target: "pip", session = %key, generation, elapsed_ms = started.elapsed().as_millis() as u64, "PiP stream stopped");
             });
         if let Err(error) = spawned {
+            lock(&self.stops.0).remove(&id);
             tracing::warn!(target: "pip", %error, "PiP could not spawn a stop thread; stream abandoned");
+        }
+    }
+
+    /// Wait for stops still inside ScreenCaptureKit to finish, each for at
+    /// most `call_timeout` from when it began, so an open never overlaps a
+    /// teardown ScreenCaptureKit is still doing (the order the stream thread
+    /// had when stops were synchronous). Returns how many stops are still
+    /// running (hung past their timeout; not waited on again).
+    fn settle_stops(&self) -> usize {
+        let (stops, done) = &*self.stops;
+        let mut stops = lock(stops);
+        loop {
+            let now = Instant::now();
+            let Some(until) = stops
+                .values()
+                .map(|began| *began + self.call_timeout)
+                .filter(|until| *until > now)
+                .max()
+            else {
+                return stops.len();
+            };
+            stops = done
+                .wait_timeout(stops, until - now)
+                .unwrap_or_else(|e| e.into_inner())
+                .0;
         }
     }
 
@@ -407,6 +459,7 @@ impl<B: Backend> Worker<B> {
 
     fn open(&mut self, key: String, generation: u64, target: Target, well: (f64, f64), attempt: u32) {
         let started = Instant::now();
+        let hung_stops = self.settle_stops();
         let backend = self.backend.clone();
         let late_backend = self.backend.clone();
         let deliver = self.deliver.clone();
@@ -425,7 +478,7 @@ impl<B: Backend> Worker<B> {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match result {
             Some(Ok(stream)) => {
-                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, elapsed_ms, "PiP stream started");
+                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, hung_stops, elapsed_ms, "PiP stream started");
                 self.running.insert(
                     key,
                     Running {
@@ -435,7 +488,7 @@ impl<B: Backend> Worker<B> {
                 );
             }
             Some(Err(error)) if attempt < OPEN_RETRIES => {
-                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, %error, elapsed_ms, "PiP stream did not open; retrying");
+                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, hung_stops, %error, elapsed_ms, "PiP stream did not open; retrying");
                 self.retries.insert(
                     key,
                     Retry {
@@ -448,11 +501,11 @@ impl<B: Backend> Worker<B> {
                 );
             }
             Some(Err(error)) => {
-                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, %error, elapsed_ms, "PiP live stream unavailable; using stills");
+                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, hung_stops, %error, elapsed_ms, "PiP live stream unavailable; using stills");
                 self.end(key, generation);
             }
             None => {
-                tracing::warn!(target: "pip", session = %key, generation, ?target, elapsed_ms, "PiP stream open timed out; using stills");
+                tracing::warn!(target: "pip", session = %key, generation, ?target, attempt, hung_stops, elapsed_ms, "PiP stream open timed out; using stills");
                 self.end(key, generation);
             }
         }
@@ -804,6 +857,8 @@ mod tests {
         plan: Mutex<std::collections::VecDeque<Open>>,
         opens: std::sync::atomic::AtomicU32,
         stopped: Mutex<Vec<u32>>,
+        /// How many stops had finished when each open began.
+        stops_done_at_open: Mutex<Vec<usize>>,
         hang_stop: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
         hang_resize: std::sync::atomic::AtomicBool,
     }
@@ -826,6 +881,8 @@ mod tests {
         ) -> anyhow::Result<FakeStream> {
             use std::sync::atomic::Ordering::SeqCst;
             let id = self.0.opens.fetch_add(1, SeqCst);
+            let done = lock(&self.0.stopped).len();
+            lock(&self.0.stops_done_at_open).push(done);
             let step = lock(&self.0.plan).pop_front().unwrap_or(Open::Ok);
             match step {
                 Open::Ok => Ok(FakeStream(id)),
@@ -920,10 +977,57 @@ mod tests {
 
         let began = Instant::now();
         worker.handle("a".into(), Request::Stop);
-        worker.handle("b".into(), start(2));
-        assert!(began.elapsed() < Duration::from_millis(80));
+        assert!(began.elapsed() < Duration::from_millis(50));
         assert!(!worker.running.contains_key("a"));
+        // The next open waits for the stop at most one call timeout.
+        worker.handle("b".into(), start(2));
+        assert!(began.elapsed() < worker.call_timeout + Duration::from_millis(80));
         assert!(worker.running.contains_key("b"));
+    }
+
+    /// The VM sequence: session A streams, idles out and hides (its stop is
+    /// still inside ScreenCaptureKit), then session B's panel appears and
+    /// opens a stream. B's open waits for A's teardown instead of racing it.
+    #[test]
+    fn an_open_waits_for_a_stop_still_in_flight() {
+        let fake = Fake::default();
+        let (release, gate) = std::sync::mpsc::channel::<()>();
+        let (mut worker, _) = worker(&fake);
+        worker.handle("a".into(), start(1));
+        *lock(&fake.0.hang_stop) = Some(gate);
+        worker.handle("a".into(), Request::Stop);
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(30));
+            drop(release);
+        });
+
+        worker.handle("b".into(), start(2));
+        assert!(worker.running.contains_key("b"));
+        // A's open saw no stops; B's saw A's stop finished.
+        assert_eq!(*lock(&fake.0.stops_done_at_open), vec![0, 1]);
+        assert_eq!(worker.settle_stops(), 0);
+    }
+
+    #[test]
+    fn a_hung_stop_delays_opens_by_at_most_one_call_timeout() {
+        let fake = Fake::default();
+        let (_hold, gate) = std::sync::mpsc::channel::<()>();
+        let (mut worker, _) = worker(&fake);
+        worker.handle("a".into(), start(1));
+        *lock(&fake.0.hang_stop) = Some(gate);
+        worker.handle("a".into(), Request::Stop);
+
+        let began = Instant::now();
+        worker.handle("b".into(), start(2));
+        let waited = began.elapsed();
+        assert!(worker.running.contains_key("b"));
+        // It waited for the stop (whose clock started just before `began`).
+        assert!(waited >= worker.call_timeout / 2 && waited < Duration::from_secs(2));
+        // The stop is past its timeout: later opens do not wait on it again.
+        let began = Instant::now();
+        worker.handle("c".into(), start(3));
+        assert!(began.elapsed() < worker.call_timeout);
+        assert_eq!(worker.settle_stops(), 1);
     }
 
     #[test]

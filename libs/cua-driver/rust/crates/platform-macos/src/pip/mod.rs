@@ -898,9 +898,15 @@ unsafe extern "C" fn live_event_cb(ctx: *mut c_void) {
                     return;
                 };
                 if !panel.stream.accepts(generation) {
+                    // At most once per ended stream: its slot stays full, so
+                    // it sends no further events.
+                    tracing::info!(target: "pip", session = %key, generation, current = panel.stream.generation(), "PiP live frame from an ended stream dropped");
                     return;
                 }
                 if let Some(frame) = lock(&slot).take() {
+                    if panel.stream.first_frame() {
+                        tracing::info!(target: "pip", session = %key, generation, shown = panel.shown, "PiP live frame shown");
+                    }
                     show_live(panel, frame);
                 }
             }
@@ -913,7 +919,9 @@ unsafe extern "C" fn live_event_cb(ctx: *mut c_void) {
                 // `panel.stream.requested` stays set, so this target is not
                 // retried until it changes or the panel hides and shows
                 // again; the Stop only releases the stream.
-                if !panel.stream.end(generation) {
+                let current = panel.stream.end(generation);
+                tracing::info!(target: "pip", session = %key, generation, current, "PiP stream ended");
+                if !current {
                     return;
                 }
                 clear_live(panel);
@@ -961,6 +969,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
         StreamStep::Start(target) => {
             *next_stream_generation += 1;
             panel.stream.begin(target, *next_stream_generation, *image_size);
+            tracing::info!(target: "pip", session = %key, generation = *next_stream_generation, ?target, "PiP stream requested");
             // Never show one window's live pixels as another's preview.
             clear_live(panel);
             streams.request(
@@ -974,6 +983,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
         }
         StreamStep::Stop => {
             // The last live frame stays up while the panel fades out.
+            tracing::info!(target: "pip", session = %key, shown = panel.shown, "PiP stream release requested");
             panel.stream.stop();
             streams.request(key, Request::Stop);
             // A shown panel only stops for a new target it cannot stream:

@@ -45,12 +45,43 @@ mod version_check;
 use std::sync::Arc;
 
 fn init_logging() {
-    use tracing_subscriber::EnvFilter;
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
-        .with_env_filter(EnvFilter::from_env("CUA_LOG").add_directive(tracing::Level::WARN.into()))
+        .with_env_filter(log_filter(&std::env::var("CUA_LOG").unwrap_or_default()))
         .init();
     telemetry::register_stdio_observer();
+}
+
+/// `warn` unless `CUA_LOG` says otherwise. The default goes first because a
+/// later directive for the same target replaces an earlier one, so a bare
+/// `CUA_LOG=info` must come after `warn` to take effect.
+fn log_filter(cua_log: &str) -> tracing_subscriber::EnvFilter {
+    tracing_subscriber::EnvFilter::builder().parse_lossy(format!("warn,{cua_log}"))
+}
+
+#[cfg(test)]
+mod log_filter_tests {
+    use super::log_filter;
+
+    #[test]
+    fn cua_log_sets_the_level_and_warn_is_the_default() {
+        // Display lists the directives in effect (a replaced one is gone).
+        assert_eq!(log_filter("").to_string(), "warn");
+        assert_eq!(log_filter("info").to_string(), "info");
+        assert_eq!(log_filter("debug").to_string(), "debug");
+        // A target directive keeps warn for everything else.
+        let scoped = log_filter("pip=info").to_string();
+        assert!(scoped.contains("pip=info") && scoped.contains("warn"), "{scoped}");
+    }
+
+    #[test]
+    fn a_default_added_after_cua_log_overrode_it() {
+        // The old construction: the trailing WARN replaced a bare CUA_LOG=info.
+        let old = tracing_subscriber::EnvFilter::builder()
+            .parse_lossy("info")
+            .add_directive(tracing::Level::WARN.into());
+        assert_eq!(old.to_string(), "warn");
+    }
 }
 
 fn configure_startup_permission_mode(
