@@ -323,11 +323,21 @@ impl<B: Backend> Worker<B> {
     }
 
     fn handle(&mut self, key: String, request: Request) {
-        // Any newer request for the session supersedes a pending retry.
+        // A resize never cancels a pending open: the retry opens at the new
+        // size. (With nothing running or pending it is a no-op; the panel
+        // keeps the size for its next start.)
+        if let Request::Resize { well } = request {
+            match self.retries.get_mut(&key) {
+                Some(retry) => retry.well = well,
+                None => self.resize(&key, well),
+            }
+            return;
+        }
+        // Any other newer request for the session supersedes a pending retry.
         self.retries.remove(&key);
         match request {
             Request::Stop => self.stop_running(&key),
-            Request::Resize { well } => self.resize(&key, well),
+            Request::Resize { .. } => {}
             Request::Start {
                 generation,
                 target,
@@ -1107,6 +1117,8 @@ mod tests {
         stopped: Mutex<Vec<u32>>,
         /// How many stops had finished when each open began.
         stops_done_at_open: Mutex<Vec<usize>>,
+        /// The well size each open asked for.
+        open_wells: Mutex<Vec<(f64, f64)>>,
         hang_stop: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
         hang_resize: std::sync::atomic::AtomicBool,
     }
@@ -1124,10 +1136,11 @@ mod tests {
             _key: &str,
             _generation: u64,
             _target: Target,
-            _well: (f64, f64),
+            well: (f64, f64),
             _deliver: &Deliver,
         ) -> anyhow::Result<FakeStream> {
             use std::sync::atomic::Ordering::SeqCst;
+            lock(&self.0.open_wells).push(well);
             let id = self.0.opens.fetch_add(1, SeqCst);
             let done = lock(&self.0.stopped).len();
             lock(&self.0.stops_done_at_open).push(done);
@@ -1330,6 +1343,24 @@ mod tests {
         assert!(worker.running.contains_key("a"));
         assert!(worker.next_retry().is_none());
         assert!(lock(&ended).is_empty());
+    }
+
+    #[test]
+    fn a_resize_keeps_a_pending_retry_and_it_opens_at_the_new_size() {
+        let fake = Fake::default();
+        lock(&fake.0.plan).push_back(Open::Err);
+        let (mut worker, ended) = worker(&fake);
+        worker.handle("a".into(), start(1));
+        assert!(worker.next_retry().is_some());
+        worker.handle("a".into(), Request::Resize { well: (400.0, 250.0) });
+        assert!(worker.next_retry().is_some(), "the resize cancelled the retry");
+        worker.retry_due(Instant::now() + Duration::from_secs(60));
+        assert!(worker.running.contains_key("a"));
+        assert_eq!(*lock(&fake.0.open_wells), [(320.0, 200.0), (400.0, 250.0)]);
+        assert!(lock(&ended).is_empty());
+        // Nothing running or pending: a resize is a no-op.
+        worker.handle("b".into(), Request::Resize { well: (1.0, 1.0) });
+        assert!(!worker.running.contains_key("b") && worker.next_retry().is_none());
     }
 
     #[test]
