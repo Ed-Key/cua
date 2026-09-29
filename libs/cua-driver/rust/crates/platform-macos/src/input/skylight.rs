@@ -1089,8 +1089,23 @@ const RAISE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis
 
 fn occlusion_at(pid: libc::pid_t, window_id: u32, point: (f64, f64)) -> Option<TargetOccluded> {
     let windows = crate::windows::composited_windows();
+    let displays: Vec<crate::windows::WindowBounds> =
+        core_graphics::display::CGDisplay::active_displays()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| {
+                let bounds = core_graphics::display::CGDisplay::new(id).bounds();
+                crate::windows::WindowBounds {
+                    x: bounds.origin.x,
+                    y: bounds.origin.y,
+                    width: bounds.size.width,
+                    height: bounds.size.height,
+                }
+            })
+            .collect();
     let covering = match crate::windows::point_owner(
         &windows,
+        &displays,
         point,
         pid,
         std::process::id() as i32,

@@ -109,11 +109,20 @@ impl RowReadback {
     }
 }
 
-/// The first `MAX_SCANNED_PEERS` children of `parent` (its rows, for a
-/// table) that expose AXSelected. The caller releases them.
-unsafe fn selectable_children(parent: AXUIElementRef) -> Vec<AXUIElementRef> {
-    let rows = crate::ax::bindings::copy_element_array_attr_checked(parent, "AXRows", 20_000)
-        .unwrap_or_else(|_| copy_children(parent));
+/// The children of `parent` (its rows, for a table) that expose AXSelected,
+/// and whether that list is complete: `false` when the children could not
+/// be read or there were more than `MAX_SCANNED_PEERS`. The caller releases
+/// them.
+unsafe fn selectable_children(parent: AXUIElementRef) -> (Vec<AXUIElementRef>, bool) {
+    let (rows, complete) =
+        match crate::ax::bindings::copy_element_array_attr_checked(parent, "AXRows", 20_000) {
+            Ok(rows) => (rows, true),
+            Err(_) => {
+                let (children, failed) = copy_children_reporting(parent);
+                (children, !failed)
+            }
+        };
+    let complete = complete && rows.len() <= MAX_SCANNED_PEERS;
     let mut kept = Vec::new();
     for (at, child) in rows.into_iter().enumerate() {
         if at < MAX_SCANNED_PEERS && copy_bool_attr(child, "AXSelected").is_some() {
@@ -122,12 +131,12 @@ unsafe fn selectable_children(parent: AXUIElementRef) -> Vec<AXUIElementRef> {
             CFRelease(child as CFTypeRef);
         }
     }
-    kept
+    (kept, complete)
 }
 
 /// (selectable peers, one of them selected) among `parent`'s children.
 unsafe fn peer_selection(parent: AXUIElementRef) -> (usize, bool) {
-    let peers = selectable_children(parent);
+    let (peers, _) = selectable_children(parent);
     let selected = peers
         .iter()
         .any(|&peer| copy_bool_attr(peer, "AXSelected") == Some(true));
@@ -147,7 +156,7 @@ impl RowSelection {
             let mut elements = Vec::new();
             let mut current = element_ptr as AXUIElementRef;
             CFRetain(current as CFTypeRef);
-            for _ in 0..MAX_SELECTION_ANCESTORS {
+            for step in 0..MAX_SELECTION_ANCESTORS {
                 let parent = copy_element_attr(current, "AXParent");
                 chain.push(RowCandidate {
                     role: copy_string_attr(current, "AXRole").unwrap_or_default(),
@@ -157,9 +166,13 @@ impl RowSelection {
                 });
                 elements.push((current, parent));
                 let Some(parent) = parent else { break };
-                if copy_string_attr(parent, "AXRole").as_deref() == Some("AXWindow") {
+                if step + 1 == MAX_SELECTION_ANCESTORS
+                    || copy_string_attr(parent, "AXRole").as_deref() == Some("AXWindow")
+                {
                     break;
                 }
+                // The next step owns `current` separately from this step's
+                // copy of the parent; each is released once below.
                 CFRetain(parent as CFTypeRef);
                 current = parent;
             }
@@ -197,6 +210,11 @@ impl RowSelection {
         }
     }
 
+    /// Whether the row still answers (it was not replaced).
+    pub fn readable(&self) -> bool {
+        unsafe { copy_bool_attr(self.row, "AXSelected") }.is_some()
+    }
+
     /// The row's centre in screen points.
     pub fn center(&self) -> Option<(f64, f64)> {
         unsafe { element_screen_rect(self.row) }
@@ -223,7 +241,14 @@ impl RowSelection {
                     count
                 }
                 Err(_) => {
-                    let peers = selectable_children(container);
+                    // Without a complete peer list, exclusivity is unproven.
+                    let (peers, complete) = selectable_children(container);
+                    if !complete {
+                        for peer in peers {
+                            CFRelease(peer as CFTypeRef);
+                        }
+                        return None;
+                    }
                     let count = peers
                         .iter()
                         .filter(|&&peer| {

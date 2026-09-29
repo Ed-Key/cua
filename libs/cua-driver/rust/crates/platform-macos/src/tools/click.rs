@@ -1897,7 +1897,7 @@ struct RowTarget<'a> {
 }
 
 const ROW_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
-const ROW_READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(600);
+const ROW_READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 const ROW_READBACK_STABILITY: std::time::Duration = std::time::Duration::from_millis(200);
 
 /// Wait for `row` to become the only selected row and stay so.
@@ -1946,9 +1946,29 @@ fn select_row(
         return confirmed("through AX selection", false);
     }
     if element_presses {
+        let alive_before = unsafe { crate::ax::bindings::element_is_alive(element) };
         let err = unsafe { crate::ax::bindings::perform_action(element, "AXPress") };
         if err == crate::ax::bindings::kAXErrorSuccess && row_settles_exclusive(row) {
             return confirmed("with AXPress", false);
+        }
+        // The press replaced the element (it navigated or rebuilt the list):
+        // the row's coordinates may now hold something else, so no pointer
+        // click follows.
+        if crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
+            crate::ax::bindings::element_gone_after_action(element)
+        }) || !row.readable()
+        {
+            return Ok((
+                format!(
+                    "✅ Performed AXPress on [{idx}] {role} \"{title}\"; the row can no longer \
+                     be read back (the press replaced it). Take a fresh snapshot before acting \
+                     again: do not retry this click."
+                ),
+                false,
+                false,
+                false,
+                false,
+            ));
         }
     }
     // The caller resolves the row's pixel target; without one there is no
