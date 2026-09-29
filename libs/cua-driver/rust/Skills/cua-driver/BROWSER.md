@@ -425,7 +425,10 @@ text does not stick. Every mode reads the field back afterwards: a confirmed
 result says what the field holds, and a field that changed or rejected the
 input returns an error with `effect: "mismatch"` and the value it holds. If
 the page replaced the field while handling the input, the result is
-unverifiable (`readback: "element_replaced"`): snapshot again. Read the page
+unverifiable (`readback: "element_replaced"`): snapshot again. A value the
+input could have produced but the driver cannot confirm (for example it
+replaced a selection the page does not expose) is unverifiable with
+`readback: "ambiguous"` and the value it holds. Read the page
 before typing again. Inspect the live schema when in doubt:
 
 ```bash

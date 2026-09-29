@@ -1394,6 +1394,10 @@ enum Readback {
     },
     /// The edited node left the document (the page replaced it).
     Detached,
+    /// The node holds a value the edit could have produced, but the evidence
+    /// cannot tell whether it did (for example it replaced a selection the
+    /// driver could not see). Carries the value it holds.
+    Ambiguous(String),
     Unverifiable,
 }
 
@@ -1409,47 +1413,66 @@ enum EditMode {
 }
 
 /// The one postcondition every browser_type path checks. Each mode and node
-/// kind has its own rule below; none of them guesses.
+/// kind has its own rule below.
+///
+/// Verdict rule: `Mismatch` only when the evidence proves the edit was
+/// rejected or changed (no outcome the request allows matches the value).
+/// When an allowed outcome matches but the evidence cannot tell it apart
+/// from another (a selection the driver cannot see), the verdict is
+/// `Ambiguous`, reported as unverifiable. Contenteditable text is compared
+/// after one whitespace normalization applied identically to the whole
+/// candidate and the whole observed value, never to pieces of either, so a
+/// space the requested text itself carries is kept.
 fn judge_edit(before: &EditState, after: &EditState, text: &str, mode: EditMode) -> Readback {
     if !after.connected {
         return Readback::Detached;
     }
-    let exact = |expected: String| {
-        if after.value == expected {
-            Readback::Confirmed(after.value.clone())
-        } else {
-            Readback::Mismatch {
-                actual: after.value.clone(),
-                expected: Some(expected),
-            }
-        }
-    };
-    let holds = |landed: bool| {
-        if landed {
-            Readback::Confirmed(after.value.clone())
-        } else {
-            Readback::Mismatch {
-                actual: after.value.clone(),
-                expected: None,
-            }
-        }
+    let actual = after.value.clone();
+    let mismatch = |expected: Option<String>| Readback::Mismatch {
+        actual: actual.clone(),
+        expected,
     };
     match (mode, before.field) {
         // An input or textarea replaced or set holds exactly the text.
-        (EditMode::Replace | EditMode::SetValue, true) => exact(text.to_owned()),
+        (EditMode::Replace | EditMode::SetValue, true) => {
+            if after.value == text {
+                Readback::Confirmed(actual)
+            } else {
+                mismatch(Some(text.to_owned()))
+            }
+        }
         (EditMode::Replace | EditMode::SetValue, false) => {
-            holds(replaced_editable_text(&after.value, text))
+            if same_rendered_text(&after.value, text) {
+                Readback::Confirmed(actual)
+            } else {
+                mismatch(None)
+            }
         }
         (EditMode::Insert, true) => match inserted_at_selection(before, text) {
-            Some(expected) => exact(expected),
-            None => holds(inserted_somewhere(&before.value, &after.value, text)),
+            Some(expected) if after.value == expected => Readback::Confirmed(actual),
+            Some(expected) => mismatch(Some(expected)),
+            None => match field_splice(&before.value, &after.value, text) {
+                Some(Splice::Inserted) => Readback::Confirmed(actual),
+                Some(Splice::ReplacedRange) => Readback::Ambiguous(actual),
+                None => mismatch(None),
+            },
         },
-        (EditMode::Insert, false) => holds(inserted_somewhere(
-            &normalize_whitespace(&before.value, true),
-            &normalize_whitespace(&after.value, true),
-            &normalize_whitespace(text, false),
-        )),
+        (EditMode::Insert, false) => match editable_splice(&before.value, &after.value, text) {
+            Some(Splice::Inserted) => Readback::Confirmed(actual),
+            Some(Splice::ReplacedRange) => Readback::Ambiguous(actual),
+            None if editable_splice_search_bounded(&before.value) => mismatch(None),
+            None => Readback::Ambiguous(actual),
+        },
     }
+}
+
+/// How the typed text sits in the new value relative to the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Splice {
+    /// Old value with the text inserted at one position.
+    Inserted,
+    /// Old value with one non-empty range replaced by the text.
+    ReplacedRange,
 }
 
 /// Input or textarea with a known selection: the text replaces the selection
@@ -1467,28 +1490,70 @@ fn inserted_at_selection(before: &EditState, text: &str) -> Option<String> {
     Some(expected)
 }
 
-/// `after` is `before` with `text` inserted at some position.
-fn inserted_somewhere(before: &str, after: &str, text: &str) -> bool {
+/// Exact values (input, textarea): is `after` the old value with `text` put
+/// in at one position, replacing nothing or one range?
+fn field_splice(before: &str, after: &str, text: &str) -> Option<Splice> {
     let (before, after, text): (Vec<char>, Vec<char>, Vec<char>) =
         (before.chars().collect(), after.chars().collect(), text.chars().collect());
-    if after.len() != before.len() + text.len() {
-        return false;
+    // Characters of the old value the edit removed.
+    let removed = (before.len() + text.len()).checked_sub(after.len())?;
+    if removed > before.len() {
+        return None;
     }
-    (0..=before.len()).any(|at| {
-        after[..at] == before[..at]
-            && after[at..at + text.len()] == text[..]
-            && after[at + text.len()..] == before[at..]
-    })
+    (0..=before.len() - removed)
+        .find(|&at| {
+            after[..at] == before[..at]
+                && after[at..at + text.len()] == text[..]
+                && after[at + text.len()..] == before[at + removed..]
+        })
+        .map(|_| if removed == 0 { Splice::Inserted } else { Splice::ReplacedRange })
 }
 
-/// A contenteditable replaced with `text` shows exactly that text, apart
-/// from the whitespace its rendering adds or collapses.
-fn replaced_editable_text(after: &str, text: &str) -> bool {
-    normalize_whitespace(after, true) == normalize_whitespace(text, true)
+/// Old values longer than this skip the range-replacement search for
+/// contenteditable (it is cubic); an unmatched edit is then ambiguous.
+const EDITABLE_RANGE_SEARCH_MAX_CHARS: usize = 200;
+/// Old values longer than this skip the contenteditable search entirely.
+const EDITABLE_INSERT_SEARCH_MAX_CHARS: usize = 4000;
+
+fn editable_splice_search_bounded(before: &str) -> bool {
+    before.chars().count() <= EDITABLE_RANGE_SEARCH_MAX_CHARS
 }
 
-/// Collapse whitespace runs to one space; `trim` also drops the ends.
-fn normalize_whitespace(value: &str, trim: bool) -> String {
+/// Rendered text (contenteditable): build each candidate from the raw old
+/// value and the raw typed text, then compare it with the observed value
+/// under the same normalization.
+fn editable_splice(before: &str, after: &str, text: &str) -> Option<Splice> {
+    let chars: Vec<char> = before.chars().collect();
+    if chars.len() > EDITABLE_INSERT_SEARCH_MAX_CHARS {
+        return None;
+    }
+    let observed = normalize_rendered(after);
+    let candidate = |start: usize, end: usize| {
+        let mut value: String = chars[..start].iter().collect();
+        value.push_str(text);
+        value.extend(&chars[end..]);
+        normalize_rendered(&value) == observed
+    };
+    if (0..=chars.len()).any(|at| candidate(at, at)) {
+        return Some(Splice::Inserted);
+    }
+    if chars.len() <= EDITABLE_RANGE_SEARCH_MAX_CHARS
+        && (0..chars.len()).any(|start| (start + 1..=chars.len()).any(|end| candidate(start, end)))
+    {
+        return Some(Splice::ReplacedRange);
+    }
+    None
+}
+
+/// A contenteditable replaced with `text` shows that text as rendered.
+fn same_rendered_text(after: &str, text: &str) -> bool {
+    normalize_rendered(after) == normalize_rendered(text)
+}
+
+/// Rendered-text normalization, applied to whole values only: whitespace runs
+/// (including the no-break spaces editors use for typed spaces) become one
+/// space, and the ends are trimmed.
+fn normalize_rendered(value: &str) -> String {
     let mut out = String::with_capacity(value.len());
     let mut in_space = false;
     for ch in value.chars() {
@@ -1502,11 +1567,7 @@ fn normalize_whitespace(value: &str, trim: bool) -> String {
             in_space = false;
         }
     }
-    if trim {
-        out.trim().to_owned()
-    } else {
-        out
-    }
+    out.trim().to_owned()
 }
 
 /// Read the node back until it holds what the input should have produced,
@@ -2354,6 +2415,27 @@ impl Tool for BrowserTypeTool {
                             "readback": "element_replaced",
                         }));
                     }
+                    Readback::Ambiguous(actual) => {
+                        let shown = shown_value(&actual, before.password);
+                        return ToolResult::text(format!(
+                            "typed {requested_chars} char(s) into {tab_id}; the field now holds \
+                             {shown}, which the input could have produced (for example by \
+                             replacing a selection the driver could not see), but that cannot \
+                             be confirmed. Check the value before typing again."
+                        ))
+                        .with_structured(json!({
+                            "status": "ok",
+                            "effect": "unverifiable",
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "ref": ext_ref,
+                            "mode": mode,
+                            "requested_chars": requested_chars,
+                            "delivered_chars": delivered_chars,
+                            "readback": "ambiguous",
+                            "value": (!before.password).then(|| truncate_value(&actual)),
+                        }));
+                    }
                     Readback::Unverifiable => {}
                 }
             }
@@ -2817,6 +2899,7 @@ mod tests {
         enum Want {
             Confirmed,
             Mismatch(Option<&'static str>),
+            Ambiguous,
             Detached,
         }
         let field = |value: &str, selection: Option<(usize, usize)>| EditState {
@@ -2849,6 +2932,7 @@ mod tests {
             ("unknown caret, at the end", field("a@b.com", None), field("a@b.comx", None), "x", Insert, Want::Confirmed),
             ("unknown caret, text lost", field("a@b.com", None), field("a@b.co", None), "x", Insert, Want::Mismatch(None)),
             ("unknown caret, empty field", field("", None), field("ada@x.io", None), "ada@x.io", Insert, Want::Confirmed),
+            ("unknown selection replaced", field("hello world", None), field("hello there", None), "there", Insert, Want::Ambiguous),
             // Replace and set_value on an input or textarea.
             ("replace", field("old", Some((3, 3))), field("new", None), "new", Replace, Want::Confirmed),
             ("replace appended", field("old", None), field("oldnew", None), "new", Replace, Want::Mismatch(Some("new"))),
@@ -2858,7 +2942,13 @@ mod tests {
             // Contenteditable.
             ("editable insert", editable("Hello"), editable("Hello world"), " world", Insert, Want::Confirmed),
             ("editable insert, extra whitespace", editable("Hello\n"), editable("Hello  world\n"), " world", Insert, Want::Confirmed),
-            ("editable insert lost", editable("Hello"), editable("Hello"), "Hello", Insert, Want::Mismatch(None)),
+            ("editable retyped over a selection", editable("Hello"), editable("Hello"), "Hello", Insert, Want::Ambiguous),
+            ("editable insert lost", editable("Hello"), editable("Hello"), "abc", Insert, Want::Mismatch(None)),
+            ("editable trailing space typed", editable(""), editable("hello "), "hello ", Insert, Want::Confirmed),
+            ("editable typed space as nbsp", editable(""), editable("hello\u{a0}"), "hello ", Insert, Want::Confirmed),
+            ("editable append after a space", editable("hello "), editable("hello world"), "world", Insert, Want::Confirmed),
+            ("editable selection replaced", editable("hello world"), editable("hello there"), "there", Insert, Want::Ambiguous),
+            ("editable autocorrected", editable(""), editable("the"), "teh", Insert, Want::Mismatch(None)),
             ("editable replace, same text", editable("Hello"), editable("Hello"), "Hello", Replace, Want::Confirmed),
             ("editable replace appended", editable("Hello"), editable("Hello world"), "world", Replace, Want::Mismatch(None)),
             ("editable replace", editable("Hello"), editable("world\n"), "world", Replace, Want::Confirmed),
@@ -2874,6 +2964,7 @@ mod tests {
                     *actual == after.value && got.as_deref() == *expected
                 }
                 (Want::Detached, Readback::Detached) => true,
+                (Want::Ambiguous, Readback::Ambiguous(value)) => *value == after.value,
                 _ => false,
             };
             assert!(ok, "{name}: got {got:?}");
