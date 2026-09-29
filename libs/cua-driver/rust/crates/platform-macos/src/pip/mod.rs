@@ -3091,7 +3091,7 @@ unsafe fn new_chip(parent: *mut AnyObject, border: *mut CGColor) -> ChipView {
         0.0,
         true,
     );
-    let _: () = msg_send![caption, setAlignment: 2u64]; // NSTextAlignmentCenter (AppKit)
+    let _: () = msg_send![caption, setAlignment: 2isize]; // NSTextAlignmentCenter (AppKit; NSInteger)
     let _: () = msg_send![caption, setAutoresizingMask: 1u64 | 4 | 32];
     let _: () = msg_send![view, addSubview: caption];
 
