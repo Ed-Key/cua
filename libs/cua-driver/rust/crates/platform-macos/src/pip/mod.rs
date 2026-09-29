@@ -122,7 +122,7 @@ mod stack;
 mod visibility;
 
 use cursor::{cursor_in_well, sprite_placement, sprite_window, Sprite};
-pub(crate) use cursor::SPRITE_BOX;
+pub(crate) use cursor::sprite_box;
 use finish::{
     checklist_fit, chip_grid, row_width, Claim, Finale, Lifecycle, Rows, Verdicts, CAPTION_GAP,
     CAPTION_LINE, LABEL_X, MARK_SIZE, MORE_LINE, ROW_INSET, ROW_PAD,
@@ -404,6 +404,8 @@ struct Panel {
     /// re-placed when the target window moves or the well resizes without
     /// waiting for the overlay to render again.
     cursor_at: Option<(f64, f64)>,
+    /// The side in points of the sprite at `cursor_at`, from its theme.
+    cursor_box: f64,
     /// The window the cursor's last action targeted: the sprite shows only
     /// while it is the displayed one.
     cursor_window: Option<u32>,
@@ -1094,15 +1096,17 @@ pub(crate) fn cursor_sink_enabled() -> bool {
 }
 
 /// One rendered frame of a session's cursor, from the overlay's render
-/// thread: its animated screen point (CoreGraphics, top-left origin),
+/// thread: its tip's animated screen point (CoreGraphics, top-left origin),
 /// whether its click pulse is on, and its sprite (a retained `CGImage`,
-/// `SPRITE_BOX` points square centered on the point; `None` while the
+/// `sprite_box` points square centered on the point; `None` while the
 /// cursor is hidden, faded or off screen). Ownership of the image passes
 /// to the panel.
 pub(crate) struct CursorUpdate {
     pub(crate) key: String,
     pub(crate) x: f64,
     pub(crate) y: f64,
+    /// The sprite's side in points, from the cursor's theme (`sprite_box`).
+    pub(crate) sprite_box: f64,
     /// The window the cursor's last action targeted, if any.
     pub(crate) window: Option<u32>,
     pub(crate) pulsing: bool,
@@ -1135,6 +1139,7 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
     };
     let well = well_size(panel.card);
     panel.cursor_at = update.image.map(|_| (update.x, update.y));
+    panel.cursor_box = update.sprite_box;
     panel.cursor_window = update.window;
     // Only over the live picture of the window the cursor works in: not
     // under a finale, not over a raised back card or a target whose
@@ -1188,6 +1193,7 @@ unsafe fn place_sprite(panel: &Panel) {
             sprite_window(panel.cursor_window, displayed, panel.target_frame),
             panel.cursor_at,
             well_size(panel.card),
+            panel.cursor_box,
         )
     };
     // The sprite tracks the cursor: no implicit move or fade.
@@ -3136,6 +3142,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         cursor_image: 0,
         sprite: Sprite::default(),
         cursor_at: None,
+        cursor_box: 0.0,
         cursor_window: None,
         cursor_seen: false,
         target_frame: None,

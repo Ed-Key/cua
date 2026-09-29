@@ -38,9 +38,10 @@ pub use session_badge::{
     MAX_SESSION_LABEL_CHARS,
 };
 pub use theme::{
-    session_fill_hex, session_fill_rgba, CursorAction, CursorVisualState, DeliveryModifier,
-    PlaybackKind, ReducedMotion, TargetModifier, DEFAULT_CURSOR_FILL, DEFAULT_THEME_ID,
-    DEFAULT_THEME_VERSION, THEME_PROFILE,
+    anchor_for_tip, default_anchor_for_tip, session_fill_hex, session_fill_rgba, tip_reach,
+    CursorAction, CursorVisualState, DeliveryModifier, PlaybackKind, ReducedMotion, TargetModifier,
+    ARROW_HEIGHT, DEFAULT_CURSOR_FILL, DEFAULT_THEME_ID, DEFAULT_THEME_VERSION, DISPLAY_SIZE,
+    THEME_PROFILE,
 };
 pub use theme_artifact::{
     decode_theme, embedded_default_theme, inspect_artifact, list_installed_themes,
@@ -352,6 +353,11 @@ pub enum OverlayCommand {
         y: f64,
         heading_radians: Option<f64>,
     },
+    /// Snap the cursor so its tip lands on a native pointer sample at the
+    /// neutral 45 degree heading. The render state resolves the anchor from
+    /// the active theme's hotspot, as it does for `MoveTo`, so a drag sample
+    /// and a glide to the same point put the tip in the same place.
+    TrackPointer { x: f64, y: f64 },
     /// Start the click-press visual.
     ClickPulse { x: f64, y: f64 },
     /// Toggle the held-button visual state.
@@ -385,18 +391,12 @@ pub enum OverlayCommand {
 
 /// Build the shared overlay command for one native pointer position.
 ///
-/// Native drag implementations report the actual event coordinate while the
-/// cursor artwork is centred 16 points down-right so its tip lands on that
-/// coordinate. Keeping this transform here prevents platform-specific drag
-/// loops from drifting apart.
+/// Native drag implementations report the actual event coordinate; the
+/// render state anchors the artwork so its tip lands on that coordinate
+/// (`OverlayCommand::TrackPointer`). Keeping this here prevents
+/// platform-specific drag loops from drifting apart.
 pub fn track_pointer_command(x: f64, y: f64) -> OverlayCommand {
-    const CLICK_OFFSET: f64 = 16.0;
-    let heading = std::f64::consts::FRAC_PI_4;
-    OverlayCommand::SnapTo {
-        x: x + heading.cos() * CLICK_OFFSET,
-        y: y + heading.sin() * CLICK_OFFSET,
-        heading_radians: Some(heading),
-    }
+    OverlayCommand::TrackPointer { x, y }
 }
 
 /// Balance one cursor's visual press even if its action future is dropped.
@@ -448,18 +448,15 @@ mod pointer_tracking_tests {
 
     #[test]
     fn tracked_artwork_keeps_its_tip_on_the_native_pointer() {
-        let OverlayCommand::SnapTo {
-            x,
-            y,
-            heading_radians: Some(heading),
-        } = track_pointer_command(120.0, 80.0)
-        else {
-            panic!("pointer tracking must produce an anchored snap");
-        };
-        // The artwork centre sits 16 points down-right of the tip at 45 degrees.
-        assert_eq!(heading, std::f64::consts::FRAC_PI_4);
-        assert!((x - 131.313_708_498_984_76).abs() < 1e-9, "x = {x}");
-        assert!((y - 91.313_708_498_984_76).abs() < 1e-9, "y = {y}");
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        core.apply_command_base(track_pointer_command(120.0, 80.0), false, false);
+        // At the neutral 45 degree heading the artwork centre sits right and
+        // below the tip by the default hotspot's canvas offset (18, 34)
+        // scaled to points (21/128).
+        assert_eq!(core.heading, std::f64::consts::FRAC_PI_4);
+        let (x, y) = core.pos;
+        assert!((x - 122.953_125).abs() < 1e-9, "x = {x}");
+        assert!((y - 85.578_125).abs() < 1e-9, "y = {y}");
     }
 
     #[test]

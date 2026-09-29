@@ -366,6 +366,7 @@ fn apply_keyed_command(
     let seed_target = match &cmd {
         OverlayCommand::MoveTo { x, y, .. }
         | OverlayCommand::SnapTo { x, y, .. }
+        | OverlayCommand::TrackPointer { x, y }
         | OverlayCommand::ClickPulse { x, y } => Some((*x, *y)),
         _ => None,
     };
@@ -564,6 +565,7 @@ fn wait_for_renderer_command(
                     cmd,
                     OverlayCommand::MoveTo { .. }
                         | OverlayCommand::SnapTo { .. }
+                        | OverlayCommand::TrackPointer { .. }
                         | OverlayCommand::ClickPulse { .. }
                 ) {
                     return Some(command);
