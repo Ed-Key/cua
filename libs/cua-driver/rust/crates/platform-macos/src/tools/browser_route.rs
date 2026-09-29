@@ -127,6 +127,57 @@ fn page_target_of(pid: i32, window_id: u32, element: Option<usize>) -> Option<Pa
     }
 }
 
+/// The browser call that replaces a refused native one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) struct NextCall {
+    pub tool: &'static str,
+    /// Arguments beyond target_id, tab_id, and ref, as a JSON object literal.
+    pub arguments: &'static str,
+}
+
+/// Typing into a text control: browser_type appends at the caret, which it
+/// accepts for inputs, textareas, and contenteditable alike.
+pub(super) const TYPE_NEXT: NextCall = NextCall {
+    tool: "browser_type",
+    arguments: "{}",
+};
+
+/// Setting a text control's value: browser_type with replace:true. Its
+/// set_value mode accepts only inputs and textareas, and AX cannot tell a
+/// textarea from a contenteditable reliably, so the replace form, which
+/// every text control accepts, is the one recommended.
+pub(super) const SET_VALUE_NEXT: NextCall = NextCall {
+    tool: "browser_type",
+    arguments: r#"{"replace": true}"#,
+};
+
+/// Where a native click gesture goes. Gesture rule: only the gestures a
+/// browser tool sends exactly are redirected: an unmodified single left
+/// press (browser_click), an unmodified double left press and an unmodified
+/// single right press (browser_pointer). Middle clicks, modifier clicks,
+/// triple clicks, and AX actions other than press (show_menu, pick,
+/// confirm, cancel, open, focus) keep native delivery.
+pub(super) fn click_next(button: &str, count: usize, modified: bool, action: &str) -> Option<NextCall> {
+    if modified || action != "press" {
+        return None;
+    }
+    match (button, count) {
+        ("left", 1) => Some(NextCall {
+            tool: "browser_click",
+            arguments: "{}",
+        }),
+        ("left", 2) => Some(NextCall {
+            tool: "browser_pointer",
+            arguments: r#"{"action": "double_click"}"#,
+        }),
+        ("right", 1) => Some(NextCall {
+            tool: "browser_pointer",
+            arguments: r#"{"action": "right_click"}"#,
+        }),
+        _ => None,
+    }
+}
+
 /// Which controls a browser tool can take over from a native tool.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum Control {
@@ -231,7 +282,7 @@ async fn extension_shows_window(pid: i32, window_id: u32, url: &str) -> bool {
 /// Apply the redirect rule to a resolved page target.
 async fn redirect_for(
     tool: &'static str,
-    next: &'static str,
+    next: NextCall,
     control: Control,
     pid: i32,
     window_id: u32,
@@ -247,7 +298,7 @@ async fn redirect_for(
 /// `element` is the addressed element, `None` for the window's focused element.
 pub(super) async fn page_input_redirect(
     tool: &'static str,
-    next: &'static str,
+    next: NextCall,
     control: Control,
     pid: i32,
     window_id: Option<u32>,
@@ -268,7 +319,7 @@ pub(super) async fn page_input_redirect(
 /// coordinates: hit-tests the point.
 pub(super) async fn page_input_redirect_at_pixel(
     tool: &'static str,
-    next: &'static str,
+    next: NextCall,
     control: Control,
     pid: i32,
     window_id: Option<u32>,
@@ -296,22 +347,30 @@ pub(super) async fn page_input_redirect_at_pixel(
 }
 
 /// The refusal for native `tool` input on a page the extension reaches.
-fn redirect_result(tool: &str, next: &str, pid: i32, window_id: u32) -> ToolResult {
+fn redirect_result(tool: &str, next: NextCall, pid: i32, window_id: u32) -> ToolResult {
+    let arguments: serde_json::Value =
+        serde_json::from_str(next.arguments).unwrap_or_else(|_| serde_json::json!({}));
+    let with = if next.arguments == "{}" {
+        String::new()
+    } else {
+        format!(" with {}", next.arguments)
+    };
     ToolResult::error(format!(
         "{tool} refused before sending input: the target is a web page in Chrome and cua's \
          Chrome extension is connected there, so page input goes through the browser tools, \
          which the page's own scripts (React and similar) observe and which read the result \
          back. Call get_browser_state {{\"pid\": {pid}, \"window_id\": {window_id}}} to bind, \
-         get_browser_state with the target_id and tab_id it returns to get refs, then {next} \
-         with the field's ref. Chrome's own UI (address bar, dialogs, extension UI) still takes \
-         native input."
+         get_browser_state with the target_id and tab_id it returns to get refs, then {}{with} \
+         and the element's ref. Chrome's own UI (address bar, dialogs, extension UI) still \
+         takes native input.",
+        next.tool
     ))
     .with_structured(serde_json::json!({
         "code": "browser_route_required",
         "effect": "refused",
         "next_calls": [
             { "tool": "get_browser_state", "arguments": { "pid": pid, "window_id": window_id } },
-            { "tool": next },
+            { "tool": next.tool, "arguments": arguments },
         ],
     }))
 }
@@ -345,7 +404,7 @@ mod tests {
 
     #[test]
     fn the_refusal_names_the_calls_to_make() {
-        let result = redirect_result("type_text", "browser_type", 42, 7);
+        let result = redirect_result("type_text", TYPE_NEXT, 42, 7);
         assert_eq!(result.is_error, Some(true));
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["code"], "browser_route_required");
@@ -401,5 +460,64 @@ mod tests {
         // The page in a different window of the link does not count.
         assert!(!link_shows(bounds, &windows, &tabs(6, true, url), url));
         assert!(!same_page("", ""));
+    }
+
+    #[test]
+    fn every_click_gesture_goes_to_the_tool_that_sends_it_or_stays_native() {
+        let redirected = [
+            (("left", 1), ("browser_click", serde_json::json!({}))),
+            (("left", 2), ("browser_pointer", serde_json::json!({ "action": "double_click" }))),
+            (("right", 1), ("browser_pointer", serde_json::json!({ "action": "right_click" }))),
+        ];
+        let actions = ["press", "show_menu", "pick", "confirm", "cancel", "open", "focus"];
+        for button in ["left", "right", "middle"] {
+            for count in 1..=3 {
+                for modified in [false, true] {
+                    for action in actions {
+                        let got = click_next(button, count, modified, action);
+                        let want = redirected
+                            .iter()
+                            .find(|(gesture, _)| *gesture == (button, count))
+                            .filter(|_| !modified && action == "press")
+                            .map(|(_, next)| next);
+                        match (got, want) {
+                            (None, None) => {}
+                            (Some(next), Some((tool, arguments))) => {
+                                assert_eq!(next.tool, *tool);
+                                let parsed: serde_json::Value =
+                                    serde_json::from_str(next.arguments).unwrap();
+                                assert_eq!(&parsed, arguments);
+                            }
+                            (got, want) => panic!(
+                                "{button} x{count} modified={modified} {action}: got {got:?}, want {want:?}"
+                            ),
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn each_text_control_is_sent_to_a_browser_type_mode_it_accepts() {
+        // browser_type accepts insert_text (the default mode, with or without
+        // replace) for inputs, textareas, and contenteditable; its set_value
+        // mode only for inputs and textareas.
+        let accepts = |arguments: &serde_json::Value, control: &str| {
+            match arguments.get("mode").and_then(serde_json::Value::as_str).unwrap_or("insert_text") {
+                "insert_text" | "keystrokes" => true,
+                "set_value" => control != "contenteditable",
+                _ => false,
+            }
+        };
+        for next in [TYPE_NEXT, SET_VALUE_NEXT] {
+            assert_eq!(next.tool, "browser_type");
+            let arguments: serde_json::Value = serde_json::from_str(next.arguments).unwrap();
+            for control in ["input", "textarea", "contenteditable", "combobox input", "search input"] {
+                assert!(accepts(&arguments, control), "{} for {control}", next.arguments);
+            }
+        }
+        let set: serde_json::Value = serde_json::from_str(SET_VALUE_NEXT.arguments).unwrap();
+        assert_eq!(set["replace"], true, "setting a value replaces it");
     }
 }

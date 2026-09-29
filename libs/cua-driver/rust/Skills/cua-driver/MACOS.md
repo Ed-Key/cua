@@ -525,12 +525,14 @@ tool and Apple Events JavaScript bridge remain compatibility surfaces, not the
 starting point for new browser workflows.
 
 When cua's Chrome extension is connected and shows the target window and page
-(same window, active tab), native `click` on that page, and native
-`type_text` or `set_value` on its text fields, refuse with
-`browser_route_required` before sending input and name the calls to make
-instead (`get_browser_state`, then `browser_type` or `browser_click`). Selects,
-sliders, Chrome's own UI, `chrome://` pages, and windows the extension cannot
-see (incognito without extension access, other profiles) keep native input. Without the extension,
+(same window, active tab), native input that a browser tool sends exactly is
+refused with `browser_route_required` before any input, naming the calls to
+make: `get_browser_state`, then `browser_click` for a plain left click,
+`browser_pointer` (`double_click`, `right_click`) for those gestures, and
+`browser_type` for `type_text` (or with `replace: true` for `set_value`) on
+text fields. Middle and modifier clicks, other AX actions, selects, sliders,
+Chrome's own UI, `chrome://` pages, and windows the extension cannot see
+(incognito without extension access, other profiles) keep native input. Without the extension,
 `type_text` into a Chrome page sends key events rather than an accessibility
 value write, which page frameworks such as React ignore, and an unchanged page
 value is reported as unverifiable rather than as zero characters delivered.

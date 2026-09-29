@@ -242,7 +242,7 @@ impl Tool for TypeTextTool {
             (Some((guard, _)), _, _) => {
                 super::browser_route::page_input_redirect(
                     "type_text",
-                    "browser_type",
+                    super::browser_route::TYPE_NEXT,
                     super::browser_route::Control::Text,
                     pid,
                     window_id,
@@ -253,7 +253,7 @@ impl Tool for TypeTextTool {
             (None, Some(x), Some(y)) if !args.bool_or("from_zoom", false) => {
                 super::browser_route::page_input_redirect_at_pixel(
                     "type_text",
-                    "browser_type",
+                    super::browser_route::TYPE_NEXT,
                     super::browser_route::Control::Text,
                     pid,
                     window_id,
@@ -265,7 +265,7 @@ impl Tool for TypeTextTool {
             (None, _, _) => {
                 super::browser_route::page_input_redirect(
                     "type_text",
-                    "browser_type",
+                    super::browser_route::TYPE_NEXT,
                     super::browser_route::Control::Text,
                     pid,
                     window_id,

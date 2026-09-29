@@ -472,15 +472,18 @@ impl Tool for ClickTool {
             }));
         }
 
-        // A Chrome page with cua's extension connected takes clicks through
-        // browser_click. Internal focus clicks (the px form of the keyboard
-        // tools) keep their own routing.
-        if action != "focus" {
+        // A Chrome page the extension reaches takes the click gestures a
+        // browser tool sends exactly (see browser_route::click_next); every
+        // other gesture, and the internal focus click of the keyboard tools,
+        // keeps native delivery.
+        if let Some(next) =
+            super::browser_route::click_next(&button_str, count, !modifiers.is_empty(), &action)
+        {
             let redirect = match (element_guard.as_ref(), x, y) {
                 (Some(guard), _, _) => {
                     super::browser_route::page_input_redirect(
                         "click",
-                        "browser_click",
+                        next,
                         super::browser_route::Control::Any,
                         pid,
                         window_id,
@@ -491,7 +494,7 @@ impl Tool for ClickTool {
                 (None, Some(x), Some(y)) if !from_zoom && capture_id.is_none() => {
                     super::browser_route::page_input_redirect_at_pixel(
                         "click",
-                        "browser_click",
+                        next,
                         super::browser_route::Control::Any,
                         pid,
                         window_id,
