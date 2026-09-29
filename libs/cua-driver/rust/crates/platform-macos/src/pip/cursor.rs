@@ -5,7 +5,7 @@
 //! `finish`). Everything here is pure: mapping a screen point into the
 //! well, the sprite's frame, and when a click is logged.
 
-use super::Area;
+use super::{Area, Tag};
 
 /// The sprite's pixmap is this many points square, centered on the
 /// cursor's anchor: room for the arrow at any heading and its click pulse.
@@ -43,6 +43,19 @@ pub(super) fn sprite_frame(point: (f64, f64), well_h: f64) -> Area {
         y: well_h - point.1 - SPRITE_BOX / 2.0,
         w: SPRITE_BOX,
         h: SPRITE_BOX,
+    }
+}
+
+/// Whether the cursor's sprite may show: only when the window the cursor
+/// is working in (`cursor_window`, the window its last action targeted) is
+/// the window the panel displays (`displayed`). A cursor with no target
+/// window, or a panel whose target is unresolved or still the previous
+/// window (its new target's capture pending), shows nothing: the sprite
+/// must never paint over another window's picture.
+pub(super) fn sprite_target_matches(cursor_window: Option<u32>, displayed: Option<Tag>) -> bool {
+    match (cursor_window, displayed) {
+        (Some(window), Some((_, Some(shown)))) => window == shown,
+        _ => false,
     }
 }
 
@@ -141,6 +154,23 @@ mod tests {
         );
         // The well's top-left maps to the top-left of the AppKit frame.
         assert_eq!(sprite_frame((0.0, 0.0), 200.0).y, 200.0 - SPRITE_BOX / 2.0);
+    }
+
+    #[test]
+    fn the_sprite_shows_only_over_the_window_the_cursor_works_in() {
+        let displayed: Option<Tag> = Some((Some(1), Some(10)));
+        // Matching window: shown.
+        assert!(sprite_target_matches(Some(10), displayed));
+        // The user raised a back card while the agent stays in window 10:
+        // hidden, whatever the geometry.
+        assert!(!sprite_target_matches(Some(10), Some((Some(1), Some(20)))));
+        // The agent moved to window 20 but its capture is pending, so the
+        // panel still displays 10: hidden until the frame lands.
+        assert!(!sprite_target_matches(Some(20), displayed));
+        // No target window known on either side: hidden.
+        assert!(!sprite_target_matches(None, displayed));
+        assert!(!sprite_target_matches(Some(10), Some((Some(1), None))));
+        assert!(!sprite_target_matches(Some(10), None));
     }
 
     #[test]

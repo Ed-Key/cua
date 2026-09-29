@@ -1058,6 +1058,11 @@ fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::Cur
     let core = &rs.core;
     let shown = core.cfg.enabled
         && core.visible
+        // ponytail: an off-Space target gets no PiP cursor. The overlay
+        // suppresses its cursor there, and the PiP's target_frame comes from
+        // an on-screen-only visibility snapshot, so there is no frame to map
+        // into. Upgrade path: separate preview visibility from desktop
+        // overlay visibility, and fetch bounds for off-Space windows.
         && !core.pinned_target_off_workspace
         && core.pos.0 >= -100.0
         && core.idle_alpha >= 0.004;
@@ -1097,6 +1102,9 @@ fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::Cur
         key: key.to_owned(),
         x: core.pos.0,
         y: core.pos.1,
+        // The window the cursor's last action targeted (every window-scoped
+        // tool pins the overlay above it).
+        window: core.pinned_wid.and_then(|wid| u32::try_from(wid).ok()),
         // A click: the pulse ring, a held button, or the theme playing its
         // click animation (an AX press sends no pulse, only the action).
         pulsing: core.click_t.is_some()

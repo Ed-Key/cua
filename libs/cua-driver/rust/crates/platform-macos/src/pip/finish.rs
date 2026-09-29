@@ -30,7 +30,7 @@
 //! | `end_session` | the session finishes (now) | none | as the idle timer, then the panel closes | the panel leaves the live set |
 //! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim by predicate, and each touched window a chip or checklist stood for by its action: app and event time, so it holds when the window resolves meanwhile); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades |
 //! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not owed news) shows the panel or plays a finale | the panel hides (an ending one closes) |
-//! | Cursor update (the overlay's render thread, once per rendered frame, carrying the cursor's animated screen point and whether its click pulse is on) | none | none | none | only the front card's cursor sprite: it moves to the point mapped into the well from the target window's last known frame (see `cursor`), and hides while the cursor is off that window, disabled or faded, or the panel has no frame; the first update of each click pulse that lands in the well logs "PiP cursor" once |
+//! | Cursor update (the overlay's render thread, once per rendered frame, carrying the cursor's animated screen point, the window its last action targeted, and whether its click pulse is on) | none | none | none | only the front card's cursor sprite, and only while the cursor's window is the displayed one (a raised back card, or a new target whose capture is pending, hides it): it moves to the point mapped into the well from the target window's last known frame (see `cursor`), is re-placed when that frame, the displayed target or the well changes, and hides while the cursor is off that window, disabled or faded, or the panel has no frame; the first update of each click pulse that lands in the well logs "PiP cursor" once |
 //!
 //! Everything here is pure (unit tested, one test per row); the cursor
 //! row's logic and test live in `cursor`.
@@ -72,6 +72,23 @@ pub(super) const CAPTION_LINE: f64 = 14.0;
 pub(super) const CAPTION_GAP: f64 = 6.0;
 /// The "+n more" line under the rows that fit.
 pub(super) const MORE_LINE: f64 = 16.0;
+/// Inset of the rows from the well's left edge, and of a row's content
+/// from its capsule.
+pub(super) const ROW_INSET: f64 = 14.0;
+pub(super) const ROW_PAD: f64 = 10.0;
+/// Size of a checklist mark.
+pub(super) const MARK_SIZE: f64 = 16.0;
+/// Where a row's label starts in its capsule: after the mark and a gap.
+pub(super) const LABEL_X: f64 = ROW_PAD + MARK_SIZE + 8.0;
+
+/// Width of a checklist capsule for a label `text_w` wide in a well
+/// `well_w` wide: mark, gap and text with the pads, but never wider than
+/// the well allows (the label then truncates with a tail ellipsis). The
+/// finale is laid out again when the well resizes, so a narrowed panel
+/// never clips a row.
+pub(super) fn row_width(text_w: f64, well_w: f64) -> f64 {
+    (LABEL_X + text_w + ROW_PAD).min((well_w - 2.0 * ROW_INSET).max(0.0))
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Claim {
@@ -1153,6 +1170,21 @@ mod tests {
         assert_eq!(chip_grid(320.0, 5, 48.0, 12.0), (5, 1));
         assert_eq!(chip_grid(228.0, 5, 48.0, 12.0), (3, 2));
         assert_eq!(chip_grid(20.0, 2, 48.0, 12.0), (1, 2));
+    }
+
+    #[test]
+    fn a_narrowed_well_shrinks_each_row_to_fit_and_truncates_its_label() {
+        // A 500 pt row: its label is 500 minus the mark and pads.
+        let text_w = 500.0 - LABEL_X - ROW_PAD;
+        // Full width in a 600 pt well.
+        assert_eq!(row_width(text_w, 600.0), 500.0);
+        // Narrowed to 240: the capsule fits inside the well's insets, and
+        // the label gets less room than its text (a tail ellipsis).
+        let row_w = row_width(text_w, 240.0);
+        assert!(ROW_INSET + row_w <= 240.0 - ROW_INSET, "{row_w}");
+        assert!(row_w - LABEL_X - ROW_PAD < text_w);
+        // A well narrower than its insets: no negative width.
+        assert_eq!(row_width(text_w, 10.0), 0.0);
     }
 
     #[test]

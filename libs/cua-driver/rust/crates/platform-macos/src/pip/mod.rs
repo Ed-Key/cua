@@ -120,11 +120,11 @@ mod live;
 mod stack;
 mod visibility;
 
-use cursor::{cursor_in_well, sprite_placement, Sprite};
+use cursor::{cursor_in_well, sprite_placement, sprite_target_matches, Sprite};
 pub(crate) use cursor::SPRITE_BOX;
 use finish::{
-    checklist_fit, chip_grid, Claim, Finale, Lifecycle, Rows, Verdicts, CAPTION_GAP, CAPTION_LINE,
-    MORE_LINE,
+    checklist_fit, chip_grid, row_width, Claim, Finale, Lifecycle, Rows, Verdicts, CAPTION_GAP,
+    CAPTION_LINE, LABEL_X, MARK_SIZE, MORE_LINE, ROW_INSET, ROW_PAD,
 };
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
@@ -403,6 +403,9 @@ struct Panel {
     /// re-placed when the target window moves or the well resizes without
     /// waiting for the overlay to render again.
     cursor_at: Option<(f64, f64)>,
+    /// The window the cursor's last action targeted: the sprite shows only
+    /// while it is the displayed one.
+    cursor_window: Option<u32>,
     /// The first cursor update was logged.
     cursor_seen: bool,
     /// The target window's frame (CoreGraphics, top-left origin) as last
@@ -474,6 +477,9 @@ struct Panel {
     finale_view: Option<usize>,
     /// The finale that overlay displays: its timer marks exactly this shown.
     displayed: Option<Finale>,
+    /// Media time the finale's rows started animating in, so a rebuild for
+    /// a resized well continues their animation instead of restarting it.
+    finale_start: f64,
     /// The next hide follows a finale: it fades slower.
     after_finale: bool,
     /// Private session key (for logs from callbacks that only have the
@@ -1097,6 +1103,8 @@ pub(crate) struct CursorUpdate {
     pub(crate) key: String,
     pub(crate) x: f64,
     pub(crate) y: f64,
+    /// The window the cursor's last action targeted, if any.
+    pub(crate) window: Option<u32>,
     pub(crate) pulsing: bool,
     pub(crate) image: Option<usize>,
 }
@@ -1127,10 +1135,15 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
     };
     let well = well_size(panel.card);
     panel.cursor_at = update.image.map(|_| (update.x, update.y));
-    // Only over the live picture: not under a finale, and only with a
-    // window frame to map into.
+    panel.cursor_window = update.window;
+    // Only over the live picture of the window the cursor works in: not
+    // under a finale, not over a raised back card or a target whose
+    // capture is pending, and only with a window frame to map into.
+    let displayed = current_tag(panel.target, panel.resolved_window);
     let point = match (update.image, panel.target_frame, panel.finale_view) {
-        (Some(_), Some(frame), None) => cursor_in_well(frame, (update.x, update.y), well),
+        (Some(_), Some(frame), None) if sprite_target_matches(update.window, displayed) => {
+            cursor_in_well(frame, (update.x, update.y), well)
+        }
         _ => None,
     };
     let log = panel.sprite.update(point, update.pulsing);
@@ -1161,14 +1174,22 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
 
 /// Put the sprite where the cursor's latest screen point lands in the well
 /// now (see `cursor::sprite_placement`), or hide it: on every cursor
-/// update, and whenever the target window's frame or the well changes.
+/// update, and whenever the target window's frame, the displayed target or
+/// the well changes.
 unsafe fn place_sprite(panel: &Panel) {
     let layer = panel.cursor_layer as *mut AnyObject;
-    let placement = if panel.finale_view.is_some() || panel.cursor_image == 0 {
+    let displayed = current_tag(panel.target, panel.resolved_window);
+    let placement = if panel.finale_view.is_some()
+        || panel.cursor_image == 0
+        || !sprite_target_matches(panel.cursor_window, displayed)
+    {
         None
     } else {
         sprite_placement(panel.target_frame, panel.cursor_at, well_size(panel.card))
     };
+    // The sprite tracks the cursor: no implicit move or fade.
+    let _: () = msg_send![class!(CATransaction), begin];
+    let _: () = msg_send![class!(CATransaction), setDisableActions: true];
     match placement {
         Some(frame) => {
             let _: () = msg_send![layer, setFrame: ns_rect(frame)];
@@ -1178,6 +1199,7 @@ unsafe fn place_sprite(panel: &Panel) {
             let _: () = msg_send![layer, setHidden: true];
         }
     }
+    let _: () = msg_send![class!(CATransaction), commit];
 }
 
 /// Show `image` (a retained `CGImage`, or 0 for none) on the sprite layer
@@ -1331,7 +1353,6 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     panel.target_visible = target_visible;
     panel.resolved_window = resolved_window;
     panel.target_frame = target_frame;
-    place_sprite(panel);
     refresh(state, &key);
 }
 
@@ -2016,8 +2037,7 @@ unsafe fn finish_session(panel: &mut Panel, key: &str, worker: &CaptureWorker) {
 /// Show `finale` (from the top) and time its end under `generation`.
 unsafe fn play_finale(panel: &mut Panel, key: &str, finale: &Finale, generation: u64) {
     tracing::info!(target: "pip", session = %key, rows = ?finale.log_rows(), kind = %finale.kind(), "PiP finished state");
-    show_finale_view(panel, finale);
-    panel.displayed = Some(finale.clone());
+    show_finale_view(panel, finale, CACurrentMediaTime());
     dispatch_to_main_after(
         finish::finale_duration(finale.len()),
         (panel.id, generation),
@@ -2069,12 +2089,6 @@ unsafe fn remove_finale_view(panel: &mut Panel) {
     }
 }
 
-/// Inset of the rows from the well's left edge, and of a row's content
-/// from its capsule.
-const ROW_INSET: f64 = 14.0;
-const ROW_PAD: f64 = 10.0;
-/// Size of a checklist mark.
-const MARK_SIZE: f64 = 16.0;
 /// Gap between finale chips.
 const FINALE_CHIP_GAP: f64 = 12.0;
 /// The scrim under the finale, and the white of a row's capsule over it.
@@ -2084,9 +2098,11 @@ const ROW_FILL: f64 = 0.16;
 const FINALE_FADE: Duration = Duration::from_millis(400);
 
 /// Put the finale over the front card's image well: a dark scrim with the
-/// checklist rows (glass capsules under a "Verified n of m" line) or the
-/// touched windows' chips animating in one by one.
-unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
+/// checklist rows (capsules under a "Verified n of m" line) or the touched
+/// windows' chips, animating in one by one from media time `start` (a
+/// rebuild for a resized well passes the original start, so rows already in
+/// stay in).
+unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
     remove_finale_view(panel);
     let (well_w, well_h) = well_size(panel.card);
     let overlay = new_view(
@@ -2114,7 +2130,6 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
     let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
     let capsule_color: *mut AnyObject = msg_send![white, colorWithAlphaComponent: ROW_FILL];
     let capsule: *mut CGColor = msg_send![capsule_color, CGColor];
-    let start = CACurrentMediaTime();
     match &finale.rows {
         Rows::Checklist(rows) => {
             // Shrunk, or cut with a "+n more" line, to fit the well.
@@ -2183,14 +2198,14 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
                 set_text(label as usize, &row.label);
                 let _: () = msg_send![label, sizeToFit];
                 let fitted: NSRect = msg_send![label, frame];
-                let text_x = ROW_PAD + MARK_SIZE + 8.0;
-                let max_w = (well_w - 2.0 * ROW_INSET).max(0.0);
-                let row_w = (text_x + fitted.size.width + ROW_PAD).min(max_w);
+                // The capsule fits its text, but never wider than the well
+                // (the label then truncates with an ellipsis).
+                let row_w = row_width(fitted.size.width, well_w);
                 let _: () = msg_send![
                     label,
                     setFrame: NSRect::new(
-                        NSPoint::new(text_x, (row_h - 16.0) / 2.0),
-                        NSSize::new((row_w - text_x - ROW_PAD).max(0.0), 16.0)
+                        NSPoint::new(LABEL_X, (row_h - 16.0) / 2.0),
+                        NSSize::new((row_w - LABEL_X - ROW_PAD).max(0.0), 16.0)
                     )
                 ];
                 // The row: a translucent capsule sized to its text, in a
@@ -2267,6 +2282,8 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale) {
     let _: () = msg_send![panel.front_view as *mut AnyObject, addSubview: overlay];
     let _: () = msg_send![overlay, release];
     panel.finale_view = Some(overlay as usize);
+    panel.displayed = Some(finale.clone());
+    panel.finale_start = start;
     place_sprite(panel);
 }
 
@@ -2533,6 +2550,9 @@ unsafe fn sync_layers(panel: &mut Panel) -> Layers {
         panel.placeholder as *mut AnyObject,
         setHidden: !layers.show_placeholder
     ];
+    // The displayed target may have changed (a raised back card): the
+    // sprite shows only over the window the cursor works in.
+    place_sprite(panel);
     layers
 }
 
@@ -3073,6 +3093,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         cursor_image: 0,
         sprite: Sprite::default(),
         cursor_at: None,
+        cursor_window: None,
         cursor_seen: false,
         target_frame: None,
         live_frame: None,
@@ -3108,6 +3129,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         lifecycle: Lifecycle::default(),
         finale_view: None,
         displayed: None,
+        finale_start: 0.0,
         after_finale: false,
         key: key.to_owned(),
         card,
@@ -3377,8 +3399,12 @@ unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
     set_frame(panel.image_view, well);
     set_frame(panel.live_view, well);
     set_frame(panel.cursor_view, well);
-    // The well changed size: the sprite moves with the picture's scale.
+    // The well changed size: the sprite moves with the picture's scale, and
+    // a finale is laid out again for it (rows re-fit, labels re-truncated).
     place_sprite(panel);
+    if let (Some(_), Some(finale)) = (panel.finale_view, panel.displayed.clone()) {
+        show_finale_view(panel, &finale, panel.finale_start);
+    }
     let (text_w, text_h) = (PLACEHOLDER_W.min(well_w), PLACEHOLDER_ICON + 18.0);
     set_frame(
         panel.placeholder,
