@@ -3413,12 +3413,9 @@ unsafe fn glass_background(bounds: NSRect, body: *mut AnyObject, radius: f64) ->
     if let Some(glass_class) = AnyClass::get("NSGlassEffectView") {
         let glass = new_view(glass_class, bounds);
         let _: () = msg_send![glass, setCornerRadius: radius];
-        // The clear style lets the backdrop's colors through (the regular
-        // one reads as a grey slab); text stays legible by its own shadow.
-        let responds: bool = msg_send![glass, respondsToSelector: sel!(setStyle:)];
-        if responds {
-            let _: () = msg_send![glass, setStyle: 1isize]; // NSGlassEffectViewStyleClear
-        }
+        // The regular (frosted) style, with no tint and no forced
+        // appearance: the backdrop's colors show through, softened; text
+        // stays legible by its own shadow.
         let _: () = msg_send![glass, setContentView: body];
         let _: () = msg_send![body, release];
         return glass;
