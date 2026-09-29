@@ -63,6 +63,37 @@ enum Attempt {
     Run { prior_timeouts: u32 },
 }
 
+/// Chromium or Electron: a known browser by name or bundle id, or an app
+/// whose bundle carries `Electron Framework.framework` next to its executable.
+/// Only these get the legacy `AXEnhancedUserInterface` opt-in.
+fn is_chromium_family(pid: i32) -> bool {
+    crate::browser::platform::is_chromium(
+        &crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
+        &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
+    ) || executable_path(pid).is_some_and(|exe| bundles_electron(&exe))
+}
+
+fn bundles_electron(executable: &std::path::Path) -> bool {
+    // <App>.app/Contents/MacOS/<exe> -> <App>.app/Contents/Frameworks/...
+    executable
+        .parent()
+        .and_then(std::path::Path::parent)
+        .is_some_and(|contents| contents.join("Frameworks/Electron Framework.framework").exists())
+}
+
+fn executable_path(pid: i32) -> Option<std::path::PathBuf> {
+    let mut buffer = vec![0u8; libc::PROC_PIDPATHINFO_MAXSIZE as usize];
+    // SAFETY: proc_pidpath writes at most `buffer.len()` bytes and returns the
+    // length written, or <= 0 on failure.
+    let length = unsafe {
+        libc::proc_pidpath(pid, buffer.as_mut_ptr().cast(), buffer.len() as u32)
+    };
+    (length > 0).then(|| {
+        buffer.truncate(length as usize);
+        std::path::PathBuf::from(String::from_utf8_lossy(&buffer).into_owned())
+    })
+}
+
 /// Kernel start time of a process: `(pbi_start_tvsec, pbi_start_tvusec)`.
 /// `None` when the process is gone or proc info is unreadable.
 fn process_start_stamp(pid: i32) -> Option<ProcessStartStamp> {
@@ -238,7 +269,7 @@ unsafe fn probe_web_content(pid: i32, deadline: Instant) -> WebContent {
 unsafe fn reassert_within(pid: i32, deadline: Instant) {
     if let Some(app) = ProbeApp::new(pid) {
         if bound_by(app.0, deadline) {
-            enable_chromium_accessibility(app.0);
+            enable_chromium_accessibility(app.0, true);
         }
     }
 }
@@ -313,7 +344,8 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
     // expose a native-only web tree before its debounced full mode is ready;
     // AXPress then acknowledges the first control without reaching the renderer.
     // Keep the bounded web-content wait on the ordinary enablement path.
-    let opt_in = enable_chromium_accessibility(app_element);
+    let chromium_family = is_chromium_family(pid);
+    let opt_in = enable_chromium_accessibility(app_element, chromium_family);
     // Chrome can schedule its legacy opt-in before the superclass setter
     // returns NotImplemented. Scope this uncertainty to known Chromium apps;
     // unrelated native applications must not pay a web-content wait.
@@ -321,10 +353,7 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
         opt_in,
         AccessibilityOptIn::EnhancedUserInterface
             | AccessibilityOptIn::EnhancedUserInterfaceUnconfirmed
-    ) && crate::browser::platform::is_chromium(
-        &crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
-        &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
-    );
+    ) && chromium_family;
     let outcome = wait_outcome(opt_in, known_chromium, prior_timeouts, attempted_at, || {
         await_web_content(
             |deadline| probe_web_content(pid, deadline),
@@ -339,6 +368,9 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
             Instant::now,
         )
     });
+    // A native app has nothing to enable: remember that for its lifetime so
+    // later walks skip the probe.
+    let outcome = outcome.or((!chromium_family).then_some(Wait::Complete));
     if let (Some(stamp), Some(wait)) = (stamp, outcome) {
         if let Ok(mut state) = ENABLEMENT_STATE.lock() {
             state.insert(pid, ProcessEnablement { stamp, wait });
@@ -350,6 +382,21 @@ pub unsafe fn ensure_chromium_ax_enabled(pid: i32, app_element: AXUIElementRef) 
 mod tests {
     use super::*;
     use std::cell::{Cell, RefCell};
+
+    /// Only Chromium and Electron get the legacy opt-in: the test runner is
+    /// neither, while a bundle shaped like an Electron app is recognised.
+    #[test]
+    fn legacy_enablement_is_limited_to_chromium_and_electron() {
+        assert!(!is_chromium_family(std::process::id() as i32));
+        let root = std::env::temp_dir().join(format!("cua-electron-shape-{}", std::process::id()));
+        let exe = root.join("Fake.app/Contents/MacOS/Fake");
+        std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+        assert!(!bundles_electron(&exe));
+        std::fs::create_dir_all(root.join("Fake.app/Contents/Frameworks/Electron Framework.framework"))
+            .unwrap();
+        assert!(bundles_electron(&exe));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
 
     /// A slow app (each probe costs a second) still ends at the deadline:
     /// probe time counts against the budget, not only the sleeps.

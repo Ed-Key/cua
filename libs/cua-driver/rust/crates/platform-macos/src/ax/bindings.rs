@@ -1003,17 +1003,23 @@ pub enum AccessibilityOptIn {
 /// `AXManualAccessibility` is the modern opt-in with no screen-reader side
 /// effects; `AXEnhancedUserInterface` is the legacy fallback some Electron
 /// builds expose instead (the modern attribute returns
-/// `kAXErrorAttributeUnsupported` on those builds).
+/// `kAXErrorAttributeUnsupported` on those builds). Every AppKit and Catalyst
+/// app also accepts the legacy attribute, and it changes how they behave
+/// (screen-reader mode), so it is sent only when `legacy_allowed` says the
+/// process is Chromium or Electron.
 ///
 /// # Safety
 ///
 /// `app_element` must be a valid, live application `AXUIElementRef`.
-pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> AccessibilityOptIn {
+pub unsafe fn enable_chromium_accessibility(
+    app_element: AXUIElementRef,
+    legacy_allowed: bool,
+) -> AccessibilityOptIn {
     let manual = set_bool_attr_true(app_element, "AXManualAccessibility");
     if manual == kAXErrorSuccess {
         return AccessibilityOptIn::ManualAccessibility;
     }
-    if manual != kAXErrorAttributeUnsupported {
+    if manual != kAXErrorAttributeUnsupported || !legacy_allowed {
         // A transient error (e.g. timeout / app busy) rather than a hard
         // "this app has no such attribute" — don't bother with the legacy
         // fallback, and don't claim enablement happened.
