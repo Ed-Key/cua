@@ -109,12 +109,16 @@ impl RowReadback {
     }
 }
 
-/// The children of `parent` (its rows, for a table) that expose AXSelected,
-/// and whether that list is complete: `false` when the children could not
-/// be read or there were more than `MAX_SCANNED_PEERS`. The caller releases
-/// them.
-unsafe fn selectable_children(parent: AXUIElementRef) -> (Vec<AXUIElementRef>, bool) {
-    let (rows, complete) =
+/// Selection among `parent`'s children (its rows, for a table), one
+/// AXSelected read per child: (selectable children, selected ones other than
+/// `row`, whether any is selected, whether the list is complete). The list
+/// is incomplete when the children could not be read or there were more
+/// than `MAX_SCANNED_PEERS`.
+unsafe fn scan_selection(
+    parent: AXUIElementRef,
+    row: Option<AXUIElementRef>,
+) -> (usize, usize, bool, bool) {
+    let (children, complete) =
         match crate::ax::bindings::copy_element_array_attr_checked(parent, "AXRows", 20_000) {
             Ok(rows) => (rows, true),
             Err(_) => {
@@ -122,29 +126,21 @@ unsafe fn selectable_children(parent: AXUIElementRef) -> (Vec<AXUIElementRef>, b
                 (children, !failed)
             }
         };
-    let complete = complete && rows.len() <= MAX_SCANNED_PEERS;
-    let mut kept = Vec::new();
-    for (at, child) in rows.into_iter().enumerate() {
-        if at < MAX_SCANNED_PEERS && copy_bool_attr(child, "AXSelected").is_some() {
-            kept.push(child);
-        } else {
-            CFRelease(child as CFTypeRef);
+    let complete = complete && children.len() <= MAX_SCANNED_PEERS;
+    let (mut selectable, mut others, mut any) = (0, 0, false);
+    for (at, child) in children.into_iter().enumerate() {
+        if at < MAX_SCANNED_PEERS {
+            if let Some(selected) = copy_bool_attr(child, "AXSelected") {
+                selectable += 1;
+                any |= selected;
+                let is_row =
+                    row.is_some_and(|row| CFEqual(child as CFTypeRef, row as CFTypeRef) != 0);
+                others += usize::from(selected && !is_row);
+            }
         }
+        CFRelease(child as CFTypeRef);
     }
-    (kept, complete)
-}
-
-/// (selectable peers, one of them selected) among `parent`'s children.
-unsafe fn peer_selection(parent: AXUIElementRef) -> (usize, bool) {
-    let (peers, _) = selectable_children(parent);
-    let selected = peers
-        .iter()
-        .any(|&peer| copy_bool_attr(peer, "AXSelected") == Some(true));
-    let count = peers.len();
-    for peer in peers {
-        CFRelease(peer as CFTypeRef);
-    }
-    (count, selected)
+    (selectable, others, any, complete)
 }
 
 impl RowSelection {
@@ -176,16 +172,21 @@ impl RowSelection {
                 CFRetain(parent as CFTypeRef);
                 current = parent;
             }
-            // Peers are read only when no AppKit row claims the click: a
-            // Finder list can hold thousands of rows.
+            // Peers are read only when no AppKit row claims the click (a
+            // Finder list can hold thousands of rows), bottom up, stopping at
+            // the first Catalyst row: Catalyst answers each read slowly.
             let chosen = choose_row(&chain).or_else(|| {
-                for (candidate, (_, parent)) in chain.iter_mut().zip(&elements) {
-                    if let (true, Some(parent)) = (candidate.selectable, parent) {
-                        (candidate.selectable_peers, candidate.peer_selected) =
-                            peer_selection(*parent);
+                for at in 0..chain.len() {
+                    if let (true, Some(parent)) = (chain[at].selectable, elements[at].1) {
+                        let (peers, _, any, _) = scan_selection(parent, None);
+                        chain[at].selectable_peers = peers;
+                        chain[at].peer_selected = any;
+                        if let found @ Some(_) = choose_row(&chain[..=at]) {
+                            return found;
+                        }
                     }
                 }
-                choose_row(&chain)
+                None
             });
             let mut result = None;
             for (at, (element, parent)) in elements.into_iter().enumerate() {
@@ -242,24 +243,11 @@ impl RowSelection {
                 }
                 Err(_) => {
                     // Without a complete peer list, exclusivity is unproven.
-                    let (peers, complete) = selectable_children(container);
+                    let (_, others, _, complete) = scan_selection(container, Some(self.row));
                     if !complete {
-                        for peer in peers {
-                            CFRelease(peer as CFTypeRef);
-                        }
                         return None;
                     }
-                    let count = peers
-                        .iter()
-                        .filter(|&&peer| {
-                            CFEqual(peer as CFTypeRef, self.row as CFTypeRef) == 0
-                                && copy_bool_attr(peer, "AXSelected") == Some(true)
-                        })
-                        .count();
-                    for peer in peers {
-                        CFRelease(peer as CFTypeRef);
-                    }
-                    count
+                    others
                 }
             };
             Some(RowReadback { target, others })

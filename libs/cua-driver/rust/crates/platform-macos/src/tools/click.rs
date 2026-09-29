@@ -507,20 +507,34 @@ impl Tool for ClickTool {
             } else {
                 action.clone()
             };
+            // The row this token named in the snapshot. A Catalyst list can
+            // hand the same accessibility element to another row between the
+            // snapshot and the click (a Stocks row token pressed Home Depot
+            // instead of Apple); a click must not land on that other row.
+            let snapshot_row = self
+                .state
+                .element_cache
+                .with_latest_payload(pid, u64::from(wid), |payload| {
+                    payload.rows.indexed.get(&idx).map(|(_, signature)| signature.clone())
+                })
+                .flatten();
             // Match the requested action against what the element advertises
             // now, before any cursor or input work: an unknown name refuses.
             let action_guard = element_guard.clone();
             let requested = effective_action.clone();
             let resolved_action = tokio::task::spawn_blocking(move || unsafe {
-                resolve_element_action(
-                    &requested,
-                    &copy_action_names(action_guard.as_ptr() as AXUIElementRef),
-                )
+                let element = action_guard.as_ptr() as AXUIElementRef;
+                let now_reads = ["AXDescription", "AXTitle"]
+                    .into_iter()
+                    .filter_map(|attribute| copy_string_attr(element, attribute))
+                    .find(|text| !still_names_row(snapshot_row.as_deref(), text));
+                (now_reads, resolve_element_action(&requested, &copy_action_names(element)))
             })
             .await;
             let ax_action = match resolved_action {
-                Ok(Ok(ax_action)) => ax_action,
-                Ok(Err(advertised)) => {
+                Ok((Some(now_reads), _)) => return element_changed_refusal(idx, &now_reads),
+                Ok((None, Ok(ax_action))) => ax_action,
+                Ok((None, Err(advertised))) => {
                     return unknown_action_refusal(&effective_action, &advertised)
                 }
                 Err(e) => return ToolResult::error(format!("Task error: {e}")),
@@ -1514,7 +1528,13 @@ fn perform_ax_click(
     let advertised = unsafe { copy_action_names(element) };
 
     let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
-    let title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
+    // The name the element answers with now (Catalyst rows have only a
+    // description), so the result says which row was acted on.
+    let title = ["AXTitle", "AXDescription"]
+        .into_iter()
+        .filter_map(|attribute| unsafe { copy_string_attr(element, attribute) })
+        .find(|name| !name.trim().is_empty())
+        .unwrap_or_default();
 
     // A plain click on a list row means "make this the selected row". Prove
     // that from the app's own selection instead of trusting a press: AppKit
@@ -1787,6 +1807,16 @@ mod action_name_tests {
     }
 
     #[test]
+    fn a_reused_element_no_longer_names_its_snapshot_row() {
+        use super::still_names_row;
+        let row = r#"- [14] AXGenericElement = "329.40, change" (Apple Inc., AAPL) [actions=[press]]"#;
+        assert!(still_names_row(Some(row), "Apple Inc., AAPL"));
+        assert!(!still_names_row(Some(row), "The Home Depot, Inc., HD"));
+        assert!(still_names_row(Some(row), ""), "no name to compare");
+        assert!(still_names_row(None, "anything"), "no snapshot row to compare");
+    }
+
+    #[test]
     fn unknown_names_refuse_with_the_advertised_list_and_aliases_keep_working() {
         let advertised = resolve_element_action("frobnicate", &stocks_row()).unwrap_err();
         assert_eq!(
@@ -1875,6 +1905,25 @@ fn resolve_element_action(requested: &str, advertised: &[String]) -> Result<Stri
     }
 }
 
+/// Whether an element's live name still matches the row its token named:
+/// the snapshot's rendered row contains it. Unknown snapshots and empty
+/// names pass; values are not compared (they change on their own).
+fn still_names_row(snapshot_row: Option<&str>, live_name: &str) -> bool {
+    let name = live_name.trim();
+    name.is_empty() || snapshot_row.is_none_or(|row| row.contains(name))
+}
+
+fn element_changed_refusal(idx: usize, now_reads: &str) -> ToolResult {
+    ToolResult::error(format!(
+        "click: element [{idx}] now reads \"{now_reads}\", not what the snapshot showed; \
+         the app reused it for other content. Nothing was sent. Take a fresh snapshot."
+    ))
+    .with_structured(serde_json::json!({
+        "code": "element_changed",
+        "effect": "refused",
+    }))
+}
+
 fn unknown_action_refusal(requested: &str, advertised: &[String]) -> ToolResult {
     ToolResult::error(format!(
         "click: the element does not advertise the action \"{requested}\". Advertised: {}.",
@@ -1900,16 +1949,22 @@ const ROW_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_milli
 const ROW_READBACK_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
 const ROW_READBACK_STABILITY: std::time::Duration = std::time::Duration::from_millis(200);
 
+/// Read-backs a row click always gets, however slowly the app answers
+/// (Catalyst AX reads can take tens of milliseconds each).
+const ROW_READBACK_MIN_POLLS: u32 = 3;
+
 /// Wait for `row` to become the only selected row and stay so.
 fn row_settles_exclusive(row: &crate::input::ax_actions::RowSelection) -> bool {
     std::thread::sleep(ROW_READBACK_SETTLE);
     let deadline = std::time::Instant::now() + ROW_READBACK_TIMEOUT;
+    let mut polls = 0;
     loop {
+        polls += 1;
         if row.observe().is_some_and(|seen| seen.exclusive()) {
             std::thread::sleep(ROW_READBACK_STABILITY);
             return row.observe().is_some_and(|seen| seen.exclusive());
         }
-        if std::time::Instant::now() >= deadline {
+        if polls >= ROW_READBACK_MIN_POLLS && std::time::Instant::now() >= deadline {
             return false;
         }
         std::thread::sleep(SELECTION_READBACK_POLL);
