@@ -4238,7 +4238,27 @@ unsafe fn client_icon(client_name: Option<&str>, client_pid: Option<i32>) -> *mu
         }
         pid = parent_pid(pid).unwrap_or(0);
     }
-    symbol_image("cursorarrow.rays")
+    cua_mark()
+}
+
+/// The cua mark (a template image, drawn in the icon view's tint), for a
+/// client with no app icon.
+unsafe fn cua_mark() -> *mut AnyObject {
+    static PNG: &[u8] = include_bytes!("assets/cua-mark-36.png");
+    let data: *mut AnyObject = msg_send![
+        class!(NSData),
+        dataWithBytes: PNG.as_ptr() as *const c_void
+        length: PNG.len()
+    ];
+    let image: *mut AnyObject = msg_send![class!(NSImage), alloc];
+    let image: *mut AnyObject = msg_send![image, initWithData: data];
+    if image.is_null() {
+        return std::ptr::null_mut();
+    }
+    let _: () = msg_send![image, setSize: NSSize::new(18.0, 18.0)];
+    let _: () = msg_send![image, setTemplate: true];
+    let _: *mut AnyObject = msg_send![image, autorelease];
+    image
 }
 
 fn parent_pid(pid: i32) -> Option<i32> {
