@@ -55,6 +55,19 @@ pub fn default_anchor_for_tip(tip: (f64, f64), heading: f64) -> (f64, f64) {
     )
 }
 
+/// Points from the tip to the farthest point a theme with this `hotspot`
+/// can paint, at any heading: the canvas corner farthest from the hotspot
+/// (rotation about the canvas centre keeps that distance), plus the default
+/// theme's float drift (`shared_float_motion`: at most 11 canvas units of
+/// translation, and a 2.5 degree sway about the centre that moves a point
+/// at most 4 units). Content outside the 128-unit canvas is not covered.
+pub fn tip_reach(hotspot: [u16; 2]) -> f64 {
+    const FLOAT_DRIFT: f64 = 15.0;
+    let canvas = f64::from(CANVAS_SIZE);
+    let far = |h: u16| f64::from(h).max(canvas - f64::from(h));
+    (far(hotspot[0]).hypot(far(hotspot[1])) + FLOAT_DRIFT) * f64::from(DISPLAY_SIZE) / canvas
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct CursorVisualState {
     pub requested_action: CursorAction,

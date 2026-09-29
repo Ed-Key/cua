@@ -38,8 +38,8 @@ pub use session_badge::{
     MAX_SESSION_LABEL_CHARS,
 };
 pub use theme::{
-    anchor_for_tip, default_anchor_for_tip, session_fill_hex, session_fill_rgba, CursorAction,
-    CursorVisualState, DeliveryModifier, PlaybackKind, ReducedMotion, TargetModifier,
+    anchor_for_tip, default_anchor_for_tip, session_fill_hex, session_fill_rgba, tip_reach,
+    CursorAction, CursorVisualState, DeliveryModifier, PlaybackKind, ReducedMotion, TargetModifier,
     ARROW_HEIGHT, DEFAULT_CURSOR_FILL, DEFAULT_THEME_ID, DEFAULT_THEME_VERSION, DISPLAY_SIZE,
     THEME_PROFILE,
 };

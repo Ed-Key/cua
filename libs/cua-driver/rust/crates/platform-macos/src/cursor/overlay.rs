@@ -1069,9 +1069,10 @@ fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::Cur
         && core.pos.0 >= -100.0
         && core.idle_alpha >= 0.004;
     let tip = core.tip();
+    let sprite_box = crate::pip::sprite_box(core.hotspot());
     let image = shown
         .then(|| {
-            let side = (crate::pip::SPRITE_BOX * scale).round().max(1.0) as u32;
+            let side = (sprite_box * scale).ceil().max(1.0) as u32;
             let mut pm = tiny_skia::Pixmap::new(side, side)?;
             let center = f64::from(side) / 2.0;
             let (anchor_x, anchor_y) = (
@@ -1109,6 +1110,7 @@ fn pip_cursor_update(key: &str, rs: &RenderState, scale: f64) -> crate::pip::Cur
         key: key.to_owned(),
         x: tip.0,
         y: tip.1,
+        sprite_box,
         // The window the cursor's last action targeted (every window-scoped
         // tool pins the overlay above it).
         window: core.pinned_wid.and_then(|wid| u32::try_from(wid).ok()),
