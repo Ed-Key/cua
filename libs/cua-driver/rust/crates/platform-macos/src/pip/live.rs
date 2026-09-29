@@ -26,7 +26,7 @@ use screencapturekit::prelude::{
 use screencapturekit::stream::delegate_trait::StreamCallbacks;
 use screencapturekit::CVPixelBuffer;
 
-use super::{capture_window, lock, LatestPerSession, Target};
+use super::{lock, resolve_target_window, LatestPerSession, Target};
 
 /// Frame rate of the live mirror. A preview, not a recording.
 pub(super) const LIVE_FPS: i32 = 12;
@@ -46,16 +46,70 @@ pub(super) enum StreamStep {
 }
 
 /// A panel's stream runs only while the panel is shown and has a target.
-/// `requested` is the target the panel last asked a stream for (running or
-/// failed); a failed stream is not retried until the target changes or the
-/// panel hides and shows again.
-pub(super) fn stream_step(shown: bool, target: Target, requested: Option<Target>) -> StreamStep {
-    let wanted = (shown && target != (None, None)).then_some(target);
+/// `resolved` is the window a pid-only target currently resolves to (looked
+/// up off the main thread; ignored when the target names its window).
+/// `requested` is the resolved target the panel last asked a stream for
+/// (running or failed); a failed stream is not retried until the resolved
+/// window changes or the panel hides and shows again. A pid-only target
+/// whose window cannot be resolved right now leaves the stream as it is.
+pub(super) fn stream_step(
+    shown: bool,
+    target: Target,
+    resolved: Option<u32>,
+    requested: Option<Target>,
+) -> StreamStep {
+    let has_target = shown && target != (None, None);
+    let wanted = has_target
+        .then(|| match target {
+            (_, Some(_)) => Some(target),
+            (pid, None) => resolved.map(|window| (pid, Some(window))),
+        })
+        .flatten();
     match (wanted, requested) {
         (Some(want), Some(have)) if want == have => StreamStep::Keep,
         (Some(want), _) => StreamStep::Start(want),
-        (None, Some(_)) => StreamStep::Stop,
-        (None, None) => StreamStep::Keep,
+        (None, Some(_)) if !has_target => StreamStep::Stop,
+        (None, _) => StreamStep::Keep,
+    }
+}
+
+/// What a panel knows about its stream. `requested` is the resolved target
+/// last asked for (running or failed) and drives retry suppression;
+/// `generation` (0 = none) is the only generation whose events are still
+/// applied. Ending or stopping a stream clears the generation but keeps
+/// `requested`, so a late frame from a dead stream is dropped while a failed
+/// target is still not retried.
+#[derive(Debug, Default)]
+pub(super) struct StreamState {
+    pub(super) requested: Option<Target>,
+    generation: u64,
+}
+
+impl StreamState {
+    /// Generations are handed out from 1, so 0 never matches an event.
+    pub(super) fn begin(&mut self, target: Target, generation: u64) {
+        self.requested = Some(target);
+        self.generation = generation;
+    }
+
+    pub(super) fn stop(&mut self) {
+        self.requested = None;
+        self.generation = 0;
+    }
+
+    /// Whether an event from `generation` should be applied.
+    pub(super) fn accepts(&self, generation: u64) -> bool {
+        self.generation != 0 && self.generation == generation
+    }
+
+    /// The stream of `generation` ended. Returns whether that was the
+    /// current stream; if so, later events from it are dropped.
+    pub(super) fn end(&mut self, generation: u64) -> bool {
+        let current = self.accepts(generation);
+        if current {
+            self.generation = 0;
+        }
+        current
     }
 }
 
@@ -169,10 +223,8 @@ fn open(
     well: (f64, f64),
     deliver: &Deliver,
 ) -> anyhow::Result<SCStream> {
-    let window_id = capture_window(target, |pid| {
-        crate::windows::resolve_main_window_id(pid).ok()
-    })
-    .ok_or_else(|| anyhow::anyhow!("no window to stream"))?;
+    let window_id = resolve_target_window(target)
+        .ok_or_else(|| anyhow::anyhow!("no window to stream"))?;
     let content = SCShareableContent::get()
         .map_err(|e| anyhow::anyhow!("SCShareableContent::get failed: {e}"))?;
     let window = content
@@ -258,25 +310,81 @@ mod tests {
 
     #[test]
     fn a_shown_panel_starts_a_stream_for_its_target() {
-        assert_eq!(stream_step(true, A, None), StreamStep::Start(A));
-        assert_eq!(stream_step(true, A, Some(A)), StreamStep::Keep);
+        assert_eq!(stream_step(true, A, None, None), StreamStep::Start(A));
+        assert_eq!(stream_step(true, A, None, Some(A)), StreamStep::Keep);
     }
 
     #[test]
     fn a_new_target_switches_the_stream() {
-        assert_eq!(stream_step(true, B, Some(A)), StreamStep::Start(B));
+        assert_eq!(stream_step(true, B, None, Some(A)), StreamStep::Start(B));
     }
 
     #[test]
     fn a_hidden_panel_stops_its_stream() {
-        assert_eq!(stream_step(false, A, Some(A)), StreamStep::Stop);
-        assert_eq!(stream_step(false, A, None), StreamStep::Keep);
+        assert_eq!(stream_step(false, A, None, Some(A)), StreamStep::Stop);
+        assert_eq!(stream_step(false, A, None, None), StreamStep::Keep);
     }
 
     #[test]
     fn no_target_means_no_stream() {
-        assert_eq!(stream_step(true, (None, None), None), StreamStep::Keep);
-        assert_eq!(stream_step(true, (None, None), Some(A)), StreamStep::Stop);
+        assert_eq!(stream_step(true, (None, None), None, None), StreamStep::Keep);
+        assert_eq!(
+            stream_step(true, (None, None), None, Some(A)),
+            StreamStep::Stop
+        );
+    }
+
+    #[test]
+    fn a_pid_only_target_follows_its_resolved_window() {
+        const PID_ONLY: Target = (Some(42), None);
+        let on = |window| (Some(42), Some(window));
+        assert_eq!(
+            stream_step(true, PID_ONLY, Some(5), None),
+            StreamStep::Start(on(5))
+        );
+        assert_eq!(
+            stream_step(true, PID_ONLY, Some(5), Some(on(5))),
+            StreamStep::Keep
+        );
+        // The app raised another window: same pid-only target, new stream.
+        assert_eq!(
+            stream_step(true, PID_ONLY, Some(6), Some(on(5))),
+            StreamStep::Start(on(6))
+        );
+        // No window to resolve right now: keep what is there, start nothing.
+        assert_eq!(
+            stream_step(true, PID_ONLY, None, Some(on(5))),
+            StreamStep::Keep
+        );
+        assert_eq!(stream_step(true, PID_ONLY, None, None), StreamStep::Keep);
+        // A hidden panel still stops.
+        assert_eq!(
+            stream_step(false, PID_ONLY, Some(5), Some(on(5))),
+            StreamStep::Stop
+        );
+    }
+
+    #[test]
+    fn a_frame_arriving_after_the_stream_ended_is_dropped() {
+        let mut state = StreamState::default();
+        state.begin(A, 3);
+        assert!(state.accepts(3));
+        assert!(state.end(3));
+        // SCK's sample handler can still deliver a frame of generation 3.
+        assert!(!state.accepts(3));
+        // Retry suppression survives: the failed target is still requested.
+        assert_eq!(
+            stream_step(true, A, None, state.requested),
+            StreamStep::Keep
+        );
+        // A repeated or stale end changes nothing.
+        assert!(!state.end(3));
+        assert!(!state.end(2));
+        // A new stream gets a fresh generation and works again.
+        state.begin(B, 4);
+        assert!(state.accepts(4) && !state.accepts(3));
+        state.stop();
+        assert!(!state.accepts(4) && state.requested.is_none());
     }
 
     #[test]
