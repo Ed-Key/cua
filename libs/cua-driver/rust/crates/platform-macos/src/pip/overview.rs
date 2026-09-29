@@ -1,9 +1,11 @@
-//! The all-agents overview: a frosted glass sheet centered on the active
-//! screen (the one with keyboard focus), one row per live session (client icon, session name,
+//! The all-agents overview: a frosted glass sheet centered on the screen
+//! under the pointer, one row per live session (client icon, session name,
 //! a dot in the session's color) with that session's windows as thumbnails
 //! (the front card's live or still picture, the back windows' stills,
-//! finished windows badged with a green check). Clicking a thumbnail brings
-//! that window forward through the panel's Focus path and closes the sheet.
+//! finished windows badged with a green check). Closed windows are left out
+//! (see `alive`); a session with none left keeps its row with a "No open
+//! windows" line. Clicking a thumbnail brings that window forward through
+//! the panel's Focus path and closes the sheet.
 //!
 //! Opened from the menu bar item (the cua koala, installed while the daemon
 //! runs with `--experimental-pip`) or the global shortcut
@@ -22,6 +24,7 @@
 //! size and per-session window counts, hit testing, the selection) is pure
 //! and unit tested; AppKit lives at the bottom of this file.
 
+use std::collections::HashSet;
 use std::ffi::c_void;
 use std::time::Duration;
 
@@ -74,6 +77,23 @@ pub(super) struct Group {
     pub(super) key: String,
     pub(super) label: String,
     pub(super) windows: Vec<Thumb>,
+}
+
+/// Whether a thumbnail's window still exists: listed in `known`, every
+/// window WindowServer knows on screen or off (another Space, minimized).
+/// The stack keeps its front card after the window closes and idle
+/// sessions get no visibility checks, so the overview asks itself. A
+/// pid-only card has no window to check and stays, and so does everything
+/// when the lookup failed (`None`).
+// ponytail: WindowServer existence only. A background app (TextEdit, closed
+// by an agent's AX press) orders the window out but destroys it on its next
+// event, so until then it still reads alive, like a minimized window. Telling
+// those apart needs AX (the app's AXWindows) off the main queue.
+pub(super) fn alive(tag: Tag, known: Option<&HashSet<u32>>) -> bool {
+    match (tag.1, known) {
+        (Some(window), Some(known)) => known.contains(&window),
+        _ => true,
+    }
 }
 
 /// Display order: by label, then key, so rows never jump while the sheet
@@ -387,6 +407,16 @@ fn contains(area: &Area, (x, y): (f64, f64)) -> bool {
     x >= area.x && x < area.x + area.w && y >= area.y && y < area.y + area.h
 }
 
+/// The screen (index into `frames`, AppKit global coordinates) holding the
+/// pointer at `point`, edges included: `mouseLocation` reaches a screen's
+/// top edge. `None` when no frame holds it; the caller falls back to
+/// `mainScreen`.
+pub(super) fn screen_at(frames: &[Area], (x, y): (f64, f64)) -> Option<usize> {
+    frames
+        .iter()
+        .position(|f| x >= f.x && x <= f.x + f.w && y >= f.y && y <= f.y + f.h)
+}
+
 pub(super) fn hit(layout: &Layout, point: (f64, f64)) -> Hit {
     if !contains(&layout.sheet, point) {
         return Hit::Outside;
@@ -644,14 +674,19 @@ unsafe fn toggle(state: &mut State, via: Via) {
     }
 }
 
-/// Every live panel as a group (sorted for display) with its pictures.
+/// Every live panel as a group (sorted for display) with its pictures,
+/// closed windows left out (one window-list query per call).
 unsafe fn snapshot(panels: &std::collections::HashMap<String, Panel>) -> (Vec<Group>, Vec<GroupPictures>) {
+    let known = super::visibility::known_windows();
     let mut groups: Vec<(Group, GroupPictures)> = panels
         .iter()
         .map(|(key, panel)| {
             let mut windows = Vec::new();
             let mut pictures = Vec::new();
             for (depth, card) in panel.cards.cards().iter().enumerate() {
+                if !alive(card.key, known.as_ref()) {
+                    continue;
+                }
                 let finished = card.key.1.is_some_and(|window| panel.verdicts.finished(window));
                 windows.push(Thumb {
                     tag: card.key,
@@ -699,13 +734,38 @@ unsafe fn snapshot(panels: &std::collections::HashMap<String, Panel>) -> (Vec<Gr
     groups.into_iter().unzip()
 }
 
-/// The visible frame of the active screen (`mainScreen`: the one with
-/// keyboard focus), and the primary screen's height (for CoreGraphics
-/// coordinates in logs). `None` headless. No walk of `[NSScreen screens]`:
-/// that array is Swift-bridged and its `count` is a signed NSInteger, which
-/// a debug build's message check rejects as NSUInteger.
+/// The visible frame of the screen under the pointer (where the user is
+/// looking, as AltTab and Spotlight pick; `mainScreen` follows the daemon's
+/// key window, else the primary screen), and the primary screen's height
+/// (for CoreGraphics coordinates in logs). `None` headless. `[NSScreen
+/// screens]` is walked with its enumerator, not `count`: the array is
+/// Swift-bridged and its `count` is a signed NSInteger, which a debug
+/// build's message check rejects as NSUInteger.
 unsafe fn active_screen() -> Option<(Area, f64)> {
-    let screen: *mut AnyObject = msg_send![class!(NSScreen), mainScreen];
+    let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
+    let mut screens = Vec::new();
+    let list: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    if !list.is_null() {
+        let each: *mut AnyObject = msg_send![list, objectEnumerator];
+        loop {
+            let screen: *mut AnyObject = msg_send![each, nextObject];
+            if screen.is_null() {
+                break;
+            }
+            screens.push(screen);
+        }
+    }
+    let frames: Vec<Area> = screens
+        .iter()
+        .map(|&screen| {
+            let frame: NSRect = msg_send![screen, frame];
+            area_of(frame)
+        })
+        .collect();
+    let screen: *mut AnyObject = match screen_at(&frames, (mouse.x, mouse.y)) {
+        Some(index) => screens[index],
+        None => msg_send![class!(NSScreen), mainScreen],
+    };
     if screen.is_null() {
         return None;
     }
@@ -761,7 +821,7 @@ unsafe fn close(state: &mut State, via: Via) {
     tracing::info!(target: "pip", via = %via.as_str(), "PiP overview closed");
 }
 
-/// Where each thumbnail is on screen, for checks.
+/// Where each thumbnail is on screen, for checks (on open and each rebuild).
 unsafe fn log_tiles(overview: &Overview, window: (f64, f64), primary_h: f64) {
     let Some(layout) = &overview.layout else {
         return;
@@ -802,6 +862,7 @@ unsafe extern "C" fn poll_cb(ctx: *mut c_void) {
                 overview.model.clamp(&shown);
                 overview.hovered = None;
                 highlight(overview);
+                log_tiles(overview, (frame.origin.x, frame.origin.y), primary_screen_height());
             } else {
                 refresh_pictures(overview, &pictures);
             }
@@ -922,6 +983,24 @@ unsafe fn build(overview: &mut Overview, screen: (f64, f64), pictures: &[GroupPi
         let _: () = msg_send![dot_layer, setBackgroundColor: color];
         add_subview(body, dot);
 
+        if group.windows.is_empty() {
+            // Every window of this session closed: say so where the
+            // thumbnails go.
+            let line = new_label(
+                ns_rect(Area {
+                    x: header.x,
+                    y: header.y - HEADER_GAP - (layout.thumb.1 + TITLE_H) / 2.0,
+                    w: header.w,
+                    h: TITLE_H,
+                }),
+                12.0,
+                0.0,
+                true,
+            );
+            on_glass(line, true);
+            set_text(line as usize, "No open windows");
+            let _: () = msg_send![body, addSubview: line];
+        }
         let mut row_tiles = Vec::with_capacity(row.tiles.len());
         for ((tile, thumb), picture) in row.tiles.iter().zip(&group.windows).zip(&group_pictures.windows) {
             row_tiles.push(new_tile(body, local(tile.thumb), local(tile.title), thumb, *picture));
@@ -1080,6 +1159,12 @@ unsafe fn focus(state: &mut State, group: usize, window: usize) {
     };
     let key = state.overview.model.groups[group].key.clone();
     let (tag, title) = (thumb.tag, thumb.title.clone());
+    // Closed since the last poll: nothing to bring forward. The sheet stays
+    // up and the next poll drops the thumbnail.
+    if !alive(tag, super::visibility::known_windows().as_ref()) {
+        tracing::info!(target: "pip", window = tag.1.unwrap_or(0), reason = %"closed", "PiP overview focus skipped");
+        return;
+    }
     tracing::info!(target: "pip", session = %key, window = tag.1.unwrap_or(0), title = %title, "PiP overview focus");
     close(state, Via::Focus);
     if let Some(pid) = tag.0 {
@@ -1375,6 +1460,15 @@ mod tests {
         assert_eq!(groups_line(&model.groups), "[]");
     }
 
+    /// The poll's snapshot: `groups` with the windows `known` no longer
+    /// lists left out, as `snapshot` does card by card.
+    fn live(mut groups: Vec<Group>, known: Option<&HashSet<u32>>) -> Vec<Group> {
+        for group in &mut groups {
+            group.windows.retain(|thumb| alive(thumb.tag, known));
+        }
+        groups
+    }
+
     #[test]
     fn a_window_closing_while_open_drops_its_thumbnail() {
         let mut model = Model::default();
@@ -1383,11 +1477,28 @@ mod tests {
         model.select(Dir::Down, &[1, 2]);
         model.select(Dir::Right, &[1, 2]);
         assert_eq!(model.selected, Some((1, 1)));
-        let mut groups = two_groups();
-        groups[1].windows.remove(1);
-        assert!(model.update(groups));
+        // doc c (21) closes; the stack may still hold it (a kept front card,
+        // an idle session), but WindowServer no longer lists it.
+        let known: HashSet<u32> = [10, 20].into();
+        assert!(model.update(live(two_groups(), Some(&known))));
         assert_eq!(model.groups[1].windows.len(), 1);
+        assert_eq!(model.groups[1].windows[0].tag, (Some(1), Some(20)));
         assert_eq!(model.selected, None);
+        // ov-a's only window (10) closes too: its row stays, with no
+        // thumbnail to draw or select.
+        let known: HashSet<u32> = [20].into();
+        assert!(model.update(live(two_groups(), Some(&known))));
+        assert_eq!(groups_line(&model.groups), r#"[ov-a: [], ov-b: ["doc b"]]"#);
+        let counts: Vec<usize> = model.groups.iter().map(|g| g.windows.len()).collect();
+        let shown = layout(SCREEN, &counts).shown();
+        assert_eq!(shown, vec![0, 1]);
+        assert_eq!(model.select(Dir::Down, &shown), Some((1, 0)));
+        // A window on another Space or minimized is still listed, so kept;
+        // a pid-only card has no window to check; a failed lookup keeps all.
+        let known: HashSet<u32> = [10, 20, 21].into();
+        assert_eq!(live(two_groups(), Some(&known)), two_groups());
+        assert!(alive((Some(1), None), Some(&known)));
+        assert_eq!(live(two_groups(), None), two_groups());
     }
 
     #[test]
@@ -1574,6 +1685,24 @@ mod tests {
         // A drawn selection is left alone; nothing drawn clears it.
         assert_eq!(model.clamp(&shown), Some((0, shown[0] - 1)));
         assert_eq!(model.clamp(&[0]), None);
+    }
+
+    #[test]
+    fn the_sheet_opens_on_the_screen_under_the_pointer() {
+        // Primary 1440x900 at the origin; a second display to its right,
+        // taller and lower (AppKit, bottom-left origin).
+        let frames = [
+            Area { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 },
+            Area { x: 1440.0, y: -180.0, w: 1920.0, h: 1080.0 },
+        ];
+        assert_eq!(screen_at(&frames, (700.0, 400.0)), Some(0));
+        assert_eq!(screen_at(&frames, (2000.0, -100.0)), Some(1));
+        // The top edge counts (mouseLocation reaches it).
+        assert_eq!(screen_at(&frames, (700.0, 900.0)), Some(0));
+        assert_eq!(screen_at(&frames, (3000.0, 900.0)), Some(1));
+        // Off every screen, or none known: the caller's mainScreen.
+        assert_eq!(screen_at(&frames, (700.0, 1000.0)), None);
+        assert_eq!(screen_at(&[], (0.0, 0.0)), None);
     }
 
     #[test]

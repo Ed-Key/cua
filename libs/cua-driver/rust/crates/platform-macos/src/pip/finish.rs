@@ -37,7 +37,7 @@
 //! | Overview focus click (a thumbnail, or Return on the selected one) | none | none | none: the window comes forward through the same path as the panel's Focus button (`bring_to_front`) | none: the overview closes first |
 //! | Session acting while the overview is open | as the action note and captured frame rows | as those rows | as those rows | as those rows; the overview follows the stack on its next poll (a new front card, a new title) |
 //! | Session ending or finishing while the overview is open | as the idle timer and `end_session` rows | as those rows | as those rows | as those rows; the overview drops an ended session's group and badges a finished window on its next poll, and shows its empty line when no live session is left |
-//! | A window closing while the overview is open | as the captured frame row (the stack prunes it) | none | none | as that row; the overview drops the thumbnail on its next poll |
+//! | A window closing while the overview is open | as the captured frame row (the stack prunes it) | none | none | as that row; the overview drops the thumbnail on its next poll whether or not the stack still holds it (a kept front card, an idle session's window), since each poll checks every thumbnail's window against WindowServer's full list; a session left with no window keeps its row with a "No open windows" line; a focus click on a window closed since the poll is a logged no-op and the sheet stays up |
 //! | Panel hidden or closed by the user while the overview is open | none | none | as the user close row | as that row; the overview keeps the session's group (a hidden panel is still a live session) |
 //!
 //! Everything here is pure (unit tested, one test per row); the cursor

@@ -1048,16 +1048,11 @@ fn poll_visibility(worker: &CaptureWorker) {
         // Every window WindowServer knows (any Space, minimized included),
         // only when some back card needs checking. An empty answer is a
         // failed lookup, not every window closing.
-        let known: Option<HashSet<u32>> = active
+        let known = active
             .iter()
             .any(|(_, _, watched)| !watched.is_empty())
-            .then(|| {
-                crate::windows::all_windows_any_layer()
-                    .iter()
-                    .map(|window| window.window_id)
-                    .collect()
-            })
-            .filter(|known: &HashSet<u32>| !known.is_empty());
+            .then(visibility::known_windows)
+            .flatten();
         for (key, target, watched) in active {
             let visible = visibility::target_fully_visible(target, &windows, &displays, own_pid);
             let resolved_window = resolve_target_window(target);
