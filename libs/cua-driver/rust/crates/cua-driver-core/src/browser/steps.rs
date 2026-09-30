@@ -212,7 +212,8 @@ pub(crate) fn judge(action: BrowserStepAction, result: &ToolResult) -> Judged {
     }
 }
 
-/// How a `{role, name}` target resolved against one read of the page.
+/// How a `{name}` or `{role, name}` target resolved against one read of the
+/// page.
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Named {
     One(String),
@@ -220,10 +221,19 @@ pub(crate) enum Named {
     Not(&'static str, Vec<String>),
 }
 
-/// The ref of the one element with exactly this role and name. `complete`
-/// says the read covered every element that could match; without it a single
-/// match is not proven to be the only one.
-pub(crate) fn resolve_named(outline: &str, complete: bool, role: &str, name: &str) -> Named {
+/// The ref of the one element with exactly this name and, when a role is
+/// given, exactly this role. Without a role it is the one element with the
+/// name whose ref offers `action` (a button and the text inside it share a
+/// name; only the button can be clicked). `complete` says the read covered
+/// every element that could match; without it a single match is not proven
+/// to be the only one.
+pub(crate) fn resolve_named(
+    outline: &str,
+    complete: bool,
+    role: Option<&str>,
+    name: &str,
+    action: &str,
+) -> Named {
     let lines: Vec<OutlineLine> = outline.lines().filter_map(parse_outline_line).collect();
     let shown = |lines: Vec<&OutlineLine>| {
         lines
@@ -232,13 +242,26 @@ pub(crate) fn resolve_named(outline: &str, complete: bool, role: &str, name: &st
             .map(|line| line.line.clone())
             .collect()
     };
-    let matches: Vec<&OutlineLine> = lines
+    let named: Vec<&OutlineLine> = lines
         .iter()
-        .filter(|line| line.role == role && line.name.as_deref() == Some(name))
+        .filter(|line| line.name.as_deref() == Some(name))
+        .collect();
+    let matches: Vec<&OutlineLine> = named
+        .iter()
+        .copied()
+        .filter(|line| match role {
+            Some(role) => line.role == role,
+            None => line.actions.iter().any(|offered| offered == action),
+        })
         .collect();
     match matches.as_slice() {
         [one] if complete => Named::One(one.reference.clone()),
         [_] => Named::Not("coverage_incomplete", shown(matches)),
+        // The name is there, on nothing that offers the action: the lines
+        // say what each does offer.
+        [] if role.is_none() && !named.is_empty() => {
+            Named::Not("browser_action_unavailable", shown(named))
+        }
         [] => Named::Not("target_not_found", shown(lines.iter().collect())),
         _ => Named::Not("target_ambiguous", shown(matches)),
     }
@@ -246,18 +269,39 @@ pub(crate) fn resolve_named(outline: &str, complete: bool, role: &str, name: &st
 
 /// Whether `expect` holds on one read of the page. Absence is only proven by
 /// a read that covered every element that could match.
+///
+/// `text` is looked for in the element's own name and value and in those of
+/// its descendants: a status region says what it says in a text child. The
+/// outline is indented by depth, so an element's descendants are the lines
+/// after it that are indented further, up to the first that is not.
 pub(crate) fn expect_holds(outline: &str, complete: bool, expect: &BrowserStepExpect) -> bool {
-    let found = outline.lines().filter_map(parse_outline_line).any(|line| {
+    let lines: Vec<(usize, OutlineLine)> = outline
+        .lines()
+        .filter_map(|line| {
+            Some((
+                line.len() - line.trim_start().len(),
+                parse_outline_line(line)?,
+            ))
+        })
+        .collect();
+    let says = |line: &OutlineLine, text: &str| {
+        [&line.name, &line.value]
+            .into_iter()
+            .flatten()
+            .any(|held| held.contains(text))
+    };
+    let found = lines.iter().enumerate().any(|(index, (indent, line))| {
         expect.role.as_ref().is_none_or(|role| &line.role == role)
             && expect
                 .name
                 .as_ref()
                 .is_none_or(|name| line.name.as_ref() == Some(name))
             && expect.text.as_ref().is_none_or(|text| {
-                [&line.name, &line.value]
-                    .into_iter()
-                    .flatten()
-                    .any(|held| held.contains(text.as_str()))
+                says(line, text)
+                    || lines[index + 1..]
+                        .iter()
+                        .take_while(|(deeper, _)| deeper > indent)
+                        .any(|(_, below)| says(below, text))
             })
     });
     if expect.present {
@@ -377,11 +421,11 @@ impl BrowserStepsTool {
         for (index, step) in input.steps.iter().enumerate() {
             let number = index as u32 + 1;
             let last = index + 1 == input.steps.len();
-            // Aim: the ref given, or the one element with this role and name
-            // on the page as it is now.
+            // Aim: the ref given, or the one element with this name (and
+            // role) on the page as it is now.
             let reference = match (&step.reference, &step.role, &step.name) {
                 (Some(reference), _, _) => reference.clone(),
-                (None, Some(role), Some(name)) => {
+                (None, role, Some(name)) => {
                     let read = match Self::read(registry, &base, name).await {
                         Ok(read) => read,
                         Err(outcome) => {
@@ -403,11 +447,22 @@ impl BrowserStepsTool {
                         (None, Some(now)) => document = Some(now.clone()),
                         _ => {}
                     }
-                    let resolved = resolve_named(&read.outline, read.complete, role, name);
+                    let action = match step.action {
+                        BrowserStepAction::Click => "click",
+                        BrowserStepAction::Type => "type",
+                    };
+                    let resolved =
+                        resolve_named(&read.outline, read.complete, role.as_deref(), name, action);
                     match resolved {
                         Named::One(reference) => reference,
                         Named::Not(code, candidates) => {
-                            let mut outcome = failed(code, None);
+                            let detail = (code == "browser_action_unavailable").then(|| {
+                                format!(
+                                    "no element named {name:?} offers {action}; candidates \
+                                     show what each offers"
+                                )
+                            });
+                            let mut outcome = failed(code, detail);
                             outcome.candidates = Some(candidates);
                             outcomes.push(outcome);
                             stopped = Some((number, "step_failed"));
@@ -415,7 +470,7 @@ impl BrowserStepsTool {
                         }
                     }
                 }
-                _ => unreachable!("validated: a ref, or a role and a name"),
+                _ => unreachable!("validated: a ref, or a name"),
             };
 
             let result = registry
@@ -842,22 +897,26 @@ mod tests {
         - link \"Remove\" [p3:12 click] -> \"https://x.test/remove\"\n\
         - status \"state\" [p3:13]\n\
         \x20 - statictext \"ada@x.com (Editor)\" [p3:14]\n\
-        - combobox \"Region\" [p3:15 click] = \"Europe\" (collapsed)";
+        - combobox \"Region\" [p3:15 click] = \"Europe\" (collapsed)\n\
+        - status [p3:16]\n\
+        \x20 - group [p3:17]\n\
+        \x20   - statictext \"{\\\"invites\\\":[{\\\"role\\\":\\\"Editor\\\"}]}\" [p3:18]";
 
     #[test]
     fn a_named_target_is_exactly_one_element_with_that_role_and_name() {
         assert_eq!(
-            resolve_named(PAGE, true, "option", "Editor"),
+            resolve_named(PAGE, true, Some("option"), "Editor", "click"),
             Named::One("p3:8".into())
         );
         // The role is part of the match: the link named Remove is not a button.
         assert_eq!(
-            resolve_named(PAGE, true, "link", "Remove"),
+            resolve_named(PAGE, true, Some("link"), "Remove", "click"),
             Named::One("p3:12".into())
         );
         // Exact, not a prefix, not another case.
         for (role, name) in [("option", "Edit"), ("option", "editor"), ("tab", "Editor")] {
-            let Named::Not(code, candidates) = resolve_named(PAGE, true, role, name) else {
+            let Named::Not(code, candidates) = resolve_named(PAGE, true, Some(role), name, "click")
+            else {
                 panic!("{role} {name:?} must not resolve")
             };
             assert_eq!(code, "target_not_found");
@@ -867,7 +926,9 @@ mod tests {
 
     #[test]
     fn an_ambiguous_target_fails_with_the_candidates_and_is_never_guessed() {
-        let Named::Not(code, candidates) = resolve_named(PAGE, true, "button", "Remove") else {
+        let Named::Not(code, candidates) =
+            resolve_named(PAGE, true, Some("button"), "Remove", "click")
+        else {
             panic!("two buttons named Remove must not resolve")
         };
         assert_eq!(code, "target_ambiguous");
@@ -882,8 +943,71 @@ mod tests {
     }
 
     #[test]
+    fn a_name_alone_is_the_one_element_with_it_that_offers_the_action() {
+        const NAMED: &str = "- textbox \"Email\" [p3:1 type]\n\
+            - option \"Editor\" [p3:8 click]\n\
+            \x20 - statictext \"Editor\" [p3:9]\n\
+            - button \"Remove\" [p3:10 click]\n\
+            - link \"Remove\" [p3:12 click] -> \"https://x.test/remove\"\n\
+            - statictext \"No invites yet\" [p3:13]";
+        let named = |name: &str, action: &str| resolve_named(NAMED, true, None, name, action);
+        // The text inside the option has its name and cannot be clicked.
+        assert_eq!(named("Editor", "click"), Named::One("p3:8".into()));
+        assert_eq!(named("Email", "type"), Named::One("p3:1".into()));
+        // Two roles share the name and both can be clicked: never guessed.
+        assert_eq!(
+            named("Remove", "click"),
+            Named::Not(
+                "target_ambiguous",
+                vec![
+                    "- button \"Remove\" [p3:10 click]".to_owned(),
+                    "- link \"Remove\" [p3:12 click] -> \"https://x.test/remove\"".to_owned(),
+                ]
+            )
+        );
+        // A role still narrows it to one.
+        assert_eq!(
+            resolve_named(NAMED, true, Some("link"), "Remove", "click"),
+            Named::One("p3:12".into())
+        );
+        // No element has the name (exact, whole, this case).
+        for name in ["Delete", "editor", "Edit"] {
+            let Named::Not(code, candidates) = named(name, "click") else {
+                panic!("{name:?} must not resolve")
+            };
+            assert_eq!(code, "target_not_found");
+            assert_eq!(candidates.len(), NAMED.lines().count());
+        }
+        // The name is there, on nothing that offers the action.
+        assert_eq!(
+            named("No invites yet", "click"),
+            Named::Not(
+                "browser_action_unavailable",
+                vec!["- statictext \"No invites yet\" [p3:13]".to_owned()]
+            )
+        );
+        assert_eq!(
+            named("Email", "click"),
+            Named::Not(
+                "browser_action_unavailable",
+                vec!["- textbox \"Email\" [p3:1 type]".to_owned()]
+            )
+        );
+        // One match on a page that was not read completely is not proven unique.
+        assert_eq!(
+            resolve_named(NAMED, false, None, "Editor", "click"),
+            Named::Not(
+                "coverage_incomplete",
+                vec!["- option \"Editor\" [p3:8 click]".to_owned()]
+            )
+        );
+    }
+
+    #[test]
     fn one_match_in_a_partly_read_page_is_not_proven_unique() {
-        let Named::Not(code, candidates) = resolve_named(PAGE, false, "option", "Editor") else {
+        let Named::Not(code, candidates) =
+            resolve_named(PAGE, false, Some("option"), "Editor", "click")
+        else {
             panic!("uniqueness needs the whole page")
         };
         assert_eq!(code, "coverage_incomplete");
@@ -894,7 +1018,7 @@ mod tests {
     }
 
     #[test]
-    fn expect_matches_role_exact_name_and_contained_text() {
+    fn expect_matches_role_exact_name_and_text_in_the_element_or_below_it() {
         let expect = |role: Option<&str>, name: Option<&str>, text: Option<&str>, present: bool| {
             BrowserStepExpect {
                 role: role.map(str::to_owned),
@@ -931,6 +1055,66 @@ mod tests {
             (
                 "role must agree",
                 expect(Some("button"), Some("Editor"), None, true),
+                true,
+                false,
+            ),
+            (
+                "text in a descendant of the element with that role",
+                expect(Some("status"), None, Some("ada@x.com (Editor)"), true),
+                true,
+                true,
+            ),
+            (
+                "text in a descendant, with the exact name too",
+                expect(Some("status"), Some("state"), Some("(Editor)"), true),
+                true,
+                true,
+            ),
+            (
+                "an option under the button that opened it",
+                expect(Some("button"), Some("Role"), Some("Viewer"), true),
+                true,
+                true,
+            ),
+            (
+                "a later sibling is not a descendant",
+                expect(Some("option"), Some("Viewer"), Some("Editor"), true),
+                true,
+                false,
+            ),
+            (
+                "nor is the line after a subtree ends",
+                expect(Some("status"), None, Some("Europe"), true),
+                true,
+                false,
+            ),
+            (
+                "two levels down, in text the outline had to escape",
+                expect(Some("status"), None, Some("\"role\":\"Editor\""), true),
+                true,
+                true,
+            ),
+            (
+                "the group between them holds it too",
+                expect(Some("group"), None, Some("invites"), true),
+                true,
+                true,
+            ),
+            (
+                "a read that was cut short cannot prove no status says it",
+                expect(Some("status"), None, Some("ada@y.com"), false),
+                false,
+                false,
+            ),
+            (
+                "no status says it: holds as absent",
+                expect(Some("status"), None, Some("ada@y.com"), false),
+                true,
+                true,
+            ),
+            (
+                "a status says it in a descendant: not absent",
+                expect(Some("status"), None, Some("ada@x.com"), false),
                 true,
                 false,
             ),

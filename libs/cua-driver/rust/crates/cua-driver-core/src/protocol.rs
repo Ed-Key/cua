@@ -385,11 +385,13 @@ fn agent_instructions() -> String {
         "`launch_app`, then `get_window_state(pid, window_id)`."
     };
 
-    // act_and_read is registered only on macOS; elsewhere keep the one-action step.
+    // act_and_read is registered only on macOS; elsewhere keep the one-action
+    // step. A web page needs no native read first: get_browser_state binds
+    // the window and returns the page (by app name on macOS only).
     let act_step = if cfg!(target_os = "macos") {
-        "Apps: act and read in one `act_and_read` (`steps`). Chrome: `get_browser_state` snapshot, then `browser_steps`."
+        "Apps: act and read in one `act_and_read` (`steps`). Chrome pages: `get_browser_state(app)`, then `browser_steps`."
     } else {
-        "Act with the fresh index. Chrome: `get_browser_state` snapshot, then `browser_steps`."
+        "Act with the fresh index. Chrome pages: `get_browser_state(pid, window_id)`, then `browser_steps`."
     };
 
     format!(
@@ -522,9 +524,11 @@ mod agent_instruction_tests {
     #[test]
     fn instructions_name_the_browser_flow_within_budget() {
         let instructions = agent_instructions();
-        assert!(
-            instructions.contains("Chrome: `get_browser_state` snapshot, then `browser_steps`.")
-        );
+        assert!(instructions.contains(if cfg!(target_os = "macos") {
+            "Chrome pages: `get_browser_state(app)`, then `browser_steps`."
+        } else {
+            "Chrome pages: `get_browser_state(pid, window_id)`, then `browser_steps`."
+        }));
         let words = instructions.split_whitespace().count();
         assert!(words <= 200, "instructions are {words} words");
     }

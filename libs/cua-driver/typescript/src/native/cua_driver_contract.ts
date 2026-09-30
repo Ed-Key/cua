@@ -1498,7 +1498,8 @@ const FfiConverterTypeBrowserStepRoute = (() => {
 
 /**
  * What must hold once a step has settled: some element with this role,
- * exact name and/or text (or, with `present: false`, none).
+ * exact name and/or text (or, with `present: false`, none). The text may be
+ * the element's own or that of anything inside it.
  */
 export type BrowserStepExpect = {
     role?: string,
@@ -1507,7 +1508,7 @@ export type BrowserStepExpect = {
      */
     name?: string,
     /**
-     * Text contained in the element's name or value.
+     * Text contained in the element's name or value, or in those of its descendants.
      */
     text?: string,
     /**
@@ -1565,8 +1566,8 @@ const FfiConverterTypeBrowserStepExpect = (() => {
 })();
 
 /**
- * One step. Target it with `ref`, or with `role` and `name` (matched
- * exactly against the live page when the step runs).
+ * One step. Target it with `ref`, or with `name` (matched exactly against
+ * the live page when the step runs), and `role` to narrow the name.
  */
 export type BrowserStep = {
     action: BrowserStepAction,
@@ -1575,9 +1576,12 @@ export type BrowserStep = {
      */
     reference?: string,
     /**
-     * With name, instead of ref.
+     * Optional with name: only an element with exactly this role.
      */
     role?: string,
+    /**
+     * Instead of ref: the one element with exactly this name that offers the action.
+     */
     name?: string,
     /**
      * type: the text.
@@ -1588,7 +1592,7 @@ export type BrowserStep = {
      */
     replace?: boolean,
     /**
-     * click: trusted (default) or dom_event (ref or role and name).
+     * click: trusted (default) or dom_event (ref or name).
      */
     inputRoute?: BrowserStepRoute,
     /**
@@ -1703,8 +1707,8 @@ const FfiConverterTypeBrowserStepStatus = (() => {
 export type BrowserStepOutcome = {
     status: BrowserStepStatus,
     /**
-     * The ref the step acted on: the one given, or the one its role and
-     * name resolved to.
+     * The ref the step acted on: the one given, or the one its name
+     * resolved to.
      */
     reference?: string,
     /**
@@ -1731,8 +1735,8 @@ export type BrowserStepOutcome = {
      */
     retryable?: boolean,
     /**
-     * The outline lines that matched the step's role and name, when it was
-     * not exactly one (or the nearest ones when there was none).
+     * The outline lines that matched the step's name (and role), when it
+     * was not exactly one (or the nearest ones when there was none).
      */
     candidates?: Array<string>
 }

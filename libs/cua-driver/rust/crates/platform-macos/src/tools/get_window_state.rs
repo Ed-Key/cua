@@ -962,7 +962,14 @@ async fn window_target(args: &Value) -> Result<(i32, u32), ToolResult> {
     let Some(app) = app else {
         return Ok((args.require_i32("pid")?, args.require_u32("window_id")?));
     };
-    let wanted = app.clone();
+    app_window(&app).await
+}
+
+/// The only window of `app` (an app name or bundle id) that the default
+/// `list_windows` would show, or the refusal that says why there is not one.
+/// `get_browser_state {app}` binds the same window through this.
+pub(crate) async fn app_window(app: &str) -> Result<(i32, u32), ToolResult> {
+    let wanted = app.to_owned();
     let (apps, windows, ax_titles) = tokio::task::spawn_blocking(move || {
         let apps = crate::apps::list_running_apps();
         let ax_titles = ax_window_titles(&app_pids(&wanted, &apps));
@@ -970,7 +977,7 @@ async fn window_target(args: &Value) -> Result<(i32, u32), ToolResult> {
     })
     .await
     .map_err(|e| ToolResult::error(format!("app lookup failed: {e}")))?;
-    select_app_window(&app, &apps, &windows, &ax_titles)
+    select_app_window(app, &apps, &windows, &ax_titles)
 }
 
 /// Private argument that carries a failed `app` lookup from `resolve_target`

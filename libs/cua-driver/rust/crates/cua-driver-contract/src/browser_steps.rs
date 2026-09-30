@@ -61,7 +61,8 @@ pub enum BrowserStepRoute {
 }
 
 /// What must hold once a step has settled: some element with this role,
-/// exact name and/or text (or, with `present: false`, none).
+/// exact name and/or text (or, with `present: false`, none). The text may be
+/// the element's own or that of anything inside it.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserStepExpect {
@@ -82,7 +83,7 @@ pub struct BrowserStepExpect {
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub name: Option<String>,
-    /// Text contained in the element's name or value.
+    /// Text contained in the element's name or value, or in those of its descendants.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -97,8 +98,8 @@ pub struct BrowserStepExpect {
     pub present: bool,
 }
 
-/// One step. Target it with `ref`, or with `role` and `name` (matched
-/// exactly against the live page when the step runs).
+/// One step. Target it with `ref`, or with `name` (matched exactly against
+/// the live page when the step runs), and `role` to narrow the name.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserStep {
@@ -113,7 +114,7 @@ pub struct BrowserStep {
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub reference: Option<String>,
-    /// With name, instead of ref.
+    /// Optional with name: only an element with exactly this role.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -122,6 +123,7 @@ pub struct BrowserStep {
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub role: Option<String>,
+    /// Instead of ref: the one element with exactly this name that offers the action.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -148,7 +150,7 @@ pub struct BrowserStep {
     #[schemars(schema_with = "boolean")]
     #[uniffi(default = None)]
     pub replace: Option<bool>,
-    /// click: trusted (default) or dom_event (ref or role and name).
+    /// click: trusted (default) or dom_event (ref or name).
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -175,8 +177,10 @@ impl BrowserStep {
             return Err("ref, role and name must be nonblank when given".into());
         }
         match (&self.reference, &self.role, &self.name) {
-            (Some(_), None, None) | (None, Some(_), Some(_)) => {}
-            _ => return Err("target the step with ref, or with role and name together".into()),
+            (Some(_), None, None) | (None, _, Some(_)) => {}
+            _ => {
+                return Err("target the step with ref, or with name (role only beside name)".into())
+            }
         }
         match self.action {
             BrowserStepAction::Type => {
@@ -261,8 +265,8 @@ pub enum BrowserStepStatus {
 #[serde(deny_unknown_fields)]
 pub struct BrowserStepOutcome {
     pub status: BrowserStepStatus,
-    /// The ref the step acted on: the one given, or the one its role and
-    /// name resolved to.
+    /// The ref the step acted on: the one given, or the one its name
+    /// resolved to.
     #[serde(rename = "ref", default, skip_serializing_if = "Option::is_none")]
     pub reference: Option<String>,
     /// The effect the step's tool reported: confirmed, unverifiable, partial,
@@ -283,8 +287,8 @@ pub struct BrowserStepOutcome {
     /// sending the step again.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub retryable: Option<bool>,
-    /// The outline lines that matched the step's role and name, when it was
-    /// not exactly one (or the nearest ones when there was none).
+    /// The outline lines that matched the step's name (and role), when it
+    /// was not exactly one (or the nearest ones when there was none).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub candidates: Option<Vec<String>>,
 }
@@ -320,9 +324,14 @@ pub fn contracts() -> Vec<ToolContract> {
     vec![ToolContract {
         name: BrowserStepsInput::TOOL_NAME.into(),
         description: "Run up to 8 page steps (click, type) on one bound tab in order, then \
-            return what the page changed. A step targets a ref, or an exact role and name \
-            resolved when it runs. Stops at the first failure, unconfirmed typing, dialog or \
-            navigation; never retries. Details: skill://cua-driver/BROWSER.md"
+            return what the page changed. A step targets a ref, or an exact name resolved \
+            when it runs (add role only when several elements share the name). Use a name \
+            for an element an earlier step reveals or enables (a menu option, a dialog, a \
+            disabled button): it has no ref or no action until then, and a name that \
+            matches nothing only stops the batch there with the candidates. So plan the \
+            whole flow as one call. Stops at the first failure, unconfirmed typing, dialog \
+            or navigation; never retries. \
+            Details: skill://cua-driver/BROWSER.md"
             .into(),
         platforms: vec![Platform::Macos, Platform::Windows, Platform::Linux],
         aliases: vec![],
@@ -355,29 +364,43 @@ mod tests {
     }
 
     #[test]
-    fn a_step_names_its_target_by_ref_or_by_role_and_name() {
+    fn a_step_names_its_target_by_ref_or_by_name_with_an_optional_role() {
         let parsed = input(json!([
             {"action": "type", "ref": "p3:4", "text": "ada@x.com", "replace": true},
-            {"action": "click", "role": "button", "name": "Role"},
+            {"action": "click", "name": "Role"},
             {"action": "click", "role": "button", "name": "Send invite",
              "expect": {"text": "ada@x.com (Editor)"}},
         ]))
         .unwrap();
         assert_eq!(parsed.steps[0].reference.as_deref(), Some("p3:4"));
+        // A name alone is a target; a role narrows it.
+        assert_eq!(
+            (
+                parsed.steps[1].role.as_deref(),
+                parsed.steps[1].name.as_deref()
+            ),
+            (None, Some("Role"))
+        );
+        assert_eq!(parsed.steps[2].role.as_deref(), Some("button"));
         assert_eq!(
             parsed.steps[2].expect.as_ref().map(|e| e.present),
             Some(true)
         );
         for (steps, error) in [
-            (json!([{"action": "click"}]), "ref, or with role and name"),
+            (json!([{"action": "click"}]), "ref, or with name"),
             (
                 json!([{"action": "click", "role": "button"}]),
-                "ref, or with role and name",
+                "ref, or with name",
             ),
             (
                 json!([{"action": "click", "ref": "p1:1", "role": "button", "name": "x"}]),
-                "ref, or with role and name",
+                "ref, or with name",
             ),
+            (
+                json!([{"action": "click", "ref": "p1:1", "name": "x"}]),
+                "ref, or with name",
+            ),
+            (json!([{"action": "click", "name": " "}]), "nonblank"),
             (json!([{"action": "click", "ref": " "}]), "nonblank"),
             (
                 json!([{"action": "type", "ref": "p1:1"}]),

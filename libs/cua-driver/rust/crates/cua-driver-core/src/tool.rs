@@ -1181,16 +1181,8 @@ impl ToolRegistry {
         // caller-chosen label alone. Translate it only after authorization so
         // policy and manifests continue to evaluate the public request.
         let runtime_prefix = namespace_runtime_args(&mut args, context, evidence);
-        if session_selecting_tool(resolved_name)
-            && args.get("_session_id").and_then(Value::as_str).is_none()
-        {
-            let implicit = args
-                .get("_transport_session_id")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-                .unwrap_or_else(|| format!("{runtime_prefix}implicit-direct"));
-            args["_session_id"] = Value::String(implicit.clone());
-            args["_transport_session_id"] = Value::String(implicit);
+        if session_selecting_tool(resolved_name) {
+            adopt_implicit_session(&mut args, &runtime_prefix);
         }
         let runtime_session = args
             .get("_session_id")
@@ -2866,6 +2858,40 @@ fn namespace_runtime_args(
         arguments.insert(key.to_owned(), Value::String(internal));
     }
     runtime_prefix
+}
+
+/// A call that named no session runs in its transport's implicit one (the
+/// runtime's own for a direct call).
+fn adopt_implicit_session(args: &mut Value, runtime_prefix: &str) {
+    if args.get("_session_id").and_then(Value::as_str).is_some() {
+        return;
+    }
+    let implicit = args
+        .get("_transport_session_id")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .unwrap_or_else(|| format!("{runtime_prefix}implicit-direct"));
+    args["_session_id"] = Value::String(implicit.clone());
+    args["_transport_session_id"] = Value::String(implicit);
+}
+
+/// The session fields the dispatch in progress hands a session-selecting tool
+/// called with these public arguments: the caller's label in this runtime's
+/// namespace, and the transport's implicit session when it gave none. They
+/// are derived by the functions the dispatch itself uses, from the context
+/// and transport evidence the dispatch holds, so a resource adapter reads the
+/// same session the tool will run in. Caller-written reserved fields are
+/// dropped first. `None` outside a registry dispatch.
+pub(crate) fn current_dispatch_runtime_args(public_args: &Value) -> Option<Value> {
+    let context = DISPATCH_AUTHORIZATION_CONTEXT.try_with(Arc::clone).ok()?;
+    let evidence = DISPATCH_TRUSTED_INVOCATION_EVIDENCE
+        .try_with(Clone::clone)
+        .unwrap_or_default();
+    let mut args = public_args.clone();
+    crate::tool_args::sanitize_reserved_args(&mut args);
+    let runtime_prefix = namespace_runtime_args(&mut args, &context, &evidence);
+    adopt_implicit_session(&mut args, &runtime_prefix);
+    Some(args)
 }
 
 fn session_requiring_tool(tool_name: &str) -> bool {
