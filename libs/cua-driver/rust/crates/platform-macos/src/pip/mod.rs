@@ -162,10 +162,11 @@ mod finish;
 mod hands;
 mod live;
 mod overview;
+mod page;
 mod stack;
 mod visibility;
 
-use cursor::{cursor_in_well, sprite_placement, sprite_window, Sprite};
+use cursor::{cursor_in_well, shown_area, sprite_placement, sprite_window, Sprite};
 pub(crate) use cursor::sprite_box;
 use hands::Hands;
 use finish::{
@@ -405,6 +406,13 @@ fn current_tag(target: Target, resolved_window: Option<u32>) -> Option<Tag> {
     }
 }
 
+/// What a layer's pixels show: the resolved target they came from, and
+/// whether they are framed to its page (`PipFrame::page`, see `page`) or
+/// show the whole window. The same window framed the other way is another
+/// view: a browser action after a native one on the same window (or back)
+/// never shows the other framing's pixels.
+type View = (Tag, bool);
+
 /// Which of the panel's three layers show. The image area only ever shows
 /// pixels captured from the CURRENT resolved target: a layer whose tag is not
 /// the current one is hidden (and its pixels dropped by the caller), and
@@ -417,8 +425,12 @@ struct Layers {
 }
 
 /// `still_tag` / `live_tag` are `None` when that layer holds no pixels.
-fn visible_layers(current: Option<Tag>, still_tag: Option<Tag>, live_tag: Option<Tag>) -> Layers {
-    let matches = |tag: Option<Tag>| current.is_some() && tag == current;
+fn visible_layers<T: PartialEq + Copy>(
+    current: Option<T>,
+    still_tag: Option<T>,
+    live_tag: Option<T>,
+) -> Layers {
+    let matches = |tag: Option<T>| current.is_some() && tag == current;
     let live = matches(live_tag);
     let still = matches(still_tag);
     Layers {
@@ -490,10 +502,21 @@ struct Panel {
     /// The live frame on screen, held so ScreenCaptureKit does not recycle
     /// its IOSurface while the layer shows it. `None` shows the still.
     live_frame: Option<screencapturekit::CVPixelBuffer>,
-    /// Target the live frame came from (`None` with no live frame).
-    live_tag: Option<Tag>,
-    /// Target the still in `image_view` came from (`None` with no still).
-    still_tag: Option<Tag>,
+    /// View the live frame came from (`None` with no live frame).
+    live_tag: Option<View>,
+    /// View the still in `image_view` came from (`None` with no still).
+    still_tag: Option<View>,
+    /// The page crop the still in `image_view` shows (window points; `None`:
+    /// the whole window).
+    still_crop: Option<Area>,
+    /// The displayed target is framed to its page (the frame came from a
+    /// bound browser tab), when its crop is known.
+    page: bool,
+    /// The latest page lookup for the displayed target (window points, or
+    /// why it is not known), tagged with the window it was looked up in.
+    /// `None` before any. Only a known crop of the displayed window frames
+    /// the card (`wanted_crop`); anything else is the whole window.
+    crop: Option<(u32, page::Crop)>,
     /// The panel's stream request and which generation's events still count.
     stream: live::StreamState,
     /// The window a pid-only `target` currently resolves to, as last looked
@@ -649,6 +672,16 @@ struct CardInfo {
     /// The window's size when its card went behind: the shape the front
     /// card takes at once when it comes back.
     shape: Option<(f64, f64)>,
+    /// Its framing when it went behind (`Panel::page`, `Panel::crop`) and
+    /// the crop its still shows, restored with the still and the shape when
+    /// the user raises it.
+    page: bool,
+    crop: Option<(u32, page::Crop)>,
+    /// The framing and crop of `still` itself, kept with it: an action that
+    /// changes the card's framing without a new capture leaves the old
+    /// still framed as it was, so it is never shown under the new framing.
+    still_page: bool,
+    still_crop: Option<Area>,
 }
 
 /// A retained `NSImage`, released on drop (like all panel state, only on
@@ -864,9 +897,11 @@ impl SessionEpochs {
 
 /// (pid, window_id) of a capture target.
 type Target = (Option<i32>, Option<u32>);
-/// A still: the window it was captured from, and its PNG.
-type Shot = (u32, Vec<u8>);
-type CaptureFn = dyn Fn(Target) -> Option<Shot> + Send + Sync;
+/// A still: the window it was captured from, its PNG, and the page crop the
+/// PNG was cut to (window points; `None`: the whole window).
+type Shot = (u32, Vec<u8>, Option<Area>);
+/// Captures a target, framed to its page when the flag says so.
+type CaptureFn = dyn Fn(Target, bool) -> Option<Shot> + Send + Sync;
 
 struct CaptureWorker {
     /// Each frame with the epoch its session was in when it was pushed.
@@ -878,8 +913,9 @@ struct CaptureWorker {
     /// Targets with a capture still running, including ones that timed out.
     /// A stuck target gets no second capture thread until the first returns.
     in_flight: Arc<Mutex<HashSet<Target>>>,
-    /// Each live session's latest target and when its last frame was pushed.
-    active: Mutex<HashMap<String, (Target, Instant)>>,
+    /// Each live session's displayed target, whether it is framed to its
+    /// page, and when its last frame was pushed.
+    active: Mutex<HashMap<String, (Target, bool, Instant)>>,
     /// Windows of each session's back cards, checked for closing by the
     /// visibility poll.
     watched: Mutex<HashMap<String, Vec<u32>>>,
@@ -906,7 +942,8 @@ impl CaptureWorker {
             .name("cua-pip-capture".into())
             .spawn(move || loop {
                 let (frame, epoch) = looping.next();
-                let png = looping.capture_bounded((frame.target_pid, frame.target_window_id));
+                let png = looping
+                    .capture_bounded((frame.target_pid, frame.target_window_id), frame.page);
                 deliver(frame, epoch, png);
             })?;
         Ok(worker)
@@ -923,8 +960,8 @@ impl CaptureWorker {
         let now = Instant::now();
         lock(&self.active)
             .entry(frame.session_key.clone())
-            .and_modify(|(_, pushed)| *pushed = now)
-            .or_insert((target, now));
+            .and_modify(|(_, _, pushed)| *pushed = now)
+            .or_insert((target, frame.page, now));
         let epoch = lock(&self.epochs).stamp(&frame.session_key);
         lock(&self.queue).push(frame.session_key.clone(), (frame, epoch));
         self.ready.notify_one();
@@ -940,15 +977,16 @@ impl CaptureWorker {
     }
 
     /// Sessions that pushed a frame within the idle window, with their
-    /// latest target and the windows of their back cards.
-    fn active_targets(&self, now: Instant) -> Vec<(String, Target, Vec<u32>)> {
+    /// displayed target, whether it is framed to its page, and the windows
+    /// of their back cards.
+    fn active_targets(&self, now: Instant) -> Vec<(String, Target, bool, Vec<u32>)> {
         let watched = lock(&self.watched);
         lock(&self.active)
             .iter()
-            .filter(|(_, (_, pushed))| !idle_hide_due(*pushed, now))
-            .map(|(key, (target, _))| {
+            .filter(|(_, (_, _, pushed))| !idle_hide_due(*pushed, now))
+            .map(|(key, (target, page, _))| {
                 let windows = watched.get(key).cloned().unwrap_or_default();
-                (key.clone(), *target, windows)
+                (key.clone(), *target, *page, windows)
             })
             .collect()
     }
@@ -962,11 +1000,13 @@ impl CaptureWorker {
         lock(&self.watched).insert(session_key.to_owned(), windows);
     }
 
-    /// The panel now shows `target`: polls answer for it. Called in the same
-    /// step as every change of the displayed target (`set_panel_target`).
-    fn retarget(&self, session_key: &str, target: Target) {
-        if let Some((current, _)) = lock(&self.active).get_mut(session_key) {
+    /// The panel now shows `target`, framed to its page or not: polls answer
+    /// for it. Called in the same step as every change of the displayed
+    /// target (`set_panel_target`).
+    fn retarget(&self, session_key: &str, target: Target, page: bool) {
+        if let Some((current, framed, _)) = lock(&self.active).get_mut(session_key) {
             *current = target;
+            *framed = page;
         }
     }
 
@@ -974,7 +1014,7 @@ impl CaptureWorker {
     /// deadline is the later of that and its last push, so the visibility
     /// poll and the panel's idle hide count from the same moment.
     fn mark_delivered(&self, session_key: &str, at: Instant) {
-        if let Some((_, last)) = lock(&self.active).get_mut(session_key) {
+        if let Some((_, _, last)) = lock(&self.active).get_mut(session_key) {
             *last = (*last).max(at);
         }
     }
@@ -998,10 +1038,10 @@ impl CaptureWorker {
         }
     }
 
-    /// Capture `target` on a helper thread, waiting at most `timeout`.
-    /// `None` on timeout, failure, or while an earlier capture of the same
-    /// target is still stuck.
-    fn capture_bounded(&self, target: Target) -> Option<Shot> {
+    /// Capture `target` (framed to its page when `page`) on a helper thread,
+    /// waiting at most `timeout`. `None` on timeout, failure, or while an
+    /// earlier capture of the same target is still stuck.
+    fn capture_bounded(&self, target: Target, page: bool) -> Option<Shot> {
         if !lock(&self.in_flight).insert(target) {
             return None;
         }
@@ -1011,7 +1051,7 @@ impl CaptureWorker {
         let spawned = std::thread::Builder::new()
             .name("cua-pip-shot".into())
             .spawn(move || {
-                let png = capture(target);
+                let png = capture(target, page);
                 lock(&in_flight).remove(&target);
                 let _ = sender.send(png);
             });
@@ -1072,6 +1112,11 @@ struct FrameUpdate {
 struct VisibilityUpdate {
     key: String,
     target: Target,
+    /// The target was polled as framed to its page.
+    page: bool,
+    /// Its page's crop, looked up in the resolved window (`None` when the
+    /// target is not framed to its page).
+    crop: Option<page::Crop>,
     visible: bool,
     resolved_window: Option<u32>,
     target_frame: Option<(u32, Area)>,
@@ -1110,7 +1155,7 @@ impl PipBackend for MacosPipBackend {
     fn end_session(&self, session_key: &str, end: PipSessionEnd) {
         let target = lock(&self.worker.active)
             .get(session_key)
-            .map(|(target, _)| *target);
+            .map(|(target, _, _)| *target);
         self.worker.forget(session_key);
         // A finished session's hidden panel may come back for its finale,
         // but never over a window the user can see: the poll stopped
@@ -1195,13 +1240,20 @@ fn poll_visibility(worker: &CaptureWorker) {
         // failed lookup, not every window closing.
         let known = active
             .iter()
-            .any(|(_, _, watched)| !watched.is_empty())
+            .any(|(_, _, _, watched)| !watched.is_empty())
             .then(visibility::known_windows)
             .flatten();
-        for (key, target, watched) in active {
+        for (key, target, page, watched) in active {
             let visible = visibility::target_fully_visible(target, &windows, &displays, own_pid);
             let resolved_window = resolve_target_window(target);
             let target_frame = visibility::frame_of(&windows, resolved_window);
+            // The page moves inside its window without the window changing
+            // (a banner, navigation, docked DevTools): looked up again every
+            // poll, like the window's own frame.
+            let crop = page.then(|| match target_frame {
+                Some((window, frame)) => page::page_crop(target.0, window, frame),
+                None => Err("the window's frame is not known"),
+            });
             let gone = known.as_ref().map_or_else(Vec::new, |known| {
                 watched
                     .into_iter()
@@ -1212,6 +1264,8 @@ fn poll_visibility(worker: &CaptureWorker) {
                 VisibilityUpdate {
                     key,
                     target,
+                    page,
+                    crop,
                     visible,
                     resolved_window,
                     target_frame,
@@ -1290,7 +1344,7 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
     let displayed = current_tag(panel.target, panel.resolved_window);
     let point = match (
         update.image,
-        sprite_window(update.window, displayed, panel.target_frame),
+        sprite_window(update.window, displayed, shown_frame(panel)),
         panel.finale_view,
     ) {
         (Some(_), Some(frame), None) => cursor_in_well(frame, (update.x, update.y), well),
@@ -1333,7 +1387,7 @@ unsafe fn place_sprite(panel: &Panel) {
         None
     } else {
         sprite_placement(
-            sprite_window(panel.cursor_window, displayed, panel.target_frame),
+            sprite_window(panel.cursor_window, displayed, shown_frame(panel)),
             panel.cursor_at,
             well_size(panel.laid_out),
             panel.cursor_box,
@@ -1354,6 +1408,21 @@ unsafe fn place_sprite(panel: &Panel) {
     let _: () = msg_send![class!(CATransaction), commit];
 }
 
+/// The screen area the front card's picture shows, tagged with its window:
+/// the target window's last known frame cut to the page crop of the pixels
+/// on screen (the live frame's while one shows, else the still's), so the
+/// cursor maps into exactly what is drawn and hides outside it.
+fn shown_frame(panel: &Panel) -> Option<(u32, Area)> {
+    let crop = if panel.live_tag.is_some() {
+        panel.stream.shown_crop
+    } else {
+        panel.still_crop
+    };
+    panel
+        .target_frame
+        .map(|(window, frame)| (window, shown_area(frame, crop)))
+}
+
 /// Show `image` (a retained `CGImage`, or 0 for none) on the sprite layer
 /// and release the one it showed.
 unsafe fn set_cursor_image(panel: &mut Panel, image: usize) {
@@ -1366,11 +1435,14 @@ unsafe fn set_cursor_image(panel: &mut Panel, image: usize) {
 }
 
 pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
-    let capture: Arc<CaptureFn> = Arc::new(|target: Target| {
+    let capture: Arc<CaptureFn> = Arc::new(|target: Target, page: bool| {
         let window_id = resolve_target_window(target)?;
         // Always window-scoped, so other PiP panels are never in the image.
+        if page {
+            return page::capture_page(target.0, window_id);
+        }
         cua_driver_core::recording::screenshot_for(Some(u64::from(window_id)), None)
-            .map(|png| (window_id, png))
+            .map(|png| (window_id, png, None))
     });
     let worker = CaptureWorker::start(capture, CAPTURE_TIMEOUT, deliver_to_main)?;
     let streams = Streams::start(deliver_live)?;
@@ -1444,7 +1516,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
             return;
         };
         state.panels.insert(key.clone(), panel);
-        let window = png.as_ref().map_or(0, |(window, _)| *window);
+        let window = png.as_ref().map_or(0, |(window, _, _)| *window);
         tracing::info!(target: "pip", session = %key, pid = frame.target_pid.unwrap_or(0), window, "PiP panel opened");
     }
     let worker = state.worker.clone();
@@ -1483,12 +1555,19 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     if pick.is_some() && !tag.is_some_and(|tag| hands::agent_takes_front(pick, tag)) {
         if let Some(tag) = tag {
             let title = target_name(frame.target_pid, target_title);
-            let still = png.and_then(|(window, png)| {
+            let mut still_crop = None;
+            let still = png.and_then(|(window, png, crop)| {
+                still_crop = crop;
                 image_from_png(&png).map(|image| ((frame.target_pid, Some(window)), image))
             });
+            // Its shape: the page its still was cut to, else its window.
             let shape = target_frame
                 .filter(|(window, _)| Some(*window) == tag.1)
                 .map(|(_, frame)| (frame.w, frame.h));
+            let shape = still_crop
+                .filter(|_| still.is_some())
+                .map(|crop| (crop.w, crop.h))
+                .or(shape);
             let restacked = restack(panel, &key, &worker, |panel| {
                 panel.cards.act_behind(tag, now);
                 panel.cards.prune(now, &keep, |_| false);
@@ -1497,8 +1576,14 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
                     card.data.title = title.clone();
                     card.data.pid = frame.target_pid;
                     card.data.status = frame.action_label.clone();
+                    card.data.page = frame.page;
                     if still.is_some() {
                         card.data.still = still;
+                        card.data.still_page = frame.page;
+                        card.data.still_crop = still_crop;
+                        card.data.crop = tag.1.map(|window| {
+                            (window, still_crop.ok_or("the still shows the whole window"))
+                        });
                     }
                     if shape.is_some() {
                         card.data.shape = shape;
@@ -1532,14 +1617,21 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     note_finished(panel, &key);
 
     // A failed capture keeps the old still; `sync_layers` (from `refresh`,
-    // below) drops it unless it is of the panel's current window.
-    if let Some((window, png)) = png {
+    // below) drops it unless it is of the panel's current view.
+    let mut looked_up = None;
+    if let Some((window, png, crop)) = png {
         let image = image_from_png(&png);
         let _: () = msg_send![
             panel.image_view as *mut AnyObject,
             setImage: image.as_ref().map_or(std::ptr::null_mut(), |image| image.0 as *mut AnyObject)
         ];
-        panel.still_tag = image.is_some().then_some((frame.target_pid, Some(window)));
+        panel.still_tag = image
+            .is_some()
+            .then_some(((frame.target_pid, Some(window)), frame.page));
+        panel.still_crop = crop;
+        looked_up = frame
+            .page
+            .then(|| (window, crop.ok_or("the still shows the whole window")));
     }
     panel.action = frame.action_label.clone();
 
@@ -1555,12 +1647,50 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     }
     // While a pick is set the target stays the concrete picked window: a
     // pid-only frame resolved to it must not reopen which window it is.
-    set_panel_target(panel, &key, &worker, hands::front_target(pick, tag, new_target));
+    set_panel_target(
+        panel,
+        &key,
+        &worker,
+        hands::front_target(pick, tag, new_target),
+        frame.page,
+    );
+    if let Some((window, crop)) = looked_up {
+        note_crop(panel, window, crop, "still");
+    }
     panel.target_visible = target_visible;
     panel.resolved_window = resolved_window;
     panel.target_frame = target_frame;
     sync_shape(panel);
     refresh(state, &key);
+}
+
+/// A page lookup in `window` answered: keep it for the card's shape and the
+/// live stream's crop (see `wanted_crop`), and log each change (`source`:
+/// an action's still or the poll).
+fn note_crop(panel: &mut Panel, window: u32, crop: page::Crop, source: &str) {
+    if panel.crop == Some((window, crop)) {
+        return;
+    }
+    panel.crop = Some((window, crop));
+    match crop {
+        Ok(crop) => {
+            tracing::info!(target: "pip", session = %panel.key, window, crop = ?(crop.x, crop.y, crop.w, crop.h), source, "PiP page crop");
+        }
+        Err(reason) => {
+            tracing::info!(target: "pip", session = %panel.key, window, reason, source, "PiP page unknown: the card shows the whole window");
+        }
+    }
+}
+
+/// The page crop the front card is framed to: a known crop of the displayed
+/// window while the panel frames its target's page, else `None` (the whole
+/// window).
+fn wanted_crop(panel: &Panel) -> Option<Area> {
+    let displayed = current_tag(panel.target, panel.resolved_window)?.1?;
+    match panel.crop {
+        Some((window, Ok(crop))) if panel.page && window == displayed => Some(crop),
+        _ => None,
+    }
 }
 
 /// An `NSImage` of `png`, owned (`dataWithBytes:length:` copies, so the
@@ -1611,13 +1741,15 @@ fn picture_size(panel: &Panel) -> (f64, f64) {
     panel.shape.map_or(well, |shape| stack::fit(well, shape))
 }
 
-/// The displayed window's size, if the last known frame is that window's:
-/// the front card takes its shape. Whether anything changed.
+/// The displayed window's size (its page's, when the card is framed to it),
+/// if the last known frame is that window's: the front card takes its shape.
+/// Whether anything changed.
 unsafe fn sync_shape(panel: &mut Panel) -> bool {
     let displayed = current_tag(panel.target, panel.resolved_window).and_then(|tag| tag.1);
     match panel.target_frame {
         Some((window, frame)) if Some(window) == displayed => {
-            set_shape(panel, Some((frame.w, frame.h)))
+            let size = wanted_crop(panel).map_or((frame.w, frame.h), |crop| (crop.w, crop.h));
+            set_shape(panel, Some(size))
         }
         _ => false,
     }
@@ -1653,16 +1785,20 @@ unsafe fn set_shape(panel: &mut Panel, shape: Option<(f64, f64)>) -> bool {
             panel.motion = Default::default();
         }
         apply_card_frames(panel);
-        log_shape(panel);
     }
+    // Every new shape, also one the card already had (a page framed out of
+    // a window the box fits the same way), so checks see what it follows.
+    log_shape(panel);
     panel.stream_well = picture_size(panel);
     true
 }
 
-/// Log the front card's size, the size box and the window's size
-/// (`window=(0.0, 0.0)`: not known), for checks.
+/// Log the front card's size, the size box and the displayed size (the
+/// page's when the card is framed to it, `framing=page`, else the window's;
+/// `window=(0.0, 0.0)`: not known), for checks.
 fn log_shape(panel: &Panel) {
-    tracing::info!(target: "pip", session = %panel.key, card = ?panel.front, bounds = ?panel.card, window = ?panel.shape.unwrap_or_default(), "PiP card shape");
+    let framing = if wanted_crop(panel).is_some() { "page" } else { "window" };
+    tracing::info!(target: "pip", session = %panel.key, card = ?panel.front, bounds = ?panel.card, window = ?panel.shape.unwrap_or_default(), %framing, "PiP card shape");
 }
 
 /// The user resized the panel: `card` is its size box now, and the front
@@ -2051,8 +2187,10 @@ unsafe fn restack(
 
 /// Make `tag` the front card: `acted` when the session acted in its window,
 /// `None` for a user click (only a card already in the stack). The old
-/// front takes its still behind (only if it is of its own window); a card
-/// coming forward brings its still, which is the new target's pixels.
+/// front takes its still behind (only if it is of its own window) with its
+/// framing; a card coming forward brings its still, which is the new
+/// target's pixels, and its page crop. A card the user raises is framed as
+/// it was when it went behind (an action sets its own framing).
 /// Whether the stack changed.
 unsafe fn switch_front(
     panel: &mut Panel,
@@ -2069,11 +2207,15 @@ unsafe fn switch_front(
     }
     if let Some(front) = panel.cards.front_mut() {
         let image: *mut AnyObject = msg_send![panel.image_view as *mut AnyObject, image];
-        if panel.still_tag == Some(front.key) && !image.is_null() {
+        if panel.still_tag == Some((front.key, panel.page)) && !image.is_null() {
             let _: *mut AnyObject = msg_send![image, retain];
             front.data.still = Some((front.key, Image(image as usize)));
+            front.data.still_page = panel.page;
+            front.data.still_crop = panel.still_crop;
         }
         front.data.shape = panel.shape;
+        front.data.page = panel.page;
+        front.data.crop = panel.crop;
     }
     let changed = restack(panel, key, worker, |panel| match acted {
         Some(now) => panel.cards.act(tag, now),
@@ -2082,13 +2224,18 @@ unsafe fn switch_front(
         }
     });
     if let Some(front) = panel.cards.front_mut() {
+        if acted.is_none() {
+            panel.page = front.data.page;
+        }
+        panel.crop = front.data.crop;
         if let Some((still_tag, image)) = front.data.still.take() {
-            if still_tag == tag {
+            if let Some(view) = card_still_view(tag, still_tag, front.data.still_page) {
                 let _: () = msg_send![
                     panel.image_view as *mut AnyObject,
                     setImage: image.0 as *mut AnyObject
                 ];
-                panel.still_tag = Some(still_tag);
+                panel.still_tag = Some(view);
+                panel.still_crop = front.data.still_crop;
             }
         }
     }
@@ -2099,6 +2246,22 @@ unsafe fn switch_front(
     let shape = panel.cards.front_mut().and_then(|front| front.data.shape);
     set_shape(panel, shape);
     changed
+}
+
+/// The view a card's saved still shows when the card `tag` comes forward:
+/// its own window's pixels only, framed as they were captured (`still_page`),
+/// whatever the card's framing is now (`sync_layers` then keeps it only if
+/// the two agree).
+fn card_still_view(tag: Tag, still_tag: Tag, still_page: bool) -> Option<View> {
+    (still_tag == tag).then_some((still_tag, still_page))
+}
+
+/// Whether a poll's answer must reach the live stream: the card changed
+/// shape (the stream is sized for it), or the page crop it is framed to
+/// changed, also when only its origin moved (the page moved in its window at
+/// the same size, e.g. docked DevTools switching sides).
+fn stream_follows(reshaped: bool, before: Option<Area>, after: Option<Area>) -> bool {
+    reshaped || before != after
 }
 
 /// Log the stack and put its size in the panel's window title, for checks.
@@ -2150,7 +2313,8 @@ unsafe fn raise_card(state: &mut State, id: i64, tag: Tag) {
     panel.action = status;
     announce_stack(panel, key);
     if live {
-        set_panel_target(panel, key, &worker, tag);
+        let page = panel.page;
+        set_panel_target(panel, key, &worker, tag, page);
     } else {
         // Ended: the poll (and any new session under this key) is not ours.
         panel.target = tag;
@@ -2184,12 +2348,19 @@ unsafe fn follow_agent(state: &mut State, id: i64, gone: impl Fn(&Tag) -> bool) 
     }
 }
 
-/// The only place the panel's displayed target changes: the visibility
-/// poll is pointed at the same target in the same step, so its answers are
-/// never rejected as being about another target.
-fn set_panel_target(panel: &mut Panel, key: &str, worker: &CaptureWorker, target: Target) {
+/// The only place the panel's displayed target (and its framing) changes:
+/// the visibility poll is pointed at the same target in the same step, so
+/// its answers are never rejected as being about another target.
+fn set_panel_target(
+    panel: &mut Panel,
+    key: &str,
+    worker: &CaptureWorker,
+    target: Target,
+    page: bool,
+) {
     panel.target = target;
-    worker.retarget(key, target);
+    panel.page = page;
+    worker.retarget(key, target, page);
 }
 
 unsafe extern "C" fn idle_check_cb(ctx: *mut c_void) {
@@ -2229,18 +2400,24 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
                 panel.cards.prune(now, &keep, is_gone);
             });
             let mut reshaped = false;
-            if panel.target == update.target {
-                // The window may have moved or changed size: the cursor maps
-                // into its new place and the card takes its new shape even
-                // when nothing else changed, without waiting for the overlay
-                // to render again.
+            let same = panel.target == update.target && panel.page == update.page;
+            if same {
+                let framed = wanted_crop(panel);
+                // The window may have moved or changed size, or its page
+                // moved inside it: the cursor maps into its new place and
+                // the card takes its new shape even when nothing else
+                // changed, without waiting for the overlay to render again.
                 panel.target_frame = update.target_frame;
+                if let (Some(crop), Some((window, _))) = (update.crop, update.target_frame) {
+                    note_crop(panel, window, crop, "poll");
+                }
                 place_sprite(panel);
                 reshaped = sync_shape(panel);
+                reshaped = stream_follows(reshaped, framed, wanted_crop(panel));
             }
             // An answer about an older target, or no change: nothing more
-            // (but a new shape resizes the stream).
-            if panel.target != update.target
+            // (but a new shape or crop reconfigures the stream).
+            if !same
                 || (panel.target_visible == update.visible
                     && panel.resolved_window == update.resolved_window)
             {
@@ -2307,7 +2484,8 @@ unsafe extern "C" fn live_event_cb(ctx: *mut c_void) {
                 }
                 panel.stream.frames.events += 1;
                 // Tags before `show_live`, which drops a mismatched frame.
-                let current = current_tag(panel.target, panel.resolved_window);
+                let current = current_tag(panel.target, panel.resolved_window)
+                    .map(|tag| (tag, panel.page));
                 let live = panel.stream.requested;
                 let outcome = match lock(&slot).take() {
                     Some(frame) => Some(show_live(panel, frame)),
@@ -2337,6 +2515,21 @@ unsafe extern "C" fn live_event_cb(ctx: *mut c_void) {
                 }
                 if panel.stream.frames.summary_due(Instant::now()) {
                     tracing::info!(target: "pip", session = %key, generation, shown = panel.shown, frames = ?panel.stream.frames, "PiP live frames on the panel");
+                }
+            }
+            Event::Reframed {
+                key,
+                generation,
+                crop,
+            } => {
+                let Some(panel) = state.panels.get_mut(&key) else {
+                    return;
+                };
+                // The stream's pixels are the new crop from here on: the
+                // cursor maps into it.
+                if panel.stream.reframed(generation, crop) {
+                    tracing::info!(target: "pip", session = %key, generation, crop = ?crop.map(|crop| (crop.x, crop.y, crop.w, crop.h)), "PiP stream crop shown");
+                    place_sprite(panel);
                 }
             }
             Event::Ended { key, generation } => {
@@ -2422,18 +2615,23 @@ unsafe fn refresh(state: &mut State, key: &str) {
         panel.slot = None;
         hide(panel, key);
     }
+    let crop = wanted_crop(panel);
     match live::stream_step(
         panel.shown,
         panel.target,
+        panel.page,
         panel.resolved_window,
         panel.stream.requested,
     ) {
         StreamStep::Start(target) => {
             *next_stream_generation += 1;
-            panel
-                .stream
-                .begin(target, *next_stream_generation, panel.stream_well);
-            tracing::info!(target: "pip", session = %key, generation = *next_stream_generation, ?target, "PiP stream requested");
+            panel.stream.begin(
+                (target, panel.page),
+                *next_stream_generation,
+                panel.stream_well,
+                crop,
+            );
+            tracing::info!(target: "pip", session = %key, generation = *next_stream_generation, ?target, page = panel.page, crop = ?crop.map(|crop| (crop.x, crop.y, crop.w, crop.h)), "PiP stream requested");
             // Never show one window's live pixels as another's preview.
             clear_live(panel);
             streams.request(
@@ -2442,6 +2640,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
                     generation: *next_stream_generation,
                     target,
                     well: panel.stream_well,
+                    crop,
                 },
             );
         }
@@ -2457,11 +2656,13 @@ unsafe fn refresh(state: &mut State, key: &str) {
             }
         }
         StreamStep::Keep => {
-            if panel.stream.needs_resize(panel.stream_well) {
+            if panel.stream.needs_resize(panel.stream_well, crop) {
+                tracing::info!(target: "pip", session = %key, generation = panel.stream.generation(), well = ?panel.stream_well, crop = ?crop.map(|crop| (crop.x, crop.y, crop.w, crop.h)), "PiP stream reconfiguration requested");
                 streams.request(
                     key,
                     Request::Resize {
                         well: panel.stream_well,
+                        crop,
                     },
                 );
             }
@@ -3036,7 +3237,7 @@ unsafe fn clear_live(panel: &mut Panel) {
 /// the panel's current resolved target, then show what `visible_layers` says.
 /// Call after any change to the target, the still, or the live frame.
 unsafe fn sync_layers(panel: &mut Panel) -> Layers {
-    let current = current_tag(panel.target, panel.resolved_window);
+    let current = current_tag(panel.target, panel.resolved_window).map(|tag| (tag, panel.page));
     if panel.live_tag.is_some() && panel.live_tag != current {
         drop_live(panel);
     }
@@ -3046,6 +3247,7 @@ unsafe fn sync_layers(panel: &mut Panel) -> Layers {
             setImage: std::ptr::null_mut::<AnyObject>()
         ];
         panel.still_tag = None;
+        panel.still_crop = None;
     }
     let layers = visible_layers(current, panel.still_tag, panel.live_tag);
     // The image view stays up (its tint is the well) unless live covers it.
@@ -3752,6 +3954,9 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         live_frame: None,
         live_tag: None,
         still_tag: None,
+        still_crop: None,
+        page: false,
+        crop: None,
         stream: live::StreamState::default(),
         resolved_window: None,
         placeholder: placeholder as usize,
@@ -5659,6 +5864,7 @@ mod tests {
             client_pid: None,
             target_pid: Some(42),
             target_window_id: Some(7),
+            page: false,
         }
     }
 
@@ -5702,10 +5908,10 @@ mod tests {
         let (started_tx, started) = mpsc::channel::<()>();
         let (release, release_rx) = mpsc::channel::<()>();
         let (started_tx, release_rx) = (Mutex::new(started_tx), Mutex::new(release_rx));
-        let capture: Arc<CaptureFn> = Arc::new(move |_| {
+        let capture: Arc<CaptureFn> = Arc::new(move |_, _| {
             let _ = lock(&started_tx).send(());
             let _ = lock(&release_rx).recv();
-            Some((7, vec![1]))
+            Some((7, vec![1], None))
         });
         let (worker, delivered) = worker(capture, Duration::from_secs(5));
 
@@ -5779,6 +5985,72 @@ mod tests {
     }
 
     #[test]
+    fn the_same_window_framed_the_other_way_shows_nothing_until_its_own_pixels_come() {
+        // A browser action framed window 5 to its page; a native action on
+        // the same window now wants the whole window (and back).
+        let (page, whole) = ((W5, true), (W5, false));
+        assert_eq!(visible_layers(Some(whole), Some(page), Some(page)), SHOW_NOTHING);
+        assert_eq!(visible_layers(Some(whole), Some(whole), Some(page)), SHOW_STILL);
+        assert_eq!(visible_layers(Some(page), Some(whole), Some(page)), SHOW_LIVE);
+    }
+
+    #[test]
+    fn a_page_that_moves_at_the_same_size_still_reconfigures_the_stream() {
+        let page = Area {
+            x: 0.0,
+            y: 87.0,
+            w: 800.0,
+            h: 413.0,
+        };
+        // DevTools docked on the left now: same size, the page moved right.
+        let moved = Area { x: 300.0, ..page };
+        assert!(stream_follows(false, Some(page), Some(moved)));
+        // Found, lost (whole window), or a new shape: all reach the stream.
+        assert!(stream_follows(false, None, Some(page)));
+        assert!(stream_follows(false, Some(page), None));
+        assert!(stream_follows(true, Some(page), Some(page)));
+        // Nothing changed: nothing to do.
+        assert!(!stream_follows(false, Some(page), Some(page)));
+        assert!(!stream_follows(false, None, None));
+    }
+
+    #[test]
+    fn a_back_cards_still_keeps_the_framing_it_was_captured_with() {
+        // Card W5's still was captured page-only; a native action then made
+        // the card whole-window, and its capture failed (no new still).
+        let still = card_still_view(W5, W5, true);
+        assert_eq!(still, Some((W5, true)));
+        // Raised, the card wants the whole window: the old page still is not
+        // shown as the whole window (nothing, until its own pixels come).
+        assert_eq!(visible_layers(Some((W5, false)), still, None), SHOW_NOTHING);
+        // Framed the way it was captured, it shows.
+        assert_eq!(visible_layers(Some((W5, true)), still, None), SHOW_STILL);
+        // Another window's still never comes forward with a card.
+        assert_eq!(card_still_view(W5, W6, true), None);
+    }
+
+    #[test]
+    fn a_frames_framing_reaches_its_capture_and_the_poll() {
+        let asked = Arc::new(Mutex::new(Vec::new()));
+        let seen = asked.clone();
+        let capture: Arc<CaptureFn> = Arc::new(move |target, page| {
+            lock(&seen).push((target, page));
+            Some((7, vec![1], None))
+        });
+        let (worker, delivered) = worker(capture, Duration::from_secs(5));
+        worker.push(PipFrame {
+            page: true,
+            ..frame("s", "browser click")
+        });
+        recv(&delivered);
+        assert_eq!(*lock(&asked), vec![((Some(42), Some(7)), true)]);
+        assert!(worker.active_targets(Instant::now())[0].2);
+        // A native action on the same window: the panel retargets unframed.
+        worker.retarget("s", (Some(42), Some(7)), false);
+        assert!(!worker.active_targets(Instant::now())[0].2);
+    }
+
+    #[test]
     fn an_unresolved_target_shows_nothing_old() {
         assert_eq!(visible_layers(None, Some(W5), Some(W5)), SHOW_NOTHING);
     }
@@ -5833,11 +6105,11 @@ mod tests {
         let (started_tx, release_rx) = (Mutex::new(started_tx), Mutex::new(release_rx));
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = calls.clone();
-        let capture: Arc<CaptureFn> = Arc::new(move |_| {
+        let capture: Arc<CaptureFn> = Arc::new(move |_, _| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = lock(&started_tx).send(());
             let _ = lock(&release_rx).recv();
-            Some((7, vec![1]))
+            Some((7, vec![1], None))
         });
         let (worker, delivered) = worker(capture, Duration::from_secs(5));
 
@@ -5850,16 +6122,16 @@ mod tests {
         assert!(pushing.elapsed() < Duration::from_secs(1));
 
         release.send(()).unwrap();
-        assert_eq!(recv(&delivered), ("first".to_owned(), Some((7, vec![1]))));
+        assert_eq!(recv(&delivered), ("first".to_owned(), Some((7, vec![1], None))));
         started.recv_timeout(Duration::from_secs(5)).unwrap();
         release.send(()).unwrap();
-        assert_eq!(recv(&delivered), ("third".to_owned(), Some((7, vec![1]))));
+        assert_eq!(recv(&delivered), ("third".to_owned(), Some((7, vec![1], None))));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]
     fn polling_follows_the_displayed_target_across_a_click_and_an_in_flight_capture() {
-        let (worker, _delivered) = worker(Arc::new(|_| None), Duration::from_secs(5));
+        let (worker, _delivered) = worker(Arc::new(|_, _| None), Duration::from_secs(5));
         let polled = |worker: &CaptureWorker| worker.active_targets(Instant::now())[0].1;
         let a = (Some(42), Some(7));
         let (b, c) = ((Some(42), Some(8)), (Some(43), Some(9)));
@@ -5867,7 +6139,7 @@ mod tests {
         worker.push(frame("s", "act in A"));
         assert_eq!(polled(&worker), a);
         // The user clicks back card B: the panel shows B, polls follow.
-        worker.retarget("s", b);
+        worker.retarget("s", b, false);
         assert_eq!(polled(&worker), b);
         // A new action's push does not move polling away from what the
         // panel shows while its capture runs.
@@ -5879,13 +6151,13 @@ mod tests {
         assert_eq!(polled(&worker), b);
         // A capture of A that was in flight lands: the panel shows A again
         // and polling moves with it in the same step.
-        worker.retarget("s", a);
+        worker.retarget("s", a, false);
         assert_eq!(polled(&worker), a);
     }
 
     #[test]
     fn polling_and_the_panel_share_one_activity_deadline() {
-        let (worker, _delivered) = worker(Arc::new(|_| Some((7, vec![1]))), Duration::from_secs(5));
+        let (worker, _delivered) = worker(Arc::new(|_, _| Some((7, vec![1], None))), Duration::from_secs(5));
         worker.push(frame("s", "act"));
         let pushed = Instant::now();
         // Delivered 5 s after the push (a slow capture).
@@ -5913,10 +6185,10 @@ mod tests {
         let stuck = Mutex::new(stuck);
         let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let counted = calls.clone();
-        let capture: Arc<CaptureFn> = Arc::new(move |_| {
+        let capture: Arc<CaptureFn> = Arc::new(move |_, _| {
             counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             let _ = lock(&stuck).recv(); // never answered
-            Some((7, vec![1]))
+            Some((7, vec![1], None))
         });
         let (worker, delivered) = worker(capture, Duration::from_millis(50));
 

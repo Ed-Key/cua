@@ -67,6 +67,21 @@ pub(super) fn sprite_frame(point: (f64, f64), well_h: f64, side: f64) -> Area {
     }
 }
 
+/// The screen area a picture of `window` (screen points) shows: the page
+/// `crop` of it (window points) when the picture is cut to its page, else
+/// the whole window.
+pub(super) fn shown_area(window: Area, crop: Option<Area>) -> Area {
+    match crop {
+        Some(crop) => Area {
+            x: window.x + crop.x,
+            y: window.y + crop.y,
+            w: crop.w,
+            h: crop.h,
+        },
+        None => window,
+    }
+}
+
 /// The window frame to map the cursor into, or `None` to hide the sprite:
 /// only when the window the cursor is working in (`cursor_window`, the
 /// window its last action targeted) is the window the panel displays
@@ -172,6 +187,33 @@ mod tests {
         );
         let empty = Area { w: 0.0, ..WINDOW };
         assert_eq!(cursor_in_well(empty, (100.0, 50.0), well), None);
+    }
+
+    #[test]
+    fn a_page_only_picture_maps_the_cursor_into_the_page_and_hides_it_over_the_toolbar() {
+        // The window's top 100 pt are tab strip and toolbar: the picture is
+        // the 800x500 page, which fills a 320x200 well exactly.
+        let crop = Area {
+            x: 0.0,
+            y: 100.0,
+            w: 800.0,
+            h: 500.0,
+        };
+        let page = shown_area(WINDOW, Some(crop));
+        assert_eq!(page, Area { y: 150.0, h: 500.0, ..WINDOW });
+        let well = (320.0, 200.0);
+        // The page's top-left corner is the well's.
+        assert_eq!(cursor_in_well(page, (100.0, 150.0), well), Some((0.0, 0.0)));
+        // Mid page lands mid well, at the page's own scale (2/5), not the window's.
+        assert_eq!(cursor_in_well(page, (500.0, 400.0), well), Some((160.0, 100.0)));
+        // Over the toolbar: outside the picture, so no sprite.
+        assert_eq!(cursor_in_well(page, (500.0, 120.0), well), None);
+        assert_eq!(sprite_placement(Some(page), Some((500.0, 120.0)), well, 48.0), None);
+        // The sprite shrinks with the page's scale (above the floor), not
+        // the window's.
+        assert_eq!(sprite_scale(page, (640.0, 400.0)), 0.8);
+        // Without a crop the picture is the whole window.
+        assert_eq!(shown_area(WINDOW, None), WINDOW);
     }
 
     #[test]

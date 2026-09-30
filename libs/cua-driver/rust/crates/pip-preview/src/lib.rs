@@ -270,6 +270,10 @@ pub struct PipFrame {
     pub client_pid: Option<i32>,
     pub target_pid: Option<i32>,
     pub target_window_id: Option<u32>,
+    /// The target window shows a bound browser tab: frame only its page
+    /// (not the tab strip, toolbar or infobars), when the backend can find
+    /// the page's area; the whole window otherwise.
+    pub page: bool,
 }
 
 /// One predicate of a `verify_state` call, for display.

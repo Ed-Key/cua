@@ -35,6 +35,9 @@ pub struct PipHookFrame {
     pub client_pid: Option<i32>,
     pub target_pid: Option<i32>,
     pub target_window_id: Option<u32>,
+    /// The target is the window of a bound browser tab the action showed in:
+    /// the PiP frames only the page, not the browser's own toolbars.
+    pub page: bool,
 }
 
 /// What the daemon knows about the MCP client behind one transport session.
@@ -517,6 +520,7 @@ mod tests {
 
     fn frame(label: Option<&str>, client: Option<&str>, pid: Option<i32>) -> PipHookFrame {
         PipHookFrame {
+            page: false,
             action_label: "click".into(),
             timestamp_ms: 0,
             session_key: "k".into(),

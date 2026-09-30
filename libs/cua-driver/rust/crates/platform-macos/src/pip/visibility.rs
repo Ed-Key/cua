@@ -104,7 +104,7 @@ pub(super) fn frame_of(windows: &[WindowInfo], window: Option<u32>) -> Option<(u
         .map(|found| (id, area(found)))
 }
 
-fn area(window: &WindowInfo) -> Area {
+pub(super) fn area(window: &WindowInfo) -> Area {
     Area {
         x: window.bounds.x,
         y: window.bounds.y,
