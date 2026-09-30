@@ -384,7 +384,7 @@ impl RefSpace {
                 .is_some_and(|held| Fingerprint::of(held) == Fingerprint::of(&entry))
             {
                 // Same entity: only what it allows now (actions, visibility) moves.
-                entry.minted = Some(index);
+                entry.minted = Some((self.id, index));
                 self.capabilities.insert(index, entry);
                 return format_ref(self.id, index);
             }
@@ -392,7 +392,7 @@ impl RefSpace {
         }
         let index = self.next_index;
         self.next_index += 1;
-        entry.minted = Some(index);
+        entry.minted = Some((self.id, index));
         self.by_node.insert(key, index);
         self.capabilities.insert(index, entry);
         format_ref(self.id, index)
@@ -477,15 +477,15 @@ impl TabRefs {
     /// Retire the ref a use just refused: its node reads as another element
     /// than `issued`, the capability the use resolved. It stays stale even if
     /// the node later reads as before, and the next diff reports its line
-    /// gone. Exactly that capability is retired (its space, by attachment,
-    /// and the index it was minted at): an observation that ran meanwhile may
+    /// gone. Exactly that capability is retired (the space and index it
+    /// was minted at): an observation that ran meanwhile may
     /// already have retired it and given the node a new ref, which must stay
     /// whatever it reads as.
     pub(crate) fn retire_refused(&mut self, issued: &RefEntry) {
         let Some(space) = self.space.as_mut() else {
             return;
         };
-        let Some(index) = issued.minted else {
+        let Some((_, index)) = issued.minted.filter(|(id, _)| *id == space.id) else {
             return;
         };
         if space.capabilities.get(&index).is_some_and(|held| {
@@ -1509,6 +1509,24 @@ mod tests {
         assert_ne!(newest, new);
         session.refs.retire_refused(&issued);
         assert!(session.resolves(&newest));
+    }
+
+    #[test]
+    fn a_refused_use_never_retires_a_ref_of_the_space_that_replaced_its_own() {
+        let mut session = Session::new(0);
+        let first = session.observe(identity("L1", 1), &[node(10, "button", "Reply")], None);
+        let (space, index) = crate::browser::store::parse_ref(&keys(&first)[0]).unwrap();
+        let issued = session.refs.resolve(space, index).unwrap().clone();
+        // The space is replaced on the same attachment (the document could
+        // not be proven the same), and the node gets the same index again.
+        session.refs.invalidate(FullReason::DocumentChanged);
+        let second = session.observe(identity("L1", 1), &[node(10, "button", "Delete")], None);
+        let new = keys(&second)[0].clone();
+        let (new_space, new_index) = crate::browser::store::parse_ref(&new).unwrap();
+        assert_ne!(new_space, space);
+        assert_eq!(new_index, index);
+        session.refs.retire_refused(&issued);
+        assert!(session.resolves(&new));
     }
 
     #[test]

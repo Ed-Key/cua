@@ -179,10 +179,10 @@ pub struct RefEntry {
     /// DOM refs.
     #[serde(skip_serializing)]
     pub attachment: Option<u64>,
-    /// The index a semantic ref was minted at in its space: which capability
+    /// The ref space and index a semantic ref was minted at: which capability
     /// this is, among those its node has had.
     #[serde(skip_serializing)]
-    pub minted: Option<u32>,
+    pub minted: Option<(u64, u32)>,
 }
 
 /// One `dom_refs_v1` snapshot.

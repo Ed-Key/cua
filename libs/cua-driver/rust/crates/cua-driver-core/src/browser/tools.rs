@@ -2423,10 +2423,12 @@ async fn await_edit_readback(
         };
         judged = judge_edit(before, &after, text, mode);
         if matches!(judged, Readback::Confirmed(_) | Readback::Detached) {
-            break;
+            return Some(judged);
         }
     }
-    Some(judged)
+    // A read that failed or did not match is no verdict once a dialog is up:
+    // the page was stopped partway through handling the input.
+    (!delivery.blocked()).then_some(judged)
 }
 
 const SHOWN_VALUE_CHARS: usize = 200;
