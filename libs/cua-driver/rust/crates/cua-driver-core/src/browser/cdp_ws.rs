@@ -475,6 +475,9 @@ pub fn endpoint_port_is_grant_owned(url: &str) -> bool {
 pub struct CdpPool {
     conns: Mutex<HashMap<String, PoolEntry>>,
     claimed_loopback_ports: StdMutex<HashSet<u16>>,
+    /// Releases requested while the pool lock was busy, from a thread that
+    /// cannot wait for it; the next pool operation applies them.
+    deferred_releases: StdMutex<Vec<(String, u64)>>,
 }
 
 impl CdpPool {
@@ -482,6 +485,7 @@ impl CdpPool {
         Self {
             conns: Mutex::new(HashMap::new()),
             claimed_loopback_ports: StdMutex::new(HashSet::new()),
+            deferred_releases: StdMutex::new(Vec::new()),
         }
     }
 
@@ -493,7 +497,7 @@ impl CdpPool {
                 "this DevTools endpoint is owned by a first-class existing-profile attachment"
             );
         }
-        let mut conns = self.conns.lock().await;
+        let mut conns = self.lock_conns().await;
         if let Some(existing) = conns.get(ws_url) {
             if existing.generation.is_some() {
                 anyhow::bail!("this DevTools endpoint is owned by an attachment generation");
@@ -528,7 +532,7 @@ impl CdpPool {
     ) -> anyhow::Result<Arc<CdpConnection>> {
         let port = loopback_port(ws_url)
             .ok_or_else(|| anyhow::anyhow!("existing-profile endpoint has no loopback port"))?;
-        let mut conns = self.conns.lock().await;
+        let mut conns = self.lock_conns().await;
         let (conn, mut holders) = match conns.get(ws_url) {
             Some(entry) if !entry.conn.is_closed() => (entry.conn.clone(), entry.holders.clone()),
             Some(_) => anyhow::bail!("the approved browser socket closed before it was claimed"),
@@ -561,7 +565,7 @@ impl CdpPool {
         ws_url: &str,
         generation: u64,
     ) -> anyhow::Result<Arc<CdpConnection>> {
-        let conns = self.conns.lock().await;
+        let conns = self.lock_conns().await;
         let entry = conns
             .get(ws_url)
             .ok_or_else(|| anyhow::anyhow!("the grant-owned browser socket is missing"))?;
@@ -599,7 +603,7 @@ impl CdpPool {
     ) -> Result<anyhow::Result<Arc<CdpConnection>>, E> {
         let new_generation;
         {
-            let mut conns = self.conns.lock().await;
+            let mut conns = self.lock_conns().await;
             new_generation = advance()?;
             let Some(entry) = conns.get_mut(ws_url) else {
                 return Ok(Err(anyhow::anyhow!(
@@ -630,7 +634,7 @@ impl CdpPool {
         // able to remove the claim when consent is refused.
         let conn = Arc::new(CdpConnection::connect(ws_url).await?);
         conn.restrict_to_existing_profile();
-        let mut conns = self.conns.lock().await;
+        let mut conns = self.lock_conns().await;
         let Some(entry) = conns
             .get_mut(ws_url)
             .filter(|e| e.holders.contains(&generation))
@@ -647,7 +651,7 @@ impl CdpPool {
     /// redials. Grant-owned sockets leave the pool only through their
     /// holders' releases, never through the legacy route's eviction.
     pub async fn evict(&self, ws_url: &str) {
-        let mut conns = self.conns.lock().await;
+        let mut conns = self.lock_conns().await;
         if conns.get(ws_url).is_some_and(|entry| entry.generation.is_none()) {
             conns.remove(ws_url);
         }
@@ -665,15 +669,39 @@ impl CdpPool {
     /// (and the listener claim marker is released) only when no other live
     /// generation shares it.
     pub async fn release_existing(&self, ws_url: &str, generation: u64) {
-        let mut conns = self.conns.lock().await;
+        let mut conns = self.lock_conns().await;
         self.release_locked(&mut conns, ws_url, generation);
     }
 
     /// [`Self::release_existing`] for a thread with no async runtime (an
-    /// SDK's idle-session sweeper). It waits for the pool lock by blocking.
-    pub fn release_existing_blocking(&self, ws_url: &str, generation: u64) {
-        let mut conns = self.conns.blocking_lock();
-        self.release_locked(&mut conns, ws_url, generation);
+    /// SDK's idle-session sweeper). It never waits: the lock holder may need
+    /// this very thread to run, so a busy pool defers the release to its
+    /// next operation instead.
+    pub fn release_existing_now_or_later(&self, ws_url: &str, generation: u64) {
+        match self.conns.try_lock() {
+            Ok(mut conns) => {
+                self.apply_deferred_releases(&mut conns);
+                self.release_locked(&mut conns, ws_url, generation);
+            }
+            Err(_) => self
+                .deferred_releases
+                .lock()
+                .unwrap()
+                .push((ws_url.to_owned(), generation)),
+        }
+    }
+
+    async fn lock_conns(&self) -> tokio::sync::MutexGuard<'_, HashMap<String, PoolEntry>> {
+        let mut conns = self.conns.lock().await;
+        self.apply_deferred_releases(&mut conns);
+        conns
+    }
+
+    fn apply_deferred_releases(&self, conns: &mut HashMap<String, PoolEntry>) {
+        let deferred = std::mem::take(&mut *self.deferred_releases.lock().unwrap());
+        for (ws_url, generation) in deferred {
+            self.release_locked(conns, &ws_url, generation);
+        }
     }
 
     fn release_locked(
@@ -1077,6 +1105,22 @@ mod tests {
         assert!(error.to_string().contains("released"), "{error}");
         let Err(error) = pool.get_existing(&url, 1).await else {
             panic!("the refused claim left a socket")
+        };
+        assert!(error.to_string().contains("missing"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_release_on_a_busy_pool_applies_at_its_next_operation() {
+        let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
+        let url = server.ws_url();
+        let pool = CdpPool::new();
+        pool.claim_existing(&url, 1, || true).await.unwrap();
+        {
+            let _busy = pool.conns.lock().await;
+            pool.release_existing_now_or_later(&url, 1);
+        }
+        let Err(error) = pool.get_existing(&url, 1).await else {
+            panic!("the deferred release was never applied")
         };
         assert!(error.to_string().contains("missing"), "{error}");
     }

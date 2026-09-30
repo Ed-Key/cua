@@ -724,12 +724,13 @@ impl BrowserEngine {
                         requests
                     };
                     // An SDK's idle sweeper ends sessions from a plain thread.
-                    // The claim is released there directly; the relay's own
-                    // idle backstop detaches the session's tabs.
+                    // The claim is released there without waiting (or at the
+                    // pool's next operation); the relay's own idle backstop
+                    // detaches the session's tabs.
                     for grant in off_runtime {
                         engine
                             .pool
-                            .release_existing_blocking(&grant.endpoint_ws_url, grant.generation);
+                            .release_existing_now_or_later(&grant.endpoint_ws_url, grant.generation);
                     }
 
                     let mut failed = Vec::new();
