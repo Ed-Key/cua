@@ -106,12 +106,64 @@ pub fn pip_enabled() -> bool {
     PIP_PUSH_FN.get().is_some()
 }
 
+// ── Bound browser tabs ────────────────────────────────────────────────────
+//
+// A browser tool names its tab by `target_id` and `tab_id`, not by pid and
+// window. The macOS window that tab lives in is known to its binding, and
+// whether the tab is the one showing in that window is known only by asking
+// the page. Both happen inside the tool, so the browser engine leaves the
+// answer here for the dispatcher that is running the tool on this task.
+
+tokio::task_local! {
+    static BOUND_WINDOW: std::cell::Cell<Option<(i32, u32)>>;
+}
+
+/// Run one tool dispatch. With its output: the macOS (pid, window) of the
+/// bound browser tab it acted on, if the engine noted one.
+pub async fn with_bound_window<T>(
+    dispatch: impl std::future::Future<Output = T>,
+) -> (T, Option<(i32, u32)>) {
+    BOUND_WINDOW
+        .scope(std::cell::Cell::new(None), async {
+            let output = dispatch.await;
+            (output, BOUND_WINDOW.with(std::cell::Cell::get))
+        })
+        .await
+}
+
+/// True inside a dispatch that would use a bound window: the engine skips
+/// its page probe otherwise.
+pub fn wants_bound_window() -> bool {
+    pip_enabled() && BOUND_WINDOW.try_with(|_| ()).is_ok()
+}
+
+/// The window a bound tab's action is shown in: its binding's macOS pid and
+/// window, and only while the tab is the one `showing` in that window. A
+/// background tab (or one whose state could not be read) has no picture:
+/// its window shows another tab.
+pub fn bound_tab_window(pid: i64, window_id: u64, showing: bool) -> Option<(i32, u32)> {
+    if !showing {
+        return None;
+    }
+    Some((i32::try_from(pid).ok()?, u32::try_from(window_id).ok()?))
+}
+
+/// Leave `window` for the dispatcher running on this task. No-op outside
+/// `with_bound_window`.
+pub fn note_bound_window(window: Option<(i32, u32)>) {
+    let _ = BOUND_WINDOW.try_with(|slot| slot.set(window));
+}
+
 /// Lifecycle, configuration, recording and other non-GUI tools never
-/// update a panel, even when they happen to carry a pid.
+/// update a panel, even when they happen to carry a pid. Nor does
+/// `browser_tabs`: its `window_id` is Chrome's own window number, not a
+/// macOS window, and its pid alone says nothing about which window a tab is
+/// in. The bound-tab actions that follow show the run.
 fn pip_meta_tool(tool_name: &str) -> bool {
     matches!(
         tool_name,
         "start_session"
+            | "browser_tabs"
             | "end_session"
             | "escalate_session"
             | "set_config"
@@ -513,6 +565,51 @@ mod tests {
             "type_text",
             &frame(Some("alpha"), None, Some(1))
         ));
+    }
+
+    #[test]
+    fn row_b4_browser_tabs_never_gets_a_frame() {
+        // With Chrome's pid and its own window number, or the pid alone.
+        let mut numbered = frame(Some("alpha"), None, Some(1));
+        numbered.target_window_id = Some(446_425_629);
+        assert!(!pip_frame_wanted("browser_tabs", &numbered));
+        assert!(!pip_frame_wanted(
+            "browser_tabs",
+            &frame(Some("alpha"), None, Some(1))
+        ));
+    }
+
+    #[test]
+    fn row_b1_b3_a_bound_tab_is_shown_in_its_window_only_while_it_is_showing() {
+        // B1: the binding's macOS pid and window.
+        assert_eq!(bound_tab_window(42, 7, true), Some((42, 7)));
+        // B3: a background tab, or one whose state could not be read.
+        assert_eq!(bound_tab_window(42, 7, false), None);
+        // Ids that are no macOS pid or window.
+        assert_eq!(bound_tab_window(i64::MAX, 7, true), None);
+        assert_eq!(bound_tab_window(42, u64::MAX, true), None);
+    }
+
+    #[tokio::test]
+    async fn a_bound_window_reaches_only_the_dispatch_that_noted_it() {
+        // Noted inside a dispatch: returned with its output.
+        let (output, window) = with_bound_window(async {
+            note_bound_window(Some((42, 7)));
+            "done"
+        })
+        .await;
+        assert_eq!((output, window), ("done", Some((42, 7))));
+        // A nested dispatch (a browser_steps step) keeps its own.
+        let (inner, outer) = with_bound_window(async {
+            with_bound_window(async { note_bound_window(Some((42, 7))) })
+                .await
+                .1
+        })
+        .await;
+        assert_eq!((inner, outer), (Some((42, 7)), None));
+        // Outside a dispatch: nothing to note into, and no panic.
+        note_bound_window(Some((42, 7)));
+        assert!(!wants_bound_window());
     }
 
     fn predicate(json: serde_json::Value) -> cua_driver_contract::StatePredicate {

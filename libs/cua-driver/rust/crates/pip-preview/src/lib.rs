@@ -302,9 +302,13 @@ pub struct PipVerification {
 /// Why a session's panel goes away.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipSessionEnd {
-    /// `end_session`, or the session's control connection closed: the
-    /// session is done, and its panel may say so.
+    /// `end_session`: the agent said the session is done, and its panel may
+    /// say so.
     Finished,
+    /// The session's control connection closed (or its host ended it):
+    /// nobody said the work is done. The panel says so only while the work
+    /// is fresh; a session that went quiet a while ago closes quietly.
+    Disconnected,
     /// The idle sweep reclaimed the session, and its connection may revive
     /// it: not a finish. The panel closes without any finished mark.
     Expired,

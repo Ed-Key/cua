@@ -1650,11 +1650,14 @@ impl ToolRegistry {
         // Desktop pixels read off a capped get_desktop_state image are mapped
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
-        let mut result = crate::recording::scope_dispatch_click_capture(
-            pending_turn.as_ref(),
-            tool.invoke(args.clone()),
-        )
-        .await;
+        // A bound browser tab's action leaves the macOS window it showed in
+        // for the PiP frame below (see `pip_hook::with_bound_window`).
+        let (mut result, bound_window) =
+            pip_hook::with_bound_window(crate::recording::scope_dispatch_click_capture(
+                pending_turn.as_ref(),
+                tool.invoke(args.clone()),
+            ))
+            .await;
         match resolved_name {
             "get_desktop_state" if result.is_error != Some(true) => {
                 crate::desktop_capture_scale::record_desktop_state(
@@ -1681,7 +1684,13 @@ impl ToolRegistry {
         // raced this call (and its hooks, which drop the session's panel)
         // synchronously, so these events must already be queued ahead of it.
         if pip_hook::pip_enabled() && should_record && !private_consent_turn {
-            let frame = pip_frame(resolved_name, &args, &public_args, &runtime_prefix);
+            let frame = pip_frame(
+                resolved_name,
+                &args,
+                &public_args,
+                &runtime_prefix,
+                bound_window,
+            );
             if pip_hook::pip_frame_wanted(resolved_name, &frame) {
                 pip_hook::push_pip_frame(frame);
             }
@@ -1690,7 +1699,7 @@ impl ToolRegistry {
             && resolved_name == "verify_state"
             && result.is_error != Some(true)
         {
-            let frame = pip_frame(resolved_name, &args, &public_args, &runtime_prefix);
+            let frame = pip_frame(resolved_name, &args, &public_args, &runtime_prefix, None);
             if let Some(event) = pip_hook::verification_event(
                 frame,
                 start_ms,
@@ -5506,12 +5515,17 @@ impl Default for ToolRegistry {
 /// has room without truncation at default geometry.
 /// Build a PiP frame from what the dispatcher already holds: the private
 /// session key and public label the runtime namespacing produced, the client
-/// identity recorded for the transport session, and the action target.
+/// identity recorded for the transport session, and the action target: the
+/// call's `pid` and `window_id`, or for an action on a bound browser tab
+/// (which names neither) the macOS window the engine noted for it
+/// (`bound_window`; `None` when the tab is not the one showing there, which
+/// leaves the frame untargeted).
 fn pip_frame(
     tool_name: &str,
     args: &Value,
     public_args: &Value,
     runtime_prefix: &str,
+    bound_window: Option<(i32, u32)>,
 ) -> pip_hook::PipHookFrame {
     let str_arg = |key: &str| {
         args.get(key)
@@ -5530,10 +5544,13 @@ fn pip_frame(
         session_label: str_arg("_public_session_label").map(str::to_owned),
         client_name: client.name,
         client_pid: client.pid,
-        target_pid: args.opt_i64("pid").and_then(|pid| i32::try_from(pid).ok()),
-        target_window_id: args
-            .opt_u64("window_id")
-            .and_then(|window_id| u32::try_from(window_id).ok()),
+        target_pid: bound_window
+            .map(|(pid, _)| pid)
+            .or_else(|| args.opt_i64("pid").and_then(|pid| i32::try_from(pid).ok())),
+        target_window_id: bound_window.map(|(_, window)| window).or_else(|| {
+            args.opt_u64("window_id")
+                .and_then(|window_id| u32::try_from(window_id).ok())
+        }),
     }
 }
 
@@ -5600,7 +5617,7 @@ mod capability_tests {
             "_transport_session_id": format!("{prefix}proxy-1"),
         });
         let public = serde_json::json!({"pid": 42, "window_id": 7, "element_index": 3});
-        let frame = pip_frame("click", &args, &public, prefix);
+        let frame = pip_frame("click", &args, &public, prefix, None);
         assert_eq!(frame.session_key, format!("{prefix}research"));
         assert_eq!(frame.session_label.as_deref(), Some("research"));
         assert_eq!(frame.target_pid, Some(42));
@@ -5608,9 +5625,50 @@ mod capability_tests {
         assert_eq!(frame.action_label, "click: element_index=3");
 
         // No session at all (one-shot CLI) shares the classic default panel.
-        let bare = pip_frame("click", &serde_json::json!({}), &public, prefix);
+        let bare = pip_frame("click", &serde_json::json!({}), &public, prefix, None);
         assert_eq!(bare.session_key, "default");
         assert!(bare.session_label.is_none() && bare.target_pid.is_none());
+    }
+
+    #[test]
+    fn row_b1_b3_b4_a_browser_frame_targets_the_bound_tabs_macos_window() {
+        let prefix = "__cua_runtime_0123456789abcdef0123456789abcdef:";
+        // A bound-tab action names its tab, not a pid or a window.
+        let args = serde_json::json!({
+            "target_id": "t1",
+            "tab_id": "tab-1",
+            "ref": "p1:3",
+            "_session_id": format!("{prefix}research"),
+            "_public_session_label": "research",
+        });
+        // B1: the tab is showing in its window; the engine noted that window.
+        for tool in [
+            "browser_click",
+            "browser_type",
+            "browser_navigate",
+            "browser_pointer",
+            "browser_set_input_files",
+            "browser_dialog",
+        ] {
+            let frame = pip_frame(tool, &args, &args, prefix, Some((42, 7)));
+            assert_eq!((frame.target_pid, frame.target_window_id), (Some(42), Some(7)));
+            assert!(pip_hook::pip_frame_wanted(tool, &frame), "{tool}");
+        }
+        // B3: a background tab (nothing noted) has no target, so no frame.
+        let frame = pip_frame("browser_click", &args, &args, prefix, None);
+        assert_eq!((frame.target_pid, frame.target_window_id), (None, None));
+        assert!(!pip_hook::pip_frame_wanted("browser_click", &frame));
+        // B4: browser_tabs carries Chrome's pid and Chrome's own window
+        // number, and never gets a frame.
+        let tabs = serde_json::json!({
+            "action": "open",
+            "pid": 42,
+            "window_id": 446425629,
+            "_session_id": format!("{prefix}research"),
+            "_public_session_label": "research",
+        });
+        let frame = pip_frame("browser_tabs", &tabs, &tabs, prefix, None);
+        assert!(!pip_hook::pip_frame_wanted("browser_tabs", &frame));
     }
 
     #[test]
@@ -5618,7 +5676,7 @@ mod capability_tests {
         let prefix = "__cua_runtime_0123456789abcdef0123456789abcdef:";
         let args = serde_json::json!({"pid": 42, "window_id": 7});
         let before = crate::recording::screenshot_calls_on_this_thread();
-        pip_hook::push_pip_frame(pip_frame("click", &args, &args, prefix));
+        pip_hook::push_pip_frame(pip_frame("click", &args, &args, prefix, None));
         assert_eq!(crate::recording::screenshot_calls_on_this_thread(), before);
     }
 

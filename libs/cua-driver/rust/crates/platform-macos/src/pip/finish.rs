@@ -11,6 +11,13 @@
 //! that action) was not satisfied. Finished back windows collapse to chips;
 //! a finished front window shows a check badge on its card.
 //!
+//! A session ends when the agent says so (`end_session`). Its control
+//! connection closing is not the agent saying so: a client that forks a
+//! chat or stops a session process closes connections for work that ended
+//! a while ago. So a closed connection counts as the session's end only
+//! while the work is fresh (see the table); otherwise the panel closes
+//! quietly.
+//!
 //! The finale plays on proof and at session end. Proof is a satisfied claim
 //! newer than the session's last action: its finale plays once the session
 //! has been quiet for 8 s since the later of that action and the proof's
@@ -32,12 +39,13 @@
 //!
 //! | Event | Verdicts (per window) | Claims (per label) | Lifecycle: finale, idle deadline, user close | Picture and stack |
 //! |---|---|---|---|---|
-//! | Action note (on push) | records the action at its event ms (the session's last action is the newest of them), and the window it touched (identity and app, titled with the app name until a frame names it); ends a session finish older than it | none are dropped, but a claim older than the session's last action is no longer proof: it waits for a later finale | only if newer than the last applied action: cancels the finale (one playing, or a proof finale still waiting for its quiet period), restarts the idle deadline, lifts a user close | none |
-//! | Captured frame | resolves a pid-only action to its window at the action's event ms (replacing that action's app-only chip) and names the touched window (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card (and its shape, from the window's size), back items, window titles |
+//! | Action note (on push; a frame that names a window its pid does not own is dropped before its note: no event at all) | records the action at its event ms (the session's last action is the newest of them), and the window it touched (identity and app, titled with the app name until a frame names it); ends a session finish older than it | none are dropped, but a claim older than the session's last action is no longer proof: it waits for a later finale | only if newer than the last applied action: cancels the finale (one playing, or a proof finale still waiting for its quiet period), restarts the idle deadline, lifts a user close | none |
+//! | Captured frame (a session's panel is created only by a frame whose capture succeeded; a frame with no picture for a session with no panel is dropped, and its action note waits for the panel a later frame creates) | resolves a pid-only action to its window at the action's event ms (replacing that action's app-only chip) and names the touched window (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card (and its shape, from the window's size), back items, window titles |
 //! | Verification | latest by event ms per window (an older one never wins; a repeat with the same event time and status is not news) | latest by event ms per predicate (its identity on its window, not its display label, which may collide: two predicates with one label are two rows), kept across finales; an older one is ignored, and so is a repeat with the same event time and status | if it brought news: replays a playing finale. Proof (a satisfied claim newer than the session's last action) starts the proof timer; unsatisfied or unknown news starts nothing by itself. Before the session's first capture the panel does not exist yet: the evidence is kept for it, and its proof timer starts with the panel | chips and cards follow the verdicts; the front card shows its check badge while its window is finished; a shown panel stays up while proof waits for its finale, and fades as soon as news calls that proof off |
 //! | Idle timer (8 s after the last action) | none: idle is not done | none | none: no finale | the panel fades (a quiet hide), unless proof is waiting for its finale |
 //! | Proof timer (8 s after the later of the session's last action and the proof's arrival, with no newer action) | none | the waiting proof is settled: it never comes due again by itself, played or not (its claims stay unshown until a finale displays them) | if a satisfied claim newer than the last action is still unshown and unsettled, the checklist plays (every unshown claim, latest status per predicate: a claim that flipped to unsatisfied shows as that): on the panel if it is up, and a quietly hidden panel is shown for it, unless the user closed the panel or the target window is fully visible (then nothing plays) | the panel fades after |
-//! | `end_session`, or the session's control connection closing | the session finishes (now), always, whatever a finale is doing: each window it touched counts as finished unless its latest verification since its last action was not satisfied | none | a finale already playing keeps playing; otherwise one plays if anything is unshown (the checklist with claims, else the chips row) and the panel is up or may come up for it (not closed by the user, target window not fully visible); then the panel closes | back cards collapse to chips; the panel leaves the live set |
+//! | `end_session` | the session finishes (now), always, whatever a finale is doing: each window it touched counts as finished unless its latest verification since its last action was not satisfied | none | a finale already playing keeps playing; otherwise one plays if anything is unshown (the checklist with claims, else the chips row) and the panel is up or may come up for it (not closed by the user, target window not fully visible); then the panel closes | back cards collapse to chips; the panel leaves the live set |
+//! | The session's control connection closing (or its host ending it) | only while the work is fresh, by event time: the session's last action is at most 8 s older than the close, or a finale is playing, or proof is waiting for its finale. Then as `end_session`. Otherwise none: not a finish | none | fresh: as `end_session`. Otherwise none: no finale plays and nothing is marked shown | fresh: as `end_session`. Otherwise the panel closes quietly and leaves the live set |
 //! | Idle-TTL eviction (the core reclaimed the session after 300 s idle; its connection may revive it) | none: not a finish | none | none: no finale plays, one playing is cut | the panel closes quietly and leaves the live set; a revived session starts a new panel on its next frame |
 //! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim by predicate, and each touched window a chip or checklist stood for by its action: app and event time, so it holds when the window resolves meanwhile); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades |
 //! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not proof) shows the panel or plays a finale | the panel hides (an ending one closes) |
@@ -47,7 +55,7 @@
 //! | Overview close (Esc, a click outside the sheet, the shortcut or the menu bar item again) | none | none | none | none: only the overview goes away |
 //! | Overview focus click (a thumbnail, or Return on the selected one) | none | none | none: the window comes forward through the same path as the panel's Focus button (`bring_to_front`) | none: the overview closes first |
 //! | Session acting while the overview is open | as the action note and captured frame rows | as those rows | as those rows | as those rows; the overview follows the stack on its next poll (a new front card, a new title) |
-//! | Session verifying, ending or being evicted while the overview is open | as the verification, `end_session` and idle-TTL eviction rows | as those rows | as those rows | as those rows; the overview badges a window a verification finished on its next poll, drops an ended or evicted session's group, and shows its empty line when no live session is left |
+//! | Session verifying, ending or being evicted while the overview is open | as the verification, `end_session`, connection closing and idle-TTL eviction rows | as those rows | as those rows | as those rows; the overview badges a window a verification finished on its next poll, drops an ended or evicted session's group, and shows its empty line when no live session is left |
 //! | A window closing while the overview is open | as the captured frame row (the stack prunes it) | none | none | as that row; the overview drops the thumbnail on its next poll whether or not the stack still holds it (a kept front card, an idle session's window), since each poll checks every thumbnail's window against WindowServer's full list; a session left with no window keeps its row with a "No open windows" line; a focus click on a window closed since the poll is a logged no-op and the sheet stays up |
 //! | Panel hidden or closed by the user while the overview is open | none | none | as the user close row | as that row; the overview keeps the session's group (a hidden panel is still a live session) |
 //!
@@ -812,11 +820,25 @@ pub(super) enum Ending {
     Close,
 }
 
-/// The session's panel is going away at `at_ms` (the `end_session` and
-/// idle-TTL eviction rows). An expired session is not finished: nothing is
-/// marked and no finale plays. A finished one is done whatever its finale
-/// is doing; then a playing finale keeps playing, or one starts if anything
-/// is unshown and the panel `may_show` it and the user has not closed it.
+/// Whether a session whose connection closed at `at_ms` finishes like one
+/// that was ended (the connection closing row): only while its work is
+/// fresh. By event time: its last action is at most `IDLE_HIDE_AFTER` older
+/// than the close, or a finale is playing, or proof is waiting for its
+/// finale. A session that never acted and proved nothing is not fresh.
+fn disconnect_finishes(verdicts: &Verdicts, lifecycle: &Lifecycle, at_ms: u64) -> bool {
+    let quiet_ms = at_ms.saturating_sub(verdicts.last_action_ms);
+    lifecycle.playing()
+        || verdicts.proof_waiting()
+        || (verdicts.last_action_ms > 0 && quiet_ms <= IDLE_HIDE_AFTER.as_millis() as u64)
+}
+
+/// The session's panel is going away at `at_ms` (the `end_session`,
+/// connection closing and idle-TTL eviction rows). An expired session is
+/// not finished, and neither is one whose connection closed after its work
+/// went stale (`disconnect_finishes`): nothing is marked and no finale
+/// plays. A finished one is done whatever its finale is doing; then a
+/// playing finale keeps playing, or one starts if anything is unshown and
+/// the panel `may_show` it and the user has not closed it.
 pub(super) fn end_session(
     verdicts: &mut Verdicts,
     lifecycle: &mut Lifecycle,
@@ -824,7 +846,12 @@ pub(super) fn end_session(
     at_ms: u64,
     may_show: bool,
 ) -> Ending {
-    if end == PipSessionEnd::Expired {
+    let finishes = match end {
+        PipSessionEnd::Finished => true,
+        PipSessionEnd::Disconnected => disconnect_finishes(verdicts, lifecycle, at_ms),
+        PipSessionEnd::Expired => false,
+    };
+    if !finishes {
         return Ending::Close;
     }
     verdicts.finish_session(at_ms);
@@ -1476,6 +1503,94 @@ mod tests {
             panic!("the new work's chips");
         };
         assert_eq!(finale.log_rows(), ["finished: Mail"]);
+    }
+
+    // ── Row: connection closing ──────────────────────────────────────────
+
+    const DISCONNECTED: PipSessionEnd = PipSessionEnd::Disconnected;
+    const IDLE_MS: u64 = IDLE_HIDE_AFTER.as_millis() as u64;
+
+    /// A session that acted in A (at 1000) and proved nothing.
+    fn acted() -> (Verdicts, Lifecycle) {
+        let (mut verdicts, mut life) = (Verdicts::default(), Lifecycle::default());
+        life.resume(1_000);
+        verdicts.note_action(A, 1_000, "Notes");
+        (verdicts, life)
+    }
+
+    #[test]
+    fn row_connection_close_within_the_idle_window_finishes_like_end_session() {
+        // C1: the connection closes at the edge of the idle window.
+        let (mut verdicts, mut life) = acted();
+        let at = 1_000 + IDLE_MS;
+        let Ending::Play(finale, _) = end_session(&mut verdicts, &mut life, DISCONNECTED, at, true)
+        else {
+            panic!("the chips row");
+        };
+        assert_eq!(finale.log_rows(), ["finished: Notes"]);
+        assert!(life.playing() && verdicts.finished(10));
+        // The other gates hold as for `end_session`: a panel that may not
+        // show, or one the user closed, plays nothing.
+        let (mut verdicts, mut life) = acted();
+        let hidden = may_show(false, true);
+        assert_eq!(end_session(&mut verdicts, &mut life, DISCONNECTED, at, hidden), Ending::Close);
+        let (mut verdicts, mut life) = acted();
+        life.close();
+        assert_eq!(end_session(&mut verdicts, &mut life, DISCONNECTED, at, true), Ending::Close);
+    }
+
+    #[test]
+    fn row_connection_close_after_the_idle_window_closes_quietly() {
+        // C2: the work ended a while ago; a panel that may come back for a
+        // finale does not.
+        let (mut verdicts, mut life) = acted();
+        let at = 1_000 + IDLE_MS + 1;
+        assert_eq!(end_session(&mut verdicts, &mut life, DISCONNECTED, at, true), Ending::Close);
+        assert!(!life.playing(), "no finale");
+        assert!(!verdicts.finished(10), "not a finish: nothing is marked");
+        assert_eq!(verdicts.finale().len(), 1, "and nothing is marked shown");
+        // C3: a session that never acted has no work to be fresh.
+        let (mut verdicts, mut life) = (Verdicts::default(), Lifecycle::default());
+        assert_eq!(end_session(&mut verdicts, &mut life, DISCONNECTED, 5, true), Ending::Close);
+        assert!(verdicts.session_done.is_none());
+        // C4: `end_session` at the same late moment is the agent saying it
+        // is done, and plays.
+        let (mut verdicts, mut life) = acted();
+        assert!(matches!(
+            end_session(&mut verdicts, &mut life, FINISHED, at, true),
+            Ending::Play(..)
+        ));
+    }
+
+    #[test]
+    fn row_connection_close_with_a_finale_playing_lets_it_play_out() {
+        // The proof finale started; the connection closes long after the
+        // last action while it is still up.
+        let (mut verdicts, mut life) = proved();
+        let (_, generation) = quiet(&mut verdicts, &mut life).unwrap();
+        let at = 100 + 10 * IDLE_MS;
+        assert_eq!(end_session(&mut verdicts, &mut life, DISCONNECTED, at, true), Ending::Playing);
+        assert!(verdicts.finished(10), "done, as for `end_session`");
+        assert!(life.end(generation));
+    }
+
+    #[test]
+    fn row_connection_close_with_proof_waiting_plays_its_checklist() {
+        // Proved (at 200) and not yet played; the last action (at 100) is
+        // long ago by the time the connection closes.
+        let (mut verdicts, mut life) = proved();
+        let at = 100 + 10 * IDLE_MS;
+        let Ending::Play(finale, _) = end_session(&mut verdicts, &mut life, DISCONNECTED, at, true)
+        else {
+            panic!("the waiting proof's checklist");
+        };
+        assert_eq!(finale.log_rows(), ["satisfied: saved"]);
+        // Once the proof timer settled it (played or not), it no longer
+        // waits: the close is quiet.
+        let (mut verdicts, mut life) = proved();
+        assert_eq!(proof_finale(&mut verdicts, &mut life, true, false), None);
+        assert_eq!(end_session(&mut verdicts, &mut life, DISCONNECTED, at, true), Ending::Close);
+        assert!(!life.playing());
     }
 
     // ── Row: idle-TTL eviction ───────────────────────────────────────────

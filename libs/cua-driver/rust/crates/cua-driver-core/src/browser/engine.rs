@@ -1909,24 +1909,15 @@ impl BrowserEngine {
         Ok((validated, live_origin))
     }
 
-    /// Animate platform-owned browser feedback without coupling it to input
-    /// delivery. Only main-frame viewport points are mapped: child-frame CDP
-    /// coordinates are not necessarily in the top-level viewport space, and a
-    /// misleading cursor is worse than no cursor.
-    pub(crate) async fn visualize_browser_action(
-        &self,
-        session: &str,
-        validated: &ValidatedTab,
-        cdp_session: &str,
-        viewport_x: f64,
-        viewport_y: f64,
-        kind: BrowserVisualActionKind,
-    ) {
-        // `document.visibilityState` distinguishes the selected tab without
-        // focusing its native window or invoking any CDP activation command.
-        // Treat an unavailable or malformed proof as inactive: omitting
-        // feedback is safer than drawing a cursor over another tab.
-        let tab_is_active = validated
+    /// Whether the tab is the one showing in its window right now.
+    ///
+    /// `document.visibilityState` distinguishes the selected tab without
+    /// focusing its native window or invoking any CDP activation command.
+    /// Treat an unavailable or malformed proof as inactive: omitting
+    /// feedback is safer than drawing a cursor, or showing a picture, over
+    /// another tab.
+    async fn tab_showing(&self, validated: &ValidatedTab) -> bool {
+        validated
             .conn
             .call(
                 Some(&validated.cdp_session),
@@ -1940,7 +1931,49 @@ impl BrowserEngine {
             .await
             .ok()
             .and_then(|result| result.pointer("/result/value").and_then(Value::as_bool))
-            .unwrap_or(false);
+            .unwrap_or(false)
+    }
+
+    /// Tell the PiP which macOS window this bound-tab action shows in: the
+    /// binding's pid and window, and only while the tab is the one showing
+    /// there (see `pip_hook::bound_tab_window`). Every tool that changes a
+    /// bound tab calls this once it holds the validated tab. No-op, with no
+    /// page probe, unless a PiP is on and a dispatch is waiting for it.
+    pub(crate) async fn note_pip_window(&self, validated: &ValidatedTab) {
+        if !crate::pip_hook::wants_bound_window() {
+            return;
+        }
+        // A page behind an open JavaScript dialog answers nothing.
+        let showing = validated
+            .conn
+            .dialog_state(&validated.tab.cdp_target_id)
+            .is_none()
+            && self.tab_showing(validated).await;
+        let window = crate::pip_hook::bound_tab_window(
+            validated.record.pid,
+            validated.record.window_id,
+            showing,
+        );
+        if window.is_none() {
+            tracing::info!(target: "pip", tab = %validated.tab.tab_id, window = validated.record.window_id, "PiP frame skipped: the tab is not the one showing in its window");
+        }
+        crate::pip_hook::note_bound_window(window);
+    }
+
+    /// Animate platform-owned browser feedback without coupling it to input
+    /// delivery. Only main-frame viewport points are mapped: child-frame CDP
+    /// coordinates are not necessarily in the top-level viewport space, and a
+    /// misleading cursor is worse than no cursor.
+    pub(crate) async fn visualize_browser_action(
+        &self,
+        session: &str,
+        validated: &ValidatedTab,
+        cdp_session: &str,
+        viewport_x: f64,
+        viewport_y: f64,
+        kind: BrowserVisualActionKind,
+    ) {
+        let tab_is_active = self.tab_showing(validated).await;
 
         let screen_point = if cdp_session == validated.cdp_session {
             validated
