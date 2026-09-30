@@ -1224,7 +1224,7 @@ impl Tool for BrowserNavigateTool {
             Ok(v) => v,
             Err(refusal) => return refusal.to_tool_result(),
         };
-        self.engine.note_pip_window(&validated).await;
+        self.engine.note_pip_window(&validated);
         let held = self.engine.held_view(&session, &target_id, &tab_id);
 
         match validated
@@ -1419,7 +1419,7 @@ impl Tool for BrowserClickTool {
             Ok(v) => v,
             Err(refusal) => return refusal.to_tool_result(),
         };
-        self.engine.note_pip_window(&validated).await;
+        self.engine.note_pip_window(&validated);
         // The activation limitation describes the remote-debugging route. Input
         // through the extension's chrome.debugger does not activate Chrome: on
         // the lane VM, trusted typing and clicks landed with Finder in front
@@ -2724,7 +2724,7 @@ impl Tool for BrowserTypeTool {
             Ok(v) => v,
             Err(refusal) => return refusal.to_tool_result(),
         };
-        self.engine.note_pip_window(&validated).await;
+        self.engine.note_pip_window(&validated);
 
         let held = self.engine.held_view(&session, &target_id, &tab_id);
         let cdp_target = validated.tab.cdp_target_id.as_str();
@@ -3641,8 +3641,8 @@ impl Tool for BrowserDialogTool {
         {
             Ok(_) => {
                 conn.clear_dialog_state(cdp_target_id, dialog.generation);
-                // Only now: the page answers nothing while its dialog is open.
-                self.engine.note_pip_window(&validated).await;
+                // Accept and dismiss only: inspect changes nothing.
+                self.engine.note_pip_window(&validated);
                 ToolResult::text(format!("{action}ed {} dialog in {tab_id}", dialog.kind))
                     .with_structured(json!({
                         "status": "ok", "target_id": target_id, "tab_id": tab_id,
@@ -3770,7 +3770,7 @@ impl Tool for BrowserSetInputFilesTool {
             Ok(validated) => validated,
             Err(refusal) => return refusal.to_tool_result(),
         };
-        self.engine.note_pip_window(&validated).await;
+        self.engine.note_pip_window(&validated);
         let entry = match self
             .engine
             .store

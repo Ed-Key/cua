@@ -354,6 +354,16 @@ pub trait BrowserPlatform: Send + Sync {
         None
     }
 
+    /// Whether the tab with this CDP target is the selected tab of its
+    /// browser window, as far as the platform already knows from reports
+    /// it follows (the Chrome extension's, on macOS). `None`: not known.
+    /// Selected is about the tab strip, not about what can be seen: a
+    /// covered or minimized window still has its selected tab. Must answer
+    /// from memory, at once: callers sit in front of an action.
+    fn selected_tab(&self, _cdp_target_id: &str) -> Option<bool> {
+        None
+    }
+
     /// Best-effort, visual-only feedback for an authorized browser action.
     /// The default is a no-op so platforms without an agent-cursor overlay do
     /// not change behavior. Implementations must not deliver input or alter

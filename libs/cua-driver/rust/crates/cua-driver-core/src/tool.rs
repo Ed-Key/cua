@@ -5518,8 +5518,8 @@ impl Default for ToolRegistry {
 /// identity recorded for the transport session, and the action target: the
 /// call's `pid` and `window_id`, or for an action on a bound browser tab
 /// (which names neither) the macOS window the engine noted for it
-/// (`bound_window`; `None` when the tab is not the one showing there, which
-/// leaves the frame untargeted).
+/// (`bound_window`; `None` when the tab is not the selected tab there,
+/// which leaves the frame untargeted).
 fn pip_frame(
     tool_name: &str,
     args: &Value,
@@ -5641,7 +5641,7 @@ mod capability_tests {
             "_session_id": format!("{prefix}research"),
             "_public_session_label": "research",
         });
-        // B1: the tab is showing in its window; the engine noted that window.
+        // B1: the tab is its window's selected tab; the engine noted that window.
         for tool in [
             "browser_click",
             "browser_type",

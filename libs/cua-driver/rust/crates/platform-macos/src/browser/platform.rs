@@ -329,6 +329,15 @@ impl BrowserCursorTracker {
         self.visibility_among(&affected, &selected)
     }
 
+    /// Whether the tab is the selected tab of its Chrome window, by the
+    /// extension's last report that lists it. `None` when no report does.
+    fn selected(&self, cdp_target_id: &str) -> Option<bool> {
+        self.reports
+            .values()
+            .find(|report| report.targets.iter().any(|target| target == cdp_target_id))
+            .map(|report| report.selected == cdp_target_id)
+    }
+
     /// An extension link went away: its reports may go stale, so actions in
     /// its windows fall back to their own probes until the next report.
     fn forget_link(&mut self, link: u64) {
@@ -932,6 +941,20 @@ impl BrowserPlatform for MacOsBrowserPlatform {
 
     fn standalone_trusted_input_background_limitation(&self) -> Option<&'static str> {
         Some("Chromium's trusted CDP Input route activates its standalone browser window on macOS")
+    }
+
+    fn selected_tab(&self, cdp_target_id: &str) -> Option<bool> {
+        self.follow_tab_switches();
+        let known = self.browser_cursors.lock().unwrap().selected(cdp_target_id);
+        // Not listed (a tab opened in the background since the last report,
+        // or reports dropped): ask the extension to report again, for the
+        // next action. Nothing here waits for it.
+        if known.is_none() && tokio::runtime::Handle::try_current().is_ok() {
+            for link in cua_driver_core::browser::extension_bridge::global().links() {
+                request_selection(link.link);
+            }
+        }
+        known
     }
 
     async fn visualize_browser_action(&self, action: BrowserVisualAction) {
@@ -2017,6 +2040,19 @@ mod tests {
             .into_iter()
             .collect::<HashMap<_, _>>();
         assert_eq!(closed.get("session-s"), Some(&false));
+
+        // The selected tab, from the reports alone (never from a probe): a
+        // report that lists the tab answers, whatever its window's state.
+        let mut reported = BrowserCursorTracker::default();
+        assert_eq!(reported.selected("tab-A"), None, "no report yet: unknown");
+        reported.activate((1, 1), Some("tab-A"), vec!["tab-A".to_owned(), "tab-B".to_owned()]);
+        assert_eq!(reported.selected("tab-A"), Some(true));
+        assert_eq!(reported.selected("tab-B"), Some(false));
+        assert_eq!(reported.selected("tab-C"), None, "opened since the report: unknown");
+        reported.activate((1, 1), Some("tab-B"), vec!["tab-A".to_owned(), "tab-B".to_owned()]);
+        assert_eq!(reported.selected("tab-A"), Some(false));
+        reported.forget_link(1);
+        assert_eq!(reported.selected("tab-B"), None, "its link went away: unknown");
 
         // Without the link's reports, the action's own probe decides again.
         tracker.forget_link(1);

@@ -110,9 +110,10 @@ pub fn pip_enabled() -> bool {
 //
 // A browser tool names its tab by `target_id` and `tab_id`, not by pid and
 // window. The macOS window that tab lives in is known to its binding, and
-// whether the tab is the one showing in that window is known only by asking
-// the page. Both happen inside the tool, so the browser engine leaves the
-// answer here for the dispatcher that is running the tool on this task.
+// whether the tab is the selected tab of that window is known only by
+// asking the browser. Both happen inside the tool, so the browser engine
+// leaves the answer here for the dispatcher that is running the tool on
+// this task.
 
 tokio::task_local! {
     static BOUND_WINDOW: std::cell::Cell<Option<(i32, u32)>>;
@@ -138,11 +139,12 @@ pub fn wants_bound_window() -> bool {
 }
 
 /// The window a bound tab's action is shown in: its binding's macOS pid and
-/// window, and only while the tab is the one `showing` in that window. A
-/// background tab (or one whose state could not be read) has no picture:
-/// its window shows another tab.
-pub fn bound_tab_window(pid: i64, window_id: u64, showing: bool) -> Option<(i32, u32)> {
-    if !showing {
+/// window, and only while the tab is the `selected` tab of that window
+/// (whether or not the window itself can be seen: the PiP decides about
+/// that). A background tab (or one whose state could not be read) has no
+/// picture: its window shows another tab.
+pub fn bound_tab_window(pid: i64, window_id: u64, selected: bool) -> Option<(i32, u32)> {
+    if !selected {
         return None;
     }
     Some((i32::try_from(pid).ok()?, u32::try_from(window_id).ok()?))
@@ -580,7 +582,7 @@ mod tests {
     }
 
     #[test]
-    fn row_b1_b3_a_bound_tab_is_shown_in_its_window_only_while_it_is_showing() {
+    fn row_b1_b3_a_bound_tab_is_shown_in_its_window_only_while_it_is_selected() {
         // B1: the binding's macOS pid and window.
         assert_eq!(bound_tab_window(42, 7, true), Some((42, 7)));
         // B3: a background tab, or one whose state could not be read.

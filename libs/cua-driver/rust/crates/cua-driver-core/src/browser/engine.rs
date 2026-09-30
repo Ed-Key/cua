@@ -270,6 +270,10 @@ pub(crate) struct ValidatedTab {
     /// Live native metadata from this mutation's revalidation, rather than
     /// the bind-time geometry retained in `record`.
     pub native: NativeWindowInfo,
+    /// The native window's title names this tab and no other tab of its
+    /// window (the binding's own selected-tab proof, read again at this
+    /// revalidation), or the endpoint has a single page.
+    pub selected_by_title: bool,
     /// Flattened CDP session id attached to the tab's target.
     pub cdp_session: String,
     /// The target's committed URL as the browser process reports it.
@@ -1810,6 +1814,9 @@ impl BrowserEngine {
         }
 
         let target_url = live.url.clone();
+        let selected_by_title =
+            selected_tab_target_id(&native.title, &candidates, record.cdp_window_id)
+                == Some(tab.cdp_target_id.as_str());
         let cdp_session = self
             .attach(
                 &conn,
@@ -1847,6 +1854,7 @@ impl BrowserEngine {
             record,
             tab,
             native,
+            selected_by_title,
             cdp_session,
             target_url,
         })
@@ -1909,53 +1917,44 @@ impl BrowserEngine {
         Ok((validated, live_origin))
     }
 
-    /// Whether the tab is the one showing in its window right now.
+    /// The macOS window a bound-tab action shows in, for the PiP: the
+    /// binding's pid and window, and only while the tab is the selected tab
+    /// of that window (see `pip_hook::bound_tab_window`).
     ///
-    /// `document.visibilityState` distinguishes the selected tab without
-    /// focusing its native window or invoking any CDP activation command.
-    /// Treat an unavailable or malformed proof as inactive: omitting
-    /// feedback is safer than drawing a cursor, or showing a picture, over
-    /// another tab.
-    async fn tab_showing(&self, validated: &ValidatedTab) -> bool {
-        validated
-            .conn
-            .call(
-                Some(&validated.cdp_session),
-                "Runtime.evaluate",
-                json!({
-                    "expression": "document.visibilityState === 'visible'",
-                    "returnByValue": true,
-                    "awaitPromise": false,
-                }),
-            )
-            .await
-            .ok()
-            .and_then(|result| result.pointer("/result/value").and_then(Value::as_bool))
-            .unwrap_or(false)
+    /// Selected is about the tab strip, not about what the user can see: it
+    /// holds for a window that is covered, minimized or on another Space
+    /// (the page's own `visibilityState` does not, and asking the page
+    /// would put a renderer round trip in front of the action). The answer
+    /// is what the daemon already holds: the Chrome extension's report of
+    /// each window's selected tab where the platform follows them, else
+    /// the binding's own proof, read again at this revalidation
+    /// (`selected_by_title`). Unknown counts as not selected.
+    ///
+    /// Not async on purpose: it asks nobody, so it can never delay the
+    /// action it is decided before or hold its mutation lock any longer.
+    pub(crate) fn pip_window(&self, validated: &ValidatedTab) -> Option<(i32, u32)> {
+        let selected = self
+            .platform
+            .selected_tab(&validated.tab.cdp_target_id)
+            .unwrap_or(validated.selected_by_title);
+        crate::pip_hook::bound_tab_window(
+            validated.record.pid,
+            validated.record.window_id,
+            selected,
+        )
     }
 
-    /// Tell the PiP which macOS window this bound-tab action shows in: the
-    /// binding's pid and window, and only while the tab is the one showing
-    /// there (see `pip_hook::bound_tab_window`). Every tool that changes a
-    /// bound tab calls this once it holds the validated tab. No-op, with no
-    /// page probe, unless a PiP is on and a dispatch is waiting for it.
-    pub(crate) async fn note_pip_window(&self, validated: &ValidatedTab) {
+    /// Tell the PiP which macOS window this bound-tab action shows in
+    /// (`pip_window`). Every tool that changes a bound tab calls this once
+    /// it holds the validated tab. No-op unless a PiP is on and a dispatch
+    /// is waiting for the answer.
+    pub(crate) fn note_pip_window(&self, validated: &ValidatedTab) {
         if !crate::pip_hook::wants_bound_window() {
             return;
         }
-        // A page behind an open JavaScript dialog answers nothing.
-        let showing = validated
-            .conn
-            .dialog_state(&validated.tab.cdp_target_id)
-            .is_none()
-            && self.tab_showing(validated).await;
-        let window = crate::pip_hook::bound_tab_window(
-            validated.record.pid,
-            validated.record.window_id,
-            showing,
-        );
+        let window = self.pip_window(validated);
         if window.is_none() {
-            tracing::info!(target: "pip", tab = %validated.tab.tab_id, window = validated.record.window_id, "PiP frame skipped: the tab is not the one showing in its window");
+            tracing::info!(target: "pip", tab = %validated.tab.tab_id, window = validated.record.window_id, "PiP frame skipped: the tab is not the selected tab of its window");
         }
         crate::pip_hook::note_bound_window(window);
     }
@@ -1973,7 +1972,25 @@ impl BrowserEngine {
         viewport_y: f64,
         kind: BrowserVisualActionKind,
     ) {
-        let tab_is_active = self.tab_showing(validated).await;
+        // `document.visibilityState` distinguishes the selected tab without
+        // focusing its native window or invoking any CDP activation command.
+        // Treat an unavailable or malformed proof as inactive: omitting
+        // feedback is safer than drawing a cursor over another tab.
+        let tab_is_active = validated
+            .conn
+            .call(
+                Some(&validated.cdp_session),
+                "Runtime.evaluate",
+                json!({
+                    "expression": "document.visibilityState === 'visible'",
+                    "returnByValue": true,
+                    "awaitPromise": false,
+                }),
+            )
+            .await
+            .ok()
+            .and_then(|result| result.pointer("/result/value").and_then(Value::as_bool))
+            .unwrap_or(false);
 
         let screen_point = if cdp_session == validated.cdp_session {
             validated
