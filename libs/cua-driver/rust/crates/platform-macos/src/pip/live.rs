@@ -17,7 +17,11 @@
 //! with the session key, generation and elapsed time.
 //!
 //! Each stream captures one window (a desktop-independent-window filter),
-//! scaled to the panel's image well at [`LIVE_FPS`]. Frames go to the main
+//! or only its page (the configuration's source rectangle, see `page`),
+//! scaled to the panel's image well at [`LIVE_FPS`]. A new crop reconfigures
+//! the running stream; the panel adopts it for the cursor only once
+//! ScreenCaptureKit applied it ([`Event::Reframed`]), so the rectangle it
+//! maps into and the pixels it shows always change together. Frames go to the main
 //! queue through a one-frame slot per stream, so a busy main thread sees
 //! the newest frame instead of a backlog. A stream that cannot start, or
 //! that ScreenCaptureKit stops (window closed, permission revoked), reports
@@ -35,7 +39,7 @@ use screencapturekit::prelude::{
 use screencapturekit::stream::delegate_trait::StreamCallbacks;
 use screencapturekit::CVPixelBuffer;
 
-use super::{lock, resolve_target_window, LatestPerSession, Target};
+use super::{lock, resolve_target_window, Area, LatestPerSession, Target};
 
 /// Frame rate of the live mirror. A preview, not a recording.
 pub(super) const LIVE_FPS: i32 = 12;
@@ -57,16 +61,19 @@ pub(super) enum StreamStep {
 /// A panel's stream runs only while the panel is shown and has a target.
 /// `resolved` is the window a pid-only target currently resolves to (looked
 /// up off the main thread; ignored when the target names its window).
-/// `requested` is the resolved target the panel last asked a stream for
-/// (running or failed); a failed stream is not retried until the resolved
-/// window changes or the panel hides and shows again. A pid-only target
-/// whose window cannot be resolved right now keeps a stream of the same pid
-/// (a transient gap) but stops a stream of any other app.
+/// `requested` is the resolved target and framing (`page`) the panel last
+/// asked a stream for (running or failed); a failed stream is not retried
+/// until the resolved window or the framing changes or the panel hides and
+/// shows again. A new framing of the same window is a new stream, so its
+/// pixels never show under the old framing. A pid-only target whose window
+/// cannot be resolved right now keeps a stream of the same pid (a transient
+/// gap) but stops a stream of any other app.
 pub(super) fn stream_step(
     shown: bool,
     target: Target,
+    page: bool,
     resolved: Option<u32>,
-    requested: Option<Target>,
+    requested: Option<(Target, bool)>,
 ) -> StreamStep {
     let has_target = shown && target != (None, None);
     let wanted = has_target
@@ -76,9 +83,9 @@ pub(super) fn stream_step(
         })
         .flatten();
     match (wanted, requested) {
-        (Some(want), Some(have)) if want == have => StreamStep::Keep,
+        (Some(want), Some(have)) if (want, page) == have => StreamStep::Keep,
         (Some(want), _) => StreamStep::Start(want),
-        (None, Some(have)) if !has_target || target.0 != have.0 => StreamStep::Stop,
+        (None, Some((have, _))) if !has_target || target.0 != have.0 => StreamStep::Stop,
         (None, _) => StreamStep::Keep,
     }
 }
@@ -91,20 +98,35 @@ pub(super) fn stream_step(
 /// target is still not retried.
 #[derive(Debug, Default)]
 pub(super) struct StreamState {
-    pub(super) requested: Option<Target>,
+    pub(super) requested: Option<(Target, bool)>,
     generation: u64,
     /// Image well size (points) the stream was last sized for.
     well: (f64, f64),
+    /// Page crop (window points) the stream was last asked for.
+    crop: Option<Area>,
+    /// Page crop the stream's frames show now (`None`: the whole window):
+    /// what it opened with, then each reconfiguration once it succeeded.
+    pub(super) shown_crop: Option<Area>,
     /// Live frames of the current generation, for logs.
     pub(super) frames: PanelFrames,
 }
 
 impl StreamState {
     /// Generations are handed out from 1, so 0 never matches an event.
-    pub(super) fn begin(&mut self, target: Target, generation: u64, well: (f64, f64)) {
-        self.requested = Some(target);
+    pub(super) fn begin(
+        &mut self,
+        view: (Target, bool),
+        generation: u64,
+        well: (f64, f64),
+        crop: Option<Area>,
+    ) {
+        self.requested = Some(view);
         self.generation = generation;
         self.well = well;
+        self.crop = crop;
+        // Its frames all show the crop it opens with (a reconfiguration
+        // folded into the open reports its own, see `reframed`).
+        self.shown_crop = crop;
         self.frames = PanelFrames::default();
     }
 
@@ -113,14 +135,26 @@ impl StreamState {
         self.generation
     }
 
-    /// Whether a running stream must be reconfigured for a new `well`.
-    /// Records the new size when it must.
-    pub(super) fn needs_resize(&mut self, well: (f64, f64)) -> bool {
-        let running = self.generation != 0 && self.well != well;
+    /// Whether a running stream must be reconfigured for a new `well` or
+    /// page `crop` (its origin as much as its size). Records them when it
+    /// must.
+    pub(super) fn needs_resize(&mut self, well: (f64, f64), crop: Option<Area>) -> bool {
+        let running = self.generation != 0 && (self.well != well || self.crop != crop);
         if running {
             self.well = well;
+            self.crop = crop;
         }
         running
+    }
+
+    /// ScreenCaptureKit applied `crop` to the stream of `generation`: its
+    /// frames show it from now on. Whether that is the current stream.
+    pub(super) fn reframed(&mut self, generation: u64, crop: Option<Area>) -> bool {
+        let current = self.accepts(generation);
+        if current {
+            self.shown_crop = crop;
+        }
+        current
     }
 
     pub(super) fn stop(&mut self) {
@@ -153,10 +187,18 @@ pub(super) fn stream_pixel_size(well: (f64, f64)) -> (u32, u32) {
     (px(well.0), px(well.1))
 }
 
-/// Stream configuration for a `well`-point image well.
-fn stream_config(well: (f64, f64)) -> SCStreamConfiguration {
+/// Stream configuration for a `well`-point image well, of the whole window
+/// or of its page `crop` (window points, which is what ScreenCaptureKit's
+/// source rectangle takes for a window filter).
+fn stream_config(well: (f64, f64), crop: Option<Area>) -> SCStreamConfiguration {
     let (width, height) = stream_pixel_size(well);
-    SCStreamConfiguration::new()
+    let config = match crop {
+        Some(crop) => SCStreamConfiguration::new().with_source_rect(
+            screencapturekit::cg::CGRect::new(crop.x, crop.y, crop.w, crop.h),
+        ),
+        None => SCStreamConfiguration::new(),
+    };
+    config
         .with_width(width)
         .with_height(height)
         .with_scales_to_fit(true)
@@ -176,6 +218,13 @@ pub(super) enum Event {
         generation: u64,
         slot: FrameSlot,
     },
+    /// The stream's frames show `crop` from now on: it opened with it, or a
+    /// reconfiguration to it succeeded.
+    Reframed {
+        key: String,
+        generation: u64,
+        crop: Option<Area>,
+    },
     /// The stream could not start or was stopped by ScreenCaptureKit.
     Ended { key: String, generation: u64 },
 }
@@ -186,9 +235,15 @@ pub(super) enum Request {
         target: Target,
         /// Image well size in points.
         well: (f64, f64),
+        /// Page crop in window points (`None`: the whole window).
+        crop: Option<Area>,
     },
-    /// The panel's image well changed size; reconfigure the running stream.
-    Resize { well: (f64, f64) },
+    /// The panel's image well changed size or its page crop changed;
+    /// reconfigure the running stream.
+    Resize {
+        well: (f64, f64),
+        crop: Option<Area>,
+    },
     Stop,
 }
 
@@ -215,10 +270,12 @@ trait Backend: Send + Sync + 'static {
         generation: u64,
         target: Target,
         well: (f64, f64),
+        crop: Option<Area>,
         deliver: &Deliver,
     ) -> anyhow::Result<Self::Stream>;
     fn stop(&self, stream: &Self::Stream);
-    fn resize(&self, stream: &Self::Stream, well: (f64, f64)) -> anyhow::Result<()>;
+    fn resize(&self, stream: &Self::Stream, well: (f64, f64), crop: Option<Area>)
+        -> anyhow::Result<()>;
 }
 
 /// Result of a call running on a helper thread, shared with its waiter.
@@ -287,6 +344,7 @@ struct Retry {
     generation: u64,
     target: Target,
     well: (f64, f64),
+    crop: Option<Area>,
     /// Retries already made.
     attempt: u32,
 }
@@ -324,12 +382,15 @@ impl<B: Backend> Worker<B> {
 
     fn handle(&mut self, key: String, request: Request) {
         // A resize never cancels a pending open: the retry opens at the new
-        // size. (With nothing running or pending it is a no-op; the panel
-        // keeps the size for its next start.)
-        if let Request::Resize { well } = request {
+        // size and crop. (With nothing running or pending it is a no-op; the
+        // panel keeps them for its next start.)
+        if let Request::Resize { well, crop } = request {
             match self.retries.get_mut(&key) {
-                Some(retry) => retry.well = well,
-                None => self.resize(&key, well),
+                Some(retry) => {
+                    retry.well = well;
+                    retry.crop = crop;
+                }
+                None => self.resize(&key, well, crop),
             }
             return;
         }
@@ -342,9 +403,10 @@ impl<B: Backend> Worker<B> {
                 generation,
                 target,
                 well,
+                crop,
             } => {
                 self.stop_running(&key);
-                self.open(key, generation, target, well, 0);
+                self.open(key, generation, target, well, crop, 0);
             }
         }
     }
@@ -369,6 +431,7 @@ impl<B: Backend> Worker<B> {
                     retry.generation,
                     retry.target,
                     retry.well,
+                    retry.crop,
                     retry.attempt + 1,
                 );
             }
@@ -434,7 +497,11 @@ impl<B: Backend> Worker<B> {
         }
     }
 
-    fn resize(&mut self, key: &str, well: (f64, f64)) {
+    /// Reconfigure the session's stream for `well` and `crop`. Only a
+    /// success reports the new crop ([`Event::Reframed`]): a failed call
+    /// keeps the old stream showing the old crop, and one that times out
+    /// abandons the stream as a stopped one.
+    fn resize(&mut self, key: &str, well: (f64, f64), crop: Option<Area>) {
         let Some(running) = self.running.get(key) else {
             return;
         };
@@ -443,13 +510,18 @@ impl<B: Backend> Worker<B> {
         let started = Instant::now();
         let result = bounded(
             self.call_timeout,
-            move || backend.resize(&stream, well),
+            move || backend.resize(&stream, well, crop),
             |_| {},
         );
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match result {
             Some(Ok(())) => {
-                tracing::info!(target: "pip", session = %key, generation, ?well, elapsed_ms, "PiP stream resized");
+                tracing::info!(target: "pip", session = %key, generation, ?well, ?crop, elapsed_ms, "PiP stream resized");
+                (self.deliver)(Event::Reframed {
+                    key: key.to_owned(),
+                    generation,
+                    crop,
+                });
             }
             Some(Err(error)) => {
                 tracing::info!(target: "pip", session = %key, generation, %error, elapsed_ms, "PiP stream resize failed; keeping the stream");
@@ -462,7 +534,15 @@ impl<B: Backend> Worker<B> {
         }
     }
 
-    fn open(&mut self, key: String, generation: u64, target: Target, well: (f64, f64), attempt: u32) {
+    fn open(
+        &mut self,
+        key: String,
+        generation: u64,
+        target: Target,
+        well: (f64, f64),
+        crop: Option<Area>,
+        attempt: u32,
+    ) {
         let started = Instant::now();
         let hung_stops = self.settle_stops();
         let backend = self.backend.clone();
@@ -471,7 +551,7 @@ impl<B: Backend> Worker<B> {
         let call_key = key.clone();
         let result = bounded(
             self.open_timeout,
-            move || backend.open(&call_key, generation, target, well, &deliver),
+            move || backend.open(&call_key, generation, target, well, crop, &deliver),
             move |stream| {
                 // The waiter gave up, so nothing owns this stream: stop it.
                 if let Ok(stream) = stream {
@@ -483,7 +563,14 @@ impl<B: Backend> Worker<B> {
         let elapsed_ms = started.elapsed().as_millis() as u64;
         match result {
             Some(Ok(stream)) => {
-                tracing::info!(target: "pip", session = %key, generation, ?target, attempt, hung_stops, elapsed_ms, "PiP stream started");
+                tracing::info!(target: "pip", session = %key, generation, ?target, ?crop, attempt, hung_stops, elapsed_ms, "PiP stream started");
+                // The crop it opened with (a reconfiguration may have folded
+                // into the open after the panel asked for it).
+                (self.deliver)(Event::Reframed {
+                    key: key.clone(),
+                    generation,
+                    crop,
+                });
                 self.running.insert(
                     key,
                     Running {
@@ -501,6 +588,7 @@ impl<B: Backend> Worker<B> {
                         generation,
                         target,
                         well,
+                        crop,
                         attempt,
                     },
                 );
@@ -548,8 +636,17 @@ impl Streams {
         {
             let mut requests = lock(&self.requests);
             match (request, requests.latest.get_mut(key)) {
-                // Not started yet: it just starts at the new size.
-                (Request::Resize { well: new }, Some(Request::Start { well, .. })) => *well = new,
+                // Not started yet: it just starts at the new size and crop.
+                (
+                    Request::Resize {
+                        well: new,
+                        crop: new_crop,
+                    },
+                    Some(Request::Start { well, crop, .. }),
+                ) => {
+                    *well = new;
+                    *crop = new_crop;
+                }
                 // About to stop: nothing to resize.
                 (Request::Resize { .. }, Some(Request::Stop)) => {}
                 (request, _) => requests.push(key.to_owned(), request),
@@ -594,18 +691,19 @@ impl Backend for SckBackend {
         generation: u64,
         target: Target,
         well: (f64, f64),
+        crop: Option<Area>,
         deliver: &Deliver,
     ) -> anyhow::Result<SCStream> {
-        open_stream(key, generation, target, well, deliver)
+        open_stream(key, generation, target, well, crop, deliver)
     }
 
     fn stop(&self, stream: &SCStream) {
         let _ = stream.stop_capture();
     }
 
-    fn resize(&self, stream: &SCStream, well: (f64, f64)) -> anyhow::Result<()> {
+    fn resize(&self, stream: &SCStream, well: (f64, f64), crop: Option<Area>) -> anyhow::Result<()> {
         stream
-            .update_configuration(&stream_config(well))
+            .update_configuration(&stream_config(well, crop))
             .map_err(|e| anyhow::anyhow!("{e}"))
     }
 }
@@ -773,6 +871,7 @@ fn open_stream(
     generation: u64,
     target: Target,
     well: (f64, f64),
+    crop: Option<Area>,
     deliver: &Deliver,
 ) -> anyhow::Result<SCStream> {
     let window_id = resolve_target_window(target)
@@ -788,7 +887,7 @@ fn open_stream(
 
     // Captures only this window, wherever it is and whatever covers it.
     let filter = SCContentFilter::create().with_window(&window).build();
-    let config = stream_config(well);
+    let config = stream_config(well, crop);
 
     let ended = deliver.clone();
     let ended_key = key.to_owned();
@@ -864,26 +963,26 @@ mod tests {
 
     #[test]
     fn a_shown_panel_starts_a_stream_for_its_target() {
-        assert_eq!(stream_step(true, A, None, None), StreamStep::Start(A));
-        assert_eq!(stream_step(true, A, None, Some(A)), StreamStep::Keep);
+        assert_eq!(stream_step(true, A, false, None, None), StreamStep::Start(A));
+        assert_eq!(stream_step(true, A, false, None, Some((A, false))), StreamStep::Keep);
     }
 
     #[test]
     fn a_new_target_switches_the_stream() {
-        assert_eq!(stream_step(true, B, None, Some(A)), StreamStep::Start(B));
+        assert_eq!(stream_step(true, B, false, None, Some((A, false))), StreamStep::Start(B));
     }
 
     #[test]
     fn a_hidden_panel_stops_its_stream() {
-        assert_eq!(stream_step(false, A, None, Some(A)), StreamStep::Stop);
-        assert_eq!(stream_step(false, A, None, None), StreamStep::Keep);
+        assert_eq!(stream_step(false, A, false, None, Some((A, false))), StreamStep::Stop);
+        assert_eq!(stream_step(false, A, false, None, None), StreamStep::Keep);
     }
 
     #[test]
     fn no_target_means_no_stream() {
-        assert_eq!(stream_step(true, (None, None), None, None), StreamStep::Keep);
+        assert_eq!(stream_step(true, (None, None), false, None, None), StreamStep::Keep);
         assert_eq!(
-            stream_step(true, (None, None), None, Some(A)),
+            stream_step(true, (None, None), false, None, Some((A, false))),
             StreamStep::Stop
         );
     }
@@ -893,33 +992,33 @@ mod tests {
         const PID_ONLY: Target = (Some(42), None);
         let on = |window| (Some(42), Some(window));
         assert_eq!(
-            stream_step(true, PID_ONLY, Some(5), None),
+            stream_step(true, PID_ONLY, false, Some(5), None),
             StreamStep::Start(on(5))
         );
         assert_eq!(
-            stream_step(true, PID_ONLY, Some(5), Some(on(5))),
+            stream_step(true, PID_ONLY, false, Some(5), Some((on(5), false))),
             StreamStep::Keep
         );
         // The app raised another window: same pid-only target, new stream.
         assert_eq!(
-            stream_step(true, PID_ONLY, Some(6), Some(on(5))),
+            stream_step(true, PID_ONLY, false, Some(6), Some((on(5), false))),
             StreamStep::Start(on(6))
         );
         // No window to resolve right now: the same app's stream stays.
         assert_eq!(
-            stream_step(true, PID_ONLY, None, Some(on(5))),
+            stream_step(true, PID_ONLY, false, None, Some((on(5), false))),
             StreamStep::Keep
         );
         // A different app with no resolvable window must not keep the old
         // app's live pixels under its label.
         assert_eq!(
-            stream_step(true, (Some(43), None), None, Some(on(5))),
+            stream_step(true, (Some(43), None), false, None, Some((on(5), false))),
             StreamStep::Stop
         );
-        assert_eq!(stream_step(true, PID_ONLY, None, None), StreamStep::Keep);
+        assert_eq!(stream_step(true, PID_ONLY, false, None, None), StreamStep::Keep);
         // A hidden panel still stops.
         assert_eq!(
-            stream_step(false, PID_ONLY, Some(5), Some(on(5))),
+            stream_step(false, PID_ONLY, false, Some(5), Some((on(5), false))),
             StreamStep::Stop
         );
     }
@@ -927,21 +1026,21 @@ mod tests {
     #[test]
     fn a_frame_arriving_after_the_stream_ended_is_dropped() {
         let mut state = StreamState::default();
-        state.begin(A, 3, (320.0, 200.0));
+        state.begin((A, false), 3, (320.0, 200.0), None);
         assert!(state.accepts(3));
         assert!(state.end(3));
         // SCK's sample handler can still deliver a frame of generation 3.
         assert!(!state.accepts(3));
         // Retry suppression survives: the failed target is still requested.
         assert_eq!(
-            stream_step(true, A, None, state.requested),
+            stream_step(true, A, false, None, state.requested),
             StreamStep::Keep
         );
         // A repeated or stale end changes nothing.
         assert!(!state.end(3));
         assert!(!state.end(2));
         // A new stream gets a fresh generation and works again.
-        state.begin(B, 4, (320.0, 200.0));
+        state.begin((B, false), 4, (320.0, 200.0), None);
         assert!(state.accepts(4) && !state.accepts(3));
         state.stop();
         assert!(!state.accepts(4) && state.requested.is_none());
@@ -958,13 +1057,13 @@ mod tests {
     #[test]
     fn a_running_stream_resizes_only_when_the_well_changes() {
         let mut state = StreamState::default();
-        state.begin(A, 1, (320.0, 200.0));
-        assert!(!state.needs_resize((320.0, 200.0)));
-        assert!(state.needs_resize((400.0, 250.0)));
-        assert!(!state.needs_resize((400.0, 250.0)));
+        state.begin((A, false), 1, (320.0, 200.0), None);
+        assert!(!state.needs_resize((320.0, 200.0), None));
+        assert!(state.needs_resize((400.0, 250.0), None));
+        assert!(!state.needs_resize((400.0, 250.0), None));
         // No running stream: nothing to reconfigure.
         state.stop();
-        assert!(!state.needs_resize((500.0, 300.0)));
+        assert!(!state.needs_resize((500.0, 300.0), None));
     }
 
     #[test]
@@ -979,18 +1078,19 @@ mod tests {
                 generation: 1,
                 target: A,
                 well: (320.0, 200.0),
+                crop: None,
             },
         );
-        streams.request("s", Request::Resize { well: (400.0, 250.0) });
+        streams.request("s", Request::Resize { well: (400.0, 250.0), crop: None });
         assert!(matches!(
             streams.next(None).unwrap(),
             (_, Request::Start { generation: 1, well, .. }) if well == (400.0, 250.0)
         ));
         streams.request("t", Request::Stop);
-        streams.request("t", Request::Resize { well: (1.0, 1.0) });
+        streams.request("t", Request::Resize { well: (1.0, 1.0), crop: None });
         assert!(matches!(streams.next(None).unwrap(), (key, Request::Stop) if key == "t"));
         // With nothing pending, a resize is queued for the stream thread.
-        streams.request("u", Request::Resize { well: (1.0, 1.0) });
+        streams.request("u", Request::Resize { well: (1.0, 1.0), crop: None });
         assert!(matches!(streams.next(None).unwrap(), (key, Request::Resize { .. }) if key == "u"));
     }
 
@@ -1004,6 +1104,7 @@ mod tests {
             generation,
             target: A,
             well: (320.0, 200.0),
+            crop: None,
         };
         streams.request("s", start(1));
         streams.request("t", start(2));
@@ -1121,6 +1222,7 @@ mod tests {
         open_wells: Mutex<Vec<(f64, f64)>>,
         hang_stop: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
         hang_resize: std::sync::atomic::AtomicBool,
+        fail_resize: std::sync::atomic::AtomicBool,
     }
 
     #[derive(Clone, Default)]
@@ -1137,6 +1239,7 @@ mod tests {
             _generation: u64,
             _target: Target,
             well: (f64, f64),
+            _crop: Option<Area>,
             _deliver: &Deliver,
         ) -> anyhow::Result<FakeStream> {
             use std::sync::atomic::Ordering::SeqCst;
@@ -1162,29 +1265,46 @@ mod tests {
             lock(&self.0.stopped).push(stream.0);
         }
 
-        fn resize(&self, _stream: &FakeStream, _well: (f64, f64)) -> anyhow::Result<()> {
+        fn resize(
+            &self,
+            _stream: &FakeStream,
+            _well: (f64, f64),
+            _crop: Option<Area>,
+        ) -> anyhow::Result<()> {
             while self.0.hang_resize.load(std::sync::atomic::Ordering::SeqCst) {
                 std::thread::sleep(Duration::from_millis(5));
+            }
+            if self.0.fail_resize.load(std::sync::atomic::Ordering::SeqCst) {
+                return Err(anyhow::anyhow!("configuration rejected"));
             }
             Ok(())
         }
     }
 
     type Ended = Arc<Mutex<Vec<(String, u64)>>>;
+    type Reframed = Arc<Mutex<Vec<(u64, Option<Area>)>>>;
 
     fn worker(fake: &Fake) -> (Worker<Fake>, Ended) {
+        let (worker, ended, _) = worker_reporting(fake);
+        (worker, ended)
+    }
+
+    fn worker_reporting(fake: &Fake) -> (Worker<Fake>, Ended, Reframed) {
         let ended: Ended = Arc::default();
-        let sink = ended.clone();
-        let deliver: Deliver = Arc::new(move |event| {
-            if let Event::Ended { key, generation } = event {
-                lock(&sink).push((key, generation));
-            }
+        let reframed: Reframed = Arc::default();
+        let (sink, crops) = (ended.clone(), reframed.clone());
+        let deliver: Deliver = Arc::new(move |event| match event {
+            Event::Ended { key, generation } => lock(&sink).push((key, generation)),
+            Event::Reframed {
+                generation, crop, ..
+            } => lock(&crops).push((generation, crop)),
+            Event::Frame { .. } => {}
         });
         let mut worker = Worker::new(fake.clone(), deliver);
         worker.call_timeout = Duration::from_millis(100);
         worker.open_timeout = Duration::from_millis(100);
         worker.retry_delay = Duration::from_millis(10);
-        (worker, ended)
+        (worker, ended, reframed)
     }
 
     fn start(generation: u64) -> Request {
@@ -1192,6 +1312,7 @@ mod tests {
             generation,
             target: A,
             well: (320.0, 200.0),
+            crop: None,
         }
     }
 
@@ -1300,7 +1421,7 @@ mod tests {
             .hang_resize
             .store(true, std::sync::atomic::Ordering::SeqCst);
 
-        worker.handle("a".into(), Request::Resize { well: (400.0, 250.0) });
+        worker.handle("a".into(), Request::Resize { well: (400.0, 250.0), crop: None });
         fake.0
             .hang_resize
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -1352,14 +1473,14 @@ mod tests {
         let (mut worker, ended) = worker(&fake);
         worker.handle("a".into(), start(1));
         assert!(worker.next_retry().is_some());
-        worker.handle("a".into(), Request::Resize { well: (400.0, 250.0) });
+        worker.handle("a".into(), Request::Resize { well: (400.0, 250.0), crop: None });
         assert!(worker.next_retry().is_some(), "the resize cancelled the retry");
         worker.retry_due(Instant::now() + Duration::from_secs(60));
         assert!(worker.running.contains_key("a"));
         assert_eq!(*lock(&fake.0.open_wells), [(320.0, 200.0), (400.0, 250.0)]);
         assert!(lock(&ended).is_empty());
         // Nothing running or pending: a resize is a no-op.
-        worker.handle("b".into(), Request::Resize { well: (1.0, 1.0) });
+        worker.handle("b".into(), Request::Resize { well: (1.0, 1.0), crop: None });
         assert!(!worker.running.contains_key("b") && worker.next_retry().is_none());
     }
 
@@ -1372,5 +1493,100 @@ mod tests {
         assert!(worker.next_retry().is_some());
         worker.handle("a".into(), Request::Stop);
         assert!(worker.next_retry().is_none());
+    }
+
+    const PAGE: Area = Area {
+        x: 0.0,
+        y: 87.0,
+        w: 1100.0,
+        h: 702.0,
+    };
+
+    #[test]
+    fn a_new_framing_of_the_same_window_is_a_new_stream() {
+        // A browser action streams the page of window 7 ...
+        assert_eq!(stream_step(true, A, true, None, None), StreamStep::Start(A));
+        assert_eq!(stream_step(true, A, true, None, Some((A, true))), StreamStep::Keep);
+        // ... a native action on the same window streams the whole window ...
+        assert_eq!(stream_step(true, A, false, None, Some((A, true))), StreamStep::Start(A));
+        // ... and a browser action again, the page.
+        assert_eq!(stream_step(true, A, true, None, Some((A, false))), StreamStep::Start(A));
+    }
+
+    #[test]
+    fn a_new_crop_reconfigures_even_at_the_same_size_and_is_shown_only_once_applied() {
+        let mut state = StreamState::default();
+        state.begin((A, true), 1, (320.0, 200.0), None);
+        // Opened before the page was known: the whole window.
+        assert_eq!(state.shown_crop, None);
+        assert!(state.needs_resize((320.0, 200.0), Some(PAGE)));
+        assert!(!state.needs_resize((320.0, 200.0), Some(PAGE)));
+        // The banner went away: same size, the page's origin moved up.
+        let moved = Area { y: 60.0, ..PAGE };
+        assert!(state.needs_resize((320.0, 200.0), Some(moved)));
+        // Asked for, not applied yet: the frames still show the old crop.
+        assert_eq!(state.shown_crop, None);
+        assert!(state.reframed(1, Some(moved)));
+        assert_eq!(state.shown_crop, Some(moved));
+        // A late report from an ended stream changes nothing.
+        state.end(1);
+        assert!(!state.reframed(1, Some(PAGE)));
+        assert_eq!(state.shown_crop, Some(moved));
+        // A new stream shows the crop it opens with.
+        state.begin((A, true), 2, (320.0, 200.0), Some(PAGE));
+        assert_eq!(state.shown_crop, Some(PAGE));
+    }
+
+    #[test]
+    fn only_a_reconfiguration_that_succeeded_reports_its_crop() {
+        use std::sync::atomic::Ordering::SeqCst;
+        let fake = Fake::default();
+        let (mut worker, ended, reframed) = worker_reporting(&fake);
+        worker.handle("a".into(), start(1));
+        // The open reports the crop it opened with.
+        assert_eq!(*lock(&reframed), vec![(1, None)]);
+        let resize = |crop| Request::Resize {
+            well: (320.0, 200.0),
+            crop,
+        };
+        // Applied: the new crop is reported.
+        worker.handle("a".into(), resize(Some(PAGE)));
+        assert_eq!(lock(&reframed).last(), Some(&(1, Some(PAGE))));
+        // Rejected: the old stream (and its crop) stays, nothing reported.
+        fake.0.fail_resize.store(true, SeqCst);
+        worker.handle("a".into(), resize(None));
+        assert_eq!(lock(&reframed).len(), 2);
+        assert!(worker.running.contains_key("a") && lock(&ended).is_empty());
+        fake.0.fail_resize.store(false, SeqCst);
+        // Timed out: the stream is abandoned as a stopped one, nothing
+        // reported.
+        fake.0.hang_resize.store(true, SeqCst);
+        worker.handle("a".into(), resize(None));
+        fake.0.hang_resize.store(false, SeqCst);
+        assert_eq!(lock(&reframed).len(), 2);
+        assert_eq!(*lock(&ended), vec![("a".to_owned(), 1)]);
+    }
+
+    #[test]
+    fn a_crop_asked_for_before_the_stream_opens_is_what_it_opens_with() {
+        let streams = Streams {
+            requests: Mutex::new(LatestPerSession::new()),
+            ready: Condvar::new(),
+        };
+        streams.request("s", start(1));
+        streams.request(
+            "s",
+            Request::Resize {
+                well: (320.0, 200.0),
+                crop: Some(PAGE),
+            },
+        );
+        let (key, request) = streams.next(None).unwrap();
+        assert!(matches!(request, Request::Start { crop: Some(PAGE), .. }));
+        // And the open reports it, so the panel maps the cursor into it.
+        let fake = Fake::default();
+        let (mut worker, _, reframed) = worker_reporting(&fake);
+        worker.handle(key, request);
+        assert_eq!(*lock(&reframed), vec![(1, Some(PAGE))]);
     }
 }

@@ -303,6 +303,7 @@ fn maybe_init_pip() {
                             client_pid: frame.client_pid,
                             target_pid: frame.target_pid,
                             target_window_id: frame.target_window_id,
+                            page: frame.page,
                         });
                     }
                 }
