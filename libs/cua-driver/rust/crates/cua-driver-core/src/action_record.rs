@@ -460,6 +460,8 @@ impl ActionExecutionRecord {
             },
             // Set at the dispatch seam, which knows the tool.
             idempotent: None,
+            // Set at the dispatch seam from the producer's page observation.
+            changes: None,
         })
     }
 
@@ -710,7 +712,9 @@ fn browser_refusal_escalation(code: &str) -> Option<ActionEscalation> {
         | "browser_tab_not_found"
         | "browser_ref_stale"
         | "browser_input_trust_unavailable"
-        | "browser_action_unavailable" => EscalationKind::RefreshPageState,
+        | "browser_action_unavailable"
+        | "browser_dialog_open"
+        | "browser_target_covered" => EscalationKind::RefreshPageState,
         // A delivered prefix is already represented by `effect: partial` and
         // `delivery.delivered_count`; verification decides whether to stop.
         "browser_input_incomplete" => return None,

@@ -41,7 +41,7 @@ use super::cdp_ws::{CdpConnection, CdpPool};
 use super::grant::{ExistingProfileGrant, ExistingProfileGrants, GrantLookup};
 use super::mutation::{MutationGates, MutationKey};
 use super::observation::{
-    DocumentIdentity, Fingerprint, FullReason, TabRefs, ViewKind, ViewLine, ViewNode,
+    DocumentIdentity, Fingerprint, FullReason, TabRefs, Told, ViewKind, ViewLine, ViewNode,
 };
 use super::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, BrowserVisualAction,
@@ -85,6 +85,9 @@ pub struct BrowserEngine {
     pub(crate) approval_broker: Arc<crate::consent::ApprovalBroker>,
     pub(crate) protected_resource_ownership: Arc<crate::consent::ProtectedResourceOwnershipStore>,
     mutation_gates: MutationGates,
+    /// One observation of a tab at a time per session: collecting the page
+    /// and recording it happen as one step, so revisions are ordered.
+    observation_gates: super::keyed_gates::KeyedGates<(String, String, String)>,
     pub(crate) reconnect_gates: ReconnectGates,
     pending_existing_profile_cleanups: Mutex<HashMap<String, Vec<ExistingProfileSetupRequest>>>,
     session_end_hook: Mutex<Option<crate::session::SessionEndHookRegistration>>,
@@ -270,6 +273,8 @@ pub(crate) struct ValidatedTab {
     pub native: NativeWindowInfo,
     /// Flattened CDP session id attached to the tab's target.
     pub cdp_session: String,
+    /// The target's committed URL as the browser process reports it.
+    pub target_url: String,
 }
 
 fn viewport_point_to_screen(
@@ -449,6 +454,11 @@ pub(crate) struct SemanticSnapshotOutcome {
     pub outline_budget: usize,
     /// The same refs as a structured list, when it was asked for.
     pub listed: Option<Vec<Value>>,
+    /// The session's baseline revision after this read.
+    pub revision: Option<u64>,
+    /// A diff when one was asked for and possible; otherwise the snapshot
+    /// stands, with the reason a diff was not possible.
+    pub told: Told,
 }
 
 /// Default size of a whole semantic snapshot result, in serialized characters.
@@ -740,6 +750,7 @@ impl BrowserEngine {
             approval_broker,
             protected_resource_ownership,
             mutation_gates: MutationGates::new(),
+            observation_gates: super::keyed_gates::KeyedGates::new(),
             reconnect_gates: ReconnectGates::new(),
             pending_existing_profile_cleanups: Mutex::new(HashMap::new()),
             session_end_hook: Mutex::new(None),
@@ -1792,13 +1803,16 @@ impl BrowserEngine {
             ));
         }
 
+        let target_url = live.url.clone();
         let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
         let dispatch_context = crate::tool::current_dispatch_authorization_context();
         if dispatch_context
             .as_deref()
             .is_some_and(|context| context.capability_manifest().is_some())
         {
-            let live_url = self.live_top_level_url(&conn, &cdp_session).await?;
+            let live_url = self
+                .live_top_level_url(&conn, &cdp_session, &tab.cdp_target_id, &target_url)
+                .await?;
             // A browser mutation admitted for a delegated session must use
             // that exact session's capability manifest. Falling back to the
             // process compatibility manifest would let a missing task-local
@@ -1820,14 +1834,27 @@ impl BrowserEngine {
             tab,
             native,
             cdp_session,
+            target_url,
         })
     }
 
+    /// The live top-level document's URL, from the page's own frame tree.
+    ///
+    /// While a JavaScript dialog is open the page answers nothing, the
+    /// frame tree included, and nothing can navigate it either. The browser
+    /// process still reports the target's committed URL, which is what the
+    /// frame tree would say; without it the dialog could never be inspected
+    /// or resolved, since both are admitted against the live origin.
     async fn live_top_level_url(
         &self,
         conn: &CdpConnection,
         cdp_session: &str,
+        cdp_target_id: &str,
+        target_url: &str,
     ) -> Result<String, BrowserRefusal> {
+        if conn.dialog_state(cdp_target_id).is_some() && !target_url.is_empty() {
+            return Ok(target_url.to_owned());
+        }
         let frame_tree = conn
             .call(Some(cdp_session), "Page.getFrameTree", json!({}))
             .await
@@ -1857,7 +1884,12 @@ impl BrowserEngine {
             .revalidate_for_mutation(session, target_id, Some(tab_id))
             .await?;
         let live_url = self
-            .live_top_level_url(&validated.conn, &validated.cdp_session)
+            .live_top_level_url(
+                &validated.conn,
+                &validated.cdp_session,
+                &validated.tab.cdp_target_id,
+                &validated.target_url,
+            )
             .await?;
         let live_origin = protected_live_origin_scope(&live_url)?;
         Ok((validated, live_origin))
@@ -2145,7 +2177,7 @@ impl BrowserEngine {
             // element, which resolves its href as the browser would follow it.
             destination = self.live_href(conn, cdp_session, backend).await;
         }
-        Ok(Some(Fingerprint::read(entry, role, name, destination)))
+        Ok(Some(Fingerprint::read(role, name, destination)))
     }
 
     async fn live_href(&self, conn: &CdpConnection, cdp_session: &str, backend: i64) -> Option<String> {
@@ -2801,6 +2833,7 @@ impl BrowserEngine {
         continuation: Option<&str>,
         max_chars: usize,
         include_refs: bool,
+        since: Option<u64>,
     ) -> Result<SemanticSnapshotOutcome, BrowserRefusal> {
         if let Some(token) = continuation {
             if scope_ref.is_some() || query.is_some() {
@@ -2852,6 +2885,7 @@ impl BrowserEngine {
                 continuation.query.as_deref(),
                 continuation.scope_backend_node_id,
                 include_refs,
+                None,
             );
             let facts = include_refs.then(|| listed_facts(&page));
             let oopif = if continuation.oopif_supported {
@@ -2914,6 +2948,8 @@ impl BrowserEngine {
                 oopif,
                 outline_budget,
                 listed: facts.map(|facts| listed_refs(&lines, facts)),
+                revision: None,
+                told: Told::Snapshot { reason: None },
             });
         }
 
@@ -2932,8 +2968,20 @@ impl BrowserEngine {
                 format!("tab {tab_id} is not known for target {target_id}"),
             )
         })?;
+        // Collect and record as one step per session and tab (see the
+        // ownership table: observations of a tab run one at a time).
+        let _observing = self
+            .observation_gates
+            .lock((session.to_owned(), target_id.to_owned(), tab_id.to_owned()))
+            .await;
         let conn = self.connection_for_record(session, &record).await?;
         let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+        // A page behind an open JavaScript dialog answers nothing: say so
+        // instead of waiting for every read below to time out.
+        self.watch_dialogs(&conn, &cdp_session, &tab.cdp_target_id).await;
+        if let Some(dialog) = conn.dialog_state(&tab.cdp_target_id) {
+            return Err(dialog_open_refusal(&dialog));
+        }
         let (document, document_complete) = self.semantic_document(&conn, &cdp_session).await?;
         let root = document.get("root").cloned().unwrap_or(Value::Null);
         let url = root
@@ -3036,6 +3084,12 @@ impl BrowserEngine {
 
         semantic.complete &= semantic.title.is_some();
         let outline_budget = outline_budget(max_chars, &url, &title);
+        // A read that will be diffed stops where the baseline was cut.
+        let until = since.and_then(|since| {
+            let target = self.store.get_target(session, target_id).ok()?;
+            let space = target.tabs.get(tab_id)?.stable.space()?;
+            space.baseline_tail(since).cloned()
+        });
         let page = semantic.page_sized(
             0,
             DEFAULT_SEMANTIC_NODE_BUDGET,
@@ -3043,7 +3097,9 @@ impl BrowserEngine {
             query,
             scope_backend_node_id,
             include_refs,
+            until.as_ref(),
         );
+        let tail = page.tail.clone();
         let facts = include_refs.then(|| listed_facts(&page));
         let next_offset = page.next_offset;
         let (scope, kind) = if scope_ref.is_some() {
@@ -3088,8 +3144,10 @@ impl BrowserEngine {
                     &document_entries,
                     semantic.complete,
                     view,
+                    (&url, &title),
+                    tail,
                     kind,
-                    None,
+                    since,
                 );
                 let mut continuations = HashMap::new();
                 if let (Some(token), Some(offset)) = (continuation.clone(), next_offset) {
@@ -3135,9 +3193,282 @@ impl BrowserEngine {
             oopif,
             outline_budget,
             listed: facts.map(|facts| listed_refs(&recorded.lines, facts)),
+            revision: recorded.revision,
+            told: recorded.told,
         })
     }
+
+    // ── Dialogs, settling, and what a session holds ─────────────────────
+
+    /// Make this connection hear the tab's JavaScript dialog events. They
+    /// need the Page domain enabled on one attached session; its id is
+    /// registered first so an opening event that arrives before the reply
+    /// is still attributed to the tab. Best effort and bounded: with a
+    /// dialog already up, the enable itself may never answer, but Chrome
+    /// announces the open dialog to the newly enabled session.
+    pub(crate) async fn watch_dialogs(
+        &self,
+        conn: &CdpConnection,
+        cdp_session: &str,
+        cdp_target_id: &str,
+    ) {
+        if conn.dialog_state(cdp_target_id).is_some() || conn.has_dialog_session(cdp_target_id) {
+            return;
+        }
+        conn.register_dialog_session(cdp_session, cdp_target_id);
+        let enabled = tokio::time::timeout(
+            DIALOG_WATCH_TIMEOUT,
+            conn.call(Some(cdp_session), "Page.enable", json!({})),
+        )
+        .await;
+        if !matches!(enabled, Ok(Ok(_))) && conn.dialog_state(cdp_target_id).is_none() {
+            conn.unregister_dialog_session(cdp_session, cdp_target_id);
+        }
+    }
+
+    /// Run one CDP command that page script answers (input dispatch), but
+    /// stop waiting when a JavaScript dialog opens: the dialog blocks the
+    /// page, so the command's reply would only come once it is resolved.
+    pub(crate) async fn call_until_dialog(
+        &self,
+        conn: &CdpConnection,
+        cdp_session: &str,
+        cdp_target_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, CallStopped> {
+        let call = conn.call(Some(cdp_session), method, params);
+        tokio::pin!(call);
+        loop {
+            tokio::select! {
+                result = &mut call => return result.map_err(CallStopped::Failed),
+                _ = tokio::time::sleep(DIALOG_POLL) => {
+                    if let Some(dialog) = conn.dialog_state(cdp_target_id) {
+                        return Err(CallStopped::Dialog(dialog));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Wait, within bounds, until the page has stopped changing after an
+    /// action: two quiet polls of a mutation counter in a row, the deadline,
+    /// a new document, or a JavaScript dialog. The counter lives in a page
+    /// object only this session can reach; nothing is left for page script
+    /// to find, and no page timer is used (timers are throttled in covered
+    /// and background tabs).
+    pub(crate) async fn settle(&self, validated: &ValidatedTab) -> Settled {
+        let conn = &validated.conn;
+        let cdp = validated.cdp_session.as_str();
+        let target = validated.tab.cdp_target_id.as_str();
+        let started = tokio::time::Instant::now();
+        let dialog = || conn.dialog_state(target).map(Settled::Dialog);
+        if let Some(open) = dialog() {
+            return open;
+        }
+        let bounded = |method: &'static str, params: Value| async move {
+            tokio::time::timeout(SETTLE_CALL_TIMEOUT, conn.call(Some(cdp), method, params)).await
+        };
+        let counter = match bounded(
+            "Runtime.evaluate",
+            json!({ "expression": SETTLE_COUNTER, "objectGroup": "cua-settle" }),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value
+                .pointer("/result/objectId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            // The document is being replaced under the call.
+            Ok(Err(error)) if is_context_gone(&error) => {
+                return self.await_document(validated, started).await
+            }
+            // The page cannot run the counter: nothing says it settled.
+            Ok(Err(_)) => return Settled::Deadline,
+            // No answer: a dialog, or a document still being replaced.
+            Err(_) => None,
+        };
+        let Some(counter) = counter else {
+            return match dialog() {
+                Some(open) => open,
+                None => self.await_document(validated, started).await,
+            };
+        };
+        let mut quiet = 0;
+        while started.elapsed() < SETTLE_DEADLINE {
+            tokio::time::sleep(SETTLE_POLL).await;
+            if let Some(open) = dialog() {
+                return open;
+            }
+            match bounded(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": counter,
+                    "functionDeclaration": SETTLE_TAKE,
+                    "returnByValue": true,
+                }),
+            )
+            .await
+            {
+                Ok(Ok(value)) => match value.pointer("/result/value").and_then(Value::as_u64) {
+                    Some(0) => {
+                        quiet += 1;
+                        if quiet == SETTLE_QUIET_POLLS {
+                            let _ = bounded(
+                                "Runtime.callFunctionOn",
+                                json!({ "objectId": counter, "functionDeclaration": SETTLE_STOP }),
+                            )
+                            .await;
+                            return Settled::Quiet;
+                        }
+                    }
+                    Some(_) => quiet = 0,
+                    // The counter is gone with its document.
+                    None => return self.await_document(validated, started).await,
+                },
+                // The counter's document was replaced.
+                Ok(Err(_)) => return self.await_document(validated, started).await,
+                // No answer in time: a dialog shows up at the next poll.
+                Err(_) => {}
+            }
+        }
+        let _ = bounded(
+            "Runtime.callFunctionOn",
+            json!({ "objectId": counter, "functionDeclaration": SETTLE_STOP }),
+        )
+        .await;
+        Settled::Deadline
+    }
+
+    /// A new document is loading: wait, within bounds, until it has loaded.
+    pub(crate) async fn await_document(
+        &self,
+        validated: &ValidatedTab,
+        started: tokio::time::Instant,
+    ) -> Settled {
+        let conn = &validated.conn;
+        let target = validated.tab.cdp_target_id.as_str();
+        while started.elapsed() < NAVIGATION_DEADLINE {
+            if let Some(dialog) = conn.dialog_state(target) {
+                return Settled::Dialog(dialog);
+            }
+            let ready = tokio::time::timeout(
+                SETTLE_CALL_TIMEOUT,
+                conn.call(
+                    Some(&validated.cdp_session),
+                    "Runtime.evaluate",
+                    json!({ "expression": "document.readyState", "returnByValue": true }),
+                ),
+            )
+            .await;
+            match ready {
+                Ok(Ok(value))
+                    if value.pointer("/result/value").and_then(Value::as_str)
+                        == Some("complete") =>
+                {
+                    // One beat for scripts that render on load.
+                    tokio::time::sleep(SETTLE_POLL * 2).await;
+                    return Settled::NewDocument { loaded: true };
+                }
+                // Still loading, between documents, or slow: ask again.
+                Ok(Ok(_)) | Err(_) => {}
+                Ok(Err(error)) if is_context_gone(&error) => {}
+                // The page cannot be asked at all.
+                Ok(Err(_)) => break,
+            }
+            tokio::time::sleep(SETTLE_POLL).await;
+        }
+        Settled::NewDocument { loaded: false }
+    }
+
+    /// What the session holds for this tab: the baseline revision of its
+    /// semantic space, a `dom_refs_v1` snapshot, or nothing.
+    pub(crate) fn held_view(&self, session: &str, target_id: &str, tab_id: &str) -> HeldView {
+        let Ok(target) = self.store.get_target(session, target_id) else {
+            return HeldView::Nothing;
+        };
+        match target.tabs.get(tab_id) {
+            Some(tab) if !tab.snapshots.is_empty() => HeldView::DomRefs,
+            Some(tab) => match tab.stable.space().and_then(|space| space.baseline_revision()) {
+                Some(revision) => HeldView::Semantic(revision),
+                None => HeldView::Nothing,
+            },
+            None => HeldView::Nothing,
+        }
+    }
 }
+
+/// Whether a Runtime call failed because its document (execution context)
+/// was replaced while the call was under way.
+fn is_context_gone(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("context") || message.contains("inspected target navigated")
+}
+
+/// How a bounded wait for the page ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Settled {
+    Quiet,
+    /// Still changing when the wait ended.
+    Deadline,
+    /// The document was replaced; `loaded` is false when it had not finished
+    /// loading in time.
+    NewDocument { loaded: bool },
+    /// A JavaScript dialog is open: the page cannot be read.
+    Dialog(super::cdp_ws::CdpDialogState),
+}
+
+/// Why [`BrowserEngine::call_until_dialog`] did not return a reply.
+#[derive(Debug)]
+pub(crate) enum CallStopped {
+    Dialog(super::cdp_ws::CdpDialogState),
+    Failed(anyhow::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldView {
+    Nothing,
+    /// A `dom_refs_v1` snapshot: actions leave its refs alone and return no
+    /// page changes.
+    DomRefs,
+    /// The baseline revision an action's changes are made against.
+    Semantic(u64),
+}
+
+pub(crate) fn dialog_id(dialog: &super::cdp_ws::CdpDialogState) -> String {
+    format!("dialog-{}", dialog.generation)
+}
+
+pub(crate) fn dialog_open_refusal(dialog: &super::cdp_ws::CdpDialogState) -> BrowserRefusal {
+    let dialog_id = dialog_id(dialog);
+    refuse(
+        BrowserRefusalCode::BrowserDialogOpen,
+        format!(
+            "a JavaScript {} dialog is open in this tab and blocks the page; resolve it with \
+             browser_dialog (dialog_id {dialog_id}) before reading or acting",
+            dialog.kind
+        ),
+    )
+    .with_detail(json!({ "dialog_id": dialog_id, "kind": dialog.kind }))
+}
+
+const DIALOG_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+const DIALOG_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const SETTLE_QUIET_POLLS: u32 = 2;
+const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_500);
+const SETTLE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+const NAVIGATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+/// A mutation counter for the main document: `n` counts records the
+/// observer's callback has seen, `o` is the observer.
+const SETTLE_COUNTER: &str = "(() => { const s = { n: 0 }; \
+    s.o = new MutationObserver((records) => { s.n += records.length; }); \
+    s.o.observe(document, { subtree: true, childList: true, attributes: true, characterData: true }); \
+    return s; })()";
+const SETTLE_TAKE: &str =
+    "function() { const n = this.n + this.o.takeRecords().length; this.n = 0; return n; }";
+const SETTLE_STOP: &str = "function() { this.o.disconnect(); }";
+
 
 /// Attribute names that make an element interactive-enough to ref.
 const INTERACTIVE_ATTRS: &[&str] = &["onclick", "role", "contenteditable", "tabindex", "href"];

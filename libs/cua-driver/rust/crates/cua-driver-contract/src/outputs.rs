@@ -636,6 +636,111 @@ pub struct ActionEscalation {
     pub reason: ActionEscalationReason,
 }
 
+/// How a browser action's result describes the page afterwards.
+///
+/// - `diff`: `ops` turn the outline at `base_revision` into the one at
+///   `revision`.
+/// - `snapshot`: `outline` is the whole page outline at `revision`; `reason`
+///   says why it is not a diff.
+/// - `unavailable`: the page was not read after the action; `reason` says
+///   why. Nothing the session holds changed.
+// Variants carry no doc comments: the advertised schema stays a plain enum.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum PageChangesKind {
+    Diff,
+    Snapshot,
+    Unavailable,
+}
+
+/// What one keyed change does to the outline.
+///
+/// - `add`: a line that was not in the outline.
+/// - `change`: the same element, with another value, state or depth.
+/// - `move`: the same element at another place.
+/// - `leave`: a line that is no longer in the outline.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Enum)]
+#[serde(rename_all = "snake_case")]
+pub enum PageChangeOpKind {
+    Add,
+    Change,
+    Move,
+    Leave,
+}
+
+/// One keyed change to the page outline. `ref` is the line's ref.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct PageChangeOp {
+    pub op: PageChangeOpKind,
+    #[serde(rename = "ref")]
+    pub reference: String,
+    /// The line as it is now (add, change, move).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub line: Option<String>,
+    /// The ref of the line directly above it (add, move); absent when it is
+    /// the first line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<String>,
+    /// leave only. `true`: the element is gone and its ref is stale. Absent:
+    /// the element only left the ranked outline; its ref still works.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub gone: Option<bool>,
+}
+
+/// A page-owned JavaScript dialog that is open; resolve it with
+/// `browser_dialog` and this `dialog_id`.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct PageDialog {
+    pub dialog_id: String,
+    pub kind: String,
+}
+
+/// What the page showed once a browser action settled, against the outline
+/// the session held. These are observed changes: the page may have made
+/// some of them by itself.
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
+pub struct PageChanges {
+    pub kind: PageChangesKind,
+    /// snapshot: `no_baseline`, `document_changed`, `attachment_changed`,
+    /// `revision_unknown`, `coverage_changed`, `diff_larger_than_snapshot`.
+    /// unavailable: `javascript_dialog_open`, or the refusal code or error of
+    /// the read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reason: Option<String>,
+    /// The ref space (`p7` in `p7:12`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snapshot_id: Option<String>,
+    /// diff: the revision `ops` apply to. If the caller does not hold it,
+    /// it asks `get_browser_state` for a full snapshot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ops: Option<Vec<PageChangeOp>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outline: Option<String>,
+    /// The page address: always with a snapshot, with a diff only when it
+    /// changed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub url: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
+    /// snapshot: `false` when more of the page is reached by `continuation`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub complete: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub continuation: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dialog: Option<PageDialog>,
+    /// `false`: the page was still changing when the bounded wait ended.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub settled: Option<bool>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActionResult {
@@ -660,6 +765,9 @@ pub struct ActionResult {
     /// types or submits). Read state before resending it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub idempotent: Option<bool>,
+    /// Browser page actions only: what the page showed afterwards.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub changes: Option<PageChanges>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -813,6 +921,7 @@ mod tests {
             summary: None,
             error: None,
             idempotent: None,
+            changes: None,
         }
     }
 
@@ -826,6 +935,7 @@ mod tests {
         assert_eq!(
             properties.keys().map(String::as_str).collect::<Vec<_>>(),
             [
+                "changes",
                 "delivery",
                 "effect",
                 "error",
@@ -835,6 +945,13 @@ mod tests {
                 "route",
                 "summary"
             ]
+        );
+        let changes = object_variant(&properties["changes"]);
+        assert_eq!(changes["additionalProperties"], false);
+        assert_eq!(changes["required"], json!(["kind"]));
+        assert_eq!(
+            changes["properties"]["kind"]["enum"],
+            json!(["diff", "snapshot", "unavailable"])
         );
         assert_eq!(
             properties["effect"]["enum"],

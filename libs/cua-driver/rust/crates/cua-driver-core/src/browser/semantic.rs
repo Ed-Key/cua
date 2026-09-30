@@ -10,7 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
-use super::observation::{ViewNode, REF_SLOT};
+use super::observation::{NodeKey, ViewNode, REF_SLOT};
 use super::store::{BrowserActionKind, BrowserVisibility, FrameKind, FrameRef, RefEntry};
 
 pub(crate) const SEMANTIC_COMPUTED_STYLES: &[&str] = &[
@@ -178,6 +178,8 @@ pub(crate) struct SemanticPage {
     pub(crate) view: Vec<ViewNode>,
     /// Each line's value, for the optional structured ref list.
     pub(crate) values: Vec<Option<String>>,
+    /// The lowest-ranked node selected, when a budget left others out.
+    pub(crate) tail: Option<NodeKey>,
     /// The ranked nodes this page selected (their ancestors are in `view`).
     #[cfg(test)]
     pub(crate) selected: Vec<SemanticNode>,
@@ -263,11 +265,19 @@ impl SemanticDocument {
             query,
             scope_backend_node_id,
             false,
+            None,
         )
     }
 
     /// [`Self::page`], with `listed` when the result also carries the
     /// structured ref list, whose entries then count against the budget.
+    ///
+    /// `until` is where the view this one will be compared with was cut
+    /// (its lowest-ranked node). While that node is still ranked, this page
+    /// stops there too, within twice the character budget: what entered or
+    /// left above the cut is then the page's doing, not the budget's.
+    // The parameters are one request for one page of the ranked set.
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn page_sized(
         &self,
         offset: usize,
@@ -276,6 +286,7 @@ impl SemanticDocument {
         query: Option<&str>,
         scope_backend_node_id: Option<i64>,
         listed: bool,
+        until: Option<&NodeKey>,
     ) -> SemanticPage {
         let by_ax_id = ax_index(&self.nodes);
         let mut candidates = scoped_indices(&self.nodes, query, scope_backend_node_id);
@@ -298,8 +309,18 @@ impl SemanticDocument {
             )
         });
 
+        let key_of = |idx: usize| self.nodes[idx].to_ref_entry().map(|entry| NodeKey::of(&entry));
         let start = offset.min(candidates.len());
-        let widest = (start + node_budget.max(1)).min(candidates.len());
+        let mut widest = (start + node_budget.max(1)).min(candidates.len());
+        let mut char_budget = char_budget;
+        if let Some(cut) = until.and_then(|until| {
+            candidates[start..widest]
+                .iter()
+                .position(|idx| key_of(*idx).as_ref() == Some(until))
+        }) {
+            widest = start + cut + 1;
+            char_budget = char_budget.saturating_mul(2);
+        }
         let render = |end: usize| {
             render_view(
                 &self.nodes,
@@ -332,6 +353,9 @@ impl SemanticDocument {
             view = render(end);
         }
         let (view, values) = view;
+        let tail = (end < candidates.len() && end > start)
+            .then(|| key_of(candidates[end - 1]))
+            .flatten();
         let page_slice = &candidates[start..end];
         #[cfg(test)]
         let selected = page_slice
@@ -364,6 +388,7 @@ impl SemanticDocument {
         SemanticPage {
             view,
             values,
+            tail,
             #[cfg(test)]
             selected,
             selected_nodes: page_slice.len(),
@@ -1363,13 +1388,31 @@ fn ax_index(nodes: &[SemanticNode]) -> HashMap<&str, usize> {
         .collect()
 }
 
-/// A node that says nothing by itself: a document root, an unnamed wrapper
-/// with no action, or the inner editing box of a field that is itself
-/// listed. Its children are shown under the nearest listed ancestor.
+/// A node that says nothing by itself: a document root, a list bullet, an
+/// unnamed wrapper with no action, the inner editing box of a field that is
+/// itself listed, or the text inside a field that repeats the field's value.
+/// Its children are shown under the nearest listed ancestor.
 fn is_structure_only(nodes: &[SemanticNode], by_ax_id: &HashMap<&str, usize>, idx: usize) -> bool {
     let node = &nodes[idx];
-    if matches!(node.role.as_str(), "rootwebarea" | "webarea") {
+    if matches!(node.role.as_str(), "rootwebarea" | "webarea" | "listmarker") {
         return true;
+    }
+    let parent = |node: &SemanticNode| {
+        node.parent_ax_id
+            .as_deref()
+            .and_then(|parent| by_ax_id.get(parent))
+            .map(|parent| &nodes[*parent])
+    };
+    if matches!(node.role.as_str(), "statictext" | "text") && node.name.is_some() {
+        // An input's text sits under its inner editing box: look two up.
+        let mut above = parent(node);
+        for _ in 0..2 {
+            let Some(field) = above else { break };
+            if field.actions.contains(&BrowserActionKind::Type) && field.value == node.name {
+                return true;
+            }
+            above = parent(field);
+        }
     }
     if !matches!(node.role.as_str(), "generic" | "none" | "presentation")
         || node.name.is_some()
@@ -1378,11 +1421,7 @@ fn is_structure_only(nodes: &[SemanticNode], by_ax_id: &HashMap<&str, usize>, id
         return false;
     }
     node.actions.is_empty()
-        || node
-            .parent_ax_id
-            .as_deref()
-            .and_then(|parent| by_ax_id.get(parent))
-            .is_some_and(|parent| nodes[*parent].actions.contains(&BrowserActionKind::Type))
+        || parent(node).is_some_and(|parent| parent.actions.contains(&BrowserActionKind::Type))
 }
 
 /// JSON-escaped length of the outline these lines make, refs counted at
@@ -1750,8 +1789,11 @@ mod tests {
             ax_node("root", None, Some(90), "RootWebArea", Some("Share")),
             ax_node("card", Some("root"), Some(1), "generic", None),
             ax_node("email", Some("card"), Some(2), "textbox", Some("Email")),
-            // The field's inner editing box: no DOM entry, typable by state.
+            // The field's inner editing box and the text in it: no DOM
+            // entry, typable by state, and only repeating the field's value.
             ax_node("inner", Some("email"), Some(20), "generic", None),
+            ax_node("typed", Some("inner"), Some(21), "StaticText", Some("ada@x.com")),
+            ax_node("bullet", Some("viewer"), Some(22), "ListMarker", Some("•")),
             ax_node("role", Some("card"), Some(3), "button", Some("Role")),
             // A mock accessibility object: no DOM node at all.
             ax_node("popup", Some("role"), None, "menulistpopup", None),
@@ -1766,9 +1808,10 @@ mod tests {
             {"name": "focusable", "value": {"value": true}},
             {"name": "editable", "value": {"value": "plaintext"}}]);
         nodes[3]["properties"] = json!([{"name": "editable", "value": {"value": "plaintext"}}]);
-        nodes[4]["properties"] = json!([{"name": "expanded", "value": {"value": true}}]);
-        nodes[7]["properties"] = json!([{"name": "selected", "value": {"value": true}}]);
-        nodes[9]["properties"] = json!([{"name": "disabled", "value": {"value": true}}]);
+        nodes[4]["properties"] = json!([{"name": "editable", "value": {"value": "plaintext"}}]);
+        nodes[6]["properties"] = json!([{"name": "expanded", "value": {"value": true}}]);
+        nodes[9]["properties"] = json!([{"name": "selected", "value": {"value": true}}]);
+        nodes[11]["properties"] = json!([{"name": "disabled", "value": {"value": true}}]);
         compose_accessibility_tree(
             &json!({ "nodes": nodes }),
             &dom,
@@ -1793,8 +1836,9 @@ mod tests {
             ]
             .join("\n")
         );
-        // The unnamed wrapper, the field's inner box and the page root say
-        // nothing; the mock popup has no DOM node to hang a ref on.
+        // The unnamed wrapper, the field's inner box and its text, the list
+        // bullet and the page root say nothing; the mock popup has no DOM
+        // node to hang a ref on.
         assert_eq!(page.omissions.no_dom_node, 1);
         assert_eq!(page.selected_nodes, 6);
     }
@@ -1814,6 +1858,34 @@ mod tests {
         let tiny = document.page(0, 300, 1, None, None);
         assert_eq!(tiny.selected_nodes, 1);
         assert_eq!(tiny.next_offset, Some(1));
+    }
+
+    #[test]
+    fn a_page_read_to_be_compared_stops_where_the_earlier_one_was_cut() {
+        let document = share_form();
+        let whole = document.page(0, 300, usize::MAX, None, None);
+        assert_eq!(whole.tail, None, "nothing was left out");
+        // A budget that leaves the last two nodes out.
+        let cut = document.page(0, whole.selected_nodes - 2, usize::MAX, None, None);
+        let tail = cut.tail.clone().expect("the view was cut");
+
+        // Read again with room for everything: it still stops at that node.
+        let again = document.page_sized(0, 300, usize::MAX, None, None, false, Some(&tail));
+        assert_eq!(again.selected_nodes, cut.selected_nodes);
+        assert_eq!(again.outline_with("R"), cut.outline_with("R"));
+        assert_eq!(again.tail, Some(tail.clone()));
+
+        // A line above the cut grew: the cut does not move for it, even
+        // though the old character budget alone would now fit one node less.
+        let budget = serialized_chars(&cut.view);
+        let mut grown = share_form();
+        let longer = Some("a much longer address than before@example.com".to_owned());
+        grown.nodes.iter_mut().find(|node| node.role == "textbox").unwrap().value = longer.clone();
+        grown.nodes.iter_mut().find(|node| node.role == "statictext").unwrap().name = longer;
+        let refit = grown.page(0, 300, budget, None, None);
+        assert!(refit.selected_nodes < cut.selected_nodes);
+        let pinned = grown.page_sized(0, 300, budget, None, None, false, Some(&tail));
+        assert_eq!(pinned.selected_nodes, cut.selected_nodes);
     }
 
     #[test]

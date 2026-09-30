@@ -458,6 +458,155 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "changes": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dialog": {
+                "additionalProperties": false,
+                "properties": {
+                  "dialog_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "dialog_id",
+                  "kind"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "diff",
+                  "snapshot",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "ops": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "after": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "gone": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "change",
+                        "move",
+                        "leave"
+                      ],
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "ref"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "outline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "settled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -900,6 +1049,155 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "changes": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dialog": {
+                "additionalProperties": false,
+                "properties": {
+                  "dialog_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "dialog_id",
+                  "kind"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "diff",
+                  "snapshot",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "ops": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "after": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "gone": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "change",
+                        "move",
+                        "leave"
+                      ],
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "ref"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "outline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "settled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -2574,6 +2872,155 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "changes": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dialog": {
+                "additionalProperties": false,
+                "properties": {
+                  "dialog_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "dialog_id",
+                  "kind"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "diff",
+                  "snapshot",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "ops": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "after": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "gone": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "change",
+                        "move",
+                        "leave"
+                      ],
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "ref"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "outline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "settled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -2784,6 +3231,155 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "changes": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dialog": {
+                "additionalProperties": false,
+                "properties": {
+                  "dialog_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "dialog_id",
+                  "kind"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "diff",
+                  "snapshot",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "ops": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "after": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "gone": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "change",
+                        "move",
+                        "leave"
+                      ],
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "ref"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "outline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "settled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -3437,6 +4033,155 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "changes": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dialog": {
+                "additionalProperties": false,
+                "properties": {
+                  "dialog_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "dialog_id",
+                  "kind"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "diff",
+                  "snapshot",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "ops": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "after": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "gone": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "change",
+                        "move",
+                        "leave"
+                      ],
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "ref"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "outline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "settled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -4196,6 +4941,155 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "changes": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dialog": {
+                "additionalProperties": false,
+                "properties": {
+                  "dialog_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "dialog_id",
+                  "kind"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "diff",
+                  "snapshot",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "ops": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "after": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "gone": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "change",
+                        "move",
+                        "leave"
+                      ],
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "ref"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "outline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "settled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -4615,6 +5509,155 @@
                     {
                       "additionalProperties": false,
                       "properties": {
+                        "changes": {
+                          "additionalProperties": false,
+                          "properties": {
+                            "base_revision": {
+                              "format": "uint64",
+                              "minimum": 0,
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "complete": {
+                              "type": [
+                                "boolean",
+                                "null"
+                              ]
+                            },
+                            "continuation": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "dialog": {
+                              "additionalProperties": false,
+                              "properties": {
+                                "dialog_id": {
+                                  "type": "string"
+                                },
+                                "kind": {
+                                  "type": "string"
+                                }
+                              },
+                              "required": [
+                                "dialog_id",
+                                "kind"
+                              ],
+                              "type": [
+                                "object",
+                                "null"
+                              ]
+                            },
+                            "kind": {
+                              "enum": [
+                                "diff",
+                                "snapshot",
+                                "unavailable"
+                              ],
+                              "type": "string"
+                            },
+                            "ops": {
+                              "items": {
+                                "additionalProperties": false,
+                                "properties": {
+                                  "after": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "gone": {
+                                    "type": [
+                                      "boolean",
+                                      "null"
+                                    ]
+                                  },
+                                  "line": {
+                                    "type": [
+                                      "string",
+                                      "null"
+                                    ]
+                                  },
+                                  "op": {
+                                    "enum": [
+                                      "add",
+                                      "change",
+                                      "move",
+                                      "leave"
+                                    ],
+                                    "type": "string"
+                                  },
+                                  "ref": {
+                                    "type": "string"
+                                  }
+                                },
+                                "required": [
+                                  "op",
+                                  "ref"
+                                ],
+                                "type": "object"
+                              },
+                              "type": [
+                                "array",
+                                "null"
+                              ]
+                            },
+                            "outline": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "reason": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "revision": {
+                              "format": "uint64",
+                              "minimum": 0,
+                              "type": [
+                                "integer",
+                                "null"
+                              ]
+                            },
+                            "settled": {
+                              "type": [
+                                "boolean",
+                                "null"
+                              ]
+                            },
+                            "snapshot_id": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "title": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            },
+                            "url": {
+                              "type": [
+                                "string",
+                                "null"
+                              ]
+                            }
+                          },
+                          "required": [
+                            "kind"
+                          ],
+                          "type": [
+                            "object",
+                            "null"
+                          ]
+                        },
                         "delivery": {
                           "additionalProperties": false,
                           "properties": {
@@ -5102,6 +6145,155 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "changes": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dialog": {
+                "additionalProperties": false,
+                "properties": {
+                  "dialog_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "dialog_id",
+                  "kind"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "diff",
+                  "snapshot",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "ops": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "after": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "gone": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "change",
+                        "move",
+                        "leave"
+                      ],
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "ref"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "outline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "settled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -5625,6 +6817,155 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "changes": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dialog": {
+                "additionalProperties": false,
+                "properties": {
+                  "dialog_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "dialog_id",
+                  "kind"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "diff",
+                  "snapshot",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "ops": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "after": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "gone": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "change",
+                        "move",
+                        "leave"
+                      ],
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "ref"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "outline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "settled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {
@@ -6017,6 +7358,155 @@
       "success_output_schema": {
         "additionalProperties": false,
         "properties": {
+          "changes": {
+            "additionalProperties": false,
+            "properties": {
+              "base_revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "complete": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "continuation": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "dialog": {
+                "additionalProperties": false,
+                "properties": {
+                  "dialog_id": {
+                    "type": "string"
+                  },
+                  "kind": {
+                    "type": "string"
+                  }
+                },
+                "required": [
+                  "dialog_id",
+                  "kind"
+                ],
+                "type": [
+                  "object",
+                  "null"
+                ]
+              },
+              "kind": {
+                "enum": [
+                  "diff",
+                  "snapshot",
+                  "unavailable"
+                ],
+                "type": "string"
+              },
+              "ops": {
+                "items": {
+                  "additionalProperties": false,
+                  "properties": {
+                    "after": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "gone": {
+                      "type": [
+                        "boolean",
+                        "null"
+                      ]
+                    },
+                    "line": {
+                      "type": [
+                        "string",
+                        "null"
+                      ]
+                    },
+                    "op": {
+                      "enum": [
+                        "add",
+                        "change",
+                        "move",
+                        "leave"
+                      ],
+                      "type": "string"
+                    },
+                    "ref": {
+                      "type": "string"
+                    }
+                  },
+                  "required": [
+                    "op",
+                    "ref"
+                  ],
+                  "type": "object"
+                },
+                "type": [
+                  "array",
+                  "null"
+                ]
+              },
+              "outline": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "reason": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "revision": {
+                "format": "uint64",
+                "minimum": 0,
+                "type": [
+                  "integer",
+                  "null"
+                ]
+              },
+              "settled": {
+                "type": [
+                  "boolean",
+                  "null"
+                ]
+              },
+              "snapshot_id": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "title": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              },
+              "url": {
+                "type": [
+                  "string",
+                  "null"
+                ]
+              }
+            },
+            "required": [
+              "kind"
+            ],
+            "type": [
+              "object",
+              "null"
+            ]
+          },
           "delivery": {
             "additionalProperties": false,
             "properties": {

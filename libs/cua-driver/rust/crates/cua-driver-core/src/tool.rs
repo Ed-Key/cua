@@ -930,6 +930,12 @@ impl ToolRegistry {
         crate::perception_tools::register_perception_tool(self, client, resolve_binding);
     }
 
+    /// The slot composite tools dispatch their child calls through: it holds
+    /// this registry once [`Self::init_self_weak`] has run.
+    pub(crate) fn composite_registry_slot(&self) -> ReplayRegistrySlot {
+        self.replay_registry.clone()
+    }
+
     /// Wire up the replay and sequence tools' weak self-reference.
     /// Call this once, immediately after `Arc::new(registry)`.
     pub fn init_self_weak(self: &Arc<Self>) {
@@ -2890,6 +2896,17 @@ fn publish_action_result(result: &mut ToolResult, idempotent: bool) -> Result<()
     // Moves, toggles, typing and submits repeat when resent: say so, so an
     // unconfirmed effect is read before it is sent again.
     public.idempotent = (!idempotent).then_some(false);
+    // A browser action's observation of the page afterwards. The producer
+    // obtained it through an authorized get_browser_state dispatch; here it
+    // only has to fit the closed contract.
+    public.changes = result
+        .structured_content
+        .as_ref()
+        .and_then(|structured| structured.get("changes"))
+        .filter(|changes| !changes.is_null())
+        .map(|changes| serde_json::from_value(changes.clone()))
+        .transpose()
+        .map_err(|error| format!("invalid page changes: {error}"))?;
     public
         .validate_invariants()
         .map_err(|error| format!("invalid public projection: {error}"))?;

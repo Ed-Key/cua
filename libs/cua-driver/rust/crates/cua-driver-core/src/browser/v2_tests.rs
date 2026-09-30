@@ -101,6 +101,17 @@ struct FixtureState {
     /// The debugger was detached from the tab (the user cancelled Chrome's
     /// banner): reported, as the relay does, before the next attach answers.
     detached: bool,
+    /// What the page does when it is clicked: rename nodes, remove nodes.
+    click_renames: Vec<(i64, String)>,
+    click_removes: Vec<i64>,
+    /// The click handler calls alert(): the dialog opens and the page
+    /// answers nothing until it is resolved.
+    click_opens_dialog: bool,
+    dialog_open: bool,
+    /// The session that enabled the Page domain (it hears dialog events).
+    page_session: Option<String>,
+    /// Mutation records the page made since the settle counter last read.
+    pending_mutations: u64,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -141,6 +152,12 @@ impl Default for FixtureState {
             renamed: Default::default(),
             removed: Default::default(),
             detached: false,
+            click_renames: Vec::new(),
+            click_removes: Vec::new(),
+            click_opens_dialog: false,
+            dialog_open: false,
+            page_session: None,
+            pending_mutations: 0,
             calls: Vec::new(),
         }
     }
@@ -572,6 +589,11 @@ fn fixture_ax_tree(st: &FixtureState, is_oopif: bool, frame_id: &str) -> Value {
             .as_i64()
             .is_some_and(|backend| st.removed.contains(&backend))
     });
+    if let Some(value) = &st.field_value {
+        for node in nodes.iter_mut().filter(|node| node["backendDOMNodeId"] == 2010) {
+            node["value"] = json!({ "value": value });
+        }
+    }
     for node in nodes {
         if let Some(name) = node["backendDOMNodeId"]
             .as_i64()
@@ -595,7 +617,68 @@ fn fixture_handler(state: SharedState) -> MockHandler {
         let is_tab = sess.starts_with("tab-sess-");
         let is_oopif = sess.starts_with("oopif-sess-");
 
+        // The page's own click handler, run by either click route.
+        let clicked = (call.method == "Input.dispatchMouseEvent"
+            && call.params["type"] == "mouseReleased")
+            || (call.method == "Runtime.callFunctionOn"
+                && call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|function| function.contains("this.click()")));
+        if clicked {
+            let renames = std::mem::take(&mut st.click_renames);
+            let removes = std::mem::take(&mut st.click_removes);
+            st.pending_mutations += (renames.len() + removes.len()) as u64;
+            st.renamed.extend(renames);
+            st.removed.extend(removes);
+            if std::mem::take(&mut st.click_opens_dialog) {
+                st.dialog_open = true;
+                return MockReply::ok(json!({}))
+                    .with_events(vec![MockEvent {
+                        method: "Page.javascriptDialogOpening".into(),
+                        session_id: st.page_session.clone(),
+                        params: json!({"type": "alert", "message": "private dialog text"}),
+                    }])
+                    .unanswered();
+            }
+        }
+        // A page behind a dialog answers only what the browser process does.
+        if st.dialog_open
+            && (is_tab || is_oopif)
+            && !matches!(
+                call.method.as_str(),
+                "Page.handleJavaScriptDialog" | "Page.enable"
+            )
+        {
+            return MockReply::ok(json!({})).unanswered();
+        }
+
         match call.method.as_str() {
+            "Page.enable" if is_tab => {
+                st.page_session = Some(sess.clone());
+                MockReply::ok(json!({}))
+            }
+            "Page.handleJavaScriptDialog" if st.dialog_open => {
+                st.dialog_open = false;
+                MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Page.javascriptDialogClosed".into(),
+                    session_id: st.page_session.clone(),
+                    params: json!({"result": true, "userInput": ""}),
+                }])
+            }
+            "Runtime.evaluate"
+                if call.params["expression"]
+                    .as_str()
+                    .is_some_and(|expression| expression.contains("MutationObserver")) =>
+            {
+                MockReply::ok(json!({"result": {"type": "object", "objectId": "settle-counter"}}))
+            }
+            "Runtime.evaluate" if call.params["expression"] == "document.readyState" => {
+                MockReply::ok(json!({"result": {"type": "string", "value": "complete"}}))
+            }
+            "Runtime.callFunctionOn" if call.params["objectId"] == "settle-counter" => {
+                let records = std::mem::take(&mut st.pending_mutations);
+                MockReply::ok(json!({"result": {"type": "number", "value": records}}))
+            }
             "Target.getTargets" => MockReply::ok(json!({
                 "targetInfos": [{
                     "targetId": "T1",
@@ -871,6 +954,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 }
             }
             "Input.insertText" => {
+                st.pending_mutations += 1;
                 let digits_only = st.field_digits_only;
                 if let Some(value) = st.field_value.as_mut() {
                     value.extend(
@@ -4078,4 +4162,365 @@ async fn semantic_link_urls_reach_query_and_continuation_outputs() {
         .find(|r| r["name"] == "Reply")
         .unwrap();
     assert_eq!(reply["url"], "https://example.test/book?slot=1#court");
+}
+
+// ── Page changes in action results (through the real registry) ──────────────
+//
+// The tools run inside a ToolRegistry here, as they do in the daemon: the
+// read after an action is a get_browser_state call the registry dispatches.
+
+fn unrestricted() -> Arc<crate::session_authorization::EffectiveAuthorizationContext> {
+    use crate::authorization::PermissionMode;
+    use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+    SessionAuthorizationRegistry::with_ceiling(
+        SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Unrestricted],
+            true,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    )
+    .compatibility_context(PermissionMode::Unrestricted, None)
+    .unwrap()
+}
+
+/// A registry with the browser tools of one fixture, bound to a tab, and a
+/// session label of its own.
+struct Agent {
+    registry: Arc<crate::tool::ToolRegistry>,
+    context: Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+    session: String,
+    target: String,
+    tab: String,
+}
+
+impl Agent {
+    async fn bound(f: &Fixture, session: &str) -> Self {
+        let mut registry = crate::tool::ToolRegistry::new();
+        super::tools::register_browser_tools(&f.engine, &mut registry);
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        let mut agent = Self {
+            registry,
+            context: unrestricted(),
+            session: session.to_owned(),
+            target: String::new(),
+            tab: String::new(),
+        };
+        let bound = agent
+            .call("get_browser_state", json!({ "pid": 1, "window_id": 7 }))
+            .await;
+        assert_eq!(bound["status"], "ok", "{bound}");
+        agent.target = bound["target_id"].as_str().unwrap().to_owned();
+        agent.tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
+        agent
+    }
+
+    /// Call a tool on the bound tab; returns its structured content.
+    async fn call(&self, name: &str, mut args: Value) -> Value {
+        let object = args.as_object_mut().unwrap();
+        object.insert("session".into(), json!(self.session));
+        if !self.target.is_empty() && !object.contains_key("pid") {
+            object.insert("target_id".into(), json!(self.target));
+            object.insert("tab_id".into(), json!(self.tab));
+        }
+        let result = self
+            .registry
+            .invoke_with_context(name, args, self.context.clone())
+            .await;
+        result.structured_content.unwrap_or_else(|| {
+            panic!("{name} returned no structured content: {:?}", result.content)
+        })
+    }
+
+    async fn snapshot(&self) -> Value {
+        with_outline_entries(self.call("get_browser_state", json!({})).await)
+    }
+}
+
+/// Apply a diff's keyed ops to an outline, as an agent would.
+fn apply_changes(outline: &str, changes: &Value) -> String {
+    let mut lines: Vec<(String, String)> = outline
+        .lines()
+        .map(|line| (parse_outline_line(line)["ref"].as_str().unwrap().to_owned(), line.to_owned()))
+        .collect();
+    let ops = changes["ops"].as_array().expect("diff ops");
+    for op in ops {
+        let key = op["ref"].as_str().unwrap();
+        match op["op"].as_str().unwrap() {
+            "leave" | "move" => lines.retain(|(held, _)| held != key),
+            "change" => {
+                lines.iter_mut().find(|(held, _)| held == key).expect("changed line").1 =
+                    op["line"].as_str().unwrap().to_owned()
+            }
+            _ => {}
+        }
+    }
+    for op in ops {
+        if matches!(op["op"].as_str(), Some("add" | "move")) {
+            let at = match op["after"].as_str() {
+                None => 0,
+                Some(after) => lines.iter().position(|(held, _)| held == after).expect("anchor") + 1,
+            };
+            lines.insert(
+                at,
+                (op["ref"].as_str().unwrap().to_owned(), op["line"].as_str().unwrap().to_owned()),
+            );
+        }
+    }
+    lines.into_iter().map(|(_, line)| line).collect::<Vec<_>>().join("\n")
+}
+
+/// Two outlines of one page state agree line for line up to where the size
+/// budget cut the shorter one. (A diffed read stops where its baseline was
+/// cut; a plain read is cut afresh.)
+fn assert_same_page(applied: &str, fresh: &str) {
+    let (shorter, longer) = if applied.len() <= fresh.len() {
+        (applied, fresh)
+    } else {
+        (fresh, applied)
+    };
+    assert!(
+        longer.starts_with(shorter) && shorter.lines().count() > 3,
+        "the diff does not lead to the page as read:\n{applied}\n--- fresh:\n{fresh}"
+    );
+}
+
+#[tokio::test]
+async fn typing_returns_the_changed_line_as_a_diff_from_the_held_revision() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+    })
+    .await;
+    let agent = Agent::bound(&f, "changes-type").await;
+    let first = agent.snapshot().await;
+    let editor = named_ref(&first, "Reply body");
+
+    let typed = agent
+        .call("browser_type", json!({ "ref": editor, "text": "hello" }))
+        .await;
+    assert_eq!(typed["effect"], "confirmed", "{typed}");
+    let changes = &typed["changes"];
+    assert_eq!(changes["kind"], "diff", "{typed}");
+    assert_eq!(changes["base_revision"], first["snapshot"]["revision"], "{typed}");
+    assert_eq!(changes["snapshot_id"], first["snapshot"]["id"]);
+    let ops = changes["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 1, "{typed}");
+    assert_eq!(ops[0]["op"], "change");
+    assert_eq!(ops[0]["ref"], editor);
+    assert_eq!(
+        ops[0]["line"],
+        format!("- textbox \"Reply body\" [{editor} type] = \"hello\"")
+    );
+    // The whole result is small: one changed line, not a page.
+    assert!(typed.to_string().chars().count() < 1_500, "{typed}");
+
+    // Applying the diff to the outline held gives what a fresh read shows.
+    let fresh = agent.snapshot().await;
+    assert_same_page(
+        &apply_changes(first["outline"].as_str().unwrap(), changes),
+        fresh["outline"].as_str().unwrap(),
+    );
+    assert!(fresh["snapshot"]["revision"].as_u64() > changes["revision"].as_u64());
+}
+
+#[tokio::test]
+async fn a_click_reports_gone_and_new_elements_and_what_the_page_did_by_itself() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-click").await;
+    let first = agent.snapshot().await;
+    let reply = named_ref(&first, "Reply");
+
+    {
+        let mut state = f.state.lock().unwrap();
+        // Before the action, by itself, the page dropped a visible line.
+        state.removed.insert(2003);
+        // The click turns the Reply button into a Sent button.
+        state.click_renames.push((2011, "Sent".into()));
+    }
+    let clicked = agent
+        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .await;
+    let changes = &clicked["changes"];
+    assert_eq!(changes["kind"], "diff", "{clicked}");
+    let ops = changes["ops"].as_array().unwrap();
+    let gone: Vec<&str> = ops
+        .iter()
+        .filter(|op| op["op"] == "leave" && op["gone"] == true)
+        .map(|op| op["ref"].as_str().unwrap())
+        .collect();
+    assert!(gone.contains(&reply.as_str()), "the old button is gone: {clicked}");
+    assert_eq!(gone.len(), 2, "and so is the line the page dropped by itself: {clicked}");
+    let added: Vec<&Value> = ops.iter().filter(|op| op["op"] == "add").collect();
+    assert_eq!(added.len(), 1, "{clicked}");
+    assert!(added[0]["line"].as_str().unwrap().contains("button \"Sent\""));
+    assert_ne!(added[0]["ref"], reply, "another element, another ref");
+
+    let fresh = agent.snapshot().await;
+    assert_same_page(
+        &apply_changes(first["outline"].as_str().unwrap(), changes),
+        fresh["outline"].as_str().unwrap(),
+    );
+    // The new ref acts; the old one is stale.
+    let sent = added[0]["ref"].as_str().unwrap();
+    let again = agent
+        .call("browser_click", json!({ "ref": sent, "input_route": "dom_event" }))
+        .await;
+    assert_eq!(again["changes"]["kind"], "diff", "{again}");
+    assert_eq!(again["changes"]["ops"], json!([]), "nothing changed this time");
+    let stale = agent
+        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .await;
+    assert_eq!(stale["error"]["code"], "browser_ref_stale", "{stale}");
+}
+
+#[tokio::test]
+async fn navigation_returns_the_new_page_as_a_full_snapshot_with_the_reason() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-navigate").await;
+    let first = agent.snapshot().await;
+    let reply = named_ref(&first, "Reply");
+
+    {
+        // The browser publishes the new document when Page.navigate lands.
+        let mut state = f.state.lock().unwrap();
+        state.main_loader = "L_MAIN_2".into();
+        state.main_url = "https://fixture.test/second".into();
+        set_page_title(&mut state, Some("Second page"));
+    }
+    let navigated = agent
+        .call("browser_navigate", json!({ "url": "https://fixture.test/second" }))
+        .await;
+    assert_eq!(navigated["status"], "ok", "{navigated}");
+    let changes = &navigated["changes"];
+    assert_eq!(changes["kind"], "snapshot", "{navigated}");
+    assert_eq!(changes["reason"], "document_changed");
+    assert_eq!(changes["url"], "https://fixture.test/second");
+    assert_eq!(changes["title"], "Second page");
+    assert!(changes["outline"].as_str().unwrap().contains("button \"Reply\""));
+    assert_ne!(changes["snapshot_id"], first["snapshot"]["id"]);
+
+    let stale = agent
+        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .await;
+    assert_eq!(stale["error"]["code"], "browser_ref_stale", "{stale}");
+    // The snapshot in the result is a baseline like any other.
+    let next = with_outline_entries(json!({ "outline": changes["outline"] }));
+    let clicked = agent
+        .call(
+            "browser_click",
+            json!({ "ref": named_ref(&next, "Reply"), "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(clicked["changes"]["kind"], "diff", "{clicked}");
+    assert_eq!(clicked["changes"]["base_revision"], changes["revision"]);
+}
+
+#[tokio::test]
+async fn an_action_with_nothing_held_returns_a_full_snapshot() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-nothing-held").await;
+    let clicked = agent.call("browser_click", json!({ "x": 30, "y": 40 })).await;
+    assert_eq!(clicked["changes"]["kind"], "snapshot", "{clicked}");
+    assert_eq!(clicked["changes"]["reason"], "no_baseline");
+    assert!(clicked["changes"]["outline"].as_str().unwrap().contains("Reply body"));
+}
+
+#[tokio::test]
+async fn a_session_on_dom_refs_gets_no_changes_and_keeps_its_refs() {
+    let f = fixture().await;
+    let agent = Agent::bound(&f, "changes-dom-refs").await;
+    let legacy = agent
+        .call("get_browser_state", json!({ "snapshot_format": "dom_refs_v1" }))
+        .await;
+    let button = ref_of(&legacy, "main", "main-btn");
+    for _ in 0..2 {
+        let clicked = agent.call("browser_click", json!({ "ref": button })).await;
+        assert_eq!(clicked["route"], "trusted_input", "{clicked}");
+        assert!(clicked.get("changes").is_none(), "{clicked}");
+    }
+    assert!(recorded_calls(&f, "Accessibility.getFullAXTree").is_empty());
+}
+
+#[tokio::test]
+async fn a_dialog_the_click_opened_is_reported_with_its_capability_and_nothing_else_moves() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-dialog").await;
+    let first = agent.snapshot().await;
+    let reply = named_ref(&first, "Reply");
+
+    f.state.lock().unwrap().click_opens_dialog = true;
+    let started = std::time::Instant::now();
+    let clicked = agent
+        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .await;
+    assert!(started.elapsed() < std::time::Duration::from_secs(3), "no timeout was waited out");
+    let changes = &clicked["changes"];
+    assert_eq!(changes["kind"], "unavailable", "{clicked}");
+    assert_eq!(changes["reason"], "javascript_dialog_open");
+    assert_eq!(changes["dialog"]["kind"], "alert");
+    let dialog_id = changes["dialog"]["dialog_id"].as_str().unwrap().to_owned();
+
+    // While it is up, reads and input say so at once instead of hanging.
+    let read = agent.call("get_browser_state", json!({})).await;
+    assert_eq!(read["refusal"]["code"], "browser_dialog_open", "{read}");
+    assert_eq!(read["refusal"]["detail"]["dialog_id"], dialog_id);
+    let blocked = agent
+        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .await;
+    assert_eq!(blocked["error"]["code"], "browser_dialog_open", "{blocked}");
+    assert!(blocked["error"]["hint"].as_str().unwrap().contains(&dialog_id));
+
+    // The capability resolves it, and the baseline held before still diffs.
+    let accepted = agent
+        .call("browser_dialog", json!({ "action": "accept", "dialog_id": dialog_id }))
+        .await;
+    assert_eq!(accepted["status"], "ok", "{accepted}");
+    let after = agent
+        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .await;
+    assert_eq!(after["changes"]["kind"], "diff", "{after}");
+    assert_eq!(after["changes"]["base_revision"], first["snapshot"]["revision"]);
+}
+
+#[tokio::test]
+async fn since_revision_answers_with_a_diff_only_from_the_revision_held() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-since").await;
+    let first = agent.snapshot().await;
+    let revision = first["snapshot"]["revision"].as_u64().unwrap();
+
+    f.state.lock().unwrap().renamed.insert(2003, "Edited message".into());
+    let changed = agent
+        .call("get_browser_state", json!({ "since_revision": revision }))
+        .await;
+    assert_eq!(changed["mode"], "changes", "{changed}");
+    assert_eq!(changed["changes"]["kind"], "diff");
+    // Text that says something else: the same ref, a changed line.
+    assert_eq!(changed["changes"]["ops"][0]["op"], "change", "{changed}");
+    assert_eq!(
+        changed["changes"]["ops"][0]["ref"],
+        named_ref(&first, "Please review the attached fixture report.")
+    );
+
+    // The revision the agent held is no longer the baseline.
+    let stale = agent
+        .call("get_browser_state", json!({ "since_revision": revision }))
+        .await;
+    assert_eq!(stale["changes"]["kind"], "snapshot", "{stale}");
+    assert_eq!(stale["changes"]["reason"], "revision_unknown");
+    assert!(stale["changes"]["outline"].as_str().unwrap().contains("Edited message"));
+
+    let refused = agent
+        .registry
+        .invoke_with_context(
+            "get_browser_state",
+            json!({ "target_id": agent.target, "tab_id": agent.tab, "session": agent.session,
+                "since_revision": revision, "query": "Reply" }),
+            agent.context.clone(),
+        )
+        .await;
+    assert_eq!(refused.is_error, Some(true), "a diff is of the whole-page view only");
 }

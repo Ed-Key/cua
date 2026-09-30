@@ -182,6 +182,8 @@ pub enum ToolRefusalCode {
     BrowserInputIncomplete,
     BrowserActionUnavailable,
     BrowserOriginOutsideScope,
+    BrowserDialogOpen,
+    BrowserTargetCovered,
     Other,
 }
 
@@ -205,6 +207,8 @@ impl ToolRefusalCode {
             Self::BrowserInputIncomplete => "browser_input_incomplete",
             Self::BrowserActionUnavailable => "browser_action_unavailable",
             Self::BrowserOriginOutsideScope => "browser_origin_outside_scope",
+            Self::BrowserDialogOpen => "browser_dialog_open",
+            Self::BrowserTargetCovered => "browser_target_covered",
             Self::Other => "other",
         }
     }
@@ -231,6 +235,8 @@ impl ToolRefusalCode {
             Some("browser_input_incomplete") => Self::BrowserInputIncomplete,
             Some("browser_action_unavailable") => Self::BrowserActionUnavailable,
             Some("browser_origin_outside_scope") => Self::BrowserOriginOutsideScope,
+            Some("browser_dialog_open") => Self::BrowserDialogOpen,
+            Some("browser_target_covered") => Self::BrowserTargetCovered,
             Some(_) | None => Self::Other,
         }
     }
@@ -256,6 +262,8 @@ impl From<crate::browser::refusal::BrowserRefusalCode> for ToolRefusalCode {
             BrowserRefusalCode::BrowserInputIncomplete => Self::BrowserInputIncomplete,
             BrowserRefusalCode::BrowserActionUnavailable => Self::BrowserActionUnavailable,
             BrowserRefusalCode::BrowserOriginOutsideScope => Self::BrowserOriginOutsideScope,
+            BrowserRefusalCode::BrowserDialogOpen => Self::BrowserDialogOpen,
+            BrowserRefusalCode::BrowserTargetCovered => Self::BrowserTargetCovered,
         }
     }
 }

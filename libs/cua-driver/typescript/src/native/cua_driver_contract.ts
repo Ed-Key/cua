@@ -913,6 +913,322 @@ const FfiConverterTypeActionRoute = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * How a browser action's result describes the page afterwards.
+ *
+ * - `diff`: `ops` turn the outline at `base_revision` into the one at
+ * `revision`.
+ * - `snapshot`: `outline` is the whole page outline at `revision`; `reason`
+ * says why it is not a diff.
+ * - `unavailable`: the page was not read after the action; `reason` says
+ * why. Nothing the session holds changed.
+ */
+export enum PageChangesKind {
+    Diff,
+    Snapshot,
+    Unavailable
+}
+
+const FfiConverterTypePageChangesKind = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = PageChangesKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return PageChangesKind.Diff;
+                case 2: return PageChangesKind.Snapshot;
+                case 3: return PageChangesKind.Unavailable;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case PageChangesKind.Diff: return ordinalConverter.write(1, into);
+                case PageChangesKind.Snapshot: return ordinalConverter.write(2, into);
+                case PageChangesKind.Unavailable: return ordinalConverter.write(3, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * What one keyed change does to the outline.
+ *
+ * - `add`: a line that was not in the outline.
+ * - `change`: the same element, with another value, state or depth.
+ * - `move`: the same element at another place.
+ * - `leave`: a line that is no longer in the outline.
+ */
+export enum PageChangeOpKind {
+    Add,
+    Change,
+    Move,
+    Leave
+}
+
+const FfiConverterTypePageChangeOpKind = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = PageChangeOpKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return PageChangeOpKind.Add;
+                case 2: return PageChangeOpKind.Change;
+                case 3: return PageChangeOpKind.Move;
+                case 4: return PageChangeOpKind.Leave;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case PageChangeOpKind.Add: return ordinalConverter.write(1, into);
+                case PageChangeOpKind.Change: return ordinalConverter.write(2, into);
+                case PageChangeOpKind.Move: return ordinalConverter.write(3, into);
+                case PageChangeOpKind.Leave: return ordinalConverter.write(4, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * One keyed change to the page outline. `ref` is the line's ref.
+ */
+export type PageChangeOp = {
+    op: PageChangeOpKind,
+    reference: string,
+    /**
+     * The line as it is now (add, change, move).
+     */
+    line?: string,
+    /**
+     * The ref of the line directly above it (add, move); absent when it is
+     * the first line.
+     */
+    after?: string,
+    /**
+     * leave only. `true`: the element is gone and its ref is stale. Absent:
+     * the element only left the ranked outline; its ref still works.
+     */
+    gone?: boolean
+}
+
+/**
+ * Generated factory for {@link PageChangeOp} record objects.
+ */
+export const PageChangeOp = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<PageChangeOp, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<PageChangeOp>,
+    });
+})();
+
+const FfiConverterTypePageChangeOp = (() => {
+    type TypeName = PageChangeOp;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                op: FfiConverterTypePageChangeOpKind.read(from),
+                reference: FfiConverterString.read(from),
+                line: FfiConverterOptionalString.read(from),
+                after: FfiConverterOptionalString.read(from),
+                gone: FfiConverterOptionalBoolean.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypePageChangeOpKind.write(value.op, into);
+            FfiConverterString.write(value.reference, into);
+            FfiConverterOptionalString.write(value.line, into);
+            FfiConverterOptionalString.write(value.after, into);
+            FfiConverterOptionalBoolean.write(value.gone, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypePageChangeOpKind.allocationSize(value.op) +
+             FfiConverterString.allocationSize(value.reference) +
+             FfiConverterOptionalString.allocationSize(value.line) +
+             FfiConverterOptionalString.allocationSize(value.after) +
+             FfiConverterOptionalBoolean.allocationSize(value.gone);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * A page-owned JavaScript dialog that is open; resolve it with
+ * `browser_dialog` and this `dialog_id`.
+ */
+export type PageDialog = {
+    dialogId: string,
+    kind: string
+}
+
+/**
+ * Generated factory for {@link PageDialog} record objects.
+ */
+export const PageDialog = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<PageDialog, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<PageDialog>,
+    });
+})();
+
+const FfiConverterTypePageDialog = (() => {
+    type TypeName = PageDialog;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                dialogId: FfiConverterString.read(from),
+                kind: FfiConverterString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.dialogId, into);
+            FfiConverterString.write(value.kind, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.dialogId) +
+             FfiConverterString.allocationSize(value.kind);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * What the page showed once a browser action settled, against the outline
+ * the session held. These are observed changes: the page may have made
+ * some of them by itself.
+ */
+export type PageChanges = {
+    kind: PageChangesKind,
+    /**
+     * snapshot: `no_baseline`, `document_changed`, `attachment_changed`,
+     * `revision_unknown`, `coverage_changed`, `diff_larger_than_snapshot`.
+     * unavailable: `javascript_dialog_open`, or the refusal code or error of
+     * the read.
+     */
+    reason?: string,
+    /**
+     * The ref space (`p7` in `p7:12`).
+     */
+    snapshotId?: string,
+    /**
+     * diff: the revision `ops` apply to. If the caller does not hold it,
+     * it asks `get_browser_state` for a full snapshot.
+     */
+    baseRevision?: bigint,
+    revision?: bigint,
+    ops?: Array<PageChangeOp>,
+    outline?: string,
+    /**
+     * The page address: always with a snapshot, with a diff only when it
+     * changed.
+     */
+    url?: string,
+    title?: string,
+    /**
+     * snapshot: `false` when more of the page is reached by `continuation`.
+     */
+    complete?: boolean,
+    continuation?: string,
+    dialog?: PageDialog,
+    /**
+     * `false`: the page was still changing when the bounded wait ended.
+     */
+    settled?: boolean
+}
+
+/**
+ * Generated factory for {@link PageChanges} record objects.
+ */
+export const PageChanges = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<PageChanges, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<PageChanges>,
+    });
+})();
+
+const FfiConverterTypePageChanges = (() => {
+    type TypeName = PageChanges;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                kind: FfiConverterTypePageChangesKind.read(from),
+                reason: FfiConverterOptionalString.read(from),
+                snapshotId: FfiConverterOptionalString.read(from),
+                baseRevision: FfiConverterOptionalUInt64.read(from),
+                revision: FfiConverterOptionalUInt64.read(from),
+                ops: FfiConverterOptionalSequenceTypePageChangeOp.read(from),
+                outline: FfiConverterOptionalString.read(from),
+                url: FfiConverterOptionalString.read(from),
+                title: FfiConverterOptionalString.read(from),
+                complete: FfiConverterOptionalBoolean.read(from),
+                continuation: FfiConverterOptionalString.read(from),
+                dialog: FfiConverterOptionalTypePageDialog.read(from),
+                settled: FfiConverterOptionalBoolean.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypePageChangesKind.write(value.kind, into);
+            FfiConverterOptionalString.write(value.reason, into);
+            FfiConverterOptionalString.write(value.snapshotId, into);
+            FfiConverterOptionalUInt64.write(value.baseRevision, into);
+            FfiConverterOptionalUInt64.write(value.revision, into);
+            FfiConverterOptionalSequenceTypePageChangeOp.write(value.ops, into);
+            FfiConverterOptionalString.write(value.outline, into);
+            FfiConverterOptionalString.write(value.url, into);
+            FfiConverterOptionalString.write(value.title, into);
+            FfiConverterOptionalBoolean.write(value.complete, into);
+            FfiConverterOptionalString.write(value.continuation, into);
+            FfiConverterOptionalTypePageDialog.write(value.dialog, into);
+            FfiConverterOptionalBoolean.write(value.settled, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypePageChangesKind.allocationSize(value.kind) +
+             FfiConverterOptionalString.allocationSize(value.reason) +
+             FfiConverterOptionalString.allocationSize(value.snapshotId) +
+             FfiConverterOptionalUInt64.allocationSize(value.baseRevision) +
+             FfiConverterOptionalUInt64.allocationSize(value.revision) +
+             FfiConverterOptionalSequenceTypePageChangeOp.allocationSize(value.ops) +
+             FfiConverterOptionalString.allocationSize(value.outline) +
+             FfiConverterOptionalString.allocationSize(value.url) +
+             FfiConverterOptionalString.allocationSize(value.title) +
+             FfiConverterOptionalBoolean.allocationSize(value.complete) +
+             FfiConverterOptionalString.allocationSize(value.continuation) +
+             FfiConverterOptionalTypePageDialog.allocationSize(value.dialog) +
+             FfiConverterOptionalBoolean.allocationSize(value.settled);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type ActionResult = {
     effect: ActionEffect,
     route: ActionRoute,
@@ -934,7 +1250,11 @@ export type ActionResult = {
      * `false`: sending this call again repeats its effect (it moves, toggles,
      * types or submits). Read state before resending it.
      */
-    idempotent?: boolean
+    idempotent?: boolean,
+    /**
+     * Browser page actions only: what the page showed afterwards.
+     */
+    changes?: PageChanges
 }
 
 /**
@@ -965,7 +1285,8 @@ const FfiConverterTypeActionResult = (() => {
                 escalation: FfiConverterOptionalTypeActionEscalation.read(from),
                 summary: FfiConverterOptionalString.read(from),
                 error: FfiConverterOptionalTypeActionError.read(from),
-                idempotent: FfiConverterOptionalBoolean.read(from)
+                idempotent: FfiConverterOptionalBoolean.read(from),
+                changes: FfiConverterOptionalTypePageChanges.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -977,6 +1298,7 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterOptionalString.write(value.summary, into);
             FfiConverterOptionalTypeActionError.write(value.error, into);
             FfiConverterOptionalBoolean.write(value.idempotent, into);
+            FfiConverterOptionalTypePageChanges.write(value.changes, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeActionEffect.allocationSize(value.effect) +
@@ -986,7 +1308,8 @@ const FfiConverterTypeActionResult = (() => {
              FfiConverterOptionalTypeActionEscalation.allocationSize(value.escalation) +
              FfiConverterOptionalString.allocationSize(value.summary) +
              FfiConverterOptionalTypeActionError.allocationSize(value.error) +
-             FfiConverterOptionalBoolean.allocationSize(value.idempotent);
+             FfiConverterOptionalBoolean.allocationSize(value.idempotent) +
+             FfiConverterOptionalTypePageChanges.allocationSize(value.changes);
 
         }
     };
@@ -7141,6 +7464,21 @@ const FfiConverterOptionalTypeActionError = new FfiConverterOptional(FfiConverte
 // FfiConverter for boolean | undefined
 const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
 
+// FfiConverter for bigint | undefined
+const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
+
+// FfiConverter for Array<PageChangeOp>
+const FfiConverterSequenceTypePageChangeOp = new FfiConverterArray(FfiConverterTypePageChangeOp);
+
+// FfiConverter for Array<PageChangeOp> | undefined
+const FfiConverterOptionalSequenceTypePageChangeOp = new FfiConverterOptional(FfiConverterSequenceTypePageChangeOp);
+
+// FfiConverter for PageDialog | undefined
+const FfiConverterOptionalTypePageDialog = new FfiConverterOptional(FfiConverterTypePageDialog);
+
+// FfiConverter for PageChanges | undefined
+const FfiConverterOptionalTypePageChanges = new FfiConverterOptional(FfiConverterTypePageChanges);
+
 // FfiConverter for number | undefined
 const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64);
 
@@ -7152,9 +7490,6 @@ const FfiConverterOptionalTypeActionTarget = new FfiConverterOptional(FfiConvert
 
 // FfiConverter for DesktopScope | undefined
 const FfiConverterOptionalTypeDesktopScope = new FfiConverterOptional(FfiConverterTypeDesktopScope);
-
-// FfiConverter for bigint | undefined
-const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
 
 // FfiConverter for TextSelectionPredicate | undefined
 const FfiConverterOptionalTypeTextSelectionPredicate = new FfiConverterOptional(FfiConverterTypeTextSelectionPredicate);
@@ -7358,6 +7693,11 @@ export default Object.freeze({
     FfiConverterTypeListWindowsInput,
     FfiConverterTypeListWindowsOutput,
     FfiConverterTypeMoveCursorInput,
+    FfiConverterTypePageChangeOp,
+    FfiConverterTypePageChangeOpKind,
+    FfiConverterTypePageChanges,
+    FfiConverterTypePageChangesKind,
+    FfiConverterTypePageDialog,
     FfiConverterTypeParseVisualRegionsInput,
     FfiConverterTypeParseVisualRegionsOptions,
     FfiConverterTypeParseVisualRegionsOutput,

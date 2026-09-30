@@ -751,6 +751,8 @@ mod tests {
                     entry: entry.clone(),
                     template: format!("- button \"Send\" [{REF_SLOT} click]"),
                 }],
+                ("https://example.test", "Example"),
+                None,
                 ViewKind::Default,
                 None,
             );

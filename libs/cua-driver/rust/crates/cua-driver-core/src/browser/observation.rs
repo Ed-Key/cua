@@ -8,8 +8,7 @@
 //!
 //! Rule for every row below: when identity cannot be proven, invalidate and
 //! return a full snapshot. A capability is never refreshed into validity: a
-//! node whose role, name or link destination changed gets a new ref, and the
-//! old one is stale.
+//! node whose fingerprint changed gets a new ref, and the old one is stale.
 //!
 //! # Ownership table
 //!
@@ -30,17 +29,19 @@
 //! | Consent revoked | The binding is refused (`browser_consent_required`) or dropped (`browser_binding_stale`) before any ref is read. | Dropped with the binding. | The refusal. |
 //! | Extension disconnect or reconnect, debugger detach and reattach | Reconnect drops the endpoint generation and every target on it (`browser_binding_stale`). Detach and reattach on a live connection changes the attachment identity: refs are stale. | Dropped. | The refusal, then a full snapshot: `no_baseline` after a new bind, `attachment_changed` after a reattach. |
 //! | Session end, idle expiry, revive | The whole namespace goes with the session. A revived session starts empty. | Dropped. | `browser_binding_stale`; after a new bind, a full snapshot, reason `no_baseline`. |
-//! | JavaScript dialog opens | Unchanged. | Unchanged: the page cannot be observed while the dialog is up. | The action result names the dialog and its `dialog_id`; `changes` is `unavailable`, reason `javascript_dialog_open`. A batch stops there. |
+//! | JavaScript dialog opens | Unchanged. | Unchanged: the page cannot be observed while the dialog is up. | The action that opened it returns at once, names the dialog and its `dialog_id`, and its `changes` is `unavailable`, reason `javascript_dialog_open`. A batch stops there. Until `browser_dialog` resolves it, reads and actions refuse `browser_dialog_open`. |
 //! | Observation and action at the same time in one session | Recording an observation is one atomic step, and observations of a tab run one at a time. | Revisions are totally ordered; each result names its base and new revision. | A diff whose `base_revision` is the latest baseline, or a full snapshot with reason `revision_unknown` when the baseline moved meanwhile. |
 //! | Call cancelled, response lost | Unchanged: refs stay valid either way. | Unchanged when cancelled before recording; advanced when the response was lost after it. | Every diff names `base_revision`. An agent that does not hold that revision asks `get_browser_state` for a full snapshot. |
 //! | Change of format, query, scope, or a continuation | A query, scope or continuation read takes its refs from the same space. A `dom_refs_v1` snapshot replaces the space: semantic refs are stale. | A query, scope or continuation read leaves both alone. `dom_refs_v1` drops them. | A side read returns its own outline, never a diff. After `dom_refs_v1`, actions return no `changes`; the next semantic observation is a full snapshot, reason `no_baseline`. |
 //!
 //! "Left the observation" is not "removed": ranking and the size budget can
 //! drop a node that still exists. A diff says `gone` only for a ref retired by
-//! the rules above.
-
-// Wired into the store and the tools by the commits that follow.
-#![allow(dead_code)]
+//! the rules above. A read that will be diffed is cut where its baseline was
+//! cut (the same lowest-ranked node), so a line that grew does not push
+//! unrelated lines out of the view.
+//!
+//! A fingerprint is the role, the name and, for a link, the destination. The
+//! name does not count for text nodes, whose name is their content.
 
 use std::collections::{HashMap, HashSet};
 
@@ -88,11 +89,11 @@ impl NodeKey {
 /// What a ref named when it was issued. A node that now reads differently is
 /// another entity, whatever its node id.
 ///
-/// The name and the link destination count only for a ref that declares an
-/// action: that is the ref an agent acts on by its name. A ref with no action
-/// only scopes reads, so a text node whose text changed is a changed line,
-/// not another entity; when such a node gains an action its fingerprint
-/// gains the name, and it gets a new ref.
+/// The name does not count for a text node: there the name is the content,
+/// and text that changed is the same line saying something else, not another
+/// entity. For every other role it counts, whether or not the element can be
+/// acted on right now: a disabled "Delete Alice" reused as an enabled
+/// "Delete Bob" is not the ref the agent read.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Fingerprint {
     pub(crate) role: String,
@@ -103,25 +104,19 @@ pub(crate) struct Fingerprint {
 impl Fingerprint {
     pub(crate) fn of(entry: &RefEntry) -> Self {
         Self::read(
-            entry,
             entry.node_name.clone(),
             entry.label.clone(),
             entry.destination.clone(),
         )
     }
 
-    /// The fingerprint of what `entry`'s node reads as now, by the same rule.
-    pub(crate) fn read(
-        entry: &RefEntry,
-        role: String,
-        name: Option<String>,
-        destination: Option<String>,
-    ) -> Self {
-        let acts = !entry.actions.is_empty();
+    /// The fingerprint of what a node reads as now, by the same rule.
+    pub(crate) fn read(role: String, name: Option<String>, destination: Option<String>) -> Self {
+        let text = matches!(role.as_str(), "statictext" | "text");
         Self {
+            name: name.filter(|_| !text),
             role,
-            name: name.filter(|_| acts),
-            destination: destination.filter(|_| acts),
+            destination,
         }
     }
 }
@@ -252,6 +247,8 @@ pub(crate) enum Told {
     Diff {
         base_revision: u64,
         ops: Vec<DiffOp>,
+        /// The page address or title differs from the baseline's.
+        page_changed: bool,
     },
 }
 
@@ -288,6 +285,10 @@ struct Baseline {
     revision: u64,
     view: Vec<ViewLine>,
     complete: bool,
+    /// Page address and title when it was recorded.
+    page: (String, String),
+    /// The lowest-ranked node the view held when a budget cut it short.
+    tail: Option<NodeKey>,
 }
 
 /// The refs one session holds for one document on one attachment.
@@ -321,6 +322,17 @@ impl RefSpace {
 
     pub(crate) fn baseline_revision(&self) -> Option<u64> {
         self.baseline.as_ref().map(|baseline| baseline.revision)
+    }
+
+    /// Where the baseline at `revision` was cut by its budget. A read that
+    /// will be diffed against it stops at the same node, so a line that grew
+    /// or went away does not shift the cut and show up as unrelated lines
+    /// leaving or entering.
+    pub(crate) fn baseline_tail(&self, revision: u64) -> Option<&NodeKey> {
+        self.baseline
+            .as_ref()
+            .filter(|baseline| baseline.revision == revision)
+            .and_then(|baseline| baseline.tail.as_ref())
     }
 
     fn retire(&mut self, index: u32) {
@@ -389,10 +401,13 @@ impl RefSpace {
             .collect()
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn advance(
         &mut self,
         view: Vec<ViewLine>,
         complete: bool,
+        page: (String, String),
+        tail: Option<NodeKey>,
         since: Option<u64>,
         revision: u64,
     ) -> Told {
@@ -410,6 +425,7 @@ impl RefSpace {
             (Some(_), Some(baseline)) => Told::Diff {
                 base_revision: baseline.revision,
                 ops: diff(&baseline.view, &view, &self.retired),
+                page_changed: baseline.page != page,
             },
         };
         self.retired.clear();
@@ -417,6 +433,8 @@ impl RefSpace {
             revision,
             view,
             complete,
+            page,
+            tail,
         });
         told
     }
@@ -474,8 +492,10 @@ impl TabRefs {
     }
 
     /// Record one fresh observation: `document` is every node collected that
-    /// can carry a ref, `view` the lines shown. `since` asks for the change
-    /// from that baseline revision (default view only).
+    /// can carry a ref, `view` the lines shown, `page` the address and title,
+    /// `tail` the lowest-ranked node shown when a budget cut the view.
+    /// `since` asks for the change from that baseline revision (default view
+    /// only).
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn record(
         &mut self,
@@ -484,6 +504,8 @@ impl TabRefs {
         document: &[RefEntry],
         complete: bool,
         view: Vec<ViewNode>,
+        page: (&str, &str),
+        tail: Option<NodeKey>,
         kind: ViewKind,
         since: Option<u64>,
     ) -> Recorded {
@@ -494,7 +516,8 @@ impl TabRefs {
             ViewKind::Side => Told::Snapshot { reason: None },
             ViewKind::Default => {
                 let revision = mint();
-                space.advance(lines.clone(), complete, since, revision)
+                let page = (page.0.to_owned(), page.1.to_owned());
+                space.advance(lines.clone(), complete, page, tail, since, revision)
             }
         };
         Recorded {
@@ -572,6 +595,7 @@ mod tests {
     struct Session {
         refs: TabRefs,
         next: u64,
+        url: &'static str,
     }
 
     impl Session {
@@ -579,6 +603,7 @@ mod tests {
             Self {
                 refs: TabRefs::default(),
                 next: first_id,
+                url: "https://x.test/",
             }
         }
 
@@ -606,8 +631,17 @@ mod tests {
                     ),
                 })
                 .collect();
-            self.refs
-                .record(&mut mint, identity, document, true, view, kind, since)
+            self.refs.record(
+                &mut mint,
+                identity,
+                document,
+                true,
+                view,
+                (self.url, "Title"),
+                None,
+                kind,
+                since,
+            )
         }
 
         /// A default-view observation that shows the whole document.
@@ -702,7 +736,7 @@ mod tests {
             ViewKind::Default,
             first.revision,
         );
-        let Told::Diff { base_revision, ops } = &after.told else {
+        let Told::Diff { base_revision, ops, .. } = &after.told else {
             panic!("an action's observation is a diff: {:?}", after.told)
         };
         assert_eq!(Some(*base_revision), first.revision);
@@ -747,10 +781,9 @@ mod tests {
             destination: Some("https://x.test/u/bob".into()),
         };
         assert_ne!(issued, live, "the use is refused as stale");
-        let held_entry = session.refs.resolve(space, index).unwrap();
-        assert_ne!(
-            issued,
-            Fingerprint::read(held_entry, "link".into(), Some("Bob".into()), live.destination.clone())
+        assert_eq!(
+            live,
+            Fingerprint::read("link".into(), Some("Bob".into()), live.destination.clone())
         );
 
         // The next observation retires the ref instead of renaming it.
@@ -865,7 +898,25 @@ mod tests {
             first.revision,
         );
         assert_eq!(keys(&second), keys(&first));
-        assert!(matches!(second.told, Told::Diff { .. }), "{:?}", second.told);
+        assert!(
+            matches!(second.told, Told::Diff { page_changed: false, .. }),
+            "{:?}",
+            second.told
+        );
+        // The diff says when the address changed, so the agent is told.
+        session.url = "https://x.test/settings";
+        let third = session.record(
+            identity("L1", 1),
+            &[tab.clone()],
+            &[(&tab, " (selected)")],
+            ViewKind::Default,
+            second.revision,
+        );
+        assert!(
+            matches!(&third.told, Told::Diff { page_changed: true, ops, .. } if ops.is_empty()),
+            "{:?}",
+            third.told
+        );
     }
 
     #[test]
@@ -1007,7 +1058,8 @@ mod tests {
             after.told,
             Told::Diff {
                 base_revision: first.revision.unwrap(),
-                ops: Vec::new()
+                ops: Vec::new(),
+                page_changed: false,
             }
         );
     }
@@ -1130,7 +1182,8 @@ mod tests {
             after.told,
             Told::Diff {
                 base_revision: first.revision.unwrap(),
-                ops: Vec::new()
+                ops: Vec::new(),
+                page_changed: false,
             }
         );
 
@@ -1210,6 +1263,8 @@ mod tests {
             std::slice::from_ref(&top),
             false,
             Vec::new(),
+            ("https://x.test/", "Title"),
+            None,
             ViewKind::Side,
             None,
         );
@@ -1228,6 +1283,8 @@ mod tests {
             std::slice::from_ref(&top),
             false,
             Vec::new(),
+            ("https://x.test/", "Title"),
+            None,
             ViewKind::Default,
             first.revision,
         );
@@ -1240,7 +1297,7 @@ mod tests {
     }
 
     #[test]
-    fn text_that_changes_is_a_changed_line_until_it_can_be_acted_on() {
+    fn text_that_changes_is_a_changed_line_and_a_renamed_element_is_another_ref() {
         let mut session = Session::new(0);
         let count = content(10, "statictext", "count = 1");
         let first = session.observe(identity("L1", 1), &[count], None);
@@ -1256,15 +1313,19 @@ mod tests {
             second.told
         );
 
-        // A disabled button named for Alice...
+        // A disabled button keeps its ref when it becomes enabled...
         let disabled = content(20, "button", "Delete Alice");
         let third = session.observe(identity("L1", 1), &[disabled], second.revision);
-        let disabled_ref = keys(&third)[0].clone();
-        // ...reused as an enabled button for Bob is not the ref the agent read.
-        let enabled = node(20, "button", "Delete Bob");
+        let button_ref = keys(&third)[0].clone();
+        let enabled = node(20, "button", "Delete Alice");
         let fourth = session.observe(identity("L1", 1), &[enabled], third.revision);
-        assert_ne!(keys(&fourth)[0], disabled_ref);
-        assert!(!session.resolves(&disabled_ref));
+        assert_eq!(keys(&fourth)[0], button_ref);
+        // ...and loses it when the node is reused for someone else, enabled
+        // or not: its name is what the agent read it by.
+        let reused = content(20, "button", "Delete Bob");
+        let fifth = session.observe(identity("L1", 1), &[reused], fourth.revision);
+        assert_ne!(keys(&fifth)[0], button_ref);
+        assert!(!session.resolves(&button_ref));
     }
 
     #[test]
