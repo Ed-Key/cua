@@ -2170,14 +2170,16 @@ unsafe fn raise_card(state: &mut State, id: i64, tag: Tag) {
 
 /// The user's pick is over (its window closed): the panel follows the
 /// agent again. The window the agent last acted in comes to the front if
-/// the stack still holds it behind; no other card is put in its place.
-unsafe fn follow_agent(state: &mut State, id: i64) {
+/// the stack still holds it behind and it has not closed too (`gone`); no
+/// other card is put in its place. With nothing live to follow, the closed
+/// pick stays the front card, as any closed front window does.
+unsafe fn follow_agent(state: &mut State, id: i64, gone: impl Fn(&Tag) -> bool) {
     let Some(panel) = panel_by_id(state, id) else {
         return;
     };
     panel.hands.unpick();
     tracing::info!(target: "pip", session = %panel.key, agent = ?panel.agent, "PiP pick cleared: its window closed");
-    if let Some(tag) = stack::click_target(panel.agent, &panel.cards.keys()) {
+    if let Some(tag) = hands::follow(panel.agent, &panel.cards.keys(), gone) {
         raise_card(state, id, tag);
     }
 }
@@ -2214,7 +2216,7 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
                     .then_some(panel.id)
             });
             if let Some(id) = unpicked {
-                follow_agent(state, id);
+                follow_agent(state, id, is_gone);
             }
             let Some(panel) = state.panels.get_mut(key) else {
                 return;
@@ -3203,6 +3205,9 @@ unsafe fn show(panel: &mut Panel) {
         return;
     }
     panel.shown = true;
+    // Where the pointer is as the panel shows: a pointer resting there does
+    // not hold it, one that moves there before the first poll does.
+    panel.hands.shown(mouse_location());
     let window = panel.window as *mut AnyObject;
     let visible: bool = msg_send![window, isVisible];
     if !visible {

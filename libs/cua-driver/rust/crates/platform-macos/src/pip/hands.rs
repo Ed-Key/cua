@@ -112,6 +112,14 @@ impl<K: Copy + PartialEq> Hands<K> {
         self.inside = holding;
     }
 
+    /// The panel was shown with the pointer at `at`: the first poll counts
+    /// movement from here, so a pointer that arrives after the show holds
+    /// and one that was already resting there does not.
+    pub(super) fn shown(&mut self, at: (f64, f64)) {
+        self.inside = false;
+        self.at = Some(at);
+    }
+
     /// A press on the panel: the pointer holds it from here on, moved or
     /// not.
     pub(super) fn press(&mut self) {
@@ -232,6 +240,18 @@ pub(super) fn poll_edges(gesture: Option<(i64, u8)>, id: i64, band: u8) -> Optio
         Some((_, edges)) if edges != 0 => Some(edges),
         _ => Some(band),
     }
+}
+
+/// The card to bring forward when the pick is over: the window the agent
+/// last acted in, if the stack holds it behind the front (`keys`) and it has
+/// not closed (`gone`). Never another card in its place, never a closed
+/// window.
+pub(super) fn follow<K: PartialEq + Copy>(
+    agent: Option<K>,
+    keys: &[K],
+    gone: impl Fn(&K) -> bool,
+) -> Option<K> {
+    super::stack::click_target(agent, keys).filter(|key| !gone(key))
 }
 
 /// Which panel last set the system cursor, and to which resize edges.
@@ -439,6 +459,45 @@ mod tests {
         // It is already the front card, or the agent never acted.
         assert_eq!(click_target(Some(1), &[1, 3]), None);
         assert_eq!(click_target(None::<u32>, &[1, 3]), None);
+    }
+
+    /// Review finding: the pick and the agent's window close together (the
+    /// app quits): the closed agent window is not promoted.
+    #[test]
+    fn a_closed_window_is_never_followed_after_a_closed_pick() {
+        let keys = [1u32, 2, 3];
+        // Pick 1 closed, the agent's window 2 alive: it comes forward.
+        assert_eq!(follow(Some(2), &keys, |key| *key == 1), Some(2));
+        // Both closed: nothing is promoted (the closed pick stays front,
+        // as a closed front window does, until the agent acts again).
+        assert_eq!(follow(Some(2), &keys, |key| *key == 1 || *key == 2), None);
+        // Never another card by index.
+        assert_eq!(follow(None, &keys, |_| false), None);
+    }
+
+    /// Review finding: the first poll after a show compares against where
+    /// the pointer was as the panel showed.
+    #[test]
+    fn the_first_poll_counts_movement_from_the_show() {
+        let t = Instant::now();
+        // The pointer arrives on the new panel before its first poll and
+        // rests: it holds.
+        let mut arrived = Hands::<u32>::default();
+        arrived.shown(OFF);
+        arrived.pointer(true, ON, at(t, 120));
+        arrived.pointer(true, ON, at(t, 240));
+        assert!(arrived.holds(at(t, 20_000)));
+        // The pointer was resting there as the panel showed: it does not.
+        let mut resting = Hands::<u32>::default();
+        resting.shown(ON);
+        resting.pointer(true, ON, at(t, 120));
+        assert!(!resting.holds(at(t, 20_000)));
+        // Shown again after a hide under a pointer that moved meanwhile but
+        // rests now: no hold.
+        resting.hidden();
+        resting.shown(NEAR);
+        resting.pointer(true, NEAR, at(t, 30_000));
+        assert!(!resting.holds(at(t, 30_000)));
     }
 
     /// Review finding: a pick holds against pid-only frames and window
