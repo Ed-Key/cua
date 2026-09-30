@@ -1173,6 +1173,7 @@ impl BrowserEngine {
             "chromium".to_owned(),
             classification.product_kind,
             endpoint.ws_url.clone(),
+            endpoint.transport,
             cleanup_remote_debugging,
             protected_consent,
         );

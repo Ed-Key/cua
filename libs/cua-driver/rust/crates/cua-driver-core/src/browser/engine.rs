@@ -724,13 +724,15 @@ impl BrowserEngine {
                         requests
                     };
                     // An SDK's idle sweeper ends sessions from a plain thread.
-                    // The claim is released there without waiting (or at the
-                    // pool's next operation); the relay's own idle backstop
-                    // detaches the session's tabs.
+                    // The claim and the relay's release of the episode's tabs
+                    // happen there without waiting, or at the pool's next
+                    // operation.
                     for grant in off_runtime {
-                        engine
-                            .pool
-                            .release_existing_now_or_later(&grant.endpoint_ws_url, grant.generation);
+                        engine.pool.release_existing_now_or_later(
+                            &grant.endpoint_ws_url,
+                            grant.generation,
+                            grant_relay_holder(&grant),
+                        );
                     }
 
                     let mut failed = Vec::new();
@@ -1255,6 +1257,7 @@ impl BrowserEngine {
         conn: &CdpConnection,
         cdp_target_id: &str,
         session: &str,
+        generation: u64,
         transport: super::types::EndpointTransport,
     ) -> Result<String, BrowserRefusal> {
         let mut params = json!({ "targetId": cdp_target_id, "flatten": true });
@@ -1263,9 +1266,9 @@ impl BrowserEngine {
         if transport == super::types::EndpointTransport::ExtensionRelay {
             params["cuaSessionColor"] =
                 json!(cua_driver_contract::cursor::session_fill_hex(session));
-            // The relay counts tab holders per Cua session (see
-            // extension_relay::attach_gates).
-            params["cuaSession"] = json!(session);
+            // The relay counts tab holders per Cua session episode (see
+            // extension_relay::attach_gates and relay_holder).
+            params["cuaSession"] = json!(relay_holder(session, generation));
         }
         let attached = conn
             .call(None, "Target.attachToTarget", params)
@@ -1703,7 +1706,7 @@ impl BrowserEngine {
             ));
         }
 
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
         let dispatch_context = crate::tool::current_dispatch_authorization_context();
         if dispatch_context
             .as_deref()
@@ -2059,7 +2062,7 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
         let metrics = conn
             .call(Some(&cdp_session), "Page.getLayoutMetrics", json!({}))
             .await
@@ -2156,7 +2159,7 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
 
         let doc = conn
             .call(
@@ -2637,7 +2640,7 @@ impl BrowserEngine {
             })?;
             if let Some(identity) = &snapshot.semantic_root_identity {
                 let conn = self.connection_for_record(session, &record).await?;
-                let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+                let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
                 let tree = self.local_frame_tree(&conn, &cdp_session).await.map_err(|error| {
                     match error {
                         FrameTreeError::Unsupported => refuse(
@@ -2735,7 +2738,7 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
         let (document, document_complete) = self.semantic_document(&conn, &cdp_session).await?;
         let root = document.get("root").cloned().unwrap_or(Value::Null);
         let url = root
@@ -3014,23 +3017,30 @@ fn collect_interactive(
     }
 }
 
+/// The relay's holder name for one Cua session episode. A session that ends
+/// and starts again gets a new grant generation, so a late release from the
+/// ended episode can never remove the new episode's hold on a tab.
+pub(crate) fn relay_holder(session: &str, generation: u64) -> String {
+    format!("{session}#{generation}")
+}
+
+/// The relay holder a grant's tabs were attached under, if it uses the relay.
+fn grant_relay_holder(grant: &ExistingProfileGrant) -> Option<String> {
+    (grant.endpoint_transport == super::types::EndpointTransport::ExtensionRelay)
+        .then(|| relay_holder(&grant.public_session, grant.generation))
+}
+
 /// Release one grant's claim on its browser socket. Through the extension
 /// relay the socket may be shared with other Cua sessions, so the relay is
 /// first told this session's tabs are released; the socket itself closes only
 /// when its last grant releases it.
 pub(crate) async fn release_grant_claim(pool: &CdpPool, grant: &ExistingProfileGrant) {
-    if super::extension_relay::is_relay_url(&grant.endpoint_ws_url) {
+    if let Some(holder) = grant_relay_holder(grant) {
         if let Ok(conn) = pool
             .get_existing(&grant.endpoint_ws_url, grant.generation)
             .await
         {
-            let _ = conn
-                .call(
-                    None,
-                    "Cua.releaseSession",
-                    json!({ "cuaSession": grant.public_session }),
-                )
-                .await;
+            super::cdp_ws::release_relay_holder(&conn, &holder).await;
         }
     }
     pool.release_existing(&grant.endpoint_ws_url, grant.generation)

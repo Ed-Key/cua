@@ -10,7 +10,7 @@ use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
-use super::types::{BrowserProduct, ProcessFingerprint};
+use super::types::{BrowserProduct, EndpointTransport, ProcessFingerprint};
 
 const GRANT_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const GRANT_ABSOLUTE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -33,6 +33,9 @@ pub(crate) struct ExistingProfileGrant {
     pub browser: String,
     pub browser_product: BrowserProduct,
     pub endpoint_ws_url: String,
+    /// How the endpoint is reached; the extension relay tracks tab holders
+    /// per session episode.
+    pub endpoint_transport: EndpointTransport,
     pub generation: u64,
     pub cleanup_remote_debugging: bool,
     pub reconnect_attempts_remaining: u8,
@@ -112,6 +115,7 @@ impl ExistingProfileGrants {
         browser: String,
         browser_product: BrowserProduct,
         endpoint_ws_url: String,
+        endpoint_transport: EndpointTransport,
         cleanup_remote_debugging: bool,
         protected_consent: Option<crate::consent::ProtectedGrant>,
     ) -> ExistingProfileGrant {
@@ -127,6 +131,7 @@ impl ExistingProfileGrants {
             browser,
             browser_product,
             endpoint_ws_url,
+            endpoint_transport,
             generation,
             cleanup_remote_debugging,
             reconnect_attempts_remaining: MAX_RECONNECT_ATTEMPTS,
@@ -287,6 +292,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );
@@ -316,6 +322,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );
@@ -338,6 +345,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );
@@ -379,6 +387,7 @@ mod tests {
                     "chromium".to_owned(),
                     BrowserProduct::GoogleChrome,
                     "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+                    EndpointTransport::LegacyJsonVersion,
                     false,
                     None,
                 )
@@ -404,6 +413,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             true,
             None,
         );
@@ -416,6 +426,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );
@@ -446,6 +457,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             true,
             None,
         );
@@ -460,6 +472,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:2/devtools/browser/y".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );

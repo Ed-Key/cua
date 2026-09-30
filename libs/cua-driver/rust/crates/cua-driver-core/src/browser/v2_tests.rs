@@ -86,6 +86,13 @@ struct FixtureState {
     field_digits_only: bool,
     /// The page replaces the field on input: reads report a detached node.
     field_detached_after_input: bool,
+    /// The field's caret, reported as its selection; keystroke `char`
+    /// events insert there. `None` reports no selection and ignores keys.
+    field_caret: Option<usize>,
+    /// A focus handler that moves the caret to the end of the field. In an
+    /// inactive tab it runs only once focus is emulated.
+    field_focus_moves_caret_to_end: bool,
+    focus_emulated: bool,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -120,6 +127,9 @@ impl Default for FixtureState {
             field_value: None,
             field_digits_only: false,
             field_detached_after_input: false,
+            field_caret: None,
+            field_focus_moves_caret_to_end: false,
+            focus_emulated: false,
             calls: Vec::new(),
         }
     }
@@ -736,6 +746,15 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     if event_type == "keyUp" {
                         st.completed_key_pairs += 1;
                     }
+                    if event_type == "char" {
+                        let text = call.params["text"].as_str().unwrap_or_default().to_owned();
+                        if let Some(caret) = st.field_caret {
+                            if let Some(value) = st.field_value.as_mut() {
+                                value.insert_str(caret, &text);
+                                st.field_caret = Some(caret + text.len());
+                            }
+                        }
+                    }
                     MockReply::ok(json!({}))
                 }
             }
@@ -753,6 +772,18 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 MockReply::ok(json!({}))
             }
             "DOM.focus" | "Emulation.setFocusEmulationEnabled" | "Input.dispatchMouseEvent" => {
+                if call.method == "Emulation.setFocusEmulationEnabled" {
+                    st.focus_emulated = call.params["enabled"].as_bool().unwrap_or(false);
+                }
+                if call.method == "DOM.focus"
+                    && st.field_focus_moves_caret_to_end
+                    && st.focus_emulated
+                {
+                    let end = st.field_value.as_ref().map(String::len);
+                    if st.field_caret.is_some() {
+                        st.field_caret = end;
+                    }
+                }
                 MockReply::ok(json!({}))
             }
             "DOM.resolveNode" => MockReply::ok(json!({
@@ -766,10 +797,11 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     .iter()
                     .any(|(_, method, _)| method == "Input.insertText");
                 let connected = !(st.field_detached_after_input && typed);
+                let caret = st.field_caret;
                 match st.field_value.as_mut() {
                     Some(value) if function.contains("selectionStart") => MockReply::ok(json!({
                         "result": { "value": {
-                            "value": value.clone(), "start": null, "end": null,
+                            "value": value.clone(), "start": caret, "end": caret,
                             "field": true, "password": false, "connected": connected,
                         } }
                     })),
@@ -1730,6 +1762,125 @@ async fn relay_tab_attach_carries_the_session_cursor_color() {
     let attaches = recorded_calls(&f, "Target.attachToTarget");
     assert!(!attaches.is_empty());
     assert!(attaches.iter().all(|(_, params)| params.get("cuaSessionColor").is_none()));
+}
+
+/// Prepare and bind one Cua session on the relay fixture and return the
+/// relay holder its tab attaches named.
+async fn relay_bind(engine: &Arc<BrowserEngine>, state: &SharedState, session: &str, transport: &str) -> String {
+    let attaches_before = relay_calls(state, "Target.attachToTarget").len();
+    let args = |extra: Value| {
+        let mut args = json!({ "session": session, "_transport_session_id": transport });
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args
+    };
+    let prepared = BrowserPrepareTool::new(engine.clone())
+        .invoke(args(json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } })))
+        .await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let bound = GetBrowserStateTool::new(engine.clone())
+        .invoke(args(json!({ "pid": 1, "window_id": 7 })))
+        .await;
+    let bound = structured(&bound).clone();
+    let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
+    GetBrowserStateTool::new(engine.clone())
+        .invoke(args(json!({ "target_id": bound["target_id"], "tab_id": tab })))
+        .await;
+    let holders: Vec<String> = relay_calls(state, "Target.attachToTarget")
+        .into_iter()
+        .skip(attaches_before)
+        .filter_map(|params| params["cuaSession"].as_str().map(str::to_owned))
+        .filter(|holder| holder.starts_with(&format!("{session}#")))
+        .collect();
+    let last = holders.last().expect("the bind attached a tab").clone();
+    assert!(holders.iter().all(|holder| *holder == last), "{holders:?}");
+    last
+}
+
+fn relay_calls(state: &SharedState, method: &str) -> Vec<Value> {
+    state
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|(_, m, _)| m == method)
+        .map(|(_, _, params)| params.clone())
+        .collect()
+}
+
+async fn relay_releases_eventually(state: &SharedState, holders: &[&str]) -> Vec<String> {
+    for _ in 0..100 {
+        let released: Vec<String> = relay_calls(state, "Cua.releaseSession")
+            .into_iter()
+            .filter_map(|params| params["cuaSession"].as_str().map(str::to_owned))
+            .collect();
+        if holders.iter().all(|holder| released.iter().any(|r| r == holder)) {
+            return released;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    relay_calls(state, "Cua.releaseSession")
+        .into_iter()
+        .filter_map(|params| params["cuaSession"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_late_release_from_an_ended_episode_never_names_the_restarted_one() {
+    const TRANSPORT: &str = "transport-relay-episode";
+    const EPISODE_SESSION: &str = "relay-episode-session";
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state.clone())).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        server.ws_url(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    let first = relay_bind(&engine, &state, EPISODE_SESSION, TRANSPORT).await;
+    let ended = engine
+        .existing_profile_grant(EPISODE_SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // End the session, start it again under the same name, and bind.
+    crate::session::fire_session_end(TRANSPORT);
+    let second = relay_bind(&engine, &state, EPISODE_SESSION, TRANSPORT).await;
+    assert_ne!(first, second, "each episode holds its tabs under its own name");
+
+    // The ended episode's release lands only now.
+    super::engine::release_grant_claim(&engine.pool, &ended).await;
+    let released = relay_releases_eventually(&state, &[&first]).await;
+    assert!(released.contains(&first), "{released:?}");
+    assert!(
+        !released.contains(&second),
+        "a release from the ended episode named the live one: {released:?}"
+    );
+    crate::session::fire_session_end(TRANSPORT);
+}
+
+#[tokio::test]
+async fn an_episode_expired_off_runtime_still_releases_its_relay_tabs() {
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state.clone())).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        server.ws_url(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    // Two Cua sessions share the relay socket and its tab.
+    let expired = relay_bind(&engine, &state, "relay-expired", "transport-relay-expired").await;
+    let live = relay_bind(&engine, &state, "relay-live", "transport-relay-live").await;
+
+    // The expired session ends from an SDK sweeper's plain thread, which
+    // cannot tell the relay itself.
+    std::thread::spawn(|| crate::session::fire_session_end("transport-relay-expired"))
+        .join()
+        .unwrap();
+    // Ending the live session releases both holds, so the tab detaches.
+    crate::session::fire_session_end("transport-relay-live");
+    let released = relay_releases_eventually(&state, &[&expired, &live]).await;
+    assert!(
+        released.contains(&expired) && released.contains(&live),
+        "{released:?}"
+    );
 }
 
 #[tokio::test]
@@ -3124,6 +3275,31 @@ async fn typing_reports_what_the_field_holds_afterwards() {
     assert_eq!(s["effect"], "confirmed");
     assert_eq!(s["value"], "ada@x.io");
     assert_eq!(s["evidence"][0]["kind"], "browser_readback");
+}
+
+#[tokio::test]
+async fn keystrokes_judge_the_caret_where_focus_left_it() {
+    // "old" with the caret at 0; once focus is emulated the page's focus
+    // handler moves it to the end, so the keys land after "old".
+    let f = fixture_with(|state| {
+        state.field_value = Some("old".into());
+        state.field_caret = Some(0);
+        state.field_focus_moves_caret_to_end = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "X", "mode": "keystrokes", "session": SESSION
+        }))
+        .await;
+    let s = structured(&typed);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["effect"], "confirmed");
+    assert_eq!(s["value"], "oldX");
 }
 
 #[tokio::test]

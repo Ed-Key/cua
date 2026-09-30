@@ -437,6 +437,21 @@ impl CdpConnection {
     }
 }
 
+struct DeferredRelease {
+    ws_url: String,
+    generation: u64,
+    relay_holder: Option<String>,
+}
+
+/// Tell the extension relay that one Cua session episode ended, so it
+/// releases (and, where no other episode holds them, detaches) that
+/// episode's tabs. See `extension_relay::attach_gates`.
+pub(crate) async fn release_relay_holder(conn: &CdpConnection, holder: &str) {
+    let _ = conn
+        .call(None, "Cua.releaseSession", serde_json::json!({ "cuaSession": holder }))
+        .await;
+}
+
 #[derive(Clone)]
 struct PoolEntry {
     conn: Arc<CdpConnection>,
@@ -475,9 +490,10 @@ pub fn endpoint_port_is_grant_owned(url: &str) -> bool {
 pub struct CdpPool {
     conns: Mutex<HashMap<String, PoolEntry>>,
     claimed_loopback_ports: StdMutex<HashSet<u16>>,
-    /// Releases requested while the pool lock was busy, from a thread that
-    /// cannot wait for it; the next pool operation applies them.
-    deferred_releases: StdMutex<Vec<(String, u64)>>,
+    /// Releases requested from a thread that cannot wait for the pool lock
+    /// (or has no runtime to tell the relay); the next pool operation
+    /// applies them.
+    deferred_releases: StdMutex<Vec<DeferredRelease>>,
 }
 
 impl CdpPool {
@@ -676,19 +692,30 @@ impl CdpPool {
     /// [`Self::release_existing`] for a thread with no async runtime (an
     /// SDK's idle-session sweeper). It never waits: the lock holder may need
     /// this very thread to run, so a busy pool defers the release to its
-    /// next operation instead.
-    pub fn release_existing_now_or_later(&self, ws_url: &str, generation: u64) {
-        match self.conns.try_lock() {
-            Ok(mut conns) => {
+    /// next operation instead. `relay_holder` names the ended episode's hold
+    /// on relay tabs; telling the relay needs a runtime, so without one the
+    /// whole release waits for the pool's next operation.
+    pub fn release_existing_now_or_later(
+        &self,
+        ws_url: &str,
+        generation: u64,
+        relay_holder: Option<String>,
+    ) {
+        let release = DeferredRelease {
+            ws_url: ws_url.to_owned(),
+            generation,
+            relay_holder,
+        };
+        let can_send = release.relay_holder.is_none()
+            || tokio::runtime::Handle::try_current().is_ok();
+        if can_send {
+            if let Ok(mut conns) = self.conns.try_lock() {
                 self.apply_deferred_releases(&mut conns);
-                self.release_locked(&mut conns, ws_url, generation);
+                self.apply_release(&mut conns, release);
+                return;
             }
-            Err(_) => self
-                .deferred_releases
-                .lock()
-                .unwrap()
-                .push((ws_url.to_owned(), generation)),
         }
+        self.deferred_releases.lock().unwrap().push(release);
     }
 
     async fn lock_conns(&self) -> tokio::sync::MutexGuard<'_, HashMap<String, PoolEntry>> {
@@ -699,9 +726,30 @@ impl CdpPool {
 
     fn apply_deferred_releases(&self, conns: &mut HashMap<String, PoolEntry>) {
         let deferred = std::mem::take(&mut *self.deferred_releases.lock().unwrap());
-        for (ws_url, generation) in deferred {
-            self.release_locked(conns, &ws_url, generation);
+        let has_runtime = tokio::runtime::Handle::try_current().is_ok();
+        for release in deferred {
+            if release.relay_holder.is_some() && !has_runtime {
+                self.deferred_releases.lock().unwrap().push(release);
+            } else {
+                self.apply_release(conns, release);
+            }
         }
+    }
+
+    /// Needs a runtime when `relay_holder` is set.
+    fn apply_release(&self, conns: &mut HashMap<String, PoolEntry>, release: DeferredRelease) {
+        if let Some(holder) = release.relay_holder {
+            let conn = conns
+                .get(&release.ws_url)
+                .filter(|entry| entry.holders.contains(&release.generation))
+                .map(|entry| entry.conn.clone());
+            // The task keeps the socket open until the relay has the notice,
+            // even when this was the socket's last claim.
+            if let Some(conn) = conn {
+                tokio::spawn(async move { release_relay_holder(&conn, &holder).await });
+            }
+        }
+        self.release_locked(conns, &release.ws_url, release.generation);
     }
 
     fn release_locked(
@@ -1117,7 +1165,7 @@ mod tests {
         pool.claim_existing(&url, 1, || true).await.unwrap();
         {
             let _busy = pool.conns.lock().await;
-            pool.release_existing_now_or_later(&url, 1);
+            pool.release_existing_now_or_later(&url, 1, None);
         }
         let Err(error) = pool.get_existing(&url, 1).await else {
             panic!("the deferred release was never applied")

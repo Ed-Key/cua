@@ -164,10 +164,13 @@ fn tab_holders() -> &'static Mutex<HashMap<(u64, i64), usize>> {
 /// - A connection that closes owns the release of every tab it reserved,
 ///   including one whose attach is still in flight; the attach then finds
 ///   its connection closed and returns an error without adopting the tab.
-/// - Holders are Cua sessions, not connections: the engine shares one relay
-///   connection among the Cua sessions on this Chrome, names the session on
-///   every attach (`cuaSession`), and sends `Cua.releaseSession` when a
-///   session ends. A tab detaches only when no live session holds it.
+/// - Holders are Cua session episodes, not connections: the engine shares
+///   one relay connection among the Cua sessions on this Chrome, names the
+///   episode (session name plus grant generation) on every attach
+///   (`cuaSession`), and sends `Cua.releaseSession` for that episode when it
+///   ends, from every end path. A late release from an ended episode
+///   therefore never removes a restarted session's hold. A tab detaches only
+///   when no live episode holds it.
 fn attach_gates() -> &'static super::keyed_gates::KeyedGates<(u64, i64)> {
     static GATES: std::sync::OnceLock<super::keyed_gates::KeyedGates<(u64, i64)>> =
         std::sync::OnceLock::new();
