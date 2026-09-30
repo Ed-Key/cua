@@ -788,6 +788,13 @@ pub(crate) fn display_action_name(raw: String) -> String {
     }
 }
 
+/// How an action name is shown in the outline and matched from a request:
+/// no "AX" prefix, lowercased with Unicode rules ("AXPress" is "press",
+/// "Öffnen" is "öffnen"). One function for both, so a shown name resolves.
+pub(crate) fn action_key(name: &str) -> String {
+    name.strip_prefix("AX").unwrap_or(name).to_lowercase()
+}
+
 /// Action names for the markdown outline. Every element answers
 /// `AXScrollToVisible` and `AXShowMenu`, and every row inside a scroll view
 /// answers the page-scroll pair, whose presence flips with scroll position and
@@ -803,7 +810,7 @@ fn rendered_action_names(actions: &[String]) -> Vec<String> {
                 "AXScrollToVisible" | "AXShowMenu" | "AXScrollUpByPage" | "AXScrollDownByPage"
             )
         })
-        .map(|a| a.strip_prefix("AX").unwrap_or(a).to_lowercase())
+        .map(|a| action_key(a))
         .collect()
 }
 

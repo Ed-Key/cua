@@ -1815,6 +1815,28 @@ mod action_name_tests {
         assert!(resolve_element_action(&raw.to_lowercase(), &stocks_row()).is_err());
     }
 
+    /// Names are shown lowercased with Unicode rules; the resolver compared
+    /// ASCII case only, so a displayed "öffnen" was refused.
+    #[test]
+    fn a_displayed_non_ascii_name_resolves_to_its_raw_action() {
+        let advertised: Vec<String> = [
+            "Name:Öffnen\nTarget:0x0\nSelector:(null)",
+            "Name:ÉDITER\nTarget:0x0\nSelector:(null)",
+            "AXPress",
+        ]
+        .map(String::from)
+        .to_vec();
+        for raw in &advertised {
+            let shown = crate::ax::tree::action_key(&crate::ax::tree::display_action_name(raw.clone()));
+            assert_eq!(resolve_element_action(&shown, &advertised).as_ref(), Ok(raw), "{shown}");
+            assert_eq!(resolve_element_action(raw, &advertised).as_ref(), Ok(raw), "raw {raw:?}");
+        }
+        assert_eq!(resolve_element_action("öffnen", &advertised).as_deref(), Ok(advertised[0].as_str()));
+        assert_eq!(resolve_element_action("ÖFFNEN", &advertised).as_deref(), Ok(advertised[0].as_str()));
+        assert_eq!(resolve_element_action("éditer", &advertised).as_deref(), Ok(advertised[1].as_str()));
+        assert!(resolve_element_action("offnen", &advertised).is_err());
+    }
+
     #[test]
     fn a_reused_element_no_longer_names_its_snapshot_row() {
         use super::still_names_row;
@@ -1894,12 +1916,14 @@ fn resolve_element_action(requested: &str, advertised: &[String]) -> Result<Stri
     if let Some(alias) = alias.filter(|alias| advertised.iter().any(|raw| raw == alias)) {
         return Ok(alias.to_owned());
     }
+    // The outline shows each name as its action_key, so that exact text
+    // (and any other case of it) must resolve.
+    let requested_key = crate::ax::tree::action_key(requested);
     let matched = advertised.iter().find(|raw| {
         let display = crate::ax::tree::display_action_name((*raw).clone());
-        let bare = display.strip_prefix("AX").unwrap_or(&display);
         raw.as_str() == requested
-            || requested.eq_ignore_ascii_case(&display)
-            || requested.eq_ignore_ascii_case(bare)
+            || requested.to_lowercase() == display.to_lowercase()
+            || requested_key == crate::ax::tree::action_key(&display)
     });
     match (matched, alias) {
         (Some(raw), _) => Ok(raw.clone()),
@@ -2079,8 +2103,11 @@ trait RowIo {
 /// Climb the row-selection rungs under one rule: after any input has been
 /// delivered, send more input only if a complete read-back proves the
 /// intended effect is missing; an unknown outcome returns unverifiable with
-/// no further input; and every input is preceded by a fresh identity check
-/// of the target.
+/// no further input; every input is preceded by a fresh identity check of
+/// the target; and a read-back showing the row selected confirms only if a
+/// fresh identity check still matches after it (a Catalyst press can rebuild
+/// the list and recycle the retained handles for another item, which then
+/// reports the selection).
 fn climb_row_ladder(io: &mut dyn RowIo) -> anyhow::Result<RowLadderEnd> {
     let mut last_sent = None;
     for rung in [RowRung::AxSelect, RowRung::Press, RowRung::Pointer] {
@@ -2098,7 +2125,12 @@ fn climb_row_ladder(io: &mut dyn RowIo) -> anyhow::Result<RowLadderEnd> {
             RungSend::Sent => {
                 last_sent = Some(rung);
                 match io.read_back() {
-                    RowReadOutcome::Selected => return Ok(RowLadderEnd::Confirmed(rung)),
+                    RowReadOutcome::Selected => {
+                        return Ok(match io.identity() {
+                            Ok(()) => RowLadderEnd::Confirmed(rung),
+                            Err(now_reads) => RowLadderEnd::Changed { now_reads, after: Some(rung) },
+                        })
+                    }
                     RowReadOutcome::Unknown => {
                         return Ok(RowLadderEnd::Unverifiable { after: rung, replaced: false })
                     }
@@ -2384,19 +2416,24 @@ mod tests {
         let all = vec![AxSelect, Press, Pointer];
         #[allow(clippy::type_complexity)]
         let cases: Vec<(&str, Vec<RowRung>, Vec<Result<(), Option<String>>>, Vec<RungSend>, Vec<RowReadOutcome>, RowLadderEnd, &[&str])> = vec![
-            ("AX selection proven", all.clone(), vec![ok()], vec![Sent], vec![Selected],
+            ("AX selection proven", all.clone(), vec![ok(), ok()], vec![Sent], vec![Selected],
              RowLadderEnd::Confirmed(AxSelect),
-             &["identity", "send AxSelect", "read Selected"]),
+             &["identity", "send AxSelect", "read Selected", "identity"]),
             ("AX selection unknown (long list, slow scan): no press, no pointer", all.clone(),
              vec![ok()], vec![Sent], vec![Unknown],
              RowLadderEnd::Unverifiable { after: AxSelect, replaced: false },
              &["identity", "send AxSelect", "read Unknown"]),
-            ("AX write rejected, press proven", all.clone(), vec![ok(), ok()], vec![NotSent, Sent],
-             vec![Selected], RowLadderEnd::Confirmed(Press),
-             &["identity", "send AxSelect", "identity", "send Press", "read Selected"]),
-            ("press missing, pointer proven", vec![Press, Pointer], vec![ok(), ok()],
+            ("AX write rejected, press proven", all.clone(), vec![ok(), ok(), ok()],
+             vec![NotSent, Sent], vec![Selected], RowLadderEnd::Confirmed(Press),
+             &["identity", "send AxSelect", "identity", "send Press", "read Selected", "identity"]),
+            ("press reads selected but the element was recycled for another row", all.clone(),
+             vec![ok(), ok(), changed()], vec![NotSent, Sent], vec![Selected],
+             RowLadderEnd::Changed { now_reads: Some("The Home Depot".into()), after: Some(Press) },
+             &["identity", "send AxSelect", "identity", "send Press", "read Selected", "identity"]),
+            ("press missing, pointer proven", vec![Press, Pointer], vec![ok(), ok(), ok()],
              vec![Sent, Sent], vec![Missing, Selected], RowLadderEnd::Confirmed(Pointer),
-             &["identity", "send Press", "read Missing", "identity", "send Pointer", "read Selected"]),
+             &["identity", "send Press", "read Missing", "identity", "send Pointer", "read Selected",
+               "identity"]),
             ("press unknown: no pointer", vec![Press, Pointer], vec![ok()], vec![Sent], vec![Unknown],
              RowLadderEnd::Unverifiable { after: Press, replaced: false },
              &["identity", "send Press", "read Unknown"]),
@@ -2428,6 +2465,10 @@ mod tests {
             // The rule itself, over the log: each send directly follows an
             // identity check, and a send after a read needs that read Missing.
             for (at, entry) in io.log.iter().enumerate() {
+                if entry == "read Selected" {
+                    assert_eq!(io.log.get(at + 1).map(String::as_str), Some("identity"),
+                               "{name}: confirmed without a fresh identity check");
+                }
                 if entry.starts_with("send") {
                     assert_eq!(io.log[at - 1], "identity", "{name}: send without identity check");
                     if let Some(read) = io.log[..at].iter().rev().find(|e| e.starts_with("read")) {
