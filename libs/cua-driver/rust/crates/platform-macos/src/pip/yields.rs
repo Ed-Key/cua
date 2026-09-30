@@ -198,6 +198,30 @@ mod tests {
         assert_eq!(step(&panels, &[(1200.0, 700.0), (1200.0, 350.0)]), Step::Wait);
     }
 
+    /// The decision reads the pointer as of now through `Hands`: a pointer
+    /// that moved onto the panel after the last hover poll holds it, and the
+    /// gesture waits; one that was resting there when the panel appeared
+    /// does not.
+    #[test]
+    fn a_pointer_that_arrived_after_the_last_poll_makes_the_gesture_wait() {
+        use super::super::hands::Hands;
+        let start = Instant::now();
+        let (off, on) = ((10.0, 10.0), (1200.0, 700.0));
+        let mut hands: Hands<u32> = Hands::default();
+        hands.shown(off);
+        hands.pointer(false, off, start); // the last poll: off the panel
+        assert!(!hands.pointer_holds(), "as the poll left it");
+        hands.pointer(true, on, start + Duration::from_millis(60)); // the decision's own look
+        let panels = [candidate(1, PANEL, hands.pointer_holds())];
+        assert_eq!(step(&panels, &[on]), Step::Wait);
+
+        let mut resting: Hands<u32> = Hands::default();
+        resting.shown(on);
+        resting.pointer(true, on, start + Duration::from_millis(60));
+        let panels = [candidate(1, PANEL, resting.pointer_holds())];
+        assert_eq!(step(&panels, &[on]), Step::Aside(vec![1]));
+    }
+
     #[test]
     fn a_waiting_gesture_is_refused_after_five_seconds() {
         let start = Instant::now();

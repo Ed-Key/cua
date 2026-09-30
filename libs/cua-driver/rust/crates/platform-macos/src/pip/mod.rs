@@ -3661,6 +3661,18 @@ pub fn step_aside(path: &[(f64, f64)]) -> Result<Aside, PipHeldByUser> {
 unsafe fn take_aside(state: &mut State, path: Vec<(f64, f64)>) -> Option<u64> {
     let pressed = state.gesture.as_ref().map(|gesture| gesture.id);
     let primary_h = overview::primary_screen_height();
+    // The user's pointer as of now, not the last hover poll (up to 120 ms
+    // old): a pointer that moved onto a panel since then holds it. Through
+    // `Hands`, so a pointer that was resting there when the panel appeared
+    // still holds nothing until it moves.
+    let now = Instant::now();
+    for panel in state.panels.values_mut().chain(state.ending.iter_mut()) {
+        let visible: bool = msg_send![panel.window as *mut AnyObject, isVisible];
+        if panel.shown && visible && panel.aside == 0 {
+            let on = pointer_on(panel);
+            panel.hands.pointer(on, mouse_location(), now);
+        }
+    }
     let candidates: Vec<yields::Candidate> = state
         .panels
         .values()
