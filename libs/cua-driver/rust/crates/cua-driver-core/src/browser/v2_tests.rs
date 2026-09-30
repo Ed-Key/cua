@@ -2831,6 +2831,36 @@ fn ref_of(snapshot: &Value, frame: &str, label_fragment: &str) -> String {
         .to_owned()
 }
 
+/// The PiP's question about a bound tab (which macOS window shows it, and is
+/// it the selected tab there) sits in front of every bound-tab action, under
+/// its mutation lock. It must never wait on the browser: a page busy in
+/// JavaScript, or behind a dialog, answers nothing for the connection's
+/// whole call timeout.
+#[tokio::test]
+async fn the_pip_window_of_a_bound_tab_is_decided_without_asking_the_browser() {
+    let f = fixture().await;
+    let (target_id, tab_id) = bind(&f).await;
+    let mut validated = f
+        .engine
+        .revalidate_for_mutation(SESSION, &target_id, Some(&tab_id))
+        .await
+        .unwrap_or_else(|refusal| panic!("revalidation: {refusal:?}"));
+    // From here on the page answers nothing at all.
+    f.state.lock().unwrap().calls.clear();
+    // Not a future: there is nothing in it that could wait. The native
+    // window's title names this tab alone, so it is the selected tab, and
+    // the binding's macOS pid and window are the picture's.
+    let window: Option<(i32, u32)> = f.engine.pip_window(&validated);
+    assert_eq!(window, Some((1, 7)));
+    // A tab the title does not single out is not known to be selected.
+    validated.selected_by_title = false;
+    assert_eq!(f.engine.pip_window(&validated), None);
+    assert!(
+        f.state.lock().unwrap().calls.is_empty(),
+        "no CDP call was made, so none could go unanswered"
+    );
+}
+
 fn recorded_calls(f: &Fixture, method: &str) -> Vec<(Option<String>, Value)> {
     f.state
         .lock()

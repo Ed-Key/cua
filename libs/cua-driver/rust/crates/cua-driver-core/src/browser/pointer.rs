@@ -795,6 +795,7 @@ impl Tool for BrowserPointerTool {
             Ok(value) => value,
             Err(refusal) => return refusal.to_tool_result(),
         };
+        self.engine.note_pip_window(&validated);
         if request.route == InputRoute::Trusted {
             if let Some(refusal) = self.trusted_background_refusal(&validated) {
                 return refusal;

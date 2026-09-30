@@ -331,8 +331,9 @@ fn maybe_init_pip() {
             });
             // Same private key the frames carry, so the ended session's
             // panel goes away with its cursor and recording. Only an
-            // explicit end or the owning connection closing means the
-            // session is done: one the idle sweep reclaimed (or whose end
+            // explicit end says the session is done. Its connection closing
+            // (or the host ending it) says so only for fresh work (the
+            // backend decides). One the idle sweep reclaimed (or whose end
             // can no longer be read, because it was revived meanwhile) may
             // come back, so its panel closes without a finished mark.
             cua_driver_core::session::register_session_end_hook(|session_key| {
@@ -341,7 +342,10 @@ fn maybe_init_pip() {
                     Some(SessionEndReason::IdleTimeout) | None => {
                         pip_preview::PipSessionEnd::Expired
                     }
-                    Some(_) => pip_preview::PipSessionEnd::Finished,
+                    Some(SessionEndReason::Explicit) => pip_preview::PipSessionEnd::Finished,
+                    Some(SessionEndReason::ProcessExit | SessionEndReason::Unknown) => {
+                        pip_preview::PipSessionEnd::Disconnected
+                    }
                 };
                 if let Some(slot) = BACKEND.get() {
                     if let Some(b) = slot.lock().unwrap().as_ref() {
