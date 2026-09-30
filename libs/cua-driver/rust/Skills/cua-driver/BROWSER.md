@@ -37,8 +37,11 @@ The outline has one line per element, with its ref and what the ref allows:
 on. `browser_steps` takes up to 8 `click` and `type` steps. Aim a step with a
 `ref`, or with an exact `role` and `name` that is looked up on the live page
 when the step runs. Use `role` and `name` for an element an earlier step
-reveals (a menu option, a dialog button): it has no ref until that step has
-run, so the whole flow still fits one call:
+reveals or enables (a menu option, a dialog button, a Send button that is
+disabled until the field is filled): it has no ref, or no action on its ref,
+until that step has run. A role and name that match nothing only stop the
+batch at that step, with the candidates to choose from, so plan the whole
+flow as one call:
 
 ```text
 browser_steps {target_id, tab_id, steps: [

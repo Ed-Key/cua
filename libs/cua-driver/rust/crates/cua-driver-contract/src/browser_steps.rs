@@ -322,10 +322,12 @@ pub fn contracts() -> Vec<ToolContract> {
         name: BrowserStepsInput::TOOL_NAME.into(),
         description: "Run up to 8 page steps (click, type) on one bound tab in order, then \
             return what the page changed. A step targets a ref, or an exact role and name \
-            resolved when it runs. Use role and name for elements an earlier step reveals \
-            (menu options, dialogs): they have no ref until then, so the whole flow fits one \
-            call. Stops at the first failure, unconfirmed typing, dialog or navigation; never \
-            retries. Details: skill://cua-driver/BROWSER.md"
+            resolved when it runs. Use role and name for an element an earlier step reveals \
+            or enables (a menu option, a dialog, a disabled button): it has no ref or no \
+            action until then, and a name that matches nothing only stops the batch there \
+            with the candidates. So plan the whole flow as one call. Stops at the first \
+            failure, unconfirmed typing, dialog or navigation; never retries. \
+            Details: skill://cua-driver/BROWSER.md"
             .into(),
         platforms: vec![Platform::Macos, Platform::Windows, Platform::Linux],
         aliases: vec![],
