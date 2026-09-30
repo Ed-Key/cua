@@ -1991,27 +1991,236 @@ const ROW_READBACK_STABILITY: std::time::Duration = std::time::Duration::from_mi
 /// (Catalyst AX reads can take tens of milliseconds each).
 const ROW_READBACK_MIN_POLLS: u32 = 3;
 
+/// What a row read-back after an input shows.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowReadOutcome {
+    /// The row is the only selected row, and stayed so.
+    Selected,
+    /// A complete read-back shows the row not (exclusively) selected.
+    Missing,
+    /// The selection could not be read completely, or did not hold still.
+    Unknown,
+}
+
 /// Wait for `row` to become the only selected row and stay so.
-fn row_settles_exclusive(row: &crate::input::ax_actions::RowSelection) -> bool {
+fn row_selection_outcome(row: &crate::input::ax_actions::RowSelection) -> RowReadOutcome {
     std::thread::sleep(ROW_READBACK_SETTLE);
     let deadline = std::time::Instant::now() + ROW_READBACK_TIMEOUT;
     let mut polls = 0;
     loop {
         polls += 1;
-        if row.observe().is_some_and(|seen| seen.exclusive()) {
+        let seen = row.observe();
+        if seen.is_some_and(|seen| seen.exclusive()) {
             std::thread::sleep(ROW_READBACK_STABILITY);
-            return row.observe().is_some_and(|seen| seen.exclusive());
+            // Selected, then not: something else is moving the selection, so
+            // the outcome is unknown rather than proven missing.
+            return if row.observe().is_some_and(|seen| seen.exclusive()) {
+                RowReadOutcome::Selected
+            } else {
+                RowReadOutcome::Unknown
+            };
         }
         if polls >= ROW_READBACK_MIN_POLLS && std::time::Instant::now() >= deadline {
-            return false;
+            return if seen.is_some() { RowReadOutcome::Missing } else { RowReadOutcome::Unknown };
         }
         std::thread::sleep(SELECTION_READBACK_POLL);
     }
 }
 
+/// The rungs `select_row` climbs, in order.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RowRung {
+    /// AX selection write (AppKit and SwiftUI rows).
+    AxSelect,
+    /// The element's own AXPress.
+    Press,
+    /// A pointer click at the row.
+    Pointer,
+}
+
+/// What one rung's delivery did.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RungSend {
+    /// Nothing reached the app (the app rejected the write before acting).
+    NotSent,
+    /// Input may have reached the app.
+    Sent,
+    /// Input reached the app and replaced the element or its row.
+    Replaced,
+}
+
+/// How a climb ended.
+#[derive(Debug, PartialEq, Eq)]
+enum RowLadderEnd {
+    Confirmed(RowRung),
+    /// Input was sent and its outcome is unknown; nothing further was sent.
+    Unverifiable { after: RowRung, replaced: bool },
+    /// The clicked element no longer reads as its snapshot row. `after` is
+    /// the last rung that sent input, if any did.
+    Changed { now_reads: String, after: Option<RowRung> },
+    /// Every rung that applied ran, and a complete read-back after the last
+    /// one shows the row not selected (or no rung applied).
+    NotSelected,
+}
+
+/// The app side of a row-selection climb.
+trait RowIo {
+    /// Whether this rung can run at all (sends nothing).
+    fn applies(&mut self, rung: RowRung) -> bool;
+    /// A fresh read of the clicked element's name: `Err(now_reads)` when it
+    /// no longer names its snapshot row.
+    fn identity(&mut self) -> Result<(), String>;
+    fn send(&mut self, rung: RowRung) -> anyhow::Result<RungSend>;
+    fn read_back(&mut self) -> RowReadOutcome;
+}
+
+/// Climb the row-selection rungs under one rule: after any input has been
+/// delivered, send more input only if a complete read-back proves the
+/// intended effect is missing; an unknown outcome returns unverifiable with
+/// no further input; and every input is preceded by a fresh identity check
+/// of the target.
+fn climb_row_ladder(io: &mut dyn RowIo) -> anyhow::Result<RowLadderEnd> {
+    let mut last_sent = None;
+    for rung in [RowRung::AxSelect, RowRung::Press, RowRung::Pointer] {
+        if !io.applies(rung) {
+            continue;
+        }
+        if let Err(now_reads) = io.identity() {
+            return Ok(RowLadderEnd::Changed { now_reads, after: last_sent });
+        }
+        match io.send(rung)? {
+            RungSend::NotSent => continue,
+            RungSend::Replaced => {
+                return Ok(RowLadderEnd::Unverifiable { after: rung, replaced: true })
+            }
+            RungSend::Sent => {
+                last_sent = Some(rung);
+                match io.read_back() {
+                    RowReadOutcome::Selected => return Ok(RowLadderEnd::Confirmed(rung)),
+                    RowReadOutcome::Unknown => {
+                        return Ok(RowLadderEnd::Unverifiable { after: rung, replaced: false })
+                    }
+                    RowReadOutcome::Missing => {}
+                }
+            }
+        }
+    }
+    Ok(RowLadderEnd::NotSelected)
+}
+
+/// The live app behind `climb_row_ladder` for one row click.
+struct LiveRowIo<'a> {
+    row: &'a crate::input::ax_actions::RowSelection,
+    element: AXUIElementRef,
+    element_presses: bool,
+    idx: usize,
+    pid: i32,
+    window_id: u32,
+    snapshot_row: Option<&'a str>,
+    pixel: Option<SelectionPixelTarget>,
+    foreground: bool,
+    /// The pointer rung had a target where the row still is.
+    pointer_possible: bool,
+}
+
+impl RowIo for LiveRowIo<'_> {
+    fn applies(&mut self, rung: RowRung) -> bool {
+        match rung {
+            RowRung::AxSelect => self.row.kind == crate::input::ax_actions::RowKind::Native,
+            RowRung::Press => self.element_presses,
+            // The row must still be where the pixel target was taken.
+            RowRung::Pointer => {
+                self.pointer_possible = self.pixel.is_some_and(|point| {
+                    self.row.center().is_some_and(|(x, y)| {
+                        (x - point.screen_x).abs() <= 2.0 && (y - point.screen_y).abs() <= 2.0
+                    })
+                });
+                self.pointer_possible
+            }
+        }
+    }
+
+    fn identity(&mut self) -> Result<(), String> {
+        ensure_names_row(self.element, self.idx, self.snapshot_row).map_err(|error| {
+            error
+                .downcast::<ElementChanged>()
+                .map(|changed| changed.now_reads)
+                .unwrap_or_else(|error| error.to_string())
+        })
+    }
+
+    fn send(&mut self, rung: RowRung) -> anyhow::Result<RungSend> {
+        use crate::ax::bindings::{kAXErrorInvalidUIElement, kAXErrorSuccess};
+        Ok(match rung {
+            RowRung::AxSelect => {
+                if self.row.select_via_ax() {
+                    RungSend::Sent
+                } else {
+                    RungSend::NotSent
+                }
+            }
+            RowRung::Press => {
+                let element = self.element;
+                let alive_before = unsafe { crate::ax::bindings::element_is_alive(element) };
+                let err = unsafe { crate::ax::bindings::perform_action(element, "AXPress") };
+                // A stale handle fails before anything happens: report that.
+                if err == kAXErrorInvalidUIElement {
+                    anyhow::bail!(
+                        "AXUIElementPerformAction(AXPress) returned {err}; take a fresh snapshot"
+                    );
+                }
+                // The press navigated or rebuilt the list: the row's
+                // coordinates may now hold something else.
+                let replaced = if err == kAXErrorSuccess {
+                    !self.row.readable() || !unsafe { crate::ax::bindings::element_is_alive(element) }
+                } else {
+                    crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
+                        crate::ax::bindings::element_gone_after_action(element)
+                    })
+                };
+                // A press that returned an error may still have acted; the
+                // read-back decides.
+                if replaced {
+                    RungSend::Replaced
+                } else {
+                    RungSend::Sent
+                }
+            }
+            RowRung::Pointer => {
+                let point = self.pixel.expect("the pointer rung applies only with a target");
+                crate::input::mouse::click_at_xy_with_window_local(
+                    self.pid,
+                    point.screen_x,
+                    point.screen_y,
+                    point.window_x,
+                    point.window_y,
+                    self.window_id,
+                    1,
+                    &[],
+                    crate::input::mouse::WindowClickDelivery::from_foreground(self.foreground),
+                )?;
+                RungSend::Sent
+            }
+        })
+    }
+
+    fn read_back(&mut self) -> RowReadOutcome {
+        row_selection_outcome(self.row)
+    }
+}
+
+fn rung_sent_text(rung: RowRung) -> &'static str {
+    match rung {
+        RowRung::AxSelect => "Requested the AX selection",
+        RowRung::Press => "Sent AXPress",
+        RowRung::Pointer => "Posted a pointer click at the row",
+    }
+}
+
 /// Make `row` the exclusive selection and prove it: an AX selection write
 /// (AppKit rows), the element's own press, then a pointer click at the row.
-/// Success only when the app reports the row selected and no other row.
+/// Success only when the app reports the row selected and no other; the
+/// rules for sending more input live on `climb_row_ladder`.
 fn select_row(
     row: &crate::input::ax_actions::RowSelection,
     element: AXUIElementRef,
@@ -2020,110 +2229,90 @@ fn select_row(
     pixel: Option<SelectionPixelTarget>,
     foreground: bool,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
-    use crate::input::ax_actions::RowKind;
     let RowTarget { idx, pid, window_id, role, title, snapshot_row } = target;
     let row_role = &row.role;
-    let confirmed = |how: &str, via_pixel: bool| {
-        Ok((
+    let mut io = LiveRowIo {
+        row,
+        element,
+        element_presses,
+        idx,
+        pid,
+        window_id,
+        snapshot_row,
+        pixel,
+        foreground,
+        pointer_possible: false,
+    };
+    let unverifiable = |text: String, rung: RowRung| {
+        Ok((text, false, false, false, rung == RowRung::Pointer))
+    };
+    match climb_row_ladder(&mut io)? {
+        RowLadderEnd::Confirmed(rung) => Ok((
             format!(
-                "✅ Selected {row_role} for [{idx}] {role} \"{title}\" {how}; read back as \
-                 the only selected row."
+                "✅ Selected {row_role} for [{idx}] {role} \"{title}\" {}; read back as the only \
+                 selected row.",
+                match rung {
+                    RowRung::AxSelect => "through AX selection",
+                    RowRung::Press => "with AXPress",
+                    RowRung::Pointer => "with a pointer click at the row",
+                }
             ),
             false,
             false,
             true,
-            via_pixel,
-        ))
-    };
-    if row.kind == RowKind::Native && row.select_via_ax() && row_settles_exclusive(row) {
-        return confirmed("through AX selection", false);
-    }
-    if element_presses {
-        // The reads above take time in Catalyst; the element must still be
-        // the row the token named when the press goes out.
-        ensure_names_row(element, idx, snapshot_row)?;
-        let alive_before = unsafe { crate::ax::bindings::element_is_alive(element) };
-        let err = unsafe { crate::ax::bindings::perform_action(element, "AXPress") };
-        if err == crate::ax::bindings::kAXErrorSuccess && row_settles_exclusive(row) {
-            return confirmed("with AXPress", false);
-        }
-        // A stale handle fails before anything happens: report that.
-        if err == crate::ax::bindings::kAXErrorInvalidUIElement {
-            anyhow::bail!("AXUIElementPerformAction(AXPress) returned {err}; take a fresh snapshot");
-        }
-        let replaced = if err == crate::ax::bindings::kAXErrorSuccess {
-            !row.readable() || !unsafe { crate::ax::bindings::element_is_alive(element) }
-        } else {
-            crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
-                crate::ax::bindings::element_gone_after_action(element)
-            })
-        };
-        // A failed press on a row that no longer answers: nothing is known,
-        // and no pointer click follows.
-        if err != crate::ax::bindings::kAXErrorSuccess && !replaced && !row.readable() {
-            anyhow::bail!(
-                "AXUIElementPerformAction(AXPress) returned {err} and the row no longer \
-                 answers; take a fresh snapshot"
-            );
-        }
-        // The press replaced the element or its row (it navigated or rebuilt
-        // the list), or the row no longer answers: the row's coordinates may
-        // now hold something else, so no pointer click follows.
-        if replaced {
-            return Ok((
-                format!(
-                    "✅ Performed AXPress on [{idx}] {role} \"{title}\"; the element or its row \
-                     was replaced, so the selection cannot be read back. Take a fresh snapshot \
-                     before acting again: do not retry this click."
-                ),
-                false,
-                false,
-                false,
-                false,
-            ));
-        }
-    }
-    // The caller resolves the row's pixel target; without one there is no
-    // pointer rung. The row must still be where that target was taken.
-    let pointer_target = pixel.filter(|point| {
-        row.center().is_some_and(|(x, y)| {
-            (x - point.screen_x).abs() <= 2.0 && (y - point.screen_y).abs() <= 2.0
-        })
-    });
-    if let Some(point) = pointer_target {
-        crate::input::mouse::click_at_xy_with_window_local(
-            pid,
-            point.screen_x,
-            point.screen_y,
-            point.window_x,
-            point.window_y,
-            window_id,
-            1,
-            &[],
-            crate::input::mouse::WindowClickDelivery::from_foreground(foreground),
-        )?;
-        if row_settles_exclusive(row) {
-            return confirmed("with a pointer click at the row", true);
-        }
-    }
-    let seen = row.observe();
-    anyhow::bail!(
-        "row selection not confirmed for [{idx}] {role} \"{title}\": the app reports \
-         {} (want the row selected and no other). Nothing claimed; take a fresh snapshot{}",
-        match seen {
-            Some(seen) => format!(
-                "the row {}selected with {} other row(s) selected",
-                if seen.target { "" } else { "not " },
-                seen.others
+            rung == RowRung::Pointer,
+        )),
+        RowLadderEnd::Unverifiable { after, replaced: true } => unverifiable(
+            format!(
+                "✅ {} on [{idx}] {role} \"{title}\"; the element or its row was replaced, so \
+                 the selection cannot be read back. Take a fresh snapshot before acting again: \
+                 do not retry this click.",
+                rung_sent_text(after)
             ),
-            None => "no readable selection".to_owned(),
-        },
-        if foreground || pointer_target.is_none() {
-            "."
-        } else {
-            ", or click the row by pixel with delivery_mode:\"foreground\"."
+            after,
+        ),
+        RowLadderEnd::Unverifiable { after, replaced: false } => unverifiable(
+            format!(
+                "✅ {} on [{idx}] {role} \"{title}\"; the selection could not be read back \
+                 completely, so nothing further was sent. Take a fresh snapshot before acting \
+                 again: do not retry this click.",
+                rung_sent_text(after)
+            ),
+            after,
+        ),
+        RowLadderEnd::Changed { now_reads, after: None } => {
+            Err(ElementChanged { idx, now_reads }.into())
         }
-    )
+        RowLadderEnd::Changed { now_reads, after: Some(after) } => unverifiable(
+            format!(
+                "✅ {} on [{idx}] {role} \"{title}\"; element [{idx}] then read \"{now_reads}\" \
+                 (element_changed: the app reused it for other content), so nothing further was \
+                 sent. Take a fresh snapshot before acting again: do not retry this click.",
+                rung_sent_text(after)
+            ),
+            after,
+        ),
+        RowLadderEnd::NotSelected => {
+            let seen = row.observe();
+            anyhow::bail!(
+                "row selection not confirmed for [{idx}] {role} \"{title}\": the app reports \
+                 {} (want the row selected and no other). Nothing claimed; take a fresh snapshot{}",
+                match seen {
+                    Some(seen) => format!(
+                        "the row {}selected with {} other row(s) selected",
+                        if seen.target { "" } else { "not " },
+                        seen.others
+                    ),
+                    None => "no readable selection".to_owned(),
+                },
+                if foreground || !io.pointer_possible {
+                    "."
+                } else {
+                    ", or click the row by pixel with delivery_mode:\"foreground\"."
+                }
+            )
+        }
+    }
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
@@ -2131,6 +2320,99 @@ fn select_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A scripted app for `climb_row_ladder`: which rungs apply, what each
+    /// identity check reads, what each send does and what each read-back
+    /// shows. Every call is logged in order.
+    struct ScriptedRow {
+        applies: Vec<RowRung>,
+        identity: Vec<Result<(), String>>,
+        sends: Vec<RungSend>,
+        reads: Vec<RowReadOutcome>,
+        log: Vec<String>,
+    }
+
+    impl RowIo for ScriptedRow {
+        fn applies(&mut self, rung: RowRung) -> bool {
+            self.applies.contains(&rung)
+        }
+        fn identity(&mut self) -> Result<(), String> {
+            self.log.push("identity".into());
+            self.identity.remove(0)
+        }
+        fn send(&mut self, rung: RowRung) -> anyhow::Result<RungSend> {
+            self.log.push(format!("send {rung:?}"));
+            Ok(self.sends.remove(0))
+        }
+        fn read_back(&mut self) -> RowReadOutcome {
+            let read = self.reads.remove(0);
+            self.log.push(format!("read {read:?}"));
+            read
+        }
+    }
+
+    /// The row-selection rule, case by case: more input only after a
+    /// complete read-back proves the effect missing, an unknown outcome
+    /// stops unverifiable, and every send follows a fresh identity check.
+    #[test]
+    fn row_ladder_sends_more_input_only_on_proof_of_a_miss() {
+        use RowReadOutcome::{Missing, Selected, Unknown};
+        use RowRung::{AxSelect, Pointer, Press};
+        use RungSend::{NotSent, Replaced, Sent};
+        let ok = || Ok(());
+        let changed = || Err("The Home Depot".to_owned());
+        let all = vec![AxSelect, Press, Pointer];
+        #[allow(clippy::type_complexity)]
+        let cases: Vec<(&str, Vec<RowRung>, Vec<Result<(), String>>, Vec<RungSend>, Vec<RowReadOutcome>, RowLadderEnd, &[&str])> = vec![
+            ("AX selection proven", all.clone(), vec![ok()], vec![Sent], vec![Selected],
+             RowLadderEnd::Confirmed(AxSelect),
+             &["identity", "send AxSelect", "read Selected"]),
+            ("AX selection unknown (long list, slow scan): no press, no pointer", all.clone(),
+             vec![ok()], vec![Sent], vec![Unknown],
+             RowLadderEnd::Unverifiable { after: AxSelect, replaced: false },
+             &["identity", "send AxSelect", "read Unknown"]),
+            ("AX write rejected, press proven", all.clone(), vec![ok(), ok()], vec![NotSent, Sent],
+             vec![Selected], RowLadderEnd::Confirmed(Press),
+             &["identity", "send AxSelect", "identity", "send Press", "read Selected"]),
+            ("press missing, pointer proven", vec![Press, Pointer], vec![ok(), ok()],
+             vec![Sent, Sent], vec![Missing, Selected], RowLadderEnd::Confirmed(Pointer),
+             &["identity", "send Press", "read Missing", "identity", "send Pointer", "read Selected"]),
+            ("press unknown: no pointer", vec![Press, Pointer], vec![ok()], vec![Sent], vec![Unknown],
+             RowLadderEnd::Unverifiable { after: Press, replaced: false },
+             &["identity", "send Press", "read Unknown"]),
+            ("press replaced the row: no pointer", vec![Press, Pointer], vec![ok()], vec![Replaced],
+             vec![], RowLadderEnd::Unverifiable { after: Press, replaced: true },
+             &["identity", "send Press"]),
+            ("press missing, element reused before the pointer: no pointer", vec![Press, Pointer],
+             vec![ok(), changed()], vec![Sent], vec![Missing],
+             RowLadderEnd::Changed { now_reads: "The Home Depot".into(), after: Some(Press) },
+             &["identity", "send Press", "read Missing", "identity"]),
+            ("element reused before any input", all.clone(), vec![changed()], vec![], vec![],
+             RowLadderEnd::Changed { now_reads: "The Home Depot".into(), after: None },
+             &["identity"]),
+            ("every rung missing", all.clone(), vec![ok(), ok(), ok()], vec![Sent, Sent, Sent],
+             vec![Missing, Missing, Missing], RowLadderEnd::NotSelected,
+             &["identity", "send AxSelect", "read Missing", "identity", "send Press",
+               "read Missing", "identity", "send Pointer", "read Missing"]),
+            ("no rung applies", vec![], vec![], vec![], vec![], RowLadderEnd::NotSelected, &[]),
+        ];
+        for (name, applies, identity, sends, reads, want, want_log) in cases {
+            let mut io = ScriptedRow { applies, identity, sends, reads, log: vec![] };
+            let end = climb_row_ladder(&mut io).expect(name);
+            assert_eq!(end, want, "{name}");
+            assert_eq!(io.log, want_log, "{name}");
+            // The rule itself, over the log: each send directly follows an
+            // identity check, and a send after a read needs that read Missing.
+            for (at, entry) in io.log.iter().enumerate() {
+                if entry.starts_with("send") {
+                    assert_eq!(io.log[at - 1], "identity", "{name}: send without identity check");
+                    if let Some(read) = io.log[..at].iter().rev().find(|e| e.starts_with("read")) {
+                        assert_eq!(read, "read Missing", "{name}: input after {read}");
+                    }
+                }
+            }
+        }
+    }
 
     /// Surface 5: schema must advertise the new `button` field with the three
     /// canonical values and default to "left". Hermes / Codex / Claude Code

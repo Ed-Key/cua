@@ -63,6 +63,36 @@ pub(crate) fn choose_row(chain: &[RowCandidate]) -> Option<(usize, RowKind)> {
         })
 }
 
+/// `choose_row`, reading a step's selectable peers (`scan_peers(at)`: count
+/// and whether one is selected) only when no AppKit row claims the click.
+/// Peers are read bottom up and the climb stops at the first Catalyst row,
+/// since Catalyst answers each read slowly and a Finder list can hold
+/// thousands of rows. A click on a control scans nothing.
+pub(crate) fn find_row(
+    chain: &mut [RowCandidate],
+    mut scan_peers: impl FnMut(usize) -> Option<(usize, bool)>,
+) -> Option<(usize, RowKind)> {
+    if chain.first().is_some_and(|clicked| is_control_role(&clicked.role)) {
+        return None;
+    }
+    if let found @ Some(_) = choose_row(chain) {
+        return found;
+    }
+    for at in 0..chain.len() {
+        if !chain[at].selectable {
+            continue;
+        }
+        if let Some((peers, any)) = scan_peers(at) {
+            chain[at].selectable_peers = peers;
+            chain[at].peer_selected = any;
+            if let found @ Some(_) = choose_row(&chain[..=at]) {
+                return found;
+            }
+        }
+    }
+    None
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
     /// AppKit / SwiftUI collection row: accepts AX selection writes.
@@ -184,6 +214,12 @@ impl RowSelection {
     /// list with a readable selection model.
     pub fn capture(element_ptr: usize) -> Option<Self> {
         unsafe {
+            // A control click is never a row click: stop before walking its
+            // ancestors (Catalyst exposes AXSelected on nearly all of them).
+            let clicked_role = copy_string_attr(element_ptr as AXUIElementRef, "AXRole");
+            if clicked_role.as_deref().is_some_and(is_control_role) {
+                return None;
+            }
             let mut chain = Vec::new();
             let mut elements = Vec::new();
             let mut current = element_ptr as AXUIElementRef;
@@ -208,21 +244,11 @@ impl RowSelection {
                 CFRetain(parent as CFTypeRef);
                 current = parent;
             }
-            // Peers are read only when no AppKit row claims the click (a
-            // Finder list can hold thousands of rows), bottom up, stopping at
-            // the first Catalyst row: Catalyst answers each read slowly.
-            let chosen = choose_row(&chain).or_else(|| {
-                for at in 0..chain.len() {
-                    if let (true, Some(parent)) = (chain[at].selectable, elements[at].1) {
-                        let (peers, _, any, _) = scan_selection(parent, None);
-                        chain[at].selectable_peers = peers;
-                        chain[at].peer_selected = any;
-                        if let found @ Some(_) = choose_row(&chain[..=at]) {
-                            return found;
-                        }
-                    }
-                }
-                None
+            let chosen = find_row(&mut chain, |at| {
+                elements[at].1.map(|parent| {
+                    let (peers, _, any, _) = scan_selection(parent, None);
+                    (peers, any)
+                })
             });
             let mut result = None;
             for (at, (element, parent)) in elements.into_iter().enumerate() {
@@ -536,6 +562,37 @@ mod tests {
         let toolbar = [step("AXGenericElement", true, 1, false), step("AXGroup", true, 3, false)];
         assert_eq!(choose_row(&toolbar), None);
         assert_eq!(choose_row(&[]), None);
+    }
+
+    /// A control click scans no peers, however many selectable ancestors it
+    /// has; a Catalyst row click still scans until the first row proves out.
+    #[test]
+    fn a_control_click_does_no_peer_scan() {
+        for control in ["AXButton", "AXLink", "AXCheckBox"] {
+            let mut chain = vec![
+                step(control, true, 0, false),
+                step("AXGroup", true, 0, false),
+                step("AXGroup", true, 0, false),
+            ];
+            let mut scans = 0;
+            let found = find_row(&mut chain, |_| {
+                scans += 1;
+                Some((11, true))
+            });
+            assert_eq!((found, scans), (None, 0), "{control}");
+        }
+        let mut stocks = vec![
+            step("AXGenericElement", true, 0, false),
+            step("AXGroup", true, 0, false),
+            step("AXGroup", true, 0, false),
+        ];
+        let mut scanned = vec![];
+        let found = find_row(&mut stocks, |at| {
+            scanned.push(at);
+            Some(if at == 0 { (1, false) } else { (11, true) })
+        });
+        assert_eq!(found, Some((1, RowKind::Catalyst)));
+        assert_eq!(scanned, [0, 1], "stops at the first Catalyst row");
     }
 
     #[test]
