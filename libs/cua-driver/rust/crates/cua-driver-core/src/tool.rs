@@ -1743,7 +1743,7 @@ impl ToolRegistry {
             }
         });
         if result.is_error != Some(true) && crate::action_record::is_action_tool(resolved_name) {
-            if let Err(error) = publish_action_result(&mut result) {
+            if let Err(error) = publish_action_result(&mut result, tool.def().idempotent) {
                 result = ToolResult::error(format!(
                     "internal action outcome mismatch for {resolved_name}: {error}; the tool may have executed. Verify state before retrying."
                 ))
@@ -2863,7 +2863,7 @@ fn session_selecting_tool(tool_name: &str) -> bool {
         )
 }
 
-fn publish_action_result(result: &mut ToolResult) -> Result<(), String> {
+fn publish_action_result(result: &mut ToolResult, idempotent: bool) -> Result<(), String> {
     let action = result
         .action_record
         .as_ref()
@@ -2880,6 +2880,9 @@ fn publish_action_result(result: &mut ToolResult) -> Result<(), String> {
         Content::Text { text, .. } if !text.trim().is_empty() => Some(text.clone()),
         _ => None,
     });
+    // Moves, toggles, typing and submits repeat when resent: say so, so an
+    // unconfirmed effect is read before it is sent again.
+    public.idempotent = (!idempotent).then_some(false);
     public
         .validate_invariants()
         .map_err(|error| format!("invalid public projection: {error}"))?;
@@ -4877,8 +4880,10 @@ resources:
         let object = structured.as_object().expect("ActionResult is an object");
         assert_eq!(
             object.keys().map(String::as_str).collect::<Vec<_>>(),
-            ["delivery", "effect", "route", "summary"]
+            ["delivery", "effect", "idempotent", "route", "summary"]
         );
+        // A click repeats when resent; the result says so.
+        assert_eq!(structured["idempotent"], false);
         assert_eq!(structured["effect"], "unverifiable");
         assert_eq!(structured["delivery"]["mode"], "unknown");
         // The producer's text travels inside the closed contract for clients
@@ -4921,8 +4926,9 @@ resources:
             &legacy,
         );
 
-        publish_action_result(&mut result).expect("browser refusal should project");
+        publish_action_result(&mut result, true).expect("browser refusal should project");
         let structured = result.structured_content.as_ref().unwrap();
+        assert!(structured.get("idempotent").is_none(), "idempotent tools stay unmarked");
         assert_eq!(structured["effect"], "refused");
         assert_eq!(structured["route"], "trusted_input");
         assert_eq!(structured["escalation"]["target"], "page");

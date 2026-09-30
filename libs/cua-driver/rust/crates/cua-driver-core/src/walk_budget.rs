@@ -44,6 +44,7 @@ pub struct WalkBudget {
     max_elements: usize,
     visited: usize,
     pending: usize,
+    skipped: usize,
     stop: Option<WalkStop>,
 }
 
@@ -58,8 +59,22 @@ impl WalkBudget {
             max_elements,
             visited: 0,
             pending: 0,
+            skipped: 0,
             stop: None,
         }
+    }
+
+    /// Bound for one accessibility read inside the walk: a quarter of the
+    /// budget, between 0.25 s and 2 s. A node slower than this is skipped
+    /// ([`WalkBudget::skip`]); a larger `timeout_ms` (or the retry) waits
+    /// longer for it.
+    pub fn read_timeout_secs(&self) -> f32 {
+        (self.timeout_ms as f32 / 4000.0).clamp(0.25, 2.0)
+    }
+
+    /// Record a visited node whose reads timed out, so its subtree was left out.
+    pub fn skip(&mut self) {
+        self.skipped += 1;
     }
 
     /// A walk bounded only by `max_elements` (internal callers with no
@@ -107,6 +122,7 @@ impl WalkBudget {
             stop: self.stop,
             nodes_visited: self.visited,
             nodes_pending: self.pending,
+            nodes_skipped: self.skipped,
             elapsed_ms: self
                 .started
                 .map_or(0, |started| started.elapsed().as_millis() as u64),
@@ -121,6 +137,9 @@ pub struct WalkOutcome {
     pub stop: Option<WalkStop>,
     pub nodes_visited: usize,
     pub nodes_pending: usize,
+    /// Nodes that did not answer within the per-read bound; their subtrees
+    /// are missing even when the walk was not cut short.
+    pub nodes_skipped: usize,
     pub elapsed_ms: u64,
 }
 
@@ -133,16 +152,21 @@ impl WalkOutcome {
             stop: Some(WalkStop::Timeout),
             nodes_visited: 0,
             nodes_pending: 0,
+            nodes_skipped: 0,
             elapsed_ms: elapsed.as_millis() as u64,
         }
     }
 
+    /// Cut short by a budget, or missing the subtrees of nodes that did not
+    /// answer.
     pub fn truncated(&self) -> bool {
-        self.stop.is_some()
+        self.stop.is_some() || self.nodes_skipped > 0
     }
 
     pub fn reason(&self) -> Option<&'static str> {
-        self.stop.map(WalkStop::as_str)
+        self.stop
+            .map(WalkStop::as_str)
+            .or((self.nodes_skipped > 0).then_some("app_unresponsive"))
     }
 
     /// Write the shared walk fields into a `get_window_state` payload.
@@ -154,6 +178,9 @@ impl WalkOutcome {
         structured["nodes_visited"] = json!(self.nodes_visited);
         structured["nodes_pending"] = json!(self.nodes_pending);
         structured["walk_elapsed_ms"] = json!(self.elapsed_ms);
+        if self.nodes_skipped > 0 {
+            structured["nodes_skipped"] = json!(self.nodes_skipped);
+        }
         structured["timeout_ms"] = json!(self.timeout_ms);
     }
 
@@ -167,6 +194,41 @@ impl WalkOutcome {
                 self.nodes_pending,
             )
         })
+    }
+}
+
+/// A walk that ran out of time after fewer nodes than this most likely hit an
+/// app that was slow to answer its first reads (waking up, busy main thread),
+/// not a large tree: it earns one retry.
+pub const RETRY_BELOW_NODES: usize = 10;
+/// Ceiling for the retry's budget.
+pub const RETRY_CAP_MS: u64 = 8_000;
+
+/// The budget for one retry of `first`: four times its budget, capped, when it
+/// timed out, or skipped unanswered nodes, after fewer than
+/// [`RETRY_BELOW_NODES`] nodes. `None` when a retry could not do better (the
+/// walk finished, stopped for the node cap, got far enough, or already had
+/// the capped budget).
+pub fn retry_timeout_ms(first: &WalkOutcome) -> Option<u64> {
+    let stalled = first.stop == Some(WalkStop::Timeout)
+        || (first.stop.is_none() && first.nodes_skipped > 0);
+    if !stalled || first.nodes_visited >= RETRY_BELOW_NODES {
+        return None;
+    }
+    let budget = first.timeout_ms.saturating_mul(4).min(RETRY_CAP_MS);
+    (budget > first.timeout_ms).then_some(budget)
+}
+
+impl WalkOutcome {
+    /// Record the abandoned first walk next to the retry's own fields, so
+    /// both timings are visible.
+    pub fn apply_retry_of(&self, first: &WalkOutcome, structured: &mut Value) {
+        structured["walk_retry"] = json!({
+            "first_timeout_ms": first.timeout_ms,
+            "first_elapsed_ms": first.elapsed_ms,
+            "first_nodes_visited": first.nodes_visited,
+            "retry_elapsed_ms": self.elapsed_ms,
+        });
     }
 }
 
@@ -202,6 +264,47 @@ pub fn truncation_note(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outcome(stop: Option<WalkStop>, timeout_ms: u64, visited: usize) -> WalkOutcome {
+        WalkOutcome {
+            timeout_ms,
+            stop,
+            nodes_visited: visited,
+            nodes_pending: 5,
+            nodes_skipped: 0,
+            elapsed_ms: timeout_ms,
+        }
+    }
+
+    /// A walk that stalled on its first reads retries once with four times the
+    /// budget (capped); a walk that got going, finished, or hit the node cap
+    /// does not.
+    #[test]
+    fn only_an_early_timeout_earns_a_bigger_retry() {
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 1000, 1)), Some(4000));
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 1000, 9)), Some(4000));
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 3000, 0)), Some(8000));
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 1000, 10)), None);
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::Timeout), 8000, 1)), None);
+        assert_eq!(retry_timeout_ms(&outcome(Some(WalkStop::NodeBudget), 1000, 1)), None);
+        assert_eq!(retry_timeout_ms(&outcome(None, 1000, 1)), None);
+        // A walk that skipped its first unanswered reads also stalled.
+        let skipped = WalkOutcome { nodes_skipped: 1, ..outcome(None, 1000, 1) };
+        assert_eq!(retry_timeout_ms(&skipped), Some(4000));
+        // Missing subtrees are a partial tree, never a complete one.
+        assert!(skipped.truncated());
+        assert_eq!(skipped.reason(), Some("app_unresponsive"));
+
+        // The per-read bound grows with the budget, so a retry waits longer.
+        assert_eq!(WalkBudget::new(1000, 10).read_timeout_secs(), 0.25);
+        assert_eq!(WalkBudget::new(4000, 10).read_timeout_secs(), 1.0);
+        assert_eq!(WalkBudget::new(60_000, 10).read_timeout_secs(), 2.0);
+
+        let mut structured = json!({});
+        outcome(None, 4000, 40).apply_retry_of(&outcome(Some(WalkStop::Timeout), 1000, 1), &mut structured);
+        assert_eq!(structured["walk_retry"]["first_elapsed_ms"], 1000);
+        assert_eq!(structured["walk_retry"]["retry_elapsed_ms"], 4000);
+    }
 
     #[test]
     fn node_budget_stops_and_counts_pending() {

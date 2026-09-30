@@ -104,8 +104,9 @@ pub(crate) fn pointer_reading_background_refusal(
 pub(crate) fn delivery_note(route: PixelClickRoute) -> &'static str {
     match route {
         PixelClickRoute::ForegroundHid => {
-            "foreground: exact window activated, hardware pointer moved to the target, \
-             HID event tap; not driver-verified — confirm via screenshot"
+            "foreground: exact window activated and confirmed topmost at the point, \
+             hardware pointer moved to the target, HID event tap; the click's effect is \
+             not driver-verified — confirm via screenshot"
         }
         _ => {
             "background CGEvent routed to the pid; the hardware pointer was not moved, \
@@ -127,8 +128,30 @@ pub(crate) fn path_label(route: PixelClickRoute) -> &'static str {
 }
 
 /// Structured error for a foreground HID click whose exact-window activation
-/// or dispatch failed. No input reaches another window in that case.
-pub(crate) fn foreground_unavailable(action: &str, window_id: u32, cause: &str) -> ToolResult {
+/// or dispatch failed. No input reaches another window in that case. A
+/// window left covering the point after the raise is `target_occluded`,
+/// naming it.
+pub(crate) fn foreground_unavailable(
+    action: &str,
+    window_id: u32,
+    cause: &anyhow::Error,
+) -> ToolResult {
+    if let Some(occluded) = cause.downcast_ref::<crate::input::skylight::TargetOccluded>() {
+        return ToolResult::error(format!("{action} refused: {occluded}.")).with_structured(
+            serde_json::json!({
+                "code": "target_occluded",
+                "effect": "refused",
+                "window_id": window_id,
+                "point": [occluded.point.0, occluded.point.1],
+                "covering": occluded.covering.as_ref().map(|window| serde_json::json!({
+                    "pid": window.pid,
+                    "app_name": window.app_name,
+                    "window_id": window.window_id,
+                    "title": window.title,
+                })),
+            }),
+        );
+    }
     ToolResult::error(format!(
         "{action} failed: foreground HID delivery to window {window_id} was not possible: \
          {cause}"
@@ -199,11 +222,33 @@ mod tests {
 
     #[test]
     fn foreground_failure_is_structured() {
-        let result = foreground_unavailable("click", 7, "window never focused");
+        let result = foreground_unavailable("click", 7, &anyhow::anyhow!("window never focused"));
         assert_eq!(result.is_error, Some(true));
         assert_eq!(
             result.structured_content.expect("structured")["code"],
             "foreground_unavailable"
         );
+    }
+
+    /// A click that would land on the window covering the target refuses and
+    /// names that window.
+    #[test]
+    fn a_covered_target_refuses_as_target_occluded_naming_the_cover() {
+        let occluded = crate::input::skylight::TargetOccluded {
+            window_id: 7,
+            point: (429.0, 470.0),
+            covering: Some(crate::input::skylight::CoveringWindow {
+                pid: 99,
+                app_name: "Finder".into(),
+                window_id: 12,
+                title: "cover".into(),
+            }),
+        };
+        let result = foreground_unavailable("click", 7, &anyhow::Error::new(occluded));
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.clone().expect("structured");
+        assert_eq!(structured["code"], "target_occluded");
+        assert_eq!(structured["covering"]["app_name"], "Finder");
+        assert!(format!("{:?}", result.content).contains("Finder"));
     }
 }

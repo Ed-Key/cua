@@ -432,6 +432,10 @@ pub struct WindowChange {
     pub new_windows: Vec<SurfaceWindow>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rebind: Option<SurfaceWindow>,
+    /// System indicator windows that also appeared and were left out
+    /// (screen-sharing badges, tiny or above-normal-level overlays).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ignored_windows: Option<u32>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]

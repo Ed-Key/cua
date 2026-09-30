@@ -121,6 +121,64 @@ struct Root {
     /// or the parent window for a sheet, dialog or popover inside it.
     window_id: Option<u32>,
     title: String,
+    kind: SurfaceKind,
+    /// An untitled window whose only child is macOS's screen-sharing
+    /// indicator button: system chrome, never the app's own surface.
+    sharing_indicator: bool,
+}
+
+/// What kind of surface a root is, from its AX role and subrole.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SurfaceKind {
+    Standard,
+    Dialog,
+    Floating,
+    Sheet,
+    Popover,
+    Other,
+}
+
+impl SurfaceKind {
+    fn of(role: &str, subrole: &str) -> Self {
+        match (role, subrole) {
+            ("AXSheet", _) => Self::Sheet,
+            ("AXPopover", _) => Self::Popover,
+            (_, "AXStandardWindow") => Self::Standard,
+            (_, "AXDialog" | "AXSystemDialog") | ("AXDialog", _) => Self::Dialog,
+            (_, "AXFloatingWindow" | "AXSystemFloatingWindow") => Self::Floating,
+            _ => Self::Other,
+        }
+    }
+
+    /// A surface an agent should move to when it is the only new one.
+    fn rebindable(self) -> bool {
+        !matches!(self, Self::Other)
+    }
+}
+
+/// Windows smaller than this (points) are indicators and badges, not
+/// something the action opened for the agent to read, unless they are a
+/// dialog or sheet.
+const MIN_SURFACE_WIDTH: f64 = 100.0;
+const MIN_SURFACE_HEIGHT: f64 = 60.0;
+const SHARING_INDICATOR_ID: &str = "WindowSharingSessionButton";
+
+/// Whether an appeared root is system chrome to leave out of the report:
+/// the sharing indicator, a tiny window, or a window above the normal level
+/// that is not a floating panel, dialog or sheet.
+fn is_ignored_surface(root: &Root, window: Option<&crate::windows::WindowInfo>) -> bool {
+    if root.sharing_indicator {
+        return true;
+    }
+    if matches!(root.kind, SurfaceKind::Dialog | SurfaceKind::Sheet) {
+        return false;
+    }
+    let Some(window) = window else {
+        return false;
+    };
+    (window.layer > 0 && root.kind != SurfaceKind::Floating)
+        || window.bounds.width < MIN_SURFACE_WIDTH
+        || window.bounds.height < MIN_SURFACE_HEIGHT
 }
 
 type RootSnapshot = HashMap<RootKey, Root>;
@@ -139,6 +197,8 @@ struct Pending {
     read_since: bool,
     /// Per root: reads so far that found its owner still unknown.
     unresolved_reads: HashMap<RootKey, u32>,
+    /// The window the first action since the baseline addressed, if any.
+    target_window: Option<u32>,
 }
 
 type PendingKey = (String, i32);
@@ -160,6 +220,12 @@ fn session_of(args: &Value) -> String {
         .to_owned()
 }
 
+fn window_of(args: &Value) -> Option<u32> {
+    args.get("window_id")
+        .and_then(Value::as_u64)
+        .and_then(|window| u32::try_from(window).ok())
+}
+
 fn pid_of(args: &Value) -> Option<i32> {
     args.get("pid")
         .and_then(Value::as_i64)
@@ -170,7 +236,7 @@ fn pid_of(args: &Value) -> Option<i32> {
 /// Blocking. Record the app's roots before an action. An unreported baseline
 /// is kept, so several actions before one read report everything since the
 /// first of them.
-fn record_before_action(session: &str, pid: i32) {
+fn record_before_action(session: &str, pid: i32, target_window: Option<u32>) {
     let key = (session.to_owned(), pid);
     if pending().get(&key).is_some_and(|entry| !entry.read_since) {
         return;
@@ -199,6 +265,7 @@ fn record_before_action(session: &str, pid: i32) {
             generation: next_generation(),
             read_since: false,
             unresolved_reads: HashMap::new(),
+            target_window,
         },
     );
 }
@@ -262,6 +329,9 @@ enum Outcome {
     Unresolved,
     /// No address at all: nothing to report, ever.
     Unaddressable,
+    /// System chrome (an indicator overlay): known from now on, counted,
+    /// never reported or rebound to.
+    Ignored,
 }
 
 /// Blocking. Windows that appeared since the recorded baseline, each reported
@@ -277,7 +347,21 @@ fn take_window_change(session: &str, pid: i32) -> Option<WindowChange> {
     let after = snapshot_roots(pid)?;
     let appeared = appeared_roots(&before, &after);
     let outcomes = resolve_outcomes(pid, &appeared);
-    finish_take(&key, generation, appeared, outcomes)
+    let target_holds_focus = !appeared.is_empty() && target_holds_focus(&key);
+    finish_take(&key, generation, appeared, outcomes, target_holds_focus)
+}
+
+/// Whether the window the action addressed is still alive, on screen and the
+/// app's focused window: then nothing new took the agent's attention away,
+/// and no rebind is offered.
+fn target_holds_focus(key: &PendingKey) -> bool {
+    let Some(target) = pending().get(key).and_then(|entry| entry.target_window) else {
+        return false;
+    };
+    let on_screen = crate::windows::window_info_by_id(target).is_some_and(|window| window.is_on_screen);
+    on_screen
+        && crate::ax::bindings::focused_window_id_of_pid(key.1)
+            .is_some_and(|focused| crate::ax::bindings::window_belongs_to(focused, target))
 }
 
 /// Apply one read's findings to the pending entry and build its report.
@@ -286,6 +370,7 @@ fn finish_take(
     generation: u64,
     appeared: Vec<(RootKey, Root)>,
     outcomes: Vec<Outcome>,
+    target_holds_focus: bool,
 ) -> Option<WindowChange> {
     let pid = key.1;
     let mut map = pending();
@@ -295,12 +380,18 @@ fn finish_take(
     }
     entry.generation = next_generation();
     let mut reported = Vec::new();
+    let mut ignored = 0u32;
     let mut still_unresolved = HashMap::new();
     for ((root_key, root), outcome) in appeared.into_iter().zip(outcomes) {
         match outcome {
             Outcome::Reported(window) => {
+                let rebindable = root.kind.rebindable();
                 entry.roots.insert(root_key, root);
-                reported.push(window);
+                reported.push((window, rebindable));
+            }
+            Outcome::Ignored => {
+                entry.roots.insert(root_key, root);
+                ignored += 1;
             }
             Outcome::Unresolved => {
                 // Each root has its own budget; one that never resolves
@@ -328,7 +419,13 @@ fn finish_take(
     } else {
         map.remove(key);
     }
-    change_from(reported, unresolved, pid)
+    if ignored > 0 {
+        tracing::debug!(pid, ignored, "surface observation left out indicator windows");
+    }
+    change_from(reported, unresolved, pid, target_holds_focus).map(|mut change| {
+        change.ignored_windows = (ignored > 0).then_some(ignored);
+        change
+    })
 }
 
 pub(crate) fn retire_session(session: &str) {
@@ -366,6 +463,10 @@ fn outcome_for(
     let Some(window_id) = root.window_id else {
         return Outcome::Unaddressable;
     };
+    let window = windows.iter().find(|window| window.window_id == window_id);
+    if is_ignored_surface(root, window) {
+        return Outcome::Ignored;
+    }
     match surface_owner(windows, pid, window_id, app_name) {
         Some((owner_pid, owner_app_name)) => Outcome::Reported(SurfaceWindow {
             pid: i64::from(owner_pid),
@@ -379,22 +480,34 @@ fn outcome_for(
 
 /// Several roots can share one address (a sheet reports its parent window),
 /// so dedupe by address. Rebind only when nothing is unresolved, exactly one
-/// address remains, and the acted-on app owns it: a window owned by another
-/// process is listed but not offered as a readable target.
-fn change_from(candidates: Vec<SurfaceWindow>, unresolved: bool, pid: i32) -> Option<WindowChange> {
+/// address remains, it is a window, dialog, floating panel, sheet or popover,
+/// the acted-on app owns it (a window owned by another process is listed but
+/// not offered as a readable target), and the window the action addressed no
+/// longer holds focus.
+fn change_from(
+    candidates: Vec<(SurfaceWindow, bool)>,
+    unresolved: bool,
+    pid: i32,
+    target_holds_focus: bool,
+) -> Option<WindowChange> {
     let mut seen = HashSet::new();
-    let new_windows: Vec<SurfaceWindow> = candidates
+    let new_windows: Vec<(SurfaceWindow, bool)> = candidates
         .into_iter()
-        .filter(|window| seen.insert((window.pid, window.window_id)))
+        .filter(|(window, _)| seen.insert((window.pid, window.window_id)))
         .collect();
     if new_windows.is_empty() {
         return None;
     }
-    let rebind = (!unresolved && new_windows.len() == 1 && new_windows[0].pid == i64::from(pid))
-        .then(|| new_windows[0].clone());
+    let rebind = match new_windows.as_slice() {
+        [(window, true)] if !unresolved && !target_holds_focus && window.pid == i64::from(pid) => {
+            Some(window.clone())
+        }
+        _ => None,
+    };
     Some(WindowChange {
-        new_windows,
+        new_windows: new_windows.into_iter().map(|(window, _)| window).collect(),
         rebind,
+        ignored_windows: None,
     })
 }
 
@@ -513,13 +626,14 @@ impl Tool for SurfaceNoted {
             Role::Action => {
                 let guard = key_guard(&session, pid).await;
                 let recording_session = session.clone();
+                let target_window = window_of(&args);
                 // The guard rides with the blocking snapshot, so cancelling
                 // this call cannot release it while the snapshot still runs.
                 // A panic in the snapshot must not strand the guard: catch it,
                 // drop the baseline (unknown), and keep the action guarded.
                 let guard = tokio::task::spawn_blocking(move || {
                     let recorded = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                        record_before_action(&recording_session, pid)
+                        record_before_action(&recording_session, pid, target_window)
                     }));
                     if recorded.is_err() {
                         pending().remove(&(recording_session, pid));
@@ -715,6 +829,12 @@ unsafe fn insert_root(
     let subrole = reader.optional_string(element, "AXSubrole")?;
     let title = reader.optional_string(element, "AXTitle")?;
     let own_window_id = reader.read(element, || ax_get_window_id_checked(element))?;
+    let kind = SurfaceKind::of(&role, &subrole);
+    // Only an untitled top-level window can be the sharing indicator; read
+    // its children only then, so ordinary windows cost nothing extra.
+    let sharing_indicator = top_level
+        && matches!(title.as_str(), "" | "Window")
+        && sharing_indicator_only_child(reader, element)?;
     // get_window_state reads top-level AX windows; a child surface is read
     // only through its parent, even when WindowServer gives it its own id.
     let effective_window_id = if top_level {
@@ -740,9 +860,28 @@ unsafe fn insert_root(
         Root {
             window_id: effective_window_id,
             title,
+            kind,
+            sharing_indicator,
         },
     );
     Ok(())
+}
+
+/// The window's only child is the screen-sharing indicator button.
+unsafe fn sharing_indicator_only_child(
+    reader: &SnapshotReader,
+    window: AXUIElementRef,
+) -> Result<bool, SnapshotReadError> {
+    let children = reader.elements(window, "AXChildren")?;
+    let [child] = children.as_slice() else {
+        return Ok(false);
+    };
+    for attribute in ["AXIdentifier", "AXDescription", "AXTitle"] {
+        if reader.optional_string(child.0, attribute)? == SHARING_INDICATOR_ID {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 fn surface_owner(
@@ -771,6 +910,8 @@ mod tests {
 
     fn root(window_id: u32, title: &str) -> Root {
         Root {
+            kind: SurfaceKind::Standard,
+            sharing_indicator: false,
             window_id: Some(window_id),
             title: title.into(),
         }
@@ -825,6 +966,7 @@ mod tests {
                 generation: 7,
                 read_since: false,
                 unresolved_reads: HashMap::new(),
+                target_window: None,
             },
         );
         (key, 7)
@@ -843,35 +985,114 @@ mod tests {
         );
     }
 
+    fn info(width: f64, height: f64, layer: i32) -> crate::windows::WindowInfo {
+        crate::windows::WindowInfo {
+            bounds: crate::windows::WindowBounds { x: 0.0, y: 0.0, width, height },
+            layer,
+            ..window(8, 42, "Messages")
+        }
+    }
+
+    fn kind(kind: SurfaceKind) -> Root {
+        Root { kind, ..root(8, "") }
+    }
+
+    /// The 66x20 screen-sharing "Window" overlays got a fresh id on every
+    /// read and were offered as the one new window to move to.
+    #[test]
+    fn indicator_overlays_are_not_surfaces() {
+        let standard = kind(SurfaceKind::Standard);
+        assert!(is_ignored_surface(&standard, Some(&info(66.0, 20.0, 0))), "tiny");
+        assert!(is_ignored_surface(&standard, Some(&info(800.0, 600.0, 25))), "above normal level");
+        assert!(
+            is_ignored_surface(&Root { sharing_indicator: true, ..standard.clone() }, Some(&info(800.0, 600.0, 0))),
+            "sharing indicator"
+        );
+        assert!(!is_ignored_surface(&standard, Some(&info(800.0, 600.0, 0))));
+        assert!(!is_ignored_surface(&standard, None), "no window info: keep");
+        // Floating panels sit above the normal level; dialogs and sheets can be small.
+        assert!(!is_ignored_surface(&kind(SurfaceKind::Floating), Some(&info(300.0, 200.0, 3))));
+        assert!(!is_ignored_surface(&kind(SurfaceKind::Dialog), Some(&info(80.0, 40.0, 8))));
+        assert!(!is_ignored_surface(&kind(SurfaceKind::Sheet), Some(&info(80.0, 40.0, 0))));
+        // Through the outcome: ignored before any owner lookup.
+        let tiny = [info(66.0, 20.0, 0)];
+        assert!(matches!(outcome_for(42, "Messages", &standard, &tiny), Outcome::Ignored));
+    }
+
+    #[test]
+    fn surface_kinds_follow_role_and_subrole() {
+        assert_eq!(SurfaceKind::of("AXWindow", "AXStandardWindow"), SurfaceKind::Standard);
+        assert_eq!(SurfaceKind::of("AXWindow", "AXDialog"), SurfaceKind::Dialog);
+        assert_eq!(SurfaceKind::of("AXWindow", "AXFloatingWindow"), SurfaceKind::Floating);
+        assert_eq!(SurfaceKind::of("AXSheet", ""), SurfaceKind::Sheet);
+        assert_eq!(SurfaceKind::of("AXWindow", "AXUnknown"), SurfaceKind::Other);
+        assert!(!SurfaceKind::Other.rebindable());
+    }
+
+    #[test]
+    fn ignored_windows_are_counted_known_and_never_rebound() {
+        let (key, generation) = seed("ignored", 4108);
+        let appeared = vec![
+            (native(8, "AXWindow"), root(8, "Open")),
+            (native(9, "AXWindow"), root(9, "Window")),
+        ];
+        let change = finish_take(
+            &key,
+            generation,
+            appeared,
+            vec![Outcome::Reported(surface(4108, 8)), Outcome::Ignored],
+            false,
+        )
+        .unwrap();
+        assert_eq!(change.new_windows, vec![surface(4108, 8)]);
+        assert_eq!(change.rebind, Some(surface(4108, 8)));
+        assert_eq!(change.ignored_windows, Some(1));
+
+        let (key, generation) = seed("only-ignored", 4109);
+        let appeared = vec![(native(9, "AXWindow"), root(9, "Window"))];
+        assert_eq!(finish_take(&key, generation, appeared, vec![Outcome::Ignored], false), None);
+        let map = pending();
+        assert!(map.get(&key).unwrap().roots.contains_key(&native(9, "AXWindow")), "known from now on");
+    }
+
+    #[test]
+    fn no_rebind_while_the_acted_on_window_holds_focus_or_for_other_kinds() {
+        let change = change_from(vec![(surface(42, 8), true)], false, 42, true).unwrap();
+        assert_eq!(change.rebind, None);
+        assert_eq!(change.new_windows, vec![surface(42, 8)]);
+        let change = change_from(vec![(surface(42, 8), false)], false, 42, false).unwrap();
+        assert_eq!(change.rebind, None);
+    }
+
     #[test]
     fn one_new_window_of_the_app_is_a_rebind_target() {
-        let change = change_from(vec![surface(42, 8)], false, 42).expect("change");
+        let change = change_from(vec![(surface(42, 8), true)], false, 42, false).expect("change");
         assert_eq!(change.rebind, Some(surface(42, 8)));
     }
 
     #[test]
     fn roots_sharing_one_address_are_one_rebind_target() {
-        let change = change_from(vec![surface(42, 8), surface(42, 8)], false, 42).unwrap();
+        let change = change_from(vec![(surface(42, 8), true), (surface(42, 8), true)], false, 42, false).unwrap();
         assert_eq!(change.new_windows.len(), 1);
         assert_eq!(change.rebind, Some(surface(42, 8)));
     }
 
     #[test]
     fn several_new_windows_are_listed_without_a_guess() {
-        let change = change_from(vec![surface(42, 8), surface(42, 9)], false, 42).unwrap();
+        let change = change_from(vec![(surface(42, 8), true), (surface(42, 9), true)], false, 42, false).unwrap();
         assert_eq!(change.rebind, None);
         assert_eq!(change.new_windows.len(), 2);
     }
 
     #[test]
     fn an_unresolved_owner_blocks_the_rebind() {
-        let change = change_from(vec![surface(42, 8)], true, 42).unwrap();
+        let change = change_from(vec![(surface(42, 8), true)], true, 42, false).unwrap();
         assert_eq!(change.rebind, None);
     }
 
     #[test]
     fn a_window_owned_by_another_process_is_listed_not_rebound() {
-        let change = change_from(vec![surface(99, 8)], false, 42).unwrap();
+        let change = change_from(vec![(surface(99, 8), true)], false, 42, false).unwrap();
         assert_eq!(change.rebind, None);
         assert_eq!(change.new_windows, vec![surface(99, 8)]);
     }
@@ -890,7 +1111,7 @@ mod tests {
             outcome_for(42, "TextEdit", &open, &proxy),
             Outcome::Reported(SurfaceWindow { pid: 42, window_id: 8, .. })
         ));
-        let no_address = Root { window_id: None, title: String::new() };
+        let no_address = Root { window_id: None, ..root(1, "") };
         assert!(matches!(outcome_for(42, "TextEdit", &no_address, &[]), Outcome::Unaddressable));
     }
 
@@ -898,11 +1119,11 @@ mod tests {
     fn a_report_is_delivered_once_and_ends_the_baseline() {
         let (key, generation) = seed("report-once", 4101);
         let appeared = vec![(native(8, "AXWindow"), root(8, "Open"))];
-        let change = finish_take(&key, generation, appeared.clone(), vec![Outcome::Reported(surface(4101, 8))]);
+        let change = finish_take(&key, generation, appeared.clone(), vec![Outcome::Reported(surface(4101, 8))], false);
         assert_eq!(change.unwrap().rebind, Some(surface(4101, 8)));
         assert!(!pending().contains_key(&key), "reported baseline is consumed");
         assert_eq!(
-            finish_take(&key, generation, appeared, vec![Outcome::Reported(surface(4101, 8))]),
+            finish_take(&key, generation, appeared, vec![Outcome::Reported(surface(4101, 8))], false),
             None
         );
     }
@@ -911,11 +1132,11 @@ mod tests {
     fn a_read_that_lost_the_race_reports_nothing() {
         let (key, generation) = seed("race", 4102);
         let appeared = vec![(native(8, "AXWindow"), root(8, "Open"))];
-        assert!(finish_take(&key, generation, appeared.clone(), vec![Outcome::Reported(surface(4102, 8))]).is_some());
+        assert!(finish_take(&key, generation, appeared.clone(), vec![Outcome::Reported(surface(4102, 8))], false).is_some());
         let (key, generation) = seed("race-2", 4102);
         pending().get_mut(&key).unwrap().generation += 1; // a concurrent read won
         assert_eq!(
-            finish_take(&key, generation, appeared, vec![Outcome::Reported(surface(4102, 8))]),
+            finish_take(&key, generation, appeared, vec![Outcome::Reported(surface(4102, 8))], false),
             None
         );
     }
@@ -931,8 +1152,7 @@ mod tests {
             &key,
             generation,
             appeared,
-            vec![Outcome::Reported(surface(4103, 8)), Outcome::Unresolved],
-        )
+            vec![Outcome::Reported(surface(4103, 8)), Outcome::Unresolved], false)
         .unwrap();
         assert_eq!(change.new_windows, vec![surface(4103, 8)]);
         assert_eq!(change.rebind, None, "an unresolved sibling blocks the rebind");
@@ -947,7 +1167,7 @@ mod tests {
         let (key, generation) = seed("unresolved-after-empty", 4105);
         pending().get_mut(&key).unwrap().read_since = true;
         let appeared = vec![(native(9, "AXWindow"), root(9, "Late"))];
-        assert_eq!(finish_take(&key, generation, appeared, vec![Outcome::Unresolved]), None);
+        assert_eq!(finish_take(&key, generation, appeared, vec![Outcome::Unresolved], false), None);
         assert!(!pending().get(&key).unwrap().read_since, "the next action must keep this baseline");
     }
 
@@ -957,7 +1177,7 @@ mod tests {
         let appeared = vec![(native(9, "AXWindow"), root(9, "Ghost"))];
         for _ in 0..MAX_UNRESOLVED_READS {
             let generation = pending().get(&key).unwrap().generation;
-            finish_take(&key, generation, appeared.clone(), vec![Outcome::Unresolved]);
+            finish_take(&key, generation, appeared.clone(), vec![Outcome::Unresolved], false);
         }
         let map = pending();
         let entry = map.get(&key).unwrap();
@@ -972,15 +1192,14 @@ mod tests {
         let new = (native(10, "AXWindow"), root(10, "Late"));
         for _ in 0..MAX_UNRESOLVED_READS - 1 {
             let generation = pending().get(&key).unwrap().generation;
-            finish_take(&key, generation, vec![old.clone()], vec![Outcome::Unresolved]);
+            finish_take(&key, generation, vec![old.clone()], vec![Outcome::Unresolved], false);
         }
         let generation = pending().get(&key).unwrap().generation;
         finish_take(
             &key,
             generation,
             vec![old.clone(), new.clone()],
-            vec![Outcome::Unresolved, Outcome::Unresolved],
-        );
+            vec![Outcome::Unresolved, Outcome::Unresolved], false);
         let map = pending();
         let entry = map.get(&key).unwrap();
         assert!(entry.roots.contains_key(&old.0), "exhausted root is given up");
@@ -997,7 +1216,7 @@ mod tests {
     #[test]
     fn nothing_new_marks_the_baseline_for_refresh() {
         let (key, generation) = seed("nothing", 4104);
-        assert_eq!(finish_take(&key, generation, Vec::new(), Vec::new()), None);
+        assert_eq!(finish_take(&key, generation, Vec::new(), Vec::new(), false), None);
         assert!(pending().get(&key).unwrap().read_since);
     }
 
@@ -1117,14 +1336,14 @@ mod tests {
 
     #[test]
     fn note_text_names_the_rebind_call() {
-        let change = change_from(vec![surface(42, 8)], false, 42).unwrap();
+        let change = change_from(vec![(surface(42, 8), true)], false, 42, false).unwrap();
         assert!(note_text(&change).contains("get_window_state(pid: 42, window_id: 8)"));
     }
 
     #[test]
     fn attach_adds_typed_change_and_a_text_note() {
         let mut result = ToolResult::text("state").with_structured(serde_json::json!({"pid": 42}));
-        attach(&mut result, &change_from(vec![surface(42, 8)], false, 42).unwrap());
+        attach(&mut result, &change_from(vec![(surface(42, 8), true)], false, 42, false).unwrap());
         let structured = result.structured_content.unwrap();
         assert_eq!(structured["window_change"]["rebind"]["window_id"], 8);
         assert_eq!(result.content.len(), 2);

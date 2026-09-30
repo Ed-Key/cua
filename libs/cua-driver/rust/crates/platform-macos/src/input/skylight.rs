@@ -1045,6 +1045,132 @@ pub fn with_foreground_hid_activation(
     result
 }
 
+/// A foreground pointer event was not sent because another window stays
+/// topmost at the point even after the target was raised.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TargetOccluded {
+    pub window_id: u32,
+    pub point: (f64, f64),
+    /// The covering window, or `None` when no window is at the point.
+    pub covering: Option<CoveringWindow>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct CoveringWindow {
+    pub pid: i32,
+    pub app_name: String,
+    pub window_id: u32,
+    pub title: String,
+}
+
+impl std::fmt::Display for TargetOccluded {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (x, y) = self.point;
+        match &self.covering {
+            Some(window) if window.pid == std::process::id() as i32 => write!(
+                f,
+                "screen point ({x:.0},{y:.0}) is covered by Cua Driver's own window {} \
+                 \"{}\" (a PiP preview panel takes clicks), not window {}; no input was sent. \
+                 Move or close the panel, or act on the target in the background",
+                window.window_id, window.title, self.window_id
+            ),
+            Some(window) => write!(
+                f,
+                "screen point ({x:.0},{y:.0}) is covered by {} window {} \"{}\" (pid {}), \
+                 not window {}, even after raising it; no input was sent",
+                window.app_name, window.window_id, window.title, window.pid, self.window_id
+            ),
+            None => write!(
+                f,
+                "screen point ({x:.0},{y:.0}) is not on window {} or any window; no input was sent",
+                self.window_id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TargetOccluded {}
+
+/// How long a raised target gets to become topmost at the point.
+const RAISE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
+
+fn occlusion_at(pid: libc::pid_t, window_id: u32, point: (f64, f64)) -> Option<TargetOccluded> {
+    let windows = crate::windows::composited_windows();
+    let displays: Vec<crate::windows::WindowBounds> =
+        core_graphics::display::CGDisplay::active_displays()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|id| {
+                let bounds = core_graphics::display::CGDisplay::new(id).bounds();
+                crate::windows::WindowBounds {
+                    x: bounds.origin.x,
+                    y: bounds.origin.y,
+                    width: bounds.size.width,
+                    height: bounds.size.height,
+                }
+            })
+            .collect();
+    let covering = match crate::windows::point_owner(
+        &windows,
+        &displays,
+        point,
+        pid,
+        std::process::id() as i32,
+        crate::cursor::overlay::is_overlay_window,
+        |id| crate::ax::bindings::window_belongs_to(id, window_id),
+    ) {
+        crate::windows::PointOwner::Target => return None,
+        crate::windows::PointOwner::Other(window) => Some(CoveringWindow {
+            pid: window.pid,
+            app_name: window.app_name.clone(),
+            window_id: window.window_id,
+            title: window.title.clone(),
+        }),
+        crate::windows::PointOwner::Nothing => None,
+    };
+    Some(TargetOccluded {
+        window_id,
+        point,
+        covering,
+    })
+}
+
+/// Make the exact target window topmost at `point`: the no-raise activation
+/// leaves it behind other apps' windows, and a HID event goes to whatever is
+/// topmost there. Raise it when covered and confirm from the on-screen
+/// window list; refuse when something still covers the point.
+fn ensure_topmost_at(pid: libc::pid_t, window_id: u32, point: (f64, f64)) -> anyhow::Result<()> {
+    if occlusion_at(pid, window_id, point).is_none() {
+        return Ok(());
+    }
+    crate::ax::bindings::raise_exact_window(pid, window_id);
+    let deadline = std::time::Instant::now() + RAISE_WAIT_TIMEOUT;
+    loop {
+        match occlusion_at(pid, window_id, point) {
+            None => return Ok(()),
+            Some(occluded) if std::time::Instant::now() >= deadline => {
+                return Err(occluded.into())
+            }
+            Some(_) => std::thread::sleep(ACTIVATION_POLL_INTERVAL),
+        }
+    }
+}
+
+/// [`with_foreground_hid_activation`] for a pointer event at screen `point`:
+/// after activation the exact window must be topmost there (raised if
+/// needed), or nothing is sent and the error is a [`TargetOccluded`].
+pub fn with_foreground_pointer_activation(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    point: (f64, f64),
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    with_foreground_hid_activation(target_pid, target_wid, || {
+        ensure_topmost_at(target_pid, target_wid, point)?;
+        action()
+    })
+}
+
 fn preserves_exact_existing_focus(
     previous_process_known: bool,
     previous_psn: [u8; 8],

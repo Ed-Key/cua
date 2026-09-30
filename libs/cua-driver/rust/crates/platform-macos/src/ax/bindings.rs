@@ -29,6 +29,7 @@ pub type AXError = c_int;
 pub const kAXErrorSuccess: AXError = 0;
 pub const kAXErrorFailure: AXError = -25200;
 pub const kAXErrorInvalidUIElement: AXError = -25202;
+pub const kAXErrorCannotComplete: AXError = -25204;
 pub const kAXErrorAttributeUnsupported: AXError = -25205;
 pub const kAXErrorNotImplemented: AXError = -25208;
 pub const kAXErrorNoValue: AXError = -25212;
@@ -226,13 +227,33 @@ pub unsafe fn copy_string_attr(element: AXUIElementRef, attr_name: &str) -> Opti
     if err != kAXErrorSuccess || value.is_null() {
         return None;
     }
-    let cf_string_type_id = CFStr::type_id();
-    if core_foundation::base::CFGetTypeID(value) != cf_string_type_id {
-        CFRelease(value);
-        return None;
+    let text = cf_plain_string(value);
+    CFRelease(value);
+    text
+}
+
+extern "C" {
+    fn CFAttributedStringGetString(string: CFTypeRef) -> CFStringRef;
+}
+
+/// Text of a borrowed `CFString` or `CFAttributedString` (formatted text:
+/// Catalyst and TextKit fields report `AXValue` that way). Anything else is
+/// not text.
+///
+/// # Safety
+///
+/// `value` must be a valid CF object for the duration of the call.
+pub unsafe fn cf_plain_string(value: CFTypeRef) -> Option<String> {
+    use core_foundation::attributed_string::CFAttributedString;
+    let type_id = core_foundation::base::CFGetTypeID(value);
+    if type_id == CFStr::type_id() {
+        return Some(CFStr::wrap_under_get_rule(value as _).to_string());
     }
-    let s = CFStr::wrap_under_create_rule(value as _);
-    Some(s.to_string())
+    if type_id == CFAttributedString::type_id() {
+        let string = CFAttributedStringGetString(value);
+        return (!string.is_null()).then(|| CFStr::wrap_under_get_rule(string).to_string());
+    }
+    None
 }
 
 /// Copy a numeric attribute from an AX element as an `f64`. Returns `None` on
@@ -294,7 +315,7 @@ pub unsafe fn copy_bool_attr(element: AXUIElementRef, attr_name: &str) -> Option
     None
 }
 
-unsafe fn coerce_binary_value(value: CFTypeRef) -> Option<bool> {
+pub(crate) unsafe fn coerce_binary_value(value: CFTypeRef) -> Option<bool> {
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
     let type_id = core_foundation::base::CFGetTypeID(value);
@@ -327,7 +348,7 @@ pub unsafe fn copy_binary_attr(element: AXUIElementRef, attr_name: &str) -> Opti
 /// and the wider structured control-state response.
 #[derive(Debug, PartialEq, Eq)]
 pub struct StringishAttrValue {
-    /// Present only when the source value was a CFString.
+    /// Present only when the source value was text (CFString or CFAttributedString).
     pub string_value: Option<String>,
     /// CFString as-is, CFNumber as text, or CFBoolean as `"1"` / `"0"`.
     pub state_value: String,
@@ -337,14 +358,13 @@ pub struct StringishAttrValue {
 unsafe fn coerce_stringish_value(value: CFTypeRef) -> Option<StringishAttrValue> {
     use core_foundation::boolean::CFBoolean;
     use core_foundation::number::CFNumber;
-    let type_id = core_foundation::base::CFGetTypeID(value);
-    if type_id == CFStr::type_id() {
-        let string = CFStr::wrap_under_get_rule(value as _).to_string();
+    if let Some(string) = cf_plain_string(value) {
         return Some(StringishAttrValue {
             string_value: Some(string.clone()),
             state_value: string,
         });
     }
+    let type_id = core_foundation::base::CFGetTypeID(value);
     if type_id == CFNumber::type_id() {
         let n = CFNumber::wrap_under_get_rule(value as _);
         let f = n.to_f64()?;
@@ -732,19 +752,30 @@ pub unsafe fn copy_children(element: AXUIElementRef) -> Vec<AXUIElementRef> {
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_children_reporting(element: AXUIElementRef) -> (Vec<AXUIElementRef>, bool) {
+    let (children, error) = copy_children_error(element);
+    (children, error.is_some())
+}
+
+/// [`copy_children`], plus the error when the read itself failed
+/// (`kAXErrorCannotComplete` when the app did not answer in time).
+///
+/// # Safety
+///
+/// `element` must be valid, and the caller must release every returned element.
+pub unsafe fn copy_children_error(element: AXUIElementRef) -> (Vec<AXUIElementRef>, Option<AXError>) {
     let attr = CFStr::new("AXChildren");
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
     if err == kAXErrorNoValue || err == kAXErrorAttributeUnsupported {
-        return (vec![], false);
+        return (vec![], None);
     }
     if err != kAXErrorSuccess || value.is_null() {
-        return (vec![], true);
+        return (vec![], Some(if err == kAXErrorSuccess { kAXErrorFailure } else { err }));
     }
     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
         CFRelease(value);
-        return (vec![], true);
+        return (vec![], Some(kAXErrorFailure));
     }
     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
     let ax_type_id = AXUIElementGetTypeID();
@@ -760,7 +791,7 @@ pub unsafe fn copy_children_reporting(element: AXUIElementRef) -> (Vec<AXUIEleme
             }
         })
         .collect();
-    (children, false)
+    (children, None)
 }
 
 /// Copy an AX element-valued attribute. The returned element is retained and
@@ -984,17 +1015,23 @@ pub enum AccessibilityOptIn {
 /// `AXManualAccessibility` is the modern opt-in with no screen-reader side
 /// effects; `AXEnhancedUserInterface` is the legacy fallback some Electron
 /// builds expose instead (the modern attribute returns
-/// `kAXErrorAttributeUnsupported` on those builds).
+/// `kAXErrorAttributeUnsupported` on those builds). Every AppKit and Catalyst
+/// app also accepts the legacy attribute, and it changes how they behave
+/// (screen-reader mode), so it is sent only when `legacy_allowed` says the
+/// process is Chromium or Electron.
 ///
 /// # Safety
 ///
 /// `app_element` must be a valid, live application `AXUIElementRef`.
-pub unsafe fn enable_chromium_accessibility(app_element: AXUIElementRef) -> AccessibilityOptIn {
+pub unsafe fn enable_chromium_accessibility(
+    app_element: AXUIElementRef,
+    legacy_allowed: bool,
+) -> AccessibilityOptIn {
     let manual = set_bool_attr_true(app_element, "AXManualAccessibility");
     if manual == kAXErrorSuccess {
         return AccessibilityOptIn::ManualAccessibility;
     }
-    if manual != kAXErrorAttributeUnsupported {
+    if manual != kAXErrorAttributeUnsupported || !legacy_allowed {
         // A transient error (e.g. timeout / app busy) rather than a hard
         // "this app has no such attribute" — don't bother with the legacy
         // fallback, and don't claim enablement happened.
@@ -1096,10 +1133,7 @@ pub(crate) unsafe fn copy_string_attr_checked(
     attribute: &str,
 ) -> Result<String, AXError> {
     let value = copy_attribute_checked(element, attribute)?;
-    if value.type_of() != CFStr::type_id() {
-        return Err(kAXErrorFailure);
-    }
-    Ok(CFStr::wrap_under_get_rule(value.as_CFTypeRef() as _).to_string())
+    cf_plain_string(value.as_CFTypeRef()).ok_or(kAXErrorFailure)
 }
 
 pub(crate) unsafe fn copy_geometry_attr_checked(
@@ -1417,5 +1451,22 @@ mod tests {
         let false_result = unsafe { coerce_stringish_value(false_value.as_CFTypeRef()) }.unwrap();
         assert_eq!(false_result.string_value, None);
         assert_eq!(false_result.state_value, "0");
+    }
+
+    /// Formatted text (Catalyst compose fields, TextKit views) reports its
+    /// AXValue as a CFAttributedString; it must read as its text, not as no
+    /// value.
+    #[test]
+    fn attributed_string_value_reads_as_its_plain_text() {
+        use core_foundation::attributed_string::CFAttributedString;
+        let attributed = CFAttributedString::new(&CFStr::new("Hello from Catalyst"));
+        let copied = unsafe { coerce_stringish_value(attributed.as_CFTypeRef()) }.unwrap();
+        assert_eq!(copied.string_value.as_deref(), Some("Hello from Catalyst"));
+        assert_eq!(copied.state_value, "Hello from Catalyst");
+        assert_eq!(
+            unsafe { cf_plain_string(attributed.as_CFTypeRef()) }.as_deref(),
+            Some("Hello from Catalyst")
+        );
+        assert!(unsafe { cf_plain_string(CFNumber::from(3).as_CFTypeRef()) }.is_none());
     }
 }

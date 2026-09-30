@@ -303,27 +303,55 @@ impl Tool for GetWindowStateTool {
         // abandoned by the backstop timeout still releases them when the task
         // drops its result.
         let mut walk_owner: Option<crate::ax::cache::CachedSnapshot> = None;
+        let mut first_walk: Option<cua_driver_core::walk_budget::WalkOutcome> = None;
         let mut tree_result = if want_tree {
             let q = query.clone();
             // `timeout_ms` bounds the walk itself: it returns the partial tree
             // when the budget runs out. The outer deadline is only a backstop
             // for an AX call that ignores the per-element messaging timeout
             // (dropping a spawn_blocking JoinHandle cannot cancel it).
+            // A walk that timed out after only a few nodes (an app slow to
+            // answer its first reads) gets one retry with a larger budget.
+            let retry_budget = |first: &cua_driver_core::walk_budget::WalkOutcome| {
+                cua_driver_core::walk_budget::retry_timeout_ms(first)
+            };
             let walk_future = tokio::task::spawn_blocking(move || {
-                let tree = crate::ax::tree::walk_tree_budgeted(
-                    pid,
-                    Some(window_id),
-                    tree_query(q.as_deref(), query_context),
-                    max_depth,
-                    cua_driver_core::walk_budget::WalkBudget::new(timeout_ms, max_elements),
-                );
+                let walk = |budget_ms| {
+                    crate::ax::tree::walk_tree_budgeted(
+                        pid,
+                        Some(window_id),
+                        tree_query(q.as_deref(), query_context),
+                        max_depth,
+                        cua_driver_core::walk_budget::WalkBudget::new(budget_ms, max_elements),
+                    )
+                };
+                let started = std::time::Instant::now();
+                let first = walk(timeout_ms);
+                // A retry repeats the walk's setup (app and window lookup),
+                // which the budget does not bound. When that setup alone was
+                // slow, the app is slow everywhere: return the partial tree
+                // rather than wait twice.
+                let setup_was_slow = started.elapsed().as_millis() as u64
+                    > timeout_ms.saturating_mul(2).max(first.walk.elapsed_ms + timeout_ms);
+                let retry = retry_budget(&first.walk).filter(|_| !setup_was_slow);
+                let (tree, first_walk) = match retry {
+                    Some(budget_ms) => {
+                        // Release the abandoned walk's element retains.
+                        drop(crate::ax::cache::CachedSnapshot::from_nodes(&first.nodes));
+                        (walk(budget_ms), Some(first.walk))
+                    }
+                    None => (first, None),
+                };
                 let owner = crate::ax::cache::CachedSnapshot::from_nodes(&tree.nodes);
-                (tree, owner)
+                (tree, owner, first_walk)
             });
-            let backstop = std::time::Duration::from_millis(timeout_ms) + AX_WALK_BACKSTOP_GRACE;
+            let retry_ms = cua_driver_core::walk_budget::RETRY_CAP_MS.min(timeout_ms.saturating_mul(4));
+            let backstop = std::time::Duration::from_millis(timeout_ms + retry_ms)
+                + AX_WALK_BACKSTOP_GRACE;
             match tokio::time::timeout(backstop, walk_future).await {
-                Ok(Ok((tree, owner))) => {
+                Ok(Ok((tree, owner, first))) => {
                     walk_owner = Some(owner);
+                    first_walk = first;
                     Some(tree)
                 }
                 Ok(Err(e)) => return ToolResult::error(format!("AX tree walk failed: {e}")),
@@ -751,6 +779,9 @@ impl Tool for GetWindowStateTool {
         }
         if let Some(r) = tree_result.as_ref() {
             r.walk.apply(&mut structured);
+            if let Some(first) = first_walk.as_ref() {
+                r.walk.apply_retry_of(first, &mut structured);
+            }
             let bounded = args.get("max_depth").is_some() || args.get("max_elements").is_some();
             if !bounded {
                 if let Some(unexposed) = unexposed_web_content(pid, r) {

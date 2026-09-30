@@ -656,6 +656,10 @@ pub struct ActionResult {
     /// Present only with `effect: refused`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub error: Option<ActionError>,
+    /// `false`: sending this call again repeats its effect (it moves, toggles,
+    /// types or submits). Read state before resending it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub idempotent: Option<bool>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -808,6 +812,7 @@ mod tests {
             escalation: None,
             summary: None,
             error: None,
+            idempotent: None,
         }
     }
 
@@ -826,6 +831,7 @@ mod tests {
                 "error",
                 "escalation",
                 "evidence",
+                "idempotent",
                 "route",
                 "summary"
             ]

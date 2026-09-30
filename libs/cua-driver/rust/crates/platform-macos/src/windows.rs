@@ -110,6 +110,80 @@ pub(crate) fn composited_windows() -> Vec<WindowInfo> {
     .windows
 }
 
+/// CGWindow layers from here up are system chrome (Dock 20, main menu 24,
+/// status items 25, pop-up menus 101). The Dock and Notification Center own
+/// display-sized, mostly transparent windows there that do not take a click
+/// meant for an app; smaller chrome (the menu bar, a menu, a banner) does.
+const SYSTEM_LAYER: i32 = 20;
+
+/// Owners of display-sized, click-through chrome windows. Any other app's
+/// display-sized window above the normal level (a full-screen overlay) takes
+/// the click and is an occluder.
+fn is_system_chrome(app_name: &str) -> bool {
+    matches!(
+        app_name,
+        "Dock" | "Notification Center" | "Window Server" | "Control Center" | "WindowManager"
+    )
+}
+
+/// Who a pointer event at a screen point reaches.
+#[derive(Debug)]
+pub(crate) enum PointOwner<'a> {
+    /// The target window, a window of its own (a sheet, a child window), or
+    /// one of the target app's menus.
+    Target,
+    /// Another window is topmost at the point.
+    Other(&'a WindowInfo),
+    /// No window at the point.
+    Nothing,
+}
+
+/// The owner of the topmost window at `(x, y)` in `front_to_back` (composited
+/// on-screen windows in WindowServer order). Display-sized system chrome and
+/// the driver's own click-through windows (`own_click_through`: the cursor
+/// overlay ignores mouse events) are transparent to the check; the driver's
+/// interactive windows (PiP panels, the overview) take a click like any
+/// other window and cover the target. `displays` are display bounds in the
+/// same coordinates.
+// ponytail: a display-sized chrome window is treated as click-through, so a
+// point over the Dock bar (drawn inside the Dock's full-screen window) is not
+// caught; hit-test the Dock's own geometry if that case shows up.
+pub(crate) fn point_owner<'a>(
+    front_to_back: &'a [WindowInfo],
+    displays: &[WindowBounds],
+    (x, y): (f64, f64),
+    target_pid: i32,
+    own_pid: i32,
+    own_click_through: impl Fn(u32) -> bool,
+    belongs_to_target: impl Fn(u32) -> bool,
+) -> PointOwner<'a> {
+    let covers_a_display = |b: &WindowBounds| {
+        displays.iter().any(|d| {
+            b.x <= d.x + 1.0
+                && b.y <= d.y + 1.0
+                && b.x + b.width >= d.x + d.width - 1.0
+                && b.y + b.height >= d.y + d.height - 1.0
+        })
+    };
+    for window in front_to_back {
+        let b = &window.bounds;
+        let inside = x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
+        if !inside || (window.pid == own_pid && own_click_through(window.window_id)) {
+            continue;
+        }
+        if belongs_to_target(window.window_id)
+            || (window.pid == target_pid && window.layer >= SYSTEM_LAYER)
+        {
+            return PointOwner::Target;
+        }
+        if window.layer >= SYSTEM_LAYER && covers_a_display(b) && is_system_chrome(&window.app_name) {
+            continue;
+        }
+        return PointOwner::Other(window);
+    }
+    PointOwner::Nothing
+}
+
 /// Which CGWindow layers an enumeration admits.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum LayerFilter {
@@ -424,6 +498,85 @@ pub fn resolve_main_window_id(pid: i32) -> anyhow::Result<u32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn at(window_id: u32, pid: i32, layer: i32, (x, y, width, height): (f64, f64, f64, f64)) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            pid,
+            app_name: format!("app{pid}"),
+            title: String::new(),
+            bounds: WindowBounds { x, y, width, height },
+            layer,
+            z_index: 0,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: None,
+            space_ids: None,
+        }
+    }
+
+    const SCREENS: [WindowBounds; 1] = [WindowBounds { x: 0.0, y: 0.0, width: 2000.0, height: 2000.0 }];
+
+    /// The Stocks row was covered by a Finder window: a HID click there
+    /// reached Finder while the result said the target was activated.
+    #[test]
+    fn the_topmost_window_at_a_point_decides_who_gets_a_click() {
+        const TARGET: u32 = 10;
+        let belongs = |id: u32| id == TARGET || id == 11; // 11: the target's sheet
+        let click_through = |id: u32| id == 1; // the driver's cursor overlay
+        let cursor = at(1, 7, 0, (0.0, 0.0, 2000.0, 2000.0));
+        let dock = WindowInfo { app_name: "Dock".into(), ..at(2, 50, 20, (0.0, 0.0, 2000.0, 2000.0)) };
+        let finder = at(3, 60, 0, (300.0, 300.0, 400.0, 300.0));
+        let target = at(TARGET, 40, 0, (200.0, 200.0, 800.0, 600.0));
+        let windows = [cursor.clone(), dock.clone(), finder.clone(), target.clone()];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 3, .. })
+        ));
+        assert!(matches!(point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs), PointOwner::Target));
+        assert!(matches!(point_owner(&windows, &SCREENS, (100.0, 100.0), 40, 7, click_through, belongs), PointOwner::Nothing));
+        // The target's own sheet and its open menu (layer 101) count as the target.
+        let sheet = at(11, 40, 0, (300.0, 300.0, 400.0, 300.0));
+        let menu = at(12, 40, 101, (300.0, 300.0, 200.0, 200.0));
+        let windows = [menu, sheet, finder.clone(), target.clone()];
+        assert!(matches!(point_owner(&windows, &SCREENS, (350.0, 350.0), 40, 7, click_through, belongs), PointOwner::Target));
+        assert!(matches!(point_owner(&windows, &SCREENS, (600.0, 550.0), 40, 7, click_through, belongs), PointOwner::Target));
+        // Smaller chrome (the menu bar, another app's menu, a banner) covers it.
+        let menu_bar = at(4, 50, 24, (0.0, 0.0, 2000.0, 30.0));
+        let other_menu = at(5, 60, 101, (850.0, 650.0, 100.0, 100.0));
+        let windows = [menu_bar, other_menu, target.clone()];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 5, .. })
+        ));
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (900.0, 10.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 4, .. })
+        ));
+        // Another app's full-screen overlay above the normal level takes clicks.
+        let overlay = at(6, 70, 25, (0.0, 0.0, 2000.0, 2000.0));
+        let windows = [overlay, target.clone()];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 6, .. })
+        ));
+        // The driver's own PiP panel takes mouse input: it covers the target,
+        // while the click-through cursor overlay above it does not.
+        let pip = at(20, 7, 3, (850.0, 650.0, 200.0, 150.0));
+        let windows = [cursor.clone(), pip, target.clone()];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 20, pid: 7, .. })
+        ));
+        assert!(matches!(point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, click_through, belongs), PointOwner::Target));
+        // Another window of the same app that is not the target's covers it.
+        let other_own = at(13, 40, 0, (300.0, 300.0, 400.0, 300.0));
+        let windows = [other_own, target];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 13, .. })
+        ));
+    }
 
     #[test]
     fn space_membership_checks_all_spaces_for_a_window() {

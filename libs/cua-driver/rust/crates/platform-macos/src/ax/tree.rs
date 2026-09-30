@@ -471,9 +471,21 @@ unsafe fn walk_element(
 
     // Messaging timeouts are per AX object, not inherited from the application
     // element, so every descendant must be bounded before any attribute read.
-    set_messaging_timeout(element);
+    // The bound scales with the budget: one node that does not answer must
+    // not spend two seconds of a one-second budget.
+    let _ = AXUIElementSetMessagingTimeout(element, budget.read_timeout_secs());
 
-    let role = copy_string_attr(element, "AXRole").unwrap_or_else(|| "AXUnknown".into());
+    let role = match copy_string_attr_checked(element, "AXRole") {
+        Ok(role) => role,
+        // The node did not answer in time: skip it and its subtree rather
+        // than spend the budget waiting on it again for every attribute.
+        Err(super::bindings::kAXErrorCannotComplete) => {
+            sightings.child_read_failed = true;
+            budget.skip();
+            return;
+        }
+        Err(_) => "AXUnknown".into(),
+    };
 
     let in_web_content = in_web_content || is_web_content_role(&role);
     sightings.web_content |= in_web_content;
@@ -486,8 +498,11 @@ unsafe fn walk_element(
         // Still recurse — children may be interesting. Layout containers
         // collapse, so children inherit the parent's depth AND the same
         // parent_index (no actionable node was emitted here).
-        let (children, failed) = copy_children_reporting(element);
-        sightings.child_read_failed |= failed;
+        let (children, error) = copy_children_error(element);
+        sightings.child_read_failed |= error.is_some();
+        if error == Some(kAXErrorCannotComplete) {
+            budget.skip();
+        }
         for child in children {
             walk_element(
                 child,
@@ -562,8 +577,11 @@ unsafe fn walk_element(
     let is_actionable = is_addressable(!actions.is_empty(), value_settable, enabled);
 
     if !is_actionable && !has_content && role != "AXWindow" && role != "AXSheet" {
-        let (children, failed) = copy_children_reporting(element);
-        sightings.child_read_failed |= failed;
+        let (children, error) = copy_children_error(element);
+        sightings.child_read_failed |= error.is_some();
+        if error == Some(kAXErrorCannotComplete) {
+            budget.skip();
+        }
         for child in children {
             walk_element(
                 child,
@@ -706,8 +724,12 @@ unsafe fn walk_element(
     let position = nodes.len();
     nodes.push(node);
 
-    let (children, failed) = copy_children_reporting(element);
-    sightings.child_read_failed |= failed;
+    let (children, error) = copy_children_error(element);
+    sightings.child_read_failed |= error.is_some();
+    // A subtree the app did not answer for in time is missing: count it.
+    if error == Some(kAXErrorCannotComplete) {
+        budget.skip();
+    }
     for child in children {
         walk_element(
             child,
@@ -722,6 +744,11 @@ unsafe fn walk_element(
             max_depth,
         );
         CFRelease(child as CFTypeRef);
+    }
+    // The cache keeps this element for actions: give it back the action
+    // timeout, since a messaging timeout stays on the object.
+    if is_actionable {
+        set_messaging_timeout(element);
     }
 }
 
@@ -754,11 +781,18 @@ mod web_content_role_tests {
 /// `Name:Heart\nTarget:0x0\nSelector:(null)`. Only the name carries meaning;
 /// the target and selector are always placeholders. Standard `AX*` names pass
 /// through unchanged.
-fn display_action_name(raw: String) -> String {
+pub(crate) fn display_action_name(raw: String) -> String {
     match raw.strip_prefix("Name:") {
         Some(rest) => rest.split('\n').next().unwrap_or(rest).trim().to_owned(),
         None => raw,
     }
+}
+
+/// How an action name is shown in the outline and matched from a request:
+/// no "AX" prefix, lowercased with Unicode rules ("AXPress" is "press",
+/// "Öffnen" is "öffnen"). One function for both, so a shown name resolves.
+pub(crate) fn action_key(name: &str) -> String {
+    name.strip_prefix("AX").unwrap_or(name).to_lowercase()
 }
 
 /// Action names for the markdown outline. Every element answers
@@ -776,7 +810,7 @@ fn rendered_action_names(actions: &[String]) -> Vec<String> {
                 "AXScrollToVisible" | "AXShowMenu" | "AXScrollUpByPage" | "AXScrollDownByPage"
             )
         })
-        .map(|a| a.strip_prefix("AX").unwrap_or(a).to_lowercase())
+        .map(|a| action_key(a))
         .collect()
 }
 
