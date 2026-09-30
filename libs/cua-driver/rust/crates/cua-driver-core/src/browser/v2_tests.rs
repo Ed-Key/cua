@@ -110,6 +110,9 @@ struct FixtureState {
     /// The click handler sets location.href: the main frame starts loading
     /// the document with this loader id.
     click_navigates: Option<String>,
+    /// What the page reports on top at a ref's click point, for the next
+    /// this-many hit-tests (an overlay, as the hit-test's `by`).
+    covered_by: Option<(usize, Value)>,
     dialog_open: bool,
     /// The session that enabled the Page domain (it hears dialog events).
     page_session: Option<String>,
@@ -159,6 +162,7 @@ impl Default for FixtureState {
             click_removes: Vec::new(),
             click_opens_dialog: false,
             click_navigates: None,
+            covered_by: None,
             dialog_open: false,
             page_session: None,
             pending_mutations: 0,
@@ -937,7 +941,8 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     let (x, y) = ((backend * 10) as f64, (backend * 10) as f64);
                     MockReply::ok(json!({
                         "model": {
-                            "content": [x, y, x + 20.0, y, x + 20.0, y + 10.0, x, y + 10.0]
+                            "content": [x, y, x + 20.0, y, x + 20.0, y + 10.0, x, y + 10.0],
+                            "border": [x - 1.0, y - 1.0, x + 21.0, y - 1.0, x + 21.0, y + 11.0, x - 1.0, y + 11.0]
                         }
                     }))
                 } else {
@@ -997,6 +1002,25 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             "DOM.resolveNode" => MockReply::ok(json!({
                 "object": { "objectId": format!("obj-{}", call.params["backendNodeId"]) }
             })),
+            "Runtime.callFunctionOn"
+                if call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|function| function.contains("elementFromPoint")) =>
+            {
+                let covered = match st.covered_by.as_mut() {
+                    Some((remaining, by)) if *remaining > 0 => {
+                        *remaining -= 1;
+                        Some(by.clone())
+                    }
+                    _ => None,
+                };
+                MockReply::ok(json!({"result": {"value": match covered {
+                    Some(by) => json!({"connected": true, "hit": true, "inside_target": false,
+                        "contains_target": false, "label_of_target": false, "by": by}),
+                    None => json!({"connected": true, "hit": true, "inside_target": true,
+                        "contains_target": false, "label_of_target": false, "by": {"tag": "button"}}),
+                }}}))
+            }
             "Runtime.callFunctionOn" => {
                 let function = call.params["functionDeclaration"].as_str().unwrap_or_default();
                 let digits_only = st.field_digits_only;
@@ -4804,4 +4828,77 @@ async fn a_single_click_that_navigates_returns_the_new_page_not_a_diff_of_the_ol
         .await;
     assert_eq!(clicked["changes"]["kind"], "snapshot", "{clicked}");
     assert_eq!(clicked["changes"]["reason"], "document_changed");
+}
+
+// ── Hit-test before a trusted click ─────────────────────────────────────────
+
+#[tokio::test]
+async fn a_trusted_click_on_a_covered_ref_is_refused_and_names_what_covers_it() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    let overlay = json!({"tag": "div", "id": "cookie-banner", "role": "dialog", "label": "", "text": "Accept cookies?"});
+    f.state.lock().unwrap().covered_by = Some((2, overlay));
+
+    let click = BrowserClickTool::new(f.engine.clone());
+    let refused = click
+        .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
+        .await;
+    let refused = structured(&refused);
+    assert_eq!(refused["refusal"]["code"], "browser_target_covered", "{refused}");
+    assert!(
+        refused["refusal"]["message"].as_str().unwrap().contains("div#cookie-banner (role dialog) \"Accept cookies?\""),
+        "{refused}"
+    );
+    assert_eq!(refused["refusal"]["detail"]["click_sent"], false);
+    assert!(
+        recorded_calls(&f, "Input.dispatchMouseEvent").is_empty(),
+        "the overlay must not receive the click"
+    );
+    // It was looked at twice: before and after the scroll and the beat.
+    let looks = recorded_calls(&f, "Runtime.callFunctionOn")
+        .iter()
+        .filter(|(_, params)| params["functionDeclaration"].as_str().unwrap().contains("elementFromPoint"))
+        .count();
+    assert_eq!(looks, 2);
+    assert_eq!(recorded_calls(&f, "DOM.scrollIntoViewIfNeeded").len(), 2);
+}
+
+#[tokio::test]
+async fn a_cover_that_clears_within_the_beat_does_not_stop_the_click() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    f.state.lock().unwrap().covered_by = Some((1, json!({"tag": "div", "id": "toast"})));
+    let clicked = BrowserClickTool::new(f.engine.clone())
+        .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
+        .await;
+    assert_eq!(structured(&clicked)["status"], "ok", "{clicked:?}");
+    assert_eq!(recorded_calls(&f, "Input.dispatchMouseEvent").len(), 2);
+}
+
+#[tokio::test]
+async fn a_coordinate_click_and_a_dom_event_click_are_not_hit_tested() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    f.state.lock().unwrap().covered_by = Some((9, json!({"tag": "div", "id": "overlay"})));
+    let click = BrowserClickTool::new(f.engine.clone());
+    // The caller named a point, not an element: there is no target to be covered.
+    let by_point = click
+        .invoke(json!({"target_id": target, "tab_id": tab, "x": 105.0, "y": 105.0, "session": SESSION}))
+        .await;
+    assert_eq!(structured(&by_point)["status"], "ok");
+    // A DOM click is dispatched on the element itself, whatever is on top.
+    let synthetic = click
+        .invoke(json!({"target_id": target, "tab_id": tab, "ref": button,
+            "input_route": "dom_event", "session": SESSION}))
+        .await;
+    assert_eq!(structured(&synthetic)["status"], "ok");
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn")
+        .iter()
+        .all(|(_, params)| !params["functionDeclaration"].as_str().unwrap().contains("elementFromPoint")));
 }

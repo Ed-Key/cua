@@ -1566,39 +1566,83 @@ impl Tool for BrowserClickTool {
         // Trusted route: resolve a click point, then Input.dispatchMouseEvent.
         let (x, y) = match (backend_node_id, coords) {
             (Some(backend), _) => {
-                // Best effort scroll-into-view; ignore failure (older Chromium).
-                let _ = conn
-                    .call(
-                        Some(cdp),
-                        "DOM.scrollIntoViewIfNeeded",
-                        json!({ "backendNodeId": backend }),
-                    )
-                    .await;
-                let box_model = match conn
-                    .call(
-                        Some(cdp),
-                        "DOM.getBoxModel",
-                        json!({ "backendNodeId": backend }),
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return BrowserRefusal::new(
-                            BrowserRefusalCode::BrowserRefStale,
-                            "the ref's node has no layout box — it left the DOM or is hidden",
+                // The point is the centre of the element's box, and the click
+                // goes to whatever is on top there. Ask the page what that
+                // is before sending it: once more after a scroll and a beat
+                // (a popover may still be moving), then refuse.
+                let mut attempt = 0;
+                loop {
+                    // Best effort scroll-into-view; ignore failure (older Chromium).
+                    let _ = conn
+                        .call(
+                            Some(cdp),
+                            "DOM.scrollIntoViewIfNeeded",
+                            json!({ "backendNodeId": backend }),
                         )
-                        .to_tool_result()
-                    }
-                };
-                match quad_center(&box_model) {
-                    Some(pt) => pt,
-                    None => {
+                        .await;
+                    let box_model = match conn
+                        .call(
+                            Some(cdp),
+                            "DOM.getBoxModel",
+                            json!({ "backendNodeId": backend }),
+                        )
+                        .await
+                    {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserRefStale,
+                                "the ref's node has no layout box — it left the DOM or is hidden",
+                            )
+                            .to_tool_result()
+                        }
+                    };
+                    let Some(point) = quad_center(&box_model) else {
                         return BrowserRefusal::new(
                             BrowserRefusalCode::BrowserRefStale,
                             "the ref's node returned an unusable layout box",
                         )
-                        .to_tool_result()
+                        .to_tool_result();
+                    };
+                    match hit_test(conn, cdp, backend, point, &box_model).await {
+                        Hit::Receives | Hit::Unknown => break point,
+                        Hit::Gone => {
+                            return BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserRefStale,
+                                "the ref's node left the page before the click",
+                            )
+                            .to_tool_result()
+                        }
+                        blocked if attempt == 0 => {
+                            let _ = blocked;
+                            attempt += 1;
+                            tokio::time::sleep(HIT_TEST_RETRY).await;
+                        }
+                        Hit::Covered(by) => {
+                            return BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserTargetCovered,
+                                format!(
+                                    "{} is covered at its centre by {by}: a click there would go \
+                                     to that element, so none was sent. Deal with what covers it \
+                                     (close or scroll it away), or act on that element's own ref",
+                                    ext_ref.as_deref().unwrap_or("the ref")
+                                ),
+                            )
+                            .with_detail(json!({ "covered_by": by, "click_sent": false }))
+                            .to_tool_result()
+                        }
+                        Hit::Outside => {
+                            return BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserTargetCovered,
+                                format!(
+                                    "the centre of {} is outside the visible page even after \
+                                     scrolling to it, so no click was sent",
+                                    ext_ref.as_deref().unwrap_or("the ref")
+                                ),
+                            )
+                            .with_detail(json!({ "covered_by": null, "click_sent": false }))
+                            .to_tool_result()
+                        }
                     }
                 }
             }
@@ -1730,6 +1774,157 @@ impl Tool for BrowserClickTool {
             ),
             changes,
         )
+    }
+}
+
+/// How long a covered target is given before it is looked at once more.
+const HIT_TEST_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// What is on top at a ref's click point, as the page reports it. Run on the
+/// ref's node; `x`, `y` are the click point and `bx`, `by` the top-left of
+/// the node's border box, both in the coordinates the click is sent in. The
+/// node's own rectangle gives the same corner in its document's coordinates,
+/// so the point is found there whatever frame the node is in. The walk goes
+/// down through open shadow roots, and up through shadow hosts when it asks
+/// whether one element contains another.
+const HIT_TEST: &str = "function(x, y, bx, by) { \
+    const target = this.nodeType === 1 ? this : this.parentElement; \
+    if (!target || !target.isConnected) return { connected: false }; \
+    const rect = target.getBoundingClientRect(); \
+    const px = x - bx + rect.left, py = y - by + rect.top; \
+    let hit = target.ownerDocument.elementFromPoint(px, py); \
+    while (hit && hit.shadowRoot) { \
+        const inner = hit.shadowRoot.elementFromPoint(px, py); \
+        if (!inner || inner === hit) break; \
+        hit = inner; \
+    } \
+    if (!hit) return { connected: true, hit: false }; \
+    const holds = (outer, node) => { \
+        for (let n = node; n; n = n.parentNode || n.host) if (n === outer) return true; \
+        return false; \
+    }; \
+    const label = hit.closest ? hit.closest('label') : null; \
+    const text = (hit.innerText || hit.textContent || '').trim().replace(/\\s+/g, ' ').slice(0, 60); \
+    return { connected: true, hit: true, \
+        inside_target: holds(target, hit), \
+        contains_target: holds(hit, target), \
+        label_of_target: !!label && (label.control === target || holds(label, target) \
+            || (!!target.labels && Array.prototype.includes.call(target.labels, label))), \
+        by: { tag: hit.tagName.toLowerCase(), id: hit.id || '', \
+            role: hit.getAttribute('role') || '', \
+            label: hit.getAttribute('aria-label') || '', text: text } }; \
+}";
+
+/// Who would receive a trusted click at a ref's click point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Hit {
+    /// The ref's element: itself, something inside it, its label, or the
+    /// container it sits in without taking pointer events of its own.
+    Receives,
+    /// Another element, described for the refusal.
+    Covered(String),
+    /// Nothing: the point is outside the visible page.
+    Outside,
+    /// The ref's node is no longer in the page.
+    Gone,
+    /// The page did not answer the question; nothing is proven either way.
+    Unknown,
+}
+
+/// Read the facts [`HIT_TEST`] returned.
+fn classify_hit(facts: &Value) -> Hit {
+    let flag = |name: &str| facts.get(name).and_then(Value::as_bool);
+    match (flag("connected"), flag("hit")) {
+        (Some(false), _) => return Hit::Gone,
+        (Some(true), Some(false)) => return Hit::Outside,
+        (Some(true), Some(true)) => {}
+        _ => return Hit::Unknown,
+    }
+    if flag("inside_target") == Some(true)
+        || flag("label_of_target") == Some(true)
+        || flag("contains_target") == Some(true)
+    {
+        return Hit::Receives;
+    }
+    let by = |name: &str| {
+        facts
+            .pointer(&format!("/by/{name}"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+    };
+    let mut described = by("tag").unwrap_or("an element").to_owned();
+    if let Some(id) = by("id") {
+        described.push('#');
+        described.push_str(id);
+    }
+    if let Some(role) = by("role") {
+        described.push_str(&format!(" (role {role})"));
+    }
+    if let Some(name) = by("label").or(by("text")) {
+        described.push_str(&format!(" {name:?}"));
+    }
+    // The extension's own notice (see semantic::CUA_INDICATOR_HOST_ID).
+    if by("id") == Some("cua-driver-indicator") {
+        described = "Cua's own \"working in this tab\" pill".to_owned();
+    }
+    Hit::Covered(described)
+}
+
+/// Ask the page what is on top at the click point of a ref's node.
+async fn hit_test(
+    conn: &CdpConnection,
+    cdp: &str,
+    backend_node_id: i64,
+    (x, y): (f64, f64),
+    box_model: &Value,
+) -> Hit {
+    // The border box's top-left: the corner the node's own rectangle names.
+    let corner = box_model
+        .pointer("/model/border")
+        .and_then(Value::as_array)
+        .map(|quad| quad.iter().filter_map(Value::as_f64).collect::<Vec<_>>())
+        .filter(|quad| quad.len() == 8)
+        .map(|quad| {
+            (
+                quad.iter().step_by(2).copied().fold(f64::INFINITY, f64::min),
+                quad.iter().skip(1).step_by(2).copied().fold(f64::INFINITY, f64::min),
+            )
+        });
+    let Some((bx, by)) = corner else {
+        return Hit::Unknown;
+    };
+    let Some(object_id) = conn
+        .call(
+            Some(cdp),
+            "DOM.resolveNode",
+            json!({ "backendNodeId": backend_node_id }),
+        )
+        .await
+        .ok()
+        .and_then(|resolved| {
+            resolved
+                .pointer("/object/objectId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    else {
+        return Hit::Gone;
+    };
+    match conn
+        .call(
+            Some(cdp),
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": HIT_TEST,
+                "arguments": [{ "value": x }, { "value": y }, { "value": bx }, { "value": by }],
+                "returnByValue": true,
+            }),
+        )
+        .await
+    {
+        Ok(answer) => classify_hit(answer.pointer("/result/value").unwrap_or(&Value::Null)),
+        Err(_) => Hit::Unknown,
     }
 }
 
@@ -3788,6 +3983,38 @@ pub(crate) mod tests {
             changes_value(&unavailable_changes("javascript_dialog_open", Some(&dialog)))["dialog"],
             json!({"dialog_id": "dialog-3", "kind": "confirm"})
         );
+    }
+
+    #[test]
+    fn a_click_point_is_the_targets_unless_another_element_is_on_top_there() {
+        let facts = |inside: bool, contains: bool, label: bool, by: Value| {
+            json!({"connected": true, "hit": true, "inside_target": inside,
+                "contains_target": contains, "label_of_target": label, "by": by})
+        };
+        let plain = json!({"tag": "div", "id": "", "role": "", "label": "", "text": ""});
+        for (case, facts, expected) in [
+            ("the element itself, or a child of it", facts(true, false, false, plain.clone()), Hit::Receives),
+            ("its label", facts(false, false, true, plain.clone()), Hit::Receives),
+            ("the container it sits in (a closed shadow host, or no pointer events of its own)",
+             facts(false, true, false, plain.clone()), Hit::Receives),
+            ("an unrelated element with nothing to name it by",
+             facts(false, false, false, plain), Hit::Covered("div".into())),
+            ("a named overlay",
+             facts(false, false, false, json!({"tag": "span", "id": "badge", "role": "", "label": "New badge", "text": "NEW"})),
+             Hit::Covered("span#badge \"New badge\"".into())),
+            ("an overlay known by its role and text",
+             facts(false, false, false, json!({"tag": "div", "id": "", "role": "dialog", "label": "", "text": "Accept cookies?"})),
+             Hit::Covered("div (role dialog) \"Accept cookies?\"".into())),
+            ("the extension's own pill",
+             facts(false, false, false, json!({"tag": "div", "id": "cua-driver-indicator", "role": "", "label": "", "text": ""})),
+             Hit::Covered("Cua's own \"working in this tab\" pill".into())),
+            ("nothing at the point", json!({"connected": true, "hit": false}), Hit::Outside),
+            ("the node left the page", json!({"connected": false}), Hit::Gone),
+            ("no answer proves nothing", json!(true), Hit::Unknown),
+            ("nor does a malformed one", json!({"hit": true}), Hit::Unknown),
+        ] {
+            assert_eq!(classify_hit(&facts), expected, "{case}");
+        }
     }
 
     #[test]
