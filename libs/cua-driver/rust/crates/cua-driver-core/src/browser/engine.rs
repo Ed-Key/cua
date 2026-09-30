@@ -693,6 +693,7 @@ impl BrowserEngine {
                 if let Some(engine) = weak.upgrade() {
                     engine.store.remove_session(session_id);
                     engine.cleanup_prepared_session(session_id);
+                    let mut off_runtime = Vec::new();
                     let pending = {
                         let mut pending = engine.pending_existing_profile_cleanups.lock().unwrap();
                         let mut requests = pending.remove(session_id).unwrap_or_default();
@@ -708,12 +709,7 @@ impl BrowserEngine {
                             if let Some(protected) = grant.protected_consent.as_ref() {
                                 protected.revoke();
                             }
-                            // An SDK's idle sweeper ends sessions from a plain
-                            // thread; release on the runtime the claim ran on.
-                            if let Some(runtime) = tokio::runtime::Handle::try_current()
-                                .ok()
-                                .or_else(|| engine.pool.claim_runtime())
-                            {
+                            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                                 let engine = engine.clone();
                                 runtime.spawn(async move {
                                     engine.release_grant_socket(&grant).await;
@@ -721,10 +717,20 @@ impl BrowserEngine {
                                         engine.approval_broker.revoke(protected).await;
                                     }
                                 });
+                            } else {
+                                off_runtime.push(grant);
                             }
                         }
                         requests
                     };
+                    // An SDK's idle sweeper ends sessions from a plain thread.
+                    // The claim is released there directly; the relay's own
+                    // idle backstop detaches the session's tabs.
+                    for grant in off_runtime {
+                        engine
+                            .pool
+                            .release_existing_blocking(&grant.endpoint_ws_url, grant.generation);
+                    }
 
                     let mut failed = Vec::new();
                     for request in pending {

@@ -475,9 +475,6 @@ pub fn endpoint_port_is_grant_owned(url: &str) -> bool {
 pub struct CdpPool {
     conns: Mutex<HashMap<String, PoolEntry>>,
     claimed_loopback_ports: StdMutex<HashSet<u16>>,
-    /// The runtime the latest claim ran on, for releasing claims from
-    /// threads that have none (an SDK's idle-session sweeper).
-    claim_runtime: StdMutex<Option<tokio::runtime::Handle>>,
 }
 
 impl CdpPool {
@@ -485,7 +482,6 @@ impl CdpPool {
         Self {
             conns: Mutex::new(HashMap::new()),
             claimed_loopback_ports: StdMutex::new(HashSet::new()),
-            claim_runtime: StdMutex::new(None),
         }
     }
 
@@ -541,7 +537,6 @@ impl CdpPool {
         if !is_live() {
             anyhow::bail!("the claiming grant was released");
         }
-        *self.claim_runtime.lock().unwrap() = Some(tokio::runtime::Handle::current());
         conn.restrict_to_existing_profile();
         holders.insert(generation);
         conns.insert(
@@ -556,11 +551,6 @@ impl CdpPool {
             *claimed_ports().lock().unwrap().entry(port).or_default() += 1;
         }
         Ok(conn)
-    }
-
-    /// The runtime that owns this pool's grant claims, if any was made.
-    pub fn claim_runtime(&self) -> Option<tokio::runtime::Handle> {
-        self.claim_runtime.lock().unwrap().clone()
     }
 
     /// Reuse only the socket belonging to the exact live grant generation.
@@ -676,8 +666,23 @@ impl CdpPool {
     /// generation shares it.
     pub async fn release_existing(&self, ws_url: &str, generation: u64) {
         let mut conns = self.conns.lock().await;
+        self.release_locked(&mut conns, ws_url, generation);
+    }
+
+    /// [`Self::release_existing`] for a thread with no async runtime (an
+    /// SDK's idle-session sweeper). It waits for the pool lock by blocking.
+    pub fn release_existing_blocking(&self, ws_url: &str, generation: u64) {
+        let mut conns = self.conns.blocking_lock();
+        self.release_locked(&mut conns, ws_url, generation);
+    }
+
+    fn release_locked(
+        &self,
+        conns: &mut HashMap<String, PoolEntry>,
+        ws_url: &str,
+        generation: u64,
+    ) {
         let Some(entry) = conns.get_mut(ws_url) else {
-            drop(conns);
             self.release_claim_marker(ws_url);
             return;
         };
@@ -686,7 +691,6 @@ impl CdpPool {
         }
         if entry.holders.is_empty() {
             conns.remove(ws_url);
-            drop(conns);
             self.release_claim_marker(ws_url);
         } else {
             entry.generation = entry.holders.iter().max().copied();
