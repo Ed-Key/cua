@@ -316,10 +316,10 @@ impl RowSelection {
         }
     }
 
-    /// Ask for this row as the only selection: the owning table's
-    /// AXSelectedRows when it accepts that, else the row's AXSelected.
-    /// Returns whether the app accepted a write (not whether it took).
-    pub fn select_via_ax(&self) -> bool {
+    /// Ask for this row as the only selection with one AX write: the owning
+    /// table's AXSelectedRows when it is settable, else the row's
+    /// AXSelected. Returns the write's error (success is not proof it took).
+    pub fn select_via_ax(&self) -> AXError {
         unsafe {
             if let Some(container) = self.container {
                 if attribute_settable(container, "AXSelectedRows") == Some(true) {
@@ -327,19 +327,33 @@ impl RowSelection {
                         core_foundation::base::CFType::wrap_under_get_rule(self.row as CFTypeRef),
                     ]);
                     let name = core_foundation::string::CFString::new("AXSelectedRows");
-                    if AXUIElementSetAttributeValue(
+                    return AXUIElementSetAttributeValue(
                         container,
                         name.as_concrete_TypeRef(),
                         rows.as_CFTypeRef(),
-                    ) == kAXErrorSuccess
-                    {
-                        return true;
-                    }
+                    );
                 }
             }
-            set_bool_attr_true(self.row, "AXSelected") == kAXErrorSuccess
+            set_bool_attr_true(self.row, "AXSelected")
         }
     }
+}
+
+/// Whether an AX write's error means the app refused it before acting, so
+/// nothing changed. Any other error (a timeout, a generic failure) may hide
+/// a write that took effect.
+pub(crate) fn ax_write_rejected(err: AXError) -> bool {
+    const ILLEGAL_ARGUMENT: AXError = -25201;
+    const ACTION_UNSUPPORTED: AXError = -25206;
+    [
+        kAXErrorAttributeUnsupported,
+        kAXErrorNotImplemented,
+        kAXErrorAPIDisabled,
+        kAXErrorInvalidUIElement,
+        ILLEGAL_ARGUMENT,
+        ACTION_UNSUPPORTED,
+    ]
+    .contains(&err)
 }
 
 /// Read the selection state of the nearest collection-like element without
@@ -562,6 +576,15 @@ mod tests {
         let toolbar = [step("AXGenericElement", true, 1, false), step("AXGroup", true, 3, false)];
         assert_eq!(choose_row(&toolbar), None);
         assert_eq!(choose_row(&[]), None);
+    }
+
+    #[test]
+    fn only_a_definite_refusal_counts_as_an_unsent_write() {
+        assert!(ax_write_rejected(kAXErrorAttributeUnsupported));
+        assert!(ax_write_rejected(-25201), "illegal argument");
+        assert!(!ax_write_rejected(kAXErrorSuccess));
+        assert!(!ax_write_rejected(kAXErrorCannotComplete), "a timeout may have taken");
+        assert!(!ax_write_rejected(kAXErrorFailure));
     }
 
     /// A control click scans no peers, however many selectable ancestors it

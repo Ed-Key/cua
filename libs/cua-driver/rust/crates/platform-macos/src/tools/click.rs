@@ -2055,9 +2055,10 @@ enum RowLadderEnd {
     Confirmed(RowRung),
     /// Input was sent and its outcome is unknown; nothing further was sent.
     Unverifiable { after: RowRung, replaced: bool },
-    /// The clicked element no longer reads as its snapshot row. `after` is
-    /// the last rung that sent input, if any did.
-    Changed { now_reads: String, after: Option<RowRung> },
+    /// The clicked element no longer reads as its snapshot row (`now_reads`
+    /// is None when its name could not be read). `after` is the last rung
+    /// that sent input, if any did.
+    Changed { now_reads: Option<String>, after: Option<RowRung> },
     /// Every rung that applied ran, and a complete read-back after the last
     /// one shows the row not selected (or no rung applied).
     NotSelected,
@@ -2067,9 +2068,10 @@ enum RowLadderEnd {
 trait RowIo {
     /// Whether this rung can run at all (sends nothing).
     fn applies(&mut self, rung: RowRung) -> bool;
-    /// A fresh read of the clicked element's name: `Err(now_reads)` when it
-    /// no longer names its snapshot row.
-    fn identity(&mut self) -> Result<(), String>;
+    /// A fresh read of the clicked element's name: `Err(Some(now_reads))`
+    /// when it no longer names its snapshot row, `Err(None)` when the name
+    /// could not be read.
+    fn identity(&mut self) -> Result<(), Option<String>>;
     fn send(&mut self, rung: RowRung) -> anyhow::Result<RungSend>;
     fn read_back(&mut self) -> RowReadOutcome;
 }
@@ -2140,23 +2142,30 @@ impl RowIo for LiveRowIo<'_> {
         }
     }
 
-    fn identity(&mut self) -> Result<(), String> {
-        ensure_names_row(self.element, self.idx, self.snapshot_row).map_err(|error| {
-            error
-                .downcast::<ElementChanged>()
-                .map(|changed| changed.now_reads)
-                .unwrap_or_else(|error| error.to_string())
-        })
+    fn identity(&mut self) -> Result<(), Option<String>> {
+        // Unlike ensure_names_row, a name that cannot be read (not merely
+        // absent) is no proof of identity.
+        for attribute in ["AXDescription", "AXTitle"] {
+            match unsafe { crate::ax::bindings::copy_string_attr_checked(self.element, attribute) } {
+                Ok(name) if !still_names_row(self.snapshot_row, &name) => return Err(Some(name)),
+                Ok(_) => {}
+                Err(err)
+                    if err == crate::ax::bindings::kAXErrorAttributeUnsupported
+                        || err == crate::ax::bindings::kAXErrorNoValue => {}
+                Err(_) => return Err(None),
+            }
+        }
+        Ok(())
     }
 
     fn send(&mut self, rung: RowRung) -> anyhow::Result<RungSend> {
         use crate::ax::bindings::{kAXErrorInvalidUIElement, kAXErrorSuccess};
         Ok(match rung {
             RowRung::AxSelect => {
-                if self.row.select_via_ax() {
-                    RungSend::Sent
-                } else {
+                if crate::input::ax_actions::ax_write_rejected(self.row.select_via_ax()) {
                     RungSend::NotSent
+                } else {
+                    RungSend::Sent
                 }
             }
             RowRung::Press => {
@@ -2280,15 +2289,25 @@ fn select_row(
             ),
             after,
         ),
-        RowLadderEnd::Changed { now_reads, after: None } => {
+        RowLadderEnd::Changed { now_reads: Some(now_reads), after: None } => {
             Err(ElementChanged { idx, now_reads }.into())
         }
+        RowLadderEnd::Changed { now_reads: None, after: None } => anyhow::bail!(
+            "element [{idx}]'s name could not be read right before input, so it is not \
+             confirmed as the row the snapshot named. Nothing was sent; take a fresh snapshot."
+        ),
         RowLadderEnd::Changed { now_reads, after: Some(after) } => unverifiable(
             format!(
-                "✅ {} on [{idx}] {role} \"{title}\"; element [{idx}] then read \"{now_reads}\" \
-                 (element_changed: the app reused it for other content), so nothing further was \
-                 sent. Take a fresh snapshot before acting again: do not retry this click.",
-                rung_sent_text(after)
+                "✅ {} on [{idx}] {role} \"{title}\"; {}, so nothing further was sent. Take a \
+                 fresh snapshot before acting again: do not retry this click.",
+                rung_sent_text(after),
+                match now_reads {
+                    Some(now_reads) => format!(
+                        "element [{idx}] then read \"{now_reads}\" (element_changed: the app \
+                         reused it for other content)"
+                    ),
+                    None => format!("element [{idx}]'s name then could not be read"),
+                }
             ),
             after,
         ),
@@ -2326,7 +2345,7 @@ mod tests {
     /// shows. Every call is logged in order.
     struct ScriptedRow {
         applies: Vec<RowRung>,
-        identity: Vec<Result<(), String>>,
+        identity: Vec<Result<(), Option<String>>>,
         sends: Vec<RungSend>,
         reads: Vec<RowReadOutcome>,
         log: Vec<String>,
@@ -2336,7 +2355,7 @@ mod tests {
         fn applies(&mut self, rung: RowRung) -> bool {
             self.applies.contains(&rung)
         }
-        fn identity(&mut self) -> Result<(), String> {
+        fn identity(&mut self) -> Result<(), Option<String>> {
             self.log.push("identity".into());
             self.identity.remove(0)
         }
@@ -2360,10 +2379,11 @@ mod tests {
         use RowRung::{AxSelect, Pointer, Press};
         use RungSend::{NotSent, Replaced, Sent};
         let ok = || Ok(());
-        let changed = || Err("The Home Depot".to_owned());
+        let changed = || Err(Some("The Home Depot".to_owned()));
+        let unreadable = || Err(None);
         let all = vec![AxSelect, Press, Pointer];
         #[allow(clippy::type_complexity)]
-        let cases: Vec<(&str, Vec<RowRung>, Vec<Result<(), String>>, Vec<RungSend>, Vec<RowReadOutcome>, RowLadderEnd, &[&str])> = vec![
+        let cases: Vec<(&str, Vec<RowRung>, Vec<Result<(), Option<String>>>, Vec<RungSend>, Vec<RowReadOutcome>, RowLadderEnd, &[&str])> = vec![
             ("AX selection proven", all.clone(), vec![ok()], vec![Sent], vec![Selected],
              RowLadderEnd::Confirmed(AxSelect),
              &["identity", "send AxSelect", "read Selected"]),
@@ -2385,11 +2405,15 @@ mod tests {
              &["identity", "send Press"]),
             ("press missing, element reused before the pointer: no pointer", vec![Press, Pointer],
              vec![ok(), changed()], vec![Sent], vec![Missing],
-             RowLadderEnd::Changed { now_reads: "The Home Depot".into(), after: Some(Press) },
+             RowLadderEnd::Changed { now_reads: Some("The Home Depot".into()), after: Some(Press) },
              &["identity", "send Press", "read Missing", "identity"]),
             ("element reused before any input", all.clone(), vec![changed()], vec![], vec![],
-             RowLadderEnd::Changed { now_reads: "The Home Depot".into(), after: None },
+             RowLadderEnd::Changed { now_reads: Some("The Home Depot".into()), after: None },
              &["identity"]),
+            ("press missing, name unreadable before the pointer: no pointer", vec![Press, Pointer],
+             vec![ok(), unreadable()], vec![Sent], vec![Missing],
+             RowLadderEnd::Changed { now_reads: None, after: Some(Press) },
+             &["identity", "send Press", "read Missing", "identity"]),
             ("every rung missing", all.clone(), vec![ok(), ok(), ok()], vec![Sent, Sent, Sent],
              vec![Missing, Missing, Missing], RowLadderEnd::NotSelected,
              &["identity", "send AxSelect", "read Missing", "identity", "send Press",
