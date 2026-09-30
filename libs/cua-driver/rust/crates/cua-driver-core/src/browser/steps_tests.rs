@@ -493,6 +493,95 @@ async fn a_step_aimed_by_role_and_name_finds_what_the_step_before_it_revealed() 
 }
 
 #[tokio::test]
+async fn a_step_aimed_by_name_alone_needs_no_role_and_is_never_guessed() {
+    const CLOSED: &str = "- textbox \"Email\" [p3:1 type]\n\
+        - button \"Role\" [p3:2 click] (collapsed)\n\
+        - button \"Send invite\" [p3:6 click]\n\
+        - statictext \"No invites yet\" [p3:9]";
+    let page = |options: &str| {
+        let (registry, script) = page_registry();
+        {
+            let mut script = script.lock().unwrap();
+            script.outline = Some(CLOSED.to_owned());
+            script
+                .reveals
+                .insert("p3:2".into(), format!("{CLOSED}\n{options}"));
+        }
+        (registry, script)
+    };
+    let flow = json!([
+        {"action": "type", "name": "Email", "text": "ada@x.com"},
+        {"action": "click", "name": "Role"},
+        {"action": "click", "name": "Editor"},
+        {"action": "click", "name": "Send invite"},
+    ]);
+
+    // The option's text child has its name; only the option can be clicked.
+    let (registry, script) =
+        page("- option \"Editor\" [p3:8 click]\n  - statictext \"Editor\" [p3:12]");
+    let output = steps(&registry, "steps-name-only", flow.clone()).await;
+    assert_eq!(output["status"], "completed", "{output}");
+    assert_eq!(
+        calls(&script),
+        [
+            "get_browser_state Email",
+            "browser_type p3:1",
+            "get_browser_state Role",
+            "browser_click p3:2",
+            "get_browser_state Editor",
+            "browser_click p3:8",
+            "get_browser_state Send invite",
+            "browser_click p3:6",
+            "get_browser_state since 0",
+        ]
+    );
+
+    // Two elements with the name offer the click, whatever their roles:
+    // refused with both, neither clicked, Send not pressed.
+    let (registry, script) =
+        page("- option \"Editor\" [p3:8 click]\n- menuitem \"Editor\" [p3:13 click]");
+    let twice = steps(&registry, "steps-name-only-twice", flow).await;
+    assert_eq!(
+        (&twice["stopped_at"], &twice["stop_reason"]),
+        (&json!(3), &json!("step_failed"))
+    );
+    assert_eq!(twice["steps"][2]["code"], "target_ambiguous", "{twice}");
+    assert_eq!(
+        twice["steps"][2]["candidates"],
+        json!([
+            "- option \"Editor\" [p3:8 click]",
+            "- menuitem \"Editor\" [p3:13 click]"
+        ])
+    );
+    assert!(twice["steps"][2].get("ref").is_none(), "nothing was chosen");
+    assert!(!calls(&script).contains(&"browser_click p3:6".to_owned()));
+
+    // No such name, and a name on something that cannot be clicked: each
+    // refused before any input, with the lines to choose from.
+    for (name, code, candidates) in [
+        ("Delete", "target_not_found", 4),
+        ("No invites yet", "browser_action_unavailable", 1),
+    ] {
+        let (registry, script) = page("");
+        let refused = steps(
+            &registry,
+            "steps-name-only-refused",
+            json!([{"action": "click", "name": name}]),
+        )
+        .await;
+        let step = &refused["steps"][0];
+        assert_eq!(step["code"], code, "{refused}");
+        assert_eq!(
+            step["candidates"].as_array().map(Vec::len),
+            Some(candidates)
+        );
+        assert!(calls(&script)
+            .iter()
+            .all(|call| !call.starts_with("browser_click")));
+    }
+}
+
+#[tokio::test]
 async fn a_dialog_a_step_opened_stops_the_batch_and_is_passed_on_with_its_capability() {
     let (registry, script) = page_registry();
     script

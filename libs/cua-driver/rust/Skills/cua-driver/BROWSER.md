@@ -35,20 +35,20 @@ The outline has one line per element, with its ref and what the ref allows:
 
 `[p3:6]` with no action is a ref you can read under (`scope_ref`) but not act
 on. `browser_steps` takes up to 8 `click` and `type` steps. Aim a step with a
-`ref`, or with an exact `role` and `name` that is looked up on the live page
-when the step runs. Use `role` and `name` for an element an earlier step
-reveals or enables (a menu option, a dialog button, a Send button that is
-disabled until the field is filled): it has no ref, or no action on its ref,
-until that step has run. A role and name that match nothing only stop the
-batch at that step, with the candidates to choose from, so plan the whole
-flow as one call:
+`ref`, or with an exact `name` that is looked up on the live page when the
+step runs (add `role` only when several elements share the name). Use a
+`name` for an element an earlier step reveals or enables (a menu option, a
+dialog button, a Send button that is disabled until the field is filled): it
+has no ref, or no action on its ref, until that step has run. A name that
+matches nothing only stops the batch at that step, with the candidates to
+choose from, so plan the whole flow as one call:
 
 ```text
 browser_steps {target_id, tab_id, steps: [
   {action: "type",  ref: "p3:4", text: "ada@x.com"},
   {action: "click", ref: "p3:5"},
-  {action: "click", role: "option", name: "Editor"},
-  {action: "click", role: "button", name: "Send invite",
+  {action: "click", name: "Editor"},
+  {action: "click", name: "Send invite",
    expect: {text: "ada@x.com (Editor)"}}]}
 ```
 
@@ -603,12 +603,16 @@ what else the page changed (a button that became enabled, a suggestion list).
 `browser_steps` runs 1 to 8 steps on one tab and returns
 `{status, steps, stopped_at, stop_reason, changes}`.
 
-- A step is `{action: "click" | "type", ...}` aimed by `ref`, or by `role`
-  and `name`. Role and name must match one element exactly (the name is the
-  accessible name, compared whole and case-sensitively). No match or several
-  fail the step with `candidates`, the outline lines to choose a ref from; a
-  single match on a page that could not be read completely fails as
-  `coverage_incomplete`.
+- A step is `{action: "click" | "type", ...}` aimed by `ref`, or by `name`
+  with an optional `role`. The name is the accessible name, compared whole
+  and case-sensitively. A name alone is the one element with it whose ref
+  offers the step's action (a button, not the text inside it); with `role`
+  it is the one element with that exact role and name. No match or several
+  fail the step with `candidates`, the outline lines to choose a ref from
+  (`target_not_found`, `target_ambiguous`; a name that is only on elements
+  without the action is `browser_action_unavailable`); a single match on a
+  page that could not be read completely fails as `coverage_incomplete`.
+  Nothing is ever guessed.
 - `type` takes `text` and optional `replace`. `click` takes optional
   `input_route`.
 - `expect: {role?, name?, text?, present?}` must hold after the step settles

@@ -295,7 +295,7 @@
     },
     {
       "name": "browser_steps",
-      "description": "Run up to 8 page steps (click, type) on one bound tab in order, then return what the page changed. A step targets a ref, or an exact role and name resolved when it runs. Use role and name for an element an earlier step reveals or enables (a menu option, a dialog, a disabled button): it has no ref or no action until then, and a name that matches nothing only stops the batch there with the candidates. So plan the whole flow as one call. Stops at the first failure, unconfirmed typing, dialog or navigation; never retries. Details: skill://cua-driver/BROWSER.md",
+      "description": "Run up to 8 page steps (click, type) on one bound tab in order, then return what the page changed. A step targets a ref, or an exact name resolved when it runs (add role only when several elements share the name). Use a name for an element an earlier step reveals or enables (a menu option, a dialog, a disabled button): it has no ref or no action until then, and a name that matches nothing only stops the batch there with the candidates. So plan the whole flow as one call. Stops at the first failure, unconfirmed typing, dialog or navigation; never retries. Details: skill://cua-driver/BROWSER.md",
       "platforms": [
         "macos",
         "windows",
@@ -322,7 +322,7 @@
             "description": "1 to 8 steps, run in order.",
             "items": {
               "additionalProperties": false,
-              "description": "One step. Target it with `ref`, or with `role` and `name` (matched\nexactly against the live page when the step runs).",
+              "description": "One step. Target it with `ref`, or with `name` (matched exactly against\nthe live page when the step runs), and `role` to narrow the name.",
               "properties": {
                 "action": {
                   "enum": [
@@ -356,7 +356,7 @@
                   "type": "object"
                 },
                 "input_route": {
-                  "description": "click: trusted (default) or dom_event (ref or role and name).",
+                  "description": "click: trusted (default) or dom_event (ref or name).",
                   "enum": [
                     "trusted",
                     "dom_event"
@@ -364,6 +364,7 @@
                   "type": "string"
                 },
                 "name": {
+                  "description": "Instead of ref: the one element with exactly this name that offers the action.",
                   "type": "string"
                 },
                 "ref": {
@@ -375,7 +376,7 @@
                   "type": "boolean"
                 },
                 "role": {
-                  "description": "With name, instead of ref.",
+                  "description": "Optional with name: only an element with exactly this role.",
                   "type": "string"
                 },
                 "text": {

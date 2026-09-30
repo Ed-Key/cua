@@ -3190,8 +3190,8 @@ class _UniffiFfiConverterOptionalTypeBrowserStepExpect(_UniffiConverterRustBuffe
 @dataclass
 class BrowserStep:
     """
-    One step. Target it with `ref`, or with `role` and `name` (matched
-    exactly against the live page when the step runs).
+    One step. Target it with `ref`, or with `name` (matched exactly against
+    the live page when the step runs), and `role` to narrow the name.
 """
     def __init__(self, *, action:BrowserStepAction, reference:typing.Optional[str] = _DEFAULT, role:typing.Optional[str] = _DEFAULT, name:typing.Optional[str] = _DEFAULT, text:typing.Optional[str] = _DEFAULT, replace:typing.Optional[bool] = _DEFAULT, input_route:typing.Optional[BrowserStepRoute] = _DEFAULT, expect:typing.Optional[BrowserStepExpect] = _DEFAULT):
         self.action = action
