@@ -28,7 +28,8 @@ After editing these files, press the extension's **Reload** button on
   so the banner does not come and go between commands. It is released, and
   the banner cleared, when the session ends (the driver sends a detach once
   no session holds the tab), when the driver disconnects, when the tab closes,
-  or when you press **Stop**.
+  or when you press **Stop**. As a backstop, a tab that gets no debugger
+  command for 10 minutes is released anyway.
 - In the tab Cua is working in: a soft blue glow, a "Cua is working in this
   tab" pill with **Stop**, and the Cua cursor on the tab's favicon.
 - Tabs Cua opens start in the background in a cyan "Cua" tab group.

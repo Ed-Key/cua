@@ -5,6 +5,7 @@
 // chrome.debugger calls, and forwards debugger events. It holds no agent logic.
 
 import { clearActive, markActive, refresh } from "./indicator.js";
+import { attachOutlivedConnection, idleTabs } from "./lifecycle.js";
 
 const HOST = "com.trycua.cua_driver";
 const RECONNECT_ALARM = "cua-driver-reconnect";
@@ -14,6 +15,12 @@ const STOPPED_MESSAGE =
   "(they can allow it again from the Cua Driver toolbar button)";
 
 let port = null;
+// Bumped on every native-messaging connect and disconnect. An attach that
+// started under one value and finishes under another outlived its driver.
+let connection = 0;
+// When each attached tab last got a debugger command, for the idle backstop
+// (lifecycle.js).
+const lastCommandAt = new Map();
 // Tabs this extension attached the debugger to, so detach only undoes its own.
 const attached = new Set();
 // Tabs where the user pressed Stop. Cua may not act in them again until the
@@ -48,6 +55,7 @@ function serialized(tabId, work) {
 function releaseDebugger(tabId, reason) {
   return serialized(tabId, async () => {
     pageEnabled.delete(tabId);
+    lastCommandAt.delete(tabId);
     if (!attached.delete(tabId)) return;
     await chrome.debugger.detach({ tabId }).catch(() => {});
     // Chrome reports only detaches it caused; tell the daemon about this one.
@@ -114,7 +122,14 @@ function ensureAttached(tabId) {
     refuseIfStopped(tabId);
     if (!attached.has(tabId)) {
       await refuseIfNotLoaded(tabId);
+      const startedUnder = connection;
       await chrome.debugger.attach({ tabId }, "1.3");
+      // The driver disconnected while Chrome was attaching: nobody holds
+      // this attachment, and the disconnect cleanup could not see it yet.
+      if (attachOutlivedConnection(startedUnder, connection)) {
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+        throw new Error("the Cua Driver disconnected while attaching");
+      }
       attached.add(tabId);
       // Nothing runs in the tab after a Stop, not even the replay below.
       if (stopped.has(tabId)) {
@@ -130,7 +145,16 @@ function ensureAttached(tabId) {
       await chrome.debugger.detach({ tabId }).catch(() => {});
       throw new Error(STOPPED_MESSAGE);
     }
+    lastCommandAt.set(tabId, Date.now());
   });
+}
+
+// The idle backstop (lifecycle.js); runs on the reconnect alarm.
+function releaseIdleTabs() {
+  for (const tabId of idleTabs(lastCommandAt, Date.now())) {
+    if (attached.has(tabId)) void releaseDebugger(tabId, "idle_backstop");
+    else lastCommandAt.delete(tabId);
+  }
 }
 
 function connect() {
@@ -141,11 +165,13 @@ function connect() {
     port = null;
     return;
   }
+  connection += 1;
   port.onMessage.addListener(handleMessage);
   port.onDisconnect.addListener(() => {
     // Reading lastError marks it handled; the alarm reconnects later.
     void chrome.runtime.lastError;
     port = null;
+    connection += 1;
     // No daemon, no agent session: let go of every tab.
     for (const tabId of [...attached]) void releaseDebugger(tabId, "daemon_disconnected");
   });
@@ -374,6 +400,7 @@ chrome.debugger.onEvent.addListener((source, method, params) => {
 chrome.debugger.onDetach.addListener((source, reason) => {
   attached.delete(source.tabId);
   pageEnabled.delete(source.tabId);
+  lastCommandAt.delete(source.tabId);
   // "canceled_by_user": the user dismissed Chrome's debugging banner.
   if (reason === "canceled_by_user") void stopTab(source.tabId);
   post({ jsonrpc: "2.0", method: "debugger.detached", params: { source, reason } });
@@ -422,6 +449,7 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (stopped.delete(tabId)) void saveStopped();
   attached.delete(tabId);
   pageEnabled.delete(tabId);
+  lastCommandAt.delete(tabId);
   tabQueues.delete(tabId);
   clearActive(tabId);
 });
@@ -438,7 +466,10 @@ chrome.action.onClicked.addListener(async () => {
 // lifecycle events bring the native link back.
 chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === RECONNECT_ALARM) connect();
+  if (alarm.name === RECONNECT_ALARM) {
+    connect();
+    releaseIdleTabs();
+  }
 });
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);
