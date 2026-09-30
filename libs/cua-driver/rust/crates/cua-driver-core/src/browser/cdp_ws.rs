@@ -636,9 +636,14 @@ impl CdpPool {
         Ok(entry.conn.clone())
     }
 
-    /// Drop a (likely dead) connection so the next call redials.
+    /// Drop a (likely dead) driver-owned connection so the next call
+    /// redials. Grant-owned sockets leave the pool only through their
+    /// holders' releases, never through the legacy route's eviction.
     pub async fn evict(&self, ws_url: &str) {
-        self.conns.lock().await.remove(ws_url);
+        let mut conns = self.conns.lock().await;
+        if conns.get(ws_url).is_some_and(|entry| entry.generation.is_none()) {
+            conns.remove(ws_url);
+        }
     }
 
     pub fn release_claim_marker(&self, ws_url: &str) {
@@ -826,6 +831,11 @@ mod tests {
             "claiming a personal-profile socket must restrict it in place"
         );
         assert!(pool.get(&url).await.is_err(), "legacy access must refuse");
+        pool.evict(&url).await;
+        assert!(
+            pool.get_existing(&url, 1).await.is_ok(),
+            "the legacy route's eviction leaves a grant-owned socket alone"
+        );
         assert!(pool.get_existing(&url, 2).await.is_err());
         let reused = pool.get_existing(&url, 1).await.unwrap();
         assert!(Arc::ptr_eq(&claimed, &reused));

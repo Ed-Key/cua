@@ -1249,6 +1249,46 @@ async fn approved_existing_profile_attach_claims_then_binds_one_generation() {
     crate::session::fire_session_end("transport-v2-attach");
 }
 
+#[tokio::test]
+async fn an_existing_profile_attach_changes_its_claim_only_under_the_endpoint_gate() {
+    const TRANSPORT: &str = "transport-v2-attach-gate";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let fingerprint = f.engine.platform.process_fingerprint(1).await.unwrap();
+    // The gate a reconnect of this endpoint holds.
+    let gate = f
+        .engine
+        .reconnect_gates
+        .lock(super::reconnect::ReconnectKey::new(&fingerprint, &f._server.ws_url()))
+        .await;
+    let tool = BrowserPrepareTool::new(f.engine.clone());
+    let prepare = tool.invoke(json!({
+        "pid": 1,
+        "window_id": 7,
+        "session": SESSION,
+        "_transport_session_id": TRANSPORT,
+        "strategy": { "kind": "existing_profile" }
+    }));
+    tokio::pin!(prepare);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut prepare)
+            .await
+            .is_err(),
+        "the attach must wait for the endpoint gate"
+    );
+    assert!(
+        f.engine
+            .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "no grant is minted while another holder owns the gate"
+    );
+    drop(gate);
+    let prepared = prepare.await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    crate::session::fire_session_end(TRANSPORT);
+}
+
 /// Forwards WebSocket connections to the mock endpoint after a delay, so a
 /// claim outlasts the 500 ms prompt window; `cut` drops every open link.
 struct SlowProxy {
