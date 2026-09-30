@@ -5577,6 +5577,7 @@ fn pip_frame(
             args.opt_u64("window_id")
                 .and_then(|window_id| u32::try_from(window_id).ok())
         }),
+        page: bound_window.is_some(),
     }
 }
 
@@ -5649,6 +5650,8 @@ mod capability_tests {
         assert_eq!(frame.target_pid, Some(42));
         assert_eq!(frame.target_window_id, Some(7));
         assert_eq!(frame.action_label, "click: element_index=3");
+        // P8: a native tool's frame frames the whole window, even a browser's.
+        assert!(!frame.page);
 
         // No session at all (one-shot CLI) shares the classic default panel.
         let bare = pip_frame("click", &serde_json::json!({}), &public, prefix, None);
@@ -5678,6 +5681,8 @@ mod capability_tests {
         ] {
             let frame = pip_frame(tool, &args, &args, prefix, Some((42, 7)));
             assert_eq!((frame.target_pid, frame.target_window_id), (Some(42), Some(7)));
+            // P1: a bound tab's frame shows only the page.
+            assert!(frame.page, "{tool}");
             assert!(pip_hook::pip_frame_wanted(tool, &frame), "{tool}");
         }
         // B3: a background tab (nothing noted) has no target, so no frame.
