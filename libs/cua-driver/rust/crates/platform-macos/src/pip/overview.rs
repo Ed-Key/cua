@@ -742,7 +742,7 @@ unsafe fn snapshot(panels: &std::collections::HashMap<String, Panel>) -> (Vec<Gr
 /// screens]` is walked with its enumerator, not `count`: the array is
 /// Swift-bridged and its `count` is a signed NSInteger, which a debug
 /// build's message check rejects as NSUInteger.
-unsafe fn active_screen() -> Option<(Area, f64)> {
+pub(super) unsafe fn active_screen() -> Option<(Area, f64)> {
     let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
     let mut screens = Vec::new();
     let list: *mut AnyObject = msg_send![class!(NSScreen), screens];

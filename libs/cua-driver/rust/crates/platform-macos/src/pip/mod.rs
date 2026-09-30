@@ -3391,6 +3391,20 @@ extern "C" fn returns_no(_this: *mut AnyObject, _cmd: Sel) -> Bool {
     Bool::NO
 }
 
+/// `constrainFrameRect:toScreen:` that keeps the frame as asked. AppKit's
+/// keeps the window's top below the menu bar, and the panel window reaches
+/// far above and left of its card (see "Card stack"), so a dragged card
+/// stopped well short of the top of the screen. What stays on screen is the
+/// card: `keep_card_on_screen` brings it back inside when it is released.
+extern "C" fn unconstrained_frame(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    frame: NSRect,
+    _screen: *mut AnyObject,
+) -> NSRect {
+    frame
+}
+
 extern "C" fn accepts_first_mouse(
     _this: *mut AnyObject,
     _cmd: Sel,
@@ -3424,6 +3438,10 @@ fn panel_class() -> &'static AnyClass {
             builder.add_method(
                 sel!(canBecomeMainWindow),
                 returns_no as extern "C" fn(_, _) -> _,
+            );
+            builder.add_method(
+                sel!(constrainFrameRect:toScreen:),
+                unconstrained_frame as extern "C" fn(_, _, _, _) -> _,
             );
         })
     })
@@ -4742,12 +4760,14 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
 }
 
 /// Move the panel so its front card lies inside the visible frame of the
-/// screen its window is on, by the least distance (`stack::keep_inside`).
+/// screen under the pointer (where the card was let go; the window's own
+/// screen is the one most of the big window is on, which may not be the
+/// card's), by the least distance (`stack::keep_inside`).
 /// The window jumps; every item glides there on the restack spring from
 /// where it was drawn (at most `LAG_ROOM` away, the room the window has).
 unsafe fn keep_card_on_screen(panel: &mut Panel) {
     let window = panel.window as *mut AnyObject;
-    let Some(visible) = visible_frame_of(window) else {
+    let Some((visible, _)) = overview::active_screen() else {
         return;
     };
     let frame: NSRect = msg_send![window, frame];
