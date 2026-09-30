@@ -1580,6 +1580,66 @@ async fn a_prepare_cancelled_mid_handshake_leaves_a_grant_the_next_bind_can_use(
     crate::session::fire_session_end(TRANSPORT);
 }
 
+#[tokio::test]
+async fn a_second_window_binds_under_the_extension_grant() {
+    const TRANSPORT: &str = "transport-extension-two-windows";
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        server.ws_url(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    let bind = |window_id: u64| {
+        let engine = engine.clone();
+        async move {
+            let bound = GetBrowserStateTool::new(engine)
+                .invoke(json!({
+                    "pid": 1, "window_id": window_id,
+                    "session": SESSION, "_transport_session_id": TRANSPORT,
+                }))
+                .await;
+            structured(&bound).clone()
+        }
+    };
+    let first = bind(7).await;
+    assert_eq!(first["status"], "ok", "{first}");
+    let second = bind(8).await;
+    assert_eq!(second["status"], "ok", "{second}");
+    // The first window's binding still works.
+    let tab = first["tabs"][0]["tab_id"].as_str().unwrap();
+    let again = GetBrowserStateTool::new(engine.clone())
+        .invoke(json!({
+            "target_id": first["target_id"], "tab_id": tab,
+            "session": SESSION, "_transport_session_id": TRANSPORT,
+        }))
+        .await;
+    assert_eq!(structured(&again)["status"], "ok", "{}", structured(&again));
+    crate::session::fire_session_end(TRANSPORT);
+}
+
+#[tokio::test]
+async fn an_explicitly_approved_grant_stays_tied_to_its_window() {
+    const TRANSPORT: &str = "transport-approved-two-windows";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let args = |window_id: u64| {
+        json!({
+            "pid": 1, "window_id": window_id,
+            "session": SESSION, "_transport_session_id": TRANSPORT,
+        })
+    };
+    let mut prepare = args(7);
+    prepare["strategy"] = json!({ "kind": "existing_profile" });
+    let prepared = BrowserPrepareTool::new(f.engine.clone()).invoke(prepare).await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let first = GetBrowserStateTool::new(f.engine.clone()).invoke(args(7)).await;
+    assert_eq!(structured(&first)["status"], "ok", "{}", structured(&first));
+    let second = GetBrowserStateTool::new(f.engine.clone()).invoke(args(8)).await;
+    let second = structured(&second).clone();
+    assert_eq!(second["status"], "refused", "{second}");
+    assert_eq!(second["refusal"]["code"], "browser_binding_stale", "{second}");
+    crate::session::fire_session_end(TRANSPORT);
+}
+
 fn standard_mode_platform(ws_url: String, transport: EndpointTransport) -> FixturePlatform {
     FixturePlatform {
         ws_url,

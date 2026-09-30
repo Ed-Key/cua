@@ -1350,10 +1350,23 @@ impl BrowserEngine {
         } else {
             self.owned_endpoint(pid).await?
         };
+        // A grant names the window it was approved for. One made through the
+        // extension covers every window of that Chrome whose consent is the
+        // extension's too (installing it is the consent, and binding such a
+        // window without a grant would mint one without asking), so a second
+        // window of the same browser binds under it. Explicitly approved
+        // grants stay tied to their window.
+        let other_window_covered = match &grant {
+            Some(grant) if grant.window_id != window_id => {
+                grant.endpoint_transport == super::types::EndpointTransport::ExtensionRelay
+                    && self.extension_consent_covers(pid, window_id).await
+            }
+            _ => false,
+        };
         if let Some(grant) = &grant {
             if !grant.fingerprint.matches(&fingerprint)
                 || grant.endpoint_ws_url != endpoint.ws_url
-                || grant.window_id != window_id
+                || (grant.window_id != window_id && !other_window_covered)
             {
                 return Err(refuse(
                     BrowserRefusalCode::BrowserBindingStale,
@@ -1477,6 +1490,16 @@ impl BrowserEngine {
     /// sent through a separate prepare step. Returns `None` when the consent
     /// in force needs an explicit `browser_prepare` (an approval host or a
     /// bounded manifest).
+    /// Whether the consent in force for this window lets the extension route
+    /// attach without an explicit `browser_prepare` approval.
+    async fn extension_consent_covers(&self, pid: i64, window_id: u64) -> bool {
+        use super::prepare::ExistingProfileConsent as Consent;
+        matches!(
+            self.existing_profile_consent(pid, window_id).await,
+            Ok((_, Consent::ExtensionInstalled | Consent::Unrestricted | Consent::LaunchGrant))
+        )
+    }
+
     async fn grant_through_extension(
         &self,
         session: &str,
@@ -1484,10 +1507,8 @@ impl BrowserEngine {
         pid: i64,
         window_id: u64,
     ) -> Result<Option<ExistingProfileGrant>, BrowserRefusal> {
-        use super::prepare::ExistingProfileConsent as Consent;
-        match self.existing_profile_consent(pid, window_id).await {
-            Ok((_, Consent::ExtensionInstalled | Consent::Unrestricted | Consent::LaunchGrant)) => {}
-            Ok((_, Consent::Protected | Consent::BoundedManifest)) | Err(_) => return Ok(None),
+        if !self.extension_consent_covers(pid, window_id).await {
+            return Ok(None);
         }
         self.attach_existing_profile_via(
             super::platform::PrepareRequest {
