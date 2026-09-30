@@ -342,6 +342,28 @@ fn panel_should_show(active: bool, dismissed: bool, target_fully_visible: bool) 
     active && !dismissed && !target_fully_visible
 }
 
+/// A frame that names both a pid and a window shows that window as that
+/// app's: the window must be one of the pid's. Anything else (a number that
+/// is no macOS window, or another app's window that happens to have that
+/// number) is dropped before its action note.
+fn names_own_window(
+    target: Target,
+    owner: impl FnOnce(i32, u32) -> crate::windows::WindowOwner,
+) -> bool {
+    match target {
+        (Some(pid), Some(window)) => owner(pid, window) == crate::windows::WindowOwner::SamePid,
+        _ => true,
+    }
+}
+
+/// A session's panel is created only by a frame whose capture succeeded: a
+/// panel never opens on "Waiting for the first frame" for a target that may
+/// never give one. A panel that exists takes every frame (a failed capture
+/// keeps its old still).
+fn frame_reaches_a_panel(has_panel: bool, captured: bool) -> bool {
+    has_panel || captured
+}
+
 /// A captured frame is applied only if its session is still in the epoch
 /// the frame was pushed in. `None` means the session has ended.
 fn should_apply(frame_epoch: u64, current_epoch: Option<u64>) -> bool {
@@ -1029,12 +1051,20 @@ struct VisibilityUpdate {
 
 impl PipBackend for MacosPipBackend {
     fn push_frame(&self, frame: PipFrame) {
+        let target = (frame.target_pid, frame.target_window_id);
+        // One CGWindowList read, as the action's own tool made to find its
+        // window. Here and not on the capture worker, so a dropped frame
+        // leaves no action note either.
+        if !names_own_window(target, crate::windows::resolve_window_owner) {
+            tracing::info!(target: "pip", session = %frame.session_key, ?target, "PiP frame dropped: the window is not one of that app's");
+            return;
+        }
         // The action itself goes straight to the main queue: the capture
         // queue keeps only a session's latest frame, so a coalesced frame
         // must not take the record of its action with it.
         let action = Action {
             key: frame.session_key.clone(),
-            target: (frame.target_pid, frame.target_window_id),
+            target,
             timestamp_ms: frame.timestamp_ms,
         };
         self.worker.push(frame);
@@ -1057,7 +1087,7 @@ impl PipBackend for MacosPipBackend {
         // answering when the session went idle, so ask now (WindowServer
         // calls, so here and not on the main queue).
         let target_visible = target
-            .filter(|_| end == PipSessionEnd::Finished)
+            .filter(|_| end != PipSessionEnd::Expired)
             .map(|target| {
                 let (windows, displays) = visibility::snapshot();
                 visibility::target_fully_visible(
@@ -1371,11 +1401,20 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     if !state.worker.is_current(&key, epoch) {
         return;
     }
-    if !state.panels.contains_key(&key) {
+    let has_panel = state.panels.contains_key(&key);
+    if !frame_reaches_a_panel(has_panel, png.is_some()) {
+        // Its action note stays with the session (`State::early`), so the
+        // panel a later frame creates knows this window was touched.
+        tracing::info!(target: "pip", session = %key, target = ?(frame.target_pid, frame.target_window_id), "PiP frame has no picture: no panel opened");
+        return;
+    }
+    if !has_panel {
         let Some(panel) = create_panel(state, &key, frame.session_label.as_deref()) else {
             return;
         };
         state.panels.insert(key.clone(), panel);
+        let window = png.as_ref().map_or(0, |(window, _)| *window);
+        tracing::info!(target: "pip", session = %key, pid = frame.target_pid.unwrap_or(0), window, "PiP panel opened");
     }
     let worker = state.worker.clone();
     let Some(panel) = state.panels.get_mut(&key) else {
@@ -2896,7 +2935,7 @@ struct SessionEnd {
     key: String,
     end: PipSessionEnd,
     /// Whether the user can see the whole target window right now (asked
-    /// only for a finished session that had a target).
+    /// for a session that had a target, unless it expired).
     target_visible: Option<bool>,
 }
 
@@ -2928,11 +2967,12 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         if let Some(visible) = target_visible {
             panel.target_visible = visible;
         }
-        // The `end_session` and idle-TTL eviction rows of the table in
-        // `finish`. A finished session is done whatever its finale is doing:
-        // its windows count as finished, so back cards collapse into chips.
-        // Then its finale plays (or keeps playing) and the panel closes when
-        // it is over. An expired session only closes.
+        // The `end_session`, connection closing and idle-TTL eviction rows
+        // of the table in `finish`. A finished session is done whatever its
+        // finale is doing: its windows count as finished, so back cards
+        // collapse into chips. Then its finale plays (or keeps playing) and
+        // the panel closes when it is over. An expired session, and one
+        // whose connection closed after its work went stale, only closes.
         tracing::info!(target: "pip", session = %key, ?end, "PiP session ended");
         let at = now_ms();
         let may_show = finish::may_show(panel.shown, panel.target_visible);
@@ -5137,6 +5177,35 @@ mod tests {
         // The default corner still puts the window's right edge at the inset.
         let (x, _) = panel_origin(screen, visible, SIZE, None, 0);
         assert_eq!(x + SIZE.0, visible.w - EDGE_INSET);
+    }
+
+    #[test]
+    fn a_frame_naming_a_window_its_pid_does_not_own_is_dropped() {
+        use crate::windows::WindowOwner;
+        let owner = |answer: WindowOwner| move |_pid: i32, _window: u32| answer;
+        assert!(names_own_window((Some(42), Some(7)), owner(WindowOwner::SamePid)));
+        // Chrome's own window number (browser_tabs), or a stale id.
+        assert!(!names_own_window((Some(42), Some(446_425_629)), owner(WindowOwner::Unknown)));
+        // A number that happens to be another app's window.
+        let foreign = WindowOwner::ForeignPid {
+            owner_pid: 9,
+            owner_app_name: "Notes".into(),
+        };
+        assert!(!names_own_window((Some(42), Some(7)), owner(foreign)));
+        // Nothing to check without both: no lookup is made.
+        let unasked = |_: i32, _: u32| -> WindowOwner { panic!("no lookup") };
+        assert!(names_own_window((Some(42), None), unasked));
+        assert!(names_own_window((None, Some(7)), unasked));
+    }
+
+    #[test]
+    fn only_a_captured_frame_opens_a_sessions_panel() {
+        // B5: no capture, no panel yet: nothing opens.
+        assert!(!frame_reaches_a_panel(false, false));
+        assert!(frame_reaches_a_panel(false, true));
+        // An existing panel takes the frame either way (it keeps its still).
+        assert!(frame_reaches_a_panel(true, false));
+        assert!(frame_reaches_a_panel(true, true));
     }
 
     #[test]
