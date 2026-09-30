@@ -458,8 +458,14 @@ struct Panel {
     target_icon: usize,
     target_title: usize,
     /// The front card's view (it holds the picture, the cursor sprite, the
-    /// placeholder and any finale overlay).
+    /// placeholder, the check badge and any finale overlay).
     front_view: usize,
+    /// The front card's check badge (see `sync_front_badge`): its view, its
+    /// mark and glyph layers, and whether it is showing.
+    front_badge: usize,
+    front_badge_mark: usize,
+    front_badge_glyph: usize,
+    front_badge_on: bool,
     focus: usize,
     close: usize,
     /// Back card views, depth 1 first.
@@ -1588,6 +1594,35 @@ unsafe fn note_finished(panel: &mut Panel, key: &str) {
     panel.finished_seen = finished;
 }
 
+/// Show the check badge on the front card while its window is finished
+/// (proved, or its session ended), and log each change. A finale covers the
+/// card and says the same in full, so the badge hides under one.
+unsafe fn sync_front_badge(panel: &mut Panel) {
+    let window = panel.cards.front_key().and_then(|tag| tag.1);
+    let on = panel.finale_view.is_none()
+        && window.is_some_and(|window| panel.verdicts.finished(window));
+    if on == panel.front_badge_on {
+        return;
+    }
+    panel.front_badge_on = on;
+    let badge = panel.front_badge as *mut AnyObject;
+    let _: () = msg_send![badge, setHidden: !on];
+    if on {
+        // It comes in like a finale row's mark: a fade, a pop, the check
+        // drawn.
+        let layer: *mut AnyObject = msg_send![badge, layer];
+        animate_row(
+            layer,
+            panel.front_badge_mark as *mut AnyObject,
+            panel.front_badge_glyph as *mut AnyObject,
+            0,
+            CACurrentMediaTime(),
+            (0.0, 0.0),
+        );
+    }
+    tracing::info!(target: "pip", session = %panel.key, window = window.unwrap_or(0), on, "PiP front badge");
+}
+
 /// Show the target app's icon and `title` (else the app's name) in the
 /// header. Returns the title shown.
 unsafe fn show_target(panel: &Panel, pid: Option<i32>, title: Option<String>) -> String {
@@ -1673,6 +1708,8 @@ unsafe fn restack(
     let old_layout = panel.layout.clone();
     let drawn = settle_frames(panel);
     change(panel);
+    // The front window, or what is known about it, may have changed.
+    sync_front_badge(panel);
     let new = panel.cards.keys();
     let layout = item_slots(panel);
     if new == old && layout == old_layout {
@@ -2131,7 +2168,9 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
     });
 }
 
-/// Take the finale overlay off the front card.
+/// Take the finale overlay off the front card. The caller brings the front
+/// badge back in line (`sync_front_badge`, directly or through the restack
+/// that follows an action).
 unsafe fn remove_finale_view(panel: &mut Panel) {
     panel.displayed = None;
     if let Some(view) = panel.finale_view.take() {
@@ -2145,6 +2184,12 @@ const FINALE_CHIP_GAP: f64 = 12.0;
 /// The scrim under the finale, and the white of a row's capsule over it.
 const SCRIM_ALPHA: f64 = 0.6;
 const ROW_FILL: f64 = 0.16;
+/// The white of a finale chip's disc over the scrim: a little more than a
+/// row's capsule, since it carries an icon, not text.
+const DISC_FILL: f64 = 0.28;
+/// The front card's check badge sits this far inside its bottom-right
+/// corner (clear of the corner's curve).
+const FRONT_BADGE_INSET: f64 = 8.0;
 /// The panel fades slower after a finale than after going idle.
 const FINALE_FADE: Duration = Duration::from_millis(400);
 
@@ -2309,8 +2354,9 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
                 let row_w = in_row * CHIP_W + (in_row - 1.0).max(0.0) * FINALE_CHIP_GAP;
                 let x = (well_w - row_w) / 2.0 + column as f64 * (CHIP_W + FINALE_CHIP_GAP);
                 let y = block_top - (row + 1) as f64 * CHIP_H - row as f64 * FINALE_CHIP_GAP;
-                // The same chip as in the trail, so one shape means finished.
-                let view = new_chip(overlay, badges, chip.finished);
+                // The same chip as in the trail, so one shape means finished;
+                // a plain disc, since glass in here would cover its badge.
+                let view = new_chip(overlay, badges, chip.finished, false);
                 for part in [view.view, view.badge].into_iter().filter(|&part| part != 0) {
                     let part = part as *mut AnyObject;
                     let _: () = msg_send![part, setFrameOrigin: NSPoint::new(x, y)];
@@ -2351,6 +2397,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
     panel.displayed = Some(finale.clone());
     panel.finale_start = start;
     place_sprite(panel);
+    sync_front_badge(panel);
 }
 
 /// The main screen's backing scale (2 on Retina), for crisp layer contents.
@@ -2420,6 +2467,17 @@ unsafe fn new_mark(size: f64, kind: Mark) -> (*mut AnyObject, *mut AnyObject) {
     let _: () = msg_send![circle, setContentsScale: scale];
     let _: () = msg_send![circle, addSublayer: glyph];
     (circle, glyph)
+}
+
+/// The finished badge, `size` points wide: a check mark with a white ring,
+/// so it reads over an icon or a picture. Its mark and glyph layers
+/// (autoreleased), as `new_mark` returns them.
+unsafe fn new_check_badge(size: f64) -> (*mut AnyObject, *mut AnyObject) {
+    let (mark, glyph) = new_mark(size, Mark::Check);
+    let white: *mut CGColor = msg_send![white_color(), CGColor];
+    let _: () = msg_send![mark, setBorderWidth: stack::CHIP_BADGE_RING];
+    let _: () = msg_send![mark, setBorderColor: white];
+    (mark, glyph)
 }
 
 /// Animate finale row `index` in (see `finish::row_timing`): the row fades
@@ -2635,6 +2693,7 @@ unsafe extern "C" fn order_out_cb(ctx: *mut c_void) {
                 // The fade is over: release the retained live frame.
                 clear_live(panel);
                 remove_finale_view(panel);
+                sync_front_badge(panel);
             }
         }
     });
@@ -3082,7 +3141,9 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let badges = new_view(decor_view_class(), bounds);
     let _: () = msg_send![badges, setAutoresizingMask: 18u64];
     add_subview(stack_view, badges);
-    let chips: Vec<ChipView> = (1..MAX_CARDS).map(|_| new_chip(deck, badges, true)).collect();
+    let chips: Vec<ChipView> = (1..MAX_CARDS)
+        .map(|_| new_chip(deck, badges, true, true))
+        .collect();
 
     // Front card: the picture itself, with continuous rounded corners and
     // the window's shadow; a faint dark backing shows only while it is
@@ -3152,6 +3213,24 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let _: () = msg_send![placeholder, addSubview: placeholder_text];
     let _: () = msg_send![placeholder, setHidden: true];
     add_subview(front_view, placeholder);
+
+    // The front window's check badge (see `sync_front_badge`): the chips'
+    // badge, inside the card's bottom-right corner, above the picture.
+    let front = slot_frame(card, Slot::Front, 0);
+    let front_badge = new_view(
+        decor_view_class(),
+        NSRect::new(
+            NSPoint::new(front.w - stack::CHIP_BADGE - FRONT_BADGE_INSET, FRONT_BADGE_INSET),
+            NSSize::new(stack::CHIP_BADGE, stack::CHIP_BADGE),
+        ),
+    );
+    let front_badge_layer = host_layer(front_badge);
+    let (front_badge_mark, front_badge_glyph) = new_check_badge(stack::CHIP_BADGE);
+    let _: () = msg_send![front_badge_layer, addSublayer: front_badge_mark];
+    // Flexible left and top margins: it stays in that corner.
+    let _: () = msg_send![front_badge, setAutoresizingMask: 1u64 | 32];
+    let _: () = msg_send![front_badge, setHidden: true];
+    add_subview(front_view, front_badge);
     add_subview(deck, front_view);
 
     // The hover bar: frosted glass above the card holding the client icon,
@@ -3228,6 +3307,10 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         target_icon: target_icon as usize,
         target_title: target_title as usize,
         front_view: front_view as usize,
+        front_badge: front_badge as usize,
+        front_badge_mark: front_badge_mark as usize,
+        front_badge_glyph: front_badge_glyph as usize,
+        front_badge_on: false,
         focus: focus as usize,
         close: close as usize,
         backs: backs.try_into().ok()?,
@@ -3436,17 +3519,25 @@ unsafe fn glass_container(parent: *mut AnyObject, bounds: NSRect) -> *mut AnyObj
     deck
 }
 
-/// A chip inside `parent`: a glass circle holding the app icon, with a
-/// green check badge (white ring) on its lower right when `finished`. The
-/// badge is its own view in `badges`, which must sit above `parent`'s glass
-/// (glass draws over non-glass siblings in its container, so a badge next
-/// to the circle would sit under its rim); it has the chip's frame, and
-/// whoever places, hides or fades the chip does the same to it. Its parts
+/// A chip inside `parent`: a circle holding the app icon, with a green
+/// check badge (white ring) on its lower right when `finished`. The badge
+/// is its own view in `badges`, which must draw above the circle; it has
+/// the chip's frame, and whoever places, hides or fades the chip does the
+/// same to it. The circle is `glass` in the trail, whose `badges` sit above
+/// the glass container (glass draws over every non-glass view in its
+/// container, so a badge inside it would sit under the circle). Where
+/// `badges` cannot be outside that container (the finale's row, inside the
+/// front card), the circle is a plain translucent disc instead. Its parts
 /// stay centered (flexible margins) while the chip's frame springs from
 /// where its window was drawn. Hidden until used; the window title is its
 /// tooltip.
-unsafe fn new_chip(parent: *mut AnyObject, badges: *mut AnyObject, finished: bool) -> ChipView {
-    use stack::{CHIP, CHIP_BADGE, CHIP_BADGE_RING, CHIP_H, CHIP_ICON, CHIP_W};
+unsafe fn new_chip(
+    parent: *mut AnyObject,
+    badges: *mut AnyObject,
+    finished: bool,
+    glass: bool,
+) -> ChipView {
+    use stack::{CHIP, CHIP_BADGE, CHIP_H, CHIP_ICON, CHIP_W};
     // NSViewMinXMargin 1 | MaxXMargin 4 | MinYMargin 8 | MaxYMargin 32.
     const CENTERED: u64 = 1 | 4 | 8 | 32;
     let view = new_view(
@@ -3461,16 +3552,27 @@ unsafe fn new_chip(parent: *mut AnyObject, badges: *mut AnyObject, finished: boo
     );
     let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP, CHIP));
     let body = new_view(class!(NSView), bounds);
+    if !glass {
+        let layer = host_layer(body);
+        let fill: *mut AnyObject = msg_send![white_color(), colorWithAlphaComponent: DISC_FILL];
+        let fill: *mut CGColor = msg_send![fill, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: fill];
+        let _: () = msg_send![layer, setCornerRadius: CHIP / 2.0];
+    }
     let inset = (CHIP - CHIP_ICON) / 2.0;
     let icon = new_icon_view(NSRect::new(
         NSPoint::new(inset, inset),
         NSSize::new(CHIP_ICON, CHIP_ICON),
     ));
     let _: () = msg_send![body, addSubview: icon];
-    let glass = glass_background(bounds, body, CHIP / 2.0);
-    let _: () = msg_send![glass, setFrame: circle];
-    let _: () = msg_send![glass, setAutoresizingMask: CENTERED];
-    add_subview(view, glass);
+    let disc = if glass {
+        glass_background(bounds, body, CHIP / 2.0)
+    } else {
+        body
+    };
+    let _: () = msg_send![disc, setFrame: circle];
+    let _: () = msg_send![disc, setAutoresizingMask: CENTERED];
+    add_subview(view, disc);
 
     let (mut mark, mut glyph) = (std::ptr::null_mut(), std::ptr::null_mut());
     let mut host: *mut AnyObject = std::ptr::null_mut();
@@ -3490,11 +3592,7 @@ unsafe fn new_chip(parent: *mut AnyObject, badges: *mut AnyObject, finished: boo
             ),
         );
         let badge_layer = host_layer(badge);
-        (mark, glyph) = new_mark(CHIP_BADGE, Mark::Check);
-        let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
-        let white: *mut CGColor = msg_send![white, CGColor];
-        let _: () = msg_send![mark, setBorderWidth: CHIP_BADGE_RING];
-        let _: () = msg_send![mark, setBorderColor: white];
+        (mark, glyph) = new_check_badge(CHIP_BADGE);
         let _: () = msg_send![badge_layer, addSublayer: mark];
         let _: () = msg_send![badge, setAutoresizingMask: CENTERED];
         add_subview(host, badge);
