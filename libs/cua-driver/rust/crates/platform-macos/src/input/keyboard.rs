@@ -39,8 +39,21 @@ pub fn press_key(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> 
 
     post_key(pid, key_code, true, flags)?;
     std::thread::sleep(std::time::Duration::from_millis(8));
-    post_key(pid, key_code, false, flags)?;
+    post_key(pid, key_code, false, key_up_flags(flags))?;
     Ok(())
+}
+
+/// Flags for the key-up half of a PID-routed key press: the chord's flags
+/// without Command.
+///
+/// A Mac Catalyst app that is not frontmost drops a key-up carrying Command,
+/// so UIKit keeps the key held and auto-repeats its key command until some
+/// other key event arrives. One background cmd+shift+[ fired a probe app's
+/// key command about 100 times, and three moved Messages five conversations.
+/// Command matters only on the key-down, where menus and key commands match
+/// it; without it on the key-up the press ends once.
+fn key_up_flags(flags: CGEventFlags) -> CGEventFlags {
+    flags & !CGEventFlags::CGEventFlagCommand
 }
 
 /// Type a string character-by-character to `pid`.
@@ -836,6 +849,21 @@ mod tests {
         assert_eq!(with_shift(&["cmd"], false), vec!["cmd"]);
     }
     use core_graphics::event::CGEventType;
+
+    #[test]
+    fn a_key_up_drops_command_and_keeps_other_modifiers() {
+        let chord = modifier_flags(&["cmd", "shift", "ctrl", "option"]);
+        assert_eq!(
+            key_up_flags(chord),
+            modifier_flags(&["shift", "ctrl", "option"])
+        );
+        assert_eq!(
+            key_up_flags(modifier_flags(&["cmd"])),
+            CGEventFlags::CGEventFlagNull
+        );
+        let no_command = modifier_flags(&["ctrl", "shift"]);
+        assert_eq!(key_up_flags(no_command), no_command);
+    }
 
     #[test]
     fn physical_text_uses_flags_changed_for_balanced_shift_transitions() {

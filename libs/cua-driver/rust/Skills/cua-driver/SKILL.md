@@ -57,7 +57,7 @@ Check the installed version and advertised schema before using unfamiliar parame
 ## Rules
 
 1. Select the exact target on each action. A session is lifecycle metadata, not capture scope or permission authority.
-2. Observe before input and verify after it. `effect:"unverifiable"` and a successful exit are not task success; never replay a partial, canceled, or unknown action blindly.
+2. Observe before input and verify after it. `effect:"unverifiable"` and a successful exit are not task success; never replay a partial, canceled, or unknown action blindly. Never resend a move, toggle, typing, or submit (`idempotent:false`) without a fresh read showing its effect missing.
 3. Use tokens from the latest snapshot (`<snapshot_id>:<index>` for a row in its tree), never invented indices. A fresh snapshot replaces prior element handles; prefer `element_token` over `element_index` plus `snapshot_id`.
 4. Keep background window actions non-interfering. Foreground delivery and desktop input require authorization for visible control; an unavailable route is not permission to escalate.
 5. Never infer pixels from a missing image, a different window, or an unaccounted-for resized preview. Capture failure and an empty accessibility tree are different failures.

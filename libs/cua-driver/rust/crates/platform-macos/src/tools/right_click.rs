@@ -275,9 +275,10 @@ impl Tool for RightClickTool {
             // window is proven focused.
             match (route, window_id) {
                 (super::pixel_route::PixelClickRoute::ForegroundHid, Some(wid)) => {
-                    crate::input::skylight::with_foreground_hid_activation(
+                    crate::input::skylight::with_foreground_pointer_activation(
                         pid as libc::pid_t,
                         wid,
+                        (screen_x, screen_y),
                         do_it,
                     )
                 }
@@ -297,7 +298,7 @@ impl Tool for RightClickTool {
                 super::pixel_route::foreground_unavailable(
                     "Right-click",
                     window_id.unwrap_or_default(),
-                    &e.to_string(),
+                    &e,
                 )
             }
             Ok(Err(e)) => ToolResult::error(format!("Right-click failed: {e}")),

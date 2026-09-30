@@ -2270,9 +2270,34 @@ class _UniffiFfiConverterOptionalTypeActionError(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterBoolean.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterBoolean.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterBoolean.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class ActionResult:
-    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], error:typing.Optional[ActionError]):
+    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], error:typing.Optional[ActionError], idempotent:typing.Optional[bool]):
         self.effect = effect
         self.route = route
         self.delivery = delivery
@@ -2280,12 +2305,13 @@ class ActionResult:
         self.escalation = escalation
         self.summary = summary
         self.error = error
+        self.idempotent = idempotent
 
 
 
 
     def __str__(self):
-        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, summary={}, error={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.summary, self.error)
+        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, summary={}, error={}, idempotent={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.summary, self.error, self.idempotent)
     def __eq__(self, other):
         if self.effect != other.effect:
             return False
@@ -2301,6 +2327,8 @@ class ActionResult:
             return False
         if self.error != other.error:
             return False
+        if self.idempotent != other.idempotent:
+            return False
         return True
 
 class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
@@ -2314,6 +2342,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
             escalation=_UniffiFfiConverterOptionalTypeActionEscalation.read(buf),
             summary=_UniffiFfiConverterOptionalString.read(buf),
             error=_UniffiFfiConverterOptionalTypeActionError.read(buf),
+            idempotent=_UniffiFfiConverterOptionalBoolean.read(buf),
         )
 
     @staticmethod
@@ -2325,6 +2354,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalTypeActionEscalation.check_lower(value.escalation)
         _UniffiFfiConverterOptionalString.check_lower(value.summary)
         _UniffiFfiConverterOptionalTypeActionError.check_lower(value.error)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.idempotent)
 
     @staticmethod
     def write(value, buf):
@@ -2335,6 +2365,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalTypeActionEscalation.write(value.escalation, buf)
         _UniffiFfiConverterOptionalString.write(value.summary, buf)
         _UniffiFfiConverterOptionalTypeActionError.write(value.error, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.idempotent, buf)
 
 @dataclass
 class AppInfo:
@@ -3892,31 +3923,6 @@ class _UniffiFfiConverterTypeElementSelector(_UniffiConverterRustBuffer):
     def write(value, buf):
         _UniffiFfiConverterOptionalString.write(value.role, buf)
         _UniffiFfiConverterOptionalString.write(value.label_contains, buf)
-
-class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterBoolean.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterBoolean.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterBoolean.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
 
 @dataclass
 class TextSelectionPredicate:
@@ -8998,19 +9004,22 @@ class WindowChange:
     only when exactly one new window appeared and every candidate's owner was
     resolved; otherwise the caller chooses from `new_windows` itself.
 """
-    def __init__(self, *, new_windows:typing.List[SurfaceWindow], rebind:typing.Optional[SurfaceWindow]):
+    def __init__(self, *, new_windows:typing.List[SurfaceWindow], rebind:typing.Optional[SurfaceWindow], ignored_windows:typing.Optional[int]):
         self.new_windows = new_windows
         self.rebind = rebind
+        self.ignored_windows = ignored_windows
 
 
 
 
     def __str__(self):
-        return "WindowChange(new_windows={}, rebind={})".format(self.new_windows, self.rebind)
+        return "WindowChange(new_windows={}, rebind={}, ignored_windows={})".format(self.new_windows, self.rebind, self.ignored_windows)
     def __eq__(self, other):
         if self.new_windows != other.new_windows:
             return False
         if self.rebind != other.rebind:
+            return False
+        if self.ignored_windows != other.ignored_windows:
             return False
         return True
 
@@ -9020,17 +9029,20 @@ class _UniffiFfiConverterTypeWindowChange(_UniffiConverterRustBuffer):
         return WindowChange(
             new_windows=_UniffiFfiConverterSequenceTypeSurfaceWindow.read(buf),
             rebind=_UniffiFfiConverterOptionalTypeSurfaceWindow.read(buf),
+            ignored_windows=_UniffiFfiConverterOptionalUInt32.read(buf),
         )
 
     @staticmethod
     def check_lower(value):
         _UniffiFfiConverterSequenceTypeSurfaceWindow.check_lower(value.new_windows)
         _UniffiFfiConverterOptionalTypeSurfaceWindow.check_lower(value.rebind)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.ignored_windows)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterSequenceTypeSurfaceWindow.write(value.new_windows, buf)
         _UniffiFfiConverterOptionalTypeSurfaceWindow.write(value.rebind, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.ignored_windows, buf)
 
 class _UniffiFfiConverterOptionalTypeTextSelection(_UniffiConverterRustBuffer):
     @classmethod

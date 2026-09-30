@@ -929,7 +929,12 @@ export type ActionResult = {
     /**
      * Present only with `effect: refused`.
      */
-    error?: ActionError
+    error?: ActionError,
+    /**
+     * `false`: sending this call again repeats its effect (it moves, toggles,
+     * types or submits). Read state before resending it.
+     */
+    idempotent?: boolean
 }
 
 /**
@@ -959,7 +964,8 @@ const FfiConverterTypeActionResult = (() => {
                 evidence: FfiConverterOptionalSequenceTypeActionEvidence.read(from),
                 escalation: FfiConverterOptionalTypeActionEscalation.read(from),
                 summary: FfiConverterOptionalString.read(from),
-                error: FfiConverterOptionalTypeActionError.read(from)
+                error: FfiConverterOptionalTypeActionError.read(from),
+                idempotent: FfiConverterOptionalBoolean.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -970,6 +976,7 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterOptionalTypeActionEscalation.write(value.escalation, into);
             FfiConverterOptionalString.write(value.summary, into);
             FfiConverterOptionalTypeActionError.write(value.error, into);
+            FfiConverterOptionalBoolean.write(value.idempotent, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeActionEffect.allocationSize(value.effect) +
@@ -978,7 +985,8 @@ const FfiConverterTypeActionResult = (() => {
              FfiConverterOptionalSequenceTypeActionEvidence.allocationSize(value.evidence) +
              FfiConverterOptionalTypeActionEscalation.allocationSize(value.escalation) +
              FfiConverterOptionalString.allocationSize(value.summary) +
-             FfiConverterOptionalTypeActionError.allocationSize(value.error);
+             FfiConverterOptionalTypeActionError.allocationSize(value.error) +
+             FfiConverterOptionalBoolean.allocationSize(value.idempotent);
 
         }
     };
@@ -6699,7 +6707,12 @@ const FfiConverterTypeVisualParseError = (() => {
  */
 export type WindowChange = {
     newWindows: Array<SurfaceWindow>,
-    rebind?: SurfaceWindow
+    rebind?: SurfaceWindow,
+    /**
+     * System indicator windows that also appeared and were left out
+     * (screen-sharing badges, tiny or above-normal-level overlays).
+     */
+    ignoredWindows?: number
 }
 
 /**
@@ -6724,16 +6737,19 @@ const FfiConverterTypeWindowChange = (() => {
         read(from: RustBuffer): TypeName {
             return {
                 newWindows: FfiConverterSequenceTypeSurfaceWindow.read(from),
-                rebind: FfiConverterOptionalTypeSurfaceWindow.read(from)
+                rebind: FfiConverterOptionalTypeSurfaceWindow.read(from),
+                ignoredWindows: FfiConverterOptionalUInt32.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
             FfiConverterSequenceTypeSurfaceWindow.write(value.newWindows, into);
             FfiConverterOptionalTypeSurfaceWindow.write(value.rebind, into);
+            FfiConverterOptionalUInt32.write(value.ignoredWindows, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterSequenceTypeSurfaceWindow.allocationSize(value.newWindows) +
-             FfiConverterOptionalTypeSurfaceWindow.allocationSize(value.rebind);
+             FfiConverterOptionalTypeSurfaceWindow.allocationSize(value.rebind) +
+             FfiConverterOptionalUInt32.allocationSize(value.ignoredWindows);
 
         }
     };
@@ -7122,6 +7138,9 @@ const FfiConverterOptionalTypeActionEscalation = new FfiConverterOptional(FfiCon
 // FfiConverter for ActionError | undefined
 const FfiConverterOptionalTypeActionError = new FfiConverterOptional(FfiConverterTypeActionError);
 
+// FfiConverter for boolean | undefined
+const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
+
 // FfiConverter for number | undefined
 const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64);
 
@@ -7136,9 +7155,6 @@ const FfiConverterOptionalTypeDesktopScope = new FfiConverterOptional(FfiConvert
 
 // FfiConverter for bigint | undefined
 const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
-
-// FfiConverter for boolean | undefined
-const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
 
 // FfiConverter for TextSelectionPredicate | undefined
 const FfiConverterOptionalTypeTextSelectionPredicate = new FfiConverterOptional(FfiConverterTypeTextSelectionPredicate);

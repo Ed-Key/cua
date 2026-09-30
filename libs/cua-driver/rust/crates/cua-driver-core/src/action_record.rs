@@ -458,6 +458,8 @@ impl ActionExecutionRecord {
                 }
                 _ => None,
             },
+            // Set at the dispatch seam, which knows the tool.
+            idempotent: None,
         })
     }
 
