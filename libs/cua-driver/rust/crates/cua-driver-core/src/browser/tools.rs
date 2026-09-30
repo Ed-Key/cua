@@ -601,6 +601,24 @@ fn with_tab_screenshot(mut result: ToolResult, screenshot: BrowserTabScreenshot)
     result
 }
 
+/// The read that was asked for a screenshot it could not get. The page was
+/// read, and that read is already the session's refs and diff baseline, so it
+/// is returned: the next action's diff is from an outline the caller holds.
+/// The capture's refusal stands beside it, where the screenshot would be.
+fn without_tab_screenshot(mut result: ToolResult, refusal: BrowserRefusal) -> ToolResult {
+    if let Some(Content::Text { text, .. }) = result.content.first_mut() {
+        text.push_str(&format!(
+            "; no screenshot: refused ({}): {}",
+            refusal.code.as_str(),
+            refusal.message
+        ));
+    }
+    if let Some(structured) = result.structured_content.as_mut() {
+        structured["screenshot"] = json!({ "status": "refused", "refusal": refusal });
+    }
+    result
+}
+
 // ── get_browser_state ────────────────────────────────────────────────────────
 
 pub struct GetBrowserStateTool {
@@ -1055,7 +1073,7 @@ impl Tool for GetBrowserStateTool {
                         .await
                     {
                         Ok(screenshot) => with_tab_screenshot(snapshot, screenshot),
-                        Err(refusal) => refusal.to_tool_result(),
+                        Err(refusal) => without_tab_screenshot(snapshot, refusal),
                     };
                 }
                 return snapshot;
@@ -1108,7 +1126,7 @@ impl Tool for GetBrowserStateTool {
                     .await
                 {
                     Ok(screenshot) => with_tab_screenshot(snapshot, screenshot),
-                    Err(refusal) => refusal.to_tool_result(),
+                    Err(refusal) => without_tab_screenshot(snapshot, refusal),
                 };
             }
             return snapshot;

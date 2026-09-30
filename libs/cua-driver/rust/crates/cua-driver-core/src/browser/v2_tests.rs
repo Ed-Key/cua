@@ -3173,9 +3173,16 @@ async fn requested_tab_screenshot_refuses_invalid_viewport_metrics_before_captur
             "include_screenshot": true
         }))
         .await;
-    let refusal = structured(&result);
-    assert_eq!(refusal["status"], "refused", "{refusal}");
-    assert_eq!(refusal["refusal"]["code"], "browser_route_unavailable");
+    // The page was read; only the screenshot is refused, beside the read.
+    let read = structured(&result);
+    assert_eq!(read["status"], "ok", "{read}");
+    assert!(read["refs"].as_array().is_some_and(|refs| !refs.is_empty()));
+    assert_eq!(read["screenshot"]["status"], "refused", "{read}");
+    assert_eq!(
+        read["screenshot"]["refusal"]["code"],
+        "browser_route_unavailable"
+    );
+    assert!(read.get("screenshot_width").is_none());
     assert!(recorded_calls(&f, "Page.captureScreenshot").is_empty());
 }
 
@@ -3192,9 +3199,18 @@ async fn requested_tab_screenshot_refuses_malformed_image_data() {
             "include_screenshot": true
         }))
         .await;
-    let refusal = structured(&result);
-    assert_eq!(refusal["status"], "refused", "{refusal}");
-    assert_eq!(refusal["refusal"]["code"], "browser_route_unavailable");
+    let read = structured(&result);
+    assert_eq!(read["status"], "ok", "{read}");
+    assert!(read["outline"].as_str().is_some_and(|o| !o.is_empty()));
+    assert_eq!(read["screenshot"]["status"], "refused", "{read}");
+    assert_eq!(
+        read["screenshot"]["refusal"]["code"],
+        "browser_route_unavailable"
+    );
+    assert!(matches!(
+        &result.content[0],
+        Content::Text { text, .. } if text.contains("no screenshot: refused (browser_route_unavailable)")
+    ));
     assert!(result
         .content
         .iter()
@@ -6109,6 +6125,74 @@ async fn a_bind_passes_a_first_reads_options_on_and_nothing_else() {
         bound.get("changes").is_none(),
         "a first read is never a diff"
     );
+}
+
+#[tokio::test]
+async fn a_read_whose_screenshot_failed_is_still_the_outline_the_next_diff_is_from() {
+    // The capture fails after the page was read and that read recorded.
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.screenshot_data = "not-base64".into();
+    })
+    .await;
+    let mut registry = crate::tool::ToolRegistry::new();
+    super::tools::register_browser_tools(&f.engine, &mut registry);
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+    let context = unrestricted();
+    let call = |name: &'static str, mut args: Value| {
+        let (registry, context) = (registry.clone(), context.clone());
+        async move {
+            args["session"] = json!("bind-screenshot-failed");
+            registry.invoke_with_context(name, args, context).await
+        }
+    };
+    let result = call(
+        "get_browser_state",
+        json!({ "pid": 1, "window_id": 7, "include_screenshot": true }),
+    )
+    .await;
+    let bound = structured(&result).clone();
+    assert_eq!((&bound["status"], &bound["mode"]), (&json!("ok"), &json!("bind")));
+    // The caller holds what the session holds: the outline and its revision.
+    assert!(bound.get("observation").is_none(), "{bound}");
+    assert_eq!(bound["tab_id"], bound["tabs"][0]["tab_id"]);
+    let first = with_outline_entries(bound.clone());
+    assert_eq!(bound["screenshot"]["status"], "refused", "{bound}");
+    assert_eq!(
+        bound["screenshot"]["refusal"]["code"],
+        "browser_route_unavailable"
+    );
+    assert!(bound.get("screenshot_width").is_none());
+    assert!(result
+        .content
+        .iter()
+        .all(|content| !matches!(content, Content::Image { .. })));
+    assert!(matches!(
+        &result.content[0],
+        Content::Text { text, .. } if text.starts_with("bound target") && text.contains("no screenshot: refused")
+    ));
+
+    // So the next action's diff is from that outline, and says what changed.
+    f.state
+        .lock()
+        .unwrap()
+        .click_renames
+        .push((2011, "Sent".into()));
+    let clicked = call(
+        "browser_click",
+        json!({ "target_id": bound["target_id"], "tab_id": bound["tab_id"],
+            "ref": named_ref(&first, "Reply"), "input_route": "dom_event" }),
+    )
+    .await;
+    let clicked = structured(&clicked);
+    assert_eq!(clicked["changes"]["kind"], "diff", "{clicked}");
+    assert_eq!(
+        clicked["changes"]["base_revision"],
+        bound["snapshot"]["revision"]
+    );
+    let applied = apply_changes(bound["outline"].as_str().unwrap(), &clicked["changes"]);
+    assert!(applied.contains("button \"Sent\""), "{applied}");
 }
 
 #[tokio::test]

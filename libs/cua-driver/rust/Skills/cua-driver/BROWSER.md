@@ -378,8 +378,10 @@ action from the PNG, convert image pixels to the browser action space with
 
 Cua Driver captures the exact tab viewport through CDP. It does not select the
 tab or foreground the browser window. Capture is opt-in because authenticated
-pages may contain sensitive information, and a requested capture refuses when
-the driver cannot return valid viewport metrics and a valid bounded PNG.
+pages may contain sensitive information. When the driver cannot return valid
+viewport metrics and a valid bounded PNG, the capture is refused and the page
+read is still returned: the result has the outline as usual and
+`screenshot: {status: "refused", refusal}` in place of the image.
 
 ### The outline
 
