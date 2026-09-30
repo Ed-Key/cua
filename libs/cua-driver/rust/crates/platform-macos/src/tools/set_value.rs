@@ -234,26 +234,25 @@ impl Tool for SetValueTool {
             || async move {
                 tokio::task::spawn_blocking(move || {
                     let element_ptr = element_guard.as_ptr();
-                    // Refuse before any side effect (no focusing) when a text
-                    // control reports its AXValue as read-only. Unknown still
-                    // attempts the write.
                     let element = element_ptr as crate::ax::bindings::AXUIElementRef;
                     let role = unsafe { crate::ax::bindings::copy_string_attr(element, "AXRole") }
                         .unwrap_or_default();
-                    if text_value_not_settable(&role, || unsafe {
-                        crate::ax::bindings::attribute_settable(element, "AXValue")
-                    }) {
-                        return Ok(SetValueAttempt::Refused);
-                    }
-                    if prepare_native_text
-                        && !crate::input::ax_actions::is_element_focused(pid, element_ptr)
-                    {
-                        crate::input::ax_actions::focus_element(element_ptr)?;
-                    }
-                    // Preparation is best effort, not evidence of delivery.
-                    // Keep target-bound readback.
-                    set_value_blocking(element_ptr, element_index, pid, &value)
-                        .map(SetValueAttempt::Applied)
+                    write_text_control(
+                        &role,
+                        || unsafe { crate::ax::bindings::attribute_settable(element, "AXValue") },
+                        || unsafe { super::type_text::catalyst_text_control_of(element) },
+                        || {
+                            if prepare_native_text
+                                && !crate::input::ax_actions::is_element_focused(pid, element_ptr)
+                            {
+                                crate::input::ax_actions::focus_element(element_ptr)?;
+                            }
+                            Ok(())
+                        },
+                        // Preparation is best effort, not evidence of delivery.
+                        // Keep target-bound readback.
+                        || set_value_blocking(element_ptr, element_index, pid, &value),
+                    )
                 })
                 .await
             },
@@ -264,8 +263,12 @@ impl Tool for SetValueTool {
 
         match result {
             Ok(Ok(SetValueAttempt::Refused)) => nonsettable_text_refusal(),
-            Ok(Ok(SetValueAttempt::Applied(mut outcome))) => {
+            Ok(Ok(SetValueAttempt::CatalystNeedsTyping)) => catalyst_text_needs_typing(pid, window_id),
+            Ok(Ok(SetValueAttempt::Applied(mut outcome, catalyst))) => {
                 apply_surface_trust(&mut outcome, ax_echo_surface);
+                // The caveat rides in the summary, which the public action
+                // result keeps.
+                apply_catalyst_uncertainty(&mut outcome, catalyst, ax_echo_surface);
                 apply_verification_label(&mut outcome);
                 let mut msg = outcome.detail;
                 msg.push_str(&changes.result_suffix());
@@ -293,7 +296,78 @@ impl Tool for SetValueTool {
 
 enum SetValueAttempt {
     Refused,
-    Applied(SetValueOutcome),
+    /// A Mac Catalyst text control: nothing was focused or written.
+    CatalystNeedsTyping,
+    Applied(SetValueOutcome, super::type_text::CatalystText),
+}
+
+fn is_text_control_role(role: &str) -> bool {
+    matches!(role, "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox")
+}
+
+/// The ordered route for one set_value on the retained element. Refusals come
+/// before any side effect: a read-only text control first (it keeps
+/// precedence), then a Mac Catalyst text control. Only then is the field
+/// prepared (`prepare_focus`) and the value written.
+fn write_text_control(
+    role: &str,
+    read_settable: impl FnOnce() -> Option<bool>,
+    catalyst: impl FnOnce() -> super::type_text::CatalystText,
+    prepare_focus: impl FnOnce() -> anyhow::Result<()>,
+    write: impl FnOnce() -> anyhow::Result<SetValueOutcome>,
+) -> anyhow::Result<SetValueAttempt> {
+    use super::type_text::CatalystText;
+    if text_value_not_settable(role, read_settable) {
+        return Ok(SetValueAttempt::Refused);
+    }
+    // Only text controls pay for the ancestry read.
+    let catalyst = if is_text_control_role(role) { catalyst() } else { CatalystText::No };
+    if catalyst == CatalystText::Yes {
+        return Ok(SetValueAttempt::CatalystNeedsTyping);
+    }
+    prepare_focus()?;
+    write().map(|outcome| SetValueAttempt::Applied(outcome, catalyst))
+}
+
+const CATALYST_TEXT_NEEDS_TYPING: &str = "catalyst_text_needs_typing";
+
+/// The refusal for set_value on a Mac Catalyst text control.
+fn catalyst_text_needs_typing(pid: i32, window_id: u32) -> ToolResult {
+    let reason = "This is a Mac Catalyst text field. Catalyst apps can take an accessibility \
+                  value write without reacting to it (Messages search does not search), and \
+                  the value read-back cannot tell the difference, so nothing was written. \
+                  Next: click the field and confirm it is focused (type_text refuses with \
+                  catalyst_text_needs_focus when it is not), select all (hotkey cmd+a) if \
+                  replacing, then type_text on it. Then check the app's own result (for a \
+                  search field, that its results changed).";
+    ToolResult::error(format!("set_value refused ({CATALYST_TEXT_NEEDS_TYPING}): {reason}"))
+        .with_structured(serde_json::json!({
+            "code": CATALYST_TEXT_NEEDS_TYPING,
+            "effect": "refused",
+            "path": "ax",
+            "pid": pid,
+            "window_id": window_id,
+            "reason": reason,
+        }))
+}
+
+/// A text control whose Catalyst ancestry could not be read keeps today's
+/// write, but a matching read-back then proves only the accessibility value,
+/// not that the app reacted. Returns whether that caveat applies.
+fn apply_catalyst_uncertainty(
+    outcome: &mut SetValueOutcome,
+    catalyst: super::type_text::CatalystText,
+    ax_echo_surface: bool,
+) -> bool {
+    if catalyst != super::type_text::CatalystText::Unknown || ax_echo_surface {
+        return false;
+    }
+    outcome.detail.push_str(
+        " The field's ancestry could not be read, so it may be a Mac Catalyst field: the \
+         read-back confirms the accessibility value, and whether the app itself reacted is \
+         unverified. Check the app's own result.",
+    );
+    true
 }
 
 /// A text control that says its AXValue is read-only is not written. This
@@ -747,6 +821,82 @@ mod tests {
     }
 
     use super::{apply_surface_trust, apply_verification_label, classify_write, SetValueOutcome};
+    use super::{write_text_control, SetValueAttempt};
+    use crate::tools::type_text::CatalystText;
+    use std::cell::Cell;
+
+    fn written() -> anyhow::Result<SetValueOutcome> {
+        Ok(SetValueOutcome { detail: "✅ Set AXValue on [1] AXTextField.".into(), verified: Some(true), changed: Some(true) })
+    }
+
+    /// Runs the route with counters on every side effect.
+    fn route(role: &str, settable: Option<bool>, catalyst: CatalystText) -> (SetValueAttempt, usize, usize, usize) {
+        let (ancestry, focus, write) = (Cell::new(0), Cell::new(0), Cell::new(0));
+        let attempt = write_text_control(
+            role,
+            || settable,
+            || { ancestry.set(ancestry.get() + 1); catalyst },
+            || { focus.set(focus.get() + 1); Ok(()) },
+            || { write.set(write.get() + 1); written() },
+        )
+        .unwrap();
+        (attempt, ancestry.get(), focus.get(), write.get())
+    }
+
+    /// R1: a Catalyst text control is refused before any focus preparation
+    /// or write; a read-only text control keeps its own refusal first.
+    #[test]
+    fn catalyst_text_is_refused_before_focus_or_write() {
+        for role in ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"] {
+            let (attempt, _, focus, write) = route(role, Some(true), CatalystText::Yes);
+            assert!(matches!(attempt, SetValueAttempt::CatalystNeedsTyping), "{role}");
+            assert_eq!((focus, write), (0, 0), "{role}: nothing prepared or written");
+        }
+        // Precedence: the read-only refusal wins and no ancestry is read.
+        let (attempt, ancestry, focus, write) = route("AXTextField", Some(false), CatalystText::Yes);
+        assert!(matches!(attempt, SetValueAttempt::Refused));
+        assert_eq!((ancestry, focus, write), (0, 0, 0));
+        // Unknown ancestry keeps today's write and carries the caveat.
+        let (attempt, _, focus, write) = route("AXTextField", None, CatalystText::Unknown);
+        assert!(matches!(attempt, SetValueAttempt::Applied(_, CatalystText::Unknown)));
+        assert_eq!((focus, write), (1, 1));
+        // A proven native field and a non-text control are written; a slider
+        // never pays for the ancestry read.
+        let (attempt, _, _, write) = route("AXTextField", Some(true), CatalystText::No);
+        assert!(matches!(attempt, SetValueAttempt::Applied(_, CatalystText::No)));
+        assert_eq!(write, 1);
+        let (attempt, ancestry, _, write) = route("AXSlider", Some(true), CatalystText::Yes);
+        assert!(matches!(attempt, SetValueAttempt::Applied(_, CatalystText::No)));
+        assert_eq!((ancestry, write), (0, 1));
+    }
+
+    #[test]
+    fn catalyst_refusal_names_the_typing_route() {
+        let result = super::catalyst_text_needs_typing(7, 42);
+        let data = result.structured_content.as_ref().unwrap();
+        assert_eq!(data["code"], "catalyst_text_needs_typing");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!((data["pid"].as_i64(), data["window_id"].as_u64()), (Some(7), Some(42)));
+        let reason = data["reason"].as_str().unwrap();
+        for needed in ["nothing was written", "click the field", "focused", "select all", "type_text", "results changed"] {
+            assert!(reason.contains(needed), "missing {needed:?}: {reason}");
+        }
+    }
+
+    /// Unknown ancestry: "confirmed" never stands without the caveat that the
+    /// app's reaction is unverified. Web content already distrusts the echo.
+    #[test]
+    fn unknown_catalyst_ancestry_says_the_app_reaction_is_unverified() {
+        let mut outcome = written().unwrap();
+        assert!(super::apply_catalyst_uncertainty(&mut outcome, CatalystText::Unknown, false));
+        assert!(outcome.detail.contains("whether the app itself reacted is unverified"), "{}", outcome.detail);
+        assert_eq!(outcome.verified, Some(true), "the AX read-back itself still matched");
+        for (catalyst, web) in [(CatalystText::No, false), (CatalystText::Unknown, true)] {
+            let mut outcome = written().unwrap();
+            assert!(!super::apply_catalyst_uncertainty(&mut outcome, catalyst, web));
+            assert_eq!(outcome.detail, "✅ Set AXValue on [1] AXTextField.");
+        }
+    }
 
     #[test]
     fn unreadable_value_reports_neither_verified_nor_changed() {

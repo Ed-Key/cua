@@ -451,13 +451,19 @@ impl Tool for LaunchAppTool {
                         summary.push_str(&format!("\n- {title} [window_id: {}]", w.window_id));
                     }
                     summary.push_str(&format!(
-                        "\n→ Call get_window_state(pid: {pid}, window_id) to inspect."
+                        "\n→ Call get_window_state(pid: {pid}, window_id) to inspect. The app was \
+                         not activated; that read's background_input reports which input routes \
+                         the window has now."
                     ));
                 }
 
                 let windows_json: Vec<Value> = windows
                     .iter()
-                    .map(super::list_windows::window_record_json)
+                    .map(|w| {
+                        let mut record = super::list_windows::window_record_json(w);
+                        record["input_readiness"] = input_readiness_pointer(pid, w.window_id);
+                        record
+                    })
                     .collect();
 
                 let mut structured = serde_json::json!({
@@ -481,6 +487,19 @@ impl Tool for LaunchAppTool {
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+/// Where a launched window's input readiness lives: the exact-window
+/// `background_input` report of get_window_state, the same facts every
+/// action gates on. A pointer, not a copy: readiness can change after launch
+/// and every action checks again.
+fn input_readiness_pointer(pid: i32, window_id: u32) -> Value {
+    serde_json::json!({
+        "see": "get_window_state",
+        "field": "background_input",
+        "pid": pid,
+        "window_id": window_id,
+    })
 }
 
 fn is_cua_driver_bundle_id(bundle_id: &str) -> bool {

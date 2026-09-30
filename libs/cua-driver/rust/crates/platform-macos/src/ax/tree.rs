@@ -417,6 +417,26 @@ pub(crate) fn query_positions(nodes: &[AXNode], query: Query) -> Vec<usize> {
     )
 }
 
+/// Collected rows with display text that `query` left out of its rows:
+/// text roles (AXTextArea, AXStaticText) and any row with a title, value or
+/// description. Rows the walk never collected (below a depth cut) are not
+/// counted; nothing is known about them.
+pub(crate) fn query_excluded_text_nodes(nodes: &[AXNode], query: Query) -> usize {
+    let kept: std::collections::HashSet<usize> = query_positions(nodes, query).into_iter().collect();
+    let has_text = |text: &Option<String>| text.as_deref().is_some_and(|t| !t.trim().is_empty());
+    nodes
+        .iter()
+        .enumerate()
+        .filter(|(position, node)| {
+            !kept.contains(position)
+                && (matches!(node.role.as_str(), "AXTextArea" | "AXStaticText")
+                    || has_text(&node.title)
+                    || has_text(&node.value)
+                    || has_text(&node.description))
+        })
+        .count()
+}
+
 /// Render `tree_markdown` from `nodes`: the whole outline, or only the rows a
 /// query keeps, at their own depths. Callers that renumber rows after the
 /// walk re-render with this.
@@ -1067,6 +1087,29 @@ mod tests {
             outline(&nodes, "save", false),
             "- [0] AXWebArea\n  - [1] AXGroup \"Profile\"\n    - [2] AXButton \"Save\"\n  - [3] AXGroup \"Billing\"\n    - [4] AXButton \"Save\"\n"
         );
+    }
+
+    /// R6: rows with display text a query dropped are counted; the kept
+    /// rows, and rows without text, are not. No match drops them all.
+    #[test]
+    fn query_exclusions_count_collected_text_rows() {
+        let mut bubble = row(None, "AXTextArea", "", 2, Some(2));
+        bubble.value = Some("the lighthouse tour".into());
+        let nodes = [
+            row(None, "AXWindow", "Chat", 0, None),
+            row(Some(0), "AXTextField", "Search", 1, Some(0)),
+            row(None, "AXGroup", "Message list", 1, Some(0)),
+            bubble,
+            row(None, "AXTextArea", "", 2, Some(2)),
+            row(Some(1), "AXButton", "", 1, Some(0)),
+        ];
+        let query = |text| Query { text, context: false };
+        // Kept: the window and the field. Text rows left out: the list, both bubbles.
+        assert_eq!(query_excluded_text_nodes(&nodes, query("search")), 3);
+        // The matching bubble and its ancestors are kept.
+        assert_eq!(query_excluded_text_nodes(&nodes, query("lighthouse")), 2);
+        // Zero matches: every text row is left out (the unnamed button is not text).
+        assert_eq!(query_excluded_text_nodes(&nodes, query("zzqx")), 5);
     }
 
     /// A message heading with its body: context keeps the body (display
