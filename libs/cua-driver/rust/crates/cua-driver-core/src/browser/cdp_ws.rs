@@ -139,6 +139,69 @@ struct Demux {
 }
 
 impl Demux {
+    /// Keep the connection's dialog bookkeeping in step with the event.
+    ///
+    /// Ownership rule: a dialog registration, and the dialog cached for it,
+    /// belong to the attachment session that enabled Page. When that
+    /// session detaches (Target.detachedFromTarget, which the relay also
+    /// sends when the last Cua session holding a tab ends while others keep
+    /// the shared socket), both go with it, so a later browser_dialog enables
+    /// Page again instead of trusting a dead registration or a stale dialog.
+    fn observe_dialog_event(&self, event: &CdpEvent) {
+        if event.method == "Target.detachedFromTarget" {
+            if let Some(detached) = event.params.get("sessionId").and_then(Value::as_str) {
+                if let Some(target_id) = self.session_targets.lock().unwrap().remove(detached) {
+                    let mut dialogs = self.dialogs.lock().unwrap();
+                    if dialogs
+                        .get(&target_id)
+                        .is_some_and(|dialog| dialog.session_id == detached)
+                    {
+                        dialogs.remove(&target_id);
+                    }
+                }
+            }
+            return;
+        }
+        let demux = self;
+        if let Some(session_id) = event.session_id.as_deref() {
+            let target_id = demux
+                .session_targets
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .cloned();
+            match event.method.as_str() {
+                "Page.javascriptDialogOpening" => {
+                    let kind = match event.params.get("type").and_then(Value::as_str) {
+                        Some("alert") => "alert",
+                        Some("confirm") => "confirm",
+                        Some("prompt") => "prompt",
+                        Some("beforeunload") => "beforeunload",
+                        _ => "other",
+                    };
+                    let generation =
+                        demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
+                    if let Some(target_id) = target_id {
+                        demux.dialogs.lock().unwrap().insert(
+                            target_id,
+                            CdpDialogState {
+                                generation,
+                                kind: kind.to_owned(),
+                                session_id: session_id.to_owned(),
+                            },
+                        );
+                    }
+                }
+                "Page.javascriptDialogClosed" => {
+                    if let Some(target_id) = target_id {
+                        demux.dialogs.lock().unwrap().remove(&target_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         // Dropping the senders wakes every pending caller with a recv
@@ -192,43 +255,7 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
                     .map(str::to_owned),
                 params: v.get("params").cloned().unwrap_or(Value::Null),
             };
-            if let Some(session_id) = event.session_id.as_deref() {
-                let target_id = demux
-                    .session_targets
-                    .lock()
-                    .unwrap()
-                    .get(session_id)
-                    .cloned();
-                match event.method.as_str() {
-                    "Page.javascriptDialogOpening" => {
-                        let kind = match event.params.get("type").and_then(Value::as_str) {
-                            Some("alert") => "alert",
-                            Some("confirm") => "confirm",
-                            Some("prompt") => "prompt",
-                            Some("beforeunload") => "beforeunload",
-                            _ => "other",
-                        };
-                        let generation =
-                            demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
-                        if let Some(target_id) = target_id {
-                            demux.dialogs.lock().unwrap().insert(
-                                target_id,
-                                CdpDialogState {
-                                    generation,
-                                    kind: kind.to_owned(),
-                                    session_id: session_id.to_owned(),
-                                },
-                            );
-                        }
-                    }
-                    "Page.javascriptDialogClosed" => {
-                        if let Some(target_id) = target_id {
-                            demux.dialogs.lock().unwrap().remove(&target_id);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            demux.observe_dialog_event(&event);
             demux
                 .subscribers
                 .lock()
@@ -670,6 +697,63 @@ fn release_claimed_port(port: u16) {
 
 #[cfg(test)]
 mod tests {
+    use super::{CdpEvent, Demux};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn a_detached_session_takes_its_dialog_registration_and_cached_dialog_with_it() {
+        let demux = Demux {
+            pending: StdMutex::new(HashMap::new()),
+            subscribers: StdMutex::new(Vec::new()),
+            session_targets: StdMutex::new(HashMap::new()),
+            dialogs: StdMutex::new(HashMap::new()),
+            next_dialog_generation: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+        };
+        let event = |method: &str, session: Option<&str>, params: serde_json::Value| CdpEvent {
+            method: method.to_owned(),
+            session_id: session.map(str::to_owned),
+            params,
+        };
+        for (session, target) in [("page-a", "T1"), ("page-b", "T2")] {
+            demux
+                .session_targets
+                .lock()
+                .unwrap()
+                .insert(session.to_owned(), target.to_owned());
+            demux.observe_dialog_event(&event(
+                "Page.javascriptDialogOpening",
+                Some(session),
+                json!({ "type": "alert" }),
+            ));
+        }
+        assert_eq!(demux.dialogs.lock().unwrap().len(), 2);
+
+        // The relay (or Chrome) reports that T1's Page session detached.
+        demux.observe_dialog_event(&event(
+            "Target.detachedFromTarget",
+            None,
+            json!({ "sessionId": "page-a" }),
+        ));
+        assert!(!demux.session_targets.lock().unwrap().contains_key("page-a"));
+        assert!(!demux.dialogs.lock().unwrap().contains_key("T1"));
+        // The other target keeps its registration and dialog.
+        assert_eq!(
+            demux.session_targets.lock().unwrap().get("page-b").map(String::as_str),
+            Some("T2")
+        );
+        assert!(demux.dialogs.lock().unwrap().contains_key("T2"));
+        // A detach of an unrelated session changes nothing.
+        demux.observe_dialog_event(&event(
+            "Target.detachedFromTarget",
+            None,
+            json!({ "sessionId": "op-7" }),
+        ));
+        assert!(demux.dialogs.lock().unwrap().contains_key("T2"));
+    }
+
     use super::*;
     use crate::browser::mock_cdp::{MockCdpServer, MockEvent, MockReply};
     use serde_json::json;
