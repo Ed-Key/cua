@@ -141,6 +141,8 @@ impl SemanticNode {
             visibility: Some(self.visibility),
             semantic: true,
             frame: self.frame.clone(),
+            destination: self.url.clone(),
+            attachment: None,
         })
     }
 }

@@ -2254,6 +2254,8 @@ impl BrowserEngine {
                 visibility: None,
                 semantic: false,
                 frame,
+                destination: None,
+                attachment: None,
             });
         }
 
@@ -2312,6 +2314,8 @@ impl BrowserEngine {
                                     oopif_target_id: Some(child.target_id.clone()),
                                     identity: Some(identity),
                                 },
+                                destination: None,
+                                attachment: None,
                             });
                         }
                         attached += 1;

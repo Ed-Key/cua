@@ -48,6 +48,7 @@ mod keyed_gates;
 #[cfg(test)]
 pub(crate) mod mock_cdp;
 mod mutation;
+mod observation;
 pub mod platform;
 pub mod pointer;
 mod prepare;

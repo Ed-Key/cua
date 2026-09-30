@@ -107,7 +107,7 @@ impl FrameKind {
 /// `loader_id` changes on every document load, so equality against the
 /// live frame tree proves the ref's document is still the one that was
 /// snapshotted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FrameIdentity {
     pub frame_id: String,
     pub loader_id: String,
@@ -166,6 +166,14 @@ pub struct RefEntry {
     /// Frame identity — internal; only the kind string is surfaced.
     #[serde(skip_serializing)]
     pub frame: FrameRef,
+    /// A link's resolved destination as issued. With the role and label it
+    /// is what the ref named (see [`super::observation::Fingerprint`]).
+    #[serde(skip_serializing)]
+    pub destination: Option<String>,
+    /// Debugger attachment a semantic ref was issued on; `None` for legacy
+    /// DOM refs.
+    #[serde(skip_serializing)]
+    pub attachment: Option<u64>,
 }
 
 #[derive(Debug, Clone)]
@@ -517,6 +525,8 @@ mod tests {
                             loader_id: "L1".into(),
                         }),
                     },
+                    destination: None,
+                    attachment: None,
                 },
             );
             rec.tabs.insert(
