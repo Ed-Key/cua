@@ -1839,6 +1839,12 @@ mod action_name_tests {
         for requested in ["AXIS", "axis", "AXAxis"] {
             assert_eq!(resolve_element_action(requested, &axis).as_ref(), Ok(&axis[0]), "{requested}");
         }
+        // An exact raw name is never shadowed by a custom action shown the same way.
+        let shadow = vec![
+            "Name:AXAXIncrement\nTarget:0x0\nSelector:(null)".to_owned(),
+            "AXIncrement".to_owned(),
+        ];
+        assert_eq!(resolve_element_action("AXIncrement", &shadow).as_deref(), Ok("AXIncrement"));
     }
 
     #[test]
@@ -1922,16 +1928,17 @@ fn resolve_element_action(requested: &str, advertised: &[String]) -> Result<Stri
     }
     // The outline shows each name as its action_key, so that exact text
     // (and any other case of it) must resolve.
+    // An exact raw name wins over any normalized match.
     let requested_key = crate::ax::tree::action_key(requested);
-    let matched = advertised.iter().find(|raw| {
+    let exact = advertised.iter().find(|raw| raw.as_str() == requested);
+    let matched = exact.or_else(|| advertised.iter().find(|raw| {
         let display = crate::ax::tree::display_action_name((*raw).clone());
         let display_key = crate::ax::tree::action_key(&display);
-        raw.as_str() == requested
-            || requested.to_lowercase() == display.to_lowercase()
+        requested.to_lowercase() == display.to_lowercase()
             || requested_key == display_key
             // A bare name that itself starts with "AX" ("AXIS" for "AXAxis").
             || requested.to_lowercase() == display_key
-    });
+    }));
     match (matched, alias) {
         (Some(raw), _) => Ok(raw.clone()),
         (None, Some(alias)) => Ok(alias.to_owned()),
