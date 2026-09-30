@@ -26,10 +26,12 @@ use core_foundation::base::{CFRelease, CFTypeRef};
 
 use super::Area;
 use crate::ax::bindings::{
-    ax_get_window_id, copy_ax_windows_including, copy_children_reporting, copy_string_attr,
-    copy_url_attr, element_screen_rect, AXUIElementCreateApplication, AXUIElementRef,
+    ax_get_window_id, copy_ax_windows_including, copy_children_reporting,
+    copy_geometry_attr_checked, copy_string_attr, copy_url_attr, kAXValueCGPointType,
+    kAXValueCGSizeType, AXUIElementCreateApplication, AXUIElementRef,
+    AXUIElementSetMessagingTimeout,
 };
-use crate::ax::enablement::{bound_by, ensure_chromium_ax_enabled};
+use crate::ax::enablement::ensure_chromium_ax_enabled;
 
 /// Longest one lookup may take (it messages the browser over AX).
 const LOOKUP_BUDGET: Duration = Duration::from_millis(300);
@@ -192,6 +194,27 @@ fn ask_for_pages(pid: i32) -> bool {
     true
 }
 
+/// The messaging timeout (seconds) for the next AX message of a lookup that
+/// must end by `deadline`: the time left, or `None` once under a millisecond
+/// is left (the lookup stops there).
+fn message_timeout(deadline: Instant, now: Instant) -> Option<f32> {
+    let left = deadline.saturating_duration_since(now);
+    (left >= Duration::from_millis(1)).then(|| left.as_secs_f32())
+}
+
+/// Bound the next AX message to `element` by the time left before
+/// `deadline` (timeouts stick to the element, so this goes before EVERY
+/// message). Whether any time is left.
+unsafe fn bound(element: AXUIElementRef, deadline: Instant) -> bool {
+    match message_timeout(deadline, Instant::now()) {
+        Some(seconds) => {
+            AXUIElementSetMessagingTimeout(element, seconds);
+            true
+        }
+        None => false,
+    }
+}
+
 /// The screen area of the one top-level `AXWebArea` in `window_id`.
 unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area, &'static str> {
     // A reference of our own: messaging timeouts stick to a reference.
@@ -200,7 +223,7 @@ unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area,
         return Err("the app has no accessibility element");
     }
     let mut root = None;
-    if bound_by(app, deadline) {
+    if bound(app, deadline) {
         for window in copy_ax_windows_including(app, pid, window_id) {
             if root.is_none() && ax_get_window_id(window) == Some(window_id) {
                 root = Some(window);
@@ -217,13 +240,15 @@ unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area,
         nodes: MAX_NODES,
         deadline,
         pages: Vec::new(),
-        complete: bound_by(root, deadline),
+        complete: true,
     };
-    if walk.complete {
+    if walk.bound(root) {
         walk.children(root, MAX_DEPTH);
     }
     CFRelease(root as CFTypeRef);
-    let found = if !walk.complete {
+    // A message that timed out reads as a missing value: past the deadline
+    // nothing the walk saw can be trusted to be all of it.
+    let found = if !walk.complete || Instant::now() >= deadline {
         Err("the lookup did not finish in time")
     } else {
         match walk.pages[..] {
@@ -253,8 +278,15 @@ struct Walk {
 }
 
 impl Walk {
-    /// Read `element`'s children (bounded already) down to `depth` more
-    /// levels, never into a web area.
+    /// `bound` for the walk's next message to `element`; a spent budget ends
+    /// the walk incomplete.
+    unsafe fn bound(&mut self, element: AXUIElementRef) -> bool {
+        self.complete &= bound(element, self.deadline);
+        self.complete
+    }
+
+    /// Read `element`'s children down to `depth` more levels, never into a
+    /// web area. The caller bounded this message.
     unsafe fn children(&mut self, element: AXUIElementRef, depth: u32) {
         let (children, failed) = copy_children_reporting(element);
         if failed {
@@ -269,22 +301,42 @@ impl Walk {
     }
 
     unsafe fn visit(&mut self, element: AXUIElementRef, depth: u32) {
-        if self.nodes == 0 || !bound_by(element, self.deadline) {
+        if self.nodes == 0 {
             self.complete = false;
             return;
         }
         self.nodes -= 1;
+        if !self.bound(element) {
+            return;
+        }
         if copy_string_attr(element, "AXRole").as_deref() == Some("AXWebArea") {
+            if !self.bound(element) {
+                return;
+            }
             if copy_url_attr(element).is_some_and(|url| url.starts_with("devtools://")) {
                 return;
             }
-            match element_screen_rect(element) {
-                Some([x, y, w, h]) => self.pages.push(Area { x, y, w, h }),
+            match self.area(element) {
+                Some(area) => self.pages.push(area),
                 None => self.complete = false,
             }
-        } else if depth > 0 && bound_by(element, self.deadline) {
+        } else if depth > 0 && self.bound(element) {
             self.children(element, depth - 1);
         }
+    }
+
+    /// `element`'s screen area: its position and its size, each message
+    /// bounded by the time left.
+    unsafe fn area(&mut self, element: AXUIElementRef) -> Option<Area> {
+        if !self.bound(element) {
+            return None;
+        }
+        let [x, y] = copy_geometry_attr_checked(element, "AXPosition", kAXValueCGPointType).ok()?;
+        if !self.bound(element) {
+            return None;
+        }
+        let [w, h] = copy_geometry_attr_checked(element, "AXSize", kAXValueCGSizeType).ok()?;
+        Some(Area { x, y, w, h })
     }
 }
 
@@ -298,6 +350,22 @@ mod tests {
         w: 1100.0,
         h: 789.0,
     };
+
+    #[test]
+    fn every_message_gets_only_the_time_left_and_none_once_it_is_spent() {
+        let start = Instant::now();
+        let deadline = start + LOOKUP_BUDGET;
+        // The first message may take the whole budget ...
+        assert_eq!(message_timeout(deadline, start), Some(0.3));
+        // ... a later one only what is left, never the first one's timeout
+        // again (which is how a slow browser overran the budget).
+        let later = message_timeout(deadline, start + Duration::from_millis(250)).unwrap();
+        assert!((later - 0.05).abs() < 1e-4, "{later}");
+        // Spent (or under a millisecond left): the lookup stops.
+        assert_eq!(message_timeout(deadline, deadline - Duration::from_micros(500)), None);
+        assert_eq!(message_timeout(deadline, deadline), None);
+        assert_eq!(message_timeout(deadline, deadline + Duration::from_secs(1)), None);
+    }
 
     #[test]
     fn a_page_under_the_toolbar_is_cropped_to_window_points() {

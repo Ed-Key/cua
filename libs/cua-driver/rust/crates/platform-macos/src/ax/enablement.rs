@@ -188,9 +188,8 @@ pub fn web_content_wait_timed_out(pid: i32) -> bool {
 }
 
 /// Bound every AX message by the time left, so a slow or hung app cannot
-/// stretch the probe past the readiness deadline. Also bounds the PiP's page
-/// lookup (`pip::page`).
-pub(crate) unsafe fn bound_by(element: AXUIElementRef, deadline: Instant) -> bool {
+/// stretch the probe past the readiness deadline.
+unsafe fn bound_by(element: AXUIElementRef, deadline: Instant) -> bool {
     let remaining = deadline.saturating_duration_since(Instant::now());
     if remaining < Duration::from_millis(1) {
         return false;

@@ -677,6 +677,10 @@ struct CardInfo {
     /// the user raises it.
     page: bool,
     crop: Option<(u32, page::Crop)>,
+    /// The framing and crop of `still` itself, kept with it: an action that
+    /// changes the card's framing without a new capture leaves the old
+    /// still framed as it was, so it is never shown under the new framing.
+    still_page: bool,
     still_crop: Option<Area>,
 }
 
@@ -1575,6 +1579,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
                     card.data.page = frame.page;
                     if still.is_some() {
                         card.data.still = still;
+                        card.data.still_page = frame.page;
                         card.data.still_crop = still_crop;
                         card.data.crop = tag.1.map(|window| {
                             (window, still_crop.ok_or("the still shows the whole window"))
@@ -2205,6 +2210,7 @@ unsafe fn switch_front(
         if panel.still_tag == Some((front.key, panel.page)) && !image.is_null() {
             let _: *mut AnyObject = msg_send![image, retain];
             front.data.still = Some((front.key, Image(image as usize)));
+            front.data.still_page = panel.page;
             front.data.still_crop = panel.still_crop;
         }
         front.data.shape = panel.shape;
@@ -2223,12 +2229,12 @@ unsafe fn switch_front(
         }
         panel.crop = front.data.crop;
         if let Some((still_tag, image)) = front.data.still.take() {
-            if still_tag == tag {
+            if let Some(view) = card_still_view(tag, still_tag, front.data.still_page) {
                 let _: () = msg_send![
                     panel.image_view as *mut AnyObject,
                     setImage: image.0 as *mut AnyObject
                 ];
-                panel.still_tag = Some((still_tag, front.data.page));
+                panel.still_tag = Some(view);
                 panel.still_crop = front.data.still_crop;
             }
         }
@@ -2240,6 +2246,22 @@ unsafe fn switch_front(
     let shape = panel.cards.front_mut().and_then(|front| front.data.shape);
     set_shape(panel, shape);
     changed
+}
+
+/// The view a card's saved still shows when the card `tag` comes forward:
+/// its own window's pixels only, framed as they were captured (`still_page`),
+/// whatever the card's framing is now (`sync_layers` then keeps it only if
+/// the two agree).
+fn card_still_view(tag: Tag, still_tag: Tag, still_page: bool) -> Option<View> {
+    (still_tag == tag).then_some((still_tag, still_page))
+}
+
+/// Whether a poll's answer must reach the live stream: the card changed
+/// shape (the stream is sized for it), or the page crop it is framed to
+/// changed, also when only its origin moved (the page moved in its window at
+/// the same size, e.g. docked DevTools switching sides).
+fn stream_follows(reshaped: bool, before: Option<Area>, after: Option<Area>) -> bool {
+    reshaped || before != after
 }
 
 /// Log the stack and put its size in the panel's window title, for checks.
@@ -2380,6 +2402,7 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
             let mut reshaped = false;
             let same = panel.target == update.target && panel.page == update.page;
             if same {
+                let framed = wanted_crop(panel);
                 // The window may have moved or changed size, or its page
                 // moved inside it: the cursor maps into its new place and
                 // the card takes its new shape even when nothing else
@@ -2390,9 +2413,10 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
                 }
                 place_sprite(panel);
                 reshaped = sync_shape(panel);
+                reshaped = stream_follows(reshaped, framed, wanted_crop(panel));
             }
             // An answer about an older target, or no change: nothing more
-            // (but a new shape resizes the stream).
+            // (but a new shape or crop reconfigures the stream).
             if !same
                 || (panel.target_visible == update.visible
                     && panel.resolved_window == update.resolved_window)
@@ -5968,6 +5992,41 @@ mod tests {
         assert_eq!(visible_layers(Some(whole), Some(page), Some(page)), SHOW_NOTHING);
         assert_eq!(visible_layers(Some(whole), Some(whole), Some(page)), SHOW_STILL);
         assert_eq!(visible_layers(Some(page), Some(whole), Some(page)), SHOW_LIVE);
+    }
+
+    #[test]
+    fn a_page_that_moves_at_the_same_size_still_reconfigures_the_stream() {
+        let page = Area {
+            x: 0.0,
+            y: 87.0,
+            w: 800.0,
+            h: 413.0,
+        };
+        // DevTools docked on the left now: same size, the page moved right.
+        let moved = Area { x: 300.0, ..page };
+        assert!(stream_follows(false, Some(page), Some(moved)));
+        // Found, lost (whole window), or a new shape: all reach the stream.
+        assert!(stream_follows(false, None, Some(page)));
+        assert!(stream_follows(false, Some(page), None));
+        assert!(stream_follows(true, Some(page), Some(page)));
+        // Nothing changed: nothing to do.
+        assert!(!stream_follows(false, Some(page), Some(page)));
+        assert!(!stream_follows(false, None, None));
+    }
+
+    #[test]
+    fn a_back_cards_still_keeps_the_framing_it_was_captured_with() {
+        // Card W5's still was captured page-only; a native action then made
+        // the card whole-window, and its capture failed (no new still).
+        let still = card_still_view(W5, W5, true);
+        assert_eq!(still, Some((W5, true)));
+        // Raised, the card wants the whole window: the old page still is not
+        // shown as the whole window (nothing, until its own pixels come).
+        assert_eq!(visible_layers(Some((W5, false)), still, None), SHOW_NOTHING);
+        // Framed the way it was captured, it shows.
+        assert_eq!(visible_layers(Some((W5, true)), still, None), SHOW_STILL);
+        // Another window's still never comes forward with a card.
+        assert_eq!(card_still_view(W5, W6, true), None);
     }
 
     #[test]
