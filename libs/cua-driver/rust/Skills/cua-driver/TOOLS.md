@@ -25,7 +25,7 @@ check `describe <tool>` there.
 - If both `bundle_id` and `name` are given, `bundle_id` wins. `urls` are handed to the app as open targets; for Finder, a folder path opens a background Finder window there.
 - `webkit_inspector_port` sets `WEBKIT_INSPECTOR_SERVER=127.0.0.1:N` and `TAURI_WEBVIEW_AUTOMATION=1`. `additional_arguments` are appended after `--args`.
 - `creates_new_application_instance`: use it when another agent or session may drive the same app. Single-instance apps (Calculator, many utilities) otherwise hand every caller the same window, and the sessions fight over it.
-- The result has `pid`, `bundle_id`, `name`, `windows`, and `launch_state` (whether the request was sent, the process is running, and a window is ready). When the target was not already frontmost, `self_activation_suppressed` reports whether focus stayed with the prior frontmost app (true) or the launched app kept it despite the driver's re-demotion (false).
+- The result has `pid`, `bundle_id`, `name`, `windows`, and `launch_state` (whether the request was sent, the process is running, and a window is ready). On macOS each window's `input_readiness` points to `get_window_state`'s `background_input` report for that window; launch does not activate the app, so do not assume key or pointer input is available. When the target was not already frontmost, `self_activation_suppressed` reports whether focus stayed with the prior frontmost app (true) or the launched app kept it despite the driver's re-demotion (false).
 
 ## get_window_state
 
@@ -36,8 +36,8 @@ check `describe <tool>` there.
 - `include_accessibility_tree:false` skips the tree walk and returns the screenshot plus `window_bounds`, `screenshot_scale`, `screenshot_width`/`screenshot_height`, `app_name`, and `window_title` (the capture-only path, for example a live preview). Setting both `include_accessibility_tree:false` and `include_screenshot:false` is an error.
 - `max_image_dimension` overrides the configured screenshot long edge for one call (0 is native resolution). The legacy `max_dimension` applies on top of it; the tighter cap wins.
 - With `query`, `element_count` still reports the whole snapshot and `filtered_element_count` the projected rows. Ancestors come from the real accessibility hierarchy, not indentation.
-- `max_elements` (default 2000) and `max_depth` (default 25) truncate the markdown and the elements identically. Lower them for Electron and large web apps with 10k+ element trees.
-- When `timeout_ms` runs out, the partial tree returns with `truncated:true`, `truncation_reason`, `nodes_visited`, `nodes_pending`, and `elements_complete:false`. Retry with a larger budget (for example 5000) or narrow with `query` or `max_depth`.
+- `max_elements` (default 2000) and `max_depth` (default 25) truncate the markdown and the elements identically. Lower them for Electron and large web apps with 10k+ element trees; rows past them are missing. On macOS, `coverage` reports a depth cut (text below it is unknown) and, with a `query`, `query_excluded_text_nodes`: collected rows with text the query left out.
+- When `timeout_ms` runs out, the partial tree returns with `truncated:true`, `truncation_reason`, `nodes_visited`, `nodes_pending`, and `elements_complete:false`. Retry with a larger budget (for example 5000). On macOS a `query` filters after the walk and does not shorten it.
 - The read is scoped to `window_id`, and never returns another surface's elements under it. A window on another Space still resolves by its exact id.
   - `window_id_not_found`: the window no longer exists; refresh `list_windows`.
   - `window_owner_pid_mismatch`: another process owns the window; retry with the reported `owner_pid`. A sandboxed app's Open/Save panel is hosted by a separate panel process.
@@ -97,6 +97,7 @@ check `describe <tool>` there.
 
 - A popup button (`AXPopUpButton`, an HTML `<select>` in Safari, any native `NSPopUpButton`) has the child option whose title or value matches `value` (case-insensitive) pressed directly; the popup menu never opens, so focus is never stolen.
 - Other elements get `AXValue` written directly; the accessibility layer coerces the string to the element's native type.
+- A Mac Catalyst text field is refused with `catalyst_text_needs_typing` before anything is focused or written: the app can take the value without reacting to it. Click the field, confirm focus, select all if replacing, then `type_text`.
 
 ## act_and_read
 

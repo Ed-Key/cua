@@ -255,13 +255,7 @@ pub fn decide_background_input(
             if visibility_disproven {
                 return refuse(
                     refusal_codes::MINIMIZED_OR_HIDDEN,
-                    format!(
-                        "window {} is minimized or its application is hidden (or that \
-                         state could not be proven); the routed pointer is refused in \
-                         v1. Use an exact element action (click/set_value by element) \
-                         instead",
-                        target.window_id
-                    ),
+                    visibility_refusal_reason(target, facts, "pointer"),
                     Some("accessibility"),
                 );
             }
@@ -275,13 +269,7 @@ pub fn decide_background_input(
             if visibility_disproven {
                 return refuse(
                     refusal_codes::MINIMIZED_OR_HIDDEN,
-                    format!(
-                        "window {} is minimized or its application is hidden (or that \
-                         state could not be proven); raw key input is refused in v1. \
-                         Use an exact element action (set_value, click \
-                         action:\"confirm\"/\"press\") instead",
-                        target.window_id
-                    ),
+                    visibility_refusal_reason(target, facts, "key"),
                     Some("accessibility"),
                 );
             }
@@ -306,6 +294,39 @@ pub fn decide_background_input(
             }
         }
     }
+}
+
+/// The `minimized_or_hidden_window` reason: which visibility fact failed
+/// (hidden, minimized, or not provable), the exact target, and the routes
+/// that can work from here. Text only; the gate above decides.
+fn visibility_refusal_reason(
+    target: ExactWindowTarget,
+    facts: &BackgroundTargetFacts,
+    input: &str,
+) -> String {
+    let mut failed = Vec::new();
+    match facts.target_minimized {
+        Some(true) => failed.push("the window is minimized"),
+        None => failed.push("whether the window is minimized could not be proven"),
+        Some(false) => {}
+    }
+    match facts.app_hidden {
+        Some(true) => failed.push("the application is hidden"),
+        None => failed.push("whether the application is hidden could not be proven"),
+        Some(false) => {}
+    }
+    let (pid, window_id) = (target.pid, target.window_id);
+    format!(
+        "window {window_id} of pid {pid}: {}, so {input} input is refused. Key and pointer \
+         input need a proven visible target. Restoring or bringing the window forward is a \
+         visible change you must be allowed to make (for example bring_to_front with pid \
+         {pid} and window_id {window_id}, or delivery_mode:\"foreground\"); after it, read the \
+         window state again (get_window_state) before retrying. An exact element action \
+         (click action:\"press\"/\"confirm\" by element) is the alternative that sends no \
+         keys. For a Mac Catalyst text field, set_value will not work: click the field, then \
+         type_text",
+        failed.join("; ")
+    )
 }
 
 /// The exact-window resolution string reported by the read-only capability
@@ -544,6 +565,82 @@ mod tests {
                     refusal_codes::MINIMIZED_OR_HIDDEN,
                     "{action:?}"
                 );
+            }
+        }
+    }
+
+    fn reason_of(decision: BackgroundInputDecision) -> String {
+        match decision {
+            BackgroundInputDecision::Refuse(refusal) => refusal.reason,
+            BackgroundInputDecision::Execute { .. } => panic!("expected a refusal"),
+        }
+    }
+
+    /// The visibility refusal names the fact that failed, the exact target,
+    /// the recovery that needs permission, the re-read, and the typing route
+    /// for Catalyst text; it never sends the caller to set_value to type.
+    #[test]
+    fn visibility_refusal_names_the_failed_fact_and_routes_that_work() {
+        let cases = [
+            (Some(false), Some(true), vec!["the application is hidden"]),
+            (Some(true), Some(false), vec!["the window is minimized"]),
+            (
+                None,
+                None,
+                vec![
+                    "whether the window is minimized could not be proven",
+                    "whether the application is hidden could not be proven",
+                ],
+            ),
+            (
+                Some(true),
+                None,
+                vec![
+                    "the window is minimized",
+                    "whether the application is hidden could not be proven",
+                ],
+            ),
+            (
+                Some(false),
+                None,
+                vec!["whether the application is hidden could not be proven"],
+            ),
+        ];
+        for (minimized, hidden, said) in cases {
+            let facts = BackgroundTargetFacts {
+                target_minimized: minimized,
+                app_hidden: hidden,
+                ..matched_facts()
+            };
+            for (action, input) in [
+                (BackgroundAction::WindowPointer, "pointer input"),
+                (BackgroundAction::InsertText, "key input"),
+                (BackgroundAction::GenericKey, "key input"),
+            ] {
+                let reason = reason_of(decide_background_input(TARGET, &facts, action));
+                for fact in &said {
+                    assert!(reason.contains(fact), "{minimized:?}/{hidden:?}: {reason}");
+                }
+                if minimized == Some(false) {
+                    assert!(!reason.contains("the window is minimized"), "{reason}");
+                }
+                if hidden == Some(false) {
+                    assert!(!reason.contains("the application is hidden"), "{reason}");
+                }
+                for needed in [
+                    input,
+                    "window 700 of pid 42",
+                    "bring_to_front with pid 42 and window_id 700",
+                    "delivery_mode:\"foreground\"",
+                    "must be allowed",
+                    "get_window_state",
+                    "click action:\"press\"/\"confirm\"",
+                    "set_value will not work",
+                    "type_text",
+                ] {
+                    assert!(reason.contains(needed), "missing {needed:?}: {reason}");
+                }
+                assert!(!reason.contains("(set_value"), "{reason}");
             }
         }
     }

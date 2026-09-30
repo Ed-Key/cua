@@ -61,6 +61,13 @@ On macOS a row can also carry:
 
 The accessibility model may lag or disagree with rendered state: Electron text shims can echo writes, Catalyst may expose placeholders, and virtualized rows may have unusable frames. Cross-check the relevant visible outcome. An empty tree can also mean an unavailable accessibility bridge; inspect `degraded_reason` and the platform guide. Retry once for lazy initialization, not indefinitely.
 
+### Find content (a message, a row, a value)
+
+1. Start unfiltered at the default depth with `diff:false`. A `query` locates rows in what the walk collected; it does not prove absence, and on macOS it filters after the walk, so it is not faster. On macOS a read that left content out says so in `coverage` and an `INCOMPLETE READ` line; read again as that line says.
+2. To search inside a Mac Catalyst app (Messages, WhatsApp, Stocks): click the search field, confirm it has focus, then `type_text`. `set_value` is refused there. Check the app's own result: the list changed.
+3. Scroll less than a page at a time so consecutive reads overlap, and read after each scroll.
+4. When a read was cut, truncated, or you skipped rows, report what you covered instead of "not found".
+
 ## Act once
 
 Use an `element_token` from the latest snapshot of the intended window: `<snapshot_id>:<index>` for a row of its tree. If using an integer, pair `element_index` with that response's `snapshot_id`. Never build a token from an older snapshot's id. A later snapshot can invalidate a pending action, including when another agent observes the same window.

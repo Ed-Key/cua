@@ -631,6 +631,21 @@ impl Tool for GetWindowStateTool {
             prepend_token_hint(&mut r.tree_markdown, handle);
         }
 
+        // Content the read left out (a depth cut, rows a query dropped) is
+        // said in the outline itself, so an absence is not read as proof.
+        let coverage = tree_result.as_ref().and_then(|r| {
+            read_coverage(
+                r.sightings.depth_cut,
+                tree_query(query.as_deref(), query_context)
+                    .map(|q| crate::ax::tree::query_excluded_text_nodes(&r.nodes, q)),
+                args.get("max_depth").is_some().then_some(max_depth),
+            )
+        });
+        if let (Some((_, line)), Some(r)) = (coverage.as_ref(), tree_result.as_mut()) {
+            r.tree_markdown.push('\n');
+            r.tree_markdown.push_str(line);
+        }
+
         // Build response.
         let mut content: Vec<Content> = Vec::new();
 
@@ -768,11 +783,14 @@ impl Tool for GetWindowStateTool {
             "elements_complete": elements_complete,
             "tree_markdown": tree_md,
             "elements": elements_json,
-            "_note": "Prefer `elements` — `tree_markdown` will continue to work \
-                but new fields will only be added to the structured side. \
-                Issue #22865: use `max_elements` / `max_depth` to bound the \
-                AX walk on apps with very large trees."
+            "_note": "`elements` holds actionable nodes only; display text (message \
+                bodies, labels) is in `tree_markdown`. Issue #22865: `max_elements` / \
+                `max_depth` bound the AX walk on apps with very large trees, and rows \
+                past those limits are missing."
         });
+        if let Some((report, _)) = coverage {
+            structured["coverage"] = report;
+        }
         project_elements(&mut structured, element_fields);
         if query.is_some() {
             structured["filtered_element_count"] = serde_json::json!(filtered_element_count);
@@ -2020,6 +2038,40 @@ mod app_target_tests {
     }
 
     #[test]
+    fn read_coverage_says_what_was_left_out() {
+        // Nothing lost: no report.
+        assert!(read_coverage(false, None, None).is_none());
+        assert!(read_coverage(false, Some(0), Some(4)).is_none());
+        // A query that dropped text rows.
+        let (report, line) = read_coverage(false, Some(12), None).unwrap();
+        assert_eq!(report["query_excluded_text_nodes"], 12);
+        assert_eq!(report["depth_cut"], false);
+        assert!(report.get("text_below_depth_cut").is_none());
+        assert!(line.contains("left out 12"), "{line}");
+        assert!(line.contains("diff:false and without max_depth/query"), "{line}");
+        // A caller's depth cut plus a query: below the cut the count is unknown.
+        let (report, line) = read_coverage(true, Some(3), Some(2)).unwrap();
+        assert_eq!(report["depth_cut"], true);
+        assert_eq!(report["text_below_depth_cut"], "unknown");
+        assert_eq!(report["query_excluded_text_nodes"], 3);
+        assert!(line.contains("max_depth 2") && line.contains("unknown"), "{line}");
+        assert!(line.contains("without max_depth/query"), "{line}");
+        // A depth cut with no query and a query with no exclusion.
+        let (report, _) = read_coverage(true, Some(0), Some(2)).unwrap();
+        assert_eq!(report["query_excluded_text_nodes"], 0);
+        // The default depth: raising max_depth is the way back.
+        let (_, line) = read_coverage(true, None, None).unwrap();
+        assert!(line.contains("larger max_depth") && line.contains("diff:false"), "{line}");
+        // A caller's cap at or above the default: removing it restores the
+        // same cap, so the advice is a larger one.
+        for depth in [crate::ax::tree::DEFAULT_MAX_DEPTH, 40] {
+            let (_, line) = read_coverage(true, Some(1), Some(depth)).unwrap();
+            assert!(line.contains("larger max_depth"), "{depth}: {line}");
+            assert!(!line.contains("without max_depth"), "{depth}: {line}");
+        }
+    }
+
+    #[test]
     fn ended_session_gets_background_input_again() {
         let sent = BackgroundInputSent::default();
         let report = serde_json::json!({"routes": []});
@@ -2084,6 +2136,49 @@ mod app_target_tests {
             "unchanged again"
         );
     }
+}
+
+/// What a read left out, for the `coverage` field and one outline line.
+/// `None` when nothing was cut by depth and a query (if any) dropped no
+/// collected text row. Below a depth cut nothing was read, so that count is
+/// unknown rather than zero. `max_depth` is the caller's limit, when given.
+fn read_coverage(
+    depth_cut: bool,
+    query_excluded: Option<usize>,
+    max_depth: Option<usize>,
+) -> Option<(Value, String)> {
+    let excluded = query_excluded.filter(|n| *n > 0);
+    if !depth_cut && excluded.is_none() {
+        return None;
+    }
+    let mut report = serde_json::json!({ "depth_cut": depth_cut });
+    let mut lost = Vec::new();
+    if let Some(n) = query_excluded {
+        report["query_excluded_text_nodes"] = serde_json::json!(n);
+        if n > 0 {
+            lost.push(format!("the query left out {n} collected row(s) with text"));
+        }
+    }
+    if depth_cut {
+        report["text_below_depth_cut"] = serde_json::json!("unknown");
+        lost.push(match max_depth {
+            Some(depth) => format!(
+                "rows deeper than max_depth {depth} were not read, so how much text they hold is unknown"
+            ),
+            None => "rows deeper than the default depth were not read, so how much text they \
+                hold is unknown"
+                .to_owned(),
+        });
+    }
+    // Removing max_depth helps only when the caller's cap was below the
+    // default; a cap at or above it (or the default itself) needs a larger one.
+    let default_or_deeper = max_depth.is_none_or(|d| d >= crate::ax::tree::DEFAULT_MAX_DEPTH);
+    let again = if depth_cut && default_or_deeper {
+        "Read again with diff:false, without query and with a larger max_depth to see them."
+    } else {
+        "Read again with diff:false and without max_depth/query to see them."
+    };
+    Some((report, format!("⚠️ INCOMPLETE READ: {}. {again}", lost.join("; "))))
 }
 
 /// Chromium can withhold a page from accessibility when it is asked while its

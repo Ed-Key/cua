@@ -129,7 +129,8 @@ pub fn timeout_ms_schema() -> Value {
         "maximum": TIMEOUT_MS_MAX,
         "default": TIMEOUT_MS_DEFAULT,
         "description": "Budget for the accessibility walk. On timeout the partial \
-            tree returns with truncated:true; retry larger or narrow with query."
+            tree returns with truncated:true; retry with a larger budget (on macOS a query \
+            filters after the walk and does not shorten it)."
     })
 }
 
