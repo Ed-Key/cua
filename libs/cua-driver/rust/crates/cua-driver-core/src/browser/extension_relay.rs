@@ -637,12 +637,23 @@ impl Session {
                 colors.retain(|session, _| sessions.contains_key(session));
                 routes.children.retain(|_, owner| *owner != tab);
                 routes.page_enabled.remove(&tab);
+                // Name the page target, as Chrome does: the engine ends the
+                // tab's attachment (and with it every page ref) by target.
+                let target = routes
+                    .targets
+                    .iter()
+                    .find(|(_, owner)| **owner == tab)
+                    .map(|(target, _)| target.clone());
                 tab_sessions
                     .into_iter()
                     .map(|session| {
                         json!({
                             "method": "Target.detachedFromTarget",
-                            "params": { "sessionId": session, "reason": event.params.get("reason") },
+                            "params": {
+                                "sessionId": session,
+                                "targetId": target,
+                                "reason": event.params.get("reason"),
+                            },
                         })
                     })
                     .collect()

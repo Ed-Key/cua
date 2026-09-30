@@ -93,6 +93,14 @@ struct FixtureState {
     /// inactive tab it runs only once focus is emulated.
     field_focus_moves_caret_to_end: bool,
     focus_emulated: bool,
+    /// Accessible names the page changed since the fixture was built, by
+    /// backend node id (a node reused for another entity).
+    renamed: std::collections::HashMap<i64, String>,
+    /// Nodes the page removed, by backend node id.
+    removed: std::collections::HashSet<i64>,
+    /// The debugger was detached from the tab (the user cancelled Chrome's
+    /// banner): reported, as the relay does, before the next attach answers.
+    detached: bool,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -130,6 +138,9 @@ impl Default for FixtureState {
             field_caret: None,
             field_focus_moves_caret_to_end: false,
             focus_emulated: false,
+            renamed: Default::default(),
+            removed: Default::default(),
+            detached: false,
             calls: Vec::new(),
         }
     }
@@ -474,6 +485,104 @@ fn oopif_document() -> Value {
     })
 }
 
+/// The DOM the fixture page has now: its document minus removed nodes.
+fn fixture_dom(st: &FixtureState, is_oopif: bool) -> Value {
+    fn prune(node: &mut Value, removed: &std::collections::HashSet<i64>) {
+        for key in ["children", "shadowRoots"] {
+            if let Some(children) = node.get_mut(key).and_then(Value::as_array_mut) {
+                children.retain(|child| {
+                    !child["backendNodeId"]
+                        .as_i64()
+                        .is_some_and(|backend| removed.contains(&backend))
+                });
+                children.iter_mut().for_each(|child| prune(child, removed));
+            }
+        }
+        if let Some(content) = node.get_mut("contentDocument") {
+            prune(content, removed);
+        }
+    }
+    let mut document = if is_oopif {
+        oopif_document()
+    } else if st.semantic_large_page {
+        large_semantic_document()
+    } else {
+        main_document()
+    };
+    if !is_oopif {
+        document["root"]["documentURL"] = json!(st.main_url);
+    }
+    prune(&mut document["root"], &st.removed);
+    document
+}
+
+fn find_dom_node(node: &Value, backend: i64) -> Option<Value> {
+    let node = node.get("root").unwrap_or(node);
+    if node["backendNodeId"].as_i64() == Some(backend) {
+        return Some(node.clone());
+    }
+    ["children", "shadowRoots"]
+        .iter()
+        .filter_map(|key| node.get(*key).and_then(Value::as_array))
+        .flatten()
+        .chain(node.get("contentDocument"))
+        .find_map(|child| find_dom_node(child, backend))
+}
+
+/// The accessibility tree the fixture page has now for one frame.
+fn fixture_ax_tree(st: &FixtureState, is_oopif: bool, frame_id: &str) -> Value {
+    let mut tree = if is_oopif {
+        json!({"nodes": [
+            {"nodeId": "oopif-root", "ignored": false,
+             "role": {"value": "RootWebArea"}, "childIds": ["oopif-input"]},
+            {"nodeId": "oopif-input", "parentId": "oopif-root", "ignored": false,
+             "backendDOMNodeId": 100, "role": {"value": "textbox"},
+             "name": {"value": "Embedded input"},
+             "properties": [{"name": "editable", "value": {"value": "plaintext"}}],
+             "childIds": []}
+        ]})
+    } else if st.semantic_large_page {
+        let mut tree = large_semantic_ax_tree(frame_id);
+        if frame_id == "F_MAIN" {
+            let nodes = tree["nodes"].as_array_mut().unwrap();
+            if !st.semantic_main_root_present {
+                nodes.remove(0);
+            } else if let Some(title) = &st.semantic_title {
+                nodes[0]["name"] = json!({"value": title});
+            } else {
+                nodes[0].as_object_mut().unwrap().remove("name");
+            }
+        }
+        if st.semantic_link_urls {
+            for node in tree["nodes"].as_array_mut().unwrap() {
+                if node["name"]["value"] == "Reply" || node["name"]["value"] == "Archive item 304"
+                {
+                    node["role"] = json!({"value":"link"});
+                    node["properties"] = json!([{"name":"url","value":{"type":"string","value":"https://example.test/book?slot=1#court"}}]);
+                }
+            }
+        }
+        tree
+    } else {
+        json!({"nodes": []})
+    };
+    let nodes = tree["nodes"].as_array_mut().unwrap();
+    nodes.retain(|node| {
+        !node["backendDOMNodeId"]
+            .as_i64()
+            .is_some_and(|backend| st.removed.contains(&backend))
+    });
+    for node in nodes {
+        if let Some(name) = node["backendDOMNodeId"]
+            .as_i64()
+            .and_then(|backend| st.renamed.get(&backend))
+        {
+            node["name"] = json!({ "value": name });
+        }
+    }
+    tree
+}
+
 fn fixture_handler(state: SharedState) -> MockHandler {
     Arc::new(move |call| {
         let mut st = state.lock().unwrap();
@@ -501,8 +610,21 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 "bounds": { "left": 0.0, "top": 0.0, "width": 800.0, "height": 600.0 }
             })),
             "Target.attachToTarget" => {
+                let mut events = Vec::new();
+                if std::mem::take(&mut st.detached) {
+                    events.push(MockEvent {
+                        method: "Target.detachedFromTarget".into(),
+                        session_id: None,
+                        params: json!({
+                            "sessionId": format!("tab-sess-{}", st.tab_sessions),
+                            "targetId": "T1",
+                            "reason": "canceled_by_user",
+                        }),
+                    });
+                }
                 st.tab_sessions += 1;
                 MockReply::ok(json!({ "sessionId": format!("tab-sess-{}", st.tab_sessions) }))
+                    .with_events(events)
             }
             "Page.getFrameTree" if is_tab => MockReply::ok(json!({
                 "frameTree": {
@@ -539,13 +661,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 } else if st.semantic_truncated_dom && depth == 8 {
                     MockReply::ok(truncated_semantic_document())
                 } else {
-                    let mut document = if st.semantic_large_page {
-                        large_semantic_document()
-                    } else {
-                        main_document()
-                    };
-                    document["root"]["documentURL"] = json!(st.main_url);
-                    MockReply::ok(document)
+                    MockReply::ok(fixture_dom(&st, false))
                 }
             }
             "DOM.describeNode" if is_tab && call.params["backendNodeId"] == 999 => {
@@ -553,45 +669,41 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     "node": large_semantic_document()["root"]["children"][0].clone()
                 }))
             }
-            "DOM.getDocument" if is_oopif => MockReply::ok(oopif_document()),
-            "Accessibility.getFullAXTree" if is_tab => {
-                let frame_id = call.params["frameId"].as_str().unwrap_or("F_MAIN");
-                if st.semantic_large_page {
-                    let mut tree = large_semantic_ax_tree(frame_id);
-                    if frame_id == "F_MAIN" {
-                        let nodes = tree["nodes"].as_array_mut().unwrap();
-                        if !st.semantic_main_root_present {
-                            nodes.remove(0);
-                        } else if let Some(title) = &st.semantic_title {
-                            nodes[0]["name"] = json!({"value": title});
-                        } else {
-                            nodes[0].as_object_mut().unwrap().remove("name");
-                        }
-                    }
-                    if st.semantic_link_urls {
-                        for node in tree["nodes"].as_array_mut().unwrap() {
-                            if node["name"]["value"] == "Reply"
-                                || node["name"]["value"] == "Archive item 304"
-                            {
-                                node["role"] = json!({"value":"link"});
-                                node["properties"] = json!([{"name":"url","value":{"type":"string","value":"https://example.test/book?slot=1#court"}}]);
-                            }
-                        }
-                    }
-                    MockReply::ok(tree)
-                } else {
-                    MockReply::ok(json!({"nodes": []}))
+            "DOM.describeNode" => {
+                let backend = call.params["backendNodeId"].as_i64().unwrap_or(0);
+                match find_dom_node(&fixture_dom(&st, is_oopif), backend) {
+                    Some(node) => MockReply::ok(json!({ "node": node })),
+                    None => MockReply::err(-32000, "No node with given id"),
                 }
             }
-            "Accessibility.getFullAXTree" if is_oopif => MockReply::ok(json!({"nodes": [
-                {"nodeId": "oopif-root", "ignored": false,
-                 "role": {"value": "RootWebArea"}, "childIds": ["oopif-input"]},
-                {"nodeId": "oopif-input", "parentId": "oopif-root", "ignored": false,
-                 "backendDOMNodeId": 100, "role": {"value": "textbox"},
-                 "name": {"value": "Embedded input"},
-                 "properties": [{"name": "editable", "value": {"value": "plaintext"}}],
-                 "childIds": []}
-            ]})),
+            "DOM.getDocument" if is_oopif => MockReply::ok(oopif_document()),
+            "Accessibility.getFullAXTree" if is_tab || is_oopif => {
+                let frame_id = call.params["frameId"].as_str().unwrap_or("F_MAIN");
+                MockReply::ok(fixture_ax_tree(&st, is_oopif, frame_id))
+            }
+            "Accessibility.getPartialAXTree" if is_tab || is_oopif => {
+                let backend = call.params["backendNodeId"].as_i64();
+                let node = ["F_MAIN", "F_IFRAME"]
+                    .iter()
+                    .flat_map(|frame_id| {
+                        fixture_ax_tree(&st, is_oopif, frame_id)["nodes"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .find(|node| node["backendDOMNodeId"].as_i64() == backend);
+                match node {
+                    Some(node) => MockReply::ok(json!({ "nodes": [node] })),
+                    // Chromium answers for any live DOM node; one with no
+                    // accessibility object of its own comes back ignored.
+                    None if find_dom_node(&fixture_dom(&st, is_oopif), backend.unwrap_or(0)).is_some() => {
+                        MockReply::ok(json!({ "nodes": [{
+                            "nodeId": "ignored", "ignored": true, "backendDOMNodeId": backend,
+                        }] }))
+                    }
+                    None => MockReply::err(-32000, "No node with given id"),
+                }
+            }
             "DOMSnapshot.captureSnapshot" if is_tab => {
                 let mut snapshot = if st.semantic_large_page {
                     let mut backends = vec![999, 2000, 2003, 2010, 2011];
@@ -3082,6 +3194,183 @@ async fn semantic_refs_enforce_declared_action_kinds_before_delivery() {
     );
     assert!(recorded_calls(&f, "Input.insertText").is_empty());
     assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+}
+
+// ── Stable semantic refs (the ownership table in observation.rs) ───────────
+
+fn named_ref(snapshot: &Value, name: &str) -> String {
+    snapshot["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(snapshot["content_refs"].as_array().unwrap())
+        .find(|entry| entry["name"] == name)
+        .and_then(|entry| entry["ref"].as_str())
+        .unwrap_or_else(|| panic!("no line named {name:?}: {snapshot}"))
+        .to_owned()
+}
+
+async fn dom_click(f: &Fixture, target: &str, tab: &str, reference: &str) -> Value {
+    let result = BrowserClickTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "session": SESSION,
+            "ref": reference, "input_route": "dom_event"
+        }))
+        .await;
+    structured(&result).clone()
+}
+
+#[tokio::test]
+async fn a_semantic_ref_keeps_its_name_across_snapshots_of_one_document() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_eq!(second["snapshot"]["id"], first["snapshot"]["id"], "{second}");
+    assert_eq!(named_ref(&second, "Reply"), reply);
+    assert_eq!(second["outline"], first["outline"]);
+
+    // The ref read in the first snapshot still acts after the second.
+    let clicked = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(clicked["status"], "ok", "{clicked}");
+    // It was re-read in the live page first.
+    let reread = recorded_calls(&f, "Accessibility.getPartialAXTree");
+    assert_eq!(reread.len(), 1);
+    assert_eq!(reread[0].1["backendNodeId"], 2011);
+}
+
+#[tokio::test]
+async fn a_ref_whose_node_became_another_element_is_stale_and_never_renamed() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    // The page reuses the button's node for something else.
+    f.state.lock().unwrap().renamed.insert(2011, "Delete thread".into());
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+    assert!(
+        refused["refusal"]["message"].as_str().unwrap().contains("Delete thread"),
+        "{refused}"
+    );
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty(), "nothing was clicked");
+
+    // The next snapshot gives the new element a new ref; the old one stays dead.
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_eq!(second["snapshot"]["id"], first["snapshot"]["id"]);
+    let delete = named_ref(&second, "Delete thread");
+    assert_ne!(delete, reply);
+    assert_eq!(dom_click(&f, &target, &tab, &reply).await["refusal"]["code"], "browser_ref_stale");
+    assert_eq!(dom_click(&f, &target, &tab, &delete).await["status"], "ok");
+    // Its neighbours kept their refs.
+    assert_eq!(named_ref(&second, "Reply body"), named_ref(&first, "Reply body"));
+}
+
+#[tokio::test]
+async fn a_ref_whose_node_left_the_page_is_stale_at_use_and_after_the_next_snapshot() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    f.state.lock().unwrap().removed.insert(2011);
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert!(!second["outline"].as_str().unwrap().contains("\"Reply\""), "{second}");
+    // Back in the page, the node is a new entity to this session's refs.
+    f.state.lock().unwrap().removed.clear();
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+    let third = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(named_ref(&third, "Reply"), reply);
+}
+
+#[tokio::test]
+async fn a_new_document_retires_every_semantic_ref() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    f.state.lock().unwrap().main_loader = "L_MAIN_2".into();
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(second["snapshot"]["id"], first["snapshot"]["id"], "{second}");
+    assert_ne!(named_ref(&second, "Reply"), reply, "same node id, another document");
+    assert_eq!(dom_click(&f, &target, &tab, &reply).await["refusal"]["code"], "browser_ref_stale");
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+}
+
+#[tokio::test]
+async fn a_debugger_detach_makes_every_semantic_ref_stale() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    // Detached and attached again: the node may well be the same, but the
+    // attachment that proved it is gone.
+    f.state.lock().unwrap().detached = true;
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+    assert!(
+        refused["refusal"]["message"].as_str().unwrap().contains("detached"),
+        "{refused}"
+    );
+    assert!(recorded_calls(&f, "Accessibility.getPartialAXTree").is_empty());
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(second["snapshot"]["id"], first["snapshot"]["id"], "{second}");
+    assert_eq!(dom_click(&f, &target, &tab, &reply).await["refusal"]["code"], "browser_ref_stale");
+    assert_eq!(
+        dom_click(&f, &target, &tab, &named_ref(&second, "Reply")).await["status"],
+        "ok"
+    );
+}
+
+#[tokio::test]
+async fn a_dom_refs_snapshot_replaces_the_semantic_refs_and_the_other_way_round() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let semantic = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&semantic, "Reply");
+
+    let legacy = snapshot(&f, &target, &tab).await;
+    assert_eq!(legacy["status"], "ok", "{legacy}");
+    assert_eq!(dom_click(&f, &target, &tab, &reply).await["refusal"]["code"], "browser_ref_stale");
+
+    let legacy_ref = legacy["refs"][0]["ref"].as_str().unwrap().to_owned();
+    let again = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(again["snapshot"]["id"], semantic["snapshot"]["id"]);
+    assert_eq!(
+        dom_click(&f, &target, &tab, &legacy_ref).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
+}
+
+#[tokio::test]
+async fn a_query_read_and_a_continuation_use_the_same_refs() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+    let queried = semantic_snapshot_with(&f, &target, &tab, json!({"query": "Reply"})).await;
+    assert_eq!(queried["snapshot"]["id"], first["snapshot"]["id"]);
+    assert_eq!(named_ref(&queried, "Reply"), reply);
+
+    // A node the first page did not reach gets its ref from a query, and
+    // keeps it when a later default snapshot pages to it.
+    let far = semantic_snapshot_with(&f, &target, &tab, json!({"query": "Archive item 304"})).await;
+    let far_ref = named_ref(&far, "Archive item 304");
+    let fresh = semantic_snapshot(&f, &target, &tab).await;
+    let paged = continue_to(&f, &target, &tab, fresh, "Archive item 304").await;
+    assert_eq!(named_ref(&paged, "Archive item 304"), far_ref);
+    assert_eq!(dom_click(&f, &target, &tab, &far_ref).await["status"], "ok");
 }
 
 #[tokio::test]

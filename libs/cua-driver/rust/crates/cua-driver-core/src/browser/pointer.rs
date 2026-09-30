@@ -353,7 +353,7 @@ impl BrowserPointerTool {
         }
         let cdp_session = self
             .engine
-            .frame_session_for_mutation(session, target_id, tab_id, validated, &entry.frame)
+            .frame_session_for_mutation(session, target_id, tab_id, validated, &entry)
             .await
             .map_err(|refusal| refusal.to_tool_result())?;
         Ok(ResolvedRef {

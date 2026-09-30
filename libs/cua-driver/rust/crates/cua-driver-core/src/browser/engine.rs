@@ -40,7 +40,9 @@ use super::binding::{
 use super::cdp_ws::{CdpConnection, CdpPool};
 use super::grant::{ExistingProfileGrant, ExistingProfileGrants, GrantLookup};
 use super::mutation::{MutationGates, MutationKey};
-use super::observation::{DocumentIdentity, TabRefs, ViewKind, ViewLine, ViewNode};
+use super::observation::{
+    DocumentIdentity, Fingerprint, FullReason, TabRefs, ViewKind, ViewLine, ViewNode,
+};
 use super::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, BrowserVisualAction,
     BrowserVisualActionKind, ExistingProfileSetupRequest,
@@ -49,8 +51,9 @@ use super::prepare::ManagedBrowsers;
 use super::reconnect::{ReconnectGates, ReconnectKey};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::semantic::{
-    build_dom_index, build_layout_index, compose_accessibility_tree, listed_ref, parse_viewport,
-    snapshot_document_title, OmissionCounts, SemanticDocument, SemanticNode,
+    ax_reading, build_dom_index, build_layout_index, compose_accessibility_tree, dom_reading,
+    listed_ref, parse_viewport, snapshot_document_title, OmissionCounts, SemanticDocument,
+    SemanticNode,
     DEFAULT_SEMANTIC_NODE_BUDGET, SEMANTIC_COMPUTED_STYLES,
 };
 use super::store::{
@@ -2029,12 +2032,154 @@ impl BrowserEngine {
         Ok(out)
     }
 
-    /// Re-prove a ref's frame/document identity and return the CDP
-    /// session its `backendNodeId` is valid in. Called after
-    /// [`Self::revalidate_for_mutation`], before the ref is touched.
-    /// Any identity that cannot be re-proven is a refusal, and a stale
-    /// document additionally invalidates the tab's snapshots.
+    /// Re-prove a ref before it is touched and return the CDP session its
+    /// `backendNodeId` is valid in. Called after
+    /// [`Self::revalidate_for_mutation`]. The frame's document identity is
+    /// proven for every ref; a semantic ref must also still be on the
+    /// attachment it was issued on and still read as what it named (see the
+    /// ownership table in [`super::observation`]). Anything that cannot be
+    /// proven is a refusal: a ref is never refreshed into validity here.
     pub(crate) async fn frame_session_for_mutation(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        validated: &ValidatedTab,
+        entry: &RefEntry,
+    ) -> Result<String, BrowserRefusal> {
+        let frame_session = self
+            .frame_session(session, target_id, tab_id, validated, &entry.frame)
+            .await?;
+        if !entry.semantic {
+            return Ok(frame_session);
+        }
+        if entry.attachment != Some(validated.conn.attachment(&validated.tab.cdp_target_id)) {
+            self.store
+                .invalidate_tab_refs(session, target_id, tab_id, FullReason::AttachmentChanged);
+            return Err(refuse(
+                BrowserRefusalCode::BrowserRefStale,
+                "the debugger was detached from this tab after the ref was issued, so the ref \
+                 no longer proves its element; re-run get_browser_state to re-snapshot",
+            ));
+        }
+        let live = self
+            .live_fingerprint(&validated.conn, &frame_session, entry)
+            .await?;
+        if live != Some(Fingerprint::of(entry)) {
+            return Err(refuse(
+                BrowserRefusalCode::BrowserRefStale,
+                match &live {
+                    Some(live) => format!(
+                        "the element this ref named is now {} {:?}: the page changed it after \
+                         the ref was issued; re-run get_browser_state to re-snapshot",
+                        live.role,
+                        live.name.as_deref().unwrap_or("")
+                    ),
+                    None => "the ref's node is no longer in the live page; re-run \
+                             get_browser_state to re-snapshot"
+                        .to_owned(),
+                },
+            ));
+        }
+        Ok(frame_session)
+    }
+
+    /// What a ref's node reads as right now, by the rules its snapshot used;
+    /// `None` when the node is gone.
+    async fn live_fingerprint(
+        &self,
+        conn: &CdpConnection,
+        cdp_session: &str,
+        entry: &RefEntry,
+    ) -> Result<Option<Fingerprint>, BrowserRefusal> {
+        let backend = entry.backend_node_id;
+        let accessible = match conn
+            .call(
+                Some(cdp_session),
+                "Accessibility.getPartialAXTree",
+                json!({ "backendNodeId": backend, "fetchRelatives": false }),
+            )
+            .await
+        {
+            Ok(tree) => tree
+                .get("nodes")
+                .and_then(Value::as_array)
+                .and_then(|nodes| {
+                    nodes
+                        .iter()
+                        .find(|node| node.get("backendDOMNodeId").and_then(Value::as_i64) == Some(backend))
+                })
+                .and_then(ax_reading),
+            Err(error) if is_method_unsupported(&error) => {
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    "the browser cannot report one node's accessibility data, so the ref \
+                     cannot be re-proven before it is used",
+                ))
+            }
+            // The node does not resolve; the DOM read below settles it.
+            Err(_) => None,
+        };
+        let (role, name, mut destination) = match accessible {
+            Some(reading) => reading,
+            None => {
+                let Ok(described) = conn
+                    .call(
+                        Some(cdp_session),
+                        "DOM.describeNode",
+                        json!({ "backendNodeId": backend }),
+                    )
+                    .await
+                else {
+                    return Ok(None);
+                };
+                let Some(node) = described.get("node") else {
+                    return Ok(None);
+                };
+                let (role, name) = dom_reading(node);
+                (role, name, None)
+            }
+        };
+        if destination.is_none() && entry.destination.is_some() {
+            // A link whose destination accessibility does not report: ask the
+            // element, which resolves its href as the browser would follow it.
+            destination = self.live_href(conn, cdp_session, backend).await;
+        }
+        Ok(Some(Fingerprint::read(entry, role, name, destination)))
+    }
+
+    async fn live_href(&self, conn: &CdpConnection, cdp_session: &str, backend: i64) -> Option<String> {
+        let resolved = conn
+            .call(
+                Some(cdp_session),
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend }),
+            )
+            .await
+            .ok()?;
+        let object_id = resolved.pointer("/object/objectId")?.as_str()?;
+        conn.call(
+            Some(cdp_session),
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration":
+                    "function() { return typeof this.href === 'string' ? this.href : null; }",
+                "returnByValue": true,
+            }),
+        )
+        .await
+        .ok()?
+        .pointer("/result/value")?
+        .as_str()
+        .map(str::to_owned)
+    }
+
+    /// Re-prove a ref's frame/document identity and return the CDP
+    /// session its `backendNodeId` is valid in. Any identity that cannot
+    /// be re-proven is a refusal, and a stale document additionally
+    /// invalidates the tab's snapshots.
+    async fn frame_session(
         &self,
         session: &str,
         target_id: &str,
@@ -2917,7 +3062,7 @@ impl BrowserEngine {
             .collect();
         let identity = DocumentIdentity {
             generation: record.generation,
-            attachment: 0,
+            attachment: conn.attachment(&tab.cdp_target_id),
             cdp_target_id: tab.cdp_target_id.clone(),
             root: semantic_root_identity.clone(),
         };
@@ -2933,9 +3078,10 @@ impl BrowserEngine {
                 };
                 stored_tab.url = url.clone();
                 stored_tab.title = title.clone();
-                // A new snapshot supersedes prior ones for the tab.
+                // A semantic snapshot ends any dom_refs_v1 one. Its own refs
+                // persist while the document and the attachment are proven
+                // the same (the ownership table in observation.rs).
                 stored_tab.snapshots.clear();
-                stored_tab.stable = TabRefs::default();
                 let outcome = stored_tab.stable.record(
                     &mut || self.store.mint_snapshot_id(),
                     identity,

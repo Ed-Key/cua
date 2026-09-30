@@ -1059,7 +1059,7 @@ impl Tool for BrowserClickTool {
                         &target_id,
                         &tab_id,
                         &validated,
-                        &entry.frame,
+                        &entry,
                     )
                     .await
                 {
@@ -1960,7 +1960,7 @@ impl Tool for BrowserTypeTool {
         // own session (tab, or the contained OOPIF child session).
         let cdp_session = match self
             .engine
-            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry.frame)
+            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry)
             .await
         {
             Ok(s) => s,
@@ -2896,7 +2896,7 @@ impl Tool for BrowserSetInputFilesTool {
         }
         let cdp_session = match self
             .engine
-            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry.frame)
+            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry)
             .await
         {
             Ok(session) => session,

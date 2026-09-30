@@ -40,6 +40,8 @@ pub enum CdpMethodPolicy {
 
 const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Accessibility.getFullAXTree",
+    // One node's role and name, read again before a ref is acted on.
+    "Accessibility.getPartialAXTree",
     "Browser.getWindowBounds",
     "Browser.getWindowForTarget",
     "Browser.setDownloadBehavior",
@@ -135,6 +137,10 @@ struct Demux {
     session_targets: StdMutex<HashMap<String, String>>,
     dialogs: StdMutex<HashMap<String, CdpDialogState>>,
     next_dialog_generation: AtomicU64,
+    /// Page target -> the stamp of its current debugger attachment on this
+    /// connection. Minted at the first attach, dropped when the debugger
+    /// detaches from the target; the next attach mints another.
+    attachments: StdMutex<HashMap<String, u64>>,
     closed: AtomicBool,
 }
 
@@ -149,6 +155,17 @@ impl Demux {
     /// Page again instead of trusting a dead registration or a stale dialog.
     fn observe_dialog_event(&self, event: &CdpEvent) {
         if event.method == "Target.detachedFromTarget" {
+            // The attachment ended: whatever was proven through it (page
+            // refs) is not proven through the next one. A detach that does
+            // not name its target proves nothing about any of them.
+            let mut attachments = self.attachments.lock().unwrap();
+            match event.params.get("targetId").and_then(Value::as_str) {
+                Some(target_id) => {
+                    attachments.remove(target_id);
+                }
+                None => attachments.clear(),
+            }
+            drop(attachments);
             if let Some(detached) = event.params.get("sessionId").and_then(Value::as_str) {
                 if let Some(target_id) = self.session_targets.lock().unwrap().remove(detached) {
                     let mut dialogs = self.dialogs.lock().unwrap();
@@ -210,6 +227,7 @@ impl Demux {
         self.subscribers.lock().unwrap().clear();
         self.session_targets.lock().unwrap().clear();
         self.dialogs.lock().unwrap().clear();
+        self.attachments.lock().unwrap().clear();
     }
 }
 
@@ -296,6 +314,7 @@ impl CdpConnection {
             session_targets: StdMutex::new(HashMap::new()),
             dialogs: StdMutex::new(HashMap::new()),
             next_dialog_generation: AtomicU64::new(1),
+            attachments: StdMutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
         });
         let reader = tokio::spawn(read_loop(read, demux.clone()));
@@ -337,6 +356,21 @@ impl CdpConnection {
         let (tx, rx) = mpsc::unbounded_channel();
         self.demux.subscribers.lock().unwrap().push(tx);
         rx
+    }
+
+    /// The stamp of this connection's current debugger attachment to a page
+    /// target. It is the same from one attach to the next while the debugger
+    /// stays attached, and new after a detach or on another connection, so
+    /// equality proves nothing was detached in between.
+    pub fn attachment(&self, target_id: &str) -> u64 {
+        static NEXT_ATTACHMENT: AtomicU64 = AtomicU64::new(1);
+        *self
+            .demux
+            .attachments
+            .lock()
+            .unwrap()
+            .entry(target_id.to_owned())
+            .or_insert_with(|| NEXT_ATTACHMENT.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Associate the one Page-enabled dialog session with its exact target.
@@ -844,6 +878,10 @@ mod tests {
             session_targets: StdMutex::new(HashMap::new()),
             dialogs: StdMutex::new(HashMap::new()),
             next_dialog_generation: AtomicU64::new(1),
+            attachments: StdMutex::new(HashMap::from([
+                ("T1".to_owned(), 1),
+                ("T2".to_owned(), 2),
+            ])),
             closed: AtomicBool::new(false),
         };
         let event = |method: &str, session: Option<&str>, params: serde_json::Value| CdpEvent {
@@ -1252,6 +1290,43 @@ mod tests {
         assert_eq!(second.session_id.as_deref(), Some("child-sess"));
         assert_eq!(second.params["n"], 2);
         assert!(events.try_recv().is_err(), "no phantom events");
+    }
+
+    #[tokio::test]
+    async fn a_detach_ends_the_targets_attachment_and_the_next_one_is_new() {
+        let handler: crate::browser::mock_cdp::MockHandler = Arc::new(|call| match call.method.as_str() {
+            "Detach.named" => MockReply::ok(json!({})).with_events(vec![MockEvent {
+                method: "Target.detachedFromTarget".into(),
+                session_id: None,
+                params: json!({"sessionId": "tab-session-a", "targetId": "page-a"}),
+            }]),
+            "Detach.unnamed" => MockReply::ok(json!({})).with_events(vec![MockEvent {
+                method: "Target.detachedFromTarget".into(),
+                session_id: None,
+                params: json!({"sessionId": "tab-session-b"}),
+            }]),
+            _ => MockReply::ok(json!({})),
+        });
+        let server = MockCdpServer::start(handler).await;
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        let (a, b) = (conn.attachment("page-a"), conn.attachment("page-b"));
+        assert_ne!(a, b);
+        // Attaching again while the debugger stays attached proves the same.
+        assert_eq!(conn.attachment("page-a"), a);
+
+        conn.call(None, "Detach.named", json!({})).await.unwrap();
+        let reattached = conn.attachment("page-a");
+        assert_ne!(reattached, a, "refs proven through the old attachment are stale");
+        assert_eq!(conn.attachment("page-b"), b, "another tab is untouched");
+
+        // A detach that names no target proves nothing about any of them.
+        conn.call(None, "Detach.unnamed", json!({})).await.unwrap();
+        assert_ne!(conn.attachment("page-a"), reattached);
+        assert_ne!(conn.attachment("page-b"), b);
+
+        // Another connection never shares a stamp, even for the same target.
+        let other = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        assert_ne!(other.attachment("page-a"), conn.attachment("page-a"));
     }
 
     #[tokio::test]

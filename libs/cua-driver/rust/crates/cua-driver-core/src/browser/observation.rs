@@ -87,6 +87,12 @@ impl NodeKey {
 
 /// What a ref named when it was issued. A node that now reads differently is
 /// another entity, whatever its node id.
+///
+/// The name and the link destination count only for a ref that declares an
+/// action: that is the ref an agent acts on by its name. A ref with no action
+/// only scopes reads, so a text node whose text changed is a changed line,
+/// not another entity; when such a node gains an action its fingerprint
+/// gains the name, and it gets a new ref.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct Fingerprint {
     pub(crate) role: String,
@@ -96,10 +102,26 @@ pub(crate) struct Fingerprint {
 
 impl Fingerprint {
     pub(crate) fn of(entry: &RefEntry) -> Self {
+        Self::read(
+            entry,
+            entry.node_name.clone(),
+            entry.label.clone(),
+            entry.destination.clone(),
+        )
+    }
+
+    /// The fingerprint of what `entry`'s node reads as now, by the same rule.
+    pub(crate) fn read(
+        entry: &RefEntry,
+        role: String,
+        name: Option<String>,
+        destination: Option<String>,
+    ) -> Self {
+        let acts = !entry.actions.is_empty();
         Self {
-            role: entry.node_name.clone(),
-            name: entry.label.clone(),
-            destination: entry.destination.clone(),
+            role,
+            name: name.filter(|_| acts),
+            destination: destination.filter(|_| acts),
         }
     }
 }
@@ -493,7 +515,7 @@ impl TabRefs {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::browser::store::{FrameKind, FrameRef};
+    use crate::browser::store::{BrowserActionKind, FrameKind, FrameRef};
 
     fn frame(frame_id: &str, loader_id: &str) -> FrameRef {
         FrameRef {
@@ -511,7 +533,7 @@ mod tests {
             backend_node_id,
             node_name: role.into(),
             label: Some(name.into()),
-            actions: Vec::new(),
+            actions: vec![BrowserActionKind::Click],
             visibility: None,
             semantic: true,
             frame,
@@ -520,8 +542,17 @@ mod tests {
         }
     }
 
+    /// A node that declares an action.
     fn node(backend_node_id: i64, role: &str, name: &str) -> RefEntry {
         node_in(frame("MAIN", "L1"), backend_node_id, role, name)
+    }
+
+    /// A node with no action: text or structure.
+    fn content(backend_node_id: i64, role: &str, name: &str) -> RefEntry {
+        RefEntry {
+            actions: Vec::new(),
+            ..node(backend_node_id, role, name)
+        }
     }
 
     fn identity(loader: &str, attachment: u64) -> DocumentIdentity {
@@ -716,6 +747,11 @@ mod tests {
             destination: Some("https://x.test/u/bob".into()),
         };
         assert_ne!(issued, live, "the use is refused as stale");
+        let held_entry = session.refs.resolve(space, index).unwrap();
+        assert_ne!(
+            issued,
+            Fingerprint::read(held_entry, "link".into(), Some("Bob".into()), live.destination.clone())
+        );
 
         // The next observation retires the ref instead of renaming it.
         let bob = RefEntry {
@@ -1201,6 +1237,34 @@ mod tests {
                 reason: Some(FullReason::CoverageChanged)
             }
         );
+    }
+
+    #[test]
+    fn text_that_changes_is_a_changed_line_until_it_can_be_acted_on() {
+        let mut session = Session::new(0);
+        let count = content(10, "statictext", "count = 1");
+        let first = session.observe(identity("L1", 1), &[count], None);
+        let held = keys(&first)[0].clone();
+
+        // The same text node says something else: same ref, changed line.
+        let count = content(10, "statictext", "count = 2");
+        let second = session.observe(identity("L1", 1), &[count], first.revision);
+        assert_eq!(keys(&second)[0], held);
+        assert!(
+            matches!(&second.told, Told::Diff { ops, .. } if matches!(ops[..], [DiffOp::Change { .. }])),
+            "{:?}",
+            second.told
+        );
+
+        // A disabled button named for Alice...
+        let disabled = content(20, "button", "Delete Alice");
+        let third = session.observe(identity("L1", 1), &[disabled], second.revision);
+        let disabled_ref = keys(&third)[0].clone();
+        // ...reused as an enabled button for Bob is not the ref the agent read.
+        let enabled = node(20, "button", "Delete Bob");
+        let fourth = session.observe(identity("L1", 1), &[enabled], third.revision);
+        assert_ne!(keys(&fourth)[0], disabled_ref);
+        assert!(!session.resolves(&disabled_ref));
     }
 
     #[test]

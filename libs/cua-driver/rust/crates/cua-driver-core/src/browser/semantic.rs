@@ -828,26 +828,7 @@ fn supplement_dom_actions(
         ) {
             continue;
         }
-        let role = meta
-            .attrs
-            .get("role")
-            .map(|value| value.to_ascii_lowercase())
-            .unwrap_or_else(|| match meta.tag.as_str() {
-                "a" => "link".to_owned(),
-                "button" => "button".to_owned(),
-                "input" => match meta.attrs.get("type").map(String::as_str) {
-                    Some("checkbox") => "checkbox".to_owned(),
-                    Some("radio") => "radio".to_owned(),
-                    Some("button" | "submit" | "reset" | "image") => "button".to_owned(),
-                    Some("range") => "slider".to_owned(),
-                    _ => "textbox".to_owned(),
-                },
-                "textarea" => "textbox".to_owned(),
-                "select" => "combobox".to_owned(),
-                "option" => "option".to_owned(),
-                "summary" => "summary".to_owned(),
-                _ => "generic".to_owned(),
-            });
+        let role = dom_role(&meta.tag, &meta.attrs);
         let mut states = BTreeMap::new();
         if meta.attrs.contains_key("disabled") {
             states.insert("disabled".to_owned(), Value::Bool(true));
@@ -856,10 +837,7 @@ fn supplement_dom_actions(
         if actions.is_empty() {
             continue;
         }
-        let name = ["aria-label", "placeholder", "title", "name", "id"]
-            .iter()
-            .find_map(|key| meta.attrs.get(*key).cloned())
-            .and_then(clean_semantic_text);
+        let name = dom_name(&meta.attrs);
         nodes.push(SemanticNode {
             ax_id: format!("dom-{backend_node_id}"),
             parent_ax_id: meta
@@ -883,6 +861,64 @@ fn supplement_dom_actions(
             document_order: meta.order,
         });
     }
+}
+
+/// The role a DOM node is given when it has no accessibility node.
+fn dom_role(tag: &str, attrs: &HashMap<String, String>) -> String {
+    attrs
+        .get("role")
+        .map(|value| value.to_ascii_lowercase())
+        .unwrap_or_else(|| match tag {
+            "a" => "link".to_owned(),
+            "button" => "button".to_owned(),
+            "input" => match attrs.get("type").map(String::as_str) {
+                Some("checkbox") => "checkbox".to_owned(),
+                Some("radio") => "radio".to_owned(),
+                Some("button" | "submit" | "reset" | "image") => "button".to_owned(),
+                Some("range") => "slider".to_owned(),
+                _ => "textbox".to_owned(),
+            },
+            "textarea" => "textbox".to_owned(),
+            "select" => "combobox".to_owned(),
+            "option" => "option".to_owned(),
+            "summary" => "summary".to_owned(),
+            _ => "generic".to_owned(),
+        })
+}
+
+/// The name a DOM node is given when it has no accessibility node.
+fn dom_name(attrs: &HashMap<String, String>) -> Option<String> {
+    ["aria-label", "placeholder", "title", "name", "id"]
+        .iter()
+        .find_map(|key| attrs.get(*key).cloned())
+        .and_then(clean_semantic_text)
+}
+
+/// What one accessibility node reads as, by the rules a snapshot uses: its
+/// role, name, and the link destination the node itself reports. `None` for
+/// a node accessibility ignores.
+pub(crate) fn ax_reading(ax: &Value) -> Option<(String, Option<String>, Option<String>)> {
+    if ax.get("ignored").and_then(Value::as_bool) == Some(true) {
+        return None;
+    }
+    let role = ax_value_string(ax.get("role"))
+        .unwrap_or_else(|| "unknown".to_owned())
+        .to_ascii_lowercase();
+    let name = ax_value_string(ax.get("name")).and_then(clean_semantic_text);
+    let destination = link_destination(&role, Some(ax), None);
+    Some((role, name, destination))
+}
+
+/// The same for a node as `DOM.describeNode` reports it (the DOM
+/// supplement's rules).
+pub(crate) fn dom_reading(node: &Value) -> (String, Option<String>) {
+    let tag = node
+        .get("nodeName")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    let attrs = attributes(node);
+    (dom_role(&tag, &attrs), dom_name(&attrs))
 }
 
 // Keep destination data separate from display text: text cleanup can truncate
