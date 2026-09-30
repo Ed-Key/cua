@@ -1509,7 +1509,9 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
     if let Some(generation) = panel.lifecycle.restart() {
         let finale = finish::replayed(&mut panel.verdicts);
         play_finale(panel, &key, &finale, generation);
-    } else if news == News::Proof {
+        return;
+    }
+    if news == News::Proof {
         // Proof: its finale plays once the session has been quiet for the
         // idle period from now (see `refresh`). Until then the visibility
         // poll keeps answering for the target, so a hidden panel comes back
@@ -1517,8 +1519,15 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
         let now = Instant::now();
         panel.proof_at = Some(now);
         worker.mark_delivered(&key, now);
-        dispatch_to_main_after(IDLE_HIDE_AFTER + Duration::from_millis(20), key, idle_check_cb);
+        dispatch_to_main_after(
+            IDLE_HIDE_AFTER + Duration::from_millis(20),
+            key.clone(),
+            idle_check_cb,
+        );
     }
+    // Other news can call waiting proof off (its claim now fails): an idle
+    // panel that stayed up for that proof fades now, not at the old timer.
+    refresh(state, &key);
 }
 
 /// An action as it was pushed, before its capture.
