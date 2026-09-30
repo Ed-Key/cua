@@ -3593,6 +3593,20 @@ extern "C" fn returns_no(_this: *mut AnyObject, _cmd: Sel) -> Bool {
     Bool::NO
 }
 
+/// `constrainFrameRect:toScreen:` that keeps the frame as asked. AppKit's
+/// keeps the window's top below the menu bar, and the panel window reaches
+/// far above and left of its card (see "Card stack"), so a dragged card
+/// stopped well short of the top of the screen. What stays on screen is the
+/// card: `keep_card_on_screen` brings it back inside when it is released.
+extern "C" fn unconstrained_frame(
+    _this: *mut AnyObject,
+    _cmd: Sel,
+    frame: NSRect,
+    _screen: *mut AnyObject,
+) -> NSRect {
+    frame
+}
+
 extern "C" fn accepts_first_mouse(
     _this: *mut AnyObject,
     _cmd: Sel,
@@ -3626,6 +3640,10 @@ fn panel_class() -> &'static AnyClass {
             builder.add_method(
                 sel!(canBecomeMainWindow),
                 returns_no as extern "C" fn(_, _) -> _,
+            );
+            builder.add_method(
+                sel!(constrainFrameRect:toScreen:),
+                unconstrained_frame as extern "C" fn(_, _, _, _) -> _,
             );
         })
     })
@@ -3730,6 +3748,32 @@ unsafe fn slot_origin(
         anchor,
         slot,
     )))
+}
+
+/// The visible frame of the screen the front card drawn at `front` (window
+/// coordinates) is on (`stack::card_screen`), else of the window's screen.
+unsafe fn card_visible_frame(window: *mut AnyObject, front: Area) -> Option<Area> {
+    let frame: NSRect = msg_send![window, frame];
+    let card = Area {
+        x: frame.origin.x + front.x,
+        y: frame.origin.y + front.y,
+        ..front
+    };
+    let screens = overview::screens();
+    let frames: Vec<Area> = screens
+        .iter()
+        .map(|&screen| {
+            let frame: NSRect = msg_send![screen, frame];
+            area_of(frame)
+        })
+        .collect();
+    match stack::card_screen(card, &frames) {
+        Some(index) => {
+            let visible: NSRect = msg_send![screens[index], visibleFrame];
+            Some(area_of(visible))
+        }
+        None => visible_frame_of(window),
+    }
 }
 
 /// The visible frame of the screen `window` is on (else the main screen's).
@@ -4330,7 +4374,7 @@ unsafe fn layout_front(panel: &mut Panel, (w, h): (f64, f64)) {
 unsafe fn place_bar(panel: &mut Panel, front: Area) {
     let window = panel.window as *mut AnyObject;
     let frame: NSRect = msg_send![window, frame];
-    let room_above = visible_frame_of(window)
+    let room_above = card_visible_frame(window, front)
         .map_or(f64::INFINITY, |visible| {
             visible.y + visible.h - (frame.origin.y + front.y + front.h)
         });
@@ -4793,8 +4837,6 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
         let window = window_of(this);
         let point = event_point(this, event);
         let mouse = mouse_location();
-        let max = visible_frame_of(window as *mut AnyObject)
-            .map_or(MIN_CARD, |visible| max_card((visible.w, visible.h)));
         with_state(|state| {
             let Some(panel) = panel_for(state, window) else {
                 return;
@@ -4804,6 +4846,8 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
             let card = panel.card;
             let point = panel_point(point);
             let frames = item_frames(panel);
+            let max = card_visible_frame(window as *mut AnyObject, to_window(frames[0]))
+                .map_or(MIN_CARD, |visible| max_card((visible.w, visible.h)));
             let bar = bar_area(panel).map(|bar| {
                 let (x, y) = panel_point((bar.x, bar.y));
                 Area { x, y, ..bar }
@@ -4947,17 +4991,18 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
 }
 
 /// Move the panel so its front card lies inside the visible frame of the
-/// screen its window is on, by the least distance (`stack::keep_inside`).
+/// screen the card is on (`card_visible_frame`), by the least distance
+/// (`stack::keep_inside`).
 /// The window jumps; every item glides there on the restack spring from
 /// where it was drawn (at most `LAG_ROOM` away, the room the window has).
 unsafe fn keep_card_on_screen(panel: &mut Panel) {
     let window = panel.window as *mut AnyObject;
-    let Some(visible) = visible_frame_of(window) else {
-        return;
-    };
     let frame: NSRect = msg_send![window, frame];
     let cards = back_cards(&panel.layout);
     let front = to_window(settle_frame(panel, Slot::Front, cards));
+    let Some(visible) = card_visible_frame(window, front) else {
+        return;
+    };
     let card = Area {
         x: frame.origin.x + front.x,
         y: frame.origin.y + front.y,
