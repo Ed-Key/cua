@@ -568,6 +568,18 @@ impl CdpPool {
     }
 
     /// Replace one dead grant-owned socket with exactly one new generation.
+    ///
+    /// Ownership rule: the engine advances the grant to `new_generation`
+    /// before calling this, so the pool moves the grant's claim from
+    /// `old_generation` to `new_generation` up front, before dialing, and
+    /// keeps it there whether the dial succeeds, fails, or is cancelled. The
+    /// pool therefore always holds the grant's current generation: a retry
+    /// transfers from exactly the claim the failed attempt left, and the
+    /// grant's final release (with its current generation) closes the
+    /// socket. A reconnect whose source claim is gone (released, or never
+    /// made) installs nothing, and a claim released while dialing discards
+    /// the new socket. Other sessions sharing the socket keep their claims
+    /// and move to the new socket with it.
     pub async fn reconnect_existing(
         &self,
         ws_url: &str,
@@ -575,54 +587,36 @@ impl CdpPool {
         new_generation: u64,
     ) -> anyhow::Result<Arc<CdpConnection>> {
         {
-            let conns = self.conns.lock().await;
-            if let Some(entry) = conns.get(ws_url) {
-                if !entry.holders.contains(&old_generation)
-                    && entry
-                        .generation
-                        .is_some_and(|generation| generation > old_generation)
-                {
-                    anyhow::bail!("the reconnect source generation is no longer current");
-                }
-                if entry.holders.contains(&old_generation) && !entry.conn.is_closed() {
-                    return Ok(entry.conn.clone());
-                }
+            let mut conns = self.conns.lock().await;
+            let Some(entry) = conns.get_mut(ws_url) else {
+                anyhow::bail!("the reconnect source claim was released");
+            };
+            if !entry.holders.remove(&old_generation) {
+                anyhow::bail!("the reconnect source generation is no longer current");
+            }
+            entry.holders.insert(new_generation);
+            entry.generation = entry.holders.iter().max().copied();
+            if !entry.conn.is_closed() {
+                return Ok(entry.conn.clone());
             }
         }
 
         // A WebSocket handshake can wait for browser-owned consent UI. Never
         // hold the pool mutex across that wait: grant revocation must remain
-        // able to remove the old generation when consent is refused.
+        // able to remove the claim when consent is refused.
         let conn = Arc::new(CdpConnection::connect(ws_url).await?);
         conn.restrict_to_existing_profile();
         let mut conns = self.conns.lock().await;
-        // The other sessions sharing the dead socket move to the new one with
-        // this grant; the source generation is replaced by the new one.
-        let mut holders = HashSet::new();
-        if let Some(entry) = conns.get(ws_url) {
-            if entry.holders.contains(&new_generation) && !entry.conn.is_closed() {
-                return Ok(entry.conn.clone());
-            }
-            if !entry.holders.contains(&old_generation)
-                && entry
-                    .generation
-                    .is_some_and(|generation| generation > old_generation)
-            {
-                anyhow::bail!("the reconnect source generation is no longer current");
-            }
-            holders = entry.holders.clone();
-            holders.remove(&old_generation);
+        let Some(entry) = conns
+            .get_mut(ws_url)
+            .filter(|e| e.holders.contains(&new_generation))
+        else {
+            anyhow::bail!("the reconnecting grant was released while dialing");
+        };
+        if entry.conn.is_closed() {
+            entry.conn = conn;
         }
-        holders.insert(new_generation);
-        conns.insert(
-            ws_url.to_owned(),
-            PoolEntry {
-                conn: conn.clone(),
-                generation: holders.iter().max().copied(),
-                holders,
-            },
-        );
-        Ok(conn)
+        Ok(entry.conn.clone())
     }
 
     /// Drop a (likely dead) connection so the next call redials.
@@ -895,10 +889,13 @@ mod tests {
     async fn stalled_reconnect_does_not_block_generation_release() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (finish_handshake, handshake_gate) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (first, _) = listener.accept().await.unwrap();
             let _first_ws = tokio_tungstenite::accept_async(first).await.unwrap();
-            let (_stalled_reconnect, _) = listener.accept().await.unwrap();
+            let (stalled_reconnect, _) = listener.accept().await.unwrap();
+            let _ = handshake_gate.await;
+            let _reconnect_ws = tokio_tungstenite::accept_async(stalled_reconnect).await;
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         });
         let url = format!("ws://127.0.0.1:{port}/devtools/browser/reconnect");
@@ -911,13 +908,70 @@ mod tests {
             _ = &mut reconnect => panic!("reconnect unexpectedly completed"),
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
         }
+        // The engine releases the grant's current generation, which the
+        // reconnect already claimed before dialing.
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            pool.release_existing(&url, 1),
+            pool.release_existing(&url, 2),
         )
         .await
         .expect("grant release must not wait for the reconnect handshake");
-        drop(reconnect);
+        // A handshake that completes after the release installs nothing.
+        finish_handshake.send(()).unwrap();
+        let Err(error) = reconnect.await else {
+            panic!("a released reconnect installed a socket")
+        };
+        assert!(
+            error.to_string().contains("released while dialing"),
+            "{error}"
+        );
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_retried_reconnect_leaves_only_the_current_generation_holding_the_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let _first_ws = tokio_tungstenite::accept_async(first).await.unwrap();
+            // The first reconnect's handshake fails.
+            drop(listener.accept().await.unwrap());
+            let (retry, _) = listener.accept().await.unwrap();
+            let _retry_ws = tokio_tungstenite::accept_async(retry).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/retry");
+        let pool = CdpPool::new();
+        pool.claim_existing(&url, 1).await.unwrap().demux.close();
+
+        assert!(pool.reconnect_existing(&url, 1, 2).await.is_err());
+        let live = pool.reconnect_existing(&url, 2, 3).await.unwrap();
+        assert!(!live.is_closed());
+        for stale in [1, 2] {
+            let Err(error) = pool.get_existing(&url, stale).await else {
+                panic!("phantom {stale}")
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("different connection generation"),
+                "phantom {stale}: {error}"
+            );
+        }
+        assert!(Arc::ptr_eq(
+            &live,
+            &pool.get_existing(&url, 3).await.unwrap()
+        ));
+
+        let socket = Arc::downgrade(&live);
+        drop(live);
+        pool.release_existing(&url, 3).await;
+        assert!(
+            socket.upgrade().is_none(),
+            "the final release closes the socket"
+        );
+        assert!(!endpoint_port_is_grant_owned(&url));
         server.abort();
     }
 
