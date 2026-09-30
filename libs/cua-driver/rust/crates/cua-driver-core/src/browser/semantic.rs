@@ -309,7 +309,11 @@ impl SemanticDocument {
             )
         });
 
-        let key_of = |idx: usize| self.nodes[idx].to_ref_entry().map(|entry| NodeKey::of(&entry));
+        let key_of = |idx: usize| {
+            self.nodes[idx]
+                .to_ref_entry()
+                .map(|entry| NodeKey::of(&entry))
+        };
         let start = offset.min(candidates.len());
         let mut widest = (start + node_budget.max(1)).min(candidates.len());
         let mut char_budget = char_budget;
@@ -447,7 +451,9 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
         let attrs = attributes(node);
         let hidden = inherited_hidden || statically_hidden(&attrs);
         let own_indicator = inherited_indicator
-            || attrs.get("id").is_some_and(|id| id == CUA_INDICATOR_HOST_ID);
+            || attrs
+                .get("id")
+                .is_some_and(|id| id == CUA_INDICATOR_HOST_ID);
         let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64);
         let frame_id = if node_type == 9 {
             node.get("frameId").and_then(Value::as_str)
@@ -970,7 +976,11 @@ fn link_destination(role: &str, ax: Option<&Value>, dom: Option<&DomMeta>) -> Op
     // Resolve against the containing document's base as a browser does: a
     // same-scheme reference such as "https:book" is relative, not absolute.
     // Only without a base does the href stand alone.
-    match dom.base_url.as_deref().and_then(|base| url::Url::parse(base).ok()) {
+    match dom
+        .base_url
+        .as_deref()
+        .and_then(|base| url::Url::parse(base).ok())
+    {
         Some(base) => base.join(href).ok().map(Into::into),
         None => url::Url::parse(href).ok().map(Into::into),
     }
@@ -1599,7 +1609,11 @@ fn line_template(node: &SemanticNode, depth: usize) -> String {
         line.push_str(&actions.join(","));
     }
     line.push(']');
-    if let Some(value) = node.value.as_ref().filter(|value| node.name.as_ref() != Some(value)) {
+    if let Some(value) = node
+        .value
+        .as_ref()
+        .filter(|value| node.name.as_ref() != Some(value))
+    {
         line.push_str(" = ");
         line.push_str(&quoted(value));
     }
@@ -1808,7 +1822,13 @@ mod tests {
         );
     }
 
-    fn ax_node(id: &str, parent: Option<&str>, backend: Option<i64>, role: &str, name: Option<&str>) -> Value {
+    fn ax_node(
+        id: &str,
+        parent: Option<&str>,
+        backend: Option<i64>,
+        role: &str,
+        name: Option<&str>,
+    ) -> Value {
         let mut node = json!({"nodeId": id, "ignored": false, "role": {"value": role}});
         if let Some(parent) = parent {
             node["parentId"] = json!(parent);
@@ -1839,12 +1859,24 @@ mod tests {
             // The field's inner editing box and the text in it: no DOM
             // entry, typable by state, and only repeating the field's value.
             ax_node("inner", Some("email"), Some(20), "generic", None),
-            ax_node("typed", Some("inner"), Some(21), "StaticText", Some("ada@x.com")),
+            ax_node(
+                "typed",
+                Some("inner"),
+                Some(21),
+                "StaticText",
+                Some("ada@x.com"),
+            ),
             ax_node("bullet", Some("viewer"), Some(22), "ListMarker", Some("•")),
             ax_node("role", Some("card"), Some(3), "button", Some("Role")),
             // A mock accessibility object: no DOM node at all.
             ax_node("popup", Some("role"), None, "menulistpopup", None),
-            ax_node("list", Some("popup"), Some(4), "listbox", Some("Role options")),
+            ax_node(
+                "list",
+                Some("popup"),
+                Some(4),
+                "listbox",
+                Some("Role options"),
+            ),
             ax_node("viewer", Some("list"), Some(5), "option", Some("Viewer")),
             ax_node("editor", Some("list"), Some(6), "option", Some("Editor")),
             ax_node("send", Some("card"), Some(7), "button", Some("Send invite")),
@@ -1897,13 +1929,23 @@ mod tests {
         let lines: Vec<OutlineLine> = outline.lines().filter_map(parse_outline_line).collect();
         assert_eq!(lines.len(), outline.lines().count(), "every line parses");
         assert_eq!(
-            (lines[0].role.as_str(), lines[0].name.as_deref(), lines[0].value.as_deref()),
+            (
+                lines[0].role.as_str(),
+                lines[0].name.as_deref(),
+                lines[0].value.as_deref()
+            ),
             ("textbox", Some("Email"), Some("ada@x.com"))
         );
         assert_eq!(lines[0].actions, vec!["type"]);
         assert_eq!(lines[3].reference, "p3:9");
-        assert_eq!(lines[3].line, "- option \"Viewer\" [p3:9 click] (selected)", "indent dropped");
-        assert!(lines[5].actions.is_empty(), "a disabled button declares no action");
+        assert_eq!(
+            lines[3].line, "- option \"Viewer\" [p3:9 click] (selected)",
+            "indent dropped"
+        );
+        assert!(
+            lines[5].actions.is_empty(),
+            "a disabled button declares no action"
+        );
         // A name with quotes, a bracket and a newline-free escape survives.
         let tricky = SemanticNode {
             name: Some("Say \"hi\" [now] = x".into()),
@@ -1943,9 +1985,15 @@ mod tests {
         let first = document.page(0, 300, budget, None, None);
         assert!(serialized_chars(&first.view) <= budget);
         assert!(first.selected_nodes < whole.selected_nodes);
-        assert_eq!(first.omissions.budget, whole.selected_nodes - first.selected_nodes);
+        assert_eq!(
+            first.omissions.budget,
+            whole.selected_nodes - first.selected_nodes
+        );
         let rest = document.page(first.next_offset.unwrap(), 300, usize::MAX, None, None);
-        assert_eq!(first.selected_nodes + rest.selected_nodes, whole.selected_nodes);
+        assert_eq!(
+            first.selected_nodes + rest.selected_nodes,
+            whole.selected_nodes
+        );
         // A budget too small for anything still returns one node, not nothing.
         let tiny = document.page(0, 300, 1, None, None);
         assert_eq!(tiny.selected_nodes, 1);
@@ -1972,8 +2020,18 @@ mod tests {
         let budget = serialized_chars(&cut.view);
         let mut grown = share_form();
         let longer = Some("a much longer address than before@example.com".to_owned());
-        grown.nodes.iter_mut().find(|node| node.role == "textbox").unwrap().value = longer.clone();
-        grown.nodes.iter_mut().find(|node| node.role == "statictext").unwrap().name = longer;
+        grown
+            .nodes
+            .iter_mut()
+            .find(|node| node.role == "textbox")
+            .unwrap()
+            .value = longer.clone();
+        grown
+            .nodes
+            .iter_mut()
+            .find(|node| node.role == "statictext")
+            .unwrap()
+            .name = longer;
         let refit = grown.page(0, 300, budget, None, None);
         assert!(refit.selected_nodes < cut.selected_nodes);
         let pinned = grown.page_sized(0, 300, budget, None, None, false, Some(&tail));

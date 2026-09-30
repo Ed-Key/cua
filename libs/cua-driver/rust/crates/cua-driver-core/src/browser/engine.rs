@@ -53,8 +53,7 @@ use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::semantic::{
     ax_reading, build_dom_index, build_layout_index, compose_accessibility_tree, dom_reading,
     listed_ref, parse_viewport, snapshot_document_title, OmissionCounts, SemanticDocument,
-    SemanticNode,
-    DEFAULT_SEMANTIC_NODE_BUDGET, SEMANTIC_COMPUTED_STYLES,
+    SemanticNode, DEFAULT_SEMANTIC_NODE_BUDGET, SEMANTIC_COMPUTED_STYLES,
 };
 use super::store::{
     format_ref, BrowserStore, FrameIdentity, FrameKind, FrameRef, RefEntry, SemanticCache,
@@ -472,9 +471,8 @@ const MIN_OUTLINE_CHARS: usize = 600;
 
 /// Characters the outline may take so the whole result stays in `max_chars`.
 fn outline_budget(max_chars: usize, url: &str, title: &str) -> usize {
-    let quoted = |text: &str| {
-        serde_json::to_string(text).map_or(text.len(), |json| json.chars().count())
-    };
+    let quoted =
+        |text: &str| serde_json::to_string(text).map_or(text.len(), |json| json.chars().count());
     max_chars
         .saturating_sub(SNAPSHOT_ENVELOPE_CHARS + quoted(url) + quoted(title))
         .max(MIN_OUTLINE_CHARS)
@@ -1053,9 +1051,12 @@ impl BrowserEngine {
                 &endpoint.ws_url,
                 old_generation,
                 || {
-                    let new_generation = self
-                        .existing_profile_grants
-                        .bump_generation(session, transport_session, pid, old_generation)?;
+                    let new_generation = self.existing_profile_grants.bump_generation(
+                        session,
+                        transport_session,
+                        pid,
+                        old_generation,
+                    )?;
                     self.store
                         .invalidate_endpoint_generation(pid, old_generation);
                     Ok(new_generation)
@@ -1409,7 +1410,9 @@ impl BrowserEngine {
             }
         }
         let access_class = endpoint_access_class(grant.is_some(), driver_owned, class.process_role)
-            .map_err(|refusal| existing_profile_next_call(refusal, pid, window_id, extension_connected))?;
+            .map_err(|refusal| {
+                existing_profile_next_call(refusal, pid, window_id, extension_connected)
+            })?;
 
         let native = self.native_window_checked(pid, window_id).await?;
         let fingerprint = self.platform.process_fingerprint(pid).await?;
@@ -1564,7 +1567,10 @@ impl BrowserEngine {
         use super::prepare::ExistingProfileConsent as Consent;
         matches!(
             self.existing_profile_consent(pid, window_id).await,
-            Ok((_, Consent::ExtensionInstalled | Consent::Unrestricted | Consent::LaunchGrant))
+            Ok((
+                _,
+                Consent::ExtensionInstalled | Consent::Unrestricted | Consent::LaunchGrant
+            ))
         )
     }
 
@@ -1804,7 +1810,15 @@ impl BrowserEngine {
         }
 
         let target_url = live.url.clone();
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+        let cdp_session = self
+            .attach(
+                &conn,
+                &tab.cdp_target_id,
+                session,
+                record.generation,
+                record.endpoint_transport,
+            )
+            .await?;
         let dispatch_context = crate::tool::current_dispatch_authorization_context();
         if dispatch_context
             .as_deref()
@@ -2086,8 +2100,12 @@ impl BrowserEngine {
             return Ok(frame_session);
         }
         if entry.attachment != Some(validated.conn.attachment(&validated.tab.cdp_target_id)) {
-            self.store
-                .invalidate_tab_refs(session, target_id, tab_id, FullReason::AttachmentChanged);
+            self.store.invalidate_tab_refs(
+                session,
+                target_id,
+                tab_id,
+                FullReason::AttachmentChanged,
+            );
             return Err(refuse(
                 BrowserRefusalCode::BrowserRefStale,
                 "the debugger was detached from this tab after the ref was issued, so the ref \
@@ -2137,9 +2155,9 @@ impl BrowserEngine {
                 .get("nodes")
                 .and_then(Value::as_array)
                 .and_then(|nodes| {
-                    nodes
-                        .iter()
-                        .find(|node| node.get("backendDOMNodeId").and_then(Value::as_i64) == Some(backend))
+                    nodes.iter().find(|node| {
+                        node.get("backendDOMNodeId").and_then(Value::as_i64) == Some(backend)
+                    })
                 })
                 .and_then(ax_reading),
             Err(error) if is_method_unsupported(&error) => {
@@ -2180,7 +2198,12 @@ impl BrowserEngine {
         Ok(Some(Fingerprint::read(role, name, destination)))
     }
 
-    async fn live_href(&self, conn: &CdpConnection, cdp_session: &str, backend: i64) -> Option<String> {
+    async fn live_href(
+        &self,
+        conn: &CdpConnection,
+        cdp_session: &str,
+        backend: i64,
+    ) -> Option<String> {
         let resolved = conn
             .call(
                 Some(cdp_session),
@@ -2322,7 +2345,15 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+        let cdp_session = self
+            .attach(
+                &conn,
+                &tab.cdp_target_id,
+                session,
+                record.generation,
+                record.endpoint_transport,
+            )
+            .await?;
         let metrics = conn
             .call(Some(&cdp_session), "Page.getLayoutMetrics", json!({}))
             .await
@@ -2419,7 +2450,15 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+        let cdp_session = self
+            .attach(
+                &conn,
+                &tab.cdp_target_id,
+                session,
+                record.generation,
+                record.endpoint_transport,
+            )
+            .await?;
 
         let doc = conn
             .call(
@@ -2854,7 +2893,15 @@ impl BrowserEngine {
             })?;
             if let Some(identity) = &cache.root_identity {
                 let conn = self.connection_for_record(session, &record).await?;
-                let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+                let cdp_session = self
+                    .attach(
+                        &conn,
+                        &tab.cdp_target_id,
+                        session,
+                        record.generation,
+                        record.endpoint_transport,
+                    )
+                    .await?;
                 let tree = self.local_frame_tree(&conn, &cdp_session).await.map_err(|error| {
                     match error {
                         FrameTreeError::Unsupported => refuse(
@@ -2975,10 +3022,19 @@ impl BrowserEngine {
             .lock((session.to_owned(), target_id.to_owned(), tab_id.to_owned()))
             .await;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+        let cdp_session = self
+            .attach(
+                &conn,
+                &tab.cdp_target_id,
+                session,
+                record.generation,
+                record.endpoint_transport,
+            )
+            .await?;
         // A page behind an open JavaScript dialog answers nothing: say so
         // instead of waiting for every read below to time out.
-        self.watch_dialogs(&conn, &cdp_session, &tab.cdp_target_id).await;
+        self.watch_dialogs(&conn, &cdp_session, &tab.cdp_target_id)
+            .await;
         if let Some(dialog) = conn.dialog_state(&tab.cdp_target_id) {
             return Err(dialog_open_refusal(&dialog));
         }
@@ -3443,7 +3499,11 @@ impl BrowserEngine {
         };
         match target.tabs.get(tab_id) {
             Some(tab) if !tab.snapshots.is_empty() => HeldView::DomRefs,
-            Some(tab) => match tab.stable.space().and_then(|space| space.baseline_revision()) {
+            Some(tab) => match tab
+                .stable
+                .space()
+                .and_then(|space| space.baseline_revision())
+            {
                 Some(revision) => HeldView::Semantic(revision),
                 None => HeldView::Nothing,
             },
@@ -3505,7 +3565,9 @@ pub(crate) enum Settled {
     Deadline,
     /// The document was replaced; `loaded` is false when it had not finished
     /// loading in time.
-    NewDocument { loaded: bool },
+    NewDocument {
+        loaded: bool,
+    },
     /// A JavaScript dialog is open: the page cannot be read.
     Dialog(super::cdp_ws::CdpDialogState),
 }
@@ -3565,7 +3627,6 @@ const SETTLE_COUNTER: &str = "(() => { const s = { n: 0 }; \
 const SETTLE_TAKE: &str =
     "function() { const n = this.n + this.o.takeRecords().length; this.n = 0; return n; }";
 const SETTLE_STOP: &str = "function() { this.o.disconnect(); }";
-
 
 /// Attribute names that make an element interactive-enough to ref.
 const INTERACTIVE_ATTRS: &[&str] = &["onclick", "role", "contenteditable", "tabindex", "href"];

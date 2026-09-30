@@ -269,15 +269,14 @@ fn page_changes(outcome: &SemanticSnapshotOutcome) -> PageChanges {
             page_changed,
         } => (*base_revision, ops, *page_changed),
     };
-    let op = |kind, key: &str, line: Option<&String>, after: Option<&String>, gone: bool| {
-        PageChangeOp {
+    let op =
+        |kind, key: &str, line: Option<&String>, after: Option<&String>, gone: bool| PageChangeOp {
             op: kind,
             reference: key.to_owned(),
             line: line.cloned(),
             after: after.cloned(),
             gone: gone.then_some(true),
-        }
-    };
+        };
     let diff = PageChanges {
         kind: PageChangesKind::Diff,
         reason: None,
@@ -293,12 +292,20 @@ fn page_changes(outcome: &SemanticSnapshotOutcome) -> PageChanges {
                     DiffOp::Change { key, line } => {
                         op(PageChangeOpKind::Change, key, Some(line), None, false)
                     }
-                    DiffOp::Add { key, after, line } => {
-                        op(PageChangeOpKind::Add, key, Some(line), after.as_ref(), false)
-                    }
-                    DiffOp::Move { key, after, line } => {
-                        op(PageChangeOpKind::Move, key, Some(line), after.as_ref(), false)
-                    }
+                    DiffOp::Add { key, after, line } => op(
+                        PageChangeOpKind::Add,
+                        key,
+                        Some(line),
+                        after.as_ref(),
+                        false,
+                    ),
+                    DiffOp::Move { key, after, line } => op(
+                        PageChangeOpKind::Move,
+                        key,
+                        Some(line),
+                        after.as_ref(),
+                        false,
+                    ),
                 })
                 .collect(),
         ),
@@ -427,7 +434,10 @@ async fn page_changes_after(
             return Some(changes_value(&unavailable_changes(reason, None)));
         }
     };
-    if matches!(settled, Settled::Deadline | Settled::NewDocument { loaded: false }) {
+    if matches!(
+        settled,
+        Settled::Deadline | Settled::NewDocument { loaded: false }
+    ) {
         changes["settled"] = json!(false);
     }
     Some(changes)
@@ -489,8 +499,7 @@ fn semantic_snapshot_result(
             "frames": outcome.oopif.frames(),
         },
     }));
-    if let (Some(listed), Some(structured)) =
-        (&outcome.listed, result.structured_content.as_mut())
+    if let (Some(listed), Some(structured)) = (&outcome.listed, result.structured_content.as_mut())
     {
         let (actions, content): (Vec<&Value>, Vec<&Value>) = listed
             .iter()
@@ -682,17 +691,16 @@ impl Tool for GetBrowserStateTool {
                     "scope_ref, query, continuation, max_chars, include_refs, and since_revision require snapshot_format=\"semantic_v2\"",
                 );
             }
-            let since = match args.get("since_revision") {
-                None => None,
-                Some(value) => match value.as_u64() {
-                    Some(revision) => Some(revision),
-                    None => {
-                        return ToolResult::error(
+            let since =
+                match args.get("since_revision") {
+                    None => None,
+                    Some(value) => match value.as_u64() {
+                        Some(revision) => Some(revision),
+                        None => return ToolResult::error(
                             "since_revision must be a snapshot.revision (a non-negative integer)",
-                        )
-                    }
-                },
-            };
+                        ),
+                    },
+                };
             if since.is_some()
                 && (args.opt_str("scope_ref").is_some()
                     || args.opt_str("query").is_some()
@@ -1359,7 +1367,8 @@ impl Tool for BrowserClickTool {
         // and with Chrome fully covered (8 of 8), and Finder stayed frontmost.
         if route == "trusted"
             && validated.record.cdp_window_id.is_some()
-            && validated.record.endpoint_transport != super::types::EndpointTransport::ExtensionRelay
+            && validated.record.endpoint_transport
+                != super::types::EndpointTransport::ExtensionRelay
         {
             if let Some(limitation) = self
                 .engine
@@ -1418,13 +1427,7 @@ impl Tool for BrowserClickTool {
                 }
                 let frame_session = match self
                     .engine
-                    .frame_session_for_mutation(
-                        &session,
-                        &target_id,
-                        &tab_id,
-                        &validated,
-                        &entry,
-                    )
+                    .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry)
                     .await
                 {
                     Ok(s) => s,
@@ -1580,23 +1583,22 @@ impl Tool for BrowserClickTool {
                             json!({ "backendNodeId": backend }),
                         )
                         .await;
-                    let box_model = match conn
-                        .call(
-                            Some(cdp),
-                            "DOM.getBoxModel",
-                            json!({ "backendNodeId": backend }),
-                        )
-                        .await
-                    {
-                        Ok(v) => v,
-                        Err(_) => {
-                            return BrowserRefusal::new(
+                    let box_model =
+                        match conn
+                            .call(
+                                Some(cdp),
+                                "DOM.getBoxModel",
+                                json!({ "backendNodeId": backend }),
+                            )
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(_) => return BrowserRefusal::new(
                                 BrowserRefusalCode::BrowserRefStale,
                                 "the ref's node has no layout box — it left the DOM or is hidden",
                             )
-                            .to_tool_result()
-                        }
-                    };
+                            .to_tool_result(),
+                        };
                     let Some(point) = quad_center(&box_model) else {
                         return BrowserRefusal::new(
                             BrowserRefusalCode::BrowserRefStale,
@@ -1886,8 +1888,15 @@ async fn hit_test(
         .filter(|quad| quad.len() == 8)
         .map(|quad| {
             (
-                quad.iter().step_by(2).copied().fold(f64::INFINITY, f64::min),
-                quad.iter().skip(1).step_by(2).copied().fold(f64::INFINITY, f64::min),
+                quad.iter()
+                    .step_by(2)
+                    .copied()
+                    .fold(f64::INFINITY, f64::min),
+                quad.iter()
+                    .skip(1)
+                    .step_by(2)
+                    .copied()
+                    .fold(f64::INFINITY, f64::min),
             )
         });
     let Some((bx, by)) = corner else {
@@ -2174,8 +2183,11 @@ fn inserted_at_selection(before: &EditState, text: &str) -> Option<String> {
 /// Exact values (input, textarea): is `after` the old value with `text` put
 /// in at one position, replacing nothing or one range?
 fn field_splice(before: &str, after: &str, text: &str) -> Option<Splice> {
-    let (before, after, text): (Vec<char>, Vec<char>, Vec<char>) =
-        (before.chars().collect(), after.chars().collect(), text.chars().collect());
+    let (before, after, text): (Vec<char>, Vec<char>, Vec<char>) = (
+        before.chars().collect(),
+        after.chars().collect(),
+        text.chars().collect(),
+    );
     // Characters of the old value the edit removed.
     let removed = (before.len() + text.len()).checked_sub(after.len())?;
     if removed > before.len() {
@@ -2187,7 +2199,13 @@ fn field_splice(before: &str, after: &str, text: &str) -> Option<Splice> {
                 && after[at..at + text.len()] == text[..]
                 && after[at + text.len()..] == before[at + removed..]
         })
-        .map(|_| if removed == 0 { Splice::Inserted } else { Splice::ReplacedRange })
+        .map(|_| {
+            if removed == 0 {
+                Splice::Inserted
+            } else {
+                Splice::ReplacedRange
+            }
+        })
 }
 
 /// Old values longer than this skip the range-replacement search for
@@ -2292,7 +2310,10 @@ fn truncate_value(value: &str) -> String {
 /// A value for a message: quoted, shortened, never a password.
 fn shown_value(value: &str, password: bool) -> String {
     if password {
-        format!("{} character(s) (a password; not shown)", value.chars().count())
+        format!(
+            "{} character(s) (a password; not shown)",
+            value.chars().count()
+        )
     } else {
         serde_json::to_string(&truncate_value(value)).unwrap_or_default()
     }
@@ -3047,7 +3068,8 @@ impl Tool for BrowserTypeTool {
         let outcome = 'outcome: {
             if typed.is_ok() {
                 if let Some(before) = before.as_ref() {
-                    match await_edit_readback(conn, cdp, &object_id, before, &text, edit_mode).await {
+                    match await_edit_readback(conn, cdp, &object_id, before, &text, edit_mode).await
+                    {
                         Readback::Mismatch { actual, expected } => {
                             let shown = shown_value(&actual, before.password);
                             break 'outcome ToolResult::error(format!(
@@ -3694,9 +3716,13 @@ pub(crate) mod tests {
             let got = judge_edit(&before, &after, text, mode);
             let ok = match (&want, &got) {
                 (Want::Confirmed, Readback::Confirmed(value)) => *value == after.value,
-                (Want::Mismatch(expected), Readback::Mismatch { actual, expected: got }) => {
-                    *actual == after.value && got.as_deref() == *expected
-                }
+                (
+                    Want::Mismatch(expected),
+                    Readback::Mismatch {
+                        actual,
+                        expected: got,
+                    },
+                ) => *actual == after.value && got.as_deref() == *expected,
                 (Want::Detached, Readback::Detached) => true,
                 (Want::Ambiguous, Readback::Ambiguous(value)) => *value == after.value,
                 _ => false,
@@ -3707,21 +3733,31 @@ pub(crate) mod tests {
 
     #[test]
     fn a_confirmed_insertion_always_changed_the_value() {
-        let values = ["", " ", "a", "hello", "hello ", "hello\n", "hello world", "ahello"];
+        let values = [
+            "",
+            " ",
+            "a",
+            "hello",
+            "hello ",
+            "hello\n",
+            "hello world",
+            "ahello",
+        ];
         let texts = [" ", "a", "hello", " world", "  "];
         for field in [true, false] {
             for selection in [None, Some((0, 0)), Some((5, 5))] {
                 for before in values {
                     for after in values {
                         for text in texts {
-                            let state = |value: &str, selection: Option<(usize, usize)>| EditState {
-                                value: value.to_owned(),
-                                start: selection.map(|(start, _)| start),
-                                end: selection.map(|(_, end)| end),
-                                field,
-                                password: false,
-                                connected: true,
-                            };
+                            let state =
+                                |value: &str, selection: Option<(usize, usize)>| EditState {
+                                    value: value.to_owned(),
+                                    start: selection.map(|(start, _)| start),
+                                    end: selection.map(|(_, end)| end),
+                                    field,
+                                    password: false,
+                                    connected: true,
+                                };
                             let verdict = judge_edit(
                                 &state(before, if field { selection } else { None }),
                                 &state(after, None),
@@ -3729,7 +3765,10 @@ pub(crate) mod tests {
                                 EditMode::Insert,
                             );
                             if matches!(verdict, Readback::Confirmed(_)) {
-                                assert_ne!(before, after, "{before:?} -> {after:?} typing {text:?}");
+                                assert_ne!(
+                                    before, after,
+                                    "{before:?} -> {after:?} typing {text:?}"
+                                );
                                 if !field {
                                     assert_ne!(
                                         normalize_rendered(before),
@@ -3970,17 +4009,26 @@ pub(crate) mod tests {
         };
         for changes in [
             unavailable_changes("javascript_dialog_open", Some(&dialog)),
-            page_changes(&outcome("- button \"Row\" [p7:0 click]", Told::Snapshot {
-                reason: Some(FullReason::DocumentChanged),
-            })),
+            page_changes(&outcome(
+                "- button \"Row\" [p7:0 click]",
+                Told::Snapshot {
+                    reason: Some(FullReason::DocumentChanged),
+                },
+            )),
         ] {
             let value = changes_value(&changes);
-            assert!(!value.to_string().contains("null"), "absent fields are left out: {value}");
+            assert!(
+                !value.to_string().contains("null"),
+                "absent fields are left out: {value}"
+            );
             let back: PageChanges = serde_json::from_value(value).expect("the typed contract");
             assert_eq!(back, changes);
         }
         assert_eq!(
-            changes_value(&unavailable_changes("javascript_dialog_open", Some(&dialog)))["dialog"],
+            changes_value(&unavailable_changes(
+                "javascript_dialog_open",
+                Some(&dialog)
+            ))["dialog"],
             json!({"dialog_id": "dialog-3", "kind": "confirm"})
         );
     }
@@ -3993,25 +4041,72 @@ pub(crate) mod tests {
         };
         let plain = json!({"tag": "div", "id": "", "role": "", "label": "", "text": ""});
         for (case, facts, expected) in [
-            ("the element itself, or a child of it", facts(true, false, false, plain.clone()), Hit::Receives),
-            ("its label", facts(false, false, true, plain.clone()), Hit::Receives),
-            ("the container it sits in (a closed shadow host, or no pointer events of its own)",
-             facts(false, true, false, plain.clone()), Hit::Receives),
-            ("an unrelated element with nothing to name it by",
-             facts(false, false, false, plain), Hit::Covered("div".into())),
-            ("a named overlay",
-             facts(false, false, false, json!({"tag": "span", "id": "badge", "role": "", "label": "New badge", "text": "NEW"})),
-             Hit::Covered("span#badge \"New badge\"".into())),
-            ("an overlay known by its role and text",
-             facts(false, false, false, json!({"tag": "div", "id": "", "role": "dialog", "label": "", "text": "Accept cookies?"})),
-             Hit::Covered("div (role dialog) \"Accept cookies?\"".into())),
-            ("the extension's own pill",
-             facts(false, false, false, json!({"tag": "div", "id": "cua-driver-indicator", "role": "", "label": "", "text": ""})),
-             Hit::Covered("Cua's own \"working in this tab\" pill".into())),
-            ("nothing at the point", json!({"connected": true, "hit": false}), Hit::Outside),
-            ("the node left the page", json!({"connected": false}), Hit::Gone),
+            (
+                "the element itself, or a child of it",
+                facts(true, false, false, plain.clone()),
+                Hit::Receives,
+            ),
+            (
+                "its label",
+                facts(false, false, true, plain.clone()),
+                Hit::Receives,
+            ),
+            (
+                "the container it sits in (a closed shadow host, or no pointer events of its own)",
+                facts(false, true, false, plain.clone()),
+                Hit::Receives,
+            ),
+            (
+                "an unrelated element with nothing to name it by",
+                facts(false, false, false, plain),
+                Hit::Covered("div".into()),
+            ),
+            (
+                "a named overlay",
+                facts(
+                    false,
+                    false,
+                    false,
+                    json!({"tag": "span", "id": "badge", "role": "", "label": "New badge", "text": "NEW"}),
+                ),
+                Hit::Covered("span#badge \"New badge\"".into()),
+            ),
+            (
+                "an overlay known by its role and text",
+                facts(
+                    false,
+                    false,
+                    false,
+                    json!({"tag": "div", "id": "", "role": "dialog", "label": "", "text": "Accept cookies?"}),
+                ),
+                Hit::Covered("div (role dialog) \"Accept cookies?\"".into()),
+            ),
+            (
+                "the extension's own pill",
+                facts(
+                    false,
+                    false,
+                    false,
+                    json!({"tag": "div", "id": "cua-driver-indicator", "role": "", "label": "", "text": ""}),
+                ),
+                Hit::Covered("Cua's own \"working in this tab\" pill".into()),
+            ),
+            (
+                "nothing at the point",
+                json!({"connected": true, "hit": false}),
+                Hit::Outside,
+            ),
+            (
+                "the node left the page",
+                json!({"connected": false}),
+                Hit::Gone,
+            ),
             ("no answer proves nothing", json!(true), Hit::Unknown),
-            ("nor does a malformed one", json!({"hit": true}), Hit::Unknown),
+            (
+                "nor does a malformed one",
+                json!({"hit": true}),
+                Hit::Unknown,
+            ),
         ] {
             assert_eq!(classify_hit(&facts), expected, "{case}");
         }

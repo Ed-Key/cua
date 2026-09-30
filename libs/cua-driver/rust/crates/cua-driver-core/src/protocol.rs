@@ -522,8 +522,9 @@ mod agent_instruction_tests {
     #[test]
     fn instructions_name_the_browser_flow_within_budget() {
         let instructions = agent_instructions();
-        assert!(instructions
-            .contains("Chrome: `get_browser_state` snapshot, then `browser_steps`."));
+        assert!(
+            instructions.contains("Chrome: `get_browser_state` snapshot, then `browser_steps`.")
+        );
         let words = instructions.split_whitespace().count();
         assert!(words <= 200, "instructions are {words} words");
     }

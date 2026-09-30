@@ -580,8 +580,7 @@ fn fixture_ax_tree(st: &FixtureState, is_oopif: bool, frame_id: &str) -> Value {
         }
         if st.semantic_link_urls {
             for node in tree["nodes"].as_array_mut().unwrap() {
-                if node["name"]["value"] == "Reply" || node["name"]["value"] == "Archive item 304"
-                {
+                if node["name"]["value"] == "Reply" || node["name"]["value"] == "Archive item 304" {
                     node["role"] = json!({"value":"link"});
                     node["properties"] = json!([{"name":"url","value":{"type":"string","value":"https://example.test/book?slot=1#court"}}]);
                 }
@@ -598,7 +597,10 @@ fn fixture_ax_tree(st: &FixtureState, is_oopif: bool, frame_id: &str) -> Value {
             .is_some_and(|backend| st.removed.contains(&backend))
     });
     if let Some(value) = &st.field_value {
-        for node in nodes.iter_mut().filter(|node| node["backendDOMNodeId"] == 2010) {
+        for node in nodes
+            .iter_mut()
+            .filter(|node| node["backendDOMNodeId"] == 2010)
+        {
             node["value"] = json!({ "value": value });
         }
     }
@@ -795,7 +797,9 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     Some(node) => MockReply::ok(json!({ "nodes": [node] })),
                     // Chromium answers for any live DOM node; one with no
                     // accessibility object of its own comes back ignored.
-                    None if find_dom_node(&fixture_dom(&st, is_oopif), backend.unwrap_or(0)).is_some() => {
+                    None if find_dom_node(&fixture_dom(&st, is_oopif), backend.unwrap_or(0))
+                        .is_some() =>
+                    {
                         MockReply::ok(json!({ "nodes": [{
                             "nodeId": "ignored", "ignored": true, "backendDOMNodeId": backend,
                         }] }))
@@ -1022,7 +1026,9 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 }}}))
             }
             "Runtime.callFunctionOn" => {
-                let function = call.params["functionDeclaration"].as_str().unwrap_or_default();
+                let function = call.params["functionDeclaration"]
+                    .as_str()
+                    .unwrap_or_default();
                 let digits_only = st.field_digits_only;
                 let typed = st
                     .calls
@@ -1549,7 +1555,12 @@ async fn an_existing_profile_attach_changes_its_claim_only_under_the_browser_gat
     );
     drop(gate);
     let prepared = prepare.await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     crate::session::fire_session_end(TRANSPORT);
 }
 
@@ -1567,7 +1578,12 @@ async fn a_cancelled_reprepare_never_leaves_a_claim_without_a_grant() {
         "strategy": { "kind": "existing_profile" }
     });
     let prepared = tool.invoke(request.clone()).await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let first = f
         .engine
         .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
@@ -1633,7 +1649,12 @@ async fn a_revocation_cancelled_on_a_busy_pool_still_releases_the_claim() {
             "strategy": { "kind": "existing_profile" }
         }))
         .await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let generation = f
         .engine
         .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
@@ -1674,7 +1695,10 @@ async fn a_revocation_cancelled_on_a_busy_pool_still_releases_the_claim() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert!(released, "generation {generation} kept the socket after its grant was revoked");
+    assert!(
+        released,
+        "generation {generation} kept the socket after its grant was revoked"
+    );
 }
 
 #[tokio::test]
@@ -1691,7 +1715,12 @@ async fn a_session_ended_from_a_thread_without_a_runtime_releases_its_claim() {
             "strategy": { "kind": "existing_profile" }
         }))
         .await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let generation = f
         .engine
         .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
@@ -1712,7 +1741,10 @@ async fn a_session_ended_from_a_thread_without_a_runtime_releases_its_claim() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert!(released, "generation {generation} kept the socket after its session ended");
+    assert!(
+        released,
+        "generation {generation} kept the socket after its session ended"
+    );
 }
 
 /// Forwards WebSocket connections to the mock endpoint after a delay, so a
@@ -1792,9 +1824,12 @@ async fn a_prepare_cancelled_mid_handshake_leaves_a_grant_the_next_bind_can_use(
     prepare_args["strategy"] = json!({ "kind": "existing_profile" });
     let tool = BrowserPrepareTool::new(engine.clone());
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(150), tool.invoke(prepare_args))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            tool.invoke(prepare_args)
+        )
+        .await
+        .is_err(),
         "the prepare must still be in its handshake"
     );
     assert!(
@@ -1861,14 +1896,28 @@ async fn an_explicitly_approved_grant_stays_tied_to_its_window() {
     };
     let mut prepare = args(7);
     prepare["strategy"] = json!({ "kind": "existing_profile" });
-    let prepared = BrowserPrepareTool::new(f.engine.clone()).invoke(prepare).await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
-    let first = GetBrowserStateTool::new(f.engine.clone()).invoke(args(7)).await;
+    let prepared = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(prepare)
+        .await;
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
+    let first = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(args(7))
+        .await;
     assert_eq!(structured(&first)["status"], "ok", "{}", structured(&first));
-    let second = GetBrowserStateTool::new(f.engine.clone()).invoke(args(8)).await;
+    let second = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(args(8))
+        .await;
     let second = structured(&second).clone();
     assert_eq!(second["status"], "refused", "{second}");
-    assert_eq!(second["refusal"]["code"], "browser_binding_stale", "{second}");
+    assert_eq!(
+        second["refusal"]["code"], "browser_binding_stale",
+        "{second}"
+    );
     crate::session::fire_session_end(TRANSPORT);
 }
 
@@ -1904,7 +1953,10 @@ async fn connected_extension_is_consent_for_the_extension_route_only() {
                     "strategy": { "kind": "existing_profile" }
                 }))
                 .await;
-            assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+            assert!(
+                !setup_invoked.load(Ordering::SeqCst),
+                "never the setup page"
+            );
             structured(&result).clone()
         }
     };
@@ -1946,7 +1998,12 @@ async fn connected_extension_is_consent_for_the_extension_route_only() {
             "_transport_session_id": "transport-extension-slow"
         }))
         .await;
-    assert_eq!(structured(&rebound)["status"], "ok", "{}", structured(&rebound));
+    assert_eq!(
+        structured(&rebound)["status"],
+        "ok",
+        "{}",
+        structured(&rebound)
+    );
     assert!(proxy.connections() >= 2, "the bind must have reconnected");
     crate::session::fire_session_end("transport-extension-slow");
 
@@ -1994,17 +2051,19 @@ async fn a_connected_extension_lets_the_bind_attach_without_a_prepare_step() {
     assert_eq!(bound["status"], "ok", "{bound}");
     assert_eq!(bound["endpoint_access_class"], "existing_profile_approved");
     assert_eq!(bound["endpoint_transport"], "extension_relay");
-    assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+    assert!(
+        !setup_invoked.load(Ordering::SeqCst),
+        "never the setup page"
+    );
     crate::session::fire_session_end(TRANSPORT);
 
     // The extension appears connected but its route is gone by the time the
     // bind attaches: refused, never a fallback to another endpoint.
     let platform = standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay);
-    platform
-        .route_script
-        .lock()
-        .unwrap()
-        .extend([Some(EndpointTransport::ExtensionRelay), Some(EndpointTransport::LegacyJsonVersion)]);
+    platform.route_script.lock().unwrap().extend([
+        Some(EndpointTransport::ExtensionRelay),
+        Some(EndpointTransport::LegacyJsonVersion),
+    ]);
     let setup_invoked = platform.setup_invoked.clone();
     let refused = GetBrowserStateTool::new(BrowserEngine::new(Arc::new(platform)))
         .invoke(json!({
@@ -2017,7 +2076,10 @@ async fn a_connected_extension_lets_the_bind_attach_without_a_prepare_step() {
     let refused = structured(&refused).clone();
     assert_eq!(refused["status"], "refused", "{refused}");
     assert_eq!(refused["refusal"]["code"], "browser_consent_required");
-    assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+    assert!(
+        !setup_invoked.load(Ordering::SeqCst),
+        "never the setup page"
+    );
 }
 
 #[tokio::test]
@@ -2031,7 +2093,10 @@ async fn a_shared_existing_profile_socket_outlives_one_of_its_sessions() {
     let second = pool.claim_existing(&url, 2, || true).await.unwrap();
     assert!(Arc::ptr_eq(&first, &second));
     first.register_dialog_session("sess-b", "target-b");
-    assert!(pool.get_existing(&url, 1).await.is_ok(), "an earlier claim stays usable");
+    assert!(
+        pool.get_existing(&url, 1).await.is_ok(),
+        "an earlier claim stays usable"
+    );
 
     // Ending the first session keeps the socket, and the second session's
     // dialog routing on it, alive.
@@ -2057,20 +2122,31 @@ async fn relay_tab_attach_carries_the_session_cursor_color() {
     )));
     let args = |extra: Value| {
         let mut args = json!({ "session": SESSION, "_transport_session_id": TRANSPORT });
-        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         args
     };
     let prepared = BrowserPrepareTool::new(engine.clone())
-        .invoke(args(json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } })))
+        .invoke(args(
+            json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } }),
+        ))
         .await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let bound = GetBrowserStateTool::new(engine.clone())
         .invoke(args(json!({ "pid": 1, "window_id": 7 })))
         .await;
     let bound = structured(&bound).clone();
     let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
     GetBrowserStateTool::new(engine)
-        .invoke(args(json!({ "target_id": bound["target_id"], "tab_id": tab })))
+        .invoke(args(
+            json!({ "target_id": bound["target_id"], "tab_id": tab }),
+        ))
         .await;
     let attaches: Vec<Value> = state
         .lock()
@@ -2082,7 +2158,12 @@ async fn relay_tab_attach_carries_the_session_cursor_color() {
         .collect();
     assert!(!attaches.is_empty());
     let color = cua_driver_contract::cursor::session_fill_hex(SESSION);
-    assert!(attaches.iter().all(|params| params["cuaSessionColor"] == json!(color)), "{attaches:?}");
+    assert!(
+        attaches
+            .iter()
+            .all(|params| params["cuaSessionColor"] == json!(color)),
+        "{attaches:?}"
+    );
     crate::session::fire_session_end(TRANSPORT);
 
     // A real DevTools endpoint never receives the relay-only field.
@@ -2091,29 +2172,47 @@ async fn relay_tab_attach_carries_the_session_cursor_color() {
     snapshot(&f, &target_id, &tab_id).await;
     let attaches = recorded_calls(&f, "Target.attachToTarget");
     assert!(!attaches.is_empty());
-    assert!(attaches.iter().all(|(_, params)| params.get("cuaSessionColor").is_none()));
+    assert!(attaches
+        .iter()
+        .all(|(_, params)| params.get("cuaSessionColor").is_none()));
 }
 
 /// Prepare and bind one Cua session on the relay fixture and return the
 /// relay holder its tab attaches named.
-async fn relay_bind(engine: &Arc<BrowserEngine>, state: &SharedState, session: &str, transport: &str) -> String {
+async fn relay_bind(
+    engine: &Arc<BrowserEngine>,
+    state: &SharedState,
+    session: &str,
+    transport: &str,
+) -> String {
     let attaches_before = relay_calls(state, "Target.attachToTarget").len();
     let args = |extra: Value| {
         let mut args = json!({ "session": session, "_transport_session_id": transport });
-        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         args
     };
     let prepared = BrowserPrepareTool::new(engine.clone())
-        .invoke(args(json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } })))
+        .invoke(args(
+            json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } }),
+        ))
         .await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let bound = GetBrowserStateTool::new(engine.clone())
         .invoke(args(json!({ "pid": 1, "window_id": 7 })))
         .await;
     let bound = structured(&bound).clone();
     let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
     GetBrowserStateTool::new(engine.clone())
-        .invoke(args(json!({ "target_id": bound["target_id"], "tab_id": tab })))
+        .invoke(args(
+            json!({ "target_id": bound["target_id"], "tab_id": tab }),
+        ))
         .await;
     let holders: Vec<String> = relay_calls(state, "Target.attachToTarget")
         .into_iter()
@@ -2143,7 +2242,10 @@ async fn relay_releases_eventually(state: &SharedState, holders: &[&str]) -> Vec
             .into_iter()
             .filter_map(|params| params["cuaSession"].as_str().map(str::to_owned))
             .collect();
-        if holders.iter().all(|holder| released.iter().any(|r| r == holder)) {
+        if holders
+            .iter()
+            .all(|holder| released.iter().any(|r| r == holder))
+        {
             return released;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -2174,7 +2276,10 @@ async fn a_late_release_from_an_ended_episode_never_names_the_restarted_one() {
     // End the session, start it again under the same name, and bind.
     crate::session::fire_session_end(TRANSPORT);
     let second = relay_bind(&engine, &state, EPISODE_SESSION, TRANSPORT).await;
-    assert_ne!(first, second, "each episode holds its tabs under its own name");
+    assert_ne!(
+        first, second,
+        "each episode holds its tabs under its own name"
+    );
 
     // The ended episode's release lands only now.
     super::engine::release_grant_claim(&engine.pool, &ended).await;
@@ -2479,8 +2584,10 @@ async fn cancelled_prepare_aborts_the_exact_pending_setup() {
 async fn snapshot(f: &Fixture, target_id: &str, tab_id: &str) -> Value {
     let tool = GetBrowserStateTool::new(f.engine.clone());
     let result = tool
-        .invoke(json!({ "target_id": target_id, "tab_id": tab_id, "session": SESSION,
-            "snapshot_format": "dom_refs_v1" }))
+        .invoke(
+            json!({ "target_id": target_id, "tab_id": tab_id, "session": SESSION,
+            "snapshot_format": "dom_refs_v1" }),
+        )
         .await;
     structured(&result).clone()
 }
@@ -2493,7 +2600,10 @@ fn parse_outline_line(line: &str) -> Value {
         let value = stream.next()?.ok()?;
         Some((value, &text[stream.byte_offset()..]))
     }
-    let rest = line.trim_start().strip_prefix("- ").expect("an outline line");
+    let rest = line
+        .trim_start()
+        .strip_prefix("- ")
+        .expect("an outline line");
     let (role, mut rest) = rest.split_once(' ').expect("a role and a bracket");
     let mut name = Value::Null;
     if rest.starts_with('"') {
@@ -2506,7 +2616,10 @@ fn parse_outline_line(line: &str) -> Value {
         .and_then(|rest| rest.split_once(']'))
         .expect("a ref bracket");
     let (reference, actions) = bracket.split_once(' ').unwrap_or((bracket, ""));
-    let actions: Vec<&str> = actions.split(',').filter(|action| !action.is_empty()).collect();
+    let actions: Vec<&str> = actions
+        .split(',')
+        .filter(|action| !action.is_empty())
+        .collect();
     let (mut value, mut url) = (Value::Null, Value::Null);
     if let Some(after) = rest.strip_prefix(" = ") {
         let (text, after) = quoted(after).expect("a quoted value");
@@ -2572,7 +2685,13 @@ async fn semantic_snapshot_with(f: &Fixture, target_id: &str, tab_id: &str, extr
 }
 
 /// Follow continuations from `page` until one lists an action named `name`.
-async fn continue_to(f: &Fixture, target_id: &str, tab_id: &str, mut page: Value, name: &str) -> Value {
+async fn continue_to(
+    f: &Fixture,
+    target_id: &str,
+    tab_id: &str,
+    mut page: Value,
+    name: &str,
+) -> Value {
     for _ in 0..64 {
         if page["refs"]
             .as_array()
@@ -3000,7 +3119,10 @@ async fn semantic_continuation_is_opaque_single_use_and_reaches_offscreen_conten
     let continued = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
     assert_eq!(continued["status"], "ok", "{continued}");
     assert_eq!(continued["snapshot"]["scope"], "continuation");
-    assert_eq!(continued["page"]["title"], "Current fixture title", "{continued}");
+    assert_eq!(
+        continued["page"]["title"], "Current fixture title",
+        "{continued}"
+    );
     // Each page is cut to the size budget; the last action is some pages on.
     let last = continue_to(&f, &target, &tab, continued, "Archive item 304").await;
     assert!(last["snapshot"]["continuation"].is_null(), "{last}");
@@ -3035,13 +3157,25 @@ async fn a_semantic_snapshot_is_the_default_and_fits_its_size_budget() {
         .await;
     let snapshot = structured(&default);
     assert_eq!(snapshot["snapshot"]["format"], "semantic_v2", "{snapshot}");
-    assert!(snapshot.get("refs").is_none(), "refs are inline in the outline");
-    assert!(wire_chars(&default) <= 6_000, "{} chars", wire_chars(&default));
-    assert!(snapshot["snapshot"]["continuation"].is_string(), "{snapshot}");
+    assert!(
+        snapshot.get("refs").is_none(),
+        "refs are inline in the outline"
+    );
+    assert!(
+        wire_chars(&default) <= 6_000,
+        "{} chars",
+        wire_chars(&default)
+    );
+    assert!(
+        snapshot["snapshot"]["continuation"].is_string(),
+        "{snapshot}"
+    );
     assert!(snapshot["snapshot"]["omitted"]["budget"].as_u64() > Some(0));
 
     let larger = tool
-        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION, "max_chars": 20_000}))
+        .invoke(
+            json!({"target_id": target, "tab_id": tab, "session": SESSION, "max_chars": 20_000}),
+        )
         .await;
     assert!(wire_chars(&larger) <= 20_000 && wire_chars(&larger) > 6_000);
     assert!(
@@ -3051,15 +3185,22 @@ async fn a_semantic_snapshot_is_the_default_and_fits_its_size_budget() {
 
     for bad in [json!(100), json!(1_000_000), json!("big")] {
         let refused = tool
-            .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION, "max_chars": bad}))
+            .invoke(
+                json!({"target_id": target, "tab_id": tab, "session": SESSION, "max_chars": bad}),
+            )
             .await;
         assert_eq!(refused.is_error, Some(true));
     }
     let legacy = tool
-        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION,
-            "snapshot_format": "dom_refs_v1"}))
+        .invoke(
+            json!({"target_id": target, "tab_id": tab, "session": SESSION,
+            "snapshot_format": "dom_refs_v1"}),
+        )
         .await;
-    assert!(structured(&legacy)["refs"].is_array(), "dom_refs_v1 stays available by name");
+    assert!(
+        structured(&legacy)["refs"].is_array(),
+        "dom_refs_v1 stays available by name"
+    );
 }
 
 #[tokio::test]
@@ -3071,9 +3212,15 @@ async fn include_refs_lists_the_outline_refs_for_programs_within_the_same_budget
         .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION}))
         .await;
     let listed = tool
-        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION, "include_refs": true}))
+        .invoke(
+            json!({"target_id": target, "tab_id": tab, "session": SESSION, "include_refs": true}),
+        )
         .await;
-    assert!(wire_chars(&listed) <= 6_000, "{} chars", wire_chars(&listed));
+    assert!(
+        wire_chars(&listed) <= 6_000,
+        "{} chars",
+        wire_chars(&listed)
+    );
     let listed = structured(&listed).clone();
     assert!(
         listed["snapshot"]["selected_nodes"].as_u64()
@@ -3348,7 +3495,10 @@ async fn a_semantic_ref_keeps_its_name_across_snapshots_of_one_document() {
     let reply = named_ref(&first, "Reply");
 
     let second = semantic_snapshot(&f, &target, &tab).await;
-    assert_eq!(second["snapshot"]["id"], first["snapshot"]["id"], "{second}");
+    assert_eq!(
+        second["snapshot"]["id"], first["snapshot"]["id"],
+        "{second}"
+    );
     assert_eq!(named_ref(&second, "Reply"), reply);
     assert_eq!(second["outline"], first["outline"]);
 
@@ -3369,24 +3519,40 @@ async fn a_ref_whose_node_became_another_element_is_stale_and_never_renamed() {
     let reply = named_ref(&first, "Reply");
 
     // The page reuses the button's node for something else.
-    f.state.lock().unwrap().renamed.insert(2011, "Delete thread".into());
+    f.state
+        .lock()
+        .unwrap()
+        .renamed
+        .insert(2011, "Delete thread".into());
     let refused = dom_click(&f, &target, &tab, &reply).await;
     assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
     assert!(
-        refused["refusal"]["message"].as_str().unwrap().contains("Delete thread"),
+        refused["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("Delete thread"),
         "{refused}"
     );
-    assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty(), "nothing was clicked");
+    assert!(
+        recorded_calls(&f, "Runtime.callFunctionOn").is_empty(),
+        "nothing was clicked"
+    );
 
     // The next snapshot gives the new element a new ref; the old one stays dead.
     let second = semantic_snapshot(&f, &target, &tab).await;
     assert_eq!(second["snapshot"]["id"], first["snapshot"]["id"]);
     let delete = named_ref(&second, "Delete thread");
     assert_ne!(delete, reply);
-    assert_eq!(dom_click(&f, &target, &tab, &reply).await["refusal"]["code"], "browser_ref_stale");
+    assert_eq!(
+        dom_click(&f, &target, &tab, &reply).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
     assert_eq!(dom_click(&f, &target, &tab, &delete).await["status"], "ok");
     // Its neighbours kept their refs.
-    assert_eq!(named_ref(&second, "Reply body"), named_ref(&first, "Reply body"));
+    assert_eq!(
+        named_ref(&second, "Reply body"),
+        named_ref(&first, "Reply body")
+    );
 }
 
 #[tokio::test]
@@ -3401,7 +3567,10 @@ async fn a_ref_whose_node_left_the_page_is_stale_at_use_and_after_the_next_snaps
     assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
 
     let second = semantic_snapshot(&f, &target, &tab).await;
-    assert!(!second["outline"].as_str().unwrap().contains("\"Reply\""), "{second}");
+    assert!(
+        !second["outline"].as_str().unwrap().contains("\"Reply\""),
+        "{second}"
+    );
     // Back in the page, the node is a new entity to this session's refs.
     f.state.lock().unwrap().removed.clear();
     let refused = dom_click(&f, &target, &tab, &reply).await;
@@ -3419,9 +3588,19 @@ async fn a_new_document_retires_every_semantic_ref() {
 
     f.state.lock().unwrap().main_loader = "L_MAIN_2".into();
     let second = semantic_snapshot(&f, &target, &tab).await;
-    assert_ne!(second["snapshot"]["id"], first["snapshot"]["id"], "{second}");
-    assert_ne!(named_ref(&second, "Reply"), reply, "same node id, another document");
-    assert_eq!(dom_click(&f, &target, &tab, &reply).await["refusal"]["code"], "browser_ref_stale");
+    assert_ne!(
+        second["snapshot"]["id"], first["snapshot"]["id"],
+        "{second}"
+    );
+    assert_ne!(
+        named_ref(&second, "Reply"),
+        reply,
+        "same node id, another document"
+    );
+    assert_eq!(
+        dom_click(&f, &target, &tab, &reply).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
     assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
 }
 
@@ -3438,15 +3617,24 @@ async fn a_debugger_detach_makes_every_semantic_ref_stale() {
     let refused = dom_click(&f, &target, &tab, &reply).await;
     assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
     assert!(
-        refused["refusal"]["message"].as_str().unwrap().contains("detached"),
+        refused["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("detached"),
         "{refused}"
     );
     assert!(recorded_calls(&f, "Accessibility.getPartialAXTree").is_empty());
     assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
 
     let second = semantic_snapshot(&f, &target, &tab).await;
-    assert_ne!(second["snapshot"]["id"], first["snapshot"]["id"], "{second}");
-    assert_eq!(dom_click(&f, &target, &tab, &reply).await["refusal"]["code"], "browser_ref_stale");
+    assert_ne!(
+        second["snapshot"]["id"], first["snapshot"]["id"],
+        "{second}"
+    );
+    assert_eq!(
+        dom_click(&f, &target, &tab, &reply).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
     assert_eq!(
         dom_click(&f, &target, &tab, &named_ref(&second, "Reply")).await["status"],
         "ok"
@@ -3462,7 +3650,10 @@ async fn a_dom_refs_snapshot_replaces_the_semantic_refs_and_the_other_way_round(
 
     let legacy = snapshot(&f, &target, &tab).await;
     assert_eq!(legacy["status"], "ok", "{legacy}");
-    assert_eq!(dom_click(&f, &target, &tab, &reply).await["refusal"]["code"], "browser_ref_stale");
+    assert_eq!(
+        dom_click(&f, &target, &tab, &reply).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
 
     let legacy_ref = legacy["refs"][0]["ref"].as_str().unwrap().to_owned();
     let again = semantic_snapshot(&f, &target, &tab).await;
@@ -4048,13 +4239,15 @@ async fn set_value_uses_the_native_setter_and_verifies() {
     assert_eq!(s["value"], "new");
     assert_eq!(s["replaced_chars"], 3);
     assert!(recorded_calls(&f, "Input.insertText").is_empty());
-    assert!(recorded_calls(&f, "Runtime.callFunctionOn").iter().any(|(_, params)| {
-        params["arguments"][0]["value"] == "new"
-            && params["functionDeclaration"]
-                .as_str()
-                .unwrap()
-                .contains("dispatchEvent(new view.Event('input'")
-    }));
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn")
+        .iter()
+        .any(|(_, params)| {
+            params["arguments"][0]["value"] == "new"
+                && params["functionDeclaration"]
+                    .as_str()
+                    .unwrap()
+                    .contains("dispatchEvent(new view.Event('input'")
+        }));
 }
 
 #[tokio::test]
@@ -4274,7 +4467,10 @@ impl Agent {
             .invoke_with_context(name, args, self.context.clone())
             .await;
         result.structured_content.unwrap_or_else(|| {
-            panic!("{name} returned no structured content: {:?}", result.content)
+            panic!(
+                "{name} returned no structured content: {:?}",
+                result.content
+            )
         })
     }
 
@@ -4287,7 +4483,12 @@ impl Agent {
 fn apply_changes(outline: &str, changes: &Value) -> String {
     let mut lines: Vec<(String, String)> = outline
         .lines()
-        .map(|line| (parse_outline_line(line)["ref"].as_str().unwrap().to_owned(), line.to_owned()))
+        .map(|line| {
+            (
+                parse_outline_line(line)["ref"].as_str().unwrap().to_owned(),
+                line.to_owned(),
+            )
+        })
         .collect();
     let ops = changes["ops"].as_array().expect("diff ops");
     for op in ops {
@@ -4295,8 +4496,11 @@ fn apply_changes(outline: &str, changes: &Value) -> String {
         match op["op"].as_str().unwrap() {
             "leave" | "move" => lines.retain(|(held, _)| held != key),
             "change" => {
-                lines.iter_mut().find(|(held, _)| held == key).expect("changed line").1 =
-                    op["line"].as_str().unwrap().to_owned()
+                lines
+                    .iter_mut()
+                    .find(|(held, _)| held == key)
+                    .expect("changed line")
+                    .1 = op["line"].as_str().unwrap().to_owned()
             }
             _ => {}
         }
@@ -4305,15 +4509,28 @@ fn apply_changes(outline: &str, changes: &Value) -> String {
         if matches!(op["op"].as_str(), Some("add" | "move")) {
             let at = match op["after"].as_str() {
                 None => 0,
-                Some(after) => lines.iter().position(|(held, _)| held == after).expect("anchor") + 1,
+                Some(after) => {
+                    lines
+                        .iter()
+                        .position(|(held, _)| held == after)
+                        .expect("anchor")
+                        + 1
+                }
             };
             lines.insert(
                 at,
-                (op["ref"].as_str().unwrap().to_owned(), op["line"].as_str().unwrap().to_owned()),
+                (
+                    op["ref"].as_str().unwrap().to_owned(),
+                    op["line"].as_str().unwrap().to_owned(),
+                ),
             );
         }
     }
-    lines.into_iter().map(|(_, line)| line).collect::<Vec<_>>().join("\n")
+    lines
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// Two outlines of one page state agree line for line up to where the size
@@ -4348,7 +4565,10 @@ async fn typing_returns_the_changed_line_as_a_diff_from_the_held_revision() {
     assert_eq!(typed["effect"], "confirmed", "{typed}");
     let changes = &typed["changes"];
     assert_eq!(changes["kind"], "diff", "{typed}");
-    assert_eq!(changes["base_revision"], first["snapshot"]["revision"], "{typed}");
+    assert_eq!(
+        changes["base_revision"], first["snapshot"]["revision"],
+        "{typed}"
+    );
     assert_eq!(changes["snapshot_id"], first["snapshot"]["id"]);
     let ops = changes["ops"].as_array().unwrap();
     assert_eq!(ops.len(), 1, "{typed}");
@@ -4385,7 +4605,10 @@ async fn a_click_reports_gone_and_new_elements_and_what_the_page_did_by_itself()
         state.click_renames.push((2011, "Sent".into()));
     }
     let clicked = agent
-        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
         .await;
     let changes = &clicked["changes"];
     assert_eq!(changes["kind"], "diff", "{clicked}");
@@ -4395,11 +4618,21 @@ async fn a_click_reports_gone_and_new_elements_and_what_the_page_did_by_itself()
         .filter(|op| op["op"] == "leave" && op["gone"] == true)
         .map(|op| op["ref"].as_str().unwrap())
         .collect();
-    assert!(gone.contains(&reply.as_str()), "the old button is gone: {clicked}");
-    assert_eq!(gone.len(), 2, "and so is the line the page dropped by itself: {clicked}");
+    assert!(
+        gone.contains(&reply.as_str()),
+        "the old button is gone: {clicked}"
+    );
+    assert_eq!(
+        gone.len(),
+        2,
+        "and so is the line the page dropped by itself: {clicked}"
+    );
     let added: Vec<&Value> = ops.iter().filter(|op| op["op"] == "add").collect();
     assert_eq!(added.len(), 1, "{clicked}");
-    assert!(added[0]["line"].as_str().unwrap().contains("button \"Sent\""));
+    assert!(added[0]["line"]
+        .as_str()
+        .unwrap()
+        .contains("button \"Sent\""));
     assert_ne!(added[0]["ref"], reply, "another element, another ref");
 
     let fresh = agent.snapshot().await;
@@ -4410,12 +4643,22 @@ async fn a_click_reports_gone_and_new_elements_and_what_the_page_did_by_itself()
     // The new ref acts; the old one is stale.
     let sent = added[0]["ref"].as_str().unwrap();
     let again = agent
-        .call("browser_click", json!({ "ref": sent, "input_route": "dom_event" }))
+        .call(
+            "browser_click",
+            json!({ "ref": sent, "input_route": "dom_event" }),
+        )
         .await;
     assert_eq!(again["changes"]["kind"], "diff", "{again}");
-    assert_eq!(again["changes"]["ops"], json!([]), "nothing changed this time");
+    assert_eq!(
+        again["changes"]["ops"],
+        json!([]),
+        "nothing changed this time"
+    );
     let stale = agent
-        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
         .await;
     assert_eq!(stale["error"]["code"], "browser_ref_stale", "{stale}");
 }
@@ -4435,7 +4678,10 @@ async fn navigation_returns_the_new_page_as_a_full_snapshot_with_the_reason() {
         set_page_title(&mut state, Some("Second page"));
     }
     let navigated = agent
-        .call("browser_navigate", json!({ "url": "https://fixture.test/second" }))
+        .call(
+            "browser_navigate",
+            json!({ "url": "https://fixture.test/second" }),
+        )
         .await;
     assert_eq!(navigated["status"], "ok", "{navigated}");
     let changes = &navigated["changes"];
@@ -4443,11 +4689,17 @@ async fn navigation_returns_the_new_page_as_a_full_snapshot_with_the_reason() {
     assert_eq!(changes["reason"], "document_changed");
     assert_eq!(changes["url"], "https://fixture.test/second");
     assert_eq!(changes["title"], "Second page");
-    assert!(changes["outline"].as_str().unwrap().contains("button \"Reply\""));
+    assert!(changes["outline"]
+        .as_str()
+        .unwrap()
+        .contains("button \"Reply\""));
     assert_ne!(changes["snapshot_id"], first["snapshot"]["id"]);
 
     let stale = agent
-        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
         .await;
     assert_eq!(stale["error"]["code"], "browser_ref_stale", "{stale}");
     // The snapshot in the result is a baseline like any other.
@@ -4466,10 +4718,15 @@ async fn navigation_returns_the_new_page_as_a_full_snapshot_with_the_reason() {
 async fn an_action_with_nothing_held_returns_a_full_snapshot() {
     let f = fixture_with(|st| st.semantic_large_page = true).await;
     let agent = Agent::bound(&f, "changes-nothing-held").await;
-    let clicked = agent.call("browser_click", json!({ "x": 30, "y": 40 })).await;
+    let clicked = agent
+        .call("browser_click", json!({ "x": 30, "y": 40 }))
+        .await;
     assert_eq!(clicked["changes"]["kind"], "snapshot", "{clicked}");
     assert_eq!(clicked["changes"]["reason"], "no_baseline");
-    assert!(clicked["changes"]["outline"].as_str().unwrap().contains("Reply body"));
+    assert!(clicked["changes"]["outline"]
+        .as_str()
+        .unwrap()
+        .contains("Reply body"));
 }
 
 #[tokio::test]
@@ -4477,7 +4734,10 @@ async fn a_session_on_dom_refs_gets_no_changes_and_keeps_its_refs() {
     let f = fixture().await;
     let agent = Agent::bound(&f, "changes-dom-refs").await;
     let legacy = agent
-        .call("get_browser_state", json!({ "snapshot_format": "dom_refs_v1" }))
+        .call(
+            "get_browser_state",
+            json!({ "snapshot_format": "dom_refs_v1" }),
+        )
         .await;
     let button = ref_of(&legacy, "main", "main-btn");
     for _ in 0..2 {
@@ -4498,9 +4758,15 @@ async fn a_dialog_the_click_opened_is_reported_with_its_capability_and_nothing_e
     f.state.lock().unwrap().click_opens_dialog = true;
     let started = std::time::Instant::now();
     let clicked = agent
-        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
         .await;
-    assert!(started.elapsed() < std::time::Duration::from_secs(3), "no timeout was waited out");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "no timeout was waited out"
+    );
     let changes = &clicked["changes"];
     assert_eq!(changes["kind"], "unavailable", "{clicked}");
     assert_eq!(changes["reason"], "javascript_dialog_open");
@@ -4512,21 +4778,36 @@ async fn a_dialog_the_click_opened_is_reported_with_its_capability_and_nothing_e
     assert_eq!(read["refusal"]["code"], "browser_dialog_open", "{read}");
     assert_eq!(read["refusal"]["detail"]["dialog_id"], dialog_id);
     let blocked = agent
-        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
         .await;
     assert_eq!(blocked["error"]["code"], "browser_dialog_open", "{blocked}");
-    assert!(blocked["error"]["hint"].as_str().unwrap().contains(&dialog_id));
+    assert!(blocked["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains(&dialog_id));
 
     // The capability resolves it, and the baseline held before still diffs.
     let accepted = agent
-        .call("browser_dialog", json!({ "action": "accept", "dialog_id": dialog_id }))
+        .call(
+            "browser_dialog",
+            json!({ "action": "accept", "dialog_id": dialog_id }),
+        )
         .await;
     assert_eq!(accepted["status"], "ok", "{accepted}");
     let after = agent
-        .call("browser_click", json!({ "ref": reply, "input_route": "dom_event" }))
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
         .await;
     assert_eq!(after["changes"]["kind"], "diff", "{after}");
-    assert_eq!(after["changes"]["base_revision"], first["snapshot"]["revision"]);
+    assert_eq!(
+        after["changes"]["base_revision"],
+        first["snapshot"]["revision"]
+    );
 }
 
 #[tokio::test]
@@ -4536,7 +4817,11 @@ async fn since_revision_answers_with_a_diff_only_from_the_revision_held() {
     let first = agent.snapshot().await;
     let revision = first["snapshot"]["revision"].as_u64().unwrap();
 
-    f.state.lock().unwrap().renamed.insert(2003, "Edited message".into());
+    f.state
+        .lock()
+        .unwrap()
+        .renamed
+        .insert(2003, "Edited message".into());
     let changed = agent
         .call("get_browser_state", json!({ "since_revision": revision }))
         .await;
@@ -4555,7 +4840,10 @@ async fn since_revision_answers_with_a_diff_only_from_the_revision_held() {
         .await;
     assert_eq!(stale["changes"]["kind"], "snapshot", "{stale}");
     assert_eq!(stale["changes"]["reason"], "revision_unknown");
-    assert!(stale["changes"]["outline"].as_str().unwrap().contains("Edited message"));
+    assert!(stale["changes"]["outline"]
+        .as_str()
+        .unwrap()
+        .contains("Edited message"));
 
     let refused = agent
         .registry
@@ -4566,7 +4854,11 @@ async fn since_revision_answers_with_a_diff_only_from_the_revision_held() {
             agent.context.clone(),
         )
         .await;
-    assert_eq!(refused.is_error, Some(true), "a diff is of the whole-page view only");
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "a diff is of the whole-page view only"
+    );
 }
 
 // ── browser_steps against the scripted page ─────────────────────────────────
@@ -4580,7 +4872,11 @@ async fn steps_run_as_single_tools_and_return_one_diff_for_the_batch() {
     .await;
     let agent = Agent::bound(&f, "steps-real").await;
     let first = agent.snapshot().await;
-    f.state.lock().unwrap().click_renames.push((2011, "Sent".into()));
+    f.state
+        .lock()
+        .unwrap()
+        .click_renames
+        .push((2011, "Sent".into()));
     let reads_before = recorded_calls(&f, "Accessibility.getFullAXTree").len();
 
     let output = agent
@@ -4596,15 +4892,22 @@ async fn steps_run_as_single_tools_and_return_one_diff_for_the_batch() {
     assert_eq!(output["status"], "completed", "{output}");
     let outcomes = output["steps"].as_array().unwrap();
     assert_eq!(outcomes[0]["effect"], "confirmed", "{output}");
-    assert_eq!(outcomes[1]["ref"], named_ref(&first, "Reply"), "resolved to the ref held");
+    assert_eq!(
+        outcomes[1]["ref"],
+        named_ref(&first, "Reply"),
+        "resolved to the ref held"
+    );
 
     // One diff, from the revision held before the batch, with both steps in it.
     let changes = &output["changes"];
     assert_eq!(changes["kind"], "diff", "{output}");
     assert_eq!(changes["base_revision"], first["snapshot"]["revision"]);
     let ops = changes["ops"].as_array().unwrap();
-    assert!(ops.iter().any(|op| op["op"] == "change"
-        && op["line"].as_str().unwrap().contains("= \"hello\"")), "{output}");
+    assert!(
+        ops.iter()
+            .any(|op| op["op"] == "change" && op["line"].as_str().unwrap().contains("= \"hello\"")),
+        "{output}"
+    );
     assert!(ops.iter().any(|op| op["op"] == "add"
         && op["line"].as_str().unwrap().contains("button \"Sent\"")), "{output}");
     assert!(output.to_string().chars().count() < 1_500, "{output}");
@@ -4618,7 +4921,10 @@ async fn steps_run_as_single_tools_and_return_one_diff_for_the_batch() {
         .count();
     assert_eq!(reads, 3, "aim, expect, final");
     // Both steps re-read their own node before acting on it.
-    assert_eq!(recorded_calls(&f, "Accessibility.getPartialAXTree").len(), 2);
+    assert_eq!(
+        recorded_calls(&f, "Accessibility.getPartialAXTree").len(),
+        2
+    );
 }
 
 #[tokio::test]
@@ -4672,10 +4978,19 @@ async fn a_dialog_stops_a_real_batch_and_the_capability_resolves_it() {
         )
         .await;
     assert_eq!(output["status"], "stopped", "{output}");
-    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(1), &json!("javascript_dialog_open")));
-    let dialog_id = output["changes"]["dialog"]["dialog_id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(1), &json!("javascript_dialog_open"))
+    );
+    let dialog_id = output["changes"]["dialog"]["dialog_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
     let accepted = agent
-        .call("browser_dialog", json!({ "action": "accept", "dialog_id": dialog_id }))
+        .call(
+            "browser_dialog",
+            json!({ "action": "accept", "dialog_id": dialog_id }),
+        )
         .await;
     assert_eq!(accepted["status"], "ok", "{accepted}");
 }
@@ -4736,13 +5051,22 @@ async fn every_step_and_read_of_a_batch_is_admitted_as_its_own_tool() {
         )
         .await;
     assert_eq!(output["status"], "stopped", "{output}");
-    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(2), &json!("step_failed")));
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(2), &json!("step_failed"))
+    );
     assert_eq!(output["steps"][0]["status"], "ok", "{output}");
     assert_eq!(output["steps"][1]["code"], "permission_denied", "{output}");
-    assert!(output["steps"][1].get("retryable").is_none(), "nothing was typed");
+    assert!(
+        output["steps"][1].get("retryable").is_none(),
+        "nothing was typed"
+    );
     assert!(recorded_calls(&f, "Input.insertText").is_empty());
     assert_eq!(output["steps"].as_array().unwrap().len(), 2);
-    assert_eq!(output["changes"]["kind"], "diff", "reading is allowed here: {output}");
+    assert_eq!(
+        output["changes"]["kind"], "diff",
+        "reading is allowed here: {output}"
+    );
 
     // Steps and clicks allowed, reading not: a step aimed by role and name
     // cannot be aimed, and what the batch changed cannot be told. No read
@@ -4776,7 +5100,10 @@ async fn every_step_and_read_of_a_batch_is_admitted_as_its_own_tool() {
     // And the batch tool itself is a tool like any other.
     agent.context = allowing("get_browser_state, browser_click, browser_type");
     let refused = agent
-        .call("browser_steps", json!({ "steps": [{"action": "click", "ref": reply}] }))
+        .call(
+            "browser_steps",
+            json!({ "steps": [{"action": "click", "ref": reply}] }),
+        )
         .await;
     assert_eq!(refused["refusal"]["code"], "permission_denied", "{refused}");
 }
@@ -4803,17 +5130,28 @@ async fn a_step_that_navigates_stops_the_batch_and_the_result_is_the_new_page() 
         )
         .await;
     assert_eq!(output["status"], "stopped", "{output}");
-    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(2), &json!("document_changed")));
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(2), &json!("document_changed"))
+    );
     assert_eq!(output["steps"].as_array().unwrap().len(), 1);
     let clicks = recorded_calls(&f, "Runtime.callFunctionOn")
         .iter()
-        .filter(|(_, params)| params["functionDeclaration"].as_str().unwrap_or_default().contains("this.click()"))
+        .filter(|(_, params)| {
+            params["functionDeclaration"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("this.click()")
+        })
         .count();
     assert_eq!(clicks, 1, "only the first step clicked");
     let changes = &output["changes"];
     assert_eq!(changes["kind"], "snapshot", "{output}");
     assert_eq!(changes["reason"], "document_changed");
-    assert!(changes["outline"].as_str().unwrap().contains("The next page"));
+    assert!(changes["outline"]
+        .as_str()
+        .unwrap()
+        .contains("The next page"));
     assert_ne!(changes["snapshot_id"], first["snapshot"]["id"]);
 }
 
@@ -4824,7 +5162,10 @@ async fn a_single_click_that_navigates_returns_the_new_page_not_a_diff_of_the_ol
     let first = agent.snapshot().await;
     f.state.lock().unwrap().click_navigates = Some("L_MAIN_2".into());
     let clicked = agent
-        .call("browser_click", json!({ "ref": named_ref(&first, "Reply"), "input_route": "dom_event" }))
+        .call(
+            "browser_click",
+            json!({ "ref": named_ref(&first, "Reply"), "input_route": "dom_event" }),
+        )
         .await;
     assert_eq!(clicked["changes"]["kind"], "snapshot", "{clicked}");
     assert_eq!(clicked["changes"]["reason"], "document_changed");
@@ -4846,9 +5187,15 @@ async fn a_trusted_click_on_a_covered_ref_is_refused_and_names_what_covers_it() 
         .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
         .await;
     let refused = structured(&refused);
-    assert_eq!(refused["refusal"]["code"], "browser_target_covered", "{refused}");
+    assert_eq!(
+        refused["refusal"]["code"], "browser_target_covered",
+        "{refused}"
+    );
     assert!(
-        refused["refusal"]["message"].as_str().unwrap().contains("div#cookie-banner (role dialog) \"Accept cookies?\""),
+        refused["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("div#cookie-banner (role dialog) \"Accept cookies?\""),
         "{refused}"
     );
     assert_eq!(refused["refusal"]["detail"]["click_sent"], false);
@@ -4859,7 +5206,12 @@ async fn a_trusted_click_on_a_covered_ref_is_refused_and_names_what_covers_it() 
     // It was looked at twice: before and after the scroll and the beat.
     let looks = recorded_calls(&f, "Runtime.callFunctionOn")
         .iter()
-        .filter(|(_, params)| params["functionDeclaration"].as_str().unwrap().contains("elementFromPoint"))
+        .filter(|(_, params)| {
+            params["functionDeclaration"]
+                .as_str()
+                .unwrap()
+                .contains("elementFromPoint")
+        })
         .count();
     assert_eq!(looks, 2);
     assert_eq!(recorded_calls(&f, "DOM.scrollIntoViewIfNeeded").len(), 2);
@@ -4889,7 +5241,9 @@ async fn a_coordinate_click_and_a_dom_event_click_are_not_hit_tested() {
     let click = BrowserClickTool::new(f.engine.clone());
     // The caller named a point, not an element: there is no target to be covered.
     let by_point = click
-        .invoke(json!({"target_id": target, "tab_id": tab, "x": 105.0, "y": 105.0, "session": SESSION}))
+        .invoke(
+            json!({"target_id": target, "tab_id": tab, "x": 105.0, "y": 105.0, "session": SESSION}),
+        )
         .await;
     assert_eq!(structured(&by_point)["status"], "ok");
     // A DOM click is dispatched on the element itself, whatever is on top.
@@ -4900,5 +5254,8 @@ async fn a_coordinate_click_and_a_dom_event_click_are_not_hit_tested() {
     assert_eq!(structured(&synthetic)["status"], "ok");
     assert!(recorded_calls(&f, "Runtime.callFunctionOn")
         .iter()
-        .all(|(_, params)| !params["functionDeclaration"].as_str().unwrap().contains("elementFromPoint")));
+        .all(|(_, params)| !params["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("elementFromPoint")));
 }

@@ -231,7 +231,14 @@ pub struct TabRecord {
 
 impl TabRecord {
     /// A tab as the bind found it, with nothing observed yet.
-    pub fn new(tab_id: String, cdp_target_id: String, title: String, url: String, active: Option<bool>, generation: u64) -> Self {
+    pub fn new(
+        tab_id: String,
+        cdp_target_id: String,
+        title: String,
+        url: String,
+        active: Option<bool>,
+        generation: u64,
+    ) -> Self {
         Self {
             tab_id,
             cdp_target_id,
@@ -585,29 +592,26 @@ mod tests {
                     attachment: None,
                 },
             );
-            rec.tabs.insert(
-                tab_id.clone(),
-                {
-                    let mut tab = TabRecord::new(
-                        tab_id.clone(),
-                        "CDP1".into(),
-                        "Example".into(),
-                        "https://example.test".into(),
-                        Some(true),
-                        0,
-                    );
-                    tab.snapshots.insert(
-                        snap_id,
-                        SnapshotRecord {
-                            id: snap_id,
-                            generation: 0,
-                            url: "https://example.test".into(),
-                            refs,
-                        },
-                    );
-                    tab
-                },
-            );
+            rec.tabs.insert(tab_id.clone(), {
+                let mut tab = TabRecord::new(
+                    tab_id.clone(),
+                    "CDP1".into(),
+                    "Example".into(),
+                    "https://example.test".into(),
+                    Some(true),
+                    0,
+                );
+                tab.snapshots.insert(
+                    snap_id,
+                    SnapshotRecord {
+                        id: snap_id,
+                        generation: 0,
+                        url: "https://example.test".into(),
+                        refs,
+                    },
+                );
+                tab
+            });
         });
         (store, tid, tab_id, ext)
     }
@@ -769,7 +773,10 @@ mod tests {
         assert_eq!(entry.backend_node_id, 555);
         assert_eq!(entry.attachment, Some(9), "issued on this attachment");
         assert_eq!(
-            store.resolve_ref("sess-b", &tid, &tab, &ext).unwrap_err().code,
+            store
+                .resolve_ref("sess-b", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
             BrowserRefusalCode::BrowserBindingStale
         );
         // A rebound window is another target: the ref is not valid there.
@@ -789,14 +796,20 @@ mod tests {
         let (store, tid, tab, ext) = store_with_semantic_ref();
         store.remove_session("sess-a");
         assert_eq!(
-            store.resolve_ref("sess-a", &tid, &tab, &ext).unwrap_err().code,
+            store
+                .resolve_ref("sess-a", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
             BrowserRefusalCode::BrowserBindingStale
         );
 
         let (store, tid, tab, ext) = store_with_semantic_ref();
         assert_eq!(store.invalidate_endpoint_generation(42, 3), 1);
         assert_eq!(
-            store.resolve_ref("sess-a", &tid, &tab, &ext).unwrap_err().code,
+            store
+                .resolve_ref("sess-a", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
             BrowserRefusalCode::BrowserBindingStale
         );
     }
@@ -806,7 +819,10 @@ mod tests {
         let (store, tid, tab, ext) = store_with_semantic_ref();
         store.update_target("sess-a", &tid, |rec| rec.generation = 4);
         assert_eq!(
-            store.resolve_ref("sess-a", &tid, &tab, &ext).unwrap_err().code,
+            store
+                .resolve_ref("sess-a", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
             BrowserRefusalCode::BrowserRefStale
         );
     }
@@ -817,7 +833,10 @@ mod tests {
         let (store, tid, tab, ext) = store_with_semantic_ref();
         store.invalidate_tab_refs("sess-a", &tid, &tab, FullReason::AttachmentChanged);
         assert_eq!(
-            store.resolve_ref("sess-a", &tid, &tab, &ext).unwrap_err().code,
+            store
+                .resolve_ref("sess-a", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
             BrowserRefusalCode::BrowserRefStale
         );
     }
