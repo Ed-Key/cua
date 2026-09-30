@@ -166,6 +166,22 @@ impl ExistingProfileGrants {
         GrantLookup::Live(grant.clone())
     }
 
+    /// Whether the grant for this key is live at exactly `generation`.
+    pub fn is_current(
+        &self,
+        public_session: &str,
+        transport_session: Option<&str>,
+        pid: i64,
+        generation: u64,
+    ) -> bool {
+        let key = Self::key(public_session, transport_session, pid);
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|grant| grant.generation == generation)
+    }
+
     pub fn revoke(
         &self,
         public_session: &str,

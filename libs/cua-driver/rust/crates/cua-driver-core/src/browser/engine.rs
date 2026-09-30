@@ -832,36 +832,14 @@ impl BrowserEngine {
         }
     }
 
-    /// Release one grant's claim on its browser socket. Through the extension
-    /// relay the socket may be shared with other Cua sessions, so the relay
-    /// is first told this session's tabs are released; the socket itself
-    /// closes only when its last grant releases it.
-    ///
-    /// The release runs as its own task, awaited here: the grant has already
-    /// left the registry (or is being replaced), so a caller cancelled while
-    /// the pool lock is busy must not strand a claim no grant will release.
+    /// Release a grant that has already left the registry (see
+    /// [`release_grant_claim`]). The release runs as its own task, awaited
+    /// here, so a caller cancelled while the pool lock is busy cannot strand
+    /// a claim that no grant will release.
     pub(crate) async fn release_grant_socket(&self, grant: &ExistingProfileGrant) {
         let pool = self.pool.clone();
         let grant = grant.clone();
-        let _ = tokio::spawn(async move {
-            if super::extension_relay::is_relay_url(&grant.endpoint_ws_url) {
-                if let Ok(conn) = pool
-                    .get_existing(&grant.endpoint_ws_url, grant.generation)
-                    .await
-                {
-                    let _ = conn
-                        .call(
-                            None,
-                            "Cua.releaseSession",
-                            json!({ "cuaSession": grant.public_session }),
-                        )
-                        .await;
-                }
-            }
-            pool.release_existing(&grant.endpoint_ws_url, grant.generation)
-                .await;
-        })
-        .await;
+        let _ = tokio::spawn(async move { release_grant_claim(&pool, &grant).await }).await;
     }
 
     pub(crate) async fn connect(&self, ws_url: &str) -> Result<Arc<CdpConnection>, BrowserRefusal> {
@@ -3022,6 +3000,29 @@ fn collect_interactive(
             .and_then(Value::as_str);
         collect_interactive(content_document, child_frame_id, false, out);
     }
+}
+
+/// Release one grant's claim on its browser socket. Through the extension
+/// relay the socket may be shared with other Cua sessions, so the relay is
+/// first told this session's tabs are released; the socket itself closes only
+/// when its last grant releases it.
+pub(crate) async fn release_grant_claim(pool: &CdpPool, grant: &ExistingProfileGrant) {
+    if super::extension_relay::is_relay_url(&grant.endpoint_ws_url) {
+        if let Ok(conn) = pool
+            .get_existing(&grant.endpoint_ws_url, grant.generation)
+            .await
+        {
+            let _ = conn
+                .call(
+                    None,
+                    "Cua.releaseSession",
+                    json!({ "cuaSession": grant.public_session }),
+                )
+                .await;
+        }
+    }
+    pool.release_existing(&grant.endpoint_ws_url, grant.generation)
+        .await;
 }
 
 #[cfg(test)]

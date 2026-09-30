@@ -1250,7 +1250,7 @@ async fn approved_existing_profile_attach_claims_then_binds_one_generation() {
 }
 
 #[tokio::test]
-async fn an_existing_profile_attach_changes_its_claim_only_under_the_endpoint_gate() {
+async fn an_existing_profile_attach_changes_its_claim_only_under_the_browser_gate() {
     const TRANSPORT: &str = "transport-v2-attach-gate";
     let (f, _provider) = protected_existing_profile_fixture().await;
     let fingerprint = f.engine.platform.process_fingerprint(1).await.unwrap();
@@ -1273,7 +1273,7 @@ async fn an_existing_profile_attach_changes_its_claim_only_under_the_endpoint_ga
         tokio::time::timeout(std::time::Duration::from_millis(300), &mut prepare)
             .await
             .is_err(),
-        "the attach must wait for the endpoint gate"
+        "the attach must wait for the browser gate"
     );
     assert!(
         f.engine
@@ -1332,8 +1332,20 @@ async fn a_cancelled_reprepare_never_leaves_a_claim_without_a_grant() {
     );
     holder.abort();
     let _ = holder.await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
 
-    // Whatever grant survived, releasing it releases every claim.
+    // The cancelled re-prepare changed nothing: the first grant is still
+    // registered and still holds its claim.
+    let surviving = f
+        .engine
+        .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(surviving.generation, first);
+    assert!(f.engine.pool.get_existing(&url, first).await.is_ok());
+
+    // Releasing it releases every claim.
     f.engine
         .revoke_existing_profile_grant(SESSION, Some(TRANSPORT), 1)
         .await;
@@ -1615,8 +1627,8 @@ async fn a_shared_existing_profile_socket_outlives_one_of_its_sessions() {
     let url = server.ws_url();
     let pool = super::cdp_ws::CdpPool::new();
     // Two Cua sessions' grants claim the same browser socket.
-    let first = pool.claim_existing(&url, 1).await.unwrap();
-    let second = pool.claim_existing(&url, 2).await.unwrap();
+    let first = pool.claim_existing(&url, 1, || true).await.unwrap();
+    let second = pool.claim_existing(&url, 2, || true).await.unwrap();
     assert!(Arc::ptr_eq(&first, &second));
     first.register_dialog_session("sess-b", "target-b");
     assert!(pool.get_existing(&url, 1).await.is_ok(), "an earlier claim stays usable");

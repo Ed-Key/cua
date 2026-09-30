@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::engine::unsupported_engine_refusal;
+use super::engine::{release_grant_claim, unsupported_engine_refusal};
 use super::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, ExistingProfileSetupOutcome,
     ExistingProfileSetupRequest, IsolatedBrowserProcess, PrepareAction, PrepareAttachment,
@@ -1151,11 +1151,12 @@ impl BrowserEngine {
             || previous_grant
                 .as_ref()
                 .is_some_and(|grant| grant.cleanup_remote_debugging);
-        // Release the previous claim before minting its replacement: a
-        // cancellation between the two then leaves a grant without a claim
-        // (released harmlessly), never a claim without a grant.
+        // Release the previous claim before minting its replacement, so a
+        // cancellation never leaves a claim without a registered grant.
         if let Some(previous) = previous_grant {
-            self.release_grant_socket(&previous).await;
+            // Not detached: the previous grant is still registered, so a
+            // cancelled release must leave its claim in place with it.
+            release_grant_claim(&self.pool, &previous).await;
             if let Some(protected) = previous.protected_consent.as_ref() {
                 self.approval_broker.revoke(protected).await;
             }
@@ -1177,7 +1178,14 @@ impl BrowserEngine {
         );
         let (claimed, displayed_consent_prompt) = {
             let ws_url = endpoint.ws_url.clone();
-            let mut claim = Box::pin(self.pool.claim_existing(&ws_url, grant.generation));
+            let mut claim = Box::pin(self.pool.claim_existing(&ws_url, grant.generation, || {
+                self.existing_profile_grants.is_current(
+                    &request.session,
+                    request.transport_session.as_deref(),
+                    pid,
+                    grant.generation,
+                )
+            }));
             // The extension route never raises Chrome's remote-debugging prompt,
             // so a slow claim there must not press Allow on some other client's.
             let prompt_possible =
@@ -1234,7 +1242,15 @@ impl BrowserEngine {
         let (claimed, initial_claim_error) = retry_claim_after_accepted_consent(
             claimed,
             displayed_consent_prompt,
-            self.pool.claim_existing(&endpoint.ws_url, grant.generation),
+            self.pool
+                .claim_existing(&endpoint.ws_url, grant.generation, || {
+                    self.existing_profile_grants.is_current(
+                        &request.session,
+                        request.transport_session.as_deref(),
+                        pid,
+                        grant.generation,
+                    )
+                }),
         )
         .await;
         if let Err(_final_claim_error) = claimed {

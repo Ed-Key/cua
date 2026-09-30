@@ -517,10 +517,14 @@ impl CdpPool {
 
     /// Convert the one live browser-level socket into grant-owned state. This
     /// does not redial and therefore cannot create a second consent prompt.
+    /// `is_live` is checked under the pool lock just before the claim is
+    /// recorded: a grant released meanwhile (its release queues behind this
+    /// lock) must not gain a claim that nothing will release.
     pub async fn claim_existing(
         &self,
         ws_url: &str,
         generation: u64,
+        is_live: impl FnOnce() -> bool,
     ) -> anyhow::Result<Arc<CdpConnection>> {
         let port = loopback_port(ws_url)
             .ok_or_else(|| anyhow::anyhow!("existing-profile endpoint has no loopback port"))?;
@@ -530,6 +534,9 @@ impl CdpPool {
             Some(_) => anyhow::bail!("the approved browser socket closed before it was claimed"),
             None => (Arc::new(CdpConnection::connect(ws_url).await?), HashSet::new()),
         };
+        if !is_live() {
+            anyhow::bail!("the claiming grant was released");
+        }
         conn.restrict_to_existing_profile();
         holders.insert(generation);
         conns.insert(
@@ -823,7 +830,7 @@ mod tests {
         let url = server.ws_url();
         let pool = CdpPool::new();
         let initial = pool.get(&url).await.unwrap();
-        let claimed = pool.claim_existing(&url, 1).await.unwrap();
+        let claimed = pool.claim_existing(&url, 1, || true).await.unwrap();
         assert!(Arc::ptr_eq(&initial, &claimed), "claim must not redial");
         assert_eq!(
             claimed.method_policy(),
@@ -891,7 +898,7 @@ mod tests {
         let url = server.ws_url();
         {
             let pool = CdpPool::new();
-            pool.claim_existing(&url, 1).await.unwrap();
+            pool.claim_existing(&url, 1, || true).await.unwrap();
             assert!(endpoint_port_is_grant_owned(&url));
         }
         assert!(!endpoint_port_is_grant_owned(&url));
@@ -903,8 +910,8 @@ mod tests {
         let url = server.ws_url();
         let first = CdpPool::new();
         let second = CdpPool::new();
-        first.claim_existing(&url, 1).await.unwrap();
-        second.claim_existing(&url, 2).await.unwrap();
+        first.claim_existing(&url, 1, || true).await.unwrap();
+        second.claim_existing(&url, 2, || true).await.unwrap();
 
         drop(first);
         assert!(endpoint_port_is_grant_owned(&url));
@@ -927,7 +934,7 @@ mod tests {
         });
         let url = format!("ws://127.0.0.1:{port}/devtools/browser/reconnect");
         let pool = CdpPool::new();
-        let claimed = pool.claim_existing(&url, 1).await.unwrap();
+        let claimed = pool.claim_existing(&url, 1, || true).await.unwrap();
         claimed.demux.close();
 
         let mut reconnect = Box::pin(pool.reconnect_existing(&url, 1, || Ok::<_, ()>(2)));
@@ -970,7 +977,7 @@ mod tests {
         });
         let url = format!("ws://127.0.0.1:{port}/devtools/browser/retry");
         let pool = CdpPool::new();
-        pool.claim_existing(&url, 1).await.unwrap().demux.close();
+        pool.claim_existing(&url, 1, || true).await.unwrap().demux.close();
 
         assert!(pool.reconnect_existing(&url, 1, || Ok::<_, ()>(2)).await.unwrap().is_err());
         let live = pool.reconnect_existing(&url, 2, || Ok::<_, ()>(3)).await.unwrap().unwrap();
@@ -1007,7 +1014,7 @@ mod tests {
         let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
         let url = server.ws_url();
         let pool = StdArc::new(CdpPool::new());
-        pool.claim_existing(&url, 1).await.unwrap().demux.close();
+        pool.claim_existing(&url, 1, || true).await.unwrap().demux.close();
 
         // An ordinary dial that stalls in its handshake holds the pool lock.
         let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1043,6 +1050,21 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(Arc::ptr_eq(&live, &pool.get_existing(&url, 2).await.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_released_grant_cannot_claim_the_socket() {
+        let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
+        let url = server.ws_url();
+        let pool = CdpPool::new();
+        let Err(error) = pool.claim_existing(&url, 1, || false).await else {
+            panic!("a released grant claimed the socket")
+        };
+        assert!(error.to_string().contains("released"), "{error}");
+        let Err(error) = pool.get_existing(&url, 1).await else {
+            panic!("the refused claim left a socket")
+        };
+        assert!(error.to_string().contains("missing"), "{error}");
     }
 
     #[tokio::test]
