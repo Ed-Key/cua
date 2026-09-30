@@ -5,7 +5,7 @@
 // chrome.debugger calls, and forwards debugger events. It holds no agent logic.
 
 import { clearActive, markActive, refresh } from "./indicator.js";
-import { attachOutlivedConnection, idleTabs, requestIsStale } from "./lifecycle.js";
+import { attachOutlivedConnection, backstopTabs, requestIsStale } from "./lifecycle.js";
 
 const HOST = "com.trycua.cua_driver";
 const RECONNECT_ALARM = "cua-driver-reconnect";
@@ -41,6 +41,9 @@ const saveStopped = () => chrome.storage.session.set({ stopped: [...stopped] }).
 // Tabs whose Page domain Cua enabled: replayed after a reattach so dialog
 // events keep flowing to the daemon's existing session.
 const pageEnabled = new Set();
+// Tabs showing a JavaScript dialog. Chrome forgets a pending dialog when the
+// debugger detaches, so the idle backstop waits until the dialog closes.
+const dialogOpen = new Set();
 // Attach and detach run one at a time per tab, so Stop cannot slip between
 // an attach starting and a command being sent.
 const tabQueues = new Map();
@@ -54,7 +57,10 @@ function serialized(tabId, work) {
 // Detach the debugger from a tab; the daemon's sessions for it end.
 function releaseDebugger(tabId, reason) {
   return serialized(tabId, async () => {
+    // A dialog may have opened since the backstop picked this tab.
+    if (reason === "idle_backstop" && dialogOpen.has(tabId)) return;
     pageEnabled.delete(tabId);
+    dialogOpen.delete(tabId);
     lastCommandAt.delete(tabId);
     if (!attached.delete(tabId)) return;
     await chrome.debugger.detach({ tabId }).catch(() => {});
@@ -160,7 +166,7 @@ function ensureAttached(tabId, arrivedUnder) {
 
 // The idle backstop (lifecycle.js); runs on the reconnect alarm.
 function releaseIdleTabs() {
-  for (const tabId of idleTabs(lastCommandAt, Date.now())) {
+  for (const tabId of backstopTabs(lastCommandAt, dialogOpen, Date.now())) {
     if (attached.has(tabId)) void releaseDebugger(tabId, "idle_backstop");
     else lastCommandAt.delete(tabId);
   }
@@ -404,12 +410,15 @@ async function handleMessage(message) {
 }
 
 chrome.debugger.onEvent.addListener((source, method, params) => {
+  if (method === "Page.javascriptDialogOpening") dialogOpen.add(source.tabId);
+  if (method === "Page.javascriptDialogClosed") dialogOpen.delete(source.tabId);
   post({ jsonrpc: "2.0", method: "debugger.event", params: { source, method, params } });
 });
 
 chrome.debugger.onDetach.addListener((source, reason) => {
   attached.delete(source.tabId);
   pageEnabled.delete(source.tabId);
+  dialogOpen.delete(source.tabId);
   lastCommandAt.delete(source.tabId);
   // "canceled_by_user": the user dismissed Chrome's debugging banner.
   if (reason === "canceled_by_user") void stopTab(source.tabId);

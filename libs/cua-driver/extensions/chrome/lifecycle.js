@@ -14,6 +14,14 @@ export function idleTabs(lastCommandAt, now, limitMs = IDLE_BACKSTOP_MS) {
   return [...lastCommandAt].filter(([, at]) => now - at >= limitMs).map(([tabId]) => tabId);
 }
 
+// Tabs the backstop detaches: idle ones without an open JavaScript dialog.
+// Chrome drops a pending dialog when the debugger detaches, which would leave
+// browser_dialog nothing to accept or dismiss; such a tab waits until the
+// dialog closes.
+export function backstopTabs(lastCommandAt, dialogOpen, now, limitMs = IDLE_BACKSTOP_MS) {
+  return idleTabs(lastCommandAt, now, limitMs).filter((tabId) => !dialogOpen.has(tabId));
+}
+
 // An attach that started under one native-messaging connection and finished
 // under another (or none) belongs to no live driver: detach it at once.
 export function attachOutlivedConnection(startedUnder, current) {

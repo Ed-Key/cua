@@ -1,7 +1,7 @@
 // Run with: node --test libs/cua-driver/extensions/chrome/tests/lifecycle.test.mjs
 import assert from "node:assert/strict";
 import test from "node:test";
-import { IDLE_BACKSTOP_MS, attachOutlivedConnection, idleTabs, requestIsStale } from "../lifecycle.js";
+import { IDLE_BACKSTOP_MS, attachOutlivedConnection, backstopTabs, idleTabs, requestIsStale } from "../lifecycle.js";
 
 test("the backstop is ten minutes, far above a normal pause between commands", () => {
   assert.equal(IDLE_BACKSTOP_MS, 600_000);
@@ -30,4 +30,15 @@ test("a request from an earlier or closed connection attaches nothing", () => {
   assert.equal(requestIsStale(3, 3, true), false);
   assert.equal(requestIsStale(3, 4, true), true, "reconnected since the request arrived");
   assert.equal(requestIsStale(3, 3, false), true, "disconnected");
+});
+
+test("the backstop leaves a tab with an open dialog attached until it closes", () => {
+  const now = 1_000_000;
+  const lastCommandAt = new Map([
+    [1, now - IDLE_BACKSTOP_MS],
+    [2, now - IDLE_BACKSTOP_MS],
+  ]);
+  assert.deepEqual(backstopTabs(lastCommandAt, new Set([2]), now), [1]);
+  // The dialog closed: the next alarm detaches it.
+  assert.deepEqual(backstopTabs(lastCommandAt, new Set(), now), [1, 2]);
 });
