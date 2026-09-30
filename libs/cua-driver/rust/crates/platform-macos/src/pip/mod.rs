@@ -2144,6 +2144,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
         next_stream_generation,
         image_size,
         anchor,
+        gesture,
         ..
     } = state;
     // An ended session's panel keeps its slot while its finale is up.
@@ -2175,8 +2176,11 @@ unsafe fn refresh(state: &mut State, key: &str) {
     // in between the idle deadline and the proof timer).
     let finale = panel.lifecycle.playing();
     let waiting = panel.shown && panel.verdicts.proof_waiting();
+    // Nor does it fade from under a press: a panel being dragged or resized
+    // stays until the button comes up (`stack_mouse_up` re-checks it).
+    let held = gesture.as_ref().is_some_and(|gesture| gesture.id == panel.id);
     if panel_should_show(
-        active || finale || waiting,
+        active || finale || waiting || held,
         panel.lifecycle.closed(),
         panel.target_visible && !finale,
     ) {
@@ -4342,6 +4346,7 @@ extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyO
         let Some(panel) = panel_by_id(state, gesture.id) else {
             return;
         };
+        let key = panel.key.clone();
         if gesture.moved {
             // The user placed it: keep it there and free its slot.
             panel.dragged = true;
@@ -4349,13 +4354,19 @@ extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyO
             panel.trail_motion.release(Instant::now());
             report_trail(panel, Instant::now());
             start_ticking();
-            return;
+        } else {
+            // A click (not a resize) on a back card raises its window, if
+            // that window is still behind the front card.
+            let pressed = gesture.pressed.filter(|_| gesture.edges == 0);
+            if let Some(tag) = stack::click_target(pressed, &panel.cards.keys()) {
+                unsafe { raise_card(state, gesture.id, tag) };
+            }
         }
-        // A click (not a resize) on a back card raises its window, if that
-        // window is still behind the front card.
-        let pressed = gesture.pressed.filter(|_| gesture.edges == 0);
-        if let Some(tag) = stack::click_target(pressed, &panel.cards.keys()) {
-            unsafe { raise_card(state, gesture.id, tag) };
+        // The press held an idle panel up (see `refresh`): it may fade now.
+        // Only a live session's panel is under that key for sure.
+        let live = state.panels.get(&key).is_some_and(|panel| panel.id == gesture.id);
+        if live {
+            unsafe { refresh(state, &key) };
         }
     });
 }
