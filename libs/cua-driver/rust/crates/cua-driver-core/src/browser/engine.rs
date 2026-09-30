@@ -2117,15 +2117,7 @@ impl BrowserEngine {
             .await?;
         if live != Some(Fingerprint::of(entry)) {
             // Stale for good, even if the node reads as before again later.
-            if let Some(held) = self.store.ref_of_node(
-                session,
-                target_id,
-                tab_id,
-                &entry.frame,
-                entry.backend_node_id,
-            ) {
-                self.store.retire_ref(session, target_id, tab_id, &held);
-            }
+            self.store.retire_refused(session, target_id, tab_id, entry);
             // What it reads as now is page content: a read says that, to a
             // caller allowed to read. The refusal only says it changed.
             return Err(refuse(
@@ -2920,8 +2912,8 @@ impl BrowserEngine {
                 .await?;
             let root = match self.local_frame_tree(&conn, &cdp_session).await {
                 Ok(tree) => Some(tree.main_identity()),
-                // A browser with no frame tree never had one: the space
-                // recorded none either, and the rest must still match.
+                // No frame tree, no proof that the document is the one that
+                // was recorded: the continuation is refused below.
                 Err(FrameTreeError::Unsupported) => None,
                 Err(FrameTreeError::Failed(error)) => {
                     return Err(route_err(
@@ -2939,14 +2931,16 @@ impl BrowserEngine {
             if tab
                 .stable
                 .space()
-                .is_none_or(|space| space.id != cache.space_id || space.identity != live)
+                .is_none_or(|space| space.id != cache.space_id || !space.identity.proves(&live))
             {
                 self.store
                     .invalidate_tab_snapshots(session, target_id, tab_id);
                 return Err(refuse(
                     BrowserRefusalCode::BrowserRefStale,
                     "the page navigated or the debugger was detached since this semantic \
-                     continuation was minted; re-run get_browser_state to start a fresh snapshot",
+                     continuation was minted, or the browser cannot prove it did not; re-run \
+                     get_browser_state to start a fresh snapshot (max_chars admits more in one \
+                     read)",
                 ));
             }
             let title = cache.document.title.clone().unwrap_or_default();

@@ -32,7 +32,7 @@
 //! | JavaScript dialog opens | Unchanged. | Unchanged: the page cannot be observed while the dialog is up. | The action that opened it returns at once, names the dialog and its `dialog_id`, and its `changes` is `unavailable`, reason `javascript_dialog_open`. A batch stops there. Until `browser_dialog` resolves it, reads and actions refuse `browser_dialog_open`. |
 //! | Observation and action at the same time in one session | Recording an observation is one atomic step, and observations of a tab run one at a time. | Revisions are totally ordered; each result names its base and new revision. | A diff whose `base_revision` is the latest baseline, or a full snapshot with reason `revision_unknown` when the baseline moved meanwhile. |
 //! | Call cancelled, response lost | Unchanged: refs stay valid either way. | Unchanged when cancelled before recording; advanced when the response was lost after it. | Every diff names `base_revision`. An agent that does not hold that revision asks `get_browser_state` for a full snapshot. |
-//! | Change of format, query, scope, or a continuation | A query, scope or continuation read takes its refs from the same space (a continuation only after the space is proven to be the live document on the live attachment). A `dom_refs_v1` snapshot replaces the space: semantic refs are stale. | A query, scope or continuation read leaves both alone. `dom_refs_v1` drops them. | A side read returns its own outline, never a diff. After `dom_refs_v1`, actions return no `changes`; the next semantic observation is a full snapshot, reason `no_baseline`. |
+//! | Change of format, query, scope, or a continuation | A query, scope or continuation read takes its refs from the same space (a continuation only after the space is proven to be the live document on the live attachment; a browser that reports no frame tree cannot prove it and gets a fresh snapshot instead). A `dom_refs_v1` snapshot replaces the space: semantic refs are stale. | A query, scope or continuation read leaves both alone. `dom_refs_v1` drops them. | A side read returns its own outline, never a diff. After `dom_refs_v1`, actions return no `changes`; the next semantic observation is a full snapshot, reason `no_baseline`. |
 //!
 //! "Left the observation" is not "removed": ranking and the size budget can
 //! drop a node that still exists. A diff says `gone` only for a ref retired by
@@ -472,12 +472,31 @@ impl TabRefs {
             .and_then(|space| space.capabilities.get(&index))
     }
 
-    /// Retire one ref for good: a use found its node reading as another
-    /// element. It stays stale even if the node later reads as before, and
-    /// the next diff reports its line gone.
-    pub(crate) fn retire(&mut self, space_id: u64, index: u32) {
-        if let Some(space) = self.space.as_mut().filter(|space| space.id == space_id) {
+    /// Retire the ref a use just refused: its node reads as another element
+    /// than `issued`, the capability the use resolved. It stays stale even if
+    /// the node later reads as before, and the next diff reports its line
+    /// gone. The ref is found by its node and retired only while it is still
+    /// that capability: an observation that ran meanwhile may already have
+    /// retired it and given the node a new ref, which must stay.
+    pub(crate) fn retire_refused(&mut self, issued: &RefEntry) {
+        let Some(space) = self.space.as_mut() else {
+            return;
+        };
+        let held = space.by_node.get(&NodeKey::of(issued)).copied();
+        if let Some(index) = held.filter(|index| {
+            space.capabilities.get(index).is_some_and(|held| {
+                held.attachment == issued.attachment
+                    && Fingerprint::of(held) == Fingerprint::of(issued)
+            })
+        }) {
             space.retire(index);
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn set_identity_for_test(&mut self, identity: DocumentIdentity) {
+        if let Some(space) = self.space.as_mut() {
+            space.identity = identity;
         }
     }
 
@@ -1439,7 +1458,8 @@ mod tests {
 
         // A use found the node reading as "Delete" and retired the ref.
         let (space, index) = crate::browser::store::parse_ref(&held).unwrap();
-        session.refs.retire(space, index);
+        let issued = session.refs.resolve(space, index).unwrap().clone();
+        session.refs.retire_refused(&issued);
         assert!(!session.resolves(&held));
         assert_eq!(session.refs.ref_of(&NodeKey::of(&reply)), None);
 
@@ -1458,6 +1478,26 @@ mod tests {
                 gone: true
             }
         );
+    }
+
+    #[test]
+    fn a_refused_use_never_retires_the_ref_an_observation_gave_the_node_meanwhile() {
+        let mut session = Session::new(0);
+        let first = session.observe(identity("L1", 1), &[node(10, "button", "Reply")], None);
+        let old = keys(&first)[0].clone();
+        // The action resolved the old ref...
+        let (space, index) = crate::browser::store::parse_ref(&old).unwrap();
+        let issued = session.refs.resolve(space, index).unwrap().clone();
+        // ...and before its live check finished, an observation saw the node
+        // as "Delete", retired the old ref and issued a new one.
+        let second = session.observe(identity("L1", 1), &[node(10, "button", "Delete")], None);
+        let new = keys(&second)[0].clone();
+        assert_ne!(new, old);
+        // The action's refusal retires what it resolved, which is gone
+        // already: the new ref is not its to take.
+        session.refs.retire_refused(&issued);
+        assert!(session.resolves(&new));
+        assert!(!session.resolves(&old));
     }
 
     #[test]

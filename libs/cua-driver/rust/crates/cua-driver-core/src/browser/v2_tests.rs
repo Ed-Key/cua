@@ -115,6 +115,12 @@ struct FixtureState {
     hit: Option<(usize, Value, i64)>,
     /// The input handler calls alert() when text arrives.
     type_opens_dialog: bool,
+    /// The input handler defers its alert: the insert is answered, and the
+    /// dialog is up by the time the answer arrives.
+    type_opens_dialog_late: bool,
+    /// A keydown handler calls alert() on this (0-based) key.
+    key_down_opens_dialog_at: Option<usize>,
+    key_downs: usize,
     dialog_open: bool,
     /// The session that enabled the Page domain (it hears dialog events).
     page_session: Option<String>,
@@ -166,6 +172,9 @@ impl Default for FixtureState {
             click_navigates: None,
             hit: None,
             type_opens_dialog: false,
+            type_opens_dialog_late: false,
+            key_down_opens_dialog_at: None,
+            key_downs: 0,
             dialog_open: false,
             page_session: None,
             pending_mutations: 0,
@@ -960,6 +969,21 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     MockReply::err(-32000, "No node with given id")
                 }
             }
+            "Input.dispatchKeyEvent"
+                if call.params["type"] == "keyDown" && {
+                    st.key_downs += 1;
+                    st.key_down_opens_dialog_at == Some(st.key_downs - 1)
+                } =>
+            {
+                st.dialog_open = true;
+                MockReply::ok(json!({}))
+                    .with_events(vec![MockEvent {
+                        method: "Page.javascriptDialogOpening".into(),
+                        session_id: st.page_session.clone(),
+                        params: json!({"type": "alert", "message": "private dialog text"}),
+                    }])
+                    .unanswered()
+            }
             "Input.dispatchKeyEvent" => {
                 let event_type = call.params["type"].as_str().unwrap_or_default();
                 if event_type == "keyDown" && st.fail_key_down_after == Some(st.completed_key_pairs)
@@ -980,6 +1004,17 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     }
                     MockReply::ok(json!({}))
                 }
+            }
+            "Input.insertText" if std::mem::take(&mut st.type_opens_dialog_late) => {
+                st.dialog_open = true;
+                if let Some(value) = st.field_value.as_mut() {
+                    value.push_str(call.params["text"].as_str().unwrap_or_default());
+                }
+                MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Page.javascriptDialogOpening".into(),
+                    session_id: st.page_session.clone(),
+                    params: json!({"type": "alert", "message": "private dialog text"}),
+                }])
             }
             "Input.insertText" if std::mem::take(&mut st.type_opens_dialog) => {
                 st.dialog_open = true;
@@ -5522,4 +5557,105 @@ async fn a_caller_that_may_click_but_not_read_learns_nothing_the_page_says() {
             "{said}"
         );
     }
+}
+
+#[tokio::test]
+async fn a_dialog_that_opens_after_the_insert_was_answered_is_still_seen_at_once() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+        st.type_opens_dialog_late = true;
+    })
+    .await;
+    let agent = Agent::bound(&f, "changes-type-late-dialog").await;
+    let first = agent.snapshot().await;
+    let started = std::time::Instant::now();
+    let typed = agent
+        .call(
+            "browser_type",
+            json!({ "ref": named_ref(&first, "Reply body"), "text": "hello" }),
+        )
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        typed["changes"]["reason"], "javascript_dialog_open",
+        "{typed}"
+    );
+    assert_eq!(
+        typed["delivery"]["delivered_count"], 5,
+        "the text was inserted: {typed}"
+    );
+    // Nothing was asked of the blocked page after the insert.
+    let after_insert: Vec<String> = {
+        let state = f.state.lock().unwrap();
+        let insert = state
+            .calls
+            .iter()
+            .position(|(_, method, _)| method == "Input.insertText")
+            .unwrap();
+        state.calls[insert + 1..]
+            .iter()
+            .map(|(_, method, _)| method.clone())
+            .collect()
+    };
+    assert!(after_insert.is_empty(), "{after_insert:?}");
+}
+
+#[tokio::test]
+async fn a_key_whose_keydown_opened_a_dialog_is_not_counted_as_typed() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+        st.field_caret = Some(0);
+        // The second key's keydown handler opens the dialog.
+        st.key_down_opens_dialog_at = Some(1);
+    })
+    .await;
+    let agent = Agent::bound(&f, "changes-keys-dialog").await;
+    let first = agent.snapshot().await;
+    let typed = agent
+        .call(
+            "browser_type",
+            json!({ "ref": named_ref(&first, "Reply body"), "text": "abc", "mode": "keystrokes" }),
+        )
+        .await;
+    assert_eq!(
+        typed["changes"]["reason"], "javascript_dialog_open",
+        "{typed}"
+    );
+    assert_eq!(
+        typed["delivery"]["delivered_count"], 1,
+        "only the first character's text event was sent: {typed}"
+    );
+    assert_eq!(f.state.lock().unwrap().field_value.as_deref(), Some("a"));
+    let chars = recorded_calls(&f, "Input.dispatchKeyEvent")
+        .iter()
+        .filter(|(_, params)| params["type"] == "char")
+        .count();
+    assert_eq!(chars, 1);
+}
+
+#[tokio::test]
+async fn a_browser_that_cannot_prove_its_document_gets_no_continuation() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let token = first["snapshot"]["continuation"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The space was recorded with a document identity; drop it, as a browser
+    // that reports no frame tree would never have had one.
+    f.engine.store.update_target(SESSION, &target, |record| {
+        let tab = record.tabs.get_mut(&tab).unwrap();
+        let mut unproven = tab.stable.space().unwrap().identity.clone();
+        unproven.root = None;
+        tab.stable.set_identity_for_test(unproven);
+    });
+    let refused = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
 }

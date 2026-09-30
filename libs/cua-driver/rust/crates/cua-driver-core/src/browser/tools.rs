@@ -231,21 +231,37 @@ struct Delivery<'a> {
 }
 
 impl Delivery<'_> {
-    /// Send one call. Once a dialog is open nothing more is sent, and the
-    /// answer is an empty result: check `opened` to tell the two apart.
-    async fn send(&mut self, method: &str, params: Value) -> anyhow::Result<Value> {
-        if self.opened.is_some() {
-            return Ok(json!({}));
+    /// Whether a dialog is open now. A dialog can also open after a call was
+    /// answered (a handler that defers its alert), so this is asked before
+    /// every send and again before anything else is asked of the page.
+    fn blocked(&mut self) -> bool {
+        if self.opened.is_none() {
+            self.opened = self.conn.dialog_state(self.target);
+        }
+        self.opened.is_some()
+    }
+
+    /// Send one call; `Ok(None)` when it was not sent because a dialog is
+    /// open. A call the page answered is `Ok(Some(..))` even when the dialog
+    /// opened while it ran: what it carried did reach the page.
+    async fn send(&mut self, method: &str, params: Value) -> anyhow::Result<Option<Value>> {
+        if self.blocked() {
+            return Ok(None);
         }
         match self
             .engine
             .call_until_dialog(self.conn, self.cdp, self.target, method, params)
             .await
         {
-            Ok(value) => Ok(value),
+            Ok(value) => {
+                self.blocked();
+                Ok(Some(value))
+            }
+            // The call that opened the dialog was delivered; its reply only
+            // comes once the dialog is resolved.
             Err(CallStopped::Dialog(dialog)) => {
                 self.opened = Some(dialog);
-                Ok(json!({}))
+                Ok(Some(json!({})))
             }
             Err(CallStopped::Failed(error)) => Err(error),
         }
@@ -2863,14 +2879,17 @@ impl Tool for BrowserTypeTool {
                 )
                 .await
             {
-                Ok(_) if delivery.opened.is_some() => (Ok(()), requested_chars),
-                Ok(value) if value["result"]["value"].as_bool() == Some(true) => {
+                // Not sent at all: a dialog was already up.
+                Ok(None) => (Ok(()), 0),
+                // Sent, and the page opened a dialog while it handled it.
+                Ok(Some(_)) if delivery.opened.is_some() => (Ok(()), requested_chars),
+                Ok(Some(value)) if value["result"]["value"].as_bool() == Some(true) => {
                     replaced_chars = before
                         .as_ref()
                         .map_or(0, |state| state.value.chars().count());
                     (Ok(()), requested_chars)
                 }
-                Ok(_) => {
+                Ok(Some(_)) => {
                     return BrowserRefusal::new(
                         BrowserRefusalCode::BrowserActionUnavailable,
                         "mode set_value needs an input or textarea ref; use insert_text or \
@@ -2916,7 +2935,7 @@ impl Tool for BrowserTypeTool {
             // same event path as typing; it is not a value assignment.
             let mut call = if replace && text.is_empty() {
                 if replaced_chars == 0 {
-                    Ok(json!({}))
+                    Ok(Some(json!({})))
                 } else {
                     match delivery
                         .send(
@@ -2931,7 +2950,8 @@ impl Tool for BrowserTypeTool {
                         )
                         .await
                     {
-                        Ok(_) => {
+                        Ok(None) => Ok(None),
+                        Ok(Some(_)) => {
                             delivery
                                 .send(
                                     "Input.dispatchKeyEvent",
@@ -2953,7 +2973,7 @@ impl Tool for BrowserTypeTool {
                     .send("Input.insertText", json!({ "text": text }))
                     .await
             };
-            if replace && delivery.opened.is_none() {
+            if replace && !delivery.blocked() {
                 if let Err(error) = conn
                     .call(
                         Some(cdp),
@@ -2966,7 +2986,9 @@ impl Tool for BrowserTypeTool {
                 }
             }
             match call {
-                Ok(_) => (Ok(()), requested_chars),
+                Ok(Some(_)) => (Ok(()), requested_chars),
+                // Nothing was sent: a dialog was already up.
+                Ok(None) => (Ok(()), 0),
                 Err(error) => (Err(error), 0),
             }
         } else {
@@ -3133,7 +3155,10 @@ impl Tool for BrowserTypeTool {
                         json!({ "type": "keyDown", "key": key }),
                     )
                     .await;
-                let character = if down.is_ok() {
+                // The `char` event carries the text: a character counts as
+                // delivered only when that event was sent. A dialog the
+                // keyDown opened leaves it unsent and uncounted.
+                let character = if matches!(down, Ok(Some(_))) {
                     delivery
                         .send(
                             "Input.dispatchKeyEvent",
@@ -3146,26 +3171,32 @@ impl Tool for BrowserTypeTool {
                         )
                         .await
                 } else {
-                    Ok(json!({}))
+                    Ok(None)
                 };
-                let up = delivery
-                    .send(
-                        "Input.dispatchKeyEvent",
-                        json!({ "type": "keyUp", "key": key }),
-                    )
-                    .await;
+                let sent = matches!(character, Ok(Some(_)));
+                let up = if sent {
+                    delivery
+                        .send(
+                            "Input.dispatchKeyEvent",
+                            json!({ "type": "keyUp", "key": key }),
+                        )
+                        .await
+                } else {
+                    Ok(None)
+                };
                 if let Err(e) = down.and(character).and(up) {
                     result = Err(e);
                     break;
                 }
-                delivered += 1;
-                // The key that opened a dialog was the last one the page took.
-                if delivery.opened.is_some() {
+                if sent {
+                    delivered += 1;
+                }
+                if delivery.blocked() {
                     break;
                 }
                 tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             }
-            if delivery.opened.is_none() {
+            if !delivery.blocked() {
                 if let Err(error) = conn
                     .call(
                         Some(cdp),
@@ -3183,6 +3214,7 @@ impl Tool for BrowserTypeTool {
         // The page opened a dialog while it handled the input: the text went
         // in as far as counted, and the field cannot be read back until the
         // dialog is resolved.
+        delivery.blocked();
         if let Some(dialog) = delivery.opened.take() {
             let changes = page_changes_after(
                 &self.engine,

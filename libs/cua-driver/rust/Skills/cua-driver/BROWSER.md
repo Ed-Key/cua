@@ -399,7 +399,9 @@ get_browser_state
 ```
 
 Continuations are opaque, single-use, and bound to the current session, tab,
-document, and browser generation. A newer read of the page invalidates them.
+document, debugger attachment, and browser generation. A newer read of the
+page invalidates them, and so does anything that leaves the document
+unproven; read again with a larger `max_chars` then.
 For a bounded read, pass either `query` or a current `scope_ref`:
 
 ```text

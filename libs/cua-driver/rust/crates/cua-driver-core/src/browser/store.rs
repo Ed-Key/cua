@@ -473,14 +473,18 @@ impl BrowserStore {
             })
     }
 
-    /// Retire one semantic ref for good (see [`TabRefs::retire`]).
-    pub(crate) fn retire_ref(&self, session: &str, target_id: &str, tab_id: &str, external: &str) {
-        let Some((space, index)) = parse_ref(external) else {
-            return;
-        };
+    /// Retire the semantic ref a use just refused (see
+    /// [`TabRefs::retire_refused`]).
+    pub(crate) fn retire_refused(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        issued: &RefEntry,
+    ) {
         self.update_target(session, target_id, |rec| {
             if let Some(tab) = rec.tabs.get_mut(tab_id) {
-                tab.stable.retire(space, index);
+                tab.stable.retire_refused(issued);
             }
         });
     }
