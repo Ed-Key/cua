@@ -43,6 +43,8 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Browser.getWindowBounds",
     "Browser.getWindowForTarget",
     "Browser.setDownloadBehavior",
+    // Relay-only notice that one Cua session sharing the connection ended.
+    "Cua.releaseSession",
     "DOM.describeNode",
     "DOM.focus",
     "DOM.getBoxModel",
@@ -137,6 +139,69 @@ struct Demux {
 }
 
 impl Demux {
+    /// Keep the connection's dialog bookkeeping in step with the event.
+    ///
+    /// Ownership rule: a dialog registration, and the dialog cached for it,
+    /// belong to the attachment session that enabled Page. When that
+    /// session detaches (Target.detachedFromTarget, which the relay also
+    /// sends when the last Cua session holding a tab ends while others keep
+    /// the shared socket), both go with it, so a later browser_dialog enables
+    /// Page again instead of trusting a dead registration or a stale dialog.
+    fn observe_dialog_event(&self, event: &CdpEvent) {
+        if event.method == "Target.detachedFromTarget" {
+            if let Some(detached) = event.params.get("sessionId").and_then(Value::as_str) {
+                if let Some(target_id) = self.session_targets.lock().unwrap().remove(detached) {
+                    let mut dialogs = self.dialogs.lock().unwrap();
+                    if dialogs
+                        .get(&target_id)
+                        .is_some_and(|dialog| dialog.session_id == detached)
+                    {
+                        dialogs.remove(&target_id);
+                    }
+                }
+            }
+            return;
+        }
+        let demux = self;
+        if let Some(session_id) = event.session_id.as_deref() {
+            let target_id = demux
+                .session_targets
+                .lock()
+                .unwrap()
+                .get(session_id)
+                .cloned();
+            match event.method.as_str() {
+                "Page.javascriptDialogOpening" => {
+                    let kind = match event.params.get("type").and_then(Value::as_str) {
+                        Some("alert") => "alert",
+                        Some("confirm") => "confirm",
+                        Some("prompt") => "prompt",
+                        Some("beforeunload") => "beforeunload",
+                        _ => "other",
+                    };
+                    let generation =
+                        demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
+                    if let Some(target_id) = target_id {
+                        demux.dialogs.lock().unwrap().insert(
+                            target_id,
+                            CdpDialogState {
+                                generation,
+                                kind: kind.to_owned(),
+                                session_id: session_id.to_owned(),
+                            },
+                        );
+                    }
+                }
+                "Page.javascriptDialogClosed" => {
+                    if let Some(target_id) = target_id {
+                        demux.dialogs.lock().unwrap().remove(&target_id);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
         // Dropping the senders wakes every pending caller with a recv
@@ -190,43 +255,7 @@ async fn read_loop(mut read: SplitStream<WsStream>, demux: Arc<Demux>) {
                     .map(str::to_owned),
                 params: v.get("params").cloned().unwrap_or(Value::Null),
             };
-            if let Some(session_id) = event.session_id.as_deref() {
-                let target_id = demux
-                    .session_targets
-                    .lock()
-                    .unwrap()
-                    .get(session_id)
-                    .cloned();
-                match event.method.as_str() {
-                    "Page.javascriptDialogOpening" => {
-                        let kind = match event.params.get("type").and_then(Value::as_str) {
-                            Some("alert") => "alert",
-                            Some("confirm") => "confirm",
-                            Some("prompt") => "prompt",
-                            Some("beforeunload") => "beforeunload",
-                            _ => "other",
-                        };
-                        let generation =
-                            demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
-                        if let Some(target_id) = target_id {
-                            demux.dialogs.lock().unwrap().insert(
-                                target_id,
-                                CdpDialogState {
-                                    generation,
-                                    kind: kind.to_owned(),
-                                    session_id: session_id.to_owned(),
-                                },
-                            );
-                        }
-                    }
-                    "Page.javascriptDialogClosed" => {
-                        if let Some(target_id) = target_id {
-                            demux.dialogs.lock().unwrap().remove(&target_id);
-                        }
-                    }
-                    _ => {}
-                }
-            }
+            demux.observe_dialog_event(&event);
             demux
                 .subscribers
                 .lock()
@@ -408,10 +437,32 @@ impl CdpConnection {
     }
 }
 
+struct DeferredRelease {
+    ws_url: String,
+    generation: u64,
+    relay_holder: Option<String>,
+}
+
+/// Tell the extension relay that one Cua session episode ended, so it
+/// releases (and, where no other episode holds them, detaches) that
+/// episode's tabs. See `extension_relay::attach_gates`.
+pub(crate) async fn release_relay_holder(conn: &CdpConnection, holder: &str) {
+    let _ = conn
+        .call(None, "Cua.releaseSession", serde_json::json!({ "cuaSession": holder }))
+        .await;
+}
+
 #[derive(Clone)]
 struct PoolEntry {
     conn: Arc<CdpConnection>,
+    /// The newest grant generation that claimed this socket (`None` for an
+    /// ordinary driver-owned endpoint).
     generation: Option<u64>,
+    /// Every live grant generation sharing this socket. Ownership rule: an
+    /// existing-profile socket is shared by the Cua sessions whose grants
+    /// claimed it and closes only when the last of them releases it, so
+    /// ending one session never tears down another's tabs or dialog state.
+    holders: HashSet<u64>,
 }
 
 fn claimed_ports() -> &'static StdMutex<HashMap<u16, usize>> {
@@ -439,6 +490,10 @@ pub fn endpoint_port_is_grant_owned(url: &str) -> bool {
 pub struct CdpPool {
     conns: Mutex<HashMap<String, PoolEntry>>,
     claimed_loopback_ports: StdMutex<HashSet<u16>>,
+    /// Releases requested from a thread that cannot wait for the pool lock
+    /// (or has no runtime to tell the relay); the next pool operation
+    /// applies them.
+    deferred_releases: StdMutex<Vec<DeferredRelease>>,
 }
 
 impl CdpPool {
@@ -446,6 +501,7 @@ impl CdpPool {
         Self {
             conns: Mutex::new(HashMap::new()),
             claimed_loopback_ports: StdMutex::new(HashSet::new()),
+            deferred_releases: StdMutex::new(Vec::new()),
         }
     }
 
@@ -457,7 +513,7 @@ impl CdpPool {
                 "this DevTools endpoint is owned by a first-class existing-profile attachment"
             );
         }
-        let mut conns = self.conns.lock().await;
+        let mut conns = self.lock_conns().await;
         if let Some(existing) = conns.get(ws_url) {
             if existing.generation.is_some() {
                 anyhow::bail!("this DevTools endpoint is owned by an attachment generation");
@@ -473,6 +529,7 @@ impl CdpPool {
             PoolEntry {
                 conn: conn.clone(),
                 generation: None,
+                holders: HashSet::new(),
             },
         );
         Ok(conn)
@@ -480,30 +537,37 @@ impl CdpPool {
 
     /// Convert the one live browser-level socket into grant-owned state. This
     /// does not redial and therefore cannot create a second consent prompt.
+    /// `is_live` is checked under the pool lock just before the claim is
+    /// recorded: a grant released meanwhile (its release queues behind this
+    /// lock) must not gain a claim that nothing will release.
     pub async fn claim_existing(
         &self,
         ws_url: &str,
         generation: u64,
+        is_live: impl FnOnce() -> bool,
     ) -> anyhow::Result<Arc<CdpConnection>> {
-        let port = loopback_port(ws_url)
+        loopback_port(ws_url)
             .ok_or_else(|| anyhow::anyhow!("existing-profile endpoint has no loopback port"))?;
-        let mut conns = self.conns.lock().await;
-        let conn = match conns.get(ws_url) {
-            Some(entry) if !entry.conn.is_closed() => entry.conn.clone(),
+        let mut conns = self.lock_conns().await;
+        let (conn, mut holders) = match conns.get(ws_url) {
+            Some(entry) if !entry.conn.is_closed() => (entry.conn.clone(), entry.holders.clone()),
             Some(_) => anyhow::bail!("the approved browser socket closed before it was claimed"),
-            None => Arc::new(CdpConnection::connect(ws_url).await?),
+            None => (Arc::new(CdpConnection::connect(ws_url).await?), HashSet::new()),
         };
+        if !is_live() {
+            anyhow::bail!("the claiming grant was released");
+        }
         conn.restrict_to_existing_profile();
+        holders.insert(generation);
         conns.insert(
             ws_url.to_owned(),
             PoolEntry {
                 conn: conn.clone(),
-                generation: Some(generation),
+                generation: holders.iter().max().copied(),
+                holders,
             },
         );
-        if self.claimed_loopback_ports.lock().unwrap().insert(port) {
-            *claimed_ports().lock().unwrap().entry(port).or_default() += 1;
-        }
+        self.mark_claimed(ws_url);
         Ok(conn)
     }
 
@@ -515,11 +579,11 @@ impl CdpPool {
         ws_url: &str,
         generation: u64,
     ) -> anyhow::Result<Arc<CdpConnection>> {
-        let conns = self.conns.lock().await;
+        let conns = self.lock_conns().await;
         let entry = conns
             .get(ws_url)
             .ok_or_else(|| anyhow::anyhow!("the grant-owned browser socket is missing"))?;
-        if entry.generation != Some(generation) {
+        if !entry.holders.contains(&generation) {
             anyhow::bail!("the browser socket belongs to a different connection generation");
         }
         if entry.conn.is_closed() {
@@ -529,57 +593,105 @@ impl CdpPool {
     }
 
     /// Replace one dead grant-owned socket with exactly one new generation.
-    pub async fn reconnect_existing(
+    ///
+    /// Ownership rule: `advance` moves the grant to its new generation (only
+    /// from `old_generation`, so it also proves the grant live), and it runs
+    /// under the pool lock together with moving the grant's claim to that
+    /// generation, before dialing. The claim stays there whether the dial
+    /// succeeds, fails, or is cancelled, and a reconnect cancelled before it
+    /// takes the lock advances nothing. The pool therefore always holds the
+    /// grant's current generation: a retry transfers from exactly the claim
+    /// the failed attempt left, and the grant's final release (with its
+    /// current generation) closes the socket. A live grant with no claim at
+    /// all (its prepare was cancelled before the claim) joins the socket or
+    /// dials one. `is_live` is checked under the lock before a dialed socket
+    /// is recorded for a claim the pool does not hold: a grant released while
+    /// dialing installs nothing. Other sessions sharing the socket keep their
+    /// claims (generations are unique per session, see
+    /// `ExistingProfileGrants`) and move to the new socket with it.
+    ///
+    /// The outer error is `advance`'s; the inner result is the reconnect's.
+    pub async fn reconnect_existing<E>(
         &self,
         ws_url: &str,
         old_generation: u64,
-        new_generation: u64,
-    ) -> anyhow::Result<Arc<CdpConnection>> {
+        advance: impl FnOnce() -> Result<u64, E>,
+        is_live: impl FnOnce(u64) -> bool,
+    ) -> Result<anyhow::Result<Arc<CdpConnection>>, E> {
+        let new_generation;
         {
-            let conns = self.conns.lock().await;
-            if let Some(entry) = conns.get(ws_url) {
-                if entry
-                    .generation
-                    .is_some_and(|generation| generation > old_generation)
-                {
-                    anyhow::bail!("the reconnect source generation is no longer current");
-                }
-                if entry.generation == Some(old_generation) && !entry.conn.is_closed() {
-                    return Ok(entry.conn.clone());
+            let mut conns = self.lock_conns().await;
+            new_generation = advance()?;
+            if let Some(entry) = conns.get_mut(ws_url) {
+                entry.holders.remove(&old_generation);
+                entry.holders.insert(new_generation);
+                entry.generation = entry.holders.iter().max().copied();
+                if !entry.conn.is_closed() {
+                    entry.conn.restrict_to_existing_profile();
+                    let conn = entry.conn.clone();
+                    self.mark_claimed(ws_url);
+                    return Ok(Ok(conn));
                 }
             }
         }
+        Ok(self.redial_claim(ws_url, new_generation, is_live).await)
+    }
 
+    async fn redial_claim(
+        &self,
+        ws_url: &str,
+        generation: u64,
+        is_live: impl FnOnce(u64) -> bool,
+    ) -> anyhow::Result<Arc<CdpConnection>> {
         // A WebSocket handshake can wait for browser-owned consent UI. Never
         // hold the pool mutex across that wait: grant revocation must remain
-        // able to remove the old generation when consent is refused.
+        // able to remove the claim when consent is refused.
         let conn = Arc::new(CdpConnection::connect(ws_url).await?);
         conn.restrict_to_existing_profile();
-        let mut conns = self.conns.lock().await;
-        if let Some(entry) = conns.get(ws_url) {
-            if entry
-                .generation
-                .is_some_and(|generation| generation > old_generation)
-            {
-                if entry.generation == Some(new_generation) && !entry.conn.is_closed() {
-                    return Ok(entry.conn.clone());
-                }
-                anyhow::bail!("the reconnect source generation is no longer current");
-            }
+        let mut conns = self.lock_conns().await;
+        let held = conns
+            .get(ws_url)
+            .is_some_and(|entry| entry.holders.contains(&generation));
+        if !held && !is_live(generation) {
+            anyhow::bail!("the reconnecting grant was released while dialing");
         }
-        conns.insert(
-            ws_url.to_owned(),
-            PoolEntry {
+        let entry = conns
+            .entry(ws_url.to_owned())
+            .or_insert_with(|| PoolEntry {
                 conn: conn.clone(),
-                generation: Some(new_generation),
-            },
-        );
+                generation: None,
+                holders: HashSet::new(),
+            });
+        if entry.conn.is_closed() {
+            entry.conn = conn;
+        }
+        entry.conn.restrict_to_existing_profile();
+        entry.holders.insert(generation);
+        entry.generation = entry.holders.iter().max().copied();
+        let conn = entry.conn.clone();
+        drop(conns);
+        self.mark_claimed(ws_url);
         Ok(conn)
     }
 
-    /// Drop a (likely dead) connection so the next call redials.
+    /// Mark the endpoint's listener as owned by a first-class attachment
+    /// (see [`endpoint_port_is_grant_owned`]), once per pool.
+    fn mark_claimed(&self, ws_url: &str) {
+        if let Some(port) = loopback_port(ws_url) {
+            if self.claimed_loopback_ports.lock().unwrap().insert(port) {
+                *claimed_ports().lock().unwrap().entry(port).or_default() += 1;
+            }
+        }
+    }
+
+    /// Drop a (likely dead) driver-owned connection so the next call
+    /// redials. Grant-owned sockets leave the pool only through their
+    /// holders' releases, never through the legacy route's eviction.
     pub async fn evict(&self, ws_url: &str) {
-        self.conns.lock().await.remove(ws_url);
+        let mut conns = self.lock_conns().await;
+        if conns.get(ws_url).is_some_and(|entry| entry.generation.is_none()) {
+            conns.remove(ws_url);
+        }
     }
 
     pub fn release_claim_marker(&self, ws_url: &str) {
@@ -590,16 +702,96 @@ impl CdpPool {
         }
     }
 
+    /// Release one grant generation's claim on the socket. The socket closes
+    /// (and the listener claim marker is released) only when no other live
+    /// generation shares it.
     pub async fn release_existing(&self, ws_url: &str, generation: u64) {
-        let mut conns = self.conns.lock().await;
-        if conns
-            .get(ws_url)
-            .is_some_and(|entry| entry.generation == Some(generation))
-        {
-            conns.remove(ws_url);
+        let mut conns = self.lock_conns().await;
+        self.release_locked(&mut conns, ws_url, generation);
+    }
+
+    /// [`Self::release_existing`] for a thread with no async runtime (an
+    /// SDK's idle-session sweeper). It never waits: the lock holder may need
+    /// this very thread to run, so a busy pool defers the release to its
+    /// next operation instead. `relay_holder` names the ended episode's hold
+    /// on relay tabs; telling the relay needs a runtime, so without one the
+    /// whole release waits for the pool's next operation.
+    pub fn release_existing_now_or_later(
+        &self,
+        ws_url: &str,
+        generation: u64,
+        relay_holder: Option<String>,
+    ) {
+        let release = DeferredRelease {
+            ws_url: ws_url.to_owned(),
+            generation,
+            relay_holder,
+        };
+        let can_send = release.relay_holder.is_none()
+            || tokio::runtime::Handle::try_current().is_ok();
+        if can_send {
+            if let Ok(mut conns) = self.conns.try_lock() {
+                self.apply_deferred_releases(&mut conns);
+                self.apply_release(&mut conns, release);
+                return;
+            }
         }
-        drop(conns);
-        self.release_claim_marker(ws_url);
+        self.deferred_releases.lock().unwrap().push(release);
+    }
+
+    async fn lock_conns(&self) -> tokio::sync::MutexGuard<'_, HashMap<String, PoolEntry>> {
+        let mut conns = self.conns.lock().await;
+        self.apply_deferred_releases(&mut conns);
+        conns
+    }
+
+    fn apply_deferred_releases(&self, conns: &mut HashMap<String, PoolEntry>) {
+        let deferred = std::mem::take(&mut *self.deferred_releases.lock().unwrap());
+        let has_runtime = tokio::runtime::Handle::try_current().is_ok();
+        for release in deferred {
+            if release.relay_holder.is_some() && !has_runtime {
+                self.deferred_releases.lock().unwrap().push(release);
+            } else {
+                self.apply_release(conns, release);
+            }
+        }
+    }
+
+    /// Needs a runtime when `relay_holder` is set.
+    fn apply_release(&self, conns: &mut HashMap<String, PoolEntry>, release: DeferredRelease) {
+        if let Some(holder) = release.relay_holder {
+            let conn = conns
+                .get(&release.ws_url)
+                .filter(|entry| entry.holders.contains(&release.generation))
+                .map(|entry| entry.conn.clone());
+            // The task keeps the socket open until the relay has the notice,
+            // even when this was the socket's last claim.
+            if let Some(conn) = conn {
+                tokio::spawn(async move { release_relay_holder(&conn, &holder).await });
+            }
+        }
+        self.release_locked(conns, &release.ws_url, release.generation);
+    }
+
+    fn release_locked(
+        &self,
+        conns: &mut HashMap<String, PoolEntry>,
+        ws_url: &str,
+        generation: u64,
+    ) {
+        let Some(entry) = conns.get_mut(ws_url) else {
+            self.release_claim_marker(ws_url);
+            return;
+        };
+        if !entry.holders.remove(&generation) {
+            return;
+        }
+        if entry.holders.is_empty() {
+            conns.remove(ws_url);
+            self.release_claim_marker(ws_url);
+        } else {
+            entry.generation = entry.holders.iter().max().copied();
+        }
     }
 }
 
@@ -639,6 +831,63 @@ fn release_claimed_port(port: u16) {
 
 #[cfg(test)]
 mod tests {
+    use super::{CdpEvent, Demux};
+    use std::collections::HashMap;
+    use std::sync::atomic::{AtomicBool, AtomicU64};
+    use std::sync::Mutex as StdMutex;
+
+    #[test]
+    fn a_detached_session_takes_its_dialog_registration_and_cached_dialog_with_it() {
+        let demux = Demux {
+            pending: StdMutex::new(HashMap::new()),
+            subscribers: StdMutex::new(Vec::new()),
+            session_targets: StdMutex::new(HashMap::new()),
+            dialogs: StdMutex::new(HashMap::new()),
+            next_dialog_generation: AtomicU64::new(1),
+            closed: AtomicBool::new(false),
+        };
+        let event = |method: &str, session: Option<&str>, params: serde_json::Value| CdpEvent {
+            method: method.to_owned(),
+            session_id: session.map(str::to_owned),
+            params,
+        };
+        for (session, target) in [("page-a", "T1"), ("page-b", "T2")] {
+            demux
+                .session_targets
+                .lock()
+                .unwrap()
+                .insert(session.to_owned(), target.to_owned());
+            demux.observe_dialog_event(&event(
+                "Page.javascriptDialogOpening",
+                Some(session),
+                json!({ "type": "alert" }),
+            ));
+        }
+        assert_eq!(demux.dialogs.lock().unwrap().len(), 2);
+
+        // The relay (or Chrome) reports that T1's Page session detached.
+        demux.observe_dialog_event(&event(
+            "Target.detachedFromTarget",
+            None,
+            json!({ "sessionId": "page-a" }),
+        ));
+        assert!(!demux.session_targets.lock().unwrap().contains_key("page-a"));
+        assert!(!demux.dialogs.lock().unwrap().contains_key("T1"));
+        // The other target keeps its registration and dialog.
+        assert_eq!(
+            demux.session_targets.lock().unwrap().get("page-b").map(String::as_str),
+            Some("T2")
+        );
+        assert!(demux.dialogs.lock().unwrap().contains_key("T2"));
+        // A detach of an unrelated session changes nothing.
+        demux.observe_dialog_event(&event(
+            "Target.detachedFromTarget",
+            None,
+            json!({ "sessionId": "op-7" }),
+        ));
+        assert!(demux.dialogs.lock().unwrap().contains_key("T2"));
+    }
+
     use super::*;
     use crate::browser::mock_cdp::{MockCdpServer, MockEvent, MockReply};
     use serde_json::json;
@@ -692,7 +941,7 @@ mod tests {
         let url = server.ws_url();
         let pool = CdpPool::new();
         let initial = pool.get(&url).await.unwrap();
-        let claimed = pool.claim_existing(&url, 1).await.unwrap();
+        let claimed = pool.claim_existing(&url, 1, || true).await.unwrap();
         assert!(Arc::ptr_eq(&initial, &claimed), "claim must not redial");
         assert_eq!(
             claimed.method_policy(),
@@ -700,6 +949,11 @@ mod tests {
             "claiming a personal-profile socket must restrict it in place"
         );
         assert!(pool.get(&url).await.is_err(), "legacy access must refuse");
+        pool.evict(&url).await;
+        assert!(
+            pool.get_existing(&url, 1).await.is_ok(),
+            "the legacy route's eviction leaves a grant-owned socket alone"
+        );
         assert!(pool.get_existing(&url, 2).await.is_err());
         let reused = pool.get_existing(&url, 1).await.unwrap();
         assert!(Arc::ptr_eq(&claimed, &reused));
@@ -755,7 +1009,7 @@ mod tests {
         let url = server.ws_url();
         {
             let pool = CdpPool::new();
-            pool.claim_existing(&url, 1).await.unwrap();
+            pool.claim_existing(&url, 1, || true).await.unwrap();
             assert!(endpoint_port_is_grant_owned(&url));
         }
         assert!(!endpoint_port_is_grant_owned(&url));
@@ -767,8 +1021,8 @@ mod tests {
         let url = server.ws_url();
         let first = CdpPool::new();
         let second = CdpPool::new();
-        first.claim_existing(&url, 1).await.unwrap();
-        second.claim_existing(&url, 2).await.unwrap();
+        first.claim_existing(&url, 1, || true).await.unwrap();
+        second.claim_existing(&url, 2, || true).await.unwrap();
 
         drop(first);
         assert!(endpoint_port_is_grant_owned(&url));
@@ -780,30 +1034,172 @@ mod tests {
     async fn stalled_reconnect_does_not_block_generation_release() {
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
         let port = listener.local_addr().unwrap().port();
+        let (finish_handshake, handshake_gate) = tokio::sync::oneshot::channel::<()>();
         let server = tokio::spawn(async move {
             let (first, _) = listener.accept().await.unwrap();
             let _first_ws = tokio_tungstenite::accept_async(first).await.unwrap();
-            let (_stalled_reconnect, _) = listener.accept().await.unwrap();
+            let (stalled_reconnect, _) = listener.accept().await.unwrap();
+            let _ = handshake_gate.await;
+            let _reconnect_ws = tokio_tungstenite::accept_async(stalled_reconnect).await;
             tokio::time::sleep(std::time::Duration::from_secs(10)).await;
         });
         let url = format!("ws://127.0.0.1:{port}/devtools/browser/reconnect");
         let pool = CdpPool::new();
-        let claimed = pool.claim_existing(&url, 1).await.unwrap();
+        let claimed = pool.claim_existing(&url, 1, || true).await.unwrap();
         claimed.demux.close();
 
-        let mut reconnect = Box::pin(pool.reconnect_existing(&url, 1, 2));
+        // The grant is released while the handshake stalls, so it is no
+        // longer live when the socket arrives.
+        let mut reconnect =
+            Box::pin(pool.reconnect_existing(&url, 1, || Ok::<_, ()>(2), |_| false));
         tokio::select! {
             _ = &mut reconnect => panic!("reconnect unexpectedly completed"),
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
         }
+        // The engine releases the grant's current generation, which the
+        // reconnect already claimed before dialing.
         tokio::time::timeout(
             std::time::Duration::from_millis(500),
-            pool.release_existing(&url, 1),
+            pool.release_existing(&url, 2),
         )
         .await
         .expect("grant release must not wait for the reconnect handshake");
-        drop(reconnect);
+        // A handshake that completes after the release installs nothing.
+        finish_handshake.send(()).unwrap();
+        let Err(error) = reconnect.await.unwrap() else {
+            panic!("a released reconnect installed a socket")
+        };
+        assert!(
+            error.to_string().contains("released while dialing"),
+            "{error}"
+        );
         server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_retried_reconnect_leaves_only_the_current_generation_holding_the_socket() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = tokio::spawn(async move {
+            let (first, _) = listener.accept().await.unwrap();
+            let _first_ws = tokio_tungstenite::accept_async(first).await.unwrap();
+            // The first reconnect's handshake fails.
+            drop(listener.accept().await.unwrap());
+            let (retry, _) = listener.accept().await.unwrap();
+            let _retry_ws = tokio_tungstenite::accept_async(retry).await.unwrap();
+            tokio::time::sleep(std::time::Duration::from_secs(10)).await;
+        });
+        let url = format!("ws://127.0.0.1:{port}/devtools/browser/retry");
+        let pool = CdpPool::new();
+        pool.claim_existing(&url, 1, || true).await.unwrap().demux.close();
+
+        assert!(pool.reconnect_existing(&url, 1, || Ok::<_, ()>(2), |_| true).await.unwrap().is_err());
+        let live = pool.reconnect_existing(&url, 2, || Ok::<_, ()>(3), |_| true).await.unwrap().unwrap();
+        assert!(!live.is_closed());
+        for stale in [1, 2] {
+            let Err(error) = pool.get_existing(&url, stale).await else {
+                panic!("phantom {stale}")
+            };
+            assert!(
+                error
+                    .to_string()
+                    .contains("different connection generation"),
+                "phantom {stale}: {error}"
+            );
+        }
+        assert!(Arc::ptr_eq(
+            &live,
+            &pool.get_existing(&url, 3).await.unwrap()
+        ));
+
+        let socket = Arc::downgrade(&live);
+        drop(live);
+        pool.release_existing(&url, 3).await;
+        assert!(
+            socket.upgrade().is_none(),
+            "the final release closes the socket"
+        );
+        assert!(!endpoint_port_is_grant_owned(&url));
+        server.abort();
+    }
+
+    #[tokio::test]
+    async fn a_reconnect_cancelled_before_the_pool_lock_advances_nothing() {
+        let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
+        let url = server.ws_url();
+        let pool = StdArc::new(CdpPool::new());
+        pool.claim_existing(&url, 1, || true).await.unwrap().demux.close();
+
+        // An ordinary dial that stalls in its handshake holds the pool lock.
+        let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let stalled_url = format!(
+            "ws://127.0.0.1:{}/devtools/browser/stalled",
+            stalled.local_addr().unwrap().port()
+        );
+        let holder = tokio::spawn({
+            let pool = pool.clone();
+            async move { pool.get(&stalled_url).await.map(|_| ()) }
+        });
+        let _accepted = stalled.accept().await.unwrap();
+
+        let advanced = std::sync::atomic::AtomicBool::new(false);
+        let reconnect = pool.reconnect_existing(
+            &url,
+            1,
+            || {
+                advanced.store(true, Ordering::SeqCst);
+                Ok::<_, ()>(2)
+            },
+            |_| true,
+        );
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(100), reconnect)
+                .await
+                .is_err(),
+            "the reconnect must wait for the pool lock"
+        );
+        assert!(!advanced.load(Ordering::SeqCst), "cancelled before the lock");
+        holder.abort();
+        let _ = holder.await;
+
+        // The claim is still generation 1, so the grant's next attempt moves it.
+        let live = pool
+            .reconnect_existing(&url, 1, || Ok::<_, ()>(2), |_| true)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(Arc::ptr_eq(&live, &pool.get_existing(&url, 2).await.unwrap()));
+    }
+
+    #[tokio::test]
+    async fn a_released_grant_cannot_claim_the_socket() {
+        let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
+        let url = server.ws_url();
+        let pool = CdpPool::new();
+        let Err(error) = pool.claim_existing(&url, 1, || false).await else {
+            panic!("a released grant claimed the socket")
+        };
+        assert!(error.to_string().contains("released"), "{error}");
+        let Err(error) = pool.get_existing(&url, 1).await else {
+            panic!("the refused claim left a socket")
+        };
+        assert!(error.to_string().contains("missing"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn a_release_on_a_busy_pool_applies_at_its_next_operation() {
+        let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
+        let url = server.ws_url();
+        let pool = CdpPool::new();
+        pool.claim_existing(&url, 1, || true).await.unwrap();
+        {
+            let _busy = pool.conns.lock().await;
+            pool.release_existing_now_or_later(&url, 1, None);
+        }
+        let Err(error) = pool.get_existing(&url, 1).await else {
+            panic!("the deferred release was never applied")
+        };
+        assert!(error.to_string().contains("missing"), "{error}");
     }
 
     #[tokio::test]

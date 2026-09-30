@@ -864,7 +864,13 @@ fn transport_from_legacy(
                 ActionTransport::BrowserCdpInputMouse
             }
         }
-        "" if tool_name == "browser_type" => ActionTransport::BrowserCdpInputKey,
+        "" if tool_name == "browser_type" => {
+            if args.get("mode").and_then(serde_json::Value::as_str) == Some("set_value") {
+                ActionTransport::BrowserCdpRuntimeFunction
+            } else {
+                ActionTransport::BrowserCdpInputKey
+            }
+        }
         "" if tool_name == "move_cursor"
             && args.get("scope").and_then(serde_json::Value::as_str) != Some("desktop") =>
         {
@@ -1966,6 +1972,40 @@ mod tests {
         )
         .expect("an explicit delivered count should normalize");
         assert_eq!(record.delivered_count, Some(2));
+    }
+
+    #[test]
+    fn a_browser_type_readback_publishes_confirmed_and_set_value_is_a_dom_route() {
+        let confirmed = serde_json::json!({
+            "status": "ok",
+            "effect": "confirmed",
+            "evidence": [{ "kind": "browser_readback", "detail": "the field holds \"ab\"" }],
+            "requested_chars": 2,
+            "delivered_chars": 2,
+        });
+        let typed = ActionExecutionRecord::from_legacy(
+            "browser_type",
+            &serde_json::json!({}),
+            &confirmed,
+        )
+        .expect("browser_type normalizes")
+        .public_result()
+        .expect("publishable");
+        assert_eq!(typed.effect, cua_driver_contract::ActionEffect::Confirmed);
+        assert_eq!(typed.route, cua_driver_contract::ActionRoute::TrustedInput);
+        assert_eq!(
+            typed.evidence.unwrap()[0].detail.as_deref(),
+            Some("the field holds \"ab\"")
+        );
+        let set = ActionExecutionRecord::from_legacy(
+            "browser_type",
+            &serde_json::json!({ "mode": "set_value" }),
+            &confirmed,
+        )
+        .expect("set_value normalizes")
+        .public_result()
+        .expect("publishable");
+        assert_eq!(set.route, cua_driver_contract::ActionRoute::Dom);
     }
 
     #[test]

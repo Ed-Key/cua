@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use super::engine::unsupported_engine_refusal;
+use super::engine::{release_grant_claim, unsupported_engine_refusal};
 use super::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, ExistingProfileSetupOutcome,
     ExistingProfileSetupRequest, IsolatedBrowserProcess, PrepareAction, PrepareAttachment,
@@ -223,6 +223,19 @@ struct PreparedProfile {
     created: bool,
     delete_on_cleanup: bool,
     marker: ProfileMarker,
+}
+
+/// What authorizes an existing-profile attachment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ExistingProfileConsent {
+    Protected,
+    BoundedManifest,
+    LaunchGrant,
+    Unrestricted,
+    /// The user installed the Cua Driver extension in this Chrome and it
+    /// is connected: an OS-proven link from their own profile. Installing
+    /// it is the consent, as it is for comparable browser agents.
+    ExtensionInstalled,
 }
 
 pub(crate) struct ManagedBrowser {
@@ -823,34 +836,13 @@ impl BrowserEngine {
         })
     }
 
-    async fn attach_existing_profile(
+    /// Which consent covers attaching to `pid`'s existing profile right now,
+    /// and the permission mode it was decided under. Refuses when none does.
+    pub(super) async fn existing_profile_consent(
         &self,
-        request: PrepareRequest,
-    ) -> Result<PrepareOutcome, BrowserRefusal> {
-        #[derive(PartialEq)]
-        enum ConsentPath {
-            Protected,
-            BoundedManifest,
-            LaunchGrant,
-            Unrestricted,
-            /// The user installed the Cua Driver extension in this Chrome and it
-            /// is connected: an OS-proven link from their own profile. Installing
-            /// it is the consent, as it is for comparable browser agents.
-            ExtensionInstalled,
-        }
-
-        let pid = request.pid.ok_or_else(|| {
-            refusal(
-                BrowserRefusalCode::BrowserConsentRequired,
-                "strategy=existing_profile requires an exact pid approval anchor",
-            )
-        })?;
-        let window_id = request.window_id.ok_or_else(|| {
-            refusal(
-                BrowserRefusalCode::BrowserConsentRequired,
-                "strategy=existing_profile requires an exact window_id approval anchor",
-            )
-        })?;
+        pid: i64,
+        window_id: u64,
+    ) -> Result<(crate::authorization::PermissionMode, ExistingProfileConsent), BrowserRefusal> {
         let mode = crate::tool::current_dispatch_authorization_context()
             .map(|context| context.mode())
             .map(Ok)
@@ -862,7 +854,7 @@ impl BrowserEngine {
                 )
             })?;
         let consent_path = if mode == crate::authorization::PermissionMode::Unrestricted {
-            ConsentPath::Unrestricted
+            ExistingProfileConsent::Unrestricted
         } else if mode == crate::authorization::PermissionMode::Bounded {
             let context = crate::tool::current_dispatch_authorization_context().ok_or_else(|| {
                 refusal(
@@ -886,17 +878,17 @@ impl BrowserEngine {
                     }),
                 )
                 .map_err(|message| refusal(BrowserRefusalCode::BrowserConsentRequired, message))?;
-            ConsentPath::BoundedManifest
+            ExistingProfileConsent::BoundedManifest
         } else if crate::authorization::launch_grant_enabled("existing_profile") {
-            ConsentPath::LaunchGrant
+            ExistingProfileConsent::LaunchGrant
         } else if self.approval_broker.provider_id().is_some() {
-            ConsentPath::Protected
+            ExistingProfileConsent::Protected
         } else if matches!(
             self.platform.discover_existing_profile_endpoint(pid).await,
             Ok(Some(ref endpoint))
                 if endpoint.transport == super::types::EndpointTransport::ExtensionRelay
         ) {
-            ConsentPath::ExtensionInstalled
+            ExistingProfileConsent::ExtensionInstalled
         } else {
             return Err(refusal(
                 BrowserRefusalCode::BrowserConsentRequired,
@@ -908,6 +900,39 @@ impl BrowserEngine {
                 "authorization_host": self.approval_broker.provider_id(),
             })));
         };
+        Ok((mode, consent_path))
+    }
+
+    async fn attach_existing_profile(
+        &self,
+        request: PrepareRequest,
+    ) -> Result<PrepareOutcome, BrowserRefusal> {
+        self.attach_existing_profile_via(request, false).await
+    }
+
+    /// `extension_only`: the caller's consent covers the extension route
+    /// only (the bind's own grant), so any other endpoint is refused exactly
+    /// as it is for [`ExistingProfileConsent::ExtensionInstalled`].
+    pub(super) async fn attach_existing_profile_via(
+        &self,
+        request: PrepareRequest,
+        extension_only: bool,
+    ) -> Result<PrepareOutcome, BrowserRefusal> {
+        let pid = request.pid.ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserConsentRequired,
+                "strategy=existing_profile requires an exact pid approval anchor",
+            )
+        })?;
+        let window_id = request.window_id.ok_or_else(|| {
+            refusal(
+                BrowserRefusalCode::BrowserConsentRequired,
+                "strategy=existing_profile requires an exact window_id approval anchor",
+            )
+        })?;
+        let (mode, consent_path) = self.existing_profile_consent(pid, window_id).await?;
+        let extension_route_only =
+            extension_only || consent_path == ExistingProfileConsent::ExtensionInstalled;
         if request.profile.is_some() || request.allow_launch {
             return Err(refusal(
                 BrowserRefusalCode::BrowserConsentRequired,
@@ -939,7 +964,7 @@ impl BrowserEngine {
         // Consent through the extension covers the extension route only: never
         // the setup page that enables Chrome's remote debugging, and never a
         // different endpoint that appeared meanwhile.
-        if consent_path == ConsentPath::ExtensionInstalled
+        if extension_route_only
             && !endpoint
                 .as_ref()
                 .is_some_and(|endpoint| endpoint.transport == super::types::EndpointTransport::ExtensionRelay)
@@ -1047,7 +1072,7 @@ impl BrowserEngine {
         // native window, browser product, and endpoint owner have all been
         // proven. Bounded capability manifests, launch grants, and unrestricted mode
         // never enter this callback path.
-        let protected_consent = if matches!(consent_path, ConsentPath::Protected) {
+        let protected_consent = if matches!(consent_path, ExistingProfileConsent::Protected) {
             let transport_session = request
                 .transport_session
                 .as_deref()
@@ -1091,6 +1116,16 @@ impl BrowserEngine {
             None
         };
 
+        // Ownership rule: a grant's pool claim changes only under this
+        // browser's reconnect gate, from reading the previous grant through
+        // releasing it, minting and claiming the new generation. Two prepares
+        // for one session, or a prepare and a reconnect (even of another
+        // endpoint), would otherwise each act on a generation the other
+        // already replaced and leave a claim that no live grant releases.
+        let _browser_gate = self
+            .reconnect_gates
+            .lock(super::reconnect::ReconnectKey::new(&fingerprint))
+            .await;
         let previous_grant = self
             .existing_profile_grant(&request.session, request.transport_session.as_deref(), pid)
             .await;
@@ -1116,6 +1151,19 @@ impl BrowserEngine {
             || previous_grant
                 .as_ref()
                 .is_some_and(|grant| grant.cleanup_remote_debugging);
+        // Release the previous claim before minting its replacement, so a
+        // cancellation never leaves a claim without a registered grant.
+        if let Some(previous) = previous_grant {
+            // Not detached: the previous grant is still registered, so a
+            // cancelled release must leave its claim in place with it.
+            release_grant_claim(&self.pool, &previous).await;
+            if let Some(protected) = previous.protected_consent.as_ref() {
+                self.approval_broker.revoke(protected).await;
+            }
+            if previous.endpoint_ws_url != endpoint.ws_url {
+                self.pool.release_claim_marker(&previous.endpoint_ws_url);
+            }
+        }
         let grant = self.existing_profile_grants.mint(
             &request.session,
             request.transport_session.as_deref(),
@@ -1125,23 +1173,20 @@ impl BrowserEngine {
             "chromium".to_owned(),
             classification.product_kind,
             endpoint.ws_url.clone(),
+            endpoint.transport,
             cleanup_remote_debugging,
             protected_consent,
         );
-        if let Some(previous) = previous_grant {
-            self.pool
-                .release_existing(&previous.endpoint_ws_url, previous.generation)
-                .await;
-            if let Some(protected) = previous.protected_consent.as_ref() {
-                self.approval_broker.revoke(protected).await;
-            }
-            if previous.endpoint_ws_url != endpoint.ws_url {
-                self.pool.release_claim_marker(&previous.endpoint_ws_url);
-            }
-        }
         let (claimed, displayed_consent_prompt) = {
             let ws_url = endpoint.ws_url.clone();
-            let mut claim = Box::pin(self.pool.claim_existing(&ws_url, grant.generation));
+            let mut claim = Box::pin(self.pool.claim_existing(&ws_url, grant.generation, || {
+                self.existing_profile_grants.is_current(
+                    &request.session,
+                    request.transport_session.as_deref(),
+                    pid,
+                    grant.generation,
+                )
+            }));
             // The extension route never raises Chrome's remote-debugging prompt,
             // so a slow claim there must not press Allow on some other client's.
             let prompt_possible =
@@ -1198,7 +1243,15 @@ impl BrowserEngine {
         let (claimed, initial_claim_error) = retry_claim_after_accepted_consent(
             claimed,
             displayed_consent_prompt,
-            self.pool.claim_existing(&endpoint.ws_url, grant.generation),
+            self.pool
+                .claim_existing(&endpoint.ws_url, grant.generation, || {
+                    self.existing_profile_grants.is_current(
+                        &request.session,
+                        request.transport_session.as_deref(),
+                        pid,
+                        grant.generation,
+                    )
+                }),
         )
         .await;
         if let Err(_final_claim_error) = claimed {

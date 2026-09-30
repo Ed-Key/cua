@@ -75,13 +75,13 @@ const MAX_BROWSER_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
 pub struct BrowserEngine {
     pub(crate) platform: Arc<dyn BrowserPlatform>,
     pub(crate) store: BrowserStore,
-    pub(crate) pool: CdpPool,
+    pub(crate) pool: Arc<CdpPool>,
     pub(crate) managed_browsers: ManagedBrowsers,
     pub(crate) existing_profile_grants: ExistingProfileGrants,
     pub(crate) approval_broker: Arc<crate::consent::ApprovalBroker>,
     pub(crate) protected_resource_ownership: Arc<crate::consent::ProtectedResourceOwnershipStore>,
     mutation_gates: MutationGates,
-    reconnect_gates: ReconnectGates,
+    pub(crate) reconnect_gates: ReconnectGates,
     pending_existing_profile_cleanups: Mutex<HashMap<String, Vec<ExistingProfileSetupRequest>>>,
     session_end_hook: Mutex<Option<crate::session::SessionEndHookRegistration>>,
 }
@@ -171,6 +171,53 @@ pub(super) fn unsupported_engine_refusal(
         "required_protocol": protocol,
         "limitation": limitation,
     }))
+}
+
+/// Name the exact call that approves a standalone profile, and what it costs,
+/// on the consent refusal a bind returns.
+fn existing_profile_next_call(
+    refusal: BrowserRefusal,
+    pid: i64,
+    window_id: u64,
+    extension_connected: bool,
+) -> BrowserRefusal {
+    if refusal.code != BrowserRefusalCode::BrowserConsentRequired {
+        return refusal;
+    }
+    let mut detail = refusal.detail.clone().unwrap_or_else(|| json!({}));
+    detail["next_call"] = json!({
+        "tool": "browser_prepare",
+        "arguments": {
+            "pid": pid,
+            "window_id": window_id,
+            "strategy": { "kind": "existing_profile" },
+        },
+    });
+    detail["extension_connected"] = json!(extension_connected);
+    let call = format!(
+        "browser_prepare {{\"pid\": {pid}, \"window_id\": {window_id}, \"strategy\": \
+         {{\"kind\": \"existing_profile\"}}}}"
+    );
+    BrowserRefusal {
+        message: if extension_connected {
+            format!(
+                "this Chrome profile needs existing-profile approval from this session's \
+                 approval host or capability manifest: call {call}, then get_browser_state \
+                 again. cua's Chrome extension is connected, so attaching changes no browser \
+                 settings."
+            )
+        } else {
+            format!(
+                "this Chrome profile needs existing-profile approval before Cua can read it: \
+                 call {call}, then get_browser_state again. With cua's Chrome extension \
+                 connected in this Chrome that call changes no browser settings; without the \
+                 extension it needs a runtime grant or an approval host and may turn on \
+                 Chrome's remote debugging for this profile."
+            )
+        },
+        detail: Some(detail),
+        ..refusal
+    }
 }
 
 fn endpoint_access_class(
@@ -629,7 +676,7 @@ impl BrowserEngine {
         let engine = Arc::new(Self {
             platform,
             store: BrowserStore::new(),
-            pool: CdpPool::new(),
+            pool: Arc::new(CdpPool::new()),
             managed_browsers: Default::default(),
             existing_profile_grants: ExistingProfileGrants::new(),
             approval_broker,
@@ -646,6 +693,7 @@ impl BrowserEngine {
                 if let Some(engine) = weak.upgrade() {
                     engine.store.remove_session(session_id);
                     engine.cleanup_prepared_session(session_id);
+                    let mut off_runtime = Vec::new();
                     let pending = {
                         let mut pending = engine.pending_existing_profile_cleanups.lock().unwrap();
                         let mut requests = pending.remove(session_id).unwrap_or_default();
@@ -664,18 +712,28 @@ impl BrowserEngine {
                             if let Ok(runtime) = tokio::runtime::Handle::try_current() {
                                 let engine = engine.clone();
                                 runtime.spawn(async move {
-                                    engine
-                                        .pool
-                                        .release_existing(&grant.endpoint_ws_url, grant.generation)
-                                        .await;
+                                    engine.release_grant_socket(&grant).await;
                                     if let Some(protected) = grant.protected_consent.as_ref() {
                                         engine.approval_broker.revoke(protected).await;
                                     }
                                 });
+                            } else {
+                                off_runtime.push(grant);
                             }
                         }
                         requests
                     };
+                    // An SDK's idle sweeper ends sessions from a plain thread.
+                    // The claim and the relay's release of the episode's tabs
+                    // happen there without waiting, or at the pool's next
+                    // operation.
+                    for grant in off_runtime {
+                        engine.pool.release_existing_now_or_later(
+                            &grant.endpoint_ws_url,
+                            grant.generation,
+                            grant_relay_holder(&grant),
+                        );
+                    }
 
                     let mut failed = Vec::new();
                     for request in pending {
@@ -739,9 +797,7 @@ impl BrowserEngine {
                             .push(request);
                     }
                 }
-                self.pool
-                    .release_existing(&grant.endpoint_ws_url, grant.generation)
-                    .await;
+                self.release_grant_socket(&grant).await;
                 if let Some(protected) = grant.protected_consent.as_ref() {
                     self.approval_broker.revoke(protected).await;
                 }
@@ -783,13 +839,21 @@ impl BrowserEngine {
                         .push(request);
                 }
             }
-            self.pool
-                .release_existing(&grant.endpoint_ws_url, grant.generation)
-                .await;
+            self.release_grant_socket(&grant).await;
             if let Some(protected) = grant.protected_consent.as_ref() {
                 self.approval_broker.revoke(protected).await;
             }
         }
+    }
+
+    /// Release a grant that has already left the registry (see
+    /// [`release_grant_claim`]). The release runs as its own task, awaited
+    /// here, so a caller cancelled while the pool lock is busy cannot strand
+    /// a claim that no grant will release.
+    pub(crate) async fn release_grant_socket(&self, grant: &ExistingProfileGrant) {
+        let pool = self.pool.clone();
+        let grant = grant.clone();
+        let _ = tokio::spawn(async move { release_grant_claim(&pool, &grant).await }).await;
     }
 
     pub(crate) async fn connect(&self, ws_url: &str) -> Result<Arc<CdpConnection>, BrowserRefusal> {
@@ -835,10 +899,7 @@ impl BrowserEngine {
         // socket rather than opening another browser-level connection.
         let _leader = self
             .reconnect_gates
-            .lock(ReconnectKey::new(
-                &grant.fingerprint,
-                &grant.endpoint_ws_url,
-            ))
+            .lock(ReconnectKey::new(&grant.fingerprint))
             .await;
         let mut grant = self
             .existing_profile_grant(session, transport_session, pid)
@@ -914,21 +975,33 @@ impl BrowserEngine {
             }
 
             let old_generation = grant.generation;
-            let new_generation =
-                self.existing_profile_grants
-                    .bump_generation(session, transport_session, pid)?;
-            self.store
-                .invalidate_endpoint_generation(pid, old_generation);
             let attempt = super::grant::MAX_RECONNECT_ATTEMPTS
                 .saturating_sub(grant.reconnect_attempts_remaining)
                 .saturating_add(1);
+            // The grant advances inside the pool's claim transfer, so no
+            // cancellation or concurrent release can separate the two.
             let mut reconnect = Box::pin(self.pool.reconnect_existing(
                 &endpoint.ws_url,
                 old_generation,
-                new_generation,
+                || {
+                    let new_generation = self
+                        .existing_profile_grants
+                        .bump_generation(session, transport_session, pid, old_generation)?;
+                    self.store
+                        .invalidate_endpoint_generation(pid, old_generation);
+                    Ok(new_generation)
+                },
+                |generation| {
+                    self.existing_profile_grants.is_current(
+                        session,
+                        transport_session,
+                        pid,
+                        generation,
+                    )
+                },
             ));
             let reconnected = tokio::select! {
-                result = &mut reconnect => result,
+                result = &mut reconnect => result?,
                 // As in prepare: no Chrome prompt exists on the extension route.
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)),
                     if endpoint.transport != super::types::EndpointTransport::ExtensionRelay => {
@@ -938,7 +1011,7 @@ impl BrowserEngine {
                         attempt,
                     }).await {
                         Ok(BrowserConsentOutcome::Accepted | BrowserConsentOutcome::NotPresent) => {
-                            reconnect.await
+                            reconnect.await?
                         }
                         Err(error) => {
                             // The reconnect future may be waiting on browser
@@ -1192,6 +1265,7 @@ impl BrowserEngine {
         conn: &CdpConnection,
         cdp_target_id: &str,
         session: &str,
+        generation: u64,
         transport: super::types::EndpointTransport,
     ) -> Result<String, BrowserRefusal> {
         let mut params = json!({ "targetId": cdp_target_id, "flatten": true });
@@ -1200,6 +1274,9 @@ impl BrowserEngine {
         if transport == super::types::EndpointTransport::ExtensionRelay {
             params["cuaSessionColor"] =
                 json!(cua_driver_contract::cursor::session_fill_hex(session));
+            // The relay counts tab holders per Cua session episode (see
+            // extension_relay::attach_gates and relay_holder).
+            params["cuaSession"] = json!(relay_holder(session, generation));
         }
         let attached = conn
             .call(None, "Target.attachToTarget", params)
@@ -1250,8 +1327,20 @@ impl BrowserEngine {
         let driver_owned = self.is_driver_owned_pid_for_session(session, pid)
             || transport_session
                 .is_some_and(|owner| self.is_driver_owned_pid_for_session(owner, pid));
-        let access_class =
-            endpoint_access_class(grant.is_some(), driver_owned, class.process_role)?;
+        let mut extension_connected = false;
+        if grant.is_none()
+            && !driver_owned
+            && class.process_role == BrowserProcessRole::StandaloneConsumer
+        {
+            extension_connected = self.platform.extension_link_connected(pid).await;
+            if extension_connected {
+                grant = self
+                    .grant_through_extension(session, transport_session, pid, window_id)
+                    .await?;
+            }
+        }
+        let access_class = endpoint_access_class(grant.is_some(), driver_owned, class.process_role)
+            .map_err(|refusal| existing_profile_next_call(refusal, pid, window_id, extension_connected))?;
 
         let native = self.native_window_checked(pid, window_id).await?;
         let fingerprint = self.platform.process_fingerprint(pid).await?;
@@ -1261,10 +1350,23 @@ impl BrowserEngine {
         } else {
             self.owned_endpoint(pid).await?
         };
+        // A grant names the window it was approved for. One made through the
+        // extension covers every window of that Chrome whose consent is the
+        // extension's too (installing it is the consent, and binding such a
+        // window without a grant would mint one without asking), so a second
+        // window of the same browser binds under it. Explicitly approved
+        // grants stay tied to their window.
+        let other_window_covered = match &grant {
+            Some(grant) if grant.window_id != window_id => {
+                grant.endpoint_transport == super::types::EndpointTransport::ExtensionRelay
+                    && self.extension_consent_covers(pid, window_id).await
+            }
+            _ => false,
+        };
         if let Some(grant) = &grant {
             if !grant.fingerprint.matches(&fingerprint)
                 || grant.endpoint_ws_url != endpoint.ws_url
-                || grant.window_id != window_id
+                || (grant.window_id != window_id && !other_window_covered)
             {
                 return Err(refuse(
                     BrowserRefusalCode::BrowserBindingStale,
@@ -1379,6 +1481,50 @@ impl BrowserEngine {
         let target_id = self.store.mint_target(session, record.clone());
         let record = self.store.get_target(session, &target_id)?;
         Ok((target_id, record))
+    }
+
+    /// The bind's own existing-profile grant. With cua's Chrome extension
+    /// connected in this browser, attaching through it is the grant
+    /// `browser_prepare` would make without asking (installing the extension
+    /// is the consent) and it changes no browser setting, so the agent is not
+    /// sent through a separate prepare step. Returns `None` when the consent
+    /// in force needs an explicit `browser_prepare` (an approval host or a
+    /// bounded manifest).
+    /// Whether the consent in force for this window lets the extension route
+    /// attach without an explicit `browser_prepare` approval.
+    async fn extension_consent_covers(&self, pid: i64, window_id: u64) -> bool {
+        use super::prepare::ExistingProfileConsent as Consent;
+        matches!(
+            self.existing_profile_consent(pid, window_id).await,
+            Ok((_, Consent::ExtensionInstalled | Consent::Unrestricted | Consent::LaunchGrant))
+        )
+    }
+
+    async fn grant_through_extension(
+        &self,
+        session: &str,
+        transport_session: Option<&str>,
+        pid: i64,
+        window_id: u64,
+    ) -> Result<Option<ExistingProfileGrant>, BrowserRefusal> {
+        if !self.extension_consent_covers(pid, window_id).await {
+            return Ok(None);
+        }
+        self.attach_existing_profile_via(
+            super::platform::PrepareRequest {
+                pid: Some(pid),
+                window_id: Some(window_id),
+                session: session.to_owned(),
+                transport_session: transport_session.map(str::to_owned),
+                strategy: Some(super::platform::PrepareStrategy::ExistingProfile),
+                profile: None,
+                allow_launch: false,
+            },
+            true,
+        )
+        .await?;
+        self.existing_profile_grant(session, transport_session, pid)
+            .await
     }
 
     pub(crate) async fn native_window_checked(
@@ -1589,7 +1735,7 @@ impl BrowserEngine {
             ));
         }
 
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
         let dispatch_context = crate::tool::current_dispatch_authorization_context();
         if dispatch_context
             .as_deref()
@@ -1945,7 +2091,7 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
         let metrics = conn
             .call(Some(&cdp_session), "Page.getLayoutMetrics", json!({}))
             .await
@@ -2042,7 +2188,7 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
 
         let doc = conn
             .call(
@@ -2523,7 +2669,7 @@ impl BrowserEngine {
             })?;
             if let Some(identity) = &snapshot.semantic_root_identity {
                 let conn = self.connection_for_record(session, &record).await?;
-                let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+                let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
                 let tree = self.local_frame_tree(&conn, &cdp_session).await.map_err(|error| {
                     match error {
                         FrameTreeError::Unsupported => refuse(
@@ -2621,7 +2767,7 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.endpoint_transport).await?;
+        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
         let (document, document_complete) = self.semantic_document(&conn, &cdp_session).await?;
         let root = document.get("root").cloned().unwrap_or(Value::Null);
         let url = root
@@ -2898,6 +3044,36 @@ fn collect_interactive(
             .and_then(Value::as_str);
         collect_interactive(content_document, child_frame_id, false, out);
     }
+}
+
+/// The relay's holder name for one Cua session episode. A session that ends
+/// and starts again gets a new grant generation, so a late release from the
+/// ended episode can never remove the new episode's hold on a tab.
+pub(crate) fn relay_holder(session: &str, generation: u64) -> String {
+    format!("{session}#{generation}")
+}
+
+/// The relay holder a grant's tabs were attached under, if it uses the relay.
+fn grant_relay_holder(grant: &ExistingProfileGrant) -> Option<String> {
+    (grant.endpoint_transport == super::types::EndpointTransport::ExtensionRelay)
+        .then(|| relay_holder(&grant.public_session, grant.generation))
+}
+
+/// Release one grant's claim on its browser socket. Through the extension
+/// relay the socket may be shared with other Cua sessions, so the relay is
+/// first told this session's tabs are released; the socket itself closes only
+/// when its last grant releases it.
+pub(crate) async fn release_grant_claim(pool: &CdpPool, grant: &ExistingProfileGrant) {
+    if let Some(holder) = grant_relay_holder(grant) {
+        if let Ok(conn) = pool
+            .get_existing(&grant.endpoint_ws_url, grant.generation)
+            .await
+        {
+            super::cdp_ws::release_relay_holder(&conn, &holder).await;
+        }
+    }
+    pool.release_existing(&grant.endpoint_ws_url, grant.generation)
+        .await;
 }
 
 #[cfg(test)]

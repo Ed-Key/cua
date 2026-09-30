@@ -250,8 +250,8 @@ impl GetBrowserStateTool {
             name: "get_browser_state".into(),
             description: "Read-only browser inspection. Bind with pid + window_id to get a \
                 target_id and tab ids; snapshot with target_id + tab_id to get page refs \
-                (semantic_v2 adds a ranked outline and typed refs). Without an endpoint it \
-                refuses with browser_requires_setup; use browser_prepare. \
+                (semantic_v2 adds a ranked outline and typed refs). Consent and setup \
+                refusals give the browser_prepare call to make. \
                 Details: skill://cua-driver/BROWSER.md"
                 .into(),
             input_schema: json!({
@@ -1125,8 +1125,9 @@ impl Tool for BrowserClickTool {
             {
                 Ok(_) => ToolResult::text(format!(
                     "dispatched synthetic DOM click on {} in {tab_id}; application effect not \
-                     verified (trust-gated controls may ignore untrusted events). Refresh page \
-                     state and verify the expected postcondition",
+                     verified (trust-gated controls may ignore untrusted events). Read the page \
+                     with get_browser_state to verify; if the control ignored it, click again \
+                     without input_route to use trusted input",
                     ext_ref.as_deref().unwrap_or("?")
                 ))
                 .with_structured(json!({
@@ -1137,10 +1138,9 @@ impl Tool for BrowserClickTool {
                     "tab_id": tab_id,
                     "ref": ext_ref,
                     "frame": frame_kind,
-                    "escalation": {
-                        "recommended": "page",
-                        "reason": "synthetic DOM dispatch cannot prove control activation; refresh page state and verify the expected postcondition",
-                    },
+                    // No escalation: the page-action target would point at the
+                    // legacy page tool, whose mutations are off by default. The
+                    // summary names the real next step.
                 })),
                 Err(e) => ToolResult::error(format!("DOM click failed: {e}")),
             };
@@ -1320,9 +1320,342 @@ const FOCUS_EMULATION_READY_CHECK: &str = "function() { \
     return document.hasFocus() && active === this; \
 }";
 
+// What an editable node holds, read on the node itself: an input's or
+// textarea's value and selection, or a contenteditable's text.
+const READ_EDIT_STATE: &str = "function() { \
+    const field = this.tagName === 'INPUT' || this.tagName === 'TEXTAREA'; \
+    let start = null, end = null; \
+    if (field) { try { start = this.selectionStart; end = this.selectionEnd; } catch (e) {} } \
+    return { value: field ? String(this.value) : String(this.innerText || ''), start: start, \
+        end: end, field: field, connected: this.isConnected, \
+        password: this.tagName === 'INPUT' && (this.type || '').toLowerCase() === 'password' }; \
+}";
+
+// Set an input's or textarea's value the way frameworks observe: through the
+// prototype's native setter (a plain `el.value = x` is swallowed by React's
+// value tracker), then input and change events. Uses the node's own window so
+// it works inside iframes.
+const SET_VALUE_WITH_EVENTS: &str = "function(value) { \
+    const view = this.ownerDocument.defaultView; \
+    const proto = this.tagName === 'INPUT' ? view.HTMLInputElement.prototype : \
+        this.tagName === 'TEXTAREA' ? view.HTMLTextAreaElement.prototype : null; \
+    if (!proto) return false; \
+    Object.getOwnPropertyDescriptor(proto, 'value').set.call(this, value); \
+    this.dispatchEvent(new view.Event('input', { bubbles: true })); \
+    this.dispatchEvent(new view.Event('change', { bubbles: true })); \
+    return true; \
+}";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct EditState {
+    value: String,
+    /// Selection in UTF-16 code units; `None` where the input type has no
+    /// selection API (email, number).
+    start: Option<usize>,
+    end: Option<usize>,
+    /// An input or textarea, as opposed to a contenteditable element.
+    field: bool,
+    password: bool,
+    /// Still in the live document. A page that replaced the element keeps
+    /// the old node's value, which then proves nothing about the page.
+    connected: bool,
+}
+
+async fn read_edit_state(conn: &CdpConnection, cdp: &str, object_id: &str) -> Option<EditState> {
+    let read = conn
+        .call(
+            Some(cdp),
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": READ_EDIT_STATE,
+                "returnByValue": true,
+            }),
+        )
+        .await
+        .ok()?;
+    let state = &read["result"]["value"];
+    Some(EditState {
+        value: state.get("value")?.as_str()?.to_owned(),
+        start: state["start"].as_u64().map(|n| n as usize),
+        end: state["end"].as_u64().map(|n| n as usize),
+        field: state["field"].as_bool().unwrap_or(false),
+        password: state["password"].as_bool().unwrap_or(false),
+        connected: state["connected"].as_bool().unwrap_or(false),
+    })
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Readback {
+    Confirmed(String),
+    Mismatch {
+        actual: String,
+        expected: Option<String>,
+    },
+    /// The edited node left the document (the page replaced it).
+    Detached,
+    /// The node holds a value the edit could have produced, but the evidence
+    /// cannot tell whether it did (for example it replaced a selection the
+    /// driver could not see). Carries the value it holds.
+    Ambiguous(String),
+    Unverifiable,
+}
+
+/// What browser_type asked the node to do.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditMode {
+    /// Insert at the caret (insert_text or keystrokes).
+    Insert,
+    /// Select all, then insert (replace:true).
+    Replace,
+    /// The native value setter (mode set_value).
+    SetValue,
+}
+
+/// The one postcondition every browser_type path checks. Each mode and node
+/// kind has its own rule below.
+///
+/// Verdict rule: `Mismatch` only when the evidence proves the edit was
+/// rejected or changed (no outcome the request allows matches the value).
+/// When an allowed outcome matches but the evidence cannot tell it apart
+/// from another (a selection the driver cannot see), the verdict is
+/// `Ambiguous`, reported as unverifiable. Contenteditable text is compared
+/// after one whitespace normalization applied identically to the whole
+/// candidate and the whole observed value, never to pieces of either, so a
+/// space the requested text itself carries is kept.
+///
+/// Distinguishability rule: a confirmation must tell the accepted outcome
+/// apart from the rejected one. An insertion of non-empty text that leaves
+/// the raw value unchanged, or (for contenteditable) leaves it unchanged
+/// after normalization, and requested contenteditable text that normalizes
+/// to nothing, cannot be confirmed: those verdicts become `Ambiguous`.
+fn judge_edit(before: &EditState, after: &EditState, text: &str, mode: EditMode) -> Readback {
+    let verdict = judge_edit_evidence(before, after, text, mode);
+    let Readback::Confirmed(actual) = verdict else {
+        return verdict;
+    };
+    let unchanged = mode == EditMode::Insert
+        && !text.is_empty()
+        && (after.value == before.value
+            || (!before.field
+                && normalize_rendered(&after.value) == normalize_rendered(&before.value)));
+    let erased_by_normalization = !before.field
+        && !text.is_empty()
+        && normalize_rendered(text).is_empty()
+        && after.value != text;
+    if unchanged || erased_by_normalization {
+        Readback::Ambiguous(actual)
+    } else {
+        Readback::Confirmed(actual)
+    }
+}
+
+/// The postcondition per mode and node kind, before the distinguishability
+/// rule in [`judge_edit`].
+fn judge_edit_evidence(
+    before: &EditState,
+    after: &EditState,
+    text: &str,
+    mode: EditMode,
+) -> Readback {
+    if !after.connected {
+        return Readback::Detached;
+    }
+    let actual = after.value.clone();
+    let mismatch = |expected: Option<String>| Readback::Mismatch {
+        actual: actual.clone(),
+        expected,
+    };
+    match (mode, before.field) {
+        // An input or textarea replaced or set holds exactly the text.
+        (EditMode::Replace | EditMode::SetValue, true) => {
+            if after.value == text {
+                Readback::Confirmed(actual)
+            } else {
+                mismatch(Some(text.to_owned()))
+            }
+        }
+        (EditMode::Replace | EditMode::SetValue, false) => {
+            if same_rendered_text(&after.value, text) {
+                Readback::Confirmed(actual)
+            } else {
+                mismatch(None)
+            }
+        }
+        (EditMode::Insert, true) => match inserted_at_selection(before, text) {
+            Some(expected) if after.value == expected => Readback::Confirmed(actual),
+            Some(expected) => mismatch(Some(expected)),
+            None => match field_splice(&before.value, &after.value, text) {
+                Some(Splice::Inserted) => Readback::Confirmed(actual),
+                Some(Splice::ReplacedRange) => Readback::Ambiguous(actual),
+                None => mismatch(None),
+            },
+        },
+        (EditMode::Insert, false) => match editable_splice(&before.value, &after.value, text) {
+            Some(Splice::Inserted) => Readback::Confirmed(actual),
+            Some(Splice::ReplacedRange) => Readback::Ambiguous(actual),
+            None if editable_splice_search_bounded(&before.value) => mismatch(None),
+            None => Readback::Ambiguous(actual),
+        },
+    }
+}
+
+/// How the typed text sits in the new value relative to the old one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Splice {
+    /// Old value with the text inserted at one position.
+    Inserted,
+    /// Old value with one non-empty range replaced by the text.
+    ReplacedRange,
+}
+
+/// Input or textarea with a known selection: the text replaces the selection
+/// (UTF-16 offsets). `None` when the selection is unknown (email and number
+/// inputs have no selection API, yet the caret can sit anywhere).
+fn inserted_at_selection(before: &EditState, text: &str) -> Option<String> {
+    let units: Vec<u16> = before.value.encode_utf16().collect();
+    let (start, end) = match (before.start, before.end) {
+        (Some(start), Some(end)) if start <= end && end <= units.len() => (start, end),
+        _ => return None,
+    };
+    let mut expected = String::from_utf16_lossy(&units[..start]);
+    expected.push_str(text);
+    expected.push_str(&String::from_utf16_lossy(&units[end..]));
+    Some(expected)
+}
+
+/// Exact values (input, textarea): is `after` the old value with `text` put
+/// in at one position, replacing nothing or one range?
+fn field_splice(before: &str, after: &str, text: &str) -> Option<Splice> {
+    let (before, after, text): (Vec<char>, Vec<char>, Vec<char>) =
+        (before.chars().collect(), after.chars().collect(), text.chars().collect());
+    // Characters of the old value the edit removed.
+    let removed = (before.len() + text.len()).checked_sub(after.len())?;
+    if removed > before.len() {
+        return None;
+    }
+    (0..=before.len() - removed)
+        .find(|&at| {
+            after[..at] == before[..at]
+                && after[at..at + text.len()] == text[..]
+                && after[at + text.len()..] == before[at + removed..]
+        })
+        .map(|_| if removed == 0 { Splice::Inserted } else { Splice::ReplacedRange })
+}
+
+/// Old values longer than this skip the range-replacement search for
+/// contenteditable (it is cubic); an unmatched edit is then ambiguous.
+const EDITABLE_RANGE_SEARCH_MAX_CHARS: usize = 200;
+/// Old values longer than this skip the contenteditable search entirely.
+const EDITABLE_INSERT_SEARCH_MAX_CHARS: usize = 4000;
+
+fn editable_splice_search_bounded(before: &str) -> bool {
+    before.chars().count() <= EDITABLE_RANGE_SEARCH_MAX_CHARS
+}
+
+/// Rendered text (contenteditable): build each candidate from the raw old
+/// value and the raw typed text, then compare it with the observed value
+/// under the same normalization.
+fn editable_splice(before: &str, after: &str, text: &str) -> Option<Splice> {
+    let chars: Vec<char> = before.chars().collect();
+    if chars.len() > EDITABLE_INSERT_SEARCH_MAX_CHARS {
+        return None;
+    }
+    let observed = normalize_rendered(after);
+    let candidate = |start: usize, end: usize| {
+        let mut value: String = chars[..start].iter().collect();
+        value.push_str(text);
+        value.extend(&chars[end..]);
+        normalize_rendered(&value) == observed
+    };
+    if (0..=chars.len()).any(|at| candidate(at, at)) {
+        return Some(Splice::Inserted);
+    }
+    if chars.len() <= EDITABLE_RANGE_SEARCH_MAX_CHARS
+        && (0..chars.len()).any(|start| (start + 1..=chars.len()).any(|end| candidate(start, end)))
+    {
+        return Some(Splice::ReplacedRange);
+    }
+    None
+}
+
+/// A contenteditable replaced with `text` shows that text as rendered.
+fn same_rendered_text(after: &str, text: &str) -> bool {
+    normalize_rendered(after) == normalize_rendered(text)
+}
+
+/// Rendered-text normalization, applied to whole values only: whitespace runs
+/// (including the no-break spaces editors use for typed spaces) become one
+/// space, and the ends are trimmed.
+fn normalize_rendered(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    let mut in_space = false;
+    for ch in value.chars() {
+        if ch.is_whitespace() {
+            if !in_space {
+                out.push(' ');
+            }
+            in_space = true;
+        } else {
+            out.push(ch);
+            in_space = false;
+        }
+    }
+    out.trim().to_owned()
+}
+
+/// Read the node back until it holds what the input should have produced,
+/// for up to half a second (frameworks may re-render after the input event).
+async fn await_edit_readback(
+    conn: &CdpConnection,
+    cdp: &str,
+    object_id: &str,
+    before: &EditState,
+    text: &str,
+    mode: EditMode,
+) -> Readback {
+    let mut judged = Readback::Unverifiable;
+    for attempt in 0..10 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let Some(after) = read_edit_state(conn, cdp, object_id).await else {
+            return judged;
+        };
+        judged = judge_edit(before, &after, text, mode);
+        if matches!(judged, Readback::Confirmed(_) | Readback::Detached) {
+            break;
+        }
+    }
+    judged
+}
+
+const SHOWN_VALUE_CHARS: usize = 200;
+
+fn truncate_value(value: &str) -> String {
+    if value.chars().count() <= SHOWN_VALUE_CHARS {
+        value.to_owned()
+    } else {
+        let mut shown: String = value.chars().take(SHOWN_VALUE_CHARS).collect();
+        shown.push('…');
+        shown
+    }
+}
+
+/// A value for a message: quoted, shortened, never a password.
+fn shown_value(value: &str, password: bool) -> String {
+    if password {
+        format!("{} character(s) (a password; not shown)", value.chars().count())
+    } else {
+        serde_json::to_string(&truncate_value(value)).unwrap_or_default()
+    }
+}
+
 // Select the element's whole content so the next insertion replaces it instead
 // of appending. Returns the number of characters selected, or -1 when the node
-// is not a shape we know how to select. Selection is the only clearing path
+// is not a shape we know how to select. Input types without a selection API
+// (email, number) are selected with select(), which cannot be confirmed here;
+// the read-back after typing shows whether the value was replaced. Selection is the only clearing path
 // that keeps input semantics intact: assigning `value` directly would skip the
 // beforeinput/input events that frameworks bind their state to.
 const SELECT_ALL_IN_ELEMENT: &str = "function() { \
@@ -1330,6 +1663,7 @@ const SELECT_ALL_IN_ELEMENT: &str = "function() { \
         const value = this.value || ''; \
         try { this.setSelectionRange(0, value.length); } catch (e) { \
             try { this.select(); } catch (_) { return -1; } \
+            if (this.selectionStart === null) return Array.from(value).length; \
         } \
         if (this.selectionStart !== 0 || this.selectionEnd !== value.length) return -1; \
         return Array.from(value).length; \
@@ -1470,6 +1804,7 @@ impl BrowserTypeTool {
             name: "browser_type".into(),
             description: "Type text into an editable page ref of a bound tab. Appends at the \
                 caret unless replace:true, which replaces the content (empty text clears it). \
+                Reads the field back: confirmed, or an error with the value it holds. \
                 Refused for heuristic bindings."
                 .into(),
             input_schema: json!({
@@ -1482,9 +1817,9 @@ impl BrowserTypeTool {
                     "ref": schema_ref(),
                     "mode": {
                         "type": "string",
-                        "enum": ["insert_text", "keystrokes"],
+                        "enum": ["insert_text", "keystrokes", "set_value"],
                         "default": "insert_text",
-                        "description": "insert_text: one bulk insert. keystrokes: per-character key events."
+                        "description": "insert_text: one bulk insert. keystrokes: per-character key events. set_value: set an input or textarea through its native value setter and fire input and change (React-safe; replaces the value)."
                     },
                     "replace": {
                         "type": "boolean",
@@ -1548,9 +1883,9 @@ impl Tool for BrowserTypeTool {
             Err(e) => return e,
         };
         let mode = args.opt_str("mode").unwrap_or_else(|| "insert_text".into());
-        if mode != "insert_text" && mode != "keystrokes" {
+        if !matches!(mode.as_str(), "insert_text" | "keystrokes" | "set_value") {
             return ToolResult::error(format!(
-                "mode must be \"insert_text\" or \"keystrokes\", got {mode:?}"
+                "mode must be \"insert_text\", \"keystrokes\", or \"set_value\", got {mode:?}"
             ));
         }
         let replace = args.opt_bool("replace").unwrap_or(false);
@@ -1701,7 +2036,48 @@ impl Tool for BrowserTypeTool {
 
         let requested_chars = text.chars().count();
         let mut replaced_chars = 0usize;
-        let (typed, delivered_chars) = if mode == "insert_text" {
+        // What the field held before any input, for the read-back below.
+        // Keystrokes re-read it after their focus preparation (see there).
+        let mut before = read_edit_state(conn, cdp, &object_id).await;
+        let replaces = replace || mode == "set_value";
+        let edit_mode = if mode == "set_value" {
+            EditMode::SetValue
+        } else if replace {
+            EditMode::Replace
+        } else {
+            EditMode::Insert
+        };
+        let (typed, delivered_chars) = if mode == "set_value" {
+            match conn
+                .call(
+                    Some(cdp),
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id,
+                        "functionDeclaration": SET_VALUE_WITH_EVENTS,
+                        "arguments": [{ "value": text }],
+                        "returnByValue": true,
+                    }),
+                )
+                .await
+            {
+                Ok(value) if value["result"]["value"].as_bool() == Some(true) => {
+                    replaced_chars = before
+                        .as_ref()
+                        .map_or(0, |state| state.value.chars().count());
+                    (Ok(()), requested_chars)
+                }
+                Ok(_) => {
+                    return BrowserRefusal::new(
+                        BrowserRefusalCode::BrowserActionUnavailable,
+                        "mode set_value needs an input or textarea ref; use insert_text or \
+                         keystrokes for other editable elements",
+                    )
+                    .to_tool_result()
+                }
+                Err(error) => (Err(error), 0),
+            }
+        } else if mode == "insert_text" {
             if replace {
                 if let Err(detail) =
                     enter_focus_emulation(conn, cdp, entry.backend_node_id, &object_id).await
@@ -1910,6 +2286,13 @@ impl Tool for BrowserTypeTool {
                     }
                 }
             }
+            // The insertion baseline is what the field holds right before the
+            // first key: focus emulation and DOM.focus can move the caret (a
+            // focus handler that puts it at the end), and the read-back judges
+            // the edit against this selection.
+            if let Some(state) = read_edit_state(conn, cdp, &object_id).await {
+                before = Some(state);
+            }
             let mut result = Ok(());
             let mut delivered = 0;
             // No characters to type means the selection has to go away by
@@ -1991,8 +2374,116 @@ impl Tool for BrowserTypeTool {
             (result, delivered)
         };
 
+        if typed.is_ok() {
+            if let Some(before) = before.as_ref() {
+                match await_edit_readback(conn, cdp, &object_id, before, &text, edit_mode).await {
+                    Readback::Mismatch { actual, expected } => {
+                        let shown = shown_value(&actual, before.password);
+                        return ToolResult::error(format!(
+                            "typed {requested_chars} char(s) into {tab_id}, but the field now \
+                             holds {shown}{}: the page changed or rejected the input. Read the \
+                             page before typing again.",
+                            expected
+                                .as_deref()
+                                .map(|expected| format!(
+                                    " instead of {}",
+                                    shown_value(expected, before.password)
+                                ))
+                                .unwrap_or_default()
+                        ))
+                        .with_structured(json!({
+                            "code": "browser_type_mismatch",
+                            "effect": "mismatch",
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "ref": ext_ref,
+                            "mode": mode,
+                            "requested_chars": requested_chars,
+                            "delivered_chars": delivered_chars,
+                            "value": (!before.password).then(|| truncate_value(&actual)),
+                            "expected": expected
+                                .filter(|_| !before.password)
+                                .map(|expected| truncate_value(&expected)),
+                        }));
+                    }
+                    Readback::Confirmed(actual) => {
+                        let shown = shown_value(&actual, before.password);
+                        let summary = if replaces {
+                            format!(
+                                "typed {requested_chars} char(s) into {tab_id}, replacing \
+                                 {replaced_chars} char(s); the field now holds {shown}"
+                            )
+                        } else {
+                            format!(
+                                "typed {requested_chars} char(s) into {tab_id}; the field now \
+                                 holds {shown}"
+                            )
+                        };
+                        return ToolResult::text(summary).with_structured(json!({
+                            "status": "ok",
+                            "effect": "confirmed",
+                            "evidence": [{
+                                "kind": "browser_readback",
+                                "detail": format!("the field holds {shown}"),
+                            }],
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "ref": ext_ref,
+                            "frame": entry.frame.kind.as_str(),
+                            "mode": mode,
+                            "chars": requested_chars,
+                            "requested_chars": requested_chars,
+                            "delivered_chars": delivered_chars,
+                            "replace": replaces,
+                            "replaced_chars": replaced_chars,
+                            "value": (!before.password).then(|| truncate_value(&actual)),
+                        }));
+                    }
+                    Readback::Detached => {
+                        return ToolResult::text(format!(
+                            "typed {requested_chars} char(s) into {tab_id}, but the page \
+                             replaced the field while it handled the input, so what it holds \
+                             now is unknown. Snapshot the tab again and read the new field."
+                        ))
+                        .with_structured(json!({
+                            "status": "ok",
+                            "effect": "unverifiable",
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "ref": ext_ref,
+                            "mode": mode,
+                            "requested_chars": requested_chars,
+                            "delivered_chars": delivered_chars,
+                            "readback": "element_replaced",
+                        }));
+                    }
+                    Readback::Ambiguous(actual) => {
+                        let shown = shown_value(&actual, before.password);
+                        return ToolResult::text(format!(
+                            "typed {requested_chars} char(s) into {tab_id}; the field now holds \
+                             {shown}, which the input could have produced (for example by \
+                             replacing a selection the driver could not see), but that cannot \
+                             be confirmed. Check the value before typing again."
+                        ))
+                        .with_structured(json!({
+                            "status": "ok",
+                            "effect": "unverifiable",
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "ref": ext_ref,
+                            "mode": mode,
+                            "requested_chars": requested_chars,
+                            "delivered_chars": delivered_chars,
+                            "readback": "ambiguous",
+                            "value": (!before.password).then(|| truncate_value(&actual)),
+                        }));
+                    }
+                    Readback::Unverifiable => {}
+                }
+            }
+        }
         match typed {
-            Ok(()) => ToolResult::text(if replace {
+            Ok(()) => ToolResult::text(if replaces {
                 format!(
                     "typed {requested_chars} char(s) into {tab_id}, replacing \
                      {replaced_chars} char(s)"
@@ -2013,7 +2504,7 @@ impl Tool for BrowserTypeTool {
                 // Report what was displaced, not just what was sent: a caller
                 // that asked to replace needs to distinguish "set an empty
                 // field" from "overwrote something" without re-reading the page.
-                "replace": replace,
+                "replace": replaces,
                 "replaced_chars": replaced_chars,
             })),
             Err(e) => BrowserRefusal::new(
@@ -2444,6 +2935,141 @@ impl Tool for BrowserSetInputFilesTool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_browser_type_mode_has_one_postcondition() {
+        use EditMode::{Insert, Replace, SetValue};
+        enum Want {
+            Confirmed,
+            Mismatch(Option<&'static str>),
+            Ambiguous,
+            Detached,
+        }
+        let field = |value: &str, selection: Option<(usize, usize)>| EditState {
+            value: value.to_owned(),
+            start: selection.map(|(start, _)| start),
+            end: selection.map(|(_, end)| end),
+            field: true,
+            password: false,
+            connected: true,
+        };
+        let editable = |value: &str| EditState {
+            field: false,
+            ..field(value, None)
+        };
+        let detached = |value: &str| EditState {
+            connected: false,
+            ..field(value, None)
+        };
+        #[rustfmt::skip]
+        let cases: Vec<(&str, EditState, EditState, &str, EditMode, Want)> = vec![
+            // Input or textarea with a known caret or selection.
+            ("caret insert", field("abcd", Some((2, 2))), field("abXcd", None), "X", Insert, Want::Confirmed),
+            ("selection replaced", field("abcd", Some((2, 3))), field("abXd", None), "X", Insert, Want::Confirmed),
+            ("caret insert, UTF-16", field("😀z", Some((2, 2))), field("😀yz", None), "y", Insert, Want::Confirmed),
+            ("caret insert, wrong spot", field("abcd", Some((2, 2))), field("abcdX", None), "X", Insert, Want::Mismatch(Some("abXcd"))),
+            ("rejected characters", field("", Some((0, 0))), field("1234", None), "12ab34", Insert, Want::Mismatch(Some("12ab34"))),
+            ("React reset the field", field("", Some((0, 0))), field("", None), "ada@x.io", Insert, Want::Mismatch(Some("ada@x.io"))),
+            // Email and number inputs: no selection API, caret anywhere.
+            ("unknown caret, mid-field", field("a@b.com", None), field("ax@b.com", None), "x", Insert, Want::Confirmed),
+            ("unknown caret, at the end", field("a@b.com", None), field("a@b.comx", None), "x", Insert, Want::Confirmed),
+            ("unknown caret, text lost", field("a@b.com", None), field("a@b.co", None), "x", Insert, Want::Mismatch(None)),
+            ("unknown caret, empty field", field("", None), field("ada@x.io", None), "ada@x.io", Insert, Want::Confirmed),
+            ("unknown selection replaced", field("hello world", None), field("hello there", None), "there", Insert, Want::Ambiguous),
+            // Replace and set_value on an input or textarea.
+            ("replace", field("old", Some((3, 3))), field("new", None), "new", Replace, Want::Confirmed),
+            ("replace appended", field("old", None), field("oldnew", None), "new", Replace, Want::Mismatch(Some("new"))),
+            ("clear", field("old", None), field("", None), "", Replace, Want::Confirmed),
+            ("set_value", field("old", None), field("new", None), "new", SetValue, Want::Confirmed),
+            ("set_value ignored", field("old", None), field("old", None), "new", SetValue, Want::Mismatch(Some("new"))),
+            // Contenteditable.
+            ("editable insert", editable("Hello"), editable("Hello world"), " world", Insert, Want::Confirmed),
+            ("editable insert, extra whitespace", editable("Hello\n"), editable("Hello  world\n"), " world", Insert, Want::Confirmed),
+            ("editable retyped over a selection", editable("Hello"), editable("Hello"), "Hello", Insert, Want::Ambiguous),
+            ("editable insert lost", editable("Hello"), editable("Hello"), "abc", Insert, Want::Mismatch(None)),
+            ("editable trailing space typed", editable(""), editable("hello "), "hello ", Insert, Want::Confirmed),
+            ("editable typed space as nbsp", editable(""), editable("hello\u{a0}"), "hello ", Insert, Want::Confirmed),
+            ("editable append after a space", editable("hello "), editable("hello world"), "world", Insert, Want::Confirmed),
+            ("editable selection replaced", editable("hello world"), editable("hello there"), "there", Insert, Want::Ambiguous),
+            ("editable autocorrected", editable(""), editable("the"), "teh", Insert, Want::Mismatch(None)),
+            // Normalization cannot tell these apart from a rejected edit.
+            ("editable space into empty", editable(""), editable(""), " ", Insert, Want::Ambiguous),
+            ("editable trailing space dropped", editable("hello"), editable("hello"), " ", Insert, Want::Ambiguous),
+            ("editable trailing space as newline", editable("hello"), editable("hello\n"), " ", Insert, Want::Ambiguous),
+            ("editable replaced with spaces", editable("x"), editable(""), "  ", Replace, Want::Ambiguous),
+            ("field retyped over the same selection", field("abc", Some((0, 3))), field("abc", None), "abc", Insert, Want::Ambiguous),
+            ("field space rejected", field("", Some((0, 0))), field("", None), " ", Insert, Want::Mismatch(Some(" "))),
+            ("editable replace, same text", editable("Hello"), editable("Hello"), "Hello", Replace, Want::Confirmed),
+            ("editable replace appended", editable("Hello"), editable("Hello world"), "world", Replace, Want::Mismatch(None)),
+            ("editable replace", editable("Hello"), editable("world\n"), "world", Replace, Want::Confirmed),
+            ("editable clear", editable("Hello"), editable("\n"), "", Replace, Want::Confirmed),
+            // The page replaced the edited element.
+            ("detached node", field("", Some((0, 0))), detached("ada@x.io"), "ada@x.io", Insert, Want::Detached),
+        ];
+        for (name, before, after, text, mode, want) in cases {
+            let got = judge_edit(&before, &after, text, mode);
+            let ok = match (&want, &got) {
+                (Want::Confirmed, Readback::Confirmed(value)) => *value == after.value,
+                (Want::Mismatch(expected), Readback::Mismatch { actual, expected: got }) => {
+                    *actual == after.value && got.as_deref() == *expected
+                }
+                (Want::Detached, Readback::Detached) => true,
+                (Want::Ambiguous, Readback::Ambiguous(value)) => *value == after.value,
+                _ => false,
+            };
+            assert!(ok, "{name}: got {got:?}");
+        }
+    }
+
+    #[test]
+    fn a_confirmed_insertion_always_changed_the_value() {
+        let values = ["", " ", "a", "hello", "hello ", "hello\n", "hello world", "ahello"];
+        let texts = [" ", "a", "hello", " world", "  "];
+        for field in [true, false] {
+            for selection in [None, Some((0, 0)), Some((5, 5))] {
+                for before in values {
+                    for after in values {
+                        for text in texts {
+                            let state = |value: &str, selection: Option<(usize, usize)>| EditState {
+                                value: value.to_owned(),
+                                start: selection.map(|(start, _)| start),
+                                end: selection.map(|(_, end)| end),
+                                field,
+                                password: false,
+                                connected: true,
+                            };
+                            let verdict = judge_edit(
+                                &state(before, if field { selection } else { None }),
+                                &state(after, None),
+                                text,
+                                EditMode::Insert,
+                            );
+                            if matches!(verdict, Readback::Confirmed(_)) {
+                                assert_ne!(before, after, "{before:?} -> {after:?} typing {text:?}");
+                                if !field {
+                                    assert_ne!(
+                                        normalize_rendered(before),
+                                        normalize_rendered(after),
+                                        "{before:?} -> {after:?} typing {text:?}"
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn passwords_are_never_shown() {
+        assert_eq!(
+            shown_value("hunter2", true),
+            "7 character(s) (a password; not shown)"
+        );
+        assert_eq!(shown_value("a\"b", false), "\"a\\\"b\"");
+        assert_eq!(truncate_value(&"x".repeat(250)).chars().count(), 201);
+    }
+
     use super::*;
     use crate::browser::platform::{BrowserPlatform, PrepareOutcome, PrepareRequest};
     use crate::browser::types::{

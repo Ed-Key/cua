@@ -456,14 +456,30 @@ fn begin_session_dispatch_inner(
     if !is_trackable(session_id) {
         return Err("session has ended");
     }
+    // An unnamed transport session reclaimed by the idle sweep starts a new
+    // lifecycle episode on its owner's next call instead of refusing every
+    // later call. Its cleanup must have finished first, so snapshots, element
+    // tokens, grants, and recordings from the ended episode stay retired.
+    let recreate = recreates_on_next_call(session_id, owner_transport);
+    if recreate && !retry_session_cleanup(session_id).complete {
+        return Err("session cleanup is incomplete; retry the call");
+    }
     let now = Instant::now();
-    {
+    let recreated = {
         // Keep tombstone admission and live-record insertion in one critical
         // section. Otherwise an end could land between the old pre-check and
         // insertion, leaving a tombstoned record that was silently recreated
         // by a racing first action.
-        let ended = ended_sessions().lock().unwrap();
-        if ended.contains_key(session_id) {
+        let mut ended = ended_sessions().lock().unwrap();
+        let mut idle_ended = idle_ended_sessions().lock().unwrap();
+        let recreated = ended.contains_key(session_id);
+        if recreated
+            && !(recreate
+                && idle_ended.contains(session_id)
+                && ended
+                    .get(session_id)
+                    .is_some_and(|owner| owner.as_deref() == Some(owner_transport)))
+        {
             return Err("session has ended");
         }
         let mut records = lifecycle_records().lock().unwrap();
@@ -490,11 +506,21 @@ fn begin_session_dispatch_inner(
             record.idle_ttl = idle_ttl;
         }
         record.in_flight += 1;
-    }
+        if recreated {
+            ended.remove(session_id);
+            idle_ended.remove(session_id);
+        }
+        recreated
+    };
     activity()
         .lock()
         .unwrap()
         .insert(session_id.to_owned(), now);
+    if recreated {
+        // Platform overlays keep their own late-command tombstones; clear
+        // them exactly as an explicit start_session revival would.
+        fire_session_revive_for_owner(session_id, owner_transport);
+    }
     Ok(SessionDispatchGuard {
         session_id: session_id.to_owned(),
     })
@@ -670,6 +696,10 @@ pub fn activate_or_revive_session_for_owner(
         }
         if revived {
             ended.remove(session_id);
+            idle_ended_sessions()
+                .lock()
+                .unwrap()
+                .remove(session_id);
         }
         revived
     };
@@ -987,6 +1017,13 @@ static ENDED_SESSIONS: OnceLock<Mutex<HashMap<String, Option<String>>>> = OnceLo
 /// (see [`reclaim_exited_session`]). A flag only counts while its tombstone
 /// exists; every new tombstone clears it first.
 static OWNER_EXITED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Tombstoned sessions, named or unnamed, whose episode ended only because the
+/// idle sweep reclaimed it. Mutated only while holding the `ENDED_SESSIONS`
+/// lock, and meaningful only while the matching tombstone exists.
+static IDLE_ENDED_SESSIONS: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
+/// Why each tombstone was written, for refusal messages. Read only while the
+/// tombstone exists ([`session_end_reason`]); a later end overwrites it.
+static ENDED_REASONS: OnceLock<Mutex<HashMap<String, SessionEndReason>>> = OnceLock::new();
 /// Runtime generations that have received terminal revoke-all.
 ///
 /// This latch is intentionally independent of grants and public session
@@ -1012,6 +1049,14 @@ fn ended_sessions() -> &'static Mutex<HashMap<String, Option<String>>> {
 
 fn owner_exited_sessions() -> &'static Mutex<HashSet<String>> {
     OWNER_EXITED_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn idle_ended_sessions() -> &'static Mutex<HashSet<String>> {
+    IDLE_ENDED_SESSIONS.get_or_init(|| Mutex::new(HashSet::new()))
+}
+
+fn ended_reasons() -> &'static Mutex<HashMap<String, SessionEndReason>> {
+    ENDED_REASONS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn suspended_runtime_scopes() -> &'static Mutex<HashSet<String>> {
@@ -1219,6 +1264,16 @@ pub fn release_process_state_for_shutdown() {
         let mut ended = ended.lock().unwrap();
         ended.clear();
         ended.shrink_to_fit();
+        if let Some(idle_ended) = IDLE_ENDED_SESSIONS.get() {
+            let mut idle_ended = idle_ended.lock().unwrap();
+            idle_ended.clear();
+            idle_ended.shrink_to_fit();
+        }
+        if let Some(reasons) = ENDED_REASONS.get() {
+            let mut reasons = reasons.lock().unwrap();
+            reasons.clear();
+            reasons.shrink_to_fit();
+        }
     }
     if let Some(exited) = OWNER_EXITED_SESSIONS.get() {
         let mut exited = exited.lock().unwrap();
@@ -1245,7 +1300,8 @@ pub fn fire_session_end(session_id: &str) -> bool {
 }
 
 fn fire_session_end_for_owner(session_id: &str, owner_transport: Option<&str>) -> bool {
-    let first_fire = mark_session_ended(session_id, owner_transport);
+    let (first_fire, _) =
+        mark_session_ended(session_id, owner_transport, SessionEndReason::Unknown);
     if first_fire {
         initialize_session_cleanup(session_id);
     }
@@ -1258,23 +1314,70 @@ fn fire_session_end_for_owner(session_id: &str, owner_transport: Option<&str>) -
 /// Hooks run after this short critical section. Keeping this transition under
 /// the same lock order as dispatch admission prevents a racing first action
 /// from recreating a record immediately before or after termination.
-fn mark_session_ended(session_id: &str, owner_transport: Option<&str>) -> bool {
+///
+/// Returns whether this call wrote the tombstone, and whether the ended
+/// episode is eligible to be recreated on its owner's next call (an idle end
+/// of a live record). Eligibility is NOT published here; see
+/// [`publish_idle_revival`].
+fn mark_session_ended(
+    session_id: &str,
+    owner_transport: Option<&str>,
+    reason: SessionEndReason,
+) -> (bool, bool) {
     activity().lock().unwrap().remove(session_id);
     let mut ended = ended_sessions().lock().unwrap();
-    let record_owner = lifecycle_records()
-        .lock()
-        .unwrap()
-        .remove(session_id)
-        .map(|record| record.owner_transport);
+    let record = lifecycle_records().lock().unwrap().remove(session_id);
+    // A session reclaimed for inactivity, named or not, may be recreated on
+    // its owner transport's next call. Every other end reason keeps the
+    // resurrection guard until an explicit start_session.
+    let idle_owned = reason == SessionEndReason::IdleTimeout && record.is_some();
+    let mut idle_ended = idle_ended_sessions().lock().unwrap();
     if ended.contains_key(session_id) {
-        false
+        // A later explicit or transport end makes an idle end terminal.
+        if reason != SessionEndReason::IdleTimeout {
+            idle_ended.remove(session_id);
+            if reason != SessionEndReason::Unknown {
+                ended_reasons()
+                    .lock()
+                    .unwrap()
+                    .insert(session_id.to_owned(), reason);
+            }
+        }
+        (false, false)
     } else {
         ended.insert(
             session_id.to_owned(),
-            owner_transport.map(str::to_owned).or(record_owner),
+            owner_transport
+                .map(str::to_owned)
+                .or(record.map(|record| record.owner_transport)),
         );
         owner_exited_sessions().lock().unwrap().remove(session_id);
-        true
+        ended_reasons()
+            .lock()
+            .unwrap()
+            .insert(session_id.to_owned(), reason);
+        idle_ended.remove(session_id);
+        (true, idle_owned)
+    }
+}
+
+/// Make an idle-ended episode recreatable by its owner's next call.
+///
+/// Ordering rule: revival eligibility is published only after the ended
+/// episode's cleanup is registered ([`initialize_session_cleanup`]).
+/// Admission of a recreating call treats "no cleanup entry" as "cleanup
+/// complete", so publishing earlier would let a racing call start a new
+/// episode whose state the old episode's cleanup then tears down. The
+/// owner-exit reclaim follows the same rule. A terminal end (explicit,
+/// transport exit, revocation) that lands in between wins: the tombstone's
+/// reason is no longer the idle timeout, so nothing is published.
+fn publish_idle_revival(session_id: &str) {
+    let ended = ended_sessions().lock().unwrap();
+    let mut idle_ended = idle_ended_sessions().lock().unwrap();
+    let still_idle = ended.contains_key(session_id)
+        && ended_reasons().lock().unwrap().get(session_id) == Some(&SessionEndReason::IdleTimeout);
+    if still_idle {
+        idle_ended.insert(session_id.to_owned());
     }
 }
 
@@ -1424,6 +1527,14 @@ pub fn forget_ended_sessions_with_prefix(prefix: &str) -> usize {
     let before = ended.len();
     ended.retain(|session, _| !session.starts_with(prefix));
     let forgotten = before - ended.len();
+    idle_ended_sessions()
+        .lock()
+        .unwrap()
+        .retain(|session| !session.starts_with(prefix));
+    ended_reasons()
+        .lock()
+        .unwrap()
+        .retain(|session, _| !session.starts_with(prefix));
     drop(ended);
     cleanup_progress()
         .lock()
@@ -1438,6 +1549,54 @@ pub fn forget_ended_sessions_with_prefix(prefix: &str) -> usize {
 /// overlay keeps its own render-side tombstone keyed on the same id.
 pub fn is_session_ended(session_id: &str) -> bool {
     ended_sessions().lock().unwrap().contains_key(session_id)
+}
+
+/// Whether an ended lifecycle id was reclaimed only by the idle sweep and
+/// `owner_transport` owned it, so that transport's next session-requiring call
+/// recreates it instead of being refused. This holds for named and unnamed
+/// sessions alike. Explicit ends, transport exits, revocations, and every
+/// other transport always return `false`.
+pub fn recreates_on_next_call(session_id: &str, owner_transport: &str) -> bool {
+    let ended = ended_sessions().lock().unwrap();
+    ended
+        .get(session_id)
+        .is_some_and(|owner| owner.as_deref() == Some(owner_transport))
+        && idle_ended_sessions()
+            .lock()
+            .unwrap()
+            .contains(session_id)
+}
+
+/// Why an ended session ended, while its tombstone exists. `None` for a live
+/// or unknown id.
+pub fn session_end_reason(session_id: &str) -> Option<SessionEndReason> {
+    let ended = ended_sessions().lock().unwrap();
+    if !ended.contains_key(session_id) {
+        return None;
+    }
+    if owner_exited_sessions().lock().unwrap().contains(session_id) {
+        return Some(SessionEndReason::ProcessExit);
+    }
+    Some(
+        ended_reasons()
+            .lock()
+            .unwrap()
+            .get(session_id)
+            .copied()
+            .unwrap_or(SessionEndReason::Unknown),
+    )
+}
+
+/// The clause a refusal uses to say why a session ended.
+pub fn session_end_explanation(reason: Option<SessionEndReason>) -> &'static str {
+    match reason {
+        Some(SessionEndReason::IdleTimeout) => {
+            "it was idle past the session idle timeout (5 minutes by default)"
+        }
+        Some(SessionEndReason::Explicit) => "end_session ended it",
+        Some(SessionEndReason::ProcessExit) => "the connection that owned it closed",
+        Some(SessionEndReason::Unknown) | None => "the host ended it",
+    }
 }
 
 /// Whether termination has been requested for a runtime-private lifecycle.
@@ -1475,11 +1634,12 @@ pub fn revive_session(session_id: &str) -> bool {
     if !retry_session_cleanup(session_id).complete {
         return false;
     }
-    ended_sessions()
+    let mut ended = ended_sessions().lock().unwrap();
+    idle_ended_sessions()
         .lock()
         .unwrap()
-        .remove(session_id)
-        .is_some()
+        .remove(session_id);
+    ended.remove(session_id).is_some()
 }
 
 /// Owner-checked revival used by the public `start_session` tool. A public
@@ -1533,6 +1693,10 @@ pub fn revive_session_for_owner(
         None if owner_transport != session_id => Err("session is not available to this transport"),
         _ => {
             ended.remove(session_id);
+            idle_ended_sessions()
+                .lock()
+                .unwrap()
+                .remove(session_id);
             Ok(true)
         }
     }
@@ -1597,7 +1761,7 @@ fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
 }
 
 fn finish_session_end(session_id: &str, reason: SessionEndReason) {
-    let first_fire = mark_session_ended(session_id, None);
+    let (first_fire, idle_revivable) = mark_session_ended(session_id, None, reason);
     let mut cursor_readers = CURSOR_OUTCOME_READERS
         .get()
         .map(|readers| {
@@ -1631,6 +1795,9 @@ fn finish_session_end(session_id: &str, reason: SessionEndReason) {
                 .lock()
                 .unwrap()
                 .insert(session_id.to_owned());
+        }
+        if idle_revivable {
+            publish_idle_revival(session_id);
         }
     }
     let _ = retry_session_cleanup(session_id);
@@ -2235,6 +2402,136 @@ mod tests {
             "successful cleanup hooks must not run twice"
         );
         assert!(revive_session(sid));
+    }
+
+    #[test]
+    fn only_the_owner_transport_recreates_an_idle_ended_session() {
+        let pid = std::process::id();
+        let implicit = format!("idle-recreate-implicit-{pid}");
+        let named = format!("idle-recreate-named-{pid}");
+        let named_owner = format!("idle-recreate-named-owner-{pid}");
+        let begin = |id: &str, label: Option<&str>, owner: &str| {
+            begin_session_dispatch(
+                id,
+                label,
+                owner,
+                label.is_none(),
+                SessionTransport::McpStdio,
+                SessionClientKind::Mcp,
+            )
+        };
+        // Fail at the idle end and at the first recreation attempt.
+        let failures = Arc::new(AtomicUsize::new(2));
+        let failures_for_hook = failures.clone();
+        let observed = implicit.clone();
+        let _hook = register_scoped_fallible_session_end_hook("idle-recreate-test", move |id| {
+            if id == observed
+                && failures_for_hook
+                    .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |left| {
+                        left.checked_sub(1)
+                    })
+                    .is_ok()
+            {
+                return Err("synthetic cleanup failure".into());
+            }
+            Ok(())
+        });
+
+        drop(begin(&implicit, None, &implicit).unwrap());
+        drop(begin(&named, Some("named"), &named_owner).unwrap());
+        assert_eq!(
+            evict_idle_with_prefix(Duration::ZERO, &implicit),
+            [implicit.clone()]
+        );
+        assert_eq!(
+            evict_idle_with_prefix(Duration::ZERO, &named),
+            [named.clone()]
+        );
+
+        // A named episode comes back for its owner transport only, and says
+        // why it ended while it is down.
+        assert_eq!(session_end_reason(&named), Some(SessionEndReason::IdleTimeout));
+        assert!(!recreates_on_next_call(&named, "another-transport"));
+        assert_eq!(
+            begin(&named, Some("named"), "another-transport").err(),
+            Some("session has ended")
+        );
+        assert!(recreates_on_next_call(&named, &named_owner));
+        drop(begin(&named, Some("named"), &named_owner).expect("named session recreated"));
+        assert!(!is_session_ended(&named));
+        assert_eq!(session_end_reason(&named), None);
+        // Another transport cannot claim the unnamed id.
+        assert_eq!(
+            begin(&implicit, None, "another-transport").err(),
+            Some("session has ended")
+        );
+        // Unfinished cleanup is retried by the call and blocks recreation.
+        assert!(recreates_on_next_call(&implicit, &implicit));
+        assert_eq!(
+            begin(&implicit, None, &implicit).err(),
+            Some("session cleanup is incomplete; retry the call")
+        );
+        let guard = begin(&implicit, None, &implicit).expect("recreated after cleanup");
+        assert!(!is_session_ended(&implicit));
+        assert!(
+            session_snapshot(&implicit, &implicit, DEFAULT_SESSION_IDLE_TTL)
+                .is_some_and(|snapshot| snapshot.implicit)
+        );
+        drop(guard);
+
+        // An explicit end stays terminal until start_session.
+        end_session(&implicit);
+        assert_eq!(session_end_reason(&implicit), Some(SessionEndReason::Explicit));
+        assert!(!recreates_on_next_call(&implicit, &implicit));
+        assert_eq!(
+            begin(&implicit, None, &implicit).err(),
+            Some("session has ended")
+        );
+        assert!(revive_session(&implicit));
+        end_session(&named);
+        assert!(revive_session(&named));
+    }
+
+    #[test]
+    fn idle_revival_is_published_only_after_cleanup_is_registered() {
+        let pid = std::process::id();
+        let id = format!("idle-publish-order-{pid}");
+        let begin = |owner: &str| {
+            begin_session_dispatch(
+                &id,
+                Some("quiet"),
+                owner,
+                false,
+                SessionTransport::McpStdio,
+                SessionClientKind::Mcp,
+            )
+        };
+        drop(begin("owner").unwrap());
+        // The sweep has written the tombstone but not registered cleanup yet:
+        // a racing call from the owner must not be admitted.
+        assert_eq!(
+            mark_session_ended(&id, None, SessionEndReason::IdleTimeout),
+            (true, true)
+        );
+        assert!(!recreates_on_next_call(&id, "owner"));
+        assert_eq!(begin("owner").err(), Some("session has ended"));
+        initialize_session_cleanup(&id);
+        publish_idle_revival(&id);
+        assert!(recreates_on_next_call(&id, "owner"));
+        drop(begin("owner").expect("recreated after cleanup registration"));
+
+        // A terminal end between the tombstone and publication wins.
+        drop(begin("owner").unwrap());
+        assert_eq!(
+            mark_session_ended(&id, None, SessionEndReason::IdleTimeout),
+            (true, true)
+        );
+        mark_session_ended(&id, None, SessionEndReason::Explicit);
+        initialize_session_cleanup(&id);
+        publish_idle_revival(&id);
+        assert!(!recreates_on_next_call(&id, "owner"));
+        assert_eq!(session_end_reason(&id), Some(SessionEndReason::Explicit));
+        assert!(revive_session(&id));
     }
 
     #[test]

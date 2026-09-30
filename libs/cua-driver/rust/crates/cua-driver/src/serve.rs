@@ -468,18 +468,28 @@ async fn invoke_daemon_tool(
 
     if let Some(sid) = &effective_session {
         if !is_session_lifecycle_tool(&tool_name)
-            && sdk.is_session_ended(sid)
+            && sdk.is_session_ended(sid, req.session_id.as_deref())
             && !sdk.is_session_reclaimable(sid, req.session_id.as_deref())
         {
             observe_daemon_error(observation, 1);
-            return DaemonResponse::err(
+            let why =
+                cua_driver_core::session::session_end_explanation(sdk.session_end_reason(sid));
+            // An unnamed call's lifecycle id is the transport session, which
+            // is not a label the caller can pass back to start_session.
+            let message = if req.session_id.as_deref() == Some(sid.as_str()) {
                 format!(
-                    "session '{sid}' has ended; tool call '{tool_name}' was rejected. \
-                     Call start_session with this id to revive it before issuing further \
-                     actions, or use a new session id."
-                ),
-                1,
-            );
+                    "this connection's unnamed session has ended because {why}; tool call \
+                     '{tool_name}' was rejected. Call start_session without a session label \
+                     to start a new unnamed session."
+                )
+            } else {
+                format!(
+                    "session '{sid}' has ended because {why}; tool call '{tool_name}' was \
+                     rejected. Call start_session with session '{sid}' to start it again, or \
+                     use a new session label."
+                )
+            };
+            return DaemonResponse::err(message, 1);
         }
     }
 

@@ -78,6 +78,21 @@ struct FixtureState {
     viewport_css_width: f64,
     viewport_css_height: f64,
     tab_visible: bool,
+    /// A simulated input field behind every editable ref: `None` keeps the
+    /// fixture's plain `true` answers, so reads cannot be verified.
+    field_value: Option<String>,
+    /// The simulated field keeps digits only, like a controlled React input
+    /// that rejects letters.
+    field_digits_only: bool,
+    /// The page replaces the field on input: reads report a detached node.
+    field_detached_after_input: bool,
+    /// The field's caret, reported as its selection; keystroke `char`
+    /// events insert there. `None` reports no selection and ignores keys.
+    field_caret: Option<usize>,
+    /// A focus handler that moves the caret to the end of the field. In an
+    /// inactive tab it runs only once focus is emulated.
+    field_focus_moves_caret_to_end: bool,
+    focus_emulated: bool,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -109,6 +124,12 @@ impl Default for FixtureState {
             viewport_css_width: 800.0,
             viewport_css_height: 600.0,
             tab_visible: true,
+            field_value: None,
+            field_digits_only: false,
+            field_detached_after_input: false,
+            field_caret: None,
+            field_focus_moves_caret_to_end: false,
+            focus_emulated: false,
             calls: Vec::new(),
         }
     }
@@ -725,17 +746,77 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     if event_type == "keyUp" {
                         st.completed_key_pairs += 1;
                     }
+                    if event_type == "char" {
+                        let text = call.params["text"].as_str().unwrap_or_default().to_owned();
+                        if let Some(caret) = st.field_caret {
+                            if let Some(value) = st.field_value.as_mut() {
+                                value.insert_str(caret, &text);
+                                st.field_caret = Some(caret + text.len());
+                            }
+                        }
+                    }
                     MockReply::ok(json!({}))
                 }
             }
-            "DOM.focus"
-            | "Emulation.setFocusEmulationEnabled"
-            | "Input.dispatchMouseEvent"
-            | "Input.insertText" => MockReply::ok(json!({})),
+            "Input.insertText" => {
+                let digits_only = st.field_digits_only;
+                if let Some(value) = st.field_value.as_mut() {
+                    value.extend(
+                        call.params["text"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .chars()
+                            .filter(|ch| !digits_only || ch.is_ascii_digit()),
+                    );
+                }
+                MockReply::ok(json!({}))
+            }
+            "DOM.focus" | "Emulation.setFocusEmulationEnabled" | "Input.dispatchMouseEvent" => {
+                if call.method == "Emulation.setFocusEmulationEnabled" {
+                    st.focus_emulated = call.params["enabled"].as_bool().unwrap_or(false);
+                }
+                if call.method == "DOM.focus"
+                    && st.field_focus_moves_caret_to_end
+                    && st.focus_emulated
+                {
+                    let end = st.field_value.as_ref().map(String::len);
+                    if st.field_caret.is_some() {
+                        st.field_caret = end;
+                    }
+                }
+                MockReply::ok(json!({}))
+            }
             "DOM.resolveNode" => MockReply::ok(json!({
                 "object": { "objectId": format!("obj-{}", call.params["backendNodeId"]) }
             })),
-            "Runtime.callFunctionOn" => MockReply::ok(json!({ "result": { "value": true } })),
+            "Runtime.callFunctionOn" => {
+                let function = call.params["functionDeclaration"].as_str().unwrap_or_default();
+                let digits_only = st.field_digits_only;
+                let typed = st
+                    .calls
+                    .iter()
+                    .any(|(_, method, _)| method == "Input.insertText");
+                let connected = !(st.field_detached_after_input && typed);
+                let caret = st.field_caret;
+                match st.field_value.as_mut() {
+                    Some(value) if function.contains("selectionStart") => MockReply::ok(json!({
+                        "result": { "value": {
+                            "value": value.clone(), "start": caret, "end": caret,
+                            "field": true, "password": false, "connected": connected,
+                        } }
+                    })),
+                    Some(value) if function.contains("getOwnPropertyDescriptor") => {
+                        *value = call.params["arguments"][0]["value"]
+                            .as_str()
+                            .unwrap_or_default()
+                            .chars()
+                            .filter(|ch| !digits_only || ch.is_ascii_digit())
+                            .collect();
+                        MockReply::ok(json!({ "result": { "value": true } }))
+                    }
+                    _ => MockReply::ok(json!({ "result": { "value": true } })),
+                }
+            }
             other => MockReply::method_not_found(other),
         }
     })
@@ -816,6 +897,11 @@ impl BrowserPlatform for FixturePlatform {
             return Ok(None);
         }
         self.discover_existing_profile_endpoint(pid).await
+    }
+
+    async fn extension_link_connected(&self, _pid: i64) -> bool {
+        self.existing_endpoint_visible.load(Ordering::SeqCst)
+            && self.existing_transport == EndpointTransport::ExtensionRelay
     }
 
     async fn discover_existing_profile_endpoint(
@@ -1137,6 +1223,19 @@ async fn standalone_consumer_bind_without_grant_refuses_before_endpoint_discover
         refusal["refusal"]["detail"]["next_action"],
         "browser_prepare"
     );
+    // The exact call, so an agent never assembles it by guessing.
+    assert_eq!(
+        refusal["refusal"]["detail"]["next_call"],
+        json!({
+            "tool": "browser_prepare",
+            "arguments": { "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } }
+        })
+    );
+    assert_eq!(refusal["refusal"]["detail"]["extension_connected"], false);
+    assert!(refusal["refusal"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("changes no browser settings"));
     assert!(
         !managed_discovery_invoked.load(Ordering::SeqCst),
         "read-only bind must not inspect a consent-gated endpoint"
@@ -1180,6 +1279,208 @@ async fn approved_existing_profile_attach_claims_then_binds_one_generation() {
         .await;
     assert_eq!(structured(&state)["status"], "ok", "{}", structured(&state));
     crate::session::fire_session_end("transport-v2-attach");
+}
+
+#[tokio::test]
+async fn an_existing_profile_attach_changes_its_claim_only_under_the_browser_gate() {
+    const TRANSPORT: &str = "transport-v2-attach-gate";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let fingerprint = f.engine.platform.process_fingerprint(1).await.unwrap();
+    // The gate a reconnect of this endpoint holds.
+    let gate = f
+        .engine
+        .reconnect_gates
+        .lock(super::reconnect::ReconnectKey::new(&fingerprint))
+        .await;
+    let tool = BrowserPrepareTool::new(f.engine.clone());
+    let prepare = tool.invoke(json!({
+        "pid": 1,
+        "window_id": 7,
+        "session": SESSION,
+        "_transport_session_id": TRANSPORT,
+        "strategy": { "kind": "existing_profile" }
+    }));
+    tokio::pin!(prepare);
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), &mut prepare)
+            .await
+            .is_err(),
+        "the attach must wait for the browser gate"
+    );
+    assert!(
+        f.engine
+            .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+            .await
+            .unwrap()
+            .is_none(),
+        "no grant is minted while another holder owns the gate"
+    );
+    drop(gate);
+    let prepared = prepare.await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    crate::session::fire_session_end(TRANSPORT);
+}
+
+#[tokio::test]
+async fn a_cancelled_reprepare_never_leaves_a_claim_without_a_grant() {
+    const TRANSPORT: &str = "transport-v2-reprepare-cancel";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let url = f._server.ws_url();
+    let tool = BrowserPrepareTool::new(f.engine.clone());
+    let request = json!({
+        "pid": 1,
+        "window_id": 7,
+        "session": SESSION,
+        "_transport_session_id": TRANSPORT,
+        "strategy": { "kind": "existing_profile" }
+    });
+    let prepared = tool.invoke(request.clone()).await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let first = f
+        .engine
+        .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    // An ordinary dial stalled in its handshake holds the pool lock, so the
+    // re-prepare stops at its first pool step; cancel it there.
+    let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled_url = format!(
+        "ws://127.0.0.1:{}/devtools/browser/stalled",
+        stalled.local_addr().unwrap().port()
+    );
+    let holder = tokio::spawn({
+        let engine = f.engine.clone();
+        async move { engine.pool.get(&stalled_url).await.map(|_| ()) }
+    });
+    let _accepted = stalled.accept().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), tool.invoke(request))
+            .await
+            .is_err(),
+        "the re-prepare must reach the stalled pool"
+    );
+    holder.abort();
+    let _ = holder.await;
+    tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+
+    // The cancelled re-prepare changed nothing: the first grant is still
+    // registered and still holds its claim.
+    let surviving = f
+        .engine
+        .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap();
+    assert_eq!(surviving.generation, first);
+    assert!(f.engine.pool.get_existing(&url, first).await.is_ok());
+
+    // Releasing it releases every claim.
+    f.engine
+        .revoke_existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await;
+    let Err(error) = f.engine.pool.get_existing(&url, first).await else {
+        panic!("generation {first} still owns the socket after its session ended")
+    };
+    assert!(error.to_string().contains("missing"), "{error}");
+}
+
+#[tokio::test]
+async fn a_revocation_cancelled_on_a_busy_pool_still_releases_the_claim() {
+    const TRANSPORT: &str = "transport-v2-revoke-cancel";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let url = f._server.ws_url();
+    let prepared = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": TRANSPORT,
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let generation = f
+        .engine
+        .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled_url = format!(
+        "ws://127.0.0.1:{}/devtools/browser/stalled",
+        stalled.local_addr().unwrap().port()
+    );
+    let holder = tokio::spawn({
+        let engine = f.engine.clone();
+        async move { engine.pool.get(&stalled_url).await.map(|_| ()) }
+    });
+    let _accepted = stalled.accept().await.unwrap();
+    // The grant leaves the registry, then its release waits on the pool.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            f.engine
+                .revoke_existing_profile_grant(SESSION, Some(TRANSPORT), 1),
+        )
+        .await
+        .is_err(),
+        "the revocation must reach the stalled pool"
+    );
+    holder.abort();
+    let _ = holder.await;
+
+    let mut released = false;
+    for _ in 0..50 {
+        if f.engine.pool.get_existing(&url, generation).await.is_err() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(released, "generation {generation} kept the socket after its grant was revoked");
+}
+
+#[tokio::test]
+async fn a_session_ended_from_a_thread_without_a_runtime_releases_its_claim() {
+    const TRANSPORT: &str = "transport-v2-sweeper-end";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let url = f._server.ws_url();
+    let prepared = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": TRANSPORT,
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let generation = f
+        .engine
+        .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    // As an SDK's idle sweeper does: end the session from a plain thread.
+    std::thread::spawn(|| crate::session::fire_session_end(TRANSPORT))
+        .join()
+        .unwrap();
+    let mut released = false;
+    for _ in 0..50 {
+        if f.engine.pool.get_existing(&url, generation).await.is_err() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(released, "generation {generation} kept the socket after its session ended");
 }
 
 /// Forwards WebSocket connections to the mock endpoint after a delay, so a
@@ -1239,6 +1540,104 @@ impl Drop for SlowProxy {
         self.accept_task.abort();
         self.cut();
     }
+}
+
+#[tokio::test]
+async fn a_prepare_cancelled_mid_handshake_leaves_a_grant_the_next_bind_can_use() {
+    const TRANSPORT: &str = "transport-prepare-cancel-handshake";
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    // A slow endpoint: every handshake takes 400 ms.
+    let proxy = SlowProxy::start(&server.ws_url(), std::time::Duration::from_millis(400)).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        proxy.ws_url.clone(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    let args = json!({
+        "pid": 1, "window_id": 7, "session": SESSION, "_transport_session_id": TRANSPORT,
+    });
+    let mut prepare_args = args.clone();
+    prepare_args["strategy"] = json!({ "kind": "existing_profile" });
+    let tool = BrowserPrepareTool::new(engine.clone());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), tool.invoke(prepare_args))
+            .await
+            .is_err(),
+        "the prepare must still be in its handshake"
+    );
+    assert!(
+        engine
+            .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+            .await
+            .unwrap()
+            .is_some(),
+        "the cancelled prepare left its grant"
+    );
+
+    // The endpoint answers (slowly) again: the next bind dials for the grant.
+    let bound = GetBrowserStateTool::new(engine.clone()).invoke(args).await;
+    assert_eq!(structured(&bound)["status"], "ok", "{}", structured(&bound));
+    crate::session::fire_session_end(TRANSPORT);
+}
+
+#[tokio::test]
+async fn a_second_window_binds_under_the_extension_grant() {
+    const TRANSPORT: &str = "transport-extension-two-windows";
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        server.ws_url(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    let bind = |window_id: u64| {
+        let engine = engine.clone();
+        async move {
+            let bound = GetBrowserStateTool::new(engine)
+                .invoke(json!({
+                    "pid": 1, "window_id": window_id,
+                    "session": SESSION, "_transport_session_id": TRANSPORT,
+                }))
+                .await;
+            structured(&bound).clone()
+        }
+    };
+    let first = bind(7).await;
+    assert_eq!(first["status"], "ok", "{first}");
+    let second = bind(8).await;
+    assert_eq!(second["status"], "ok", "{second}");
+    // The first window's binding still works.
+    let tab = first["tabs"][0]["tab_id"].as_str().unwrap();
+    let again = GetBrowserStateTool::new(engine.clone())
+        .invoke(json!({
+            "target_id": first["target_id"], "tab_id": tab,
+            "session": SESSION, "_transport_session_id": TRANSPORT,
+        }))
+        .await;
+    assert_eq!(structured(&again)["status"], "ok", "{}", structured(&again));
+    crate::session::fire_session_end(TRANSPORT);
+}
+
+#[tokio::test]
+async fn an_explicitly_approved_grant_stays_tied_to_its_window() {
+    const TRANSPORT: &str = "transport-approved-two-windows";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let args = |window_id: u64| {
+        json!({
+            "pid": 1, "window_id": window_id,
+            "session": SESSION, "_transport_session_id": TRANSPORT,
+        })
+    };
+    let mut prepare = args(7);
+    prepare["strategy"] = json!({ "kind": "existing_profile" });
+    let prepared = BrowserPrepareTool::new(f.engine.clone()).invoke(prepare).await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let first = GetBrowserStateTool::new(f.engine.clone()).invoke(args(7)).await;
+    assert_eq!(structured(&first)["status"], "ok", "{}", structured(&first));
+    let second = GetBrowserStateTool::new(f.engine.clone()).invoke(args(8)).await;
+    let second = structured(&second).clone();
+    assert_eq!(second["status"], "refused", "{second}");
+    assert_eq!(second["refusal"]["code"], "browser_binding_stale", "{second}");
+    crate::session::fire_session_end(TRANSPORT);
 }
 
 fn standard_mode_platform(ws_url: String, transport: EndpointTransport) -> FixturePlatform {
@@ -1344,6 +1743,78 @@ async fn connected_extension_is_consent_for_the_extension_route_only() {
 }
 
 #[tokio::test]
+async fn a_connected_extension_lets_the_bind_attach_without_a_prepare_step() {
+    const TRANSPORT: &str = "transport-extension-bind";
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    let platform = standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay);
+    let setup_invoked = platform.setup_invoked.clone();
+    let engine = BrowserEngine::new(Arc::new(platform));
+    let bound = GetBrowserStateTool::new(engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": TRANSPORT
+        }))
+        .await;
+    let bound = structured(&bound).clone();
+    assert_eq!(bound["status"], "ok", "{bound}");
+    assert_eq!(bound["endpoint_access_class"], "existing_profile_approved");
+    assert_eq!(bound["endpoint_transport"], "extension_relay");
+    assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+    crate::session::fire_session_end(TRANSPORT);
+
+    // The extension appears connected but its route is gone by the time the
+    // bind attaches: refused, never a fallback to another endpoint.
+    let platform = standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay);
+    platform
+        .route_script
+        .lock()
+        .unwrap()
+        .extend([Some(EndpointTransport::ExtensionRelay), Some(EndpointTransport::LegacyJsonVersion)]);
+    let setup_invoked = platform.setup_invoked.clone();
+    let refused = GetBrowserStateTool::new(BrowserEngine::new(Arc::new(platform)))
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": "transport-extension-bind-gone"
+        }))
+        .await;
+    let refused = structured(&refused).clone();
+    assert_eq!(refused["status"], "refused", "{refused}");
+    assert_eq!(refused["refusal"]["code"], "browser_consent_required");
+    assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+}
+
+#[tokio::test]
+async fn a_shared_existing_profile_socket_outlives_one_of_its_sessions() {
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    let url = server.ws_url();
+    let pool = super::cdp_ws::CdpPool::new();
+    // Two Cua sessions' grants claim the same browser socket.
+    let first = pool.claim_existing(&url, 1, || true).await.unwrap();
+    let second = pool.claim_existing(&url, 2, || true).await.unwrap();
+    assert!(Arc::ptr_eq(&first, &second));
+    first.register_dialog_session("sess-b", "target-b");
+    assert!(pool.get_existing(&url, 1).await.is_ok(), "an earlier claim stays usable");
+
+    // Ending the first session keeps the socket, and the second session's
+    // dialog routing on it, alive.
+    pool.release_existing(&url, 1).await;
+    let still = pool.get_existing(&url, 2).await.unwrap();
+    assert!(Arc::ptr_eq(&still, &second) && !still.is_closed());
+    assert!(still.has_dialog_session("target-b"));
+    assert!(pool.get_existing(&url, 1).await.is_err());
+
+    // The last session's release closes it.
+    pool.release_existing(&url, 2).await;
+    assert!(pool.get_existing(&url, 2).await.is_err());
+}
+
+#[tokio::test]
 async fn relay_tab_attach_carries_the_session_cursor_color() {
     const TRANSPORT: &str = "transport-session-color";
     let state = Arc::new(StdMutex::new(FixtureState::default()));
@@ -1389,6 +1860,125 @@ async fn relay_tab_attach_carries_the_session_cursor_color() {
     let attaches = recorded_calls(&f, "Target.attachToTarget");
     assert!(!attaches.is_empty());
     assert!(attaches.iter().all(|(_, params)| params.get("cuaSessionColor").is_none()));
+}
+
+/// Prepare and bind one Cua session on the relay fixture and return the
+/// relay holder its tab attaches named.
+async fn relay_bind(engine: &Arc<BrowserEngine>, state: &SharedState, session: &str, transport: &str) -> String {
+    let attaches_before = relay_calls(state, "Target.attachToTarget").len();
+    let args = |extra: Value| {
+        let mut args = json!({ "session": session, "_transport_session_id": transport });
+        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args
+    };
+    let prepared = BrowserPrepareTool::new(engine.clone())
+        .invoke(args(json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } })))
+        .await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let bound = GetBrowserStateTool::new(engine.clone())
+        .invoke(args(json!({ "pid": 1, "window_id": 7 })))
+        .await;
+    let bound = structured(&bound).clone();
+    let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
+    GetBrowserStateTool::new(engine.clone())
+        .invoke(args(json!({ "target_id": bound["target_id"], "tab_id": tab })))
+        .await;
+    let holders: Vec<String> = relay_calls(state, "Target.attachToTarget")
+        .into_iter()
+        .skip(attaches_before)
+        .filter_map(|params| params["cuaSession"].as_str().map(str::to_owned))
+        .filter(|holder| holder.starts_with(&format!("{session}#")))
+        .collect();
+    let last = holders.last().expect("the bind attached a tab").clone();
+    assert!(holders.iter().all(|holder| *holder == last), "{holders:?}");
+    last
+}
+
+fn relay_calls(state: &SharedState, method: &str) -> Vec<Value> {
+    state
+        .lock()
+        .unwrap()
+        .calls
+        .iter()
+        .filter(|(_, m, _)| m == method)
+        .map(|(_, _, params)| params.clone())
+        .collect()
+}
+
+async fn relay_releases_eventually(state: &SharedState, holders: &[&str]) -> Vec<String> {
+    for _ in 0..100 {
+        let released: Vec<String> = relay_calls(state, "Cua.releaseSession")
+            .into_iter()
+            .filter_map(|params| params["cuaSession"].as_str().map(str::to_owned))
+            .collect();
+        if holders.iter().all(|holder| released.iter().any(|r| r == holder)) {
+            return released;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    relay_calls(state, "Cua.releaseSession")
+        .into_iter()
+        .filter_map(|params| params["cuaSession"].as_str().map(str::to_owned))
+        .collect()
+}
+
+#[tokio::test]
+async fn a_late_release_from_an_ended_episode_never_names_the_restarted_one() {
+    const TRANSPORT: &str = "transport-relay-episode";
+    const EPISODE_SESSION: &str = "relay-episode-session";
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state.clone())).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        server.ws_url(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    let first = relay_bind(&engine, &state, EPISODE_SESSION, TRANSPORT).await;
+    let ended = engine
+        .existing_profile_grant(EPISODE_SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap();
+
+    // End the session, start it again under the same name, and bind.
+    crate::session::fire_session_end(TRANSPORT);
+    let second = relay_bind(&engine, &state, EPISODE_SESSION, TRANSPORT).await;
+    assert_ne!(first, second, "each episode holds its tabs under its own name");
+
+    // The ended episode's release lands only now.
+    super::engine::release_grant_claim(&engine.pool, &ended).await;
+    let released = relay_releases_eventually(&state, &[&first]).await;
+    assert!(released.contains(&first), "{released:?}");
+    assert!(
+        !released.contains(&second),
+        "a release from the ended episode named the live one: {released:?}"
+    );
+    crate::session::fire_session_end(TRANSPORT);
+}
+
+#[tokio::test]
+async fn an_episode_expired_off_runtime_still_releases_its_relay_tabs() {
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state.clone())).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        server.ws_url(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    // Two Cua sessions share the relay socket and its tab.
+    let expired = relay_bind(&engine, &state, "relay-expired", "transport-relay-expired").await;
+    let live = relay_bind(&engine, &state, "relay-live", "transport-relay-live").await;
+
+    // The expired session ends from an SDK sweeper's plain thread, which
+    // cannot tell the relay itself.
+    std::thread::spawn(|| crate::session::fire_session_end("transport-relay-expired"))
+        .join()
+        .unwrap();
+    // Ending the live session releases both holds, so the tab detaches.
+    crate::session::fire_session_end("transport-relay-live");
+    let released = relay_releases_eventually(&state, &[&expired, &live]).await;
+    assert!(
+        released.contains(&expired) && released.contains(&live),
+        "{released:?}"
+    );
 }
 
 #[tokio::test]
@@ -2593,7 +3183,11 @@ async fn trusted_click_refuses_when_standalone_background_posture_is_unavailable
         .await;
     assert_eq!(structured(&synthetic)["status"], "ok");
     assert_eq!(structured(&synthetic)["effect"], "unverifiable");
-    assert_eq!(structured(&synthetic)["escalation"]["recommended"], "page");
+    assert!(structured(&synthetic).get("escalation").is_none());
+    assert!(synthetic.content.iter().any(|content| matches!(
+        content,
+        crate::protocol::Content::Text { text, .. } if text.contains("get_browser_state")
+    )));
     assert!(synthetic.content.iter().any(|content| matches!(
         content,
         crate::protocol::Content::Text { text, .. }
@@ -2612,11 +3206,8 @@ async fn trusted_click_refuses_when_standalone_background_posture_is_unavailable
     assert_eq!(public["effect"], "unverifiable", "{public}");
     assert_eq!(public["route"], "dom", "{public}");
     assert_eq!(public["delivery"]["mode"], "background", "{public}");
-    assert_eq!(public["escalation"]["target"], "page", "{public}");
-    assert_eq!(
-        public["escalation"]["reason"], "effect_unconfirmed",
-        "{public}"
-    );
+    // No dead-end escalation; the summary names get_browser_state instead.
+    assert!(public.get("escalation").is_none(), "{public}");
     assert!(public.get("status").is_none(), "{public}");
     assert!(!recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
     assert!(recorded_calls(&f, "Page.bringToFront").is_empty());
@@ -2763,6 +3354,124 @@ async fn typing_into_composed_shadow_input_uses_the_tab_session() {
     );
     assert!(recorded_calls(&f, "Page.bringToFront").is_empty());
     assert!(recorded_calls(&f, "Target.activateTarget").is_empty());
+}
+
+#[tokio::test]
+async fn typing_reports_what_the_field_holds_afterwards() {
+    let f = fixture_with(|state| state.field_value = Some("ada".into())).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "@x.io", "session": SESSION
+        }))
+        .await;
+    let s = structured(&typed);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["effect"], "confirmed");
+    assert_eq!(s["value"], "ada@x.io");
+    assert_eq!(s["evidence"][0]["kind"], "browser_readback");
+}
+
+#[tokio::test]
+async fn keystrokes_judge_the_caret_where_focus_left_it() {
+    // "old" with the caret at 0; once focus is emulated the page's focus
+    // handler moves it to the end, so the keys land after "old".
+    let f = fixture_with(|state| {
+        state.field_value = Some("old".into());
+        state.field_caret = Some(0);
+        state.field_focus_moves_caret_to_end = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "X", "mode": "keystrokes", "session": SESSION
+        }))
+        .await;
+    let s = structured(&typed);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["effect"], "confirmed");
+    assert_eq!(s["value"], "oldX");
+}
+
+#[tokio::test]
+async fn a_field_that_rejects_input_is_reported_as_a_mismatch() {
+    let f = fixture_with(|state| {
+        state.field_value = Some(String::new());
+        state.field_digits_only = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "12ab34", "session": SESSION
+        }))
+        .await;
+    assert_eq!(typed.is_error, Some(true));
+    let s = structured(&typed);
+    assert_eq!(s["code"], "browser_type_mismatch", "{s}");
+    assert_eq!(s["effect"], "mismatch");
+    assert_eq!(s["value"], "1234");
+    // The fixture field reports no selection (like an email input), so no
+    // single expected value is claimed.
+    assert!(s["expected"].is_null(), "{s}");
+}
+
+#[tokio::test]
+async fn a_field_the_page_replaced_is_unverifiable_not_confirmed() {
+    let f = fixture_with(|state| {
+        state.field_value = Some(String::new());
+        state.field_detached_after_input = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "ada", "session": SESSION
+        }))
+        .await;
+    let s = structured(&typed);
+    assert_eq!(s["effect"], "unverifiable", "{s}");
+    assert_eq!(s["readback"], "element_replaced");
+}
+
+#[tokio::test]
+async fn set_value_uses_the_native_setter_and_verifies() {
+    let f = fixture_with(|state| state.field_value = Some("old".into())).await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let set = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "new", "mode": "set_value", "session": SESSION
+        }))
+        .await;
+    let s = structured(&set);
+    assert_eq!(s["status"], "ok", "{s}");
+    assert_eq!(s["effect"], "confirmed");
+    assert_eq!(s["value"], "new");
+    assert_eq!(s["replaced_chars"], 3);
+    assert!(recorded_calls(&f, "Input.insertText").is_empty());
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn").iter().any(|(_, params)| {
+        params["arguments"][0]["value"] == "new"
+            && params["functionDeclaration"]
+                .as_str()
+                .unwrap()
+                .contains("dispatchEvent(new view.Event('input'")
+    }));
 }
 
 #[tokio::test]

@@ -472,6 +472,44 @@ impl Tool for ClickTool {
             }));
         }
 
+        // A Chrome page the extension reaches takes the click gestures a
+        // browser tool sends exactly (see browser_route::click_next); every
+        // other gesture, and the internal focus click of the keyboard tools,
+        // keeps native delivery.
+        if let Some(next) =
+            super::browser_route::click_next(&button_str, count, !modifiers.is_empty(), &action)
+        {
+            let redirect = match (element_guard.as_ref(), x, y) {
+                (Some(guard), _, _) => {
+                    super::browser_route::page_input_redirect(
+                        "click",
+                        next,
+                        super::browser_route::Control::Any,
+                        pid,
+                        window_id,
+                        Some(guard.as_ptr() as usize),
+                    )
+                    .await
+                }
+                (None, Some(x), Some(y)) if !from_zoom && capture_id.is_none() => {
+                    super::browser_route::page_input_redirect_at_pixel(
+                        "click",
+                        next,
+                        super::browser_route::Control::Any,
+                        pid,
+                        window_id,
+                        x,
+                        y,
+                    )
+                    .await
+                }
+                _ => None,
+            };
+            if let Some(redirect) = redirect {
+                return redirect;
+            }
+        }
+
         if let (Some(idx), Some(wid), Some(element_guard)) =
             (element_index, window_id, element_guard)
         {

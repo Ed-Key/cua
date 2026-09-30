@@ -5,6 +5,7 @@
 // chrome.debugger calls, and forwards debugger events. It holds no agent logic.
 
 import { clearActive, markActive, refresh } from "./indicator.js";
+import { attachOutlivedConnection, backstopTabs, requestIsStale } from "./lifecycle.js";
 
 const HOST = "com.trycua.cua_driver";
 const RECONNECT_ALARM = "cua-driver-reconnect";
@@ -14,6 +15,12 @@ const STOPPED_MESSAGE =
   "(they can allow it again from the Cua Driver toolbar button)";
 
 let port = null;
+// Bumped on every native-messaging connect and disconnect. An attach that
+// started under one value and finishes under another outlived its driver.
+let connection = 0;
+// When each attached tab last got a debugger command, for the idle backstop
+// (lifecycle.js).
+const lastCommandAt = new Map();
 // Tabs this extension attached the debugger to, so detach only undoes its own.
 const attached = new Set();
 // Tabs where the user pressed Stop. Cua may not act in them again until the
@@ -26,15 +33,16 @@ const stoppedLoaded = chrome.storage.session
   .catch(() => {});
 const saveStopped = () => chrome.storage.session.set({ stopped: [...stopped] }).catch(() => {});
 
-// The debugger is released after this long without a command, which also
-// clears Chrome's debugging banner; the next command attaches again.
-const DEBUGGER_IDLE_MS = 20000;
-const debuggerIdle = new Map();
-// Tabs whose Page domain Cua enabled: replayed after an idle reattach so
-// dialog events keep flowing to the daemon's existing session.
+// The debugger stays attached while an agent session holds the tab, so
+// Chrome's debugging banner does not come and go between commands. It is
+// released when the daemon says the session is done with the tab
+// (debugger.detach), when the daemon disconnects, when the tab closes, or
+// when the user presses Stop.
+// Tabs whose Page domain Cua enabled: replayed after a reattach so dialog
+// events keep flowing to the daemon's existing session.
 const pageEnabled = new Set();
 // Tabs showing a JavaScript dialog. Chrome forgets a pending dialog when the
-// debugger detaches, so an idle release waits until the dialog closes.
+// debugger detaches, so the idle backstop waits until the dialog closes.
 const dialogOpen = new Set();
 // Attach and detach run one at a time per tab, so Stop cannot slip between
 // an attach starting and a command being sent.
@@ -46,32 +54,18 @@ function serialized(tabId, work) {
   return run;
 }
 
-function touchDebugger(tabId) {
-  clearTimeout(debuggerIdle.get(tabId));
-  debuggerIdle.set(tabId, setTimeout(() => void releaseDebugger(tabId, "idle"), DEBUGGER_IDLE_MS));
-}
-
-// "idle" keeps the daemon's sessions (the next command reattaches);
-// anything else ends them.
+// Detach the debugger from a tab; the daemon's sessions for it end.
 function releaseDebugger(tabId, reason) {
   return serialized(tabId, async () => {
-    if (reason === "idle" && dialogOpen.has(tabId)) {
-      touchDebugger(tabId);
-      return;
-    }
-    clearTimeout(debuggerIdle.get(tabId));
-    debuggerIdle.delete(tabId);
-    // After a deliberate detach nothing is known about the tab's dialogs;
-    // Chrome sends no event for detaches the extension makes itself.
-    if (reason !== "idle") {
-      pageEnabled.delete(tabId);
-      dialogOpen.delete(tabId);
-    }
+    // A dialog may have opened since the backstop picked this tab.
+    if (reason === "idle_backstop" && dialogOpen.has(tabId)) return;
+    pageEnabled.delete(tabId);
+    dialogOpen.delete(tabId);
+    lastCommandAt.delete(tabId);
     if (!attached.delete(tabId)) return;
     await chrome.debugger.detach({ tabId }).catch(() => {});
     // Chrome reports only detaches it caused; tell the daemon about this one.
-    const method = reason === "idle" ? "debugger.released" : "debugger.detached";
-    post({ jsonrpc: "2.0", method, params: { source: { tabId }, reason } });
+    post({ jsonrpc: "2.0", method: "debugger.detached", params: { source: { tabId }, reason } });
   });
 }
 
@@ -129,12 +123,28 @@ function loadTab(tabId) {
   return load;
 }
 
-function ensureAttached(tabId) {
+// `arrivedUnder` is the connection the request arrived on, captured before
+// any await: a request that outlived its connection attaches nothing.
+function refuseIfStale(arrivedUnder) {
+  if (requestIsStale(arrivedUnder, connection, port !== null)) {
+    throw new Error("the Cua Driver disconnected before this request ran");
+  }
+}
+
+function ensureAttached(tabId, arrivedUnder) {
   return serialized(tabId, async () => {
     refuseIfStopped(tabId);
     if (!attached.has(tabId)) {
+      refuseIfStale(arrivedUnder);
       await refuseIfNotLoaded(tabId);
+      refuseIfStale(arrivedUnder);
       await chrome.debugger.attach({ tabId }, "1.3");
+      // The driver disconnected while Chrome was attaching: nobody holds
+      // this attachment, and the disconnect cleanup could not see it yet.
+      if (attachOutlivedConnection(arrivedUnder, connection)) {
+        await chrome.debugger.detach({ tabId }).catch(() => {});
+        throw new Error("the Cua Driver disconnected while attaching");
+      }
       attached.add(tabId);
       // Nothing runs in the tab after a Stop, not even the replay below.
       if (stopped.has(tabId)) {
@@ -150,8 +160,16 @@ function ensureAttached(tabId) {
       await chrome.debugger.detach({ tabId }).catch(() => {});
       throw new Error(STOPPED_MESSAGE);
     }
-    touchDebugger(tabId);
+    lastCommandAt.set(tabId, Date.now());
   });
+}
+
+// The idle backstop (lifecycle.js); runs on the reconnect alarm.
+function releaseIdleTabs() {
+  for (const tabId of backstopTabs(lastCommandAt, dialogOpen, Date.now())) {
+    if (attached.has(tabId)) void releaseDebugger(tabId, "idle_backstop");
+    else lastCommandAt.delete(tabId);
+  }
 }
 
 function connect() {
@@ -162,11 +180,15 @@ function connect() {
     port = null;
     return;
   }
+  connection += 1;
   port.onMessage.addListener(handleMessage);
   port.onDisconnect.addListener(() => {
     // Reading lastError marks it handled; the alarm reconnects later.
     void chrome.runtime.lastError;
     port = null;
+    connection += 1;
+    // No daemon, no agent session: let go of every tab.
+    for (const tabId of [...attached]) void releaseDebugger(tabId, "daemon_disconnected");
   });
   post({
     jsonrpc: "2.0",
@@ -294,8 +316,8 @@ const handlers = {
   "tabGroups.update": async ({ groupId, title, color, collapsed }) =>
     groupInfo(await chrome.tabGroups.update(groupId, defined({ title, color, collapsed }))),
 
-  "debugger.attach": async ({ tabId }) => {
-    await ensureAttached(tabId);
+  "debugger.attach": async ({ tabId }, arrivedUnder) => {
+    await ensureAttached(tabId, arrivedUnder);
     return { attached: true };
   },
 
@@ -304,8 +326,8 @@ const handlers = {
     return { detached: true };
   },
 
-  "debugger.send": async ({ tabId, sessionId, method, params }) => {
-    await ensureAttached(tabId);
+  "debugger.send": async ({ tabId, sessionId, method, params }, arrivedUnder) => {
+    await ensureAttached(tabId, arrivedUnder);
     refuseIfStopped(tabId);
     if (method === "Page.enable" && !sessionId) pageEnabled.add(tabId);
     return chrome.debugger.sendCommand(defined({ tabId, sessionId }), method, params ?? {});
@@ -361,6 +383,7 @@ async function stopTab(tabId) {
 
 async function handleMessage(message) {
   if (!message || message.id === undefined || typeof message.method !== "string") return;
+  const arrivedUnder = connection;
   await stoppedLoaded;
   const tabs = tabsOf(message.method, message.params ?? {});
   if (tabs.some((tabId) => stopped.has(tabId))) {
@@ -379,7 +402,7 @@ async function handleMessage(message) {
     return;
   }
   try {
-    const result = await handler(message.params ?? {});
+    const result = await handler(message.params ?? {}, arrivedUnder);
     post({ jsonrpc: "2.0", id: message.id, result: result ?? null });
   } catch (error) {
     post({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: String(error?.message ?? error) } });
@@ -396,8 +419,7 @@ chrome.debugger.onDetach.addListener((source, reason) => {
   attached.delete(source.tabId);
   pageEnabled.delete(source.tabId);
   dialogOpen.delete(source.tabId);
-  clearTimeout(debuggerIdle.get(source.tabId));
-  debuggerIdle.delete(source.tabId);
+  lastCommandAt.delete(source.tabId);
   // "canceled_by_user": the user dismissed Chrome's debugging banner.
   if (reason === "canceled_by_user") void stopTab(source.tabId);
   post({ jsonrpc: "2.0", method: "debugger.detached", params: { source, reason } });
@@ -446,10 +468,8 @@ chrome.tabs.onRemoved.addListener((tabId) => {
   if (stopped.delete(tabId)) void saveStopped();
   attached.delete(tabId);
   pageEnabled.delete(tabId);
-  dialogOpen.delete(tabId);
+  lastCommandAt.delete(tabId);
   tabQueues.delete(tabId);
-  clearTimeout(debuggerIdle.get(tabId));
-  debuggerIdle.delete(tabId);
   clearActive(tabId);
 });
 
@@ -465,7 +485,10 @@ chrome.action.onClicked.addListener(async () => {
 // lifecycle events bring the native link back.
 chrome.alarms.create(RECONNECT_ALARM, { periodInMinutes: 0.5 });
 chrome.alarms.onAlarm.addListener((alarm) => {
-  if (alarm.name === RECONNECT_ALARM) connect();
+  if (alarm.name === RECONNECT_ALARM) {
+    connect();
+    releaseIdleTabs();
+  }
 });
 chrome.runtime.onStartup.addListener(connect);
 chrome.runtime.onInstalled.addListener(connect);

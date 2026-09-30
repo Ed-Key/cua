@@ -5,11 +5,12 @@
 //! grant, connection generation, and reconnect budget.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
-use super::types::{BrowserProduct, ProcessFingerprint};
+use super::types::{BrowserProduct, EndpointTransport, ProcessFingerprint};
 
 const GRANT_IDLE_TTL: Duration = Duration::from_secs(30 * 60);
 const GRANT_ABSOLUTE_TTL: Duration = Duration::from_secs(8 * 60 * 60);
@@ -32,6 +33,9 @@ pub(crate) struct ExistingProfileGrant {
     pub browser: String,
     pub browser_product: BrowserProduct,
     pub endpoint_ws_url: String,
+    /// How the endpoint is reached; the extension relay tracks tab holders
+    /// per session episode.
+    pub endpoint_transport: EndpointTransport,
     pub generation: u64,
     pub cleanup_remote_debugging: bool,
     pub reconnect_attempts_remaining: u8,
@@ -73,11 +77,21 @@ impl ExistingProfileGrant {
 #[derive(Default)]
 pub(crate) struct ExistingProfileGrants {
     inner: Mutex<HashMap<GrantKey, ExistingProfileGrant>>,
+    /// Generations are unique across every grant in the registry, not just
+    /// per grant key: the socket pool counts each generation as one Cua
+    /// session's claim, and the store invalidates targets by (pid,
+    /// generation), so two sessions sharing a generation would release or
+    /// invalidate each other's state.
+    last_generation: AtomicU64,
 }
 
 impl ExistingProfileGrants {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.last_generation.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn key(public_session: &str, transport_session: Option<&str>, pid: i64) -> GrantKey {
@@ -101,17 +115,13 @@ impl ExistingProfileGrants {
         browser: String,
         browser_product: BrowserProduct,
         endpoint_ws_url: String,
+        endpoint_transport: EndpointTransport,
         cleanup_remote_debugging: bool,
         protected_consent: Option<crate::consent::ProtectedGrant>,
     ) -> ExistingProfileGrant {
         let now = Instant::now();
         let key = Self::key(public_session, transport_session, pid);
-        let generation = self
-            .inner
-            .lock()
-            .unwrap()
-            .get(&key)
-            .map_or(1, |grant| grant.generation.saturating_add(1));
+        let generation = self.next_generation();
         let grant = ExistingProfileGrant {
             public_session: public_session.to_owned(),
             transport_session: transport_session.unwrap_or(public_session).to_owned(),
@@ -121,6 +131,7 @@ impl ExistingProfileGrants {
             browser,
             browser_product,
             endpoint_ws_url,
+            endpoint_transport,
             generation,
             cleanup_remote_debugging,
             reconnect_attempts_remaining: MAX_RECONNECT_ATTEMPTS,
@@ -160,6 +171,22 @@ impl ExistingProfileGrants {
         GrantLookup::Live(grant.clone())
     }
 
+    /// Whether the grant for this key is live at exactly `generation`.
+    pub fn is_current(
+        &self,
+        public_session: &str,
+        transport_session: Option<&str>,
+        pid: i64,
+        generation: u64,
+    ) -> bool {
+        let key = Self::key(public_session, transport_session, pid);
+        self.inner
+            .lock()
+            .unwrap()
+            .get(&key)
+            .is_some_and(|grant| grant.generation == generation)
+    }
+
     pub fn revoke(
         &self,
         public_session: &str,
@@ -188,11 +215,14 @@ impl ExistingProfileGrants {
         removed
     }
 
+    /// Advance the grant from `expected` only: a grant another prepare
+    /// already replaced is not this reconnect's to move.
     pub fn bump_generation(
         &self,
         public_session: &str,
         transport_session: Option<&str>,
         pid: i64,
+        expected: u64,
     ) -> Result<u64, BrowserRefusal> {
         let key = Self::key(public_session, transport_session, pid);
         let mut grants = self.inner.lock().unwrap();
@@ -202,6 +232,12 @@ impl ExistingProfileGrants {
                 "no live existing-profile grant remains for reconnect",
             )
         })?;
+        if grant.generation != expected {
+            return Err(BrowserRefusal::new(
+                BrowserRefusalCode::BrowserBindingStale,
+                "the existing-profile grant was replaced while reconnecting; retry the call",
+            ));
+        }
         if grant.reconnect_attempts_remaining == 0 {
             return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserReconnectExhausted,
@@ -209,7 +245,7 @@ impl ExistingProfileGrants {
             ));
         }
         grant.reconnect_attempts_remaining -= 1;
-        grant.generation = grant.generation.saturating_add(1);
+        grant.generation = self.next_generation();
         grant.last_used_at = Instant::now();
         Ok(grant.generation)
     }
@@ -256,6 +292,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );
@@ -285,6 +322,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );
@@ -307,6 +345,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );
@@ -335,6 +374,34 @@ mod tests {
     }
 
     #[test]
+    fn generations_are_unique_across_sessions() {
+        let grants = ExistingProfileGrants::new();
+        let mint = |session: &str| {
+            grants
+                .mint(
+                    session,
+                    None,
+                    42,
+                    9,
+                    fingerprint(42),
+                    "chromium".to_owned(),
+                    BrowserProduct::GoogleChrome,
+                    "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+                    EndpointTransport::LegacyJsonVersion,
+                    false,
+                    None,
+                )
+                .generation
+        };
+        let first = mint("public-a");
+        let second = mint("public-b");
+        let bumped = grants.bump_generation("public-a", None, 42, first).unwrap();
+        assert!(first != second && bumped != second && bumped > first);
+        let stale = grants.bump_generation("public-a", None, 42, first).unwrap_err();
+        assert_eq!(stale.code, BrowserRefusalCode::BrowserBindingStale);
+    }
+
+    #[test]
     fn cleanup_ownership_moves_to_another_live_grant_for_the_same_process() {
         let grants = ExistingProfileGrants::new();
         grants.mint(
@@ -346,6 +413,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             true,
             None,
         );
@@ -358,6 +426,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );
@@ -388,6 +457,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             true,
             None,
         );
@@ -402,6 +472,7 @@ mod tests {
             "chromium".to_owned(),
             BrowserProduct::GoogleChrome,
             "ws://127.0.0.1:2/devtools/browser/y".to_owned(),
+            EndpointTransport::LegacyJsonVersion,
             false,
             None,
         );

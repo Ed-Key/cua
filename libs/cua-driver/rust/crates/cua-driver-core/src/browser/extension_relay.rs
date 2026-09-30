@@ -135,6 +135,63 @@ struct Session {
     link: u64,
     bridge: Arc<ExtensionBridge>,
     routes: Arc<Mutex<Routes>>,
+    /// Tabs this connection attached. The extension keeps a tab's debugger
+    /// attached while any connection holds it and detaches once the last
+    /// one closes (the engine drops its connection when the cua session ends).
+    /// `None` once the connection closed, so a late attach holds nothing.
+    /// Keyed by tab, then by the Cua session that attached it: one relay
+    /// connection can be shared by several Cua sessions on this Chrome.
+    held_tabs: Mutex<Option<HashMap<i64, std::collections::HashSet<String>>>>,
+}
+
+/// How many relay connections hold each (extension link, tab).
+fn tab_holders() -> &'static Mutex<HashMap<(u64, i64), usize>> {
+    static HOLDERS: std::sync::OnceLock<Mutex<HashMap<(u64, i64), usize>>> =
+        std::sync::OnceLock::new();
+    HOLDERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Ownership rule for a tab's debugger attachment (one per tab, shared by
+/// every relay connection on the link):
+///
+/// - A connection reserves the tab (counts as a holder) *before* it asks the
+///   extension to attach, so a last holder closing meanwhile does not detach
+///   a tab that is about to be adopted.
+/// - Reserving and attaching, and releasing and the last-holder detach, run
+///   under one gate per (link, tab). The extension handles a tab's requests
+///   in order, so whichever step takes the gate first finishes, including its
+///   detach, before the other decides anything.
+/// - A connection that closes owns the release of every tab it reserved,
+///   including one whose attach is still in flight; the attach then finds
+///   its connection closed and returns an error without adopting the tab.
+/// - Holders are Cua session episodes, not connections: the engine shares
+///   one relay connection among the Cua sessions on this Chrome, names the
+///   episode (session name plus grant generation) on every attach
+///   (`cuaSession`), and sends `Cua.releaseSession` for that episode when it
+///   ends, from every end path. A late release from an ended episode
+///   therefore never removes a restarted session's hold. A tab detaches only
+///   when no live episode holds it.
+fn attach_gates() -> &'static super::keyed_gates::KeyedGates<(u64, i64)> {
+    static GATES: std::sync::OnceLock<super::keyed_gates::KeyedGates<(u64, i64)>> =
+        std::sync::OnceLock::new();
+    GATES.get_or_init(super::keyed_gates::KeyedGates::new)
+}
+
+/// Count one more holder of `tab`.
+fn hold_tab(link: u64, tab: i64) {
+    *tab_holders().lock().unwrap().entry((link, tab)).or_default() += 1;
+}
+
+/// Drop one holder of `tab`.
+fn release_tab(link: u64, tab: i64) {
+    let mut holders = tab_holders().lock().unwrap();
+    match holders.get_mut(&(link, tab)) {
+        Some(count) if *count > 1 => *count -= 1,
+        Some(_) => {
+            holders.remove(&(link, tab));
+        }
+        None => {}
+    }
 }
 
 type Reply = Value;
@@ -145,7 +202,108 @@ impl Session {
             link,
             bridge: extension_bridge::global().clone(),
             routes: Arc::new(Mutex::new(Routes::default())),
+            held_tabs: Mutex::new(Some(HashMap::new())),
         }
+    }
+
+    /// The connection closed: let go of its tabs, and detach the debugger
+    /// from each one no other connection holds.
+    async fn release_held_tabs(&self) {
+        let tabs = self.held_tabs.lock().unwrap().take().unwrap_or_default();
+        for (tab, holders) in tabs {
+            let _gate = attach_gates().lock((self.link, tab)).await;
+            for _ in holders {
+                release_tab(self.link, tab);
+            }
+            self.detach_if_unheld(tab).await;
+        }
+    }
+
+    /// One Cua session ended: release the tabs it holds on this connection.
+    async fn release_session(&self, cua_session: &str) {
+        let tabs: Vec<i64> = self
+            .held_tabs
+            .lock()
+            .unwrap()
+            .as_ref()
+            .map(|held| {
+                held.iter()
+                    .filter(|(_, holders)| holders.contains(cua_session))
+                    .map(|(tab, _)| *tab)
+                    .collect()
+            })
+            .unwrap_or_default();
+        for tab in tabs {
+            let _gate = attach_gates().lock((self.link, tab)).await;
+            let released = match self.held_tabs.lock().unwrap().as_mut() {
+                Some(held) => {
+                    let removed = held
+                        .get_mut(&tab)
+                        .is_some_and(|holders| holders.remove(cua_session));
+                    if held.get(&tab).is_some_and(|holders| holders.is_empty()) {
+                        held.remove(&tab);
+                    }
+                    removed
+                }
+                None => false,
+            };
+            if released {
+                release_tab(self.link, tab);
+                self.detach_if_unheld(tab).await;
+            }
+        }
+    }
+
+    /// Reserve `tab` for `cua_session` on this connection, then attach. See
+    /// [`attach_gates`].
+    async fn attach_tab(
+        &self,
+        tab: i64,
+        color: &Value,
+        cua_session: &str,
+    ) -> Result<(), (i64, String)> {
+        let _gate = attach_gates().lock((self.link, tab)).await;
+        let newly_reserved = match self.held_tabs.lock().unwrap().as_mut() {
+            Some(held) => {
+                let new = held.entry(tab).or_default().insert(cua_session.to_owned());
+                if new {
+                    hold_tab(self.link, tab);
+                }
+                new
+            }
+            None => return Err((-32001, "the relay connection closed".to_owned())),
+        };
+        let attached = self
+            .request("debugger.attach", json!({ "tabId": tab, "sessionColor": color }))
+            .await;
+        if self.held_tabs.lock().unwrap().is_none() {
+            // Closed while attaching: the closing path releases the
+            // reservation (it waits for this gate) and detaches.
+            return Err((-32001, "the connection closed while attaching".to_owned()));
+        }
+        if attached.is_err() && newly_reserved {
+            if let Some(held) = self.held_tabs.lock().unwrap().as_mut() {
+                if let Some(holders) = held.get_mut(&tab) {
+                    holders.remove(cua_session);
+                    if holders.is_empty() {
+                        held.remove(&tab);
+                    }
+                }
+            }
+            release_tab(self.link, tab);
+            self.detach_if_unheld(tab).await;
+        }
+        attached.map(drop)
+    }
+
+    async fn detach_if_unheld(&self, tab: i64) {
+        if tab_holders().lock().unwrap().contains_key(&(self.link, tab)) {
+            return;
+        }
+        let _ = self
+            .bridge
+            .request_on(self.link, "debugger.detach", json!({ "tabId": tab }))
+            .await;
     }
 
     async fn run(self, socket: tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>) {
@@ -153,7 +311,7 @@ impl Session {
         let mut events = self.bridge.subscribe();
         let (reply_tx, mut replies) = mpsc::unbounded_channel::<Reply>();
         let this = Arc::new(self);
-        loop {
+        'serve: loop {
             tokio::select! {
                 incoming = stream.next() => {
                     let Some(Ok(message)) = incoming else { break };
@@ -174,16 +332,16 @@ impl Session {
                     // queued; CDP delivers them first, and the engine relies on it.
                     while let Ok(event) = events.try_recv() {
                         for event in this.translate(event) {
-                            if sink.send(Message::Text(event.to_string().into())).await.is_err() { return; }
+                            if sink.send(Message::Text(event.to_string().into())).await.is_err() { break 'serve; }
                         }
                     }
-                    if sink.send(Message::Text(reply.to_string().into())).await.is_err() { return; }
+                    if sink.send(Message::Text(reply.to_string().into())).await.is_err() { break; }
                 }
                 event = events.recv() => {
                     match event {
                         Ok(event) => {
                             for event in this.translate(event) {
-                                if sink.send(Message::Text(event.to_string().into())).await.is_err() { return; }
+                                if sink.send(Message::Text(event.to_string().into())).await.is_err() { break 'serve; }
                             }
                         }
                         Err(broadcast::error::RecvError::Lagged(_)) => continue,
@@ -192,6 +350,7 @@ impl Session {
                 }
             }
         }
+        this.release_held_tabs().await;
     }
 
     async fn answer(&self, command: Value) -> Reply {
@@ -309,19 +468,28 @@ impl Session {
             "Target.attachToTarget" => {
                 let tab = self.tab_of_target(target_id()).await?;
                 let color = params.get("cuaSessionColor").cloned().unwrap_or(Value::Null);
-                self.request("debugger.attach", json!({ "tabId": tab, "sessionColor": color }))
-                    .await?;
+                let cua_session =
+                    params.get("cuaSession").and_then(Value::as_str).unwrap_or_default();
+                self.attach_tab(tab, &color, cua_session).await?;
                 let session = uuid::Uuid::new_v4().simple().to_string().to_uppercase();
                 let mut routes = self.routes.lock().unwrap();
                 routes.sessions.insert(session.clone(), tab);
                 routes.colors.insert(session.clone(), color);
                 Ok(json!({ "sessionId": session }))
             }
+            // Not CDP: the engine's notice that one Cua session sharing this
+            // connection ended.
+            "Cua.releaseSession" => {
+                let cua_session =
+                    params.get("cuaSession").and_then(Value::as_str).unwrap_or_default();
+                self.release_session(cua_session).await;
+                Ok(json!({}))
+            }
             "Target.detachFromTarget" => {
                 let session = params.get("sessionId").and_then(Value::as_str).unwrap_or_default();
                 // A relay tab session only stops being routed; the debugger
-                // stays attached for the tab's other sessions (the extension
-                // releases it once the tab is idle).
+                // stays attached until this connection closes and no other
+                // connection holds the tab.
                 {
                     let mut routes = self.routes.lock().unwrap();
                     if let Some(tab) = routes.sessions.remove(session) {
@@ -453,15 +621,16 @@ impl Session {
                     .map(|session| json!({ "method": method, "params": params, "sessionId": session }))
                     .collect()
             }
-            // The extension released an idle debugger. Relay sessions stay
-            // valid (the next command reattaches and replays Page.enable);
-            // only out-of-process iframe sessions died with the attachment.
+            // Older extension builds released an idle debugger. Relay
+            // sessions stay valid (the next command reattaches and replays
+            // Page.enable); only out-of-process iframe sessions died with the
+            // attachment.
             "debugger.released" => {
                 routes.children.retain(|_, owner| *owner != tab);
                 Vec::new()
             }
             "debugger.detached" => {
-                // The debugger left the tab (idle release, tab closed, or the
+                // The debugger left the tab (session done, tab closed, or the
                 // user cancelled): its sessions end; the next operation attaches again.
                 routes.sessions.retain(|_, owner| *owner != tab);
                 let Routes { sessions, colors, .. } = &mut *routes;
@@ -523,6 +692,7 @@ mod tests {
             link: bridge.links()[0].link,
             bridge,
             routes: Arc::new(Mutex::new(Routes::default())),
+            held_tabs: Mutex::new(Some(HashMap::new())),
         });
         session.routes.lock().unwrap().targets.insert("T".to_owned(), 4);
         // The fake extension answers every request and hands it to the test.
@@ -553,5 +723,179 @@ mod tests {
             assert_eq!(sent["method"], "debugger.send");
             assert_eq!(sent["params"]["sessionColor"], color);
         }
+    }
+
+    /// A fake extension that answers every request, except that it holds
+    /// back its answer to debugger.attach until the test releases it.
+    #[cfg(unix)]
+    fn gated_extension(
+        mut extension: tokio::net::UnixStream,
+    ) -> (mpsc::UnboundedReceiver<Value>, mpsc::UnboundedSender<()>) {
+        use tokio::io::AsyncWriteExt;
+        let (seen_tx, seen) = mpsc::unbounded_channel::<Value>();
+        let (release_tx, mut release) = mpsc::unbounded_channel::<()>();
+        tokio::spawn(async move {
+            loop {
+                let request = extension_bridge::tests::read_frame(&mut extension).await;
+                seen_tx.send(request.clone()).unwrap();
+                if request["method"] == "debugger.attach" {
+                    release.recv().await;
+                }
+                let reply = json!({"jsonrpc":"2.0","id":request["id"],"result":{}});
+                extension.write_all(&extension_bridge::frame(&reply)).await.unwrap();
+            }
+        });
+        (seen, release_tx)
+    }
+
+    #[cfg(unix)]
+    fn relay_session(bridge: Arc<ExtensionBridge>, link: u64, tab: i64) -> Arc<Session> {
+        let session = Session {
+            link,
+            bridge,
+            routes: Arc::new(Mutex::new(Routes::default())),
+            held_tabs: Mutex::new(Some(HashMap::new())),
+        };
+        session.routes.lock().unwrap().targets.insert("T".to_owned(), tab);
+        Arc::new(session)
+    }
+
+    async fn next_method(seen: &mut mpsc::UnboundedReceiver<Value>) -> String {
+        seen.recv().await.unwrap()["method"].as_str().unwrap().to_owned()
+    }
+
+    fn quiet(seen: &mut mpsc::UnboundedReceiver<Value>) -> bool {
+        seen.try_recv().is_err()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_pending_attach_keeps_the_tab_when_the_last_holder_closes() {
+        let (bridge, extension, _dir) = extension_bridge::tests::connected().await;
+        let link = bridge.links()[0].link;
+        let (mut seen, release) = gated_extension(extension);
+        let attach = json!({ "targetId": "T", "flatten": true });
+        let (a, b) = (relay_session(bridge.clone(), link, 11), relay_session(bridge, link, 11));
+
+        let a_attach = tokio::spawn({
+            let a = a.clone();
+            let attach = attach.clone();
+            async move { a.root("Target.attachToTarget", &attach).await }
+        });
+        assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        release.send(()).unwrap();
+        a_attach.await.unwrap().unwrap();
+
+        // B's attach is in flight; then A, the only holder, closes.
+        let b_attach = tokio::spawn({
+            let b = b.clone();
+            let attach = attach.clone();
+            async move { b.root("Target.attachToTarget", &attach).await }
+        });
+        assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        let a_close = tokio::spawn({
+            let a = a.clone();
+            async move { a.release_held_tabs().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+        b_attach.await.unwrap().expect("B adopts the tab");
+        a_close.await.unwrap();
+        assert!(quiet(&mut seen), "no detach while B holds the tab");
+
+        // The other ordering: the last holder closes first, then an attach.
+        b.release_held_tabs().await;
+        assert_eq!(next_method(&mut seen).await, "debugger.detach");
+        let a2 = relay_session(a.bridge.clone(), link, 11);
+        let a2_attach = tokio::spawn({
+            let a2 = a2.clone();
+            async move { a2.root("Target.attachToTarget", &attach).await }
+        });
+        assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        release.send(()).unwrap();
+        a2_attach.await.unwrap().expect("attach after the detach holds the tab");
+        assert_eq!(tab_holders().lock().unwrap().get(&(link, 11)), Some(&1));
+        a2.release_held_tabs().await;
+        assert_eq!(next_method(&mut seen).await, "debugger.detach");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_connection_closing_during_its_own_attach_releases_the_tab() {
+        let (bridge, extension, _dir) = extension_bridge::tests::connected().await;
+        let link = bridge.links()[0].link;
+        let (mut seen, release) = gated_extension(extension);
+        let a = relay_session(bridge, link, 12);
+        let attach = tokio::spawn({
+            let a = a.clone();
+            async move {
+                a.root("Target.attachToTarget", &json!({ "targetId": "T", "flatten": true }))
+                    .await
+            }
+        });
+        assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        let close = tokio::spawn({
+            let a = a.clone();
+            async move { a.release_held_tabs().await }
+        });
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        release.send(()).unwrap();
+        assert!(attach.await.unwrap().is_err(), "a closed connection adopts nothing");
+        close.await.unwrap();
+        assert_eq!(next_method(&mut seen).await, "debugger.detach");
+        assert!(tab_holders().lock().unwrap().get(&(link, 12)).is_none());
+        // A connection already closed refuses before attaching at all.
+        assert!(a
+            .root("Target.attachToTarget", &json!({ "targetId": "T", "flatten": true }))
+            .await
+            .is_err());
+        assert!(quiet(&mut seen));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_tab_detaches_only_when_no_cua_session_on_the_shared_connection_holds_it() {
+        let (bridge, extension, _dir) = extension_bridge::tests::connected().await;
+        let link = bridge.links()[0].link;
+        let (mut seen, release) = gated_extension(extension);
+        // One relay connection shared by two Cua sessions.
+        let shared = relay_session(bridge, link, 21);
+        shared.routes.lock().unwrap().targets.insert("U".to_owned(), 22);
+        let attach = |target: &'static str, cua: &'static str| {
+            let shared = shared.clone();
+            let release = release.clone();
+            async move {
+                let pending = tokio::spawn(async move {
+                    shared
+                        .root("Target.attachToTarget", &json!({ "targetId": target, "cuaSession": cua }))
+                        .await
+                });
+                release.send(()).unwrap();
+                pending.await.unwrap().unwrap();
+            }
+        };
+        attach("T", "one").await; // tab 21: only session one
+        attach("U", "one").await; // tab 22: both sessions
+        attach("U", "two").await;
+        for _ in 0..3 {
+            assert_eq!(next_method(&mut seen).await, "debugger.attach");
+        }
+
+        // Session one ends; the notice passes the relay's method allowlist.
+        let reply = shared
+            .answer(json!({ "id": 1, "method": "Cua.releaseSession", "params": { "cuaSession": "one" } }))
+            .await;
+        assert!(reply.get("error").is_none(), "{reply}");
+        let detach = seen.recv().await.unwrap();
+        assert_eq!(detach["method"], "debugger.detach");
+        assert_eq!(detach["params"]["tabId"], 21, "only the tab no live session holds");
+        assert!(quiet(&mut seen), "session two still holds tab 22");
+
+        // The connection closes with session two still holding tab 22.
+        shared.release_held_tabs().await;
+        let detach = seen.recv().await.unwrap();
+        assert_eq!(detach["params"]["tabId"], 22);
+        assert!(tab_holders().lock().unwrap().get(&(link, 21)).is_none());
+        assert!(tab_holders().lock().unwrap().get(&(link, 22)).is_none());
     }
 }

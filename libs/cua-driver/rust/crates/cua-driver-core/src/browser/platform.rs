@@ -134,8 +134,10 @@ pub enum PrepareStrategy {
     ExistingProfile,
 }
 
-/// Caller context for an explicit `browser_prepare` call. Prepare is never
-/// implicit: `get_browser_state` must not trigger it.
+/// Caller context for an existing-profile attachment or a `browser_prepare`
+/// call. `get_browser_state` makes the attachment itself only through a
+/// connected Cua Driver extension, where it changes no browser setting; every
+/// other preparation needs an explicit `browser_prepare`.
 #[derive(Debug, Clone)]
 pub struct PrepareRequest {
     /// Existing browser process used to select and attest the launch executable.
@@ -418,6 +420,16 @@ pub trait BrowserPlatform: Send + Sync {
         pid: i64,
     ) -> Result<Option<OwnedEndpoint>, BrowserRefusal> {
         self.discover_owned_endpoint(pid).await
+    }
+
+    /// Whether cua's Chrome extension running in browser process `pid` is
+    /// connected to this driver. A connectivity check only: it opens nothing
+    /// and inspects no endpoint.
+    async fn extension_link_connected(&self, pid: i64) -> bool {
+        super::extension_bridge::global()
+            .links()
+            .iter()
+            .any(|link| link.chrome_pid == Some(pid))
     }
 
     /// Re-prove an endpoint that was already claimed under an existing-profile
