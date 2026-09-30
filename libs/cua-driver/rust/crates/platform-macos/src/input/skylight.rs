@@ -1123,8 +1123,8 @@ impl std::fmt::Display for TargetOccluded {
             Some(window) if window.pid == std::process::id() as i32 => write!(
                 f,
                 "screen point ({x:.0},{y:.0}) is covered by Cua Driver's own window {} \
-                 \"{}\" (a PiP preview panel takes clicks), not window {}; no input was sent. \
-                 Move or close the panel, or act on the target in the background",
+                 \"{}\" (an interactive driver window such as the overview takes clicks), \
+                 not window {}; no input was sent. Close it, or act on the target in the background",
                 window.window_id, window.title, self.window_id
             ),
             Some(window) => write!(
@@ -1218,6 +1218,28 @@ pub fn with_foreground_pointer_activation(
     point: (f64, f64),
     action: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<()> {
+    with_foreground_pointer_gesture(target_pid, target_wid, &[point], action)
+}
+
+/// [`with_foreground_pointer_activation`] for a gesture along `path` (the
+/// click point, or a drag's start and end; admission checks the first).
+///
+/// cua's own PiP panels that the gesture crosses step aside for all of it
+/// (`crate::pip::step_aside`): out before admission, so the check sees what
+/// is underneath, and back once the gesture and its settle are over, on
+/// every path out of here. While the user's hands are on such a panel the
+/// gesture waits, and past the bound nothing is sent and the error is a
+/// [`crate::pip::PipHeldByUser`].
+pub fn with_foreground_pointer_gesture(
+    target_pid: libc::pid_t,
+    target_wid: u32,
+    path: &[(f64, f64)],
+    action: impl FnOnce() -> anyhow::Result<()>,
+) -> anyhow::Result<()> {
+    let point = *path
+        .first()
+        .ok_or_else(|| anyhow::anyhow!("a pointer gesture needs a point"))?;
+    let _aside = crate::pip::step_aside(path)?;
     with_foreground_hid_activation(target_pid, target_wid, || {
         ensure_topmost_at(target_pid, target_wid, point)?;
         action()

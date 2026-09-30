@@ -141,6 +141,12 @@ impl<K: Copy + PartialEq> Hands<K> {
                 .is_some_and(|last| now.saturating_duration_since(last) < IDLE_HIDE_AFTER)
     }
 
+    /// Whether the pointer is on the panel and holds it (it moved there, or
+    /// pressed), as of the last poll: the user's hands, without the clock.
+    pub(super) fn pointer_holds(&self) -> bool {
+        self.inside
+    }
+
     /// The user clock ran out with the pointer off the panel: true once, as
     /// the hold ends, so the caller re-checks the panel then.
     pub(super) fn lapse(&mut self, now: Instant) -> bool {

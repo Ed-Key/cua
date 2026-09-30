@@ -640,7 +640,7 @@ impl Tool for ClickTool {
                          (background CGEvent; not driver-verified — confirm via screenshot)."
                     ))
                     .with_structured(serde_json::json!({ "path": "cgevent", "verified": false, "effect": "unverifiable" })),
-                    Ok(Err(e)) if e.is::<crate::input::skylight::TargetOccluded>() => {
+                    Ok(Err(e)) if super::pixel_route::is_pointer_refusal(&e) => {
                         super::pixel_route::foreground_unavailable("Middle-click", wid, &e)
                     }
                     Ok(Err(e)) => ToolResult::error(format!("Middle-click failed: {e}")),
@@ -909,7 +909,7 @@ impl Tool for ClickTool {
                     }
                     ToolResult::text(msg).with_structured(structured)
                 }
-                Ok(Err(e)) if e.is::<crate::input::skylight::TargetOccluded>() => {
+                Ok(Err(e)) if super::pixel_route::is_pointer_refusal(&e) => {
                     super::pixel_route::foreground_unavailable("click", wid, &e)
                 }
                 Ok(Err(e)) if e.is::<ElementChanged>() => {

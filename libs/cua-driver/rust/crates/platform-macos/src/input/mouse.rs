@@ -160,8 +160,12 @@ fn click_at_xy_desktop_inner(
         }
 
         for pair_index in 0..count.max(1) {
+            // Both halves exist before the press is posted, so no failure
+            // can leave the button down.
             let down = CGEvent::new_mouse_event(source.clone(), down_ty, point, btn)
                 .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
+            let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
+                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
             down.set_flags(flags);
             down.set_integer_value_field(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
@@ -169,8 +173,6 @@ fn click_at_xy_desktop_inner(
             );
             crate::focus_steal::post_hid_mouse_event(&down);
             std::thread::sleep(std::time::Duration::from_millis(28));
-            let up = CGEvent::new_mouse_event(source.clone(), up_ty, point, btn)
-                .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
             up.set_flags(flags);
             up.set_integer_value_field(
                 core_graphics::event::EventField::MOUSE_EVENT_CLICK_STATE,
@@ -949,6 +951,9 @@ where
     let events = foreground_drag_events(from_x, from_y, to_x, to_y, steps);
 
     super::keyboard::with_global_modifier_keys(modifiers, |flags| {
+        // Where the button is held, between the press and the release: a
+        // failure there releases it before returning, never replaying input.
+        let mut held: Option<CGPoint> = None;
         for spec in events {
             let (event_type, click_state, event_button, event_button_number, subtype) = match spec
                 .kind
@@ -982,7 +987,7 @@ where
                 ForegroundDragEventKind::Down => {}
             }
 
-            post_drag_mouse_event(
+            let posted = post_drag_mouse_event(
                 pid,
                 event_type,
                 spec.point,
@@ -996,7 +1001,32 @@ where
                 MousePostMode::HidOnly,
                 flags,
                 "foreground drag event creation failed",
-            )?;
+            );
+            if let Err(error) = posted {
+                if let Some(at) = held {
+                    let _ = post_drag_mouse_event(
+                        pid,
+                        up_type,
+                        at,
+                        cg_button,
+                        None,
+                        wid,
+                        click_group_id,
+                        1,
+                        button_number,
+                        0,
+                        MousePostMode::HidOnly,
+                        flags,
+                        "foreground drag release failed",
+                    );
+                }
+                return Err(error);
+            }
+            held = match spec.kind {
+                ForegroundDragEventKind::Down | ForegroundDragEventKind::Dragged => Some(spec.point),
+                ForegroundDragEventKind::Up => None,
+                ForegroundDragEventKind::Move => held,
+            };
 
             match spec.kind {
                 ForegroundDragEventKind::Move => {

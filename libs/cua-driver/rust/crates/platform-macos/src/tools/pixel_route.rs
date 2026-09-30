@@ -127,6 +127,12 @@ pub(crate) fn path_label(route: PixelClickRoute) -> &'static str {
     }
 }
 
+/// Whether a foreground pointer failure is one of the refusals
+/// [`foreground_unavailable`] names (sent no input, with its own code).
+pub(crate) fn is_pointer_refusal(cause: &anyhow::Error) -> bool {
+    cause.is::<crate::input::skylight::TargetOccluded>() || cause.is::<crate::pip::PipHeldByUser>()
+}
+
 /// Structured error for a foreground HID click whose exact-window activation
 /// or dispatch failed. No input reaches another window in that case. A
 /// window left covering the point after the raise is `target_occluded`,
@@ -136,6 +142,18 @@ pub(crate) fn foreground_unavailable(
     window_id: u32,
     cause: &anyhow::Error,
 ) -> ToolResult {
+    if let Some(held) = cause.downcast_ref::<crate::pip::PipHeldByUser>() {
+        return ToolResult::error(format!("{action} refused: {held}.")).with_structured(
+            serde_json::json!({
+                "code": "pip_held_by_user",
+                "effect": "refused",
+                "window_id": window_id,
+                "point": [held.point.0, held.point.1],
+                "waited_ms": held.waited.as_millis() as u64,
+                "retryable": true,
+            }),
+        );
+    }
     if let Some(occluded) = cause.downcast_ref::<crate::input::skylight::TargetOccluded>() {
         return ToolResult::error(format!("{action} refused: {occluded}.")).with_structured(
             serde_json::json!({
@@ -218,6 +236,24 @@ mod tests {
         assert_eq!(structured["toolkit"], "tk");
         assert_eq!(structured["event_kind"], "mouse_click");
         assert_eq!(structured["escalation"]["recommended"], "foreground");
+    }
+
+    /// An agent gesture refused because the user holds the preview says so,
+    /// with its own code, and is recognised as a refusal.
+    #[test]
+    fn a_preview_held_by_the_user_refuses_as_pip_held_by_user() {
+        let held = anyhow::Error::new(crate::pip::PipHeldByUser {
+            point: (1200.0, 700.0),
+            waited: std::time::Duration::from_secs(5),
+        });
+        assert!(is_pointer_refusal(&held));
+        let result = foreground_unavailable("click", 7, &held);
+        assert_eq!(result.is_error, Some(true));
+        let structured = result.structured_content.clone().expect("structured");
+        assert_eq!(structured["code"], "pip_held_by_user");
+        assert_eq!(structured["effect"], "refused");
+        assert!(format!("{:?}", result.content).contains("holding"));
+        assert!(!is_pointer_refusal(&anyhow::anyhow!("window never focused")));
     }
 
     #[test]
