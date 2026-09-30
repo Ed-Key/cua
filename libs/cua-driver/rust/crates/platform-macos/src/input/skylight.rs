@@ -1067,6 +1067,13 @@ impl std::fmt::Display for TargetOccluded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let (x, y) = self.point;
         match &self.covering {
+            Some(window) if window.pid == std::process::id() as i32 => write!(
+                f,
+                "screen point ({x:.0},{y:.0}) is covered by Cua Driver's own window {} \
+                 \"{}\" (a PiP preview panel takes clicks), not window {}; no input was sent. \
+                 Move or close the panel, or act on the target in the background",
+                window.window_id, window.title, self.window_id
+            ),
             Some(window) => write!(
                 f,
                 "screen point ({x:.0},{y:.0}) is covered by {} window {} \"{}\" (pid {}), \
@@ -1109,6 +1116,7 @@ fn occlusion_at(pid: libc::pid_t, window_id: u32, point: (f64, f64)) -> Option<T
         point,
         pid,
         std::process::id() as i32,
+        crate::cursor::overlay::is_overlay_window,
         |id| crate::ax::bindings::window_belongs_to(id, window_id),
     ) {
         crate::windows::PointOwner::Target => return None,

@@ -139,9 +139,12 @@ pub(crate) enum PointOwner<'a> {
 }
 
 /// The owner of the topmost window at `(x, y)` in `front_to_back` (composited
-/// on-screen windows in WindowServer order). The driver's own windows (cursor
-/// overlay, PiP panels) and display-sized system chrome are transparent to
-/// the check. `displays` are display bounds in the same coordinates.
+/// on-screen windows in WindowServer order). Display-sized system chrome and
+/// the driver's own click-through windows (`own_click_through`: the cursor
+/// overlay ignores mouse events) are transparent to the check; the driver's
+/// interactive windows (PiP panels, the overview) take a click like any
+/// other window and cover the target. `displays` are display bounds in the
+/// same coordinates.
 // ponytail: a display-sized chrome window is treated as click-through, so a
 // point over the Dock bar (drawn inside the Dock's full-screen window) is not
 // caught; hit-test the Dock's own geometry if that case shows up.
@@ -151,6 +154,7 @@ pub(crate) fn point_owner<'a>(
     (x, y): (f64, f64),
     target_pid: i32,
     own_pid: i32,
+    own_click_through: impl Fn(u32) -> bool,
     belongs_to_target: impl Fn(u32) -> bool,
 ) -> PointOwner<'a> {
     let covers_a_display = |b: &WindowBounds| {
@@ -164,7 +168,7 @@ pub(crate) fn point_owner<'a>(
     for window in front_to_back {
         let b = &window.bounds;
         let inside = x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
-        if window.pid == own_pid || !inside {
+        if !inside || (window.pid == own_pid && own_click_through(window.window_id)) {
             continue;
         }
         if belongs_to_target(window.window_id)
@@ -519,47 +523,57 @@ mod tests {
     fn the_topmost_window_at_a_point_decides_who_gets_a_click() {
         const TARGET: u32 = 10;
         let belongs = |id: u32| id == TARGET || id == 11; // 11: the target's sheet
-        let cursor = at(1, 7, 0, (0.0, 0.0, 2000.0, 2000.0)); // the driver's own overlay
+        let click_through = |id: u32| id == 1; // the driver's cursor overlay
+        let cursor = at(1, 7, 0, (0.0, 0.0, 2000.0, 2000.0));
         let dock = WindowInfo { app_name: "Dock".into(), ..at(2, 50, 20, (0.0, 0.0, 2000.0, 2000.0)) };
         let finder = at(3, 60, 0, (300.0, 300.0, 400.0, 300.0));
         let target = at(TARGET, 40, 0, (200.0, 200.0, 800.0, 600.0));
         let windows = [cursor.clone(), dock.clone(), finder.clone(), target.clone()];
         assert!(matches!(
-            point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, belongs),
+            point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, click_through, belongs),
             PointOwner::Other(WindowInfo { window_id: 3, .. })
         ));
-        assert!(matches!(point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, belongs), PointOwner::Target));
-        assert!(matches!(point_owner(&windows, &SCREENS, (100.0, 100.0), 40, 7, belongs), PointOwner::Nothing));
+        assert!(matches!(point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs), PointOwner::Target));
+        assert!(matches!(point_owner(&windows, &SCREENS, (100.0, 100.0), 40, 7, click_through, belongs), PointOwner::Nothing));
         // The target's own sheet and its open menu (layer 101) count as the target.
         let sheet = at(11, 40, 0, (300.0, 300.0, 400.0, 300.0));
         let menu = at(12, 40, 101, (300.0, 300.0, 200.0, 200.0));
         let windows = [menu, sheet, finder.clone(), target.clone()];
-        assert!(matches!(point_owner(&windows, &SCREENS, (350.0, 350.0), 40, 7, belongs), PointOwner::Target));
-        assert!(matches!(point_owner(&windows, &SCREENS, (600.0, 550.0), 40, 7, belongs), PointOwner::Target));
+        assert!(matches!(point_owner(&windows, &SCREENS, (350.0, 350.0), 40, 7, click_through, belongs), PointOwner::Target));
+        assert!(matches!(point_owner(&windows, &SCREENS, (600.0, 550.0), 40, 7, click_through, belongs), PointOwner::Target));
         // Smaller chrome (the menu bar, another app's menu, a banner) covers it.
         let menu_bar = at(4, 50, 24, (0.0, 0.0, 2000.0, 30.0));
         let other_menu = at(5, 60, 101, (850.0, 650.0, 100.0, 100.0));
         let windows = [menu_bar, other_menu, target.clone()];
         assert!(matches!(
-            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, belongs),
+            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs),
             PointOwner::Other(WindowInfo { window_id: 5, .. })
         ));
         assert!(matches!(
-            point_owner(&windows, &SCREENS, (900.0, 10.0), 40, 7, belongs),
+            point_owner(&windows, &SCREENS, (900.0, 10.0), 40, 7, click_through, belongs),
             PointOwner::Other(WindowInfo { window_id: 4, .. })
         ));
         // Another app's full-screen overlay above the normal level takes clicks.
         let overlay = at(6, 70, 25, (0.0, 0.0, 2000.0, 2000.0));
         let windows = [overlay, target.clone()];
         assert!(matches!(
-            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, belongs),
+            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs),
             PointOwner::Other(WindowInfo { window_id: 6, .. })
         ));
+        // The driver's own PiP panel takes mouse input: it covers the target,
+        // while the click-through cursor overlay above it does not.
+        let pip = at(20, 7, 3, (850.0, 650.0, 200.0, 150.0));
+        let windows = [cursor.clone(), pip, target.clone()];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 20, pid: 7, .. })
+        ));
+        assert!(matches!(point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, click_through, belongs), PointOwner::Target));
         // Another window of the same app that is not the target's covers it.
         let other_own = at(13, 40, 0, (300.0, 300.0, 400.0, 300.0));
         let windows = [other_own, target];
         assert!(matches!(
-            point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, belongs),
+            point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, click_through, belongs),
             PointOwner::Other(WindowInfo { window_id: 13, .. })
         ));
     }
