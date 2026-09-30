@@ -10,7 +10,7 @@
 //! calls to make instead. Chrome's own UI (address bar, toolbar, permission
 //! prompts, extension UI) has no web area and keeps native input, as do pages
 //! an extension cannot reach (chrome:// pages, other extensions, the Web
-//! Store).
+//! Store, and file:// pages, which need a per-extension opt-in).
 //!
 //! Redirect rule: refuse native input only when (1) the extension link for
 //! this Chrome provably shows the exact target window and page (a window of
@@ -34,7 +34,9 @@ fn extension_connected(pid: i32) -> bool {
 }
 
 /// Whether Chrome lets an extension debug a page at `url`. Unknown (empty)
-/// URLs count as unreachable, so native input stays available there.
+/// URLs count as unreachable, so native input stays available there. So do
+/// file:// pages: Chrome refuses the debugger there unless the user turned on
+/// the extension's "Allow access to file URLs", which the driver cannot see.
 fn extension_can_reach(url: &str) -> bool {
     let url = url.to_ascii_lowercase();
     !url.is_empty()
@@ -42,6 +44,7 @@ fn extension_can_reach(url: &str) -> bool {
             "chrome:",
             "chrome-extension:",
             "chrome-untrusted:",
+            "file:",
             "chrome-search:",
             "devtools:",
             "https://chromewebstore.google.com",
@@ -385,7 +388,6 @@ mod tests {
             "https://claude.ai/chat/1",
             "http://127.0.0.1:8765/react-form/",
             "about:blank",
-            "file:///tmp/a.html",
             "data:text/html,<p>x",
         ] {
             assert!(extension_can_reach(url), "{url}");
@@ -394,6 +396,8 @@ mod tests {
             "",
             "chrome://extensions/",
             "Chrome://settings",
+            "file:///tmp/a.html",
+            "FILE:///Users/x/page.html",
             "chrome-extension://abc/popup.html",
             "devtools://devtools/bundled/inspector.html",
             "https://chromewebstore.google.com/detail/x",
