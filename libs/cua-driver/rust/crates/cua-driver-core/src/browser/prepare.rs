@@ -1117,17 +1117,14 @@ impl BrowserEngine {
         };
 
         // Ownership rule: a grant's pool claim changes only under this
-        // endpoint's reconnect gate, from reading the previous grant through
-        // minting, releasing it and claiming the new generation. Two prepares
-        // for one session, or a prepare and a reconnect, would otherwise each
-        // act on a generation the other already replaced and leave a claim
-        // that no live grant releases.
-        let _endpoint_gate = self
+        // browser's reconnect gate, from reading the previous grant through
+        // releasing it, minting and claiming the new generation. Two prepares
+        // for one session, or a prepare and a reconnect (even of another
+        // endpoint), would otherwise each act on a generation the other
+        // already replaced and leave a claim that no live grant releases.
+        let _browser_gate = self
             .reconnect_gates
-            .lock(super::reconnect::ReconnectKey::new(
-                &fingerprint,
-                &endpoint.ws_url,
-            ))
+            .lock(super::reconnect::ReconnectKey::new(&fingerprint))
             .await;
         let previous_grant = self
             .existing_profile_grant(&request.session, request.transport_session.as_deref(), pid)

@@ -75,7 +75,7 @@ const MAX_BROWSER_SCREENSHOT_BYTES: usize = 16 * 1024 * 1024;
 pub struct BrowserEngine {
     pub(crate) platform: Arc<dyn BrowserPlatform>,
     pub(crate) store: BrowserStore,
-    pub(crate) pool: CdpPool,
+    pub(crate) pool: Arc<CdpPool>,
     pub(crate) managed_browsers: ManagedBrowsers,
     pub(crate) existing_profile_grants: ExistingProfileGrants,
     pub(crate) approval_broker: Arc<crate::consent::ApprovalBroker>,
@@ -676,7 +676,7 @@ impl BrowserEngine {
         let engine = Arc::new(Self {
             platform,
             store: BrowserStore::new(),
-            pool: CdpPool::new(),
+            pool: Arc::new(CdpPool::new()),
             managed_browsers: Default::default(),
             existing_profile_grants: ExistingProfileGrants::new(),
             approval_broker,
@@ -836,25 +836,32 @@ impl BrowserEngine {
     /// relay the socket may be shared with other Cua sessions, so the relay
     /// is first told this session's tabs are released; the socket itself
     /// closes only when its last grant releases it.
+    ///
+    /// The release runs as its own task, awaited here: the grant has already
+    /// left the registry (or is being replaced), so a caller cancelled while
+    /// the pool lock is busy must not strand a claim no grant will release.
     pub(crate) async fn release_grant_socket(&self, grant: &ExistingProfileGrant) {
-        if super::extension_relay::is_relay_url(&grant.endpoint_ws_url) {
-            if let Ok(conn) = self
-                .pool
-                .get_existing(&grant.endpoint_ws_url, grant.generation)
-                .await
-            {
-                let _ = conn
-                    .call(
-                        None,
-                        "Cua.releaseSession",
-                        json!({ "cuaSession": grant.public_session }),
-                    )
-                    .await;
+        let pool = self.pool.clone();
+        let grant = grant.clone();
+        let _ = tokio::spawn(async move {
+            if super::extension_relay::is_relay_url(&grant.endpoint_ws_url) {
+                if let Ok(conn) = pool
+                    .get_existing(&grant.endpoint_ws_url, grant.generation)
+                    .await
+                {
+                    let _ = conn
+                        .call(
+                            None,
+                            "Cua.releaseSession",
+                            json!({ "cuaSession": grant.public_session }),
+                        )
+                        .await;
+                }
             }
-        }
-        self.pool
-            .release_existing(&grant.endpoint_ws_url, grant.generation)
-            .await;
+            pool.release_existing(&grant.endpoint_ws_url, grant.generation)
+                .await;
+        })
+        .await;
     }
 
     pub(crate) async fn connect(&self, ws_url: &str) -> Result<Arc<CdpConnection>, BrowserRefusal> {
@@ -900,10 +907,7 @@ impl BrowserEngine {
         // socket rather than opening another browser-level connection.
         let _leader = self
             .reconnect_gates
-            .lock(ReconnectKey::new(
-                &grant.fingerprint,
-                &grant.endpoint_ws_url,
-            ))
+            .lock(ReconnectKey::new(&grant.fingerprint))
             .await;
         let mut grant = self
             .existing_profile_grant(session, transport_session, pid)

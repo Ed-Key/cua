@@ -1258,7 +1258,7 @@ async fn an_existing_profile_attach_changes_its_claim_only_under_the_endpoint_ga
     let gate = f
         .engine
         .reconnect_gates
-        .lock(super::reconnect::ReconnectKey::new(&fingerprint, &f._server.ws_url()))
+        .lock(super::reconnect::ReconnectKey::new(&fingerprint))
         .await;
     let tool = BrowserPrepareTool::new(f.engine.clone());
     let prepare = tool.invoke(json!({
@@ -1341,6 +1341,64 @@ async fn a_cancelled_reprepare_never_leaves_a_claim_without_a_grant() {
         panic!("generation {first} still owns the socket after its session ended")
     };
     assert!(error.to_string().contains("missing"), "{error}");
+}
+
+#[tokio::test]
+async fn a_revocation_cancelled_on_a_busy_pool_still_releases_the_claim() {
+    const TRANSPORT: &str = "transport-v2-revoke-cancel";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let url = f._server.ws_url();
+    let prepared = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": TRANSPORT,
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let generation = f
+        .engine
+        .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled_url = format!(
+        "ws://127.0.0.1:{}/devtools/browser/stalled",
+        stalled.local_addr().unwrap().port()
+    );
+    let holder = tokio::spawn({
+        let engine = f.engine.clone();
+        async move { engine.pool.get(&stalled_url).await.map(|_| ()) }
+    });
+    let _accepted = stalled.accept().await.unwrap();
+    // The grant leaves the registry, then its release waits on the pool.
+    assert!(
+        tokio::time::timeout(
+            std::time::Duration::from_millis(200),
+            f.engine
+                .revoke_existing_profile_grant(SESSION, Some(TRANSPORT), 1),
+        )
+        .await
+        .is_err(),
+        "the revocation must reach the stalled pool"
+    );
+    holder.abort();
+    let _ = holder.await;
+
+    let mut released = false;
+    for _ in 0..50 {
+        if f.engine.pool.get_existing(&url, generation).await.is_err() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(released, "generation {generation} kept the socket after its grant was revoked");
 }
 
 /// Forwards WebSocket connections to the mock endpoint after a delay, so a
