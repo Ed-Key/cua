@@ -634,6 +634,9 @@ struct Gesture {
     pressed: Option<Tag>,
     /// The pointer went past `DRAG_SLOP`: a drag, not a click.
     moved: bool,
+    /// Since when the button has been seen up with no mouse-up delivered
+    /// (see `release_missed`).
+    up_since: Option<Instant>,
     /// Largest front card on the panel's screen.
     max: (f64, f64),
 }
@@ -3002,10 +3005,23 @@ unsafe extern "C" fn hover_poll_cb(ctx: *mut c_void) {
     let id = *Box::from_raw(ctx as *mut i64);
     with_state(|state| {
         // A press holds its panel up (see `refresh`). If its mouse-up never
-        // reached the panel, end it here once the button is up, or it would
-        // hold the panel for good.
-        let pressed = state.gesture.as_ref().is_some_and(|gesture| gesture.id == id);
-        if pressed && !primary_button_down() {
+        // reached the panel, end it here, or it would hold the panel for
+        // good: once the button has been up for `RELEASE_GRACE`, so a
+        // mouse-up (or the last drags) still queued behind this poll is
+        // handled as the release it is.
+        let now = Instant::now();
+        let missed = state
+            .gesture
+            .as_mut()
+            .filter(|gesture| gesture.id == id)
+            .is_some_and(|gesture| {
+                if primary_button_down() {
+                    gesture.up_since = None;
+                    return false;
+                }
+                release_missed(*gesture.up_since.get_or_insert(now), now)
+            });
+        if missed {
             end_gesture(state, false);
         }
         let Some(panel) = panel_by_id(state, id) else {
@@ -4288,6 +4304,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
                 edges,
                 pressed,
                 moved: false,
+                up_since: None,
                 max,
             });
         });
@@ -4381,6 +4398,19 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
     if live {
         refresh(state, &key);
     }
+}
+
+/// A press counts as released without its mouse-up once the button has
+/// been up this long: far longer than a queued mouse-up takes to arrive.
+const RELEASE_GRACE: Duration = Duration::from_secs(1);
+
+/// Whether a press whose button was first seen up at `up_since` (with no
+/// mouse-up delivered) has missed its release by `now`. Not at the first
+/// sighting: the button's state runs ahead of event delivery, so the
+/// mouse-up and the last drags may still be queued, and ending the press
+/// before them would drop a click's raise or a drag's last step.
+fn release_missed(up_since: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(up_since) >= RELEASE_GRACE
 }
 
 /// Whether the primary mouse button is down right now.
@@ -5153,6 +5183,19 @@ mod tests {
         #[cfg(target_arch = "x86_64")]
         assert_eq!(TEXT_CENTER, 2);
         assert_eq!(TEXT_CENTER + objc2_app_kit::NSTextAlignment::Right.0, 3);
+    }
+
+    #[test]
+    fn a_press_is_ended_without_its_mouse_up_only_after_a_grace() {
+        let up = Instant::now();
+        // The poll that first sees the button up runs before a queued
+        // mouse-up: the press is still the mouse-up's to end.
+        assert!(!release_missed(up, up));
+        assert!(!release_missed(up, up + HOVER_POLL));
+        assert!(!release_missed(up, up + Duration::from_millis(999)));
+        // No mouse-up for a second: it was missed, the press ends.
+        assert!(release_missed(up, up + RELEASE_GRACE));
+        assert!(RELEASE_GRACE >= 4 * HOVER_POLL, "several polls of grace");
     }
 
     #[test]
