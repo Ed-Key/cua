@@ -2527,6 +2527,7 @@ impl BrowserEngine {
                 frame,
                 destination: None,
                 attachment: None,
+                minted: None,
             });
         }
 
@@ -2587,6 +2588,7 @@ impl BrowserEngine {
                                 },
                                 destination: None,
                                 attachment: None,
+                                minted: None,
                             });
                         }
                         attached += 1;
@@ -3638,7 +3640,7 @@ pub(crate) fn dialog_open_refusal(dialog: &super::cdp_ws::CdpDialogState) -> Bro
 }
 
 const DIALOG_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
-const DIALOG_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+pub(crate) const DIALOG_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
 const SETTLE_QUIET_POLLS: u32 = 2;
 const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_500);

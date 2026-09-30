@@ -384,6 +384,7 @@ impl RefSpace {
                 .is_some_and(|held| Fingerprint::of(held) == Fingerprint::of(&entry))
             {
                 // Same entity: only what it allows now (actions, visibility) moves.
+                entry.minted = Some(index);
                 self.capabilities.insert(index, entry);
                 return format_ref(self.id, index);
             }
@@ -391,6 +392,7 @@ impl RefSpace {
         }
         let index = self.next_index;
         self.next_index += 1;
+        entry.minted = Some(index);
         self.by_node.insert(key, index);
         self.capabilities.insert(index, entry);
         format_ref(self.id, index)
@@ -475,19 +477,19 @@ impl TabRefs {
     /// Retire the ref a use just refused: its node reads as another element
     /// than `issued`, the capability the use resolved. It stays stale even if
     /// the node later reads as before, and the next diff reports its line
-    /// gone. The ref is found by its node and retired only while it is still
-    /// that capability: an observation that ran meanwhile may already have
-    /// retired it and given the node a new ref, which must stay.
+    /// gone. Exactly that capability is retired (its space, by attachment,
+    /// and the index it was minted at): an observation that ran meanwhile may
+    /// already have retired it and given the node a new ref, which must stay
+    /// whatever it reads as.
     pub(crate) fn retire_refused(&mut self, issued: &RefEntry) {
         let Some(space) = self.space.as_mut() else {
             return;
         };
-        let held = space.by_node.get(&NodeKey::of(issued)).copied();
-        if let Some(index) = held.filter(|index| {
-            space.capabilities.get(index).is_some_and(|held| {
-                held.attachment == issued.attachment
-                    && Fingerprint::of(held) == Fingerprint::of(issued)
-            })
+        let Some(index) = issued.minted else {
+            return;
+        };
+        if space.capabilities.get(&index).is_some_and(|held| {
+            held.attachment == issued.attachment && NodeKey::of(held) == NodeKey::of(issued)
         }) {
             space.retire(index);
         }
@@ -608,6 +610,7 @@ mod tests {
             frame,
             destination: None,
             attachment: None,
+            minted: None,
         }
     }
 
@@ -1498,6 +1501,14 @@ mod tests {
         session.refs.retire_refused(&issued);
         assert!(session.resolves(&new));
         assert!(!session.resolves(&old));
+
+        // Nor when the node changed and changed back meanwhile, so that its
+        // newest ref reads exactly as the refused one did.
+        let third = session.observe(identity("L1", 1), &[node(10, "button", "Reply")], None);
+        let newest = keys(&third)[0].clone();
+        assert_ne!(newest, new);
+        session.refs.retire_refused(&issued);
+        assert!(session.resolves(&newest));
     }
 
     #[test]

@@ -154,6 +154,7 @@ impl SemanticNode {
             frame: self.frame.clone(),
             destination: self.url.clone(),
             attachment: None,
+            minted: None,
         })
     }
 }

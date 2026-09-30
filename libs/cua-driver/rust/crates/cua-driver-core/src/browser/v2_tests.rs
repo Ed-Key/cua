@@ -118,6 +118,12 @@ struct FixtureState {
     /// The input handler defers its alert: the insert is answered, and the
     /// dialog is up by the time the answer arrives.
     type_opens_dialog_late: bool,
+    /// The alert opens while the field is being read back: this read (0-based,
+    /// counted from the insert) is never answered.
+    readback_opens_dialog_at: Option<usize>,
+    readbacks: usize,
+    /// The browser does not report a frame tree.
+    frame_tree_unsupported: bool,
     /// A keydown handler calls alert() on this (0-based) key.
     key_down_opens_dialog_at: Option<usize>,
     key_downs: usize,
@@ -173,6 +179,9 @@ impl Default for FixtureState {
             hit: None,
             type_opens_dialog: false,
             type_opens_dialog_late: false,
+            readback_opens_dialog_at: None,
+            readbacks: 0,
+            frame_tree_unsupported: false,
             key_down_opens_dialog_at: None,
             key_downs: 0,
             dialog_open: false,
@@ -739,6 +748,9 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 MockReply::ok(json!({ "sessionId": format!("tab-sess-{}", st.tab_sessions) }))
                     .with_events(events)
             }
+            "Page.getFrameTree" if st.frame_tree_unsupported => {
+                MockReply::err(-32601, "'Page.getFrameTree' wasn't found")
+            }
             "Page.getFrameTree" if is_tab => MockReply::ok(json!({
                 "frameTree": {
                     "frame": {
@@ -1082,6 +1094,29 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                         "contains_target": false, "label_of_target": false, "own_indicator": false,
                     }))}}),
                 )
+            }
+            "Runtime.callFunctionOn"
+                if st.readback_opens_dialog_at.is_some()
+                    && st
+                        .calls
+                        .iter()
+                        .any(|(_, method, _)| method == "Input.insertText")
+                    && call.params["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|function| function.contains("selectionStart"))
+                    && {
+                        st.readbacks += 1;
+                        st.readback_opens_dialog_at == Some(st.readbacks - 1)
+                    } =>
+            {
+                st.dialog_open = true;
+                MockReply::ok(json!({}))
+                    .with_events(vec![MockEvent {
+                        method: "Page.javascriptDialogOpening".into(),
+                        session_id: st.page_session.clone(),
+                        params: json!({"type": "alert", "message": "private dialog text"}),
+                    }])
+                    .unanswered()
             }
             "Runtime.callFunctionOn" => {
                 let function = call.params["functionDeclaration"]
@@ -5606,6 +5641,42 @@ async fn a_dialog_that_opens_after_the_insert_was_answered_is_still_seen_at_once
 }
 
 #[tokio::test]
+async fn a_dialog_that_opens_during_the_read_back_is_not_waited_out() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        // The page keeps only digits, so the first read is a mismatch and the
+        // read-back asks again; the alert is up by then.
+        st.field_value = Some(String::new());
+        st.field_digits_only = true;
+        st.readback_opens_dialog_at = Some(1);
+    })
+    .await;
+    let agent = Agent::bound(&f, "changes-readback-dialog").await;
+    let first = agent.snapshot().await;
+    let started = std::time::Instant::now();
+    let typed = agent
+        .call(
+            "browser_type",
+            json!({ "ref": named_ref(&first, "Reply body"), "text": "hello" }),
+        )
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(typed["effect"], "unverifiable", "{typed}");
+    assert_eq!(
+        typed["changes"]["reason"], "javascript_dialog_open",
+        "{typed}"
+    );
+    assert!(
+        !typed.to_string().contains("private dialog text"),
+        "{typed}"
+    );
+}
+
+#[tokio::test]
 async fn a_key_whose_keydown_opened_a_dialog_is_not_counted_as_typed() {
     let f = fixture_with(|st| {
         st.semantic_large_page = true;
@@ -5656,6 +5727,22 @@ async fn a_browser_that_cannot_prove_its_document_gets_no_continuation() {
         unproven.root = None;
         tab.stable.set_identity_for_test(unproven);
     });
+    let refused = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+}
+
+#[tokio::test]
+async fn a_browser_without_a_frame_tree_gets_no_continuation() {
+    // Neither the read that issued the token nor the one that uses it can
+    // name the document: two unknowns are not the same document.
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.frame_tree_unsupported = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let token = first["snapshot"]["continuation"].as_str().unwrap();
     let refused = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
     assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
 }

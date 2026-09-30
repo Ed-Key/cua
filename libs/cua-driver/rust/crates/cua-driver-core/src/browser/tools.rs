@@ -241,6 +241,13 @@ impl Delivery<'_> {
         self.opened.is_some()
     }
 
+    /// Completes once a dialog is open.
+    async fn opens(&mut self) {
+        while !self.blocked() {
+            tokio::time::sleep(super::engine::DIALOG_POLL).await;
+        }
+    }
+
     /// Send one call; `Ok(None)` when it was not sent because a dialog is
     /// open. A call the page answered is `Ok(Some(..))` even when the dialog
     /// opened while it ran: what it carried did reach the page.
@@ -2391,28 +2398,35 @@ fn normalize_rendered(value: &str) -> String {
 
 /// Read the node back until it holds what the input should have produced,
 /// for up to half a second (frameworks may re-render after the input event).
+/// `None` when the page opened a dialog meanwhile (a handler that defers its
+/// alert): a blocked page answers no read, so none is sent or waited for.
 async fn await_edit_readback(
-    conn: &CdpConnection,
-    cdp: &str,
+    delivery: &mut Delivery<'_>,
     object_id: &str,
     before: &EditState,
     text: &str,
     mode: EditMode,
-) -> Readback {
+) -> Option<Readback> {
+    let (conn, cdp) = (delivery.conn, delivery.cdp);
     let mut judged = Readback::Unverifiable;
     for attempt in 0..10 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        let Some(after) = read_edit_state(conn, cdp, object_id).await else {
-            return judged;
+        let after = tokio::select! {
+            biased;
+            _ = delivery.opens() => return None,
+            after = read_edit_state(conn, cdp, object_id) => after,
+        };
+        let Some(after) = after else {
+            break;
         };
         judged = judge_edit(before, &after, text, mode);
         if matches!(judged, Readback::Confirmed(_) | Readback::Detached) {
             break;
         }
     }
-    judged
+    Some(judged)
 }
 
 const SHOWN_VALUE_CHARS: usize = 200;
@@ -3211,11 +3225,17 @@ impl Tool for BrowserTypeTool {
             (result, delivered)
         };
 
+        // Read the field back, unless a dialog stops the page answering.
+        let readback = match before.as_ref() {
+            Some(before) if typed.is_ok() => {
+                await_edit_readback(&mut delivery, &object_id, before, &text, edit_mode).await
+            }
+            _ => (!delivery.blocked()).then_some(Readback::Unverifiable),
+        };
         // The page opened a dialog while it handled the input: the text went
         // in as far as counted, and the field cannot be read back until the
         // dialog is resolved.
-        delivery.blocked();
-        if let Some(dialog) = delivery.opened.take() {
+        if let (None, Some(dialog)) = (&readback, delivery.opened.take()) {
             let changes = page_changes_after(
                 &self.engine,
                 &self.registry,
@@ -3252,10 +3272,9 @@ impl Tool for BrowserTypeTool {
         // Input was sent: from here every outcome also says what the page
         // changed, read once the page has settled.
         let outcome = 'outcome: {
-            if typed.is_ok() {
-                if let Some(before) = before.as_ref() {
-                    match await_edit_readback(conn, cdp, &object_id, before, &text, edit_mode).await
-                    {
+            if let (Some(readback), Some(before)) = (readback, before.as_ref()) {
+                {
+                    match readback {
                         Readback::Mismatch { actual, expected } => {
                             let shown = shown_value(&actual, before.password);
                             break 'outcome ToolResult::error(format!(

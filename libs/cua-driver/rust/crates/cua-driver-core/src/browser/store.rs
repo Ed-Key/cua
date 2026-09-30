@@ -179,6 +179,10 @@ pub struct RefEntry {
     /// DOM refs.
     #[serde(skip_serializing)]
     pub attachment: Option<u64>,
+    /// The index a semantic ref was minted at in its space: which capability
+    /// this is, among those its node has had.
+    #[serde(skip_serializing)]
+    pub minted: Option<u32>,
 }
 
 /// One `dom_refs_v1` snapshot.
@@ -625,6 +629,7 @@ mod tests {
                     },
                     destination: None,
                     attachment: None,
+                    minted: None,
                 },
             );
             rec.tabs.insert(tab_id.clone(), {
@@ -775,6 +780,7 @@ mod tests {
                 frame: frame.clone(),
                 destination: None,
                 attachment: None,
+                minted: None,
             };
             let recorded = tab.stable.record(
                 &mut || store.mint_snapshot_id(),
