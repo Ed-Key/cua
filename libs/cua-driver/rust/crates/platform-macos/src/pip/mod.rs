@@ -53,8 +53,9 @@
 //!   fresh answer, and a `cua-pip-visibility` thread re-checks active
 //!   sessions (and panels the user holds) every 500 ms between frames.
 //! - Neither of those takes a shown panel from under the user's hands (see
-//!   `hands`): while the pointer is on it, a press that started on it
-//!   lasts, or the user's last interaction with it is less than 8 s old,
+//!   `hands`): while the pointer is on it (having moved there: a pointer
+//!   resting where a panel appears holds nothing), a press that started on
+//!   it lasts, or the user's last interaction with it is less than 8 s old,
 //!   it stays up and drops no back card. That is a second clock, the
 //!   user's; the agent's clock (the idle deadline above, the proof timer)
 //!   runs as ever, so a finale is never postponed by a resting pointer. A
@@ -3251,7 +3252,7 @@ unsafe extern "C" fn hover_poll_cb(ctx: *mut c_void) {
         let mut cursor = state.cursor;
         let polled = panel_by_id(state, id).filter(|panel| panel.shown).map(|panel| {
             let on = pointer_on(panel);
-            panel.hands.pointer(on, now);
+            panel.hands.pointer(on, mouse_location(), now);
             // The cursor of the press that is resizing, else of the band
             // under the pointer.
             let edges = match (resizing, on) {
@@ -4601,6 +4602,8 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
                 .map(|card| card.key);
             let region = stack::press_region(point, item, edges, frames[0], bar);
             tracing::info!(target: "pip", session = %key, region, x = point.0, y = point.1, "PiP panel press");
+            // A press holds the panel even with a pointer that never moved.
+            panel.hands.press();
             state.gesture = Some(Gesture {
                 id,
                 mouse,

@@ -17,6 +17,12 @@
 //! button still closes it, a session that ends still closes it, and a panel
 //! that is not shown is never brought back by the pointer.
 //!
+//! The pointer holds only once it has MOVED onto or within the shown panel
+//! (any real movement while over one of its surfaces), or pressed it. A
+//! pointer that was already resting there when the panel appeared, or when
+//! a card changed under it, holds nothing until it moves: a pointer parked
+//! in a corner for minutes must not keep a panel up for minutes.
+//!
 //! "On the panel" is read from the real pointer position against every
 //! visible surface of the panel (front card, bar, back cards, chips), by the
 //! panel's pointer poll: entered and exited events are not trusted (a
@@ -37,7 +43,8 @@
 //!
 //! | Event | User clock | Hold | Pick | Back cards |
 //! |---|---|---|---|---|
-//! | Pointer comes onto the panel (any visible surface) | none | on while it stays | none | none expire or are evicted while held |
+//! | Pointer moves onto or within the panel (any visible surface) | none | on while it stays | none | none expire or are evicted while held |
+//! | Panel appears (or a card changes) under a resting pointer | none | none until the pointer moves or presses | none | as without a pointer |
 //! | Pointer leaves the panel | restarts: a full idle period starts now | lasts that period | none | as above until the hold is over; their own action times are never rewritten |
 //! | Press on a card, the bar or a resize band | none | on until the release, wherever the pointer goes meanwhile | none | as above |
 //! | Release (delivered, or found missing by the poll after `RELEASE_GRACE`), also outside the panel | restarts | lasts a full idle period from the release | a click (no drag, no resize) on a back card or chip: pick = that window, or cleared if it is the window the agent last acted in | as above |
@@ -59,11 +66,18 @@ use std::time::Instant;
 
 use super::IDLE_HIDE_AFTER;
 
+/// Pointer travel (points) between two polls that counts as moving.
+const MOVED: f64 = 0.5;
+
 /// The user's side of one panel.
 #[derive(Debug)]
 pub(super) struct Hands<K> {
-    /// The pointer is on the panel, as of the last poll.
+    /// The pointer is on the panel and holds it (it moved there, or
+    /// pressed), as of the last poll.
     inside: bool,
+    /// Where the last poll saw the pointer (screen points), since the panel
+    /// was shown.
+    at: Option<(f64, f64)>,
     /// The user's last interaction, until the idle period after it is over.
     last: Option<Instant>,
     /// The window the user put in front.
@@ -74,6 +88,7 @@ impl<K> Default for Hands<K> {
     fn default() -> Self {
         Self {
             inside: false,
+            at: None,
             last: None,
             pick: None,
         }
@@ -81,13 +96,26 @@ impl<K> Default for Hands<K> {
 }
 
 impl<K: Copy + PartialEq> Hands<K> {
-    /// The poll's answer: whether the pointer is on the panel at `now`.
-    /// Leaving is an interaction, so a full idle period follows it.
-    pub(super) fn pointer(&mut self, inside: bool, now: Instant) {
-        if self.inside && !inside {
+    /// The poll's answer: whether the pointer is `on` the panel at `now`,
+    /// and where it is (`at`, screen points). It holds only once it has
+    /// moved while on the panel (see the module docs). Leaving a panel it
+    /// held is an interaction, so a full idle period follows it.
+    pub(super) fn pointer(&mut self, on: bool, at: (f64, f64), now: Instant) {
+        let moved = self
+            .at
+            .is_some_and(|last| (last.0 - at.0).abs() > MOVED || (last.1 - at.1).abs() > MOVED);
+        self.at = Some(at);
+        let holding = on && (self.inside || moved);
+        if self.inside && !holding {
             self.last = Some(now);
         }
-        self.inside = inside;
+        self.inside = holding;
+    }
+
+    /// A press on the panel: the pointer holds it from here on, moved or
+    /// not.
+    pub(super) fn press(&mut self) {
+        self.inside = true;
     }
 
     /// The user did something with the panel at `now` (a release, a scroll,
@@ -119,6 +147,7 @@ impl<K: Copy + PartialEq> Hands<K> {
     /// does not bring it back. The pick stays for when it shows again.
     pub(super) fn hidden(&mut self) {
         self.inside = false;
+        self.at = None;
         self.last = None;
     }
 
@@ -208,6 +237,47 @@ mod tests {
         start + Duration::from_millis(millis)
     }
 
+    /// Off the panel, on it (having moved there), and a spot on it nearby.
+    const OFF: (f64, f64) = (10.0, 10.0);
+    const ON: (f64, f64) = (500.0, 400.0);
+    const NEAR: (f64, f64) = (520.0, 410.0);
+
+    /// A panel that appears under a resting pointer (or has a card change
+    /// under it) is not held until the pointer moves; it then fades on the
+    /// agent's clock alone. Moving on it, or a press, holds it.
+    #[test]
+    fn a_resting_pointer_holds_nothing_until_it_moves() {
+        let t = Instant::now();
+        let mut hands = Hands::<u32>::default();
+        // The panel shows under the pointer and it never moves.
+        hands.pointer(true, ON, at(t, 100));
+        hands.pointer(true, ON, at(t, 5_000));
+        assert!(!hands.holds(at(t, 5_000)));
+        assert!(!shows(false, held(true, false, &hands, at(t, 8_000)), false, false, false), "idle: it fades");
+        // Resting over the margin while a card grows under it: still no hold.
+        hands.pointer(false, ON, at(t, 6_000));
+        hands.pointer(true, ON, at(t, 6_100));
+        assert!(!hands.holds(at(t, 6_100)));
+        assert!(!hands.lapse(at(t, 20_000)), "nothing was held, nothing lapses");
+        // It moves a little on the panel: now it holds, and leaving stamps.
+        hands.pointer(true, NEAR, at(t, 30_000));
+        assert!(hands.holds(at(t, 60_000)));
+        hands.pointer(false, OFF, at(t, 61_000));
+        assert!(hands.holds(at(t, 68_999)));
+        assert!(!hands.holds(at(t, 69_000)));
+        // A press holds even without movement.
+        let mut pressed = Hands::<u32>::default();
+        pressed.pointer(true, ON, t);
+        pressed.press();
+        pressed.pointer(true, ON, at(t, 20_000));
+        assert!(pressed.holds(at(t, 20_000)));
+        // Hiding forgets where the pointer was: the next showing under the
+        // same resting pointer holds nothing.
+        pressed.hidden();
+        pressed.pointer(true, ON, at(t, 30_000));
+        assert!(!pressed.holds(at(t, 30_000)));
+    }
+
     /// Two clocks: the pointer resting on the panel, then leaving, holds it
     /// for a full idle period, and never moves the agent's clock, so the
     /// proof finale comes due exactly when it would have.
@@ -218,7 +288,8 @@ mod tests {
         let proof = Some(at(t, 1_000));
         let mut hands = Hands::<u32>::default();
         assert!(!hands.holds(t), "nobody touched it");
-        hands.pointer(true, at(t, 2_000));
+        hands.pointer(false, OFF, at(t, 1_900));
+        hands.pointer(true, ON, at(t, 2_000));
         // 15 s past the agent's idle deadline, still held.
         assert!(hands.holds(at(t, 23_000)));
         assert!(held(true, false, &hands, at(t, 23_000)));
@@ -229,7 +300,7 @@ mod tests {
         assert!(!finish::proof_quiet(last_action, proof, at(t, 8_999)));
         assert!(finish::proof_quiet(last_action, proof, at(t, 9_000)));
         // Leaving starts a full idle period; then the hold is over, once.
-        hands.pointer(false, at(t, 30_000));
+        hands.pointer(false, OFF, at(t, 30_000));
         assert!(hands.holds(at(t, 37_999)));
         assert!(!hands.lapse(at(t, 37_999)));
         assert!(!hands.holds(at(t, 38_000)));
@@ -238,9 +309,10 @@ mod tests {
         assert!(!shows(false, held(true, false, &hands, at(t, 38_000)), false, false, false));
         // Moving between surfaces of the panel is not leaving: no stamp.
         let mut resting = Hands::<u32>::default();
-        resting.pointer(true, t);
-        resting.pointer(true, at(t, 5_000));
-        resting.pointer(false, at(t, 20_000));
+        resting.pointer(false, OFF, t);
+        resting.pointer(true, ON, at(t, 100));
+        resting.pointer(true, NEAR, at(t, 5_000));
+        resting.pointer(false, OFF, at(t, 20_000));
         assert!(resting.holds(at(t, 27_999)), "the period counts from the real leave");
     }
 
@@ -251,10 +323,11 @@ mod tests {
     fn a_press_holds_until_its_release_and_the_release_starts_a_full_period() {
         let t = Instant::now();
         let mut hands = Hands::<u32>::default();
-        hands.pointer(true, t);
+        hands.pointer(true, ON, t);
+        hands.press();
         // Dragged off the panel (a resize past its largest size) at 1 s:
         // the pointer leaving stamps, but the press is what holds.
-        hands.pointer(false, at(t, 1_000));
+        hands.pointer(false, OFF, at(t, 1_000));
         assert!(held(true, true, &hands, at(t, 12_000)), "the press holds past idle");
         assert!(!held(true, false, &hands, at(t, 12_000)), "without it the panel would go");
         // Released outside at 12 s.
@@ -271,7 +344,8 @@ mod tests {
     fn a_hold_postpones_the_idle_and_visibility_hides_but_never_the_close() {
         let t = Instant::now();
         let mut hands = Hands::<u32>::default();
-        hands.pointer(true, t);
+        hands.pointer(false, OFF, t);
+        hands.pointer(true, ON, at(t, 100));
         let now = at(t, 20_000);
         // Idle agent, pointer on the shown panel.
         assert!(shows(false, held(true, false, &hands, now), false, false, false));
