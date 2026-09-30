@@ -2422,12 +2422,14 @@ async fn await_edit_readback(
             break;
         };
         judged = judge_edit(before, &after, text, mode);
-        if matches!(judged, Readback::Confirmed(_) | Readback::Detached) {
-            return Some(judged);
+        match judged {
+            Readback::Confirmed(_) => return Some(judged),
+            Readback::Detached => break,
+            _ => {}
         }
     }
-    // A read that failed or did not match is no verdict once a dialog is up:
-    // the page was stopped partway through handling the input.
+    // Only a confirmed read is a verdict once a dialog is up: the page was
+    // stopped partway through handling the input.
     (!delivery.blocked()).then_some(judged)
 }
 

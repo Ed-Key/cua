@@ -120,7 +120,7 @@ struct FixtureState {
     type_opens_dialog_late: bool,
     /// The alert opens while the field is being read back, at this read
     /// (0-based, counted from the insert), which is then "unanswered", fails
-    /// ("error") or is "answered" all the same.
+    /// ("error"), is "answered" all the same, or finds the field "detached".
     readback_opens_dialog: Option<(usize, &'static str)>,
     readbacks: usize,
     /// The browser does not report a frame tree.
@@ -1114,10 +1114,11 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 let reply = match st.readback_opens_dialog.unwrap().1 {
                     "unanswered" => MockReply::ok(json!({})).unanswered(),
                     "error" => MockReply::err(-32000, "fixture read failure"),
-                    _ => MockReply::ok(json!({
+                    read => MockReply::ok(json!({
                         "result": { "value": {
                             "value": st.field_value.clone(), "start": null, "end": null,
-                            "field": true, "password": false, "connected": true,
+                            "field": true, "password": false,
+                            "connected": read != "detached",
                         } }
                     })),
                 };
@@ -5659,6 +5660,7 @@ async fn a_dialog_that_opens_during_the_read_back_is_not_waited_out() {
         (1, "error"),
         (0, "error"),
         (0, "answered"),
+        (0, "detached"),
     ] {
         let f = fixture_with(|st| {
             st.semantic_large_page = true;
@@ -5689,6 +5691,30 @@ async fn a_dialog_that_opens_during_the_read_back_is_not_waited_out() {
         let said = typed.to_string();
         assert!(!said.contains("browser_type_mismatch"), "{said}");
         assert!(!said.contains("private dialog text"), "{said}");
+    }
+}
+
+#[tokio::test]
+async fn a_dialog_during_the_read_back_is_reported_to_a_dom_refs_caller_too() {
+    // No page changes come back with dom_refs_v1, so the result itself has
+    // to say a dialog is why the field was not read.
+    for read in ["unanswered", "detached"] {
+        let f = fixture_with(|st| {
+            st.field_value = Some(String::new());
+            st.readback_opens_dialog = Some((0, read));
+        })
+        .await;
+        let (target, tab) = bind(&f).await;
+        let snap = snapshot(&f, &target, &tab).await;
+        let typed = BrowserTypeTool::new(f.engine.clone())
+            .invoke(json!({
+                "target_id": target, "tab_id": tab, "session": SESSION,
+                "ref": ref_of(&snap, "main", "Shadow Input"), "text": "ada"
+            }))
+            .await;
+        let s = structured(&typed);
+        assert_eq!(s["effect"], "unverifiable", "{read}: {s}");
+        assert_eq!(s["readback"], "javascript_dialog_open", "{read}: {s}");
     }
 }
 

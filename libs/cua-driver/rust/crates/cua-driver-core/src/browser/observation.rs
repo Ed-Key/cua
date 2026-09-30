@@ -1518,9 +1518,10 @@ mod tests {
         let (space, index) = crate::browser::store::parse_ref(&keys(&first)[0]).unwrap();
         let issued = session.refs.resolve(space, index).unwrap().clone();
         // The space is replaced on the same attachment (the document could
-        // not be proven the same), and the node gets the same index again.
+        // not be proven the same), and the node, reading as it did, gets the
+        // same index again.
         session.refs.invalidate(FullReason::DocumentChanged);
-        let second = session.observe(identity("L1", 1), &[node(10, "button", "Delete")], None);
+        let second = session.observe(identity("L1", 1), &[node(10, "button", "Reply")], None);
         let new = keys(&second)[0].clone();
         let (new_space, new_index) = crate::browser::store::parse_ref(&new).unwrap();
         assert_ne!(new_space, space);
