@@ -708,7 +708,12 @@ impl BrowserEngine {
                             if let Some(protected) = grant.protected_consent.as_ref() {
                                 protected.revoke();
                             }
-                            if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+                            // An SDK's idle sweeper ends sessions from a plain
+                            // thread; release on the runtime the claim ran on.
+                            if let Some(runtime) = tokio::runtime::Handle::try_current()
+                                .ok()
+                                .or_else(|| engine.pool.claim_runtime())
+                            {
                                 let engine = engine.clone();
                                 runtime.spawn(async move {
                                     engine.release_grant_socket(&grant).await;

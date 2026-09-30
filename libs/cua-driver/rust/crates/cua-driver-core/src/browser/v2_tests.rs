@@ -1413,6 +1413,44 @@ async fn a_revocation_cancelled_on_a_busy_pool_still_releases_the_claim() {
     assert!(released, "generation {generation} kept the socket after its grant was revoked");
 }
 
+#[tokio::test]
+async fn a_session_ended_from_a_thread_without_a_runtime_releases_its_claim() {
+    const TRANSPORT: &str = "transport-v2-sweeper-end";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let url = f._server.ws_url();
+    let prepared = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(json!({
+            "pid": 1,
+            "window_id": 7,
+            "session": SESSION,
+            "_transport_session_id": TRANSPORT,
+            "strategy": { "kind": "existing_profile" }
+        }))
+        .await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let generation = f
+        .engine
+        .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    // As an SDK's idle sweeper does: end the session from a plain thread.
+    std::thread::spawn(|| crate::session::fire_session_end(TRANSPORT))
+        .join()
+        .unwrap();
+    let mut released = false;
+    for _ in 0..50 {
+        if f.engine.pool.get_existing(&url, generation).await.is_err() {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    assert!(released, "generation {generation} kept the socket after its session ended");
+}
+
 /// Forwards WebSocket connections to the mock endpoint after a delay, so a
 /// claim outlasts the 500 ms prompt window; `cut` drops every open link.
 struct SlowProxy {
