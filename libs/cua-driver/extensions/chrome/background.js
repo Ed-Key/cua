@@ -5,7 +5,7 @@
 // chrome.debugger calls, and forwards debugger events. It holds no agent logic.
 
 import { clearActive, markActive, refresh } from "./indicator.js";
-import { attachOutlivedConnection, idleTabs } from "./lifecycle.js";
+import { attachOutlivedConnection, idleTabs, requestIsStale } from "./lifecycle.js";
 
 const HOST = "com.trycua.cua_driver";
 const RECONNECT_ALARM = "cua-driver-reconnect";
@@ -117,16 +117,25 @@ function loadTab(tabId) {
   return load;
 }
 
-function ensureAttached(tabId) {
+// `arrivedUnder` is the connection the request arrived on, captured before
+// any await: a request that outlived its connection attaches nothing.
+function refuseIfStale(arrivedUnder) {
+  if (requestIsStale(arrivedUnder, connection, port !== null)) {
+    throw new Error("the Cua Driver disconnected before this request ran");
+  }
+}
+
+function ensureAttached(tabId, arrivedUnder) {
   return serialized(tabId, async () => {
     refuseIfStopped(tabId);
     if (!attached.has(tabId)) {
+      refuseIfStale(arrivedUnder);
       await refuseIfNotLoaded(tabId);
-      const startedUnder = connection;
+      refuseIfStale(arrivedUnder);
       await chrome.debugger.attach({ tabId }, "1.3");
       // The driver disconnected while Chrome was attaching: nobody holds
       // this attachment, and the disconnect cleanup could not see it yet.
-      if (attachOutlivedConnection(startedUnder, connection)) {
+      if (attachOutlivedConnection(arrivedUnder, connection)) {
         await chrome.debugger.detach({ tabId }).catch(() => {});
         throw new Error("the Cua Driver disconnected while attaching");
       }
@@ -301,8 +310,8 @@ const handlers = {
   "tabGroups.update": async ({ groupId, title, color, collapsed }) =>
     groupInfo(await chrome.tabGroups.update(groupId, defined({ title, color, collapsed }))),
 
-  "debugger.attach": async ({ tabId }) => {
-    await ensureAttached(tabId);
+  "debugger.attach": async ({ tabId }, arrivedUnder) => {
+    await ensureAttached(tabId, arrivedUnder);
     return { attached: true };
   },
 
@@ -311,8 +320,8 @@ const handlers = {
     return { detached: true };
   },
 
-  "debugger.send": async ({ tabId, sessionId, method, params }) => {
-    await ensureAttached(tabId);
+  "debugger.send": async ({ tabId, sessionId, method, params }, arrivedUnder) => {
+    await ensureAttached(tabId, arrivedUnder);
     refuseIfStopped(tabId);
     if (method === "Page.enable" && !sessionId) pageEnabled.add(tabId);
     return chrome.debugger.sendCommand(defined({ tabId, sessionId }), method, params ?? {});
@@ -368,6 +377,7 @@ async function stopTab(tabId) {
 
 async function handleMessage(message) {
   if (!message || message.id === undefined || typeof message.method !== "string") return;
+  const arrivedUnder = connection;
   await stoppedLoaded;
   const tabs = tabsOf(message.method, message.params ?? {});
   if (tabs.some((tabId) => stopped.has(tabId))) {
@@ -386,7 +396,7 @@ async function handleMessage(message) {
     return;
   }
   try {
-    const result = await handler(message.params ?? {});
+    const result = await handler(message.params ?? {}, arrivedUnder);
     post({ jsonrpc: "2.0", id: message.id, result: result ?? null });
   } catch (error) {
     post({ jsonrpc: "2.0", id: message.id, error: { code: -32000, message: String(error?.message ?? error) } });

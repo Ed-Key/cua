@@ -1,7 +1,7 @@
 // Run with: node --test libs/cua-driver/extensions/chrome/tests/lifecycle.test.mjs
 import assert from "node:assert/strict";
 import test from "node:test";
-import { IDLE_BACKSTOP_MS, attachOutlivedConnection, idleTabs } from "../lifecycle.js";
+import { IDLE_BACKSTOP_MS, attachOutlivedConnection, idleTabs, requestIsStale } from "../lifecycle.js";
 
 test("the backstop is ten minutes, far above a normal pause between commands", () => {
   assert.equal(IDLE_BACKSTOP_MS, 600_000);
@@ -24,4 +24,10 @@ test("only tabs idle for the whole backstop are released", () => {
 test("an attach that finishes under a different connection is released", () => {
   assert.equal(attachOutlivedConnection(3, 3), false);
   assert.equal(attachOutlivedConnection(3, 4), true);
+});
+
+test("a request from an earlier or closed connection attaches nothing", () => {
+  assert.equal(requestIsStale(3, 3, true), false);
+  assert.equal(requestIsStale(3, 4, true), true, "reconnected since the request arrived");
+  assert.equal(requestIsStale(3, 3, false), true, "disconnected");
 });

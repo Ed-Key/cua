@@ -19,3 +19,10 @@ export function idleTabs(lastCommandAt, now, limitMs = IDLE_BACKSTOP_MS) {
 export function attachOutlivedConnection(startedUnder, current) {
   return startedUnder !== current;
 }
+
+// A request is answered only for the connection it arrived on: one that
+// arrived before a disconnect (or reconnect) belongs to no live driver and
+// must not attach anything.
+export function requestIsStale(arrivedUnder, current, connected) {
+  return !connected || arrivedUnder !== current;
+}
