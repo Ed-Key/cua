@@ -378,8 +378,8 @@ pub fn tool_operation(tool_name: &str, args: Option<&serde_json::Value>) -> Tool
         "get_browser_state" => {
             if string_arg("target_id").is_some() {
                 match string_arg("snapshot_format") {
-                    Some("semantic_v2") => ToolOperation::BrowserSnapshotSemanticV2,
-                    None | Some("dom_refs_v1") => ToolOperation::BrowserSnapshotDomRefsV1,
+                    None | Some("semantic_v2") => ToolOperation::BrowserSnapshotSemanticV2,
+                    Some("dom_refs_v1") => ToolOperation::BrowserSnapshotDomRefsV1,
                     Some(_) => ToolOperation::Other,
                 }
             } else if args.and_then(|value| value.get("pid")).is_some()

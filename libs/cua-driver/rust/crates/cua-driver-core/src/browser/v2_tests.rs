@@ -2243,25 +2243,85 @@ async fn cancelled_prepare_aborts_the_exact_pending_setup() {
     stalled_server.abort();
 }
 
+/// A `dom_refs_v1` snapshot (the flat ref list).
 async fn snapshot(f: &Fixture, target_id: &str, tab_id: &str) -> Value {
     let tool = GetBrowserStateTool::new(f.engine.clone());
     let result = tool
-        .invoke(json!({ "target_id": target_id, "tab_id": tab_id, "session": SESSION }))
+        .invoke(json!({ "target_id": target_id, "tab_id": tab_id, "session": SESSION,
+            "snapshot_format": "dom_refs_v1" }))
         .await;
     structured(&result).clone()
 }
 
+/// One outline line read back into its parts: `- role "name" [ref actions]
+/// = "value" -> "url" (states)`.
+fn parse_outline_line(line: &str) -> Value {
+    fn quoted(text: &str) -> Option<(String, &str)> {
+        let mut stream = serde_json::Deserializer::from_str(text).into_iter::<String>();
+        let value = stream.next()?.ok()?;
+        Some((value, &text[stream.byte_offset()..]))
+    }
+    let rest = line.trim_start().strip_prefix("- ").expect("an outline line");
+    let (role, mut rest) = rest.split_once(' ').expect("a role and a bracket");
+    let mut name = Value::Null;
+    if rest.starts_with('"') {
+        let (text, after) = quoted(rest).expect("a quoted name");
+        name = json!(text);
+        rest = after.trim_start();
+    }
+    let (bracket, mut rest) = rest
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .expect("a ref bracket");
+    let (reference, actions) = bracket.split_once(' ').unwrap_or((bracket, ""));
+    let actions: Vec<&str> = actions.split(',').filter(|action| !action.is_empty()).collect();
+    let (mut value, mut url) = (Value::Null, Value::Null);
+    if let Some(after) = rest.strip_prefix(" = ") {
+        let (text, after) = quoted(after).expect("a quoted value");
+        value = json!(text);
+        rest = after;
+    }
+    if let Some(after) = rest.strip_prefix(" -> ") {
+        let (text, after) = quoted(after).expect("a quoted url");
+        url = json!(text);
+        rest = after;
+    }
+    let states: Vec<&str> = rest
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(", ")
+        .filter(|state| !state.is_empty())
+        .collect();
+    let frame = ["iframe", "oopif"]
+        .into_iter()
+        .find(|kind| states.contains(kind))
+        .unwrap_or("main");
+    json!({
+        "ref": reference, "role": role, "name": name, "value": value, "url": url,
+        "actions": actions, "states": states, "frame": frame, "line": line,
+    })
+}
+
+/// A semantic snapshot's outline as entries: `refs` for lines that declare
+/// an action, `content_refs` for the rest. The result itself has only the
+/// outline; these two keys exist for the assertions below.
+fn with_outline_entries(mut snapshot: Value) -> Value {
+    let Some(outline) = snapshot["outline"].as_str().map(str::to_owned) else {
+        return snapshot;
+    };
+    assert!(snapshot.get("refs").is_none() && snapshot.get("content_refs").is_none());
+    let (actions, content): (Vec<Value>, Vec<Value>) = outline
+        .lines()
+        .map(parse_outline_line)
+        .partition(|entry| !entry["actions"].as_array().unwrap().is_empty());
+    snapshot["refs"] = json!(actions);
+    snapshot["content_refs"] = json!(content);
+    snapshot
+}
+
 async fn semantic_snapshot(f: &Fixture, target_id: &str, tab_id: &str) -> Value {
-    let tool = GetBrowserStateTool::new(f.engine.clone());
-    let result = tool
-        .invoke(json!({
-            "target_id": target_id,
-            "tab_id": tab_id,
-            "session": SESSION,
-            "snapshot_format": "semantic_v2"
-        }))
-        .await;
-    structured(&result).clone()
+    semantic_snapshot_with(f, target_id, tab_id, json!({})).await
 }
 
 async fn semantic_snapshot_with(f: &Fixture, target_id: &str, tab_id: &str, extra: Value) -> Value {
@@ -2269,7 +2329,6 @@ async fn semantic_snapshot_with(f: &Fixture, target_id: &str, tab_id: &str, extr
         "target_id": target_id,
         "tab_id": tab_id,
         "session": SESSION,
-        "snapshot_format": "semantic_v2"
     });
     args.as_object_mut()
         .unwrap()
@@ -2277,7 +2336,26 @@ async fn semantic_snapshot_with(f: &Fixture, target_id: &str, tab_id: &str, extr
     let result = GetBrowserStateTool::new(f.engine.clone())
         .invoke(args)
         .await;
-    structured(&result).clone()
+    with_outline_entries(structured(&result).clone())
+}
+
+/// Follow continuations from `page` until one lists an action named `name`.
+async fn continue_to(f: &Fixture, target_id: &str, tab_id: &str, mut page: Value, name: &str) -> Value {
+    for _ in 0..64 {
+        if page["refs"]
+            .as_array()
+            .is_some_and(|refs| refs.iter().any(|entry| entry["name"] == name))
+        {
+            return page;
+        }
+        let token = page["snapshot"]["continuation"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name:?} was never reached: {page}"))
+            .to_owned();
+        page = semantic_snapshot_with(f, target_id, tab_id, json!({"continuation": token})).await;
+        assert_eq!(page["status"], "ok", "{page}");
+    }
+    panic!("{name:?} was not reached within 64 pages")
 }
 
 /// The `ref` string of the first snapshot entry in the given frame kind
@@ -2691,18 +2769,111 @@ async fn semantic_continuation_is_opaque_single_use_and_reaches_offscreen_conten
     assert_eq!(continued["status"], "ok", "{continued}");
     assert_eq!(continued["snapshot"]["scope"], "continuation");
     assert_eq!(continued["page"]["title"], "Current fixture title", "{continued}");
-    assert!(
-        continued["refs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| { entry["name"] == "Archive item 304" }),
-        "last offscreen action was not reachable: {continued}"
-    );
+    // Each page is cut to the size budget; the last action is some pages on.
+    let last = continue_to(&f, &target, &tab, continued, "Archive item 304").await;
+    assert!(last["snapshot"]["continuation"].is_null(), "{last}");
+    assert_eq!(last["snapshot"]["complete"], true, "{last}");
 
     let reused = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
     assert_eq!(reused["status"], "refused", "{reused}");
     assert_eq!(reused["refusal"]["code"], "browser_ref_stale");
+}
+
+/// The `tools/call` response line a client receives for `result`.
+fn wire_chars(result: &ToolResult) -> usize {
+    json!({"jsonrpc": "2.0", "id": 123_456, "result": result})
+        .to_string()
+        .chars()
+        .count()
+}
+
+#[tokio::test]
+async fn a_semantic_snapshot_is_the_default_and_fits_its_size_budget() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        // A long address and title spend the budget too.
+        st.main_url = format!("https://fixture.test/inbox/{}", "segment/".repeat(40));
+        set_page_title(st, Some(&"A long page title ".repeat(12)));
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let tool = GetBrowserStateTool::new(f.engine.clone());
+    let default = tool
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION}))
+        .await;
+    let snapshot = structured(&default);
+    assert_eq!(snapshot["snapshot"]["format"], "semantic_v2", "{snapshot}");
+    assert!(snapshot.get("refs").is_none(), "refs are inline in the outline");
+    assert!(wire_chars(&default) <= 6_000, "{} chars", wire_chars(&default));
+    assert!(snapshot["snapshot"]["continuation"].is_string(), "{snapshot}");
+    assert!(snapshot["snapshot"]["omitted"]["budget"].as_u64() > Some(0));
+
+    let larger = tool
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION, "max_chars": 20_000}))
+        .await;
+    assert!(wire_chars(&larger) <= 20_000 && wire_chars(&larger) > 6_000);
+    assert!(
+        structured(&larger)["snapshot"]["selected_nodes"].as_u64()
+            > snapshot["snapshot"]["selected_nodes"].as_u64()
+    );
+
+    for bad in [json!(100), json!(1_000_000), json!("big")] {
+        let refused = tool
+            .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION, "max_chars": bad}))
+            .await;
+        assert_eq!(refused.is_error, Some(true));
+    }
+    let legacy = tool
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION,
+            "snapshot_format": "dom_refs_v1"}))
+        .await;
+    assert!(structured(&legacy)["refs"].is_array(), "dom_refs_v1 stays available by name");
+}
+
+#[tokio::test]
+async fn include_refs_lists_the_outline_refs_for_programs_within_the_same_budget() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let tool = GetBrowserStateTool::new(f.engine.clone());
+    let plain = tool
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION}))
+        .await;
+    let listed = tool
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION, "include_refs": true}))
+        .await;
+    assert!(wire_chars(&listed) <= 6_000, "{} chars", wire_chars(&listed));
+    let listed = structured(&listed).clone();
+    assert!(
+        listed["snapshot"]["selected_nodes"].as_u64()
+            < structured(&plain)["snapshot"]["selected_nodes"].as_u64(),
+        "the list spends part of the budget"
+    );
+    // The lists say what the outline says, line for line.
+    let outline = listed["outline"].as_str().unwrap();
+    let from_outline: Vec<Value> = outline.lines().map(parse_outline_line).collect();
+    let from_lists: Vec<&Value> = listed["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(listed["content_refs"].as_array().unwrap())
+        .collect();
+    assert_eq!(from_lists.len(), from_outline.len());
+    for entry in from_lists {
+        let line = from_outline
+            .iter()
+            .find(|line| line["ref"] == entry["ref"])
+            .unwrap_or_else(|| panic!("{entry} is not in the outline"));
+        for field in ["role", "name", "value"] {
+            assert_eq!(line[field], entry[field], "{entry}");
+        }
+    }
+    let reply = listed["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "Reply")
+        .expect("Reply action");
+    assert_eq!(reply["actions"][0], "click", "{reply}");
 }
 
 #[tokio::test]
@@ -2752,13 +2923,16 @@ async fn semantic_query_and_content_scope_are_read_only_and_precise() {
     let natural =
         semantic_snapshot_with(&f, &target, &tab, json!({"query": "reply archive 304"})).await;
     assert_eq!(natural["snapshot"]["scope"], "query", "{natural}");
-    assert_eq!(natural["refs"][0]["name"], "Archive item 304", "{natural}");
-    assert!(
+    // Ranked by the query: the best match and the visible Reply make the
+    // first page, ahead of the archive items that only share a word.
+    let named = |name: &str| {
         natural["refs"]
             .as_array()
-            .is_some_and(|refs| refs.iter().any(|entry| entry["name"] == "Reply")),
-        "{natural}"
-    );
+            .is_some_and(|refs| refs.iter().any(|entry| entry["name"] == name))
+    };
+    assert!(named("Archive item 304") && named("Reply"), "{natural}");
+    assert!(!named("Archive item 303"), "{natural}");
+    assert!(natural["snapshot"]["continuation"].is_string(), "{natural}");
 
     let fresh = semantic_snapshot(&f, &target, &tab).await;
     let heading_ref = fresh["content_refs"]
@@ -3599,6 +3773,7 @@ async fn semantic_link_urls_reach_query_and_continuation_outputs() {
     assert!(reply["value"].is_null());
     let token = first["snapshot"]["continuation"].as_str().unwrap();
     let continued = semantic_snapshot_with(&f, &target, &tab, json!({"continuation":token})).await;
+    let continued = continue_to(&f, &target, &tab, continued, "Archive item 304").await;
     let archive = continued["refs"]
         .as_array()
         .unwrap()

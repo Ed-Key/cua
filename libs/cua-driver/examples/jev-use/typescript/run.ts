@@ -376,6 +376,7 @@ async function run(args: Arguments): Promise<Outcome> {
         target_id: targetId,
         tab_id: tabId,
         snapshot_format: 'semantic_v2',
+        include_refs: true,
       })) as BrowserSnapshot;
       const {
         candidates,

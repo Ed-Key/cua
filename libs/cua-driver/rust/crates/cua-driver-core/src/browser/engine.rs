@@ -40,6 +40,7 @@ use super::binding::{
 use super::cdp_ws::{CdpConnection, CdpPool};
 use super::grant::{ExistingProfileGrant, ExistingProfileGrants, GrantLookup};
 use super::mutation::{MutationGates, MutationKey};
+use super::observation::{DocumentIdentity, TabRefs, ViewKind, ViewLine, ViewNode};
 use super::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, BrowserVisualAction,
     BrowserVisualActionKind, ExistingProfileSetupRequest,
@@ -48,13 +49,13 @@ use super::prepare::ManagedBrowsers;
 use super::reconnect::{ReconnectGates, ReconnectKey};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::semantic::{
-    build_dom_index, build_layout_index, compose_accessibility_tree, parse_viewport,
+    build_dom_index, build_layout_index, compose_accessibility_tree, listed_ref, parse_viewport,
     snapshot_document_title, OmissionCounts, SemanticDocument, SemanticNode,
     DEFAULT_SEMANTIC_NODE_BUDGET, SEMANTIC_COMPUTED_STYLES,
 };
 use super::store::{
-    format_ref, BrowserStore, FrameIdentity, FrameKind, FrameRef, RefEntry, SemanticContinuation,
-    SnapshotRecord, TabRecord, TargetRecord,
+    format_ref, BrowserStore, FrameIdentity, FrameKind, FrameRef, RefEntry, SemanticCache,
+    SemanticContinuation, SnapshotRecord, TabRecord, TargetRecord,
 };
 use super::types::{
     BindingQuality, BrowserClassification, BrowserEngineFamily, BrowserProcessRole,
@@ -426,18 +427,14 @@ pub(crate) struct SnapshotOutcome {
     pub oopif: OopifStatus,
 }
 
-pub(crate) struct SemanticListedRef {
-    pub external: String,
-    pub node: SemanticNode,
-}
-
 pub(crate) struct SemanticSnapshotOutcome {
     pub snapshot_id: u64,
     pub url: String,
     pub title: String,
+    /// One line per node, its ref and actions inline.
     pub outline: String,
-    pub refs: Vec<SemanticListedRef>,
-    pub content_refs: Vec<SemanticListedRef>,
+    pub action_refs: usize,
+    pub content_refs: usize,
     pub complete: bool,
     pub scope: &'static str,
     pub selected_nodes: usize,
@@ -445,6 +442,64 @@ pub(crate) struct SemanticSnapshotOutcome {
     pub omissions: OmissionCounts,
     pub continuation: Option<String>,
     pub oopif: OopifStatus,
+    /// Characters the outline was allowed.
+    pub outline_budget: usize,
+    /// The same refs as a structured list, when it was asked for.
+    pub listed: Option<Vec<Value>>,
+}
+
+/// Default size of a whole semantic snapshot result, in serialized characters.
+pub(crate) const DEFAULT_SNAPSHOT_CHARS: usize = 6_000;
+pub(crate) const MIN_SNAPSHOT_CHARS: usize = 1_500;
+pub(crate) const MAX_SNAPSHOT_CHARS: usize = 60_000;
+/// What a snapshot result spends outside the outline, the page URL and the
+/// title: ids, snapshot metadata, the text summary and the JSON-RPC frame.
+const SNAPSHOT_ENVELOPE_CHARS: usize = 900;
+const MIN_OUTLINE_CHARS: usize = 600;
+
+/// Characters the outline may take so the whole result stays in `max_chars`.
+fn outline_budget(max_chars: usize, url: &str, title: &str) -> usize {
+    let quoted = |text: &str| {
+        serde_json::to_string(text).map_or(text.len(), |json| json.chars().count())
+    };
+    max_chars
+        .saturating_sub(SNAPSHOT_ENVELOPE_CHARS + quoted(url) + quoted(title))
+        .max(MIN_OUTLINE_CHARS)
+}
+
+fn outline_of(lines: &[ViewLine]) -> String {
+    lines
+        .iter()
+        .map(|line| line.line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The structured ref list for recorded lines: `facts` holds each line's
+/// capability and value, in line order.
+fn listed_refs(lines: &[ViewLine], facts: Vec<(RefEntry, Option<String>)>) -> Vec<Value> {
+    lines
+        .iter()
+        .zip(facts)
+        .map(|(line, (entry, value))| listed_ref(&line.key, &entry, value.as_deref()))
+        .collect()
+}
+
+fn listed_facts(page: &super::semantic::SemanticPage) -> Vec<(RefEntry, Option<String>)> {
+    page.view
+        .iter()
+        .map(|node| node.entry.clone())
+        .zip(page.values.iter().cloned())
+        .collect()
+}
+
+/// (action refs, content refs) among a view's lines.
+fn ref_counts(view: &[ViewNode]) -> (usize, usize) {
+    let actions = view
+        .iter()
+        .filter(|node| !node.entry.actions.is_empty())
+        .count();
+    (actions, view.len() - actions)
 }
 
 pub(crate) struct BrowserTabScreenshot {
@@ -1445,15 +1500,14 @@ impl BrowserEngine {
             let tab_id = self.store.mint_tab_id();
             tabs.insert(
                 tab_id.clone(),
-                TabRecord {
+                TabRecord::new(
                     tab_id,
-                    cdp_target_id: c.cdp_target_id.clone(),
-                    title: c.title.clone(),
-                    url: c.url.clone(),
-                    active: selected_cdp_target_id.map(|selected| selected == c.cdp_target_id),
-                    generation: grant.as_ref().map_or(0, |grant| grant.generation),
-                    snapshots: HashMap::new(),
-                },
+                    c.cdp_target_id.clone(),
+                    c.title.clone(),
+                    c.url.clone(),
+                    selected_cdp_target_id.map(|selected| selected == c.cdp_target_id),
+                    grant.as_ref().map_or(0, |grant| grant.generation),
+                ),
             );
         }
 
@@ -2374,7 +2428,10 @@ impl BrowserEngine {
         // across snapshots of a mutating page.
         self.store.update_target(session, target_id, |rec| {
             if let Some(tab) = rec.tabs.get_mut(tab_id) {
+                // Another format: the semantic space and its refs end here.
                 tab.snapshots.clear();
+                tab.stable = TabRefs::default();
+                tab.semantic = None;
                 tab.snapshots.insert(
                     snapshot_id,
                     SnapshotRecord {
@@ -2382,9 +2439,6 @@ impl BrowserEngine {
                         generation: record.generation,
                         url: url.clone(),
                         refs,
-                        semantic: None,
-                        semantic_root_identity: None,
-                        continuations: HashMap::new(),
                     },
                 );
             }
@@ -2590,61 +2644,8 @@ impl BrowserEngine {
         Ok(document)
     }
 
-    // These values form one semantic snapshot envelope; keeping them explicit
-    // makes the stored reference index and reported metadata auditable together.
+    // One semantic read: its scope, its paging and its size budget.
     #[allow(clippy::too_many_arguments)]
-    fn semantic_outcome(
-        &self,
-        snapshot_id: u64,
-        url: String,
-        title: String,
-        page: super::semantic::SemanticPage,
-        document_complete: bool,
-        scope: &'static str,
-        oopif: OopifStatus,
-        start_index: u32,
-    ) -> (SemanticSnapshotOutcome, HashMap<u32, RefEntry>) {
-        let mut stored_refs = HashMap::new();
-        let mut refs = Vec::new();
-        let mut content_refs = Vec::new();
-        for (position, node) in page.selected.iter().enumerate() {
-            let Some(entry) = node.to_ref_entry() else {
-                continue;
-            };
-            let index = start_index.saturating_add(position as u32);
-            let external = format_ref(snapshot_id, index);
-            stored_refs.insert(index, entry);
-            let listed = SemanticListedRef {
-                external,
-                node: node.clone(),
-            };
-            if node.actions.is_empty() {
-                content_refs.push(listed);
-            } else {
-                refs.push(listed);
-            }
-        }
-        let complete = document_complete && page.next_offset.is_none();
-        (
-            SemanticSnapshotOutcome {
-                snapshot_id,
-                url,
-                title,
-                outline: page.outline,
-                refs,
-                content_refs,
-                complete,
-                scope,
-                selected_nodes: page.selected_nodes,
-                total_nodes: page.total_nodes,
-                omissions: page.omissions,
-                continuation: page.next_offset.map(|_| format!("bc-{}", Uuid::new_v4())),
-                oopif,
-            },
-            stored_refs,
-        )
-    }
-
     pub(crate) async fn snapshot_tab_semantic(
         &self,
         session: &str,
@@ -2653,6 +2654,8 @@ impl BrowserEngine {
         scope_ref: Option<&str>,
         query: Option<&str>,
         continuation: Option<&str>,
+        max_chars: usize,
+        include_refs: bool,
     ) -> Result<SemanticSnapshotOutcome, BrowserRefusal> {
         if let Some(token) = continuation {
             if scope_ref.is_some() || query.is_some() {
@@ -2661,7 +2664,7 @@ impl BrowserEngine {
                     "continuation cannot be combined with a new scope_ref or query",
                 ));
             }
-            let (snapshot, continuation) = self
+            let (cache, continuation) = self
                 .store
                 .resolve_semantic_continuation(session, target_id, tab_id, token)?;
             let record = self.store.get_target(session, target_id)?;
@@ -2671,7 +2674,7 @@ impl BrowserEngine {
                     format!("tab {tab_id} is not known for target {target_id}"),
                 )
             })?;
-            if let Some(identity) = &snapshot.semantic_root_identity {
+            if let Some(identity) = &cache.root_identity {
                 let conn = self.connection_for_record(session, &record).await?;
                 let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
                 let tree = self.local_frame_tree(&conn, &cdp_session).await.map_err(|error| {
@@ -2695,64 +2698,78 @@ impl BrowserEngine {
                     ));
                 }
             }
-            let document = snapshot.semantic.clone().ok_or_else(|| {
-                refuse(
-                    BrowserRefusalCode::BrowserRefStale,
-                    "the continuation no longer has semantic snapshot state",
-                )
-            })?;
-            let page = document.page(
+            let title = cache.document.title.clone().unwrap_or_default();
+            let outline_budget = outline_budget(max_chars, &cache.url, &title);
+            let page = cache.document.page_sized(
                 continuation.offset,
                 DEFAULT_SEMANTIC_NODE_BUDGET,
+                outline_budget,
                 continuation.query.as_deref(),
                 continuation.scope_backend_node_id,
+                include_refs,
             );
-            let start_index = snapshot
-                .refs
-                .keys()
-                .max()
-                .copied()
-                .map_or(0, |value| value.saturating_add(1));
+            let facts = include_refs.then(|| listed_facts(&page));
             let oopif = if continuation.oopif_supported {
                 OopifStatus::Attached(continuation.oopif_frames)
             } else {
                 OopifStatus::Unsupported
             };
             let next_offset = page.next_offset;
-            let (outcome, new_refs) = self.semantic_outcome(
-                snapshot.id,
-                snapshot.url.clone(),
-                document.title.clone().unwrap_or_default(),
-                page,
-                document.complete,
-                "continuation",
-                oopif,
-                start_index,
-            );
-            let next_token = outcome.continuation.clone();
+            let next_token = next_offset.map(|_| format!("bc-{}", Uuid::new_v4()));
+            let (action_refs, content_refs) = ref_counts(&page.view);
+            let mut lines = None;
             self.store.update_target(session, target_id, |record| {
-                if let Some(stored) = record
-                    .tabs
-                    .get_mut(tab_id)
-                    .and_then(|tab| tab.snapshots.get_mut(&snapshot.id))
-                {
-                    stored.continuations.remove(token);
-                    stored.refs.extend(new_refs);
-                    if let (Some(token), Some(offset)) = (next_token, next_offset) {
-                        stored.continuations.insert(
-                            token,
-                            SemanticContinuation {
-                                offset,
-                                query: continuation.query.clone(),
-                                scope_backend_node_id: continuation.scope_backend_node_id,
-                                oopif_supported: continuation.oopif_supported,
-                                oopif_frames: continuation.oopif_frames,
-                            },
-                        );
-                    }
+                let Some(tab) = record.tabs.get_mut(tab_id) else {
+                    return;
+                };
+                let Some(stored) = tab
+                    .semantic
+                    .as_mut()
+                    .filter(|stored| stored.space_id == cache.space_id)
+                else {
+                    return;
+                };
+                // Single use: a token names one page of one recorded document.
+                if stored.continuations.remove(token).is_none() {
+                    return;
                 }
+                if let (Some(token), Some(offset)) = (next_token.clone(), next_offset) {
+                    stored.continuations.insert(
+                        token,
+                        SemanticContinuation {
+                            offset,
+                            query: continuation.query.clone(),
+                            scope_backend_node_id: continuation.scope_backend_node_id,
+                            oopif_supported: continuation.oopif_supported,
+                            oopif_frames: continuation.oopif_frames,
+                        },
+                    );
+                }
+                lines = tab.stable.extend(page.view);
             });
-            return Ok(outcome);
+            let lines = lines.ok_or_else(|| {
+                refuse(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the semantic continuation was used or superseded by a newer snapshot",
+                )
+            })?;
+            return Ok(SemanticSnapshotOutcome {
+                snapshot_id: cache.space_id,
+                url: cache.url,
+                title,
+                outline: outline_of(&lines),
+                action_refs,
+                content_refs,
+                complete: cache.document.complete && next_offset.is_none(),
+                scope: "continuation",
+                selected_nodes: page.selected_nodes,
+                total_nodes: page.total_nodes,
+                omissions: page.omissions,
+                continuation: next_token,
+                oopif,
+                outline_budget,
+                listed: facts.map(|facts| listed_refs(&lines, facts)),
+            });
         }
 
         let scope_backend_node_id = match scope_ref {
@@ -2873,66 +2890,106 @@ impl BrowserEngine {
         };
 
         semantic.complete &= semantic.title.is_some();
-        let page = semantic.page(
+        let outline_budget = outline_budget(max_chars, &url, &title);
+        let page = semantic.page_sized(
             0,
             DEFAULT_SEMANTIC_NODE_BUDGET,
+            outline_budget,
             query,
             scope_backend_node_id,
+            include_refs,
         );
+        let facts = include_refs.then(|| listed_facts(&page));
         let next_offset = page.next_offset;
-        let snapshot_id = self.store.mint_snapshot_id();
-        let scope = if scope_ref.is_some() {
-            "subtree"
+        let (scope, kind) = if scope_ref.is_some() {
+            ("subtree", ViewKind::Side)
         } else if query.is_some() {
-            "query"
+            ("query", ViewKind::Side)
         } else {
-            "viewport"
+            ("viewport", ViewKind::Default)
         };
-        let (outcome, refs) = self.semantic_outcome(
-            snapshot_id,
-            url.clone(),
-            title.clone(),
-            page,
-            semantic.complete,
-            scope,
-            oopif,
-            0,
-        );
-        let continuation_token = outcome.continuation.clone();
+        let continuation = next_offset.map(|_| format!("bc-{}", Uuid::new_v4()));
+        let (action_refs, content_refs) = ref_counts(&page.view);
+        let document_entries: Vec<RefEntry> = semantic
+            .nodes
+            .iter()
+            .filter_map(SemanticNode::to_ref_entry)
+            .collect();
+        let identity = DocumentIdentity {
+            generation: record.generation,
+            attachment: 0,
+            cdp_target_id: tab.cdp_target_id.clone(),
+            root: semantic_root_identity.clone(),
+        };
+        let complete = semantic.complete && next_offset.is_none();
+        let (selected_nodes, total_nodes, omissions) =
+            (page.selected_nodes, page.total_nodes, page.omissions);
+        let view = page.view;
+        let mut recorded = None;
         self.store
             .update_target(session, target_id, |stored_target| {
-                if let Some(stored_tab) = stored_target.tabs.get_mut(tab_id) {
-                    stored_tab.url = url.clone();
-                    stored_tab.title = title;
-                    let mut continuations = HashMap::new();
-                    if let (Some(token), Some(offset)) = (continuation_token, next_offset) {
-                        continuations.insert(
-                            token,
-                            SemanticContinuation {
-                                offset,
-                                query: query.map(str::to_owned),
-                                scope_backend_node_id,
-                                oopif_supported: matches!(oopif, OopifStatus::Attached(_)),
-                                oopif_frames: oopif.frames(),
-                            },
-                        );
-                    }
-                    stored_tab.snapshots.clear();
-                    stored_tab.snapshots.insert(
-                        snapshot_id,
-                        SnapshotRecord {
-                            id: snapshot_id,
-                            generation: record.generation,
-                            url,
-                            refs,
-                            semantic: Some(semantic),
-                            semantic_root_identity,
-                            continuations,
+                let Some(stored_tab) = stored_target.tabs.get_mut(tab_id) else {
+                    return;
+                };
+                stored_tab.url = url.clone();
+                stored_tab.title = title.clone();
+                // A new snapshot supersedes prior ones for the tab.
+                stored_tab.snapshots.clear();
+                stored_tab.stable = TabRefs::default();
+                let outcome = stored_tab.stable.record(
+                    &mut || self.store.mint_snapshot_id(),
+                    identity,
+                    &document_entries,
+                    semantic.complete,
+                    view,
+                    kind,
+                    None,
+                );
+                let mut continuations = HashMap::new();
+                if let (Some(token), Some(offset)) = (continuation.clone(), next_offset) {
+                    continuations.insert(
+                        token,
+                        SemanticContinuation {
+                            offset,
+                            query: query.map(str::to_owned),
+                            scope_backend_node_id,
+                            oopif_supported: matches!(oopif, OopifStatus::Attached(_)),
+                            oopif_frames: oopif.frames(),
                         },
                     );
                 }
+                stored_tab.semantic = Some(SemanticCache {
+                    space_id: outcome.space_id,
+                    url: url.clone(),
+                    document: semantic,
+                    root_identity: semantic_root_identity,
+                    continuations,
+                });
+                recorded = Some(outcome);
             });
-        Ok(outcome)
+        let recorded = recorded.ok_or_else(|| {
+            refuse(
+                BrowserRefusalCode::BrowserBindingStale,
+                "the binding ended while the page was being read; re-run get_browser_state with pid + window_id",
+            )
+        })?;
+        Ok(SemanticSnapshotOutcome {
+            snapshot_id: recorded.space_id,
+            url,
+            title,
+            outline: outline_of(&recorded.lines),
+            action_refs,
+            content_refs,
+            complete,
+            scope,
+            selected_nodes,
+            total_nodes,
+            omissions,
+            continuation,
+            oopif,
+            outline_budget,
+            listed: facts.map(|facts| listed_refs(&recorded.lines, facts)),
+        })
     }
 }
 

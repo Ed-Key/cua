@@ -10,6 +10,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde_json::Value;
 
+use super::observation::{ViewNode, REF_SLOT};
 use super::store::{BrowserActionKind, BrowserVisibility, FrameKind, FrameRef, RefEntry};
 
 pub(crate) const SEMANTIC_COMPUTED_STYLES: &[&str] = &[
@@ -24,7 +25,15 @@ pub(crate) const SEMANTIC_COMPUTED_STYLES: &[&str] = &[
     "overflow-y",
 ];
 pub(crate) const DEFAULT_SEMANTIC_NODE_BUDGET: usize = 300;
+/// Width a ref is counted at when an outline is fitted to its character
+/// budget, before the ref is assigned (`p` + id + `:` + index).
+const BUDGETED_REF: &str = "p0000000:000";
 const NEAR_VIEWPORT_MARGIN: f64 = 1_000.0;
+/// The element the Cua Driver Chrome extension adds to a page while Cua
+/// works in it (HOST_ID in extensions/chrome/indicator.js). It is Cua's own
+/// notice to the user, not page content: snapshots leave it out, so it never
+/// shows up as a page change and its Stop button is never offered as a ref.
+const CUA_INDICATOR_HOST_ID: &str = "cua-driver-indicator";
 const MAX_SEMANTIC_TEXT_CHARS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -81,6 +90,8 @@ struct DomMeta {
     attrs: HashMap<String, String>,
     order: usize,
     css_hidden: bool,
+    /// Inside Cua's own indicator (see [`CUA_INDICATOR_HOST_ID`]).
+    own_indicator: bool,
     parent_backend_node_id: Option<i64>,
     frame_id: Option<String>,
 }
@@ -156,16 +167,36 @@ pub(crate) struct OmissionCounts {
     pub(crate) unknown: usize,
     pub(crate) budget: usize,
     pub(crate) unprovable_frame: usize,
+    /// Accessibility nodes with no DOM node behind them: they cannot carry a
+    /// ref, so the outline does not list them.
+    pub(crate) no_dom_node: usize,
 }
 
 #[derive(Debug, Clone)]
 pub(crate) struct SemanticPage {
-    pub(crate) outline: String,
+    /// Outline lines in tree order, each awaiting its ref.
+    pub(crate) view: Vec<ViewNode>,
+    /// Each line's value, for the optional structured ref list.
+    pub(crate) values: Vec<Option<String>>,
+    /// The ranked nodes this page selected (their ancestors are in `view`).
+    #[cfg(test)]
     pub(crate) selected: Vec<SemanticNode>,
     pub(crate) selected_nodes: usize,
     pub(crate) total_nodes: usize,
     pub(crate) next_offset: Option<usize>,
     pub(crate) omissions: OmissionCounts,
+}
+
+impl SemanticPage {
+    /// The outline with every ref written as `fill`.
+    #[cfg(test)]
+    pub(crate) fn outline_with(&self, fill: &str) -> String {
+        self.view
+            .iter()
+            .map(|node| node.template.replace(REF_SLOT, fill))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -194,6 +225,14 @@ impl SemanticDocument {
         let offset = self.nodes.len();
         for node in &mut other.nodes {
             node.document_order += offset;
+            // Accessibility ids are unique per process, not across the frames
+            // merged here: keep each document's tree apart.
+            if !was_empty {
+                let scoped = |id: &String| format!("{offset}/{id}");
+                node.ax_id = scoped(&node.ax_id);
+                node.parent_ax_id = node.parent_ax_id.as_ref().map(scoped);
+                node.child_ax_ids = node.child_ax_ids.iter().map(scoped).collect();
+            }
         }
         self.nodes.extend(other.nodes);
         self.css_hidden_dom_count += other.css_hidden_dom_count;
@@ -205,20 +244,52 @@ impl SemanticDocument {
         };
     }
 
+    /// One page of the ranked working set: at most `node_budget` nodes whose
+    /// outline (with ancestors, JSON-escaped) fits `char_budget`, and never
+    /// fewer than one node.
+    #[cfg(test)]
     pub(crate) fn page(
         &self,
         offset: usize,
-        budget: usize,
+        node_budget: usize,
+        char_budget: usize,
         query: Option<&str>,
         scope_backend_node_id: Option<i64>,
     ) -> SemanticPage {
+        self.page_sized(
+            offset,
+            node_budget,
+            char_budget,
+            query,
+            scope_backend_node_id,
+            false,
+        )
+    }
+
+    /// [`Self::page`], with `listed` when the result also carries the
+    /// structured ref list, whose entries then count against the budget.
+    pub(crate) fn page_sized(
+        &self,
+        offset: usize,
+        node_budget: usize,
+        char_budget: usize,
+        query: Option<&str>,
+        scope_backend_node_id: Option<i64>,
+        listed: bool,
+    ) -> SemanticPage {
+        let by_ax_id = ax_index(&self.nodes);
         let mut candidates = scoped_indices(&self.nodes, query, scope_backend_node_id);
         candidates.retain(|idx| {
             !matches!(
                 self.nodes[*idx].visibility,
                 BrowserVisibility::CssHidden | BrowserVisibility::PageOccluded
-            )
+            ) && !is_structure_only(&self.nodes, &by_ax_id, *idx)
         });
+        let no_dom_node = candidates
+            .iter()
+            .filter(|idx| self.nodes[**idx].backend_node_id.is_none())
+            .count();
+        candidates.retain(|idx| self.nodes[*idx].backend_node_id.is_some());
         candidates.sort_by_key(|idx| {
             (
                 Reverse(query.map_or(0, |query| query_score(&self.nodes[*idx], query))),
@@ -228,11 +299,42 @@ impl SemanticDocument {
         });
 
         let start = offset.min(candidates.len());
-        let end = (start + budget.max(1)).min(candidates.len());
+        let widest = (start + node_budget.max(1)).min(candidates.len());
+        let render = |end: usize| {
+            render_view(
+                &self.nodes,
+                &by_ax_id,
+                &with_ancestors(&self.nodes, &candidates[start..end]),
+            )
+        };
+        let serialized_chars = |view: &(Vec<ViewNode>, Vec<Option<String>>)| {
+            serialized_chars(&view.0)
+                + if listed {
+                    listed_chars(&view.0, &view.1)
+                } else {
+                    0
+                }
+        };
+        let mut end = widest;
+        let mut view = render(end);
+        if serialized_chars(&view) > char_budget {
+            // Each node only adds lines, so the fitting prefixes are contiguous.
+            let (mut fits, mut over) = ((start + 1).min(widest), widest);
+            while fits < over {
+                let middle = (fits + over).div_ceil(2);
+                if serialized_chars(&render(middle)) <= char_budget {
+                    fits = middle;
+                } else {
+                    over = middle - 1;
+                }
+            }
+            end = fits;
+            view = render(end);
+        }
+        let (view, values) = view;
         let page_slice = &candidates[start..end];
-        let selected = with_ancestors(&self.nodes, page_slice);
-        let outline = render_outline(&self.nodes, &selected);
-        let selected_nodes = page_slice
+        #[cfg(test)]
+        let selected = page_slice
             .iter()
             .map(|idx| self.nodes[*idx].clone())
             .collect::<Vec<_>>();
@@ -244,6 +346,7 @@ impl SemanticDocument {
         let mut omissions = OmissionCounts {
             css_hidden: self.css_hidden_dom_count.max(semantic_css_hidden),
             unprovable_frame: self.unprovable_frame_count,
+            no_dom_node,
             ..Default::default()
         };
         for node in &self.nodes {
@@ -259,8 +362,10 @@ impl SemanticDocument {
         omissions.budget = candidates.len().saturating_sub(end);
 
         SemanticPage {
-            outline,
-            selected: selected_nodes,
+            view,
+            values,
+            #[cfg(test)]
+            selected,
             selected_nodes: page_slice.len(),
             total_nodes: candidates.len(),
             next_offset: (end < candidates.len()).then_some(end),
@@ -294,9 +399,11 @@ impl DomIndex {
 }
 
 pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
+    #[allow(clippy::too_many_arguments)]
     fn walk(
         node: &Value,
         inherited_hidden: bool,
+        inherited_indicator: bool,
         parent_backend_node_id: Option<i64>,
         inherited_frame_id: Option<&str>,
         inherited_base_url: Option<&str>,
@@ -314,6 +421,8 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
         };
         let attrs = attributes(node);
         let hidden = inherited_hidden || statically_hidden(&attrs);
+        let own_indicator = inherited_indicator
+            || attrs.get("id").is_some_and(|id| id == CUA_INDICATOR_HOST_ID);
         let backend_node_id = node.get("backendNodeId").and_then(Value::as_i64);
         let frame_id = if node_type == 9 {
             node.get("frameId").and_then(Value::as_str)
@@ -337,6 +446,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
                     attrs,
                     order: *order,
                     css_hidden: hidden,
+                    own_indicator,
                     parent_backend_node_id,
                     frame_id: frame_id.map(str::to_owned),
                 },
@@ -348,6 +458,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
                 walk(
                     child,
                     hidden,
+                    own_indicator,
                     backend_node_id.or(parent_backend_node_id),
                     frame_id,
                     base_url,
@@ -364,6 +475,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
                 walk(
                     shadow_root,
                     hidden,
+                    own_indicator,
                     backend_node_id.or(parent_backend_node_id),
                     frame_id,
                     base_url,
@@ -376,6 +488,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
             walk(
                 content_document,
                 hidden,
+                own_indicator,
                 backend_node_id.or(parent_backend_node_id),
                 content_document.get("frameId").and_then(Value::as_str),
                 None,
@@ -389,6 +502,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
     let mut order = 0;
     walk(
         root,
+        false,
         false,
         None,
         root.get("frameId").and_then(Value::as_str),
@@ -581,6 +695,9 @@ pub(crate) fn compose_accessibility_tree(
         }
         let backend_node_id = ax.get("backendDOMNodeId").and_then(Value::as_i64);
         let dom_meta = backend_node_id.and_then(|backend| dom.nodes.get(&backend));
+        if dom_meta.is_some_and(|meta| meta.own_indicator) {
+            continue;
+        }
         let layout_meta = backend_node_id.and_then(|backend| layout.nodes.get(&backend));
         let states = ax_states(ax);
         let visibility = classify_visibility(dom_meta, layout_meta, viewport);
@@ -698,6 +815,7 @@ fn supplement_dom_actions(
     candidates.sort_by_key(|(_, meta)| meta.order);
     for (&backend_node_id, meta) in candidates {
         if existing.contains(&backend_node_id)
+            || meta.own_indicator
             || expected_frame.is_some_and(|expected| meta.frame_id.as_deref() != Some(expected))
         {
             continue;
@@ -1201,61 +1319,205 @@ fn with_ancestors(nodes: &[SemanticNode], selected: &[usize]) -> HashSet<usize> 
     keep
 }
 
-fn render_outline(nodes: &[SemanticNode], selected: &HashSet<usize>) -> String {
-    let by_ax_id: HashMap<&str, usize> = nodes
+fn ax_index(nodes: &[SemanticNode]) -> HashMap<&str, usize> {
+    nodes
         .iter()
         .enumerate()
         .map(|(idx, node)| (node.ax_id.as_str(), idx))
+        .collect()
+}
+
+/// A node that says nothing by itself: a document root, an unnamed wrapper
+/// with no action, or the inner editing box of a field that is itself
+/// listed. Its children are shown under the nearest listed ancestor.
+fn is_structure_only(nodes: &[SemanticNode], by_ax_id: &HashMap<&str, usize>, idx: usize) -> bool {
+    let node = &nodes[idx];
+    if matches!(node.role.as_str(), "rootwebarea" | "webarea") {
+        return true;
+    }
+    if !matches!(node.role.as_str(), "generic" | "none" | "presentation")
+        || node.name.is_some()
+        || node.value.is_some()
+    {
+        return false;
+    }
+    node.actions.is_empty()
+        || node
+            .parent_ax_id
+            .as_deref()
+            .and_then(|parent| by_ax_id.get(parent))
+            .is_some_and(|parent| nodes[*parent].actions.contains(&BrowserActionKind::Type))
+}
+
+/// JSON-escaped length of the outline these lines make, refs counted at
+/// [`BUDGETED_REF`] width.
+fn serialized_chars(view: &[ViewNode]) -> usize {
+    view.iter()
+        .map(|node| {
+            let line = node.template.replace(REF_SLOT, BUDGETED_REF);
+            serde_json::to_string(&line).map_or(line.len(), |json| json.chars().count() - 2)
+        })
+        .sum::<usize>()
+        + view.len().saturating_sub(1) * 2
+}
+
+/// One entry of the optional structured ref list.
+pub(crate) fn listed_ref(reference: &str, entry: &RefEntry, value: Option<&str>) -> Value {
+    let mut listed = serde_json::json!({
+        "ref": reference,
+        "role": entry.node_name,
+        "name": entry.label,
+        "value": value,
+        "actions": entry.actions.iter().map(|action| action.as_str()).collect::<Vec<_>>(),
+    });
+    if let Some(url) = &entry.destination {
+        listed["url"] = Value::String(url.clone());
+    }
+    listed
+}
+
+/// Serialized length of the structured ref list for these lines.
+fn listed_chars(view: &[ViewNode], values: &[Option<String>]) -> usize {
+    view.iter()
+        .zip(values)
+        .map(|(node, value)| {
+            listed_ref(BUDGETED_REF, &node.entry, value.as_deref())
+                .to_string()
+                .chars()
+                .count()
+                + 1
+        })
+        .sum()
+}
+
+/// The kept nodes as outline lines with their values, walked as a tree: a
+/// line sits under its nearest listed ancestor, siblings in document order.
+fn render_view(
+    nodes: &[SemanticNode],
+    by_ax_id: &HashMap<&str, usize>,
+    keep: &HashSet<usize>,
+) -> (Vec<ViewNode>, Vec<Option<String>>) {
+    let listed: HashSet<usize> = keep
+        .iter()
+        .copied()
+        .filter(|idx| {
+            nodes[*idx].backend_node_id.is_some() && !is_structure_only(nodes, by_ax_id, *idx)
+        })
         .collect();
-    let mut ordered: Vec<usize> = selected.iter().copied().collect();
-    ordered.sort_by_key(|idx| nodes[*idx].document_order);
-    let mut lines = Vec::new();
+    let mut ordered: Vec<usize> = listed.iter().copied().collect();
+    ordered.sort_by_key(|idx| (nodes[*idx].document_order, *idx));
+    let mut children: HashMap<Option<usize>, Vec<usize>> = HashMap::new();
     for idx in ordered {
-        let node = &nodes[idx];
-        if matches!(node.role.as_str(), "rootwebarea" | "webarea") {
-            continue;
-        }
-        let mut depth = 0;
-        let mut parent = node.parent_ax_id.as_deref();
-        while let Some(parent_id) = parent {
-            let Some(parent_idx) = by_ax_id.get(parent_id).copied() else {
+        let mut above = nodes[idx].parent_ax_id.as_deref();
+        let mut parent = None;
+        // Bounded by the node count, so a malformed parent cycle ends.
+        for _ in 0..nodes.len() {
+            let Some(parent_idx) = above.and_then(|id| by_ax_id.get(id)).copied() else {
                 break;
             };
-            if selected.contains(&parent_idx)
-                && !matches!(nodes[parent_idx].role.as_str(), "rootwebarea" | "webarea")
-            {
-                depth += 1;
+            if listed.contains(&parent_idx) {
+                parent = Some(parent_idx);
+                break;
             }
-            parent = nodes[parent_idx].parent_ax_id.as_deref();
+            above = nodes[parent_idx].parent_ax_id.as_deref();
         }
-        let mut line = format!("{}- {}", "  ".repeat(depth), node.role);
-        if let Some(name) = &node.name {
-            line.push(' ');
-            line.push_str(&serde_json::to_string(name).unwrap_or_else(|_| "\"\"".to_owned()));
-        }
-        if let Some(value) = &node.value {
-            if node.name.as_deref() != Some(value) {
-                line.push_str(": ");
-                line.push_str(value);
-            }
-        }
-        if let Some(url) = &node.url {
-            line.push_str(" [url=");
-            line.push_str(&serde_json::to_string(url).expect("URL string serialization"));
-            line.push(']');
-        }
-        if !node.states.is_empty() {
-            let states = node
-                .states
-                .iter()
-                .map(|(name, value)| format!("{name}={value}"))
-                .collect::<Vec<_>>()
-                .join(",");
-            line.push_str(&format!(" [{states}]"));
-        }
-        lines.push(line);
+        children.entry(parent).or_default().push(idx);
     }
-    lines.join("\n")
+    let mut view = Vec::with_capacity(listed.len());
+    let mut values = Vec::with_capacity(listed.len());
+    let mut stack: Vec<(usize, usize)> = children
+        .get(&None)
+        .into_iter()
+        .flatten()
+        .rev()
+        .map(|idx| (*idx, 0))
+        .collect();
+    while let Some((idx, depth)) = stack.pop() {
+        if let Some(entry) = nodes[idx].to_ref_entry() {
+            view.push(ViewNode {
+                entry,
+                template: line_template(&nodes[idx], depth),
+            });
+            values.push(nodes[idx].value.clone());
+        }
+        stack.extend(
+            children
+                .get(&Some(idx))
+                .into_iter()
+                .flatten()
+                .rev()
+                .map(|child| (*child, depth + 1)),
+        );
+    }
+    (view, values)
+}
+
+/// One outline line: `- role "name" [ref actions] = "value" -> "url" (states)`.
+/// The bracket holds the ref and what it may be used for; a ref with no
+/// action there only scopes a later read.
+fn line_template(node: &SemanticNode, depth: usize) -> String {
+    let quoted = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned());
+    let mut line = format!("{}- {}", "  ".repeat(depth), node.role);
+    if let Some(name) = &node.name {
+        line.push(' ');
+        line.push_str(&quoted(name));
+    }
+    line.push_str(" [");
+    line.push(REF_SLOT);
+    // `pointer` comes with any other action on a node that has a box; leave
+    // it off the line.
+    let actions = node
+        .actions
+        .iter()
+        .filter(|action| **action != BrowserActionKind::Pointer)
+        .map(|action| action.as_str())
+        .collect::<Vec<_>>();
+    if !actions.is_empty() {
+        line.push(' ');
+        line.push_str(&actions.join(","));
+    }
+    line.push(']');
+    if let Some(value) = node.value.as_ref().filter(|value| node.name.as_ref() != Some(value)) {
+        line.push_str(" = ");
+        line.push_str(&quoted(value));
+    }
+    if let Some(url) = &node.url {
+        line.push_str(" -> ");
+        line.push_str(&quoted(url));
+    }
+    let mut states = Vec::new();
+    for (name, value) in &node.states {
+        let word = match (name.as_str(), value) {
+            // What the role and the bracket already say.
+            ("focusable" | "editable", _) => continue,
+            ("expanded", Value::Bool(false)) => "collapsed".to_owned(),
+            ("checked", Value::Bool(false)) => "unchecked".to_owned(),
+            (_, Value::Bool(true)) => name.clone(),
+            (_, Value::Bool(false)) | (_, Value::Null) => continue,
+            (_, Value::String(text)) if text == "true" => name.clone(),
+            (_, Value::String(text)) if text == "false" => match name.as_str() {
+                "expanded" => "collapsed".to_owned(),
+                "checked" => "unchecked".to_owned(),
+                _ => continue,
+            },
+            (_, Value::String(text)) => format!("{name}={text}"),
+            (_, other) => format!("{name}={other}"),
+        };
+        states.push(word);
+    }
+    if node.frame.kind != FrameKind::Main {
+        states.push(node.frame.kind.as_str().to_owned());
+    }
+    if !matches!(
+        node.visibility,
+        BrowserVisibility::InViewport | BrowserVisibility::Unknown
+    ) {
+        states.push(node.visibility.as_str().to_owned());
+    }
+    if !states.is_empty() {
+        line.push_str(&format!(" ({})", states.join(", ")));
+    }
+    line
 }
 
 #[cfg(test)]
@@ -1417,14 +1679,177 @@ mod tests {
             &Viewport::default(),
             frame(),
         );
-        let page = doc.page(0, 300, None, None);
-        assert!(
-            page.outline
-                .contains("https://example.test/book?q=a%20b#time"),
-            "{}",
-            page.outline
+        let page = doc.page(0, 300, usize::MAX, None, None);
+        assert_eq!(
+            page.outline_with("p1:0"),
+            "- link \"Book a court\" [p1:0 click] -> \"https://example.test/book?q=a%20b#time\""
         );
-        assert!(page.outline.contains("Book a court"));
+    }
+
+    fn ax_node(id: &str, parent: Option<&str>, backend: Option<i64>, role: &str, name: Option<&str>) -> Value {
+        let mut node = json!({"nodeId": id, "ignored": false, "role": {"value": role}});
+        if let Some(parent) = parent {
+            node["parentId"] = json!(parent);
+        }
+        if let Some(backend) = backend {
+            node["backendDOMNodeId"] = json!(backend);
+        }
+        if let Some(name) = name {
+            node["name"] = json!({"value": name});
+        }
+        node
+    }
+
+    fn share_form() -> SemanticDocument {
+        let dom = build_dom_index(&json!({"nodeType": 9, "children": [
+            {"nodeType": 1, "nodeName": "DIV", "backendNodeId": 1},
+            {"nodeType": 1, "nodeName": "INPUT", "backendNodeId": 2, "attributes": ["type", "email"]},
+            {"nodeType": 1, "nodeName": "BUTTON", "backendNodeId": 3},
+            {"nodeType": 1, "nodeName": "UL", "backendNodeId": 4},
+            {"nodeType": 1, "nodeName": "LI", "backendNodeId": 5},
+            {"nodeType": 1, "nodeName": "LI", "backendNodeId": 6},
+            {"nodeType": 1, "nodeName": "BUTTON", "backendNodeId": 7, "attributes": ["disabled", ""]}
+        ]}));
+        let mut nodes = vec![
+            ax_node("root", None, Some(90), "RootWebArea", Some("Share")),
+            ax_node("card", Some("root"), Some(1), "generic", None),
+            ax_node("email", Some("card"), Some(2), "textbox", Some("Email")),
+            // The field's inner editing box: no DOM entry, typable by state.
+            ax_node("inner", Some("email"), Some(20), "generic", None),
+            ax_node("role", Some("card"), Some(3), "button", Some("Role")),
+            // A mock accessibility object: no DOM node at all.
+            ax_node("popup", Some("role"), None, "menulistpopup", None),
+            ax_node("list", Some("popup"), Some(4), "listbox", Some("Role options")),
+            ax_node("viewer", Some("list"), Some(5), "option", Some("Viewer")),
+            ax_node("editor", Some("list"), Some(6), "option", Some("Editor")),
+            ax_node("send", Some("card"), Some(7), "button", Some("Send invite")),
+        ];
+        nodes[2]["value"] = json!({"value": "ada@x.com"});
+        nodes[2]["properties"] = json!([
+            {"name": "focused", "value": {"value": true}},
+            {"name": "focusable", "value": {"value": true}},
+            {"name": "editable", "value": {"value": "plaintext"}}]);
+        nodes[3]["properties"] = json!([{"name": "editable", "value": {"value": "plaintext"}}]);
+        nodes[4]["properties"] = json!([{"name": "expanded", "value": {"value": true}}]);
+        nodes[7]["properties"] = json!([{"name": "selected", "value": {"value": true}}]);
+        nodes[9]["properties"] = json!([{"name": "disabled", "value": {"value": true}}]);
+        compose_accessibility_tree(
+            &json!({ "nodes": nodes }),
+            &dom,
+            &LayoutIndex::default(),
+            &Viewport::default(),
+            frame(),
+        )
+    }
+
+    #[test]
+    fn outline_lines_carry_the_ref_its_actions_the_value_and_the_states() {
+        let page = share_form().page(0, 300, usize::MAX, None, None);
+        assert_eq!(
+            page.outline_with("R"),
+            [
+                "- textbox \"Email\" [R type] = \"ada@x.com\" (focused)",
+                "- button \"Role\" [R click] (expanded)",
+                "  - listbox \"Role options\" [R click]",
+                "    - option \"Viewer\" [R click] (selected)",
+                "    - option \"Editor\" [R click]",
+                "- button \"Send invite\" [R] (disabled)",
+            ]
+            .join("\n")
+        );
+        // The unnamed wrapper, the field's inner box and the page root say
+        // nothing; the mock popup has no DOM node to hang a ref on.
+        assert_eq!(page.omissions.no_dom_node, 1);
+        assert_eq!(page.selected_nodes, 6);
+    }
+
+    #[test]
+    fn outline_stops_at_the_character_budget_and_continues_from_there() {
+        let document = share_form();
+        let whole = document.page(0, 300, usize::MAX, None, None);
+        let budget = serialized_chars(&whole.view) - 1;
+        let first = document.page(0, 300, budget, None, None);
+        assert!(serialized_chars(&first.view) <= budget);
+        assert!(first.selected_nodes < whole.selected_nodes);
+        assert_eq!(first.omissions.budget, whole.selected_nodes - first.selected_nodes);
+        let rest = document.page(first.next_offset.unwrap(), 300, usize::MAX, None, None);
+        assert_eq!(first.selected_nodes + rest.selected_nodes, whole.selected_nodes);
+        // A budget too small for anything still returns one node, not nothing.
+        let tiny = document.page(0, 300, 1, None, None);
+        assert_eq!(tiny.selected_nodes, 1);
+        assert_eq!(tiny.next_offset, Some(1));
+    }
+
+    #[test]
+    fn budget_counts_the_outline_as_it_is_serialized() {
+        let page = share_form().page(0, 300, usize::MAX, None, None);
+        let outline = page.outline_with(BUDGETED_REF);
+        assert_eq!(
+            serialized_chars(&page.view),
+            serde_json::to_string(&outline).unwrap().chars().count() - 2
+        );
+    }
+
+    #[test]
+    fn merged_frame_documents_keep_their_own_trees() {
+        let dom = DomIndex::default();
+        let tree = |backend: i64, name: &str| {
+            compose_accessibility_tree(
+                &json!({"nodes": [
+                    ax_node("1", None, Some(backend), "RootWebArea", None),
+                    ax_node("2", Some("1"), Some(backend + 1), "group", Some(name)),
+                    ax_node("3", Some("2"), Some(backend + 2), "button", Some(&format!("{name} button"))),
+                ]}),
+                &dom,
+                &LayoutIndex::default(),
+                &Viewport::default(),
+                frame(),
+            )
+        };
+        // Two processes number their accessibility nodes alike.
+        let mut document = tree(10, "Outer");
+        document.extend(tree(20, "Inner"));
+        let page = document.page(0, 300, usize::MAX, None, None);
+        assert_eq!(
+            page.outline_with("R"),
+            [
+                "- group \"Outer\" [R]",
+                "  - button \"Outer button\" [R click]",
+                "- group \"Inner\" [R]",
+                "  - button \"Inner button\" [R click]",
+            ]
+            .join("\n")
+        );
+    }
+
+    #[test]
+    fn the_extensions_own_indicator_is_not_page_content() {
+        let dom = build_dom_index(&json!({"nodeType": 9, "children": [
+            {"nodeType": 1, "nodeName": "BUTTON", "backendNodeId": 1},
+            {"nodeType": 1, "nodeName": "DIV", "backendNodeId": 2,
+             "attributes": ["id", "cua-driver-indicator"],
+             "shadowRoots": [{"nodeType": 11, "shadowRootType": "closed", "backendNodeId": 3,
+                "children": [
+                    {"nodeType": 1, "nodeName": "SPAN", "backendNodeId": 4},
+                    {"nodeType": 1, "nodeName": "BUTTON", "backendNodeId": 5,
+                     "attributes": ["onclick", "stop()"]}]}]}
+        ]}));
+        let document = compose_accessibility_tree(
+            &json!({"nodes": [
+                ax_node("root", None, Some(90), "RootWebArea", None),
+                ax_node("send", Some("root"), Some(1), "button", Some("Send")),
+                ax_node("label", Some("root"), Some(4), "StaticText", Some("Cua is working in this tab")),
+            ]}),
+            &dom,
+            &LayoutIndex::default(),
+            &Viewport::default(),
+            frame(),
+        );
+        let page = document.page(0, 300, usize::MAX, None, None);
+        // Neither the accessibility node nor the clickable Stop the DOM
+        // supplement would add; and nothing is reported as hidden page content.
+        assert_eq!(page.outline_with("R"), "- button \"Send\" [R click]");
+        assert_eq!(page.omissions.css_hidden, 0);
     }
 
     #[test]
@@ -1435,6 +1860,7 @@ mod tests {
             attrs: HashMap::from([("type".into(), "file".into())]),
             order: 0,
             css_hidden: false,
+            own_indicator: false,
             parent_backend_node_id: None,
             frame_id: None,
         };
@@ -1477,7 +1903,7 @@ mod tests {
             &Viewport::default(),
             frame(),
         );
-        let page = document.page(0, 300, None, None);
+        let page = document.page(0, 300, usize::MAX, None, None);
         assert_eq!(page.omissions.css_hidden, 1);
         let actionable = page
             .selected
@@ -1524,7 +1950,7 @@ mod tests {
             &viewport,
             frame(),
         );
-        let page = document.page(0, 300, None, None);
+        let page = document.page(0, 300, usize::MAX, None, None);
         assert!(page.selected.iter().any(|node| {
             node.name.as_deref() == Some("Custom action")
                 && node.actions == vec![BrowserActionKind::Click, BrowserActionKind::Pointer]
@@ -1576,7 +2002,7 @@ mod tests {
             &viewport,
             frame(),
         );
-        let page = document.page(0, 300, None, None);
+        let page = document.page(0, 300, usize::MAX, None, None);
         let scrollable = page
             .selected
             .iter()
@@ -1625,7 +2051,7 @@ mod tests {
              "name": {"value": "Reply"}}
         ]});
         let document = compose_accessibility_tree(&ax, &dom, &layout, &viewport, frame());
-        let page = document.page(0, 1, None, None);
+        let page = document.page(0, 1, usize::MAX, None, None);
         assert_eq!(page.selected[0].name.as_deref(), Some("Reply"));
         assert_eq!(page.next_offset, Some(1));
     }
@@ -1664,7 +2090,7 @@ mod tests {
              "name": {"value": "Covered"}}
         ]});
         let document = compose_accessibility_tree(&ax, &dom, &layout, &viewport, frame());
-        let page = document.page(0, 300, None, None);
+        let page = document.page(0, 300, usize::MAX, None, None);
         assert!(page
             .selected
             .iter()
@@ -1724,7 +2150,7 @@ mod tests {
              "name": {"value": "Remove"}, "childIds": []}
         ]});
         let document = compose_accessibility_tree(&ax, &dom, &layout, &viewport, frame());
-        let page = document.page(0, 300, None, None);
+        let page = document.page(0, 300, usize::MAX, None, None);
         let actions = page
             .selected
             .iter()

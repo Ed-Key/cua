@@ -194,21 +194,63 @@ pub(crate) async fn browser_protected_resource_scope(
     Ok(Some(resource))
 }
 
-fn semantic_ref_value(listed: &super::engine::SemanticListedRef) -> Value {
-    let mut value = json!({
-        "ref": listed.external,
-        "role": listed.node.role,
-        "name": listed.node.name,
-        "value": listed.node.value,
-        "states": listed.node.states,
-        "actions": listed.node.actions.iter().map(|action| action.as_str()).collect::<Vec<_>>(),
-        "frame": listed.node.frame.kind.as_str(),
-        "visibility": listed.node.visibility.as_str(),
-    });
-    if let Some(url) = &listed.node.url {
-        value["url"] = json!(url);
+/// The result of one semantic snapshot. The outline is the only place the
+/// refs appear: `- role "name" [ref actions] = "value" (states)`.
+fn semantic_snapshot_result(
+    target_id: &str,
+    tab_id: &str,
+    outcome: &super::engine::SemanticSnapshotOutcome,
+) -> ToolResult {
+    let mut result = ToolResult::text(format!(
+        "snapshot p{}: {} action ref(s), {} content ref(s) in the outline",
+        outcome.snapshot_id, outcome.action_refs, outcome.content_refs
+    ))
+    .with_structured(json!({
+        "status": "ok",
+        "mode": "snapshot",
+        "target_id": target_id,
+        "tab_id": tab_id,
+        "snapshot": {
+            "id": format!("p{}", outcome.snapshot_id),
+            "format": "semantic_v2",
+            "complete": outcome.complete,
+            "scope": outcome.scope,
+            "selected_nodes": outcome.selected_nodes,
+            "total_nodes": outcome.total_nodes,
+            "node_budget": super::semantic::DEFAULT_SEMANTIC_NODE_BUDGET,
+            "outline_char_budget": outcome.outline_budget,
+            "omitted": {
+                "css_hidden": outcome.omissions.css_hidden,
+                "offscreen": outcome.omissions.offscreen,
+                "page_occluded": outcome.omissions.page_occluded,
+                "no_layout": outcome.omissions.no_layout,
+                "unknown": outcome.omissions.unknown,
+                "budget": outcome.omissions.budget,
+                "unprovable_frame": outcome.omissions.unprovable_frame,
+                "no_dom_node": outcome.omissions.no_dom_node,
+            },
+            "continuation": outcome.continuation,
+        },
+        "page": {
+            "url": outcome.url,
+            "title": outcome.title,
+        },
+        "outline": outcome.outline,
+        "oopif": {
+            "status": outcome.oopif.as_str(),
+            "frames": outcome.oopif.frames(),
+        },
+    }));
+    if let (Some(listed), Some(structured)) =
+        (&outcome.listed, result.structured_content.as_mut())
+    {
+        let (actions, content): (Vec<&Value>, Vec<&Value>) = listed
+            .iter()
+            .partition(|entry| entry["actions"].as_array().is_some_and(|a| !a.is_empty()));
+        structured["refs"] = json!(actions);
+        structured["content_refs"] = json!(content);
     }
-    value
+    result
 }
 
 fn with_tab_screenshot(mut result: ToolResult, screenshot: BrowserTabScreenshot) -> ToolResult {
@@ -249,9 +291,9 @@ impl GetBrowserStateTool {
         let def = ToolDef {
             name: "get_browser_state".into(),
             description: "Read-only browser inspection. Bind with pid + window_id to get a \
-                target_id and tab ids; snapshot with target_id + tab_id to get page refs \
-                (semantic_v2 adds a ranked outline and typed refs). Consent and setup \
-                refusals give the browser_prepare call to make. \
+                target_id and tab ids; snapshot with target_id + tab_id to get the page \
+                outline, one line per element with its ref and actions inline. Consent and \
+                setup refusals give the browser_prepare call to make. \
                 Details: skill://cua-driver/BROWSER.md"
                 .into(),
             input_schema: json!({
@@ -264,9 +306,16 @@ impl GetBrowserStateTool {
                     "session": schema_session(),
                     "snapshot_format": {
                         "type": "string",
-                        "enum": ["dom_refs_v1", "semantic_v2"],
-                        "default": "dom_refs_v1",
-                        "description": "Snapshot format."
+                        "enum": ["semantic_v2", "dom_refs_v1"],
+                        "default": "semantic_v2",
+                        "description": "semantic_v2: ranked outline with inline refs. dom_refs_v1: a flat ref list."
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": super::engine::DEFAULT_SNAPSHOT_CHARS,
+                        "minimum": super::engine::MIN_SNAPSHOT_CHARS,
+                        "maximum": super::engine::MAX_SNAPSHOT_CHARS,
+                        "description": "Size budget for a semantic_v2 result; the rest is reached by continuation."
                     },
                     "scope_ref": {
                         "type": "string",
@@ -278,7 +327,12 @@ impl GetBrowserStateTool {
                     },
                     "continuation": {
                         "type": "string",
-                        "description": "Continuation from an earlier semantic_v2 response."
+                        "description": "Continuation from an earlier response."
+                    },
+                    "include_refs": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Also return the outline's refs as lists (refs, content_refs) for programs; counts against max_chars."
                     },
                     "include_screenshot": {
                         "type": "boolean",
@@ -348,7 +402,7 @@ impl Tool for GetBrowserStateTool {
             };
             let snapshot_format = args
                 .opt_str("snapshot_format")
-                .unwrap_or_else(|| "dom_refs_v1".into());
+                .unwrap_or_else(|| "semantic_v2".into());
             let include_screenshot = match args.get("include_screenshot") {
                 None => false,
                 Some(Value::Bool(include)) => *include,
@@ -366,12 +420,40 @@ impl Tool for GetBrowserStateTool {
             if snapshot_format == "dom_refs_v1"
                 && (args.opt_str("scope_ref").is_some()
                     || args.opt_str("query").is_some()
-                    || args.opt_str("continuation").is_some())
+                    || args.opt_str("continuation").is_some()
+                    || args.get("max_chars").is_some()
+                    || args.get("include_refs").is_some())
             {
                 return ToolResult::error(
-                    "scope_ref, query, and continuation require snapshot_format=\"semantic_v2\"",
+                    "scope_ref, query, continuation, max_chars, and include_refs require snapshot_format=\"semantic_v2\"",
                 );
             }
+            let include_refs = match args.get("include_refs") {
+                None => false,
+                Some(Value::Bool(include)) => *include,
+                Some(_) => {
+                    return ToolResult::error("Field include_refs has wrong type: expected boolean")
+                }
+            };
+            let max_chars = match args.get("max_chars") {
+                None => super::engine::DEFAULT_SNAPSHOT_CHARS,
+                Some(value) => match value.as_u64().map(|chars| chars as usize) {
+                    Some(chars)
+                        if (super::engine::MIN_SNAPSHOT_CHARS
+                            ..=super::engine::MAX_SNAPSHOT_CHARS)
+                            .contains(&chars) =>
+                    {
+                        chars
+                    }
+                    _ => {
+                        return ToolResult::error(format!(
+                            "max_chars must be an integer from {} to {}",
+                            super::engine::MIN_SNAPSHOT_CHARS,
+                            super::engine::MAX_SNAPSHOT_CHARS
+                        ))
+                    }
+                },
+            };
             if snapshot_format == "semantic_v2" {
                 let snapshot = match self
                     .engine
@@ -382,64 +464,12 @@ impl Tool for GetBrowserStateTool {
                         args.opt_str("scope_ref").as_deref(),
                         args.opt_str("query").as_deref(),
                         args.opt_str("continuation").as_deref(),
+                        max_chars,
+                        include_refs,
                     )
                     .await
                 {
-                    Ok(outcome) => {
-                        let refs = outcome
-                            .refs
-                            .iter()
-                            .map(semantic_ref_value)
-                            .collect::<Vec<_>>();
-                        let content_refs = outcome
-                            .content_refs
-                            .iter()
-                            .map(semantic_ref_value)
-                            .collect::<Vec<_>>();
-                        ToolResult::text(format!(
-                            "semantic snapshot p{} of {}: {} action ref(s), {} content ref(s)",
-                            outcome.snapshot_id,
-                            outcome.url,
-                            refs.len(),
-                            content_refs.len()
-                        ))
-                        .with_structured(json!({
-                            "status": "ok",
-                            "mode": "snapshot",
-                            "target_id": target_id,
-                            "tab_id": tab_id,
-                            "snapshot": {
-                                "id": format!("p{}", outcome.snapshot_id),
-                                "format": "semantic_v2",
-                                "complete": outcome.complete,
-                                "scope": outcome.scope,
-                                "selected_nodes": outcome.selected_nodes,
-                                "total_nodes": outcome.total_nodes,
-                                "node_budget": super::semantic::DEFAULT_SEMANTIC_NODE_BUDGET,
-                                "omitted": {
-                                    "css_hidden": outcome.omissions.css_hidden,
-                                    "offscreen": outcome.omissions.offscreen,
-                                    "page_occluded": outcome.omissions.page_occluded,
-                                    "no_layout": outcome.omissions.no_layout,
-                                    "unknown": outcome.omissions.unknown,
-                                    "budget": outcome.omissions.budget,
-                                    "unprovable_frame": outcome.omissions.unprovable_frame,
-                                },
-                                "continuation": outcome.continuation,
-                            },
-                            "page": {
-                                "url": outcome.url,
-                                "title": outcome.title,
-                            },
-                            "outline": outcome.outline,
-                            "refs": refs,
-                            "content_refs": content_refs,
-                            "oopif": {
-                                "status": outcome.oopif.as_str(),
-                                "frames": outcome.oopif.frames(),
-                            },
-                        }))
-                    }
+                    Ok(outcome) => semantic_snapshot_result(&target_id, &tab_id, &outcome),
                     Err(refusal) => return refusal.to_tool_result(),
                 };
                 if include_screenshot {
@@ -3602,15 +3632,14 @@ mod tests {
         let tab_id = e.store.mint_tab_id();
         tabs.insert(
             tab_id.clone(),
-            crate::browser::store::TabRecord {
-                tab_id: tab_id.clone(),
-                cdp_target_id: "CDPX".into(),
-                title: "Mock".into(),
-                url: "https://example.test".into(),
-                active: Some(true),
-                generation: 0,
-                snapshots: HashMap::new(),
-            },
+            crate::browser::store::TabRecord::new(
+                tab_id.clone(),
+                "CDPX".into(),
+                "Mock".into(),
+                "https://example.test".into(),
+                Some(true),
+                0,
+            ),
         );
         let target_id = e.store.mint_target(
             "run-1",
@@ -3662,15 +3691,14 @@ mod tests {
         let tab_id = e.store.mint_tab_id();
         tabs.insert(
             tab_id.clone(),
-            crate::browser::store::TabRecord {
-                tab_id: tab_id.clone(),
-                cdp_target_id: "CDPX".into(),
-                title: "Mock".into(),
-                url: "https://example.test".into(),
-                active: Some(true),
-                generation: 0,
-                snapshots: HashMap::new(),
-            },
+            crate::browser::store::TabRecord::new(
+                tab_id.clone(),
+                "CDPX".into(),
+                "Mock".into(),
+                "https://example.test".into(),
+                Some(true),
+                0,
+            ),
         );
         // Bound fingerprint has start_time 999; MockPlatform now reports 1.
         let target_id = e.store.mint_target(

@@ -1,7 +1,7 @@
 //! Session-scoped target / tab / page-ref capability store.
 //!
 //! Browser target ids (`bt-<uuid>`), tab ids (`tab-<uuid>`) and page refs
-//! (`p<snapshot>:<index>`) are opaque, session-scoped capabilities:
+//! (`p<space>:<index>`) are opaque, session-scoped capabilities:
 //! they only resolve in the session that minted them, and the whole
 //! namespace is dropped when that session ends. Ids are minted from a
 //! process-global counter so they never collide across sessions — a
@@ -14,6 +14,10 @@
 //! every snapshot of the navigated tab; stale refs refuse with
 //! `browser_ref_stale`, and frame identity is re-proven against the
 //! live frame tree before any mutation.
+//!
+//! A `dom_refs_v1` snapshot is one [`SnapshotRecord`]; a newer one replaces
+//! it. Semantic refs live in the tab's [`TabRefs`], whose ownership rules
+//! are the table in [`super::observation`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +26,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use uuid::Uuid;
 
+use super::observation::{FullReason, TabRefs};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::semantic::SemanticDocument;
 use super::types::{
@@ -176,6 +181,7 @@ pub struct RefEntry {
     pub attachment: Option<u64>,
 }
 
+/// One `dom_refs_v1` snapshot.
 #[derive(Debug, Clone)]
 pub struct SnapshotRecord {
     pub id: u64,
@@ -183,8 +189,17 @@ pub struct SnapshotRecord {
     pub url: String,
     /// index → entry; the external ref is `p<id>:<index>`.
     pub refs: HashMap<u32, RefEntry>,
-    pub(crate) semantic: Option<SemanticDocument>,
-    pub(crate) semantic_root_identity: Option<FrameIdentity>,
+}
+
+/// The semantic document last collected for a tab, kept for continuations
+/// and for resolving a step's `{role, name}` target.
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticCache {
+    /// The ref space the document was recorded in.
+    pub(crate) space_id: u64,
+    pub(crate) url: String,
+    pub(crate) document: SemanticDocument,
+    pub(crate) root_identity: Option<FrameIdentity>,
     pub(crate) continuations: HashMap<String, SemanticContinuation>,
 }
 
@@ -209,6 +224,26 @@ pub struct TabRecord {
     pub active: Option<bool>,
     pub generation: u64,
     pub snapshots: HashMap<u64, SnapshotRecord>,
+    /// Semantic refs and the diff baseline (see [`super::observation`]).
+    pub(crate) stable: TabRefs,
+    pub(crate) semantic: Option<SemanticCache>,
+}
+
+impl TabRecord {
+    /// A tab as the bind found it, with nothing observed yet.
+    pub fn new(tab_id: String, cdp_target_id: String, title: String, url: String, active: Option<bool>, generation: u64) -> Self {
+        Self {
+            tab_id,
+            cdp_target_id,
+            title,
+            url,
+            active,
+            generation,
+            snapshots: HashMap::new(),
+            stable: TabRefs::default(),
+            semantic: None,
+        }
+    }
 }
 
 /// One bound browser target: the full evidence set captured at bind
@@ -375,27 +410,34 @@ impl BrowserStore {
             .get(&snap)
             .filter(|snapshot| snapshot.generation == target.generation)
             .and_then(|snapshot| snapshot.refs.get(&idx))
+            .or_else(|| {
+                tab.stable
+                    .space()
+                    .filter(|space| space.identity.generation == target.generation)
+                    .and_then(|_| tab.stable.resolve(snap, idx))
+            })
             .cloned()
             .ok_or_else(|| {
                 BrowserRefusal::new(
                     BrowserRefusalCode::BrowserRefStale,
                     format!(
-                        "ref {external} is stale — the page navigated or the snapshot \
-                         was superseded; re-run get_browser_state to re-snapshot"
+                        "ref {external} is stale — the page navigated, the node left the \
+                         page or became another element, or the snapshot was superseded; \
+                         re-run get_browser_state to re-snapshot"
                     ),
                 )
             })
     }
 
     /// Resolve an opaque continuation within the same session, target, tab,
-    /// snapshot generation, and currently-live snapshot namespace.
-    pub fn resolve_semantic_continuation(
+    /// browser generation, and the ref space its document was recorded in.
+    pub(crate) fn resolve_semantic_continuation(
         &self,
         session: &str,
         target_id: &str,
         tab_id: &str,
         token: &str,
-    ) -> Result<(SnapshotRecord, SemanticContinuation), BrowserRefusal> {
+    ) -> Result<(SemanticCache, SemanticContinuation), BrowserRefusal> {
         let target = self.get_target(session, target_id)?;
         let tab = target.tabs.get(tab_id).ok_or_else(|| {
             BrowserRefusal::new(
@@ -403,19 +445,19 @@ impl BrowserStore {
                 format!("tab {tab_id} is not known for target {target_id}"),
             )
         })?;
-        tab.snapshots
-            .values()
-            .find(|snapshot| {
-                snapshot.generation == target.generation
-                    && snapshot.semantic.is_some()
-                    && snapshot.continuations.contains_key(token)
+        tab.semantic
+            .as_ref()
+            .filter(|cache| {
+                tab.stable.space().is_some_and(|space| {
+                    space.id == cache.space_id && space.identity.generation == target.generation
+                })
             })
-            .and_then(|snapshot| {
-                snapshot
+            .and_then(|cache| {
+                cache
                     .continuations
                     .get(token)
                     .cloned()
-                    .map(|continuation| (snapshot.clone(), continuation))
+                    .map(|continuation| (cache.clone(), continuation))
             })
             .ok_or_else(|| {
                 BrowserRefusal::new(
@@ -430,6 +472,8 @@ impl BrowserStore {
         self.update_target(session, target_id, |rec| {
             if let Some(tab) = rec.tabs.get_mut(tab_id) {
                 tab.snapshots.clear();
+                tab.stable.invalidate(FullReason::DocumentChanged);
+                tab.semantic = None;
             }
         });
     }
@@ -531,25 +575,25 @@ mod tests {
             );
             rec.tabs.insert(
                 tab_id.clone(),
-                TabRecord {
-                    tab_id: tab_id.clone(),
-                    cdp_target_id: "CDP1".into(),
-                    title: "Example".into(),
-                    url: "https://example.test".into(),
-                    active: Some(true),
-                    generation: 0,
-                    snapshots: HashMap::from([(
+                {
+                    let mut tab = TabRecord::new(
+                        tab_id.clone(),
+                        "CDP1".into(),
+                        "Example".into(),
+                        "https://example.test".into(),
+                        Some(true),
+                        0,
+                    );
+                    tab.snapshots.insert(
                         snap_id,
                         SnapshotRecord {
                             id: snap_id,
                             generation: 0,
                             url: "https://example.test".into(),
                             refs,
-                            semantic: None,
-                            semantic_root_identity: None,
-                            continuations: HashMap::new(),
                         },
-                    )]),
+                    );
+                    tab
                 },
             );
         });

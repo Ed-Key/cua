@@ -1589,20 +1589,24 @@ fn ref_by_frame_label(snapshot: &ToolResponse, frame: &str, fragment: &str) -> S
         .to_owned()
 }
 
+/// The ref on the outline line `- role "name" [ref actions]` that names
+/// `name` and declares `action`.
 fn semantic_ref_by_name(snapshot: &ToolResponse, name: &str, action: &str) -> String {
-    snapshot.structured()["refs"]
-        .as_array()
-        .and_then(|refs| {
-            refs.iter().find(|entry| {
-                entry["name"] == name
-                    && entry["actions"]
-                        .as_array()
-                        .is_some_and(|actions| actions.iter().any(|value| value == action))
-            })
+    let quoted = serde_json::to_string(name).expect("name serializes");
+    snapshot.structured()["outline"]
+        .as_str()
+        .into_iter()
+        .flat_map(str::lines)
+        .find_map(|line| {
+            let (_, bracket) = line.split_once(&format!(" {quoted} ["))?;
+            let (bracket, _) = bracket.split_once(']')?;
+            let (reference, actions) = bracket.split_once(' ')?;
+            actions
+                .split(',')
+                .any(|declared| declared == action)
+                .then(|| reference.to_owned())
         })
-        .and_then(|entry| entry["ref"].as_str())
         .unwrap_or_else(|| panic!("missing semantic {action} ref {name:?}: {}", snapshot.raw))
-        .to_owned()
 }
 
 fn bind(fixture: &mut BrowserFixture, session: &str) -> (String, String, ToolResponse) {
@@ -1649,6 +1653,7 @@ fn bind(fixture: &mut BrowserFixture, session: &str) -> (String, String, ToolRes
         "get_browser_state",
         serde_json::json!({
             "target_id": target,
+            "snapshot_format": "dom_refs_v1",
             "tab_id": tab,
             "session": session,
         }),
@@ -1960,6 +1965,7 @@ fn run_roundtrip(spec: &BrowserSpec) {
                 "get_browser_state",
                 serde_json::json!({
                     "target_id": target,
+                    "snapshot_format": "dom_refs_v1",
                     "tab_id": tab,
                     "session": session,
                 }),
@@ -2094,15 +2100,10 @@ fn run_semantic_state(spec: &BrowserSpec) {
                 snapshot.raw
             );
             assert!(
-                snapshot.structured()["refs"]
-                    .as_array()
-                    .is_some_and(|refs| refs.iter().all(|entry| {
-                        !entry["name"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .starts_with("Retained control")
-                    })),
-                "hidden retained action leaked into semantic refs: {}",
+                snapshot.structured()["outline"]
+                    .as_str()
+                    .is_some_and(|outline| !outline.contains("Retained control")),
+                "hidden retained action leaked into the semantic outline: {}",
                 snapshot.raw
             );
 
@@ -2665,6 +2666,7 @@ fn run_prepare_isolated_launch(spec: &BrowserSpec) {
                     "get_browser_state",
                     serde_json::json!({
                         "target_id": target,
+                        "snapshot_format": "dom_refs_v1",
                         "tab_id": tab,
                         "session": session,
                     }),
@@ -2877,6 +2879,7 @@ fn run_existing_profile_attach(spec: &BrowserSpec) {
                     "get_browser_state",
                     serde_json::json!({
                         "target_id": target,
+                        "snapshot_format": "dom_refs_v1",
                         "tab_id": tab,
                         "session": session,
                     }),
@@ -3043,6 +3046,7 @@ fn run_existing_profile_setup(spec: &BrowserSpec) {
                     "get_browser_state",
                     serde_json::json!({
                         "target_id": target,
+                        "snapshot_format": "dom_refs_v1",
                         "tab_id": tab,
                         "session": session,
                     }),
@@ -3237,6 +3241,7 @@ fn run_stale_ref(spec: &BrowserSpec) {
                 "get_browser_state",
                 serde_json::json!({
                     "target_id": target,
+                    "snapshot_format": "dom_refs_v1",
                     "tab_id": tab,
                     "session": session,
                 }),
@@ -4810,10 +4815,16 @@ fn run_pointer_actions(spec: &BrowserSpec) {
             );
             assert_eq!(snapshot.structured()["status"], "ok", "{}", snapshot.raw);
 
-            let content_ref = snapshot.structured()["content_refs"]
-                .as_array()
-                .and_then(|refs| refs.first())
-                .and_then(|entry| entry["ref"].as_str())
+            // A line whose bracket holds only the ref declares no action.
+            let content_ref = snapshot.structured()["outline"]
+                .as_str()
+                .into_iter()
+                .flat_map(str::lines)
+                .find_map(|line| {
+                    let (_, bracket) = line.split_once(" [")?;
+                    let (bracket, _) = bracket.split_once(']')?;
+                    (!bracket.contains(' ')).then_some(bracket)
+                })
                 .expect("semantic snapshot content ref");
             let refused = fixture.driver.call(
                 "browser_pointer",
