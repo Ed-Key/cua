@@ -205,6 +205,10 @@ const EDGE_INSET: f64 = 16.0;
 const STACK_GAP: f64 = 12.0;
 /// How often active sessions re-check whether their window is fully visible.
 const VISIBILITY_POLL: Duration = Duration::from_millis(500);
+/// `NSTextAlignmentCenter` for `setAlignment:`. AppKit swaps center and
+/// right between its two ABIs (center is 1 on Apple silicon and 2 on Intel),
+/// so never pass a literal.
+const TEXT_CENTER: isize = objc2_app_kit::NSTextAlignment::Center.0;
 
 // ── Pure placement / timing decisions (unit tested) ───────────────────────
 
@@ -3218,7 +3222,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         true,
     );
     set_text(placeholder_text as usize, "Waiting for the first frame");
-    let _: () = msg_send![placeholder_text, setAlignment: 2isize]; // NSTextAlignmentCenter (NSInteger)
+    let _: () = msg_send![placeholder_text, setAlignment: TEXT_CENTER];
     let _: () = msg_send![placeholder, addSubview: placeholder_text];
     let _: () = msg_send![placeholder, setHidden: true];
     add_subview(front_view, placeholder);
@@ -4957,6 +4961,17 @@ mod tests {
         assert_eq!(slot_on_show([0, 1], true), None);
         assert!(moved_from((100.0, 50.0), (1088.0, 86.0)));
         assert!(!moved_from((1088.2, 86.0), (1088.0, 86.0)));
+    }
+
+    #[test]
+    fn centered_text_uses_this_architectures_value() {
+        // Center and right trade places: 1 and 2 on Apple silicon, 2 and 1
+        // on Intel. A literal 2 right-aligned every centered label on arm64.
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(TEXT_CENTER, 1);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(TEXT_CENTER, 2);
+        assert_eq!(TEXT_CENTER + objc2_app_kit::NSTextAlignment::Right.0, 3);
     }
 
     #[test]

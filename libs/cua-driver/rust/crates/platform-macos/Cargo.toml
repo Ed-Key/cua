@@ -53,6 +53,8 @@ objc2-app-kit = { version = "0.2", features = [
     "NSImage", "NSImageView", "NSTextField", "NSControl", "NSCell",
     # System cursor shape reporting (cursor_shape adapter).
     "NSCursor",
+    # NSTextAlignment, whose center and right values differ by architecture.
+    "NSText",
     "block2", "libc",
 ] }
 
