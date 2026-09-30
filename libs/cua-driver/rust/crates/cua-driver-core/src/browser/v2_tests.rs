@@ -110,9 +110,11 @@ struct FixtureState {
     /// The click handler sets location.href: the main frame starts loading
     /// the document with this loader id.
     click_navigates: Option<String>,
-    /// What the page reports on top at a ref's click point, for the next
-    /// this-many hit-tests (an overlay, as the hit-test's `by`).
-    covered_by: Option<(usize, Value)>,
+    /// What the page answers the next this-many hit-tests at a ref's click
+    /// point (the facts), and the node that is on top there.
+    hit: Option<(usize, Value, i64)>,
+    /// The input handler calls alert() when text arrives.
+    type_opens_dialog: bool,
     dialog_open: bool,
     /// The session that enabled the Page domain (it hears dialog events).
     page_session: Option<String>,
@@ -162,7 +164,8 @@ impl Default for FixtureState {
             click_removes: Vec::new(),
             click_opens_dialog: false,
             click_navigates: None,
-            covered_by: None,
+            hit: None,
+            type_opens_dialog: false,
             dialog_open: false,
             page_session: None,
             pending_mutations: 0,
@@ -770,6 +773,10 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     "node": large_semantic_document()["root"]["children"][0].clone()
                 }))
             }
+            "DOM.describeNode" if call.params["objectId"] == "obj-on-top" => {
+                let on_top = st.hit.as_ref().map_or(0, |(_, _, backend)| *backend);
+                MockReply::ok(json!({"node": {"backendNodeId": on_top}}))
+            }
             "DOM.describeNode" => {
                 let backend = call.params["backendNodeId"].as_i64().unwrap_or(0);
                 match find_dom_node(&fixture_dom(&st, is_oopif), backend) {
@@ -974,6 +981,16 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     MockReply::ok(json!({}))
                 }
             }
+            "Input.insertText" if std::mem::take(&mut st.type_opens_dialog) => {
+                st.dialog_open = true;
+                MockReply::ok(json!({}))
+                    .with_events(vec![MockEvent {
+                        method: "Page.javascriptDialogOpening".into(),
+                        session_id: st.page_session.clone(),
+                        params: json!({"type": "confirm", "message": "private dialog text"}),
+                    }])
+                    .unanswered()
+            }
             "Input.insertText" => {
                 st.pending_mutations += 1;
                 let digits_only = st.field_digits_only;
@@ -1011,19 +1028,25 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     .as_str()
                     .is_some_and(|function| function.contains("elementFromPoint")) =>
             {
-                let covered = match st.covered_by.as_mut() {
-                    Some((remaining, by)) if *remaining > 0 => {
+                // The second form asks for the element on top itself.
+                if call.params["arguments"][4]["value"] == true {
+                    return MockReply::ok(
+                        json!({"result": {"type": "object", "objectId": "obj-on-top"}}),
+                    );
+                }
+                let scripted = match st.hit.as_mut() {
+                    Some((remaining, facts, _)) if *remaining > 0 => {
                         *remaining -= 1;
-                        Some(by.clone())
+                        Some(facts.clone())
                     }
                     _ => None,
                 };
-                MockReply::ok(json!({"result": {"value": match covered {
-                    Some(by) => json!({"connected": true, "hit": true, "inside_target": false,
-                        "contains_target": false, "label_of_target": false, "by": by}),
-                    None => json!({"connected": true, "hit": true, "inside_target": true,
-                        "contains_target": false, "label_of_target": false, "by": {"tag": "button"}}),
-                }}}))
+                MockReply::ok(
+                    json!({"result": {"value": scripted.unwrap_or_else(|| json!({
+                        "connected": true, "hit": true, "inside_target": true,
+                        "contains_target": false, "label_of_target": false, "own_indicator": false,
+                    }))}}),
+                )
             }
             "Runtime.callFunctionOn" => {
                 let function = call.params["functionDeclaration"]
@@ -3527,13 +3550,6 @@ async fn a_ref_whose_node_became_another_element_is_stale_and_never_renamed() {
     let refused = dom_click(&f, &target, &tab, &reply).await;
     assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
     assert!(
-        refused["refusal"]["message"]
-            .as_str()
-            .unwrap()
-            .contains("Delete thread"),
-        "{refused}"
-    );
-    assert!(
         recorded_calls(&f, "Runtime.callFunctionOn").is_empty(),
         "nothing was clicked"
     );
@@ -5173,14 +5189,20 @@ async fn a_single_click_that_navigates_returns_the_new_page_not_a_diff_of_the_ol
 
 // ── Hit-test before a trusted click ─────────────────────────────────────────
 
+fn covered() -> Value {
+    json!({"connected": true, "hit": true, "inside_target": false,
+        "contains_target": false, "label_of_target": false, "own_indicator": false})
+}
+
 #[tokio::test]
-async fn a_trusted_click_on_a_covered_ref_is_refused_and_names_what_covers_it() {
+async fn a_trusted_click_on_a_covered_ref_is_refused_and_names_the_cover_by_its_ref() {
     let f = fixture().await;
     let (target, tab) = bind(&f).await;
-    let snap = snapshot(&f, &target, &tab).await;
-    let button = ref_of(&snap, "main", "main-btn");
-    let overlay = json!({"tag": "div", "id": "cookie-banner", "role": "dialog", "label": "", "text": "Accept cookies?"});
-    f.state.lock().unwrap().covered_by = Some((2, overlay));
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    let button = named_ref(&snap, "main-btn");
+    let cover = named_ref(&snap, "Shadow Input");
+    // Node 20 (the shadow input) is on top at the button's centre.
+    f.state.lock().unwrap().hit = Some((2, covered(), 20));
 
     let click = BrowserClickTool::new(f.engine.clone());
     let refused = click
@@ -5191,30 +5213,101 @@ async fn a_trusted_click_on_a_covered_ref_is_refused_and_names_what_covers_it() 
         refused["refusal"]["code"], "browser_target_covered",
         "{refused}"
     );
+    assert_eq!(
+        refused["refusal"]["detail"]["covered_by_ref"], cover,
+        "{refused}"
+    );
+    assert_eq!(refused["refusal"]["detail"]["click_sent"], false);
+    let message = refused["refusal"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("covered at its centre by {cover}")),
+        "{message}"
+    );
+    // The refusal names a ref the session holds, and nothing the page says.
+    assert!(!message.contains("Shadow Input"), "{message}");
+    assert!(
+        recorded_calls(&f, "Input.dispatchMouseEvent").is_empty(),
+        "the element on top must not receive the click"
+    );
+    // It was looked at twice: before and after the scroll and the beat.
+    assert_eq!(recorded_calls(&f, "DOM.scrollIntoViewIfNeeded").len(), 2);
+}
+
+#[tokio::test]
+async fn a_cover_the_session_holds_no_ref_for_is_not_described() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    f.state.lock().unwrap().hit = Some((2, covered(), 20));
+    let refused = BrowserClickTool::new(f.engine.clone())
+        .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
+        .await;
+    let refused = structured(&refused);
+    assert_eq!(
+        refused["refusal"]["code"], "browser_target_covered",
+        "{refused}"
+    );
+    assert!(refused["refusal"]["detail"]["covered_by_ref"].is_null());
     assert!(
         refused["refusal"]["message"]
             .as_str()
             .unwrap()
-            .contains("div#cookie-banner (role dialog) \"Accept cookies?\""),
+            .contains("has no ref in the outline you hold"),
         "{refused}"
     );
-    assert_eq!(refused["refusal"]["detail"]["click_sent"], false);
-    assert!(
-        recorded_calls(&f, "Input.dispatchMouseEvent").is_empty(),
-        "the overlay must not receive the click"
-    );
-    // It was looked at twice: before and after the scroll and the beat.
-    let looks = recorded_calls(&f, "Runtime.callFunctionOn")
-        .iter()
-        .filter(|(_, params)| {
-            params["functionDeclaration"]
+}
+
+#[tokio::test]
+async fn a_click_is_not_sent_on_an_unproven_or_container_hit() {
+    for (facts, code, says) in [
+        // The page did not answer the question.
+        (
+            json!(true),
+            "browser_action_unavailable",
+            "did not say which element",
+        ),
+        // The element around the button would receive it, not the button.
+        (
+            json!({"connected": true, "hit": true, "inside_target": false,
+                "contains_target": true, "label_of_target": false, "own_indicator": false}),
+            "browser_target_covered",
+            "takes no click at its centre",
+        ),
+        (
+            json!({"connected": true, "hit": false}),
+            "browser_target_covered",
+            "outside the visible page",
+        ),
+        (
+            json!({"connected": true, "hit": true, "inside_target": false,
+                "contains_target": false, "label_of_target": false, "own_indicator": true}),
+            "browser_target_covered",
+            "Cua's own",
+        ),
+    ] {
+        let f = fixture().await;
+        let (target, tab) = bind(&f).await;
+        let snap = snapshot(&f, &target, &tab).await;
+        let button = ref_of(&snap, "main", "main-btn");
+        f.state.lock().unwrap().hit = Some((2, facts.clone(), 0));
+        let refused = BrowserClickTool::new(f.engine.clone())
+            .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
+            .await;
+        let refused = structured(&refused);
+        assert_eq!(refused["refusal"]["code"], code, "{facts}: {refused}");
+        assert!(
+            refused["refusal"]["message"]
                 .as_str()
                 .unwrap()
-                .contains("elementFromPoint")
-        })
-        .count();
-    assert_eq!(looks, 2);
-    assert_eq!(recorded_calls(&f, "DOM.scrollIntoViewIfNeeded").len(), 2);
+                .contains(says),
+            "{facts}: {refused}"
+        );
+        assert!(
+            recorded_calls(&f, "Input.dispatchMouseEvent").is_empty(),
+            "{facts}"
+        );
+    }
 }
 
 #[tokio::test]
@@ -5223,7 +5316,7 @@ async fn a_cover_that_clears_within_the_beat_does_not_stop_the_click() {
     let (target, tab) = bind(&f).await;
     let snap = snapshot(&f, &target, &tab).await;
     let button = ref_of(&snap, "main", "main-btn");
-    f.state.lock().unwrap().covered_by = Some((1, json!({"tag": "div", "id": "toast"})));
+    f.state.lock().unwrap().hit = Some((1, covered(), 20));
     let clicked = BrowserClickTool::new(f.engine.clone())
         .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
         .await;
@@ -5237,7 +5330,7 @@ async fn a_coordinate_click_and_a_dom_event_click_are_not_hit_tested() {
     let (target, tab) = bind(&f).await;
     let snap = snapshot(&f, &target, &tab).await;
     let button = ref_of(&snap, "main", "main-btn");
-    f.state.lock().unwrap().covered_by = Some((9, json!({"tag": "div", "id": "overlay"})));
+    f.state.lock().unwrap().hit = Some((9, covered(), 20));
     let click = BrowserClickTool::new(f.engine.clone());
     // The caller named a point, not an element: there is no target to be covered.
     let by_point = click
@@ -5258,4 +5351,175 @@ async fn a_coordinate_click_and_a_dom_event_click_are_not_hit_tested() {
             .as_str()
             .unwrap()
             .contains("elementFromPoint")));
+}
+
+// ── Found by review ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_stale_refusal_says_nothing_the_page_says_and_retires_the_ref_for_good() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    f.state
+        .lock()
+        .unwrap()
+        .renamed
+        .insert(2011, "Wire 4,000 USD".into());
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+    assert!(
+        !refused.to_string().contains("Wire"),
+        "what the element reads as now is for a read to tell: {refused}"
+    );
+
+    // The page puts the old name back before anything is read again: the
+    // ref was refused once and does not come back.
+    f.state.lock().unwrap().renamed.clear();
+    let again = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(again["refusal"]["code"], "browser_ref_stale", "{again}");
+    assert!(
+        recorded_calls(&f, "Runtime.callFunctionOn").is_empty(),
+        "nothing was clicked"
+    );
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(named_ref(&second, "Reply"), reply);
+}
+
+#[tokio::test]
+async fn a_continuation_is_refused_after_a_detach_even_on_the_same_document() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let token = first["snapshot"]["continuation"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    f.state.lock().unwrap().detached = true;
+    let stale = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
+    assert_eq!(stale["refusal"]["code"], "browser_ref_stale", "{stale}");
+    let fresh = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(fresh["snapshot"]["id"], first["snapshot"]["id"]);
+}
+
+#[tokio::test]
+async fn typing_that_opens_a_dialog_returns_at_once_with_the_dialog() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+        st.type_opens_dialog = true;
+    })
+    .await;
+    let agent = Agent::bound(&f, "changes-type-dialog").await;
+    let first = agent.snapshot().await;
+    let started = std::time::Instant::now();
+    let typed = agent
+        .call(
+            "browser_type",
+            json!({ "ref": named_ref(&first, "Reply body"), "text": "hello" }),
+        )
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "no call was waited out behind the dialog: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(typed["effect"], "unverifiable", "{typed}");
+    assert_eq!(typed["changes"]["kind"], "unavailable", "{typed}");
+    assert_eq!(typed["changes"]["reason"], "javascript_dialog_open");
+    assert_eq!(typed["changes"]["dialog"]["kind"], "confirm");
+    // The tab is not held: the dialog tool gets to it.
+    let dialog_id = typed["changes"]["dialog"]["dialog_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let dismissed = agent
+        .call(
+            "browser_dialog",
+            json!({ "action": "dismiss", "dialog_id": dialog_id }),
+        )
+        .await;
+    assert_eq!(dismissed["status"], "ok", "{dismissed}");
+}
+
+#[cfg(feature = "yaml")]
+#[tokio::test]
+async fn a_caller_that_may_click_but_not_read_learns_nothing_the_page_says() {
+    use crate::authorization::PermissionMode;
+    use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+    let runtime = SessionAuthorizationRegistry::with_ceiling(
+        SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Bounded],
+            false,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let allowing = |tools: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [{tools}]\n\
+                 resources:\n  desktop:\n    windows:\n      - pid: 1\n        window_id: 7\n  \
+                 browser:\n    origins: [\"https://fixture.test\"]\n"
+            ),
+        )
+        .unwrap();
+        let manifest = Arc::new(crate::session_manifest::load_manifest(&path).unwrap());
+        runtime
+            .compatibility_context(PermissionMode::Bounded, Some(manifest))
+            .unwrap()
+    };
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let mut agent = Agent::bound_as(
+        &f,
+        "click-no-read",
+        allowing("get_browser_state, browser_click"),
+    )
+    .await;
+    let first = agent.snapshot().await;
+    let (reply, archive) = (
+        named_ref(&first, "Reply"),
+        named_ref(&first, "Archive item 0"),
+    );
+    // Reading is taken away; the refs already held still act.
+    agent.context = allowing("browser_click");
+    {
+        let mut state = f.state.lock().unwrap();
+        state.renamed.insert(2011, "Wire 4,000 USD".into());
+        state
+            .click_renames
+            .push((2000, "Balance: 12,000 USD".into()));
+    }
+    let stale = agent
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(stale["error"]["code"], "browser_ref_stale", "{stale}");
+    let clicked = agent
+        .call(
+            "browser_click",
+            json!({ "ref": archive, "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(
+        clicked["effect"], "unverifiable",
+        "the click itself is allowed: {clicked}"
+    );
+    assert_eq!(clicked["changes"]["kind"], "unavailable", "{clicked}");
+    assert_eq!(clicked["changes"]["reason"], "permission_denied");
+    for result in [&stale, &clicked] {
+        let said = result.to_string();
+        assert!(
+            !said.contains("Wire") && !said.contains("Balance"),
+            "{said}"
+        );
+    }
 }

@@ -1896,7 +1896,7 @@ export type BrowserStepsOutput = {
     stoppedAt?: number,
     /**
      * `step_failed`, `typing_unconfirmed`, `javascript_dialog_open`,
-     * `document_changed`, `origin_changed`.
+     * `document_changed`.
      */
     stopReason?: string,
     /**

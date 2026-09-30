@@ -17,7 +17,10 @@
 //! - an `expect` that does not hold;
 //! - a JavaScript dialog the step opened (the page cannot be read or acted on
 //!   until `browser_dialog` resolves it);
-//! - a new document: later steps were planned against the old one.
+//! - a new document: later steps were planned against the old one. The batch
+//!   is pinned to the document it began on, whoever replaces it: a step that
+//!   reports a navigation stops the ones after it, and a named step whose
+//!   read lands in another ref space is not aimed at all.
 
 use std::sync::{Arc, OnceLock};
 use std::time::Duration;
@@ -268,6 +271,9 @@ pub(crate) fn expect_holds(outline: &str, complete: bool, expect: &BrowserStepEx
 struct Read {
     outline: String,
     complete: bool,
+    /// The ref space the read was recorded in (`p7`): another one means
+    /// another document.
+    space: Option<String>,
 }
 
 impl BrowserStepsTool {
@@ -293,6 +299,10 @@ impl BrowserStepsTool {
                     .and_then(|structured| structured.pointer("/snapshot/complete"))
                     .and_then(Value::as_bool)
                     == Some(true),
+                space: structured
+                    .and_then(|structured| structured.pointer("/snapshot/id"))
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
             }),
             // The read was refused or failed: the step cannot be aimed.
             _ => Err(failed(
@@ -313,11 +323,13 @@ impl BrowserStepsTool {
         }
     }
 
+    /// Wait, within bounds, for `expect` to hold. `Ok` carries the ref space
+    /// of the read that showed it.
     async fn expect(
         registry: &ToolRegistry,
         base: &Value,
         expect: &BrowserStepExpect,
-    ) -> Result<(), BrowserStepOutcome> {
+    ) -> Result<Option<String>, BrowserStepOutcome> {
         let query = expect
             .text
             .as_deref()
@@ -328,7 +340,7 @@ impl BrowserStepsTool {
         loop {
             let read = Self::read(registry, base, query).await?;
             if expect_holds(&read.outline, read.complete, expect) {
-                return Ok(());
+                return Ok(read.space);
             }
             if started.elapsed() >= EXPECT_WAIT {
                 return Err(failed(
@@ -346,11 +358,13 @@ impl BrowserStepsTool {
         }
     }
 
+    /// `document` is the ref space the session held when the batch began.
     async fn run(
         &self,
         registry: &ToolRegistry,
         input: &BrowserStepsInput,
         held: HeldView,
+        mut document: Option<String>,
     ) -> BrowserStepsOutput {
         let mut base = json!({ "target_id": input.target_id, "tab_id": input.tab_id });
         if let Some(session) = &input.session {
@@ -368,14 +382,28 @@ impl BrowserStepsTool {
             let reference = match (&step.reference, &step.role, &step.name) {
                 (Some(reference), _, _) => reference.clone(),
                 (None, Some(role), Some(name)) => {
-                    let resolved = match Self::read(registry, &base, name).await {
-                        Ok(read) => resolve_named(&read.outline, read.complete, role, name),
+                    let read = match Self::read(registry, &base, name).await {
+                        Ok(read) => read,
                         Err(outcome) => {
                             outcomes.push(outcome);
                             stopped = Some((number, "step_failed"));
                             break;
                         }
                     };
+                    // The batch is pinned to the document it began on. If
+                    // anything replaced it meanwhile (another session, the
+                    // page itself), a name found on the new page is not the
+                    // element this step was written for. A ref needs no such
+                    // check here: its own document is proven when it is used.
+                    match (&document, &read.space) {
+                        (Some(began), Some(now)) if began != now => {
+                            stopped = Some((number, "document_changed"));
+                            break;
+                        }
+                        (None, Some(now)) => document = Some(now.clone()),
+                        _ => {}
+                    }
+                    let resolved = resolve_named(&read.outline, read.complete, role, name);
                     match resolved {
                         Named::One(reference) => reference,
                         Named::Not(code, candidates) => {
@@ -405,7 +433,7 @@ impl BrowserStepsTool {
             let dialog = step_reported
                 .as_ref()
                 .is_some_and(|changes| changes.dialog.is_some());
-            let new_document = step_reported
+            let mut new_document = step_reported
                 .as_ref()
                 .is_some_and(|changes| changes.reason.as_deref() == Some("document_changed"));
             if dialog {
@@ -416,11 +444,23 @@ impl BrowserStepsTool {
             }
             if stop.is_none() && !dialog {
                 if let Some(expect) = &step.expect {
-                    if let Err(unmet) = Self::expect(registry, &base, expect).await {
-                        outcome.status = BrowserStepStatus::Failed;
-                        outcome.code = unmet.code;
-                        outcome.detail = unmet.detail;
-                        stop = Some("step_failed");
+                    match Self::expect(registry, &base, expect).await {
+                        // An expect may be about the page the step led to.
+                        Ok(space) => {
+                            new_document |= matches!(
+                                (&document, &space),
+                                (Some(began), Some(now)) if began != now
+                            );
+                            if document.is_none() {
+                                document = space;
+                            }
+                        }
+                        Err(unmet) => {
+                            outcome.status = BrowserStepStatus::Failed;
+                            outcome.code = unmet.code;
+                            outcome.detail = unmet.detail;
+                            stop = Some("step_failed");
+                        }
                     }
                 }
             }
@@ -596,8 +636,11 @@ impl Tool for BrowserStepsTool {
         let held = self
             .engine
             .held_view(&runtime_session, &input.target_id, &input.tab_id);
+        let document = self
+            .engine
+            .held_space(&runtime_session, &input.target_id, &input.tab_id);
         let output = IN_STEPS_BATCH
-            .scope((), self.run(&registry, &input, held))
+            .scope((), self.run(&registry, &input, held, document))
             .await;
         let ran = output.steps.len();
         let summary = match (&output.stopped_at, &output.stop_reason) {

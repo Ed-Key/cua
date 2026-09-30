@@ -383,7 +383,11 @@ session that works from it gets no `changes` from actions.
 The snapshot ranks active dialogs and visible controls before near-viewport
 and offscreen content. It excludes CSS-hidden retained state before applying
 the budgets. The whole result is fitted to `max_chars` (default 6000, up to
-60000): the ranked set is cut where the outline would pass it. Inspect
+60000): the ranked set is cut where the outline would pass it. It is a
+target, not a hard limit: a result always carries at least one line and 600
+characters of outline, and the snapshot inside `changes` may be up to twice
+as long, because a read that is diffed is cut at the same element as the
+outline it is compared with. Inspect
 `snapshot.complete`, `snapshot.omitted`, and `snapshot.continuation` rather
 than assuming the first response is exhaustive. To continue the same ranked
 snapshot:
@@ -416,8 +420,10 @@ too, so a ref from an earlier snapshot can be used later. A ref goes stale
 - the element leaves the page;
 - the element now reads as something else. Before every use the driver reads
   the element's role, name and link destination again, and refuses when they
-  differ from what the ref was issued for; the next read gives that element a
-  new ref;
+  differ from what the ref was issued for. That ref is then stale for good,
+  even if the element reads as before again, and the next read gives the
+  element a new ref. The refusal does not say what the element reads as now:
+  read the page for that;
 - the debugger is detached from the tab (the user cancelled Chrome's banner
   or pressed Stop), the extension reconnects, or the session ends.
 
@@ -488,10 +494,15 @@ browser_click
 
 `trusted` is the default and models browser input through CDP's Input domain.
 Before dispatch, the driver refreshes the element box and asks the page what
-is on top at the click point. When that is another element (an overlay, a
-badge, a cookie banner), it looks once more after a scroll and a short wait,
-then refuses with `browser_target_covered`, names the covering element, and
-sends nothing. The result's `changes` says what the click did.
+is on top at the click point. The click is sent only when that is the ref's
+element, something inside it, or its label. When it is another element (an
+overlay, a badge, a cookie banner), or the element around the ref's element,
+the driver looks once more after a scroll and a short wait, then refuses with
+`browser_target_covered` and sends nothing. The refusal names what is on top
+by its ref when your outline has one (`covered by p3:8`); otherwise read the
+page again to see it. If the page does not answer the question at all, the
+click is refused (`browser_action_unavailable`) rather than sent unproven.
+The result's `changes` says what the click did.
 
 Standalone Chromium on macOS and Linux can activate its native window when
 trusted CDP pointer input is used. CUA Driver detects that limitation and
@@ -694,8 +705,8 @@ result from the current host, process, window, session, and tab.
 - `browser_ref_stale`: the element left the page, became another element, or
   the document or attachment changed. Read again and use a new ref.
 - `browser_target_covered`: another element is on top of the click point. Act
-  on what covers it (its line is in the outline), or scroll; do not switch to
-  `dom_event` to click through it.
+  on what covers it (the refusal gives its ref when your outline has it), or
+  scroll; do not switch to `dom_event` to click through it.
 - `browser_dialog_open`: resolve the named `dialog_id` with `browser_dialog`.
 - `browser_action_unavailable`: choose a ref that declares the requested
   action; never treat a readable `content_ref` as clickable or editable.

@@ -2116,18 +2116,27 @@ impl BrowserEngine {
             .live_fingerprint(&validated.conn, &frame_session, entry)
             .await?;
         if live != Some(Fingerprint::of(entry)) {
+            // Stale for good, even if the node reads as before again later.
+            if let Some(held) = self.store.ref_of_node(
+                session,
+                target_id,
+                tab_id,
+                &entry.frame,
+                entry.backend_node_id,
+            ) {
+                self.store.retire_ref(session, target_id, tab_id, &held);
+            }
+            // What it reads as now is page content: a read says that, to a
+            // caller allowed to read. The refusal only says it changed.
             return Err(refuse(
                 BrowserRefusalCode::BrowserRefStale,
-                match &live {
-                    Some(live) => format!(
-                        "the element this ref named is now {} {:?}: the page changed it after \
-                         the ref was issued; re-run get_browser_state to re-snapshot",
-                        live.role,
-                        live.name.as_deref().unwrap_or("")
-                    ),
-                    None => "the ref's node is no longer in the live page; re-run \
-                             get_browser_state to re-snapshot"
-                        .to_owned(),
+                if live.is_some() {
+                    "the element this ref named now reads as another element (its role, name \
+                     or link destination changed after the ref was issued); re-run \
+                     get_browser_state to re-snapshot"
+                } else {
+                    "the ref's node is no longer in the live page; re-run get_browser_state \
+                     to re-snapshot"
                 },
             ));
         }
@@ -2891,37 +2900,54 @@ impl BrowserEngine {
                     format!("tab {tab_id} is not known for target {target_id}"),
                 )
             })?;
-            if let Some(identity) = &cache.root_identity {
-                let conn = self.connection_for_record(session, &record).await?;
-                let cdp_session = self
-                    .attach(
-                        &conn,
-                        &tab.cdp_target_id,
-                        session,
-                        record.generation,
-                        record.endpoint_transport,
-                    )
-                    .await?;
-                let tree = self.local_frame_tree(&conn, &cdp_session).await.map_err(|error| {
-                    match error {
-                        FrameTreeError::Unsupported => refuse(
-                            BrowserRefusalCode::BrowserRouteUnavailable,
-                            "the browser no longer reports its frame tree, so the semantic \n+                             continuation's document identity cannot be re-proven",
-                        ),
-                        FrameTreeError::Failed(error) => route_err(
-                            "Page.getFrameTree failed during semantic continuation revalidation",
-                            error,
-                        ),
-                    }
-                })?;
-                if !tree.proves(identity) {
-                    self.store
-                        .invalidate_tab_snapshots(session, target_id, tab_id);
-                    return Err(refuse(
-                        BrowserRefusalCode::BrowserRefStale,
-                        "the page navigated since this semantic continuation was minted; \n+                         re-run get_browser_state to start a fresh snapshot",
-                    ));
+            // A continuation pages the document recorded in a ref space and
+            // takes its refs from it: prove that space is still the live
+            // document on the live attachment, and do it one observation at
+            // a time like any other read.
+            let _observing = self
+                .observation_gates
+                .lock((session.to_owned(), target_id.to_owned(), tab_id.to_owned()))
+                .await;
+            let conn = self.connection_for_record(session, &record).await?;
+            let cdp_session = self
+                .attach(
+                    &conn,
+                    &tab.cdp_target_id,
+                    session,
+                    record.generation,
+                    record.endpoint_transport,
+                )
+                .await?;
+            let root = match self.local_frame_tree(&conn, &cdp_session).await {
+                Ok(tree) => Some(tree.main_identity()),
+                // A browser with no frame tree never had one: the space
+                // recorded none either, and the rest must still match.
+                Err(FrameTreeError::Unsupported) => None,
+                Err(FrameTreeError::Failed(error)) => {
+                    return Err(route_err(
+                        "Page.getFrameTree failed during semantic continuation revalidation",
+                        error,
+                    ))
                 }
+            };
+            let live = DocumentIdentity {
+                generation: record.generation,
+                attachment: conn.attachment(&tab.cdp_target_id),
+                cdp_target_id: tab.cdp_target_id.clone(),
+                root,
+            };
+            if tab
+                .stable
+                .space()
+                .is_none_or(|space| space.id != cache.space_id || space.identity != live)
+            {
+                self.store
+                    .invalidate_tab_snapshots(session, target_id, tab_id);
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the page navigated or the debugger was detached since this semantic \
+                     continuation was minted; re-run get_browser_state to start a fresh snapshot",
+                ));
             }
             let title = cache.document.title.clone().unwrap_or_default();
             let outline_budget = outline_budget(max_chars, &cache.url, &title);
@@ -3222,7 +3248,6 @@ impl BrowserEngine {
                     space_id: outcome.space_id,
                     url: url.clone(),
                     document: semantic,
-                    root_identity: semantic_root_identity,
                     continuations,
                 });
                 recorded = Some(outcome);
@@ -3489,6 +3514,18 @@ impl BrowserEngine {
         } else {
             Settled::Deadline
         }
+    }
+
+    /// The ref space (`p7`) the session holds for this tab, if any.
+    pub(crate) fn held_space(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+    ) -> Option<String> {
+        let target = self.store.get_target(session, target_id).ok()?;
+        let space = target.tabs.get(tab_id)?.stable.space()?;
+        Some(format!("p{}", space.id))
     }
 
     /// What the session holds for this tab: the baseline revision of its

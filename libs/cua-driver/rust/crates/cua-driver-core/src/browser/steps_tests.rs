@@ -50,6 +50,10 @@ struct Script {
     /// The outline reads return; `None` refuses them.
     outline: Option<String>,
     complete: bool,
+    /// The ref space reads report, and the one they report once any input
+    /// tool has been called (another session loaded another page meanwhile).
+    space: String,
+    space_after_input: Option<String>,
 }
 
 type Shared = Arc<Mutex<Script>>;
@@ -84,12 +88,15 @@ impl Tool for PageDouble {
                 })),
                 None => ToolResult::text("snapshot").with_structured(json!({
                     "status": "ok", "mode": "snapshot", "outline": outline,
-                    "snapshot": {"id": "p3", "complete": script.complete},
+                    "snapshot": {"id": script.space, "complete": script.complete},
                 })),
             };
         }
         let reference = args["ref"].as_str().unwrap_or_default().to_owned();
         let typing = self.def.name == "browser_type";
+        if let Some(space) = script.space_after_input.take() {
+            script.space = space;
+        }
         match script.acts.get(&reference).cloned() {
             Some(Acts::Refuses(code)) => BrowserRefusal::new(code, "refused by the page double").to_tool_result(),
             Some(Acts::Unverifiable) => ToolResult::text("typed; not read back").with_structured(json!({
@@ -119,6 +126,7 @@ fn page_registry() -> (Arc<ToolRegistry>, Shared) {
     let script = Arc::new(Mutex::new(Script {
         outline: Some(PAGE.to_owned()),
         complete: true,
+        space: "p3".to_owned(),
         ..Default::default()
     }));
     let mut registry = ToolRegistry::new();
@@ -478,6 +486,59 @@ async fn a_new_document_stops_the_steps_planned_against_the_old_one() {
     )
     .await;
     assert_eq!(output["status"], "completed", "{output}");
+}
+
+#[tokio::test]
+async fn a_named_step_is_not_aimed_at_a_document_the_batch_did_not_begin_on() {
+    // Nothing the batch did navigated: between two steps another session (or
+    // the page itself) loaded a page that has a button of the same name.
+    let (registry, script) = page_registry();
+    script.lock().unwrap().space_after_input = Some("p9".into());
+    let output = steps(
+        &registry,
+        "steps-replaced",
+        json!([
+            {"action": "click", "role": "button", "name": "Role"},
+            {"action": "click", "role": "button", "name": "Send invite"},
+        ]),
+    )
+    .await;
+    assert_eq!(
+        calls(&script),
+        [
+            "get_browser_state Role",
+            "browser_click p3:2",
+            "get_browser_state Send invite",
+            "get_browser_state since 0",
+        ],
+        "Send invite was found on the new page and not clicked"
+    );
+    assert_eq!(output["status"], "stopped");
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(2), &json!("document_changed"))
+    );
+    assert_eq!(output["steps"].as_array().unwrap().len(), 1);
+
+    // An expect may look at the page a step led to; the steps after it may not.
+    let (registry, script) = page_registry();
+    script.lock().unwrap().space_after_input = Some("p9".into());
+    let output = steps(
+        &registry,
+        "steps-replaced-expect",
+        json!([
+            {"action": "click", "role": "button", "name": "Role",
+             "expect": {"text": "ada@x.com (Editor)"}},
+            {"action": "click", "ref": "p3:6"},
+        ]),
+    )
+    .await;
+    assert_eq!(output["steps"][0]["status"], "ok", "{output}");
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(2), &json!("document_changed"))
+    );
+    assert!(!calls(&script).contains(&"browser_click p3:6".to_owned()));
 }
 
 #[tokio::test]

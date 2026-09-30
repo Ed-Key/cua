@@ -199,7 +199,6 @@ pub(crate) struct SemanticCache {
     pub(crate) space_id: u64,
     pub(crate) url: String,
     pub(crate) document: SemanticDocument,
-    pub(crate) root_identity: Option<FrameIdentity>,
     pub(crate) continuations: HashMap<String, SemanticContinuation>,
 }
 
@@ -472,6 +471,38 @@ impl BrowserStore {
                     "the semantic continuation is stale or does not belong to this session and tab",
                 )
             })
+    }
+
+    /// Retire one semantic ref for good (see [`TabRefs::retire`]).
+    pub(crate) fn retire_ref(&self, session: &str, target_id: &str, tab_id: &str, external: &str) {
+        let Some((space, index)) = parse_ref(external) else {
+            return;
+        };
+        self.update_target(session, target_id, |rec| {
+            if let Some(tab) = rec.tabs.get_mut(tab_id) {
+                tab.stable.retire(space, index);
+            }
+        });
+    }
+
+    /// The ref this session holds for one node of a tab, if it holds one.
+    pub(crate) fn ref_of_node(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        frame: &FrameRef,
+        backend_node_id: i64,
+    ) -> Option<String> {
+        let target = self.get_target(session, target_id).ok()?;
+        target
+            .tabs
+            .get(tab_id)?
+            .stable
+            .ref_of(&super::observation::NodeKey::in_frame(
+                frame,
+                backend_node_id,
+            ))
     }
 
     /// Drop every snapshot of one tab (navigation invalidates refs).

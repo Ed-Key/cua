@@ -19,7 +19,7 @@
 //! |---|---|---|---|
 //! | `get_browser_state` (default view) | Nodes seen before keep their refs; new nodes get new refs. Refs are retired when their node left a completely covered document or its fingerprint changed. | New revision; the baseline becomes this view. | A full snapshot (a diff when `since_revision` names the baseline). |
 //! | Action by this session (click, type, navigate, steps) | Proven at use: binding, frame document, attachment, live fingerprint. The observation after the action then follows the row above. | New revision once the page settles; one per `browser_steps` batch. | The diff from the baseline to the new revision. A full snapshot with a reason when no diff is possible or it would be larger. `unavailable` with a reason when the observation failed or was refused; then nothing here changes. |
-//! | Page mutates on its own | Unchanged until the next observation or use. A use re-reads the node's fingerprint and refuses `browser_ref_stale` when it differs or the node is gone. | Unchanged. | Nothing until the next result, whose diff lists the mutations as observed changes, never as caused by the action. |
+//! | Page mutates on its own | Unchanged until the next observation or use. A use re-reads the node's fingerprint and refuses `browser_ref_stale` when it differs or the node is gone; a ref refused for a changed fingerprint is retired for good, even if the node reads as before again. | Unchanged. | Nothing until the next result, whose diff lists the mutations as observed changes, never as caused by the action. A refusal never says what the node reads as now: that is page content, which only a read tells. |
 //! | Navigation, document replaced | Every ref of the old document is stale: at once for `browser_navigate`, otherwise when the loader identity is next proven (use or observation). | Dropped. | `browser_ref_stale` for an old ref; the next observation is a full snapshot, reason `document_changed`. |
 //! | Child frame navigated, removed, or moved to another process | Refs carry their frame's document and process identity. A use fails that proof (`browser_ref_stale`, and the space is dropped as above). An observation retires only that frame's refs; its new nodes get new refs. | Kept across an observation; dropped by a failed use. | The diff reports the frame's old lines as gone and its new lines as added. |
 //! | Same-document history change (pushState, fragment) | Kept: the loader identity is unchanged, and fingerprints still guard each use. | Kept. | A diff; it carries the page URL when that changed. |
@@ -32,7 +32,7 @@
 //! | JavaScript dialog opens | Unchanged. | Unchanged: the page cannot be observed while the dialog is up. | The action that opened it returns at once, names the dialog and its `dialog_id`, and its `changes` is `unavailable`, reason `javascript_dialog_open`. A batch stops there. Until `browser_dialog` resolves it, reads and actions refuse `browser_dialog_open`. |
 //! | Observation and action at the same time in one session | Recording an observation is one atomic step, and observations of a tab run one at a time. | Revisions are totally ordered; each result names its base and new revision. | A diff whose `base_revision` is the latest baseline, or a full snapshot with reason `revision_unknown` when the baseline moved meanwhile. |
 //! | Call cancelled, response lost | Unchanged: refs stay valid either way. | Unchanged when cancelled before recording; advanced when the response was lost after it. | Every diff names `base_revision`. An agent that does not hold that revision asks `get_browser_state` for a full snapshot. |
-//! | Change of format, query, scope, or a continuation | A query, scope or continuation read takes its refs from the same space. A `dom_refs_v1` snapshot replaces the space: semantic refs are stale. | A query, scope or continuation read leaves both alone. `dom_refs_v1` drops them. | A side read returns its own outline, never a diff. After `dom_refs_v1`, actions return no `changes`; the next semantic observation is a full snapshot, reason `no_baseline`. |
+//! | Change of format, query, scope, or a continuation | A query, scope or continuation read takes its refs from the same space (a continuation only after the space is proven to be the live document on the live attachment). A `dom_refs_v1` snapshot replaces the space: semantic refs are stale. | A query, scope or continuation read leaves both alone. `dom_refs_v1` drops them. | A side read returns its own outline, never a diff. After `dom_refs_v1`, actions return no `changes`; the next semantic observation is a full snapshot, reason `no_baseline`. |
 //!
 //! "Left the observation" is not "removed": ranking and the size budget can
 //! drop a node that still exists. A diff says `gone` only for a ref retired by
@@ -78,10 +78,15 @@ pub(crate) struct NodeKey {
 
 impl NodeKey {
     pub(crate) fn of(entry: &RefEntry) -> Self {
+        Self::in_frame(&entry.frame, entry.backend_node_id)
+    }
+
+    /// The node `backend_node_id` of the document `frame` names.
+    pub(crate) fn in_frame(frame: &super::store::FrameRef, backend_node_id: i64) -> Self {
         Self {
-            frame: entry.frame.identity.clone(),
-            oopif_target_id: entry.frame.oopif_target_id.clone(),
-            backend_node_id: entry.backend_node_id,
+            frame: frame.identity.clone(),
+            oopif_target_id: frame.oopif_target_id.clone(),
+            backend_node_id,
         }
     }
 }
@@ -465,6 +470,24 @@ impl TabRefs {
             .as_ref()
             .filter(|space| space.id == space_id)
             .and_then(|space| space.capabilities.get(&index))
+    }
+
+    /// Retire one ref for good: a use found its node reading as another
+    /// element. It stays stale even if the node later reads as before, and
+    /// the next diff reports its line gone.
+    pub(crate) fn retire(&mut self, space_id: u64, index: u32) {
+        if let Some(space) = self.space.as_mut().filter(|space| space.id == space_id) {
+            space.retire(index);
+        }
+    }
+
+    /// The ref this session holds for a node, if it holds one.
+    pub(crate) fn ref_of(&self, node: &NodeKey) -> Option<String> {
+        let space = self.space.as_ref()?;
+        space
+            .by_node
+            .get(node)
+            .map(|index| format_ref(space.id, *index))
     }
 
     /// The space for `identity`: the current one when it is provably the same
@@ -1401,6 +1424,40 @@ mod tests {
         let fifth = session.observe(identity("L1", 1), &[reused], fourth.revision);
         assert_ne!(keys(&fifth)[0], button_ref);
         assert!(!session.resolves(&button_ref));
+    }
+
+    #[test]
+    fn a_ref_retired_at_use_stays_stale_when_the_node_reads_as_before_again() {
+        let mut session = Session::new(0);
+        let reply = node(10, "button", "Reply");
+        let first = session.observe(identity("L1", 1), &[reply.clone()], None);
+        let held = keys(&first)[0].clone();
+        assert_eq!(
+            session.refs.ref_of(&NodeKey::of(&reply)),
+            Some(held.clone())
+        );
+
+        // A use found the node reading as "Delete" and retired the ref.
+        let (space, index) = crate::browser::store::parse_ref(&held).unwrap();
+        session.refs.retire(space, index);
+        assert!(!session.resolves(&held));
+        assert_eq!(session.refs.ref_of(&NodeKey::of(&reply)), None);
+
+        // The page put the old name back. The node gets a new ref; the old
+        // one is reported gone and never resolves again.
+        let second = session.observe(identity("L1", 1), &[reply], first.revision);
+        assert_ne!(keys(&second)[0], held);
+        assert!(!session.resolves(&held));
+        let Told::Diff { ops, .. } = &second.told else {
+            panic!("{:?}", second.told)
+        };
+        assert_eq!(
+            ops[0],
+            DiffOp::Leave {
+                key: held,
+                gone: true
+            }
+        );
     }
 
     #[test]
