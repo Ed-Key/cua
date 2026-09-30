@@ -182,6 +182,8 @@ pub enum ToolRefusalCode {
     BrowserInputIncomplete,
     BrowserActionUnavailable,
     BrowserOriginOutsideScope,
+    BrowserDialogOpen,
+    BrowserTargetCovered,
     Other,
 }
 
@@ -205,6 +207,8 @@ impl ToolRefusalCode {
             Self::BrowserInputIncomplete => "browser_input_incomplete",
             Self::BrowserActionUnavailable => "browser_action_unavailable",
             Self::BrowserOriginOutsideScope => "browser_origin_outside_scope",
+            Self::BrowserDialogOpen => "browser_dialog_open",
+            Self::BrowserTargetCovered => "browser_target_covered",
             Self::Other => "other",
         }
     }
@@ -231,6 +235,8 @@ impl ToolRefusalCode {
             Some("browser_input_incomplete") => Self::BrowserInputIncomplete,
             Some("browser_action_unavailable") => Self::BrowserActionUnavailable,
             Some("browser_origin_outside_scope") => Self::BrowserOriginOutsideScope,
+            Some("browser_dialog_open") => Self::BrowserDialogOpen,
+            Some("browser_target_covered") => Self::BrowserTargetCovered,
             Some(_) | None => Self::Other,
         }
     }
@@ -256,6 +262,8 @@ impl From<crate::browser::refusal::BrowserRefusalCode> for ToolRefusalCode {
             BrowserRefusalCode::BrowserInputIncomplete => Self::BrowserInputIncomplete,
             BrowserRefusalCode::BrowserActionUnavailable => Self::BrowserActionUnavailable,
             BrowserRefusalCode::BrowserOriginOutsideScope => Self::BrowserOriginOutsideScope,
+            BrowserRefusalCode::BrowserDialogOpen => Self::BrowserDialogOpen,
+            BrowserRefusalCode::BrowserTargetCovered => Self::BrowserTargetCovered,
         }
     }
 }
@@ -378,8 +386,8 @@ pub fn tool_operation(tool_name: &str, args: Option<&serde_json::Value>) -> Tool
         "get_browser_state" => {
             if string_arg("target_id").is_some() {
                 match string_arg("snapshot_format") {
-                    Some("semantic_v2") => ToolOperation::BrowserSnapshotSemanticV2,
-                    None | Some("dom_refs_v1") => ToolOperation::BrowserSnapshotDomRefsV1,
+                    None | Some("semantic_v2") => ToolOperation::BrowserSnapshotSemanticV2,
+                    Some("dom_refs_v1") => ToolOperation::BrowserSnapshotDomRefsV1,
                     Some(_) => ToolOperation::Other,
                 }
             } else if args.and_then(|value| value.get("pid")).is_some()
@@ -471,7 +479,7 @@ pub fn is_computer_action(tool_name: &str, operation: ToolOperation) -> bool {
     }
     if matches!(
         tool_name,
-        "browser_set_input_files" | "browser_download" | "browser_pointer"
+        "browser_set_input_files" | "browser_download" | "browser_pointer" | "browser_steps"
     ) {
         return true;
     }
@@ -725,6 +733,7 @@ fn structured_refusal_code(tool_name: &str, result: Option<&serde_json::Value>) 
             | "browser_set_input_files"
             | "browser_download"
             | "browser_pointer"
+            | "browser_steps"
     ) {
         return ToolRefusalCode::None;
     }

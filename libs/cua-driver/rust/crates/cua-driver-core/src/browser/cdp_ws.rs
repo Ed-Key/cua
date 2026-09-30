@@ -40,6 +40,8 @@ pub enum CdpMethodPolicy {
 
 const EXISTING_PROFILE_METHODS: &[&str] = &[
     "Accessibility.getFullAXTree",
+    // One node's role and name, read again before a ref is acted on.
+    "Accessibility.getPartialAXTree",
     "Browser.getWindowBounds",
     "Browser.getWindowForTarget",
     "Browser.setDownloadBehavior",
@@ -135,6 +137,10 @@ struct Demux {
     session_targets: StdMutex<HashMap<String, String>>,
     dialogs: StdMutex<HashMap<String, CdpDialogState>>,
     next_dialog_generation: AtomicU64,
+    /// Page target -> the stamp of its current debugger attachment on this
+    /// connection. Minted at the first attach, dropped when the debugger
+    /// detaches from the target; the next attach mints another.
+    attachments: StdMutex<HashMap<String, u64>>,
     closed: AtomicBool,
 }
 
@@ -149,6 +155,17 @@ impl Demux {
     /// Page again instead of trusting a dead registration or a stale dialog.
     fn observe_dialog_event(&self, event: &CdpEvent) {
         if event.method == "Target.detachedFromTarget" {
+            // The attachment ended: whatever was proven through it (page
+            // refs) is not proven through the next one. A detach that does
+            // not name its target proves nothing about any of them.
+            let mut attachments = self.attachments.lock().unwrap();
+            match event.params.get("targetId").and_then(Value::as_str) {
+                Some(target_id) => {
+                    attachments.remove(target_id);
+                }
+                None => attachments.clear(),
+            }
+            drop(attachments);
             if let Some(detached) = event.params.get("sessionId").and_then(Value::as_str) {
                 if let Some(target_id) = self.session_targets.lock().unwrap().remove(detached) {
                     let mut dialogs = self.dialogs.lock().unwrap();
@@ -179,8 +196,7 @@ impl Demux {
                         Some("beforeunload") => "beforeunload",
                         _ => "other",
                     };
-                    let generation =
-                        demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
+                    let generation = demux.next_dialog_generation.fetch_add(1, Ordering::Relaxed);
                     if let Some(target_id) = target_id {
                         demux.dialogs.lock().unwrap().insert(
                             target_id,
@@ -210,6 +226,7 @@ impl Demux {
         self.subscribers.lock().unwrap().clear();
         self.session_targets.lock().unwrap().clear();
         self.dialogs.lock().unwrap().clear();
+        self.attachments.lock().unwrap().clear();
     }
 }
 
@@ -296,6 +313,7 @@ impl CdpConnection {
             session_targets: StdMutex::new(HashMap::new()),
             dialogs: StdMutex::new(HashMap::new()),
             next_dialog_generation: AtomicU64::new(1),
+            attachments: StdMutex::new(HashMap::new()),
             closed: AtomicBool::new(false),
         });
         let reader = tokio::spawn(read_loop(read, demux.clone()));
@@ -337,6 +355,21 @@ impl CdpConnection {
         let (tx, rx) = mpsc::unbounded_channel();
         self.demux.subscribers.lock().unwrap().push(tx);
         rx
+    }
+
+    /// The stamp of this connection's current debugger attachment to a page
+    /// target. It is the same from one attach to the next while the debugger
+    /// stays attached, and new after a detach or on another connection, so
+    /// equality proves nothing was detached in between.
+    pub fn attachment(&self, target_id: &str) -> u64 {
+        static NEXT_ATTACHMENT: AtomicU64 = AtomicU64::new(1);
+        *self
+            .demux
+            .attachments
+            .lock()
+            .unwrap()
+            .entry(target_id.to_owned())
+            .or_insert_with(|| NEXT_ATTACHMENT.fetch_add(1, Ordering::Relaxed))
     }
 
     /// Associate the one Page-enabled dialog session with its exact target.
@@ -448,7 +481,11 @@ struct DeferredRelease {
 /// episode's tabs. See `extension_relay::attach_gates`.
 pub(crate) async fn release_relay_holder(conn: &CdpConnection, holder: &str) {
     let _ = conn
-        .call(None, "Cua.releaseSession", serde_json::json!({ "cuaSession": holder }))
+        .call(
+            None,
+            "Cua.releaseSession",
+            serde_json::json!({ "cuaSession": holder }),
+        )
         .await;
 }
 
@@ -552,7 +589,10 @@ impl CdpPool {
         let (conn, mut holders) = match conns.get(ws_url) {
             Some(entry) if !entry.conn.is_closed() => (entry.conn.clone(), entry.holders.clone()),
             Some(_) => anyhow::bail!("the approved browser socket closed before it was claimed"),
-            None => (Arc::new(CdpConnection::connect(ws_url).await?), HashSet::new()),
+            None => (
+                Arc::new(CdpConnection::connect(ws_url).await?),
+                HashSet::new(),
+            ),
         };
         if !is_live() {
             anyhow::bail!("the claiming grant was released");
@@ -655,13 +695,11 @@ impl CdpPool {
         if !held && !is_live(generation) {
             anyhow::bail!("the reconnecting grant was released while dialing");
         }
-        let entry = conns
-            .entry(ws_url.to_owned())
-            .or_insert_with(|| PoolEntry {
-                conn: conn.clone(),
-                generation: None,
-                holders: HashSet::new(),
-            });
+        let entry = conns.entry(ws_url.to_owned()).or_insert_with(|| PoolEntry {
+            conn: conn.clone(),
+            generation: None,
+            holders: HashSet::new(),
+        });
         if entry.conn.is_closed() {
             entry.conn = conn;
         }
@@ -689,7 +727,10 @@ impl CdpPool {
     /// holders' releases, never through the legacy route's eviction.
     pub async fn evict(&self, ws_url: &str) {
         let mut conns = self.lock_conns().await;
-        if conns.get(ws_url).is_some_and(|entry| entry.generation.is_none()) {
+        if conns
+            .get(ws_url)
+            .is_some_and(|entry| entry.generation.is_none())
+        {
             conns.remove(ws_url);
         }
     }
@@ -727,8 +768,8 @@ impl CdpPool {
             generation,
             relay_holder,
         };
-        let can_send = release.relay_holder.is_none()
-            || tokio::runtime::Handle::try_current().is_ok();
+        let can_send =
+            release.relay_holder.is_none() || tokio::runtime::Handle::try_current().is_ok();
         if can_send {
             if let Ok(mut conns) = self.conns.try_lock() {
                 self.apply_deferred_releases(&mut conns);
@@ -844,6 +885,7 @@ mod tests {
             session_targets: StdMutex::new(HashMap::new()),
             dialogs: StdMutex::new(HashMap::new()),
             next_dialog_generation: AtomicU64::new(1),
+            attachments: StdMutex::new(HashMap::from([("T1".to_owned(), 1), ("T2".to_owned(), 2)])),
             closed: AtomicBool::new(false),
         };
         let event = |method: &str, session: Option<&str>, params: serde_json::Value| CdpEvent {
@@ -875,7 +917,12 @@ mod tests {
         assert!(!demux.dialogs.lock().unwrap().contains_key("T1"));
         // The other target keeps its registration and dialog.
         assert_eq!(
-            demux.session_targets.lock().unwrap().get("page-b").map(String::as_str),
+            demux
+                .session_targets
+                .lock()
+                .unwrap()
+                .get("page-b")
+                .map(String::as_str),
             Some("T2")
         );
         assert!(demux.dialogs.lock().unwrap().contains_key("T2"));
@@ -1091,10 +1138,22 @@ mod tests {
         });
         let url = format!("ws://127.0.0.1:{port}/devtools/browser/retry");
         let pool = CdpPool::new();
-        pool.claim_existing(&url, 1, || true).await.unwrap().demux.close();
+        pool.claim_existing(&url, 1, || true)
+            .await
+            .unwrap()
+            .demux
+            .close();
 
-        assert!(pool.reconnect_existing(&url, 1, || Ok::<_, ()>(2), |_| true).await.unwrap().is_err());
-        let live = pool.reconnect_existing(&url, 2, || Ok::<_, ()>(3), |_| true).await.unwrap().unwrap();
+        assert!(pool
+            .reconnect_existing(&url, 1, || Ok::<_, ()>(2), |_| true)
+            .await
+            .unwrap()
+            .is_err());
+        let live = pool
+            .reconnect_existing(&url, 2, || Ok::<_, ()>(3), |_| true)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(!live.is_closed());
         for stale in [1, 2] {
             let Err(error) = pool.get_existing(&url, stale).await else {
@@ -1128,7 +1187,11 @@ mod tests {
         let server = MockCdpServer::start(StdArc::new(|_| MockReply::ok(json!({})))).await;
         let url = server.ws_url();
         let pool = StdArc::new(CdpPool::new());
-        pool.claim_existing(&url, 1, || true).await.unwrap().demux.close();
+        pool.claim_existing(&url, 1, || true)
+            .await
+            .unwrap()
+            .demux
+            .close();
 
         // An ordinary dial that stalls in its handshake holds the pool lock.
         let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -1158,7 +1221,10 @@ mod tests {
                 .is_err(),
             "the reconnect must wait for the pool lock"
         );
-        assert!(!advanced.load(Ordering::SeqCst), "cancelled before the lock");
+        assert!(
+            !advanced.load(Ordering::SeqCst),
+            "cancelled before the lock"
+        );
         holder.abort();
         let _ = holder.await;
 
@@ -1168,7 +1234,10 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert!(Arc::ptr_eq(&live, &pool.get_existing(&url, 2).await.unwrap()));
+        assert!(Arc::ptr_eq(
+            &live,
+            &pool.get_existing(&url, 2).await.unwrap()
+        ));
     }
 
     #[tokio::test]
@@ -1252,6 +1321,47 @@ mod tests {
         assert_eq!(second.session_id.as_deref(), Some("child-sess"));
         assert_eq!(second.params["n"], 2);
         assert!(events.try_recv().is_err(), "no phantom events");
+    }
+
+    #[tokio::test]
+    async fn a_detach_ends_the_targets_attachment_and_the_next_one_is_new() {
+        let handler: crate::browser::mock_cdp::MockHandler =
+            Arc::new(|call| match call.method.as_str() {
+                "Detach.named" => MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Target.detachedFromTarget".into(),
+                    session_id: None,
+                    params: json!({"sessionId": "tab-session-a", "targetId": "page-a"}),
+                }]),
+                "Detach.unnamed" => MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Target.detachedFromTarget".into(),
+                    session_id: None,
+                    params: json!({"sessionId": "tab-session-b"}),
+                }]),
+                _ => MockReply::ok(json!({})),
+            });
+        let server = MockCdpServer::start(handler).await;
+        let conn = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        let (a, b) = (conn.attachment("page-a"), conn.attachment("page-b"));
+        assert_ne!(a, b);
+        // Attaching again while the debugger stays attached proves the same.
+        assert_eq!(conn.attachment("page-a"), a);
+
+        conn.call(None, "Detach.named", json!({})).await.unwrap();
+        let reattached = conn.attachment("page-a");
+        assert_ne!(
+            reattached, a,
+            "refs proven through the old attachment are stale"
+        );
+        assert_eq!(conn.attachment("page-b"), b, "another tab is untouched");
+
+        // A detach that names no target proves nothing about any of them.
+        conn.call(None, "Detach.unnamed", json!({})).await.unwrap();
+        assert_ne!(conn.attachment("page-a"), reattached);
+        assert_ne!(conn.attachment("page-b"), b);
+
+        // Another connection never shares a stamp, even for the same target.
+        let other = CdpConnection::connect(&server.ws_url()).await.unwrap();
+        assert_ne!(other.attachment("page-a"), conn.attachment("page-a"));
     }
 
     #[tokio::test]

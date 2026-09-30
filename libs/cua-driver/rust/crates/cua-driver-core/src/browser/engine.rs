@@ -40,6 +40,9 @@ use super::binding::{
 use super::cdp_ws::{CdpConnection, CdpPool};
 use super::grant::{ExistingProfileGrant, ExistingProfileGrants, GrantLookup};
 use super::mutation::{MutationGates, MutationKey};
+use super::observation::{
+    DocumentIdentity, Fingerprint, FullReason, TabRefs, Told, ViewKind, ViewLine, ViewNode,
+};
 use super::platform::{
     BrowserConsentOutcome, BrowserConsentRequest, BrowserPlatform, BrowserVisualAction,
     BrowserVisualActionKind, ExistingProfileSetupRequest,
@@ -48,13 +51,13 @@ use super::prepare::ManagedBrowsers;
 use super::reconnect::{ReconnectGates, ReconnectKey};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::semantic::{
-    build_dom_index, build_layout_index, compose_accessibility_tree, parse_viewport,
-    snapshot_document_title, OmissionCounts, SemanticDocument, SemanticNode,
-    DEFAULT_SEMANTIC_NODE_BUDGET, SEMANTIC_COMPUTED_STYLES,
+    ax_reading, build_dom_index, build_layout_index, compose_accessibility_tree, dom_reading,
+    listed_ref, parse_viewport, snapshot_document_title, OmissionCounts, SemanticDocument,
+    SemanticNode, DEFAULT_SEMANTIC_NODE_BUDGET, SEMANTIC_COMPUTED_STYLES,
 };
 use super::store::{
-    format_ref, BrowserStore, FrameIdentity, FrameKind, FrameRef, RefEntry, SemanticContinuation,
-    SnapshotRecord, TabRecord, TargetRecord,
+    format_ref, BrowserStore, FrameIdentity, FrameKind, FrameRef, RefEntry, SemanticCache,
+    SemanticContinuation, SnapshotRecord, TabRecord, TargetRecord,
 };
 use super::types::{
     BindingQuality, BrowserClassification, BrowserEngineFamily, BrowserProcessRole,
@@ -81,6 +84,9 @@ pub struct BrowserEngine {
     pub(crate) approval_broker: Arc<crate::consent::ApprovalBroker>,
     pub(crate) protected_resource_ownership: Arc<crate::consent::ProtectedResourceOwnershipStore>,
     mutation_gates: MutationGates,
+    /// One observation of a tab at a time per session: collecting the page
+    /// and recording it happen as one step, so revisions are ordered.
+    observation_gates: super::keyed_gates::KeyedGates<(String, String, String)>,
     pub(crate) reconnect_gates: ReconnectGates,
     pending_existing_profile_cleanups: Mutex<HashMap<String, Vec<ExistingProfileSetupRequest>>>,
     session_end_hook: Mutex<Option<crate::session::SessionEndHookRegistration>>,
@@ -266,6 +272,8 @@ pub(crate) struct ValidatedTab {
     pub native: NativeWindowInfo,
     /// Flattened CDP session id attached to the tab's target.
     pub cdp_session: String,
+    /// The target's committed URL as the browser process reports it.
+    pub target_url: String,
 }
 
 fn viewport_point_to_screen(
@@ -426,18 +434,14 @@ pub(crate) struct SnapshotOutcome {
     pub oopif: OopifStatus,
 }
 
-pub(crate) struct SemanticListedRef {
-    pub external: String,
-    pub node: SemanticNode,
-}
-
 pub(crate) struct SemanticSnapshotOutcome {
     pub snapshot_id: u64,
     pub url: String,
     pub title: String,
+    /// One line per node, its ref and actions inline.
     pub outline: String,
-    pub refs: Vec<SemanticListedRef>,
-    pub content_refs: Vec<SemanticListedRef>,
+    pub action_refs: usize,
+    pub content_refs: usize,
     pub complete: bool,
     pub scope: &'static str,
     pub selected_nodes: usize,
@@ -445,6 +449,68 @@ pub(crate) struct SemanticSnapshotOutcome {
     pub omissions: OmissionCounts,
     pub continuation: Option<String>,
     pub oopif: OopifStatus,
+    /// Characters the outline was allowed.
+    pub outline_budget: usize,
+    /// The same refs as a structured list, when it was asked for.
+    pub listed: Option<Vec<Value>>,
+    /// The session's baseline revision after this read.
+    pub revision: Option<u64>,
+    /// A diff when one was asked for and possible; otherwise the snapshot
+    /// stands, with the reason a diff was not possible.
+    pub told: Told,
+}
+
+/// Default size of a whole semantic snapshot result, in serialized characters.
+pub(crate) const DEFAULT_SNAPSHOT_CHARS: usize = 6_000;
+pub(crate) const MIN_SNAPSHOT_CHARS: usize = 1_500;
+pub(crate) const MAX_SNAPSHOT_CHARS: usize = 60_000;
+/// What a snapshot result spends outside the outline, the page URL and the
+/// title: ids, snapshot metadata, the text summary and the JSON-RPC frame.
+const SNAPSHOT_ENVELOPE_CHARS: usize = 900;
+const MIN_OUTLINE_CHARS: usize = 600;
+
+/// Characters the outline may take so the whole result stays in `max_chars`.
+fn outline_budget(max_chars: usize, url: &str, title: &str) -> usize {
+    let quoted =
+        |text: &str| serde_json::to_string(text).map_or(text.len(), |json| json.chars().count());
+    max_chars
+        .saturating_sub(SNAPSHOT_ENVELOPE_CHARS + quoted(url) + quoted(title))
+        .max(MIN_OUTLINE_CHARS)
+}
+
+fn outline_of(lines: &[ViewLine]) -> String {
+    lines
+        .iter()
+        .map(|line| line.line.as_str())
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The structured ref list for recorded lines: `facts` holds each line's
+/// capability and value, in line order.
+fn listed_refs(lines: &[ViewLine], facts: Vec<(RefEntry, Option<String>)>) -> Vec<Value> {
+    lines
+        .iter()
+        .zip(facts)
+        .map(|(line, (entry, value))| listed_ref(&line.key, &entry, value.as_deref()))
+        .collect()
+}
+
+fn listed_facts(page: &super::semantic::SemanticPage) -> Vec<(RefEntry, Option<String>)> {
+    page.view
+        .iter()
+        .map(|node| node.entry.clone())
+        .zip(page.values.iter().cloned())
+        .collect()
+}
+
+/// (action refs, content refs) among a view's lines.
+fn ref_counts(view: &[ViewNode]) -> (usize, usize) {
+    let actions = view
+        .iter()
+        .filter(|node| !node.entry.actions.is_empty())
+        .count();
+    (actions, view.len() - actions)
 }
 
 pub(crate) struct BrowserTabScreenshot {
@@ -682,6 +748,7 @@ impl BrowserEngine {
             approval_broker,
             protected_resource_ownership,
             mutation_gates: MutationGates::new(),
+            observation_gates: super::keyed_gates::KeyedGates::new(),
             reconnect_gates: ReconnectGates::new(),
             pending_existing_profile_cleanups: Mutex::new(HashMap::new()),
             session_end_hook: Mutex::new(None),
@@ -984,9 +1051,12 @@ impl BrowserEngine {
                 &endpoint.ws_url,
                 old_generation,
                 || {
-                    let new_generation = self
-                        .existing_profile_grants
-                        .bump_generation(session, transport_session, pid, old_generation)?;
+                    let new_generation = self.existing_profile_grants.bump_generation(
+                        session,
+                        transport_session,
+                        pid,
+                        old_generation,
+                    )?;
                     self.store
                         .invalidate_endpoint_generation(pid, old_generation);
                     Ok(new_generation)
@@ -1340,7 +1410,9 @@ impl BrowserEngine {
             }
         }
         let access_class = endpoint_access_class(grant.is_some(), driver_owned, class.process_role)
-            .map_err(|refusal| existing_profile_next_call(refusal, pid, window_id, extension_connected))?;
+            .map_err(|refusal| {
+                existing_profile_next_call(refusal, pid, window_id, extension_connected)
+            })?;
 
         let native = self.native_window_checked(pid, window_id).await?;
         let fingerprint = self.platform.process_fingerprint(pid).await?;
@@ -1445,15 +1517,14 @@ impl BrowserEngine {
             let tab_id = self.store.mint_tab_id();
             tabs.insert(
                 tab_id.clone(),
-                TabRecord {
+                TabRecord::new(
                     tab_id,
-                    cdp_target_id: c.cdp_target_id.clone(),
-                    title: c.title.clone(),
-                    url: c.url.clone(),
-                    active: selected_cdp_target_id.map(|selected| selected == c.cdp_target_id),
-                    generation: grant.as_ref().map_or(0, |grant| grant.generation),
-                    snapshots: HashMap::new(),
-                },
+                    c.cdp_target_id.clone(),
+                    c.title.clone(),
+                    c.url.clone(),
+                    selected_cdp_target_id.map(|selected| selected == c.cdp_target_id),
+                    grant.as_ref().map_or(0, |grant| grant.generation),
+                ),
             );
         }
 
@@ -1496,7 +1567,10 @@ impl BrowserEngine {
         use super::prepare::ExistingProfileConsent as Consent;
         matches!(
             self.existing_profile_consent(pid, window_id).await,
-            Ok((_, Consent::ExtensionInstalled | Consent::Unrestricted | Consent::LaunchGrant))
+            Ok((
+                _,
+                Consent::ExtensionInstalled | Consent::Unrestricted | Consent::LaunchGrant
+            ))
         )
     }
 
@@ -1735,13 +1809,24 @@ impl BrowserEngine {
             ));
         }
 
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+        let target_url = live.url.clone();
+        let cdp_session = self
+            .attach(
+                &conn,
+                &tab.cdp_target_id,
+                session,
+                record.generation,
+                record.endpoint_transport,
+            )
+            .await?;
         let dispatch_context = crate::tool::current_dispatch_authorization_context();
         if dispatch_context
             .as_deref()
             .is_some_and(|context| context.capability_manifest().is_some())
         {
-            let live_url = self.live_top_level_url(&conn, &cdp_session).await?;
+            let live_url = self
+                .live_top_level_url(&conn, &cdp_session, &tab.cdp_target_id, &target_url)
+                .await?;
             // A browser mutation admitted for a delegated session must use
             // that exact session's capability manifest. Falling back to the
             // process compatibility manifest would let a missing task-local
@@ -1763,14 +1848,27 @@ impl BrowserEngine {
             tab,
             native,
             cdp_session,
+            target_url,
         })
     }
 
+    /// The live top-level document's URL, from the page's own frame tree.
+    ///
+    /// While a JavaScript dialog is open the page answers nothing, the
+    /// frame tree included, and nothing can navigate it either. The browser
+    /// process still reports the target's committed URL, which is what the
+    /// frame tree would say; without it the dialog could never be inspected
+    /// or resolved, since both are admitted against the live origin.
     async fn live_top_level_url(
         &self,
         conn: &CdpConnection,
         cdp_session: &str,
+        cdp_target_id: &str,
+        target_url: &str,
     ) -> Result<String, BrowserRefusal> {
+        if conn.dialog_state(cdp_target_id).is_some() && !target_url.is_empty() {
+            return Ok(target_url.to_owned());
+        }
         let frame_tree = conn
             .call(Some(cdp_session), "Page.getFrameTree", json!({}))
             .await
@@ -1800,7 +1898,12 @@ impl BrowserEngine {
             .revalidate_for_mutation(session, target_id, Some(tab_id))
             .await?;
         let live_url = self
-            .live_top_level_url(&validated.conn, &validated.cdp_session)
+            .live_top_level_url(
+                &validated.conn,
+                &validated.cdp_session,
+                &validated.tab.cdp_target_id,
+                &validated.target_url,
+            )
             .await?;
         let live_origin = protected_live_origin_scope(&live_url)?;
         Ok((validated, live_origin))
@@ -1975,12 +2078,164 @@ impl BrowserEngine {
         Ok(out)
     }
 
-    /// Re-prove a ref's frame/document identity and return the CDP
-    /// session its `backendNodeId` is valid in. Called after
-    /// [`Self::revalidate_for_mutation`], before the ref is touched.
-    /// Any identity that cannot be re-proven is a refusal, and a stale
-    /// document additionally invalidates the tab's snapshots.
+    /// Re-prove a ref before it is touched and return the CDP session its
+    /// `backendNodeId` is valid in. Called after
+    /// [`Self::revalidate_for_mutation`]. The frame's document identity is
+    /// proven for every ref; a semantic ref must also still be on the
+    /// attachment it was issued on and still read as what it named (see the
+    /// ownership table in [`super::observation`]). Anything that cannot be
+    /// proven is a refusal: a ref is never refreshed into validity here.
     pub(crate) async fn frame_session_for_mutation(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        validated: &ValidatedTab,
+        entry: &RefEntry,
+    ) -> Result<String, BrowserRefusal> {
+        let frame_session = self
+            .frame_session(session, target_id, tab_id, validated, &entry.frame)
+            .await?;
+        if !entry.semantic {
+            return Ok(frame_session);
+        }
+        if entry.attachment != Some(validated.conn.attachment(&validated.tab.cdp_target_id)) {
+            self.store.invalidate_tab_refs(
+                session,
+                target_id,
+                tab_id,
+                FullReason::AttachmentChanged,
+            );
+            return Err(refuse(
+                BrowserRefusalCode::BrowserRefStale,
+                "the debugger was detached from this tab after the ref was issued, so the ref \
+                 no longer proves its element; re-run get_browser_state to re-snapshot",
+            ));
+        }
+        let live = self
+            .live_fingerprint(&validated.conn, &frame_session, entry)
+            .await?;
+        if live != Some(Fingerprint::of(entry)) {
+            // Stale for good, even if the node reads as before again later.
+            self.store.retire_refused(session, target_id, tab_id, entry);
+            // What it reads as now is page content: a read says that, to a
+            // caller allowed to read. The refusal only says it changed.
+            return Err(refuse(
+                BrowserRefusalCode::BrowserRefStale,
+                if live.is_some() {
+                    "the element this ref named now reads as another element (its role, name \
+                     or link destination changed after the ref was issued); re-run \
+                     get_browser_state to re-snapshot"
+                } else {
+                    "the ref's node is no longer in the live page; re-run get_browser_state \
+                     to re-snapshot"
+                },
+            ));
+        }
+        Ok(frame_session)
+    }
+
+    /// What a ref's node reads as right now, by the rules its snapshot used;
+    /// `None` when the node is gone.
+    async fn live_fingerprint(
+        &self,
+        conn: &CdpConnection,
+        cdp_session: &str,
+        entry: &RefEntry,
+    ) -> Result<Option<Fingerprint>, BrowserRefusal> {
+        let backend = entry.backend_node_id;
+        let accessible = match conn
+            .call(
+                Some(cdp_session),
+                "Accessibility.getPartialAXTree",
+                json!({ "backendNodeId": backend, "fetchRelatives": false }),
+            )
+            .await
+        {
+            Ok(tree) => tree
+                .get("nodes")
+                .and_then(Value::as_array)
+                .and_then(|nodes| {
+                    nodes.iter().find(|node| {
+                        node.get("backendDOMNodeId").and_then(Value::as_i64) == Some(backend)
+                    })
+                })
+                .and_then(ax_reading),
+            Err(error) if is_method_unsupported(&error) => {
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    "the browser cannot report one node's accessibility data, so the ref \
+                     cannot be re-proven before it is used",
+                ))
+            }
+            // The node does not resolve; the DOM read below settles it.
+            Err(_) => None,
+        };
+        let (role, name, mut destination) = match accessible {
+            Some(reading) => reading,
+            None => {
+                let Ok(described) = conn
+                    .call(
+                        Some(cdp_session),
+                        "DOM.describeNode",
+                        json!({ "backendNodeId": backend }),
+                    )
+                    .await
+                else {
+                    return Ok(None);
+                };
+                let Some(node) = described.get("node") else {
+                    return Ok(None);
+                };
+                let (role, name) = dom_reading(node);
+                (role, name, None)
+            }
+        };
+        if destination.is_none() && entry.destination.is_some() {
+            // A link whose destination accessibility does not report: ask the
+            // element, which resolves its href as the browser would follow it.
+            destination = self.live_href(conn, cdp_session, backend).await;
+        }
+        Ok(Some(Fingerprint::read(role, name, destination)))
+    }
+
+    async fn live_href(
+        &self,
+        conn: &CdpConnection,
+        cdp_session: &str,
+        backend: i64,
+    ) -> Option<String> {
+        let resolved = conn
+            .call(
+                Some(cdp_session),
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend }),
+            )
+            .await
+            .ok()?;
+        let object_id = resolved.pointer("/object/objectId")?.as_str()?;
+        conn.call(
+            Some(cdp_session),
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration":
+                    "function() { return typeof this.href === 'string' ? this.href : null; }",
+                "returnByValue": true,
+            }),
+        )
+        .await
+        .ok()?
+        .pointer("/result/value")?
+        .as_str()
+        .map(str::to_owned)
+    }
+
+    /// Re-prove a ref's frame/document identity and return the CDP
+    /// session its `backendNodeId` is valid in. Any identity that cannot
+    /// be re-proven is a refusal, and a stale document additionally
+    /// invalidates the tab's snapshots.
+    async fn frame_session(
         &self,
         session: &str,
         target_id: &str,
@@ -2091,7 +2346,15 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+        let cdp_session = self
+            .attach(
+                &conn,
+                &tab.cdp_target_id,
+                session,
+                record.generation,
+                record.endpoint_transport,
+            )
+            .await?;
         let metrics = conn
             .call(Some(&cdp_session), "Page.getLayoutMetrics", json!({}))
             .await
@@ -2188,7 +2451,15 @@ impl BrowserEngine {
             )
         })?;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+        let cdp_session = self
+            .attach(
+                &conn,
+                &tab.cdp_target_id,
+                session,
+                record.generation,
+                record.endpoint_transport,
+            )
+            .await?;
 
         let doc = conn
             .call(
@@ -2254,6 +2525,9 @@ impl BrowserEngine {
                 visibility: None,
                 semantic: false,
                 frame,
+                destination: None,
+                attachment: None,
+                minted: None,
             });
         }
 
@@ -2312,6 +2586,9 @@ impl BrowserEngine {
                                     oopif_target_id: Some(child.target_id.clone()),
                                     identity: Some(identity),
                                 },
+                                destination: None,
+                                attachment: None,
+                                minted: None,
                             });
                         }
                         attached += 1;
@@ -2370,7 +2647,10 @@ impl BrowserEngine {
         // across snapshots of a mutating page.
         self.store.update_target(session, target_id, |rec| {
             if let Some(tab) = rec.tabs.get_mut(tab_id) {
+                // Another format: the semantic space and its refs end here.
                 tab.snapshots.clear();
+                tab.stable = TabRefs::default();
+                tab.semantic = None;
                 tab.snapshots.insert(
                     snapshot_id,
                     SnapshotRecord {
@@ -2378,9 +2658,6 @@ impl BrowserEngine {
                         generation: record.generation,
                         url: url.clone(),
                         refs,
-                        semantic: None,
-                        semantic_root_identity: None,
-                        continuations: HashMap::new(),
                     },
                 );
             }
@@ -2586,61 +2863,8 @@ impl BrowserEngine {
         Ok(document)
     }
 
-    // These values form one semantic snapshot envelope; keeping them explicit
-    // makes the stored reference index and reported metadata auditable together.
+    // One semantic read: its scope, its paging and its size budget.
     #[allow(clippy::too_many_arguments)]
-    fn semantic_outcome(
-        &self,
-        snapshot_id: u64,
-        url: String,
-        title: String,
-        page: super::semantic::SemanticPage,
-        document_complete: bool,
-        scope: &'static str,
-        oopif: OopifStatus,
-        start_index: u32,
-    ) -> (SemanticSnapshotOutcome, HashMap<u32, RefEntry>) {
-        let mut stored_refs = HashMap::new();
-        let mut refs = Vec::new();
-        let mut content_refs = Vec::new();
-        for (position, node) in page.selected.iter().enumerate() {
-            let Some(entry) = node.to_ref_entry() else {
-                continue;
-            };
-            let index = start_index.saturating_add(position as u32);
-            let external = format_ref(snapshot_id, index);
-            stored_refs.insert(index, entry);
-            let listed = SemanticListedRef {
-                external,
-                node: node.clone(),
-            };
-            if node.actions.is_empty() {
-                content_refs.push(listed);
-            } else {
-                refs.push(listed);
-            }
-        }
-        let complete = document_complete && page.next_offset.is_none();
-        (
-            SemanticSnapshotOutcome {
-                snapshot_id,
-                url,
-                title,
-                outline: page.outline,
-                refs,
-                content_refs,
-                complete,
-                scope,
-                selected_nodes: page.selected_nodes,
-                total_nodes: page.total_nodes,
-                omissions: page.omissions,
-                continuation: page.next_offset.map(|_| format!("bc-{}", Uuid::new_v4())),
-                oopif,
-            },
-            stored_refs,
-        )
-    }
-
     pub(crate) async fn snapshot_tab_semantic(
         &self,
         session: &str,
@@ -2649,6 +2873,9 @@ impl BrowserEngine {
         scope_ref: Option<&str>,
         query: Option<&str>,
         continuation: Option<&str>,
+        max_chars: usize,
+        include_refs: bool,
+        since: Option<u64>,
     ) -> Result<SemanticSnapshotOutcome, BrowserRefusal> {
         if let Some(token) = continuation {
             if scope_ref.is_some() || query.is_some() {
@@ -2657,7 +2884,7 @@ impl BrowserEngine {
                     "continuation cannot be combined with a new scope_ref or query",
                 ));
             }
-            let (snapshot, continuation) = self
+            let (cache, continuation) = self
                 .store
                 .resolve_semantic_continuation(session, target_id, tab_id, token)?;
             let record = self.store.get_target(session, target_id)?;
@@ -2667,88 +2894,132 @@ impl BrowserEngine {
                     format!("tab {tab_id} is not known for target {target_id}"),
                 )
             })?;
-            if let Some(identity) = &snapshot.semantic_root_identity {
-                let conn = self.connection_for_record(session, &record).await?;
-                let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
-                let tree = self.local_frame_tree(&conn, &cdp_session).await.map_err(|error| {
-                    match error {
-                        FrameTreeError::Unsupported => refuse(
-                            BrowserRefusalCode::BrowserRouteUnavailable,
-                            "the browser no longer reports its frame tree, so the semantic \n+                             continuation's document identity cannot be re-proven",
-                        ),
-                        FrameTreeError::Failed(error) => route_err(
-                            "Page.getFrameTree failed during semantic continuation revalidation",
-                            error,
-                        ),
-                    }
-                })?;
-                if !tree.proves(identity) {
-                    self.store
-                        .invalidate_tab_snapshots(session, target_id, tab_id);
-                    return Err(refuse(
-                        BrowserRefusalCode::BrowserRefStale,
-                        "the page navigated since this semantic continuation was minted; \n+                         re-run get_browser_state to start a fresh snapshot",
-                    ));
-                }
-            }
-            let document = snapshot.semantic.clone().ok_or_else(|| {
-                refuse(
-                    BrowserRefusalCode::BrowserRefStale,
-                    "the continuation no longer has semantic snapshot state",
+            // A continuation pages the document recorded in a ref space and
+            // takes its refs from it: prove that space is still the live
+            // document on the live attachment, and do it one observation at
+            // a time like any other read.
+            let _observing = self
+                .observation_gates
+                .lock((session.to_owned(), target_id.to_owned(), tab_id.to_owned()))
+                .await;
+            let conn = self.connection_for_record(session, &record).await?;
+            let cdp_session = self
+                .attach(
+                    &conn,
+                    &tab.cdp_target_id,
+                    session,
+                    record.generation,
+                    record.endpoint_transport,
                 )
-            })?;
-            let page = document.page(
+                .await?;
+            let root = match self.local_frame_tree(&conn, &cdp_session).await {
+                Ok(tree) => Some(tree.main_identity()),
+                // No frame tree, no proof that the document is the one that
+                // was recorded: the continuation is refused below.
+                Err(FrameTreeError::Unsupported) => None,
+                Err(FrameTreeError::Failed(error)) => {
+                    return Err(route_err(
+                        "Page.getFrameTree failed during semantic continuation revalidation",
+                        error,
+                    ))
+                }
+            };
+            let live = DocumentIdentity {
+                generation: record.generation,
+                attachment: conn.attachment(&tab.cdp_target_id),
+                cdp_target_id: tab.cdp_target_id.clone(),
+                root,
+            };
+            if tab
+                .stable
+                .space()
+                .is_none_or(|space| space.id != cache.space_id || !space.identity.proves(&live))
+            {
+                self.store
+                    .invalidate_tab_snapshots(session, target_id, tab_id);
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the page navigated or the debugger was detached since this semantic \
+                     continuation was minted, or the browser cannot prove it did not; re-run \
+                     get_browser_state to start a fresh snapshot (max_chars admits more in one \
+                     read)",
+                ));
+            }
+            let title = cache.document.title.clone().unwrap_or_default();
+            let outline_budget = outline_budget(max_chars, &cache.url, &title);
+            let page = cache.document.page_sized(
                 continuation.offset,
                 DEFAULT_SEMANTIC_NODE_BUDGET,
+                outline_budget,
                 continuation.query.as_deref(),
                 continuation.scope_backend_node_id,
+                include_refs,
+                None,
             );
-            let start_index = snapshot
-                .refs
-                .keys()
-                .max()
-                .copied()
-                .map_or(0, |value| value.saturating_add(1));
+            let facts = include_refs.then(|| listed_facts(&page));
             let oopif = if continuation.oopif_supported {
                 OopifStatus::Attached(continuation.oopif_frames)
             } else {
                 OopifStatus::Unsupported
             };
             let next_offset = page.next_offset;
-            let (outcome, new_refs) = self.semantic_outcome(
-                snapshot.id,
-                snapshot.url.clone(),
-                document.title.clone().unwrap_or_default(),
-                page,
-                document.complete,
-                "continuation",
-                oopif,
-                start_index,
-            );
-            let next_token = outcome.continuation.clone();
+            let next_token = next_offset.map(|_| format!("bc-{}", Uuid::new_v4()));
+            let (action_refs, content_refs) = ref_counts(&page.view);
+            let mut lines = None;
             self.store.update_target(session, target_id, |record| {
-                if let Some(stored) = record
-                    .tabs
-                    .get_mut(tab_id)
-                    .and_then(|tab| tab.snapshots.get_mut(&snapshot.id))
-                {
-                    stored.continuations.remove(token);
-                    stored.refs.extend(new_refs);
-                    if let (Some(token), Some(offset)) = (next_token, next_offset) {
-                        stored.continuations.insert(
-                            token,
-                            SemanticContinuation {
-                                offset,
-                                query: continuation.query.clone(),
-                                scope_backend_node_id: continuation.scope_backend_node_id,
-                                oopif_supported: continuation.oopif_supported,
-                                oopif_frames: continuation.oopif_frames,
-                            },
-                        );
-                    }
+                let Some(tab) = record.tabs.get_mut(tab_id) else {
+                    return;
+                };
+                let Some(stored) = tab
+                    .semantic
+                    .as_mut()
+                    .filter(|stored| stored.space_id == cache.space_id)
+                else {
+                    return;
+                };
+                // Single use: a token names one page of one recorded document.
+                if stored.continuations.remove(token).is_none() {
+                    return;
                 }
+                if let (Some(token), Some(offset)) = (next_token.clone(), next_offset) {
+                    stored.continuations.insert(
+                        token,
+                        SemanticContinuation {
+                            offset,
+                            query: continuation.query.clone(),
+                            scope_backend_node_id: continuation.scope_backend_node_id,
+                            oopif_supported: continuation.oopif_supported,
+                            oopif_frames: continuation.oopif_frames,
+                        },
+                    );
+                }
+                lines = tab.stable.extend(page.view);
             });
-            return Ok(outcome);
+            let lines = lines.ok_or_else(|| {
+                refuse(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the semantic continuation was used or superseded by a newer snapshot",
+                )
+            })?;
+            return Ok(SemanticSnapshotOutcome {
+                snapshot_id: cache.space_id,
+                url: cache.url,
+                title,
+                outline: outline_of(&lines),
+                action_refs,
+                content_refs,
+                complete: cache.document.complete && next_offset.is_none(),
+                scope: "continuation",
+                selected_nodes: page.selected_nodes,
+                total_nodes: page.total_nodes,
+                omissions: page.omissions,
+                continuation: next_token,
+                oopif,
+                outline_budget,
+                listed: facts.map(|facts| listed_refs(&lines, facts)),
+                revision: None,
+                told: Told::Snapshot { reason: None },
+            });
         }
 
         let scope_backend_node_id = match scope_ref {
@@ -2766,8 +3037,29 @@ impl BrowserEngine {
                 format!("tab {tab_id} is not known for target {target_id}"),
             )
         })?;
+        // Collect and record as one step per session and tab (see the
+        // ownership table: observations of a tab run one at a time).
+        let _observing = self
+            .observation_gates
+            .lock((session.to_owned(), target_id.to_owned(), tab_id.to_owned()))
+            .await;
         let conn = self.connection_for_record(session, &record).await?;
-        let cdp_session = self.attach(&conn, &tab.cdp_target_id, session, record.generation, record.endpoint_transport).await?;
+        let cdp_session = self
+            .attach(
+                &conn,
+                &tab.cdp_target_id,
+                session,
+                record.generation,
+                record.endpoint_transport,
+            )
+            .await?;
+        // A page behind an open JavaScript dialog answers nothing: say so
+        // instead of waiting for every read below to time out.
+        self.watch_dialogs(&conn, &cdp_session, &tab.cdp_target_id)
+            .await;
+        if let Some(dialog) = conn.dialog_state(&tab.cdp_target_id) {
+            return Err(dialog_open_refusal(&dialog));
+        }
         let (document, document_complete) = self.semantic_document(&conn, &cdp_session).await?;
         let root = document.get("root").cloned().unwrap_or(Value::Null);
         let url = root
@@ -2869,68 +3161,505 @@ impl BrowserEngine {
         };
 
         semantic.complete &= semantic.title.is_some();
-        let page = semantic.page(
+        let outline_budget = outline_budget(max_chars, &url, &title);
+        // A read that will be diffed stops where the baseline was cut.
+        let until = since.and_then(|since| {
+            let target = self.store.get_target(session, target_id).ok()?;
+            let space = target.tabs.get(tab_id)?.stable.space()?;
+            space.baseline_tail(since).cloned()
+        });
+        let page = semantic.page_sized(
             0,
             DEFAULT_SEMANTIC_NODE_BUDGET,
+            outline_budget,
             query,
             scope_backend_node_id,
+            include_refs,
+            until.as_ref(),
         );
+        let tail = page.tail.clone();
+        let facts = include_refs.then(|| listed_facts(&page));
         let next_offset = page.next_offset;
-        let snapshot_id = self.store.mint_snapshot_id();
-        let scope = if scope_ref.is_some() {
-            "subtree"
+        let (scope, kind) = if scope_ref.is_some() {
+            ("subtree", ViewKind::Side)
         } else if query.is_some() {
-            "query"
+            ("query", ViewKind::Side)
         } else {
-            "viewport"
+            ("viewport", ViewKind::Default)
         };
-        let (outcome, refs) = self.semantic_outcome(
-            snapshot_id,
-            url.clone(),
-            title.clone(),
-            page,
-            semantic.complete,
-            scope,
-            oopif,
-            0,
-        );
-        let continuation_token = outcome.continuation.clone();
+        let continuation = next_offset.map(|_| format!("bc-{}", Uuid::new_v4()));
+        let (action_refs, content_refs) = ref_counts(&page.view);
+        let document_entries: Vec<RefEntry> = semantic
+            .nodes
+            .iter()
+            .filter_map(SemanticNode::to_ref_entry)
+            .collect();
+        let identity = DocumentIdentity {
+            generation: record.generation,
+            attachment: conn.attachment(&tab.cdp_target_id),
+            cdp_target_id: tab.cdp_target_id.clone(),
+            root: semantic_root_identity.clone(),
+        };
+        let complete = semantic.complete && next_offset.is_none();
+        let (selected_nodes, total_nodes, omissions) =
+            (page.selected_nodes, page.total_nodes, page.omissions);
+        let view = page.view;
+        let mut recorded = None;
         self.store
             .update_target(session, target_id, |stored_target| {
-                if let Some(stored_tab) = stored_target.tabs.get_mut(tab_id) {
-                    stored_tab.url = url.clone();
-                    stored_tab.title = title;
-                    let mut continuations = HashMap::new();
-                    if let (Some(token), Some(offset)) = (continuation_token, next_offset) {
-                        continuations.insert(
-                            token,
-                            SemanticContinuation {
-                                offset,
-                                query: query.map(str::to_owned),
-                                scope_backend_node_id,
-                                oopif_supported: matches!(oopif, OopifStatus::Attached(_)),
-                                oopif_frames: oopif.frames(),
-                            },
-                        );
-                    }
-                    stored_tab.snapshots.clear();
-                    stored_tab.snapshots.insert(
-                        snapshot_id,
-                        SnapshotRecord {
-                            id: snapshot_id,
-                            generation: record.generation,
-                            url,
-                            refs,
-                            semantic: Some(semantic),
-                            semantic_root_identity,
-                            continuations,
+                let Some(stored_tab) = stored_target.tabs.get_mut(tab_id) else {
+                    return;
+                };
+                stored_tab.url = url.clone();
+                stored_tab.title = title.clone();
+                // A semantic snapshot ends any dom_refs_v1 one. Its own refs
+                // persist while the document and the attachment are proven
+                // the same (the ownership table in observation.rs).
+                stored_tab.snapshots.clear();
+                let outcome = stored_tab.stable.record(
+                    &mut || self.store.mint_snapshot_id(),
+                    identity,
+                    &document_entries,
+                    semantic.complete,
+                    view,
+                    (&url, &title),
+                    tail,
+                    kind,
+                    since,
+                );
+                let mut continuations = HashMap::new();
+                if let (Some(token), Some(offset)) = (continuation.clone(), next_offset) {
+                    continuations.insert(
+                        token,
+                        SemanticContinuation {
+                            offset,
+                            query: query.map(str::to_owned),
+                            scope_backend_node_id,
+                            oopif_supported: matches!(oopif, OopifStatus::Attached(_)),
+                            oopif_frames: oopif.frames(),
                         },
                     );
                 }
+                stored_tab.semantic = Some(SemanticCache {
+                    space_id: outcome.space_id,
+                    url: url.clone(),
+                    document: semantic,
+                    continuations,
+                });
+                recorded = Some(outcome);
             });
-        Ok(outcome)
+        let recorded = recorded.ok_or_else(|| {
+            refuse(
+                BrowserRefusalCode::BrowserBindingStale,
+                "the binding ended while the page was being read; re-run get_browser_state with pid + window_id",
+            )
+        })?;
+        Ok(SemanticSnapshotOutcome {
+            snapshot_id: recorded.space_id,
+            url,
+            title,
+            outline: outline_of(&recorded.lines),
+            action_refs,
+            content_refs,
+            complete,
+            scope,
+            selected_nodes,
+            total_nodes,
+            omissions,
+            continuation,
+            oopif,
+            outline_budget,
+            listed: facts.map(|facts| listed_refs(&recorded.lines, facts)),
+            revision: recorded.revision,
+            told: recorded.told,
+        })
+    }
+
+    // ── Dialogs, settling, and what a session holds ─────────────────────
+
+    /// Make this connection hear the tab's JavaScript dialog events. They
+    /// need the Page domain enabled on one attached session; its id is
+    /// registered first so an opening event that arrives before the reply
+    /// is still attributed to the tab. Best effort and bounded: with a
+    /// dialog already up, the enable itself may never answer, but Chrome
+    /// announces the open dialog to the newly enabled session.
+    pub(crate) async fn watch_dialogs(
+        &self,
+        conn: &CdpConnection,
+        cdp_session: &str,
+        cdp_target_id: &str,
+    ) {
+        if conn.dialog_state(cdp_target_id).is_some() || conn.has_dialog_session(cdp_target_id) {
+            return;
+        }
+        conn.register_dialog_session(cdp_session, cdp_target_id);
+        let enabled = tokio::time::timeout(
+            DIALOG_WATCH_TIMEOUT,
+            conn.call(Some(cdp_session), "Page.enable", json!({})),
+        )
+        .await;
+        if !matches!(enabled, Ok(Ok(_))) && conn.dialog_state(cdp_target_id).is_none() {
+            conn.unregister_dialog_session(cdp_session, cdp_target_id);
+        }
+    }
+
+    /// Run one CDP command that page script answers (input dispatch), but
+    /// stop waiting when a JavaScript dialog opens: the dialog blocks the
+    /// page, so the command's reply would only come once it is resolved.
+    pub(crate) async fn call_until_dialog(
+        &self,
+        conn: &CdpConnection,
+        cdp_session: &str,
+        cdp_target_id: &str,
+        method: &str,
+        params: Value,
+    ) -> Result<Value, CallStopped> {
+        let call = conn.call(Some(cdp_session), method, params);
+        tokio::pin!(call);
+        loop {
+            tokio::select! {
+                result = &mut call => return result.map_err(CallStopped::Failed),
+                _ = tokio::time::sleep(DIALOG_POLL) => {
+                    if let Some(dialog) = conn.dialog_state(cdp_target_id) {
+                        return Err(CallStopped::Dialog(dialog));
+                    }
+                }
+            }
+        }
+    }
+
+    /// Start watching a tab before an action is sent, so a navigation the
+    /// action sets off is seen when it starts, not only once the new
+    /// document has replaced the old. `None` when the browser reports no
+    /// frame tree: then a new document is only noticed when the old one's
+    /// script context goes away.
+    pub(crate) async fn page_watch(&self, validated: &ValidatedTab) -> Option<PageWatch> {
+        // Subscribed first: nothing between here and the action is missed.
+        let events = validated.conn.subscribe();
+        let tree = self
+            .local_frame_tree(&validated.conn, &validated.cdp_session)
+            .await
+            .ok()?;
+        Some(PageWatch {
+            events,
+            main: tree.main_identity(),
+            navigating: false,
+        })
+    }
+
+    /// Wait, within bounds, until the page has stopped changing after an
+    /// action: two quiet polls of a mutation counter in a row, the deadline,
+    /// a new document, or a JavaScript dialog. The counter lives in a page
+    /// object only this session can reach; nothing is left for page script
+    /// to find, and no page timer is used (timers are throttled in covered
+    /// and background tabs).
+    pub(crate) async fn settle(
+        &self,
+        validated: &ValidatedTab,
+        mut watch: Option<PageWatch>,
+    ) -> Settled {
+        let conn = &validated.conn;
+        let cdp = validated.cdp_session.as_str();
+        let target = validated.tab.cdp_target_id.as_str();
+        let started = tokio::time::Instant::now();
+        let dialog = || conn.dialog_state(target).map(Settled::Dialog);
+        if let Some(open) = dialog() {
+            return open;
+        }
+        let main = watch.as_ref().map(|watch| watch.main.clone());
+        let mut navigating = move || watch.as_mut().is_some_and(PageWatch::navigating);
+        if navigating() {
+            return self.await_document(validated, main.as_ref(), started).await;
+        }
+        let bounded = |method: &'static str, params: Value| async move {
+            tokio::time::timeout(SETTLE_CALL_TIMEOUT, conn.call(Some(cdp), method, params)).await
+        };
+        let counter = match bounded(
+            "Runtime.evaluate",
+            json!({ "expression": SETTLE_COUNTER, "objectGroup": "cua-settle" }),
+        )
+        .await
+        {
+            Ok(Ok(value)) => value
+                .pointer("/result/objectId")
+                .and_then(Value::as_str)
+                .map(str::to_owned),
+            // The document is being replaced under the call.
+            Ok(Err(error)) if is_context_gone(&error) => {
+                return self.await_document(validated, main.as_ref(), started).await
+            }
+            // The page cannot run the counter: nothing says it settled.
+            Ok(Err(_)) => return Settled::Deadline,
+            // No answer: a dialog, or a document still being replaced.
+            Err(_) => None,
+        };
+        let Some(counter) = counter else {
+            return match dialog() {
+                Some(open) => open,
+                None => self.await_document(validated, main.as_ref(), started).await,
+            };
+        };
+        let mut quiet = 0;
+        while started.elapsed() < SETTLE_DEADLINE {
+            tokio::time::sleep(SETTLE_POLL).await;
+            if let Some(open) = dialog() {
+                return open;
+            }
+            // A page at rest that is about to be replaced has not settled.
+            if navigating() {
+                return self.await_document(validated, main.as_ref(), started).await;
+            }
+            match bounded(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": counter,
+                    "functionDeclaration": SETTLE_TAKE,
+                    "returnByValue": true,
+                }),
+            )
+            .await
+            {
+                Ok(Ok(value)) => match value.pointer("/result/value").and_then(Value::as_u64) {
+                    Some(0) => {
+                        quiet += 1;
+                        if quiet == SETTLE_QUIET_POLLS {
+                            let _ = bounded(
+                                "Runtime.callFunctionOn",
+                                json!({ "objectId": counter, "functionDeclaration": SETTLE_STOP }),
+                            )
+                            .await;
+                            return Settled::Quiet;
+                        }
+                    }
+                    Some(_) => quiet = 0,
+                    // The counter is gone with its document.
+                    None => return self.await_document(validated, main.as_ref(), started).await,
+                },
+                // The counter's document was replaced.
+                Ok(Err(_)) => return self.await_document(validated, main.as_ref(), started).await,
+                // No answer in time: a dialog shows up at the next poll.
+                Err(_) => {}
+            }
+        }
+        let _ = bounded(
+            "Runtime.callFunctionOn",
+            json!({ "objectId": counter, "functionDeclaration": SETTLE_STOP }),
+        )
+        .await;
+        Settled::Deadline
+    }
+
+    /// A new document is on its way: wait, within bounds, until it has
+    /// replaced `old` (the main frame's document before the action, when
+    /// known) and has loaded. When `old` is still there at the deadline the
+    /// navigation did not happen, and the page is simply not settled.
+    pub(crate) async fn await_document(
+        &self,
+        validated: &ValidatedTab,
+        old: Option<&FrameIdentity>,
+        started: tokio::time::Instant,
+    ) -> Settled {
+        let conn = &validated.conn;
+        let target = validated.tab.cdp_target_id.as_str();
+        let mut replaced = old.is_none();
+        while started.elapsed() < NAVIGATION_DEADLINE {
+            if let Some(dialog) = conn.dialog_state(target) {
+                return Settled::Dialog(dialog);
+            }
+            if !replaced {
+                let tree = tokio::time::timeout(
+                    SETTLE_CALL_TIMEOUT,
+                    self.local_frame_tree(conn, &validated.cdp_session),
+                )
+                .await;
+                replaced = matches!(
+                    (&tree, old),
+                    (Ok(Ok(tree)), Some(old)) if tree.main_identity() != *old
+                );
+            }
+            if replaced {
+                let ready = tokio::time::timeout(
+                    SETTLE_CALL_TIMEOUT,
+                    conn.call(
+                        Some(&validated.cdp_session),
+                        "Runtime.evaluate",
+                        json!({ "expression": "document.readyState", "returnByValue": true }),
+                    ),
+                )
+                .await;
+                match ready {
+                    Ok(Ok(value))
+                        if value.pointer("/result/value").and_then(Value::as_str)
+                            == Some("complete") =>
+                    {
+                        // One beat for scripts that render on load.
+                        tokio::time::sleep(SETTLE_POLL * 2).await;
+                        return Settled::NewDocument { loaded: true };
+                    }
+                    // Still loading, between documents, or slow: ask again.
+                    Ok(Ok(_)) | Err(_) => {}
+                    Ok(Err(error)) if is_context_gone(&error) => {}
+                    // The page cannot be asked at all.
+                    Ok(Err(_)) => break,
+                }
+            }
+            tokio::time::sleep(SETTLE_POLL).await;
+        }
+        if replaced {
+            Settled::NewDocument { loaded: false }
+        } else {
+            Settled::Deadline
+        }
+    }
+
+    /// The ref space (`p7`) the session holds for this tab, if any.
+    pub(crate) fn held_space(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+    ) -> Option<String> {
+        let target = self.store.get_target(session, target_id).ok()?;
+        let space = target.tabs.get(tab_id)?.stable.space()?;
+        Some(format!("p{}", space.id))
+    }
+
+    /// What the session holds for this tab: the baseline revision of its
+    /// semantic space, a `dom_refs_v1` snapshot, or nothing.
+    pub(crate) fn held_view(&self, session: &str, target_id: &str, tab_id: &str) -> HeldView {
+        let Ok(target) = self.store.get_target(session, target_id) else {
+            return HeldView::Nothing;
+        };
+        match target.tabs.get(tab_id) {
+            Some(tab) if !tab.snapshots.is_empty() => HeldView::DomRefs,
+            Some(tab) => match tab
+                .stable
+                .space()
+                .and_then(|space| space.baseline_revision())
+            {
+                Some(revision) => HeldView::Semantic(revision),
+                None => HeldView::Nothing,
+            },
+            None => HeldView::Nothing,
+        }
     }
 }
+
+/// Whether a Runtime call failed because its document (execution context)
+/// was replaced while the call was under way.
+fn is_context_gone(error: &anyhow::Error) -> bool {
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("context") || message.contains("inspected target navigated")
+}
+
+/// One tab watched from before an action: its main frame's document then,
+/// and the connection's events since.
+pub(crate) struct PageWatch {
+    events: tokio::sync::mpsc::UnboundedReceiver<super::cdp_ws::CdpEvent>,
+    main: FrameIdentity,
+    navigating: bool,
+}
+
+impl PageWatch {
+    /// Whether the main frame has started to load another document since
+    /// the watch began. Child frames, new tabs and same-document history
+    /// changes do not count.
+    fn navigating(&mut self) -> bool {
+        while let Ok(event) = self.events.try_recv() {
+            let frame = match event.method.as_str() {
+                "Page.frameRequestedNavigation"
+                    if event
+                        .params
+                        .get("disposition")
+                        .and_then(Value::as_str)
+                        .is_none_or(|disposition| disposition == "currentTab") =>
+                {
+                    event.params.get("frameId")
+                }
+                "Page.frameScheduledNavigation" | "Page.frameStartedLoading" => {
+                    event.params.get("frameId")
+                }
+                "Page.frameNavigated" => event.params.pointer("/frame/id"),
+                _ => None,
+            };
+            if frame.and_then(Value::as_str) == Some(self.main.frame_id.as_str()) {
+                self.navigating = true;
+            }
+        }
+        self.navigating
+    }
+}
+
+/// How a bounded wait for the page ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Settled {
+    Quiet,
+    /// Still changing when the wait ended.
+    Deadline,
+    /// The document was replaced; `loaded` is false when it had not finished
+    /// loading in time.
+    NewDocument {
+        loaded: bool,
+    },
+    /// A JavaScript dialog is open: the page cannot be read.
+    Dialog(super::cdp_ws::CdpDialogState),
+}
+
+/// Why [`BrowserEngine::call_until_dialog`] did not return a reply.
+#[derive(Debug)]
+pub(crate) enum CallStopped {
+    Dialog(super::cdp_ws::CdpDialogState),
+    Failed(anyhow::Error),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum HeldView {
+    Nothing,
+    /// A `dom_refs_v1` snapshot: actions leave its refs alone and return no
+    /// page changes.
+    DomRefs,
+    /// The baseline revision an action's changes are made against.
+    Semantic(u64),
+}
+
+pub(crate) fn dialog_id(dialog: &super::cdp_ws::CdpDialogState) -> String {
+    format!("dialog-{}", dialog.generation)
+}
+
+pub(crate) fn dialog_open_refusal(dialog: &super::cdp_ws::CdpDialogState) -> BrowserRefusal {
+    let dialog_id = dialog_id(dialog);
+    refuse(
+        BrowserRefusalCode::BrowserDialogOpen,
+        format!(
+            "a JavaScript {} dialog is open in this tab and blocks the page; resolve it with \
+             browser_dialog (dialog_id {dialog_id}) before reading or acting",
+            dialog.kind
+        ),
+    )
+    .with_detail(json!({ "dialog_id": dialog_id, "kind": dialog.kind }))
+}
+
+const DIALOG_WATCH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+pub(crate) const DIALOG_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const SETTLE_POLL: std::time::Duration = std::time::Duration::from_millis(50);
+const SETTLE_QUIET_POLLS: u32 = 2;
+const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_500);
+const SETTLE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
+const NAVIGATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
+/// A mutation counter for the main document: `n` counts records the
+/// observer's callback has seen, `o` is the observer.
+// ponytail: the main document only (open shadow roots and frames are not
+// observed), and the counter's handle is not released: Runtime.releaseObject
+// is outside the existing-profile allowlist, and the handle is a few bytes
+// that die with the document. Observe frames, and release the handle, if a
+// long-lived single-page app ever shows either as a problem.
+const SETTLE_COUNTER: &str = "(() => { const s = { n: 0 }; \
+    s.o = new MutationObserver((records) => { s.n += records.length; }); \
+    s.o.observe(document, { subtree: true, childList: true, attributes: true, characterData: true }); \
+    return s; })()";
+const SETTLE_TAKE: &str =
+    "function() { const n = this.n + this.o.takeRecords().length; this.n = 0; return n; }";
+const SETTLE_STOP: &str = "function() { this.o.disconnect(); }";
 
 /// Attribute names that make an element interactive-enough to ref.
 const INTERACTIVE_ATTRS: &[&str] = &["onclick", "role", "contenteditable", "tabindex", "href"];

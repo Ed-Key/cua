@@ -252,7 +252,11 @@ fn run_native_named_groups(spec: &BrowserSpec) {
             assert!(plain.is_empty(), "no context keeps no Save: {plain:?}");
             let (billing, save_parents) = billing_read(&mut fixture.driver, true);
             eprintln!("[native-named-groups] query_context Billing={billing} Save parents={save_parents:?}");
-            assert_eq!(save_parents, vec![billing], "context keeps only Billing's own Save");
+            assert_eq!(
+                save_parents,
+                vec![billing],
+                "context keeps only Billing's own Save"
+            );
             Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
         });
     }
@@ -1589,20 +1593,24 @@ fn ref_by_frame_label(snapshot: &ToolResponse, frame: &str, fragment: &str) -> S
         .to_owned()
 }
 
+/// The ref on the outline line `- role "name" [ref actions]` that names
+/// `name` and declares `action`.
 fn semantic_ref_by_name(snapshot: &ToolResponse, name: &str, action: &str) -> String {
-    snapshot.structured()["refs"]
-        .as_array()
-        .and_then(|refs| {
-            refs.iter().find(|entry| {
-                entry["name"] == name
-                    && entry["actions"]
-                        .as_array()
-                        .is_some_and(|actions| actions.iter().any(|value| value == action))
-            })
+    let quoted = serde_json::to_string(name).expect("name serializes");
+    snapshot.structured()["outline"]
+        .as_str()
+        .into_iter()
+        .flat_map(str::lines)
+        .find_map(|line| {
+            let (_, bracket) = line.split_once(&format!(" {quoted} ["))?;
+            let (bracket, _) = bracket.split_once(']')?;
+            let (reference, actions) = bracket.split_once(' ')?;
+            actions
+                .split(',')
+                .any(|declared| declared == action)
+                .then(|| reference.to_owned())
         })
-        .and_then(|entry| entry["ref"].as_str())
         .unwrap_or_else(|| panic!("missing semantic {action} ref {name:?}: {}", snapshot.raw))
-        .to_owned()
 }
 
 fn bind(fixture: &mut BrowserFixture, session: &str) -> (String, String, ToolResponse) {
@@ -1649,6 +1657,7 @@ fn bind(fixture: &mut BrowserFixture, session: &str) -> (String, String, ToolRes
         "get_browser_state",
         serde_json::json!({
             "target_id": target,
+            "snapshot_format": "dom_refs_v1",
             "tab_id": tab,
             "session": session,
         }),
@@ -1960,6 +1969,7 @@ fn run_roundtrip(spec: &BrowserSpec) {
                 "get_browser_state",
                 serde_json::json!({
                     "target_id": target,
+                    "snapshot_format": "dom_refs_v1",
                     "tab_id": tab,
                     "session": session,
                 }),
@@ -2094,15 +2104,10 @@ fn run_semantic_state(spec: &BrowserSpec) {
                 snapshot.raw
             );
             assert!(
-                snapshot.structured()["refs"]
-                    .as_array()
-                    .is_some_and(|refs| refs.iter().all(|entry| {
-                        !entry["name"]
-                            .as_str()
-                            .unwrap_or_default()
-                            .starts_with("Retained control")
-                    })),
-                "hidden retained action leaked into semantic refs: {}",
+                snapshot.structured()["outline"]
+                    .as_str()
+                    .is_some_and(|outline| !outline.contains("Retained control")),
+                "hidden retained action leaked into the semantic outline: {}",
                 snapshot.raw
             );
 
@@ -2665,6 +2670,7 @@ fn run_prepare_isolated_launch(spec: &BrowserSpec) {
                     "get_browser_state",
                     serde_json::json!({
                         "target_id": target,
+                        "snapshot_format": "dom_refs_v1",
                         "tab_id": tab,
                         "session": session,
                     }),
@@ -2877,6 +2883,7 @@ fn run_existing_profile_attach(spec: &BrowserSpec) {
                     "get_browser_state",
                     serde_json::json!({
                         "target_id": target,
+                        "snapshot_format": "dom_refs_v1",
                         "tab_id": tab,
                         "session": session,
                     }),
@@ -3043,6 +3050,7 @@ fn run_existing_profile_setup(spec: &BrowserSpec) {
                     "get_browser_state",
                     serde_json::json!({
                         "target_id": target,
+                        "snapshot_format": "dom_refs_v1",
                         "tab_id": tab,
                         "session": session,
                     }),
@@ -3237,6 +3245,7 @@ fn run_stale_ref(spec: &BrowserSpec) {
                 "get_browser_state",
                 serde_json::json!({
                     "target_id": target,
+                    "snapshot_format": "dom_refs_v1",
                     "tab_id": tab,
                     "session": session,
                 }),
@@ -4810,10 +4819,16 @@ fn run_pointer_actions(spec: &BrowserSpec) {
             );
             assert_eq!(snapshot.structured()["status"], "ok", "{}", snapshot.raw);
 
-            let content_ref = snapshot.structured()["content_refs"]
-                .as_array()
-                .and_then(|refs| refs.first())
-                .and_then(|entry| entry["ref"].as_str())
+            // A line whose bracket holds only the ref declares no action.
+            let content_ref = snapshot.structured()["outline"]
+                .as_str()
+                .into_iter()
+                .flat_map(str::lines)
+                .find_map(|line| {
+                    let (_, bracket) = line.split_once(" [")?;
+                    let (bracket, _) = bracket.split_once(']')?;
+                    (!bracket.contains(' ')).then_some(bracket)
+                })
                 .expect("semantic snapshot content ref");
             let refused = fixture.driver.call(
                 "browser_pointer",
@@ -5230,9 +5245,10 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             launch_browser_with_html(spec, &scenario, standalone_browser_completeness_html());
         *evidence = recording_evidence(fixture.driver.recording_dir());
         let (pid, wid) = (fixture.pid, fixture.window_id);
-        let front = fixture
-            .driver
-            .call("bring_to_front", serde_json::json!({"pid":pid,"window_id":wid}));
+        let front = fixture.driver.call(
+            "bring_to_front",
+            serde_json::json!({"pid":pid,"window_id":wid}),
+        );
         assert!(!front.is_error(), "{}", front.raw);
         let read = |driver: &mut McpDriver, pid: u32, wid: u64| {
             driver.call(
@@ -5249,12 +5265,20 @@ fn run_native_file_picker(spec: &BrowserSpec) {
                 .as_array()
                 .into_iter()
                 .flatten()
-                .find(|e| e["label"].as_str().is_some_and(|l| l.contains("standalone-upload")))
+                .find(|e| {
+                    e["label"]
+                        .as_str()
+                        .is_some_and(|l| l.contains("standalone-upload"))
+                })
                 .and_then(|e| e["element_token"].as_str().map(str::to_owned));
             if let Some(token) = found {
                 break token;
             }
-            assert!(Instant::now() < deadline, "file input absent: {}", state.structured()["tree_markdown"]);
+            assert!(
+                Instant::now() < deadline,
+                "file input absent: {}",
+                state.structured()["tree_markdown"]
+            );
             thread::sleep(Duration::from_millis(200));
         };
         let clicked = fixture.driver.call(
@@ -5272,12 +5296,20 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             if let Some(window) = change["rebind"]
                 .as_object()
                 .map(|_| change["rebind"].clone())
-                .or_else(|| change["new_windows"].as_array().and_then(|w| w.first().cloned()))
+                .or_else(|| {
+                    change["new_windows"]
+                        .as_array()
+                        .and_then(|w| w.first().cloned())
+                })
             {
                 eprintln!("[file-picker] window_change={change}");
                 break window;
             }
-            assert!(Instant::now() < deadline, "no window_change for the Open panel: {}", state.raw);
+            assert!(
+                Instant::now() < deadline,
+                "no window_change for the Open panel: {}",
+                state.raw
+            );
         };
         let panel_pid = panel["pid"].as_u64().unwrap() as u32;
         let panel_wid = panel["window_id"].as_u64().unwrap();
@@ -5290,7 +5322,11 @@ fn run_native_file_picker(spec: &BrowserSpec) {
                 .as_array()
                 .expect("list_windows returns a windows array")
                 .iter()
-                .find(|w| w["pid"].as_u64() == Some(u64::from(pid)) && w["title"] == "Open" && w["is_on_screen"] == true)
+                .find(|w| {
+                    w["pid"].as_u64() == Some(u64::from(pid))
+                        && w["title"] == "Open"
+                        && w["is_on_screen"] == true
+                })
                 .and_then(|w| w["window_id"].as_u64())
         };
         let wait_closed = |driver: &mut McpDriver| {
@@ -5322,14 +5358,22 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             }
             thread::sleep(Duration::from_millis(200));
         };
-        let tree = state.structured()["tree_markdown"].as_str().unwrap_or_default().to_owned();
-        assert!(tree.contains("AXSheet"), "parent read lacks the sheet: {tree}");
+        let tree = state.structured()["tree_markdown"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            tree.contains("AXSheet"),
+            "parent read lacks the sheet: {tree}"
+        );
         assert!(
             state.structured()["elements"]
                 .as_array()
                 .into_iter()
                 .flatten()
-                .any(|e| e["role"] == "AXButton" && e["label"] == "Cancel" && e["element_token"].is_string()),
+                .any(|e| e["role"] == "AXButton"
+                    && e["label"] == "Cancel"
+                    && e["element_token"].is_string()),
             "the sheet's Cancel button is actionable"
         );
         // Diagnostic: what a direct read of the sheet's own id answers.
@@ -5351,7 +5395,11 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             "bring_to_front",
             serde_json::json!({"pid":panel_pid,"window_id":panel_wid}),
         );
-        assert!(!fronted.is_error(), "bring_to_front with a sheet attached: {}", fronted.raw);
+        assert!(
+            !fronted.is_error(),
+            "bring_to_front with a sheet attached: {}",
+            fronted.raw
+        );
         assert_eq!(fronted.structured()["activated"], true, "{}", fronted.raw);
 
         // 2b. A sheet on the sheet: typing "/" opens Go to Folder, whose path
@@ -5374,14 +5422,23 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             if let Some(token) = found {
                 break token;
             }
-            assert!(Instant::now() < deadline, "Go to Folder field absent: {}", state.structured()["tree_markdown"]);
+            assert!(
+                Instant::now() < deadline,
+                "Go to Folder field absent: {}",
+                state.structured()["tree_markdown"]
+            );
             thread::sleep(Duration::from_millis(200));
         };
         let set = fixture.driver.call(
             "set_value",
             serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"element_token":path_field,"value":"/tmp"}),
         );
-        assert_eq!(set.action_effect(), Some("confirmed"), "nested sheet field write: {}", set.raw);
+        assert_eq!(
+            set.action_effect(),
+            Some("confirmed"),
+            "nested sheet field write: {}",
+            set.raw
+        );
         let closed_go_to = fixture.driver.call(
             "press_key",
             serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"key":"escape","delivery_mode":"foreground"}),
@@ -5402,7 +5459,10 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"element_token":cancel,"delivery_mode":"background"}),
         );
         assert!(!clicked.is_error(), "Cancel click: {}", clicked.raw);
-        assert!(wait_closed(&mut fixture.driver), "Cancel did not close the Open panel");
+        assert!(
+            wait_closed(&mut fixture.driver),
+            "Cancel did not close the Open panel"
+        );
 
         // 4. Reopen; a foreground Escape aimed at the parent closes it.
         let state = read(&mut fixture.driver, pid, wid);
@@ -5410,7 +5470,11 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             .as_array()
             .into_iter()
             .flatten()
-            .find(|e| e["label"].as_str().is_some_and(|l| l.contains("standalone-upload")))
+            .find(|e| {
+                e["label"]
+                    .as_str()
+                    .is_some_and(|l| l.contains("standalone-upload"))
+            })
             .and_then(|e| e["element_token"].as_str().map(str::to_owned))
             .expect("file input still present");
         let reopened = fixture.driver.call(
@@ -5436,9 +5500,20 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             "press_key",
             serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"key":"escape","delivery_mode":"foreground"}),
         );
-        eprintln!("[file-picker] escape result: {}", escaped.raw.to_string().chars().take(300).collect::<String>());
+        eprintln!(
+            "[file-picker] escape result: {}",
+            escaped
+                .raw
+                .to_string()
+                .chars()
+                .take(300)
+                .collect::<String>()
+        );
         assert!(!escaped.is_error(), "foreground Escape: {}", escaped.raw);
-        assert!(wait_closed(&mut fixture.driver), "foreground Escape did not close the Open panel");
+        assert!(
+            wait_closed(&mut fixture.driver),
+            "foreground Escape did not close the Open panel"
+        );
 
         // 5. Another app in front (the reported case): reopen, bring the
         // sentinel app forward, then a foreground Escape must still reach the
@@ -5448,7 +5523,11 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             .as_array()
             .into_iter()
             .flatten()
-            .find(|e| e["label"].as_str().is_some_and(|l| l.contains("standalone-upload")))
+            .find(|e| {
+                e["label"]
+                    .as_str()
+                    .is_some_and(|l| l.contains("standalone-upload"))
+            })
             .and_then(|e| e["element_token"].as_str().map(str::to_owned))
             .expect("file input still present");
         let reopened = fixture.driver.call(
@@ -5465,7 +5544,10 @@ fn run_native_file_picker(spec: &BrowserSpec) {
         // An ordinary window of another app in front (the reported case had
         // a chat app in front). The full-screen sentinel sits in its own
         // Space, where a no-Space-switch activation cannot take the front.
-        let launched = fixture.driver.call("launch_app", serde_json::json!({"bundle_id":"com.apple.finder"}));
+        let launched = fixture.driver.call(
+            "launch_app",
+            serde_json::json!({"bundle_id":"com.apple.finder"}),
+        );
         assert!(!launched.is_error(), "{}", launched.raw);
         let windows = fixture.driver.call("list_windows", serde_json::json!({}));
         let finder = windows.structured()["windows"]
@@ -5479,7 +5561,12 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             "bring_to_front",
             serde_json::json!({"pid":finder["pid"],"window_id":finder["window_id"]}),
         );
-        assert_eq!(fronted.structured()["activated"], true, "Finder in front: {}", fronted.raw);
+        assert_eq!(
+            fronted.structured()["activated"],
+            true,
+            "Finder in front: {}",
+            fronted.raw
+        );
         let finder_pid = finder["pid"].as_i64().unwrap() as i32;
         assert_eq!(
             platform_macos::input::skylight::front_pid_matches(finder_pid),
@@ -5490,9 +5577,24 @@ fn run_native_file_picker(spec: &BrowserSpec) {
             "press_key",
             serde_json::json!({"pid":panel_pid,"window_id":panel_wid,"key":"escape","delivery_mode":"foreground"}),
         );
-        eprintln!("[file-picker] escape from behind: {}", escaped.raw.to_string().chars().take(300).collect::<String>());
-        assert!(!escaped.is_error(), "foreground Escape from behind: {}", escaped.raw);
-        assert!(wait_closed(&mut fixture.driver), "foreground Escape from behind did not close the Open panel");
+        eprintln!(
+            "[file-picker] escape from behind: {}",
+            escaped
+                .raw
+                .to_string()
+                .chars()
+                .take(300)
+                .collect::<String>()
+        );
+        assert!(
+            !escaped.is_error(),
+            "foreground Escape from behind: {}",
+            escaped.raw
+        );
+        assert!(
+            wait_closed(&mut fixture.driver),
+            "foreground Escape from behind did not close the Open panel"
+        );
         // The user's app comes back, and stays back through the window in
         // which a late self-activation of the target would be reverted.
         for delay in [Duration::from_millis(300), Duration::from_millis(1200)] {
@@ -5513,7 +5615,10 @@ standalone_browser_test!(
     run_native_named_groups
 );
 #[cfg(target_os = "macos")]
-standalone_browser_test!(standalone_browser_native_file_picker, run_native_file_picker);
+standalone_browser_test!(
+    standalone_browser_native_file_picker,
+    run_native_file_picker
+);
 standalone_browser_test!(standalone_browser_roundtrip, run_roundtrip);
 standalone_browser_test!(
     standalone_browser_trust_gated_dom_click,
@@ -5804,7 +5909,10 @@ fn run_cold_covered_read(spec: &BrowserSpec) {
             launch_browser_with_html(spec, &scenario, standalone_named_groups_html(false));
         *evidence = recording_evidence(fixture.driver.recording_dir());
         let (pid, wid) = (fixture.pid, fixture.window_id);
-        let target = TargetWindow { pid, native_id: wid };
+        let target = TargetWindow {
+            pid,
+            native_id: wid,
+        };
         let read = |driver: &mut McpDriver| {
             let state = driver.call(
                 "get_window_state",
@@ -5829,9 +5937,10 @@ fn run_cold_covered_read(spec: &BrowserSpec) {
         } else {
             assert_eq!(web_content["exposed"], false, "unexposed page not reported");
             // 2. The advice: bring the window forward once and read again.
-            let front = fixture
-                .driver
-                .call("bring_to_front", serde_json::json!({"pid":pid,"window_id":wid}));
+            let front = fixture.driver.call(
+                "bring_to_front",
+                serde_json::json!({"pid":pid,"window_id":wid}),
+            );
             assert!(!front.is_error(), "{}", front.raw);
             let deadline = Instant::now() + Duration::from_secs(10);
             loop {
@@ -5851,7 +5960,10 @@ fn run_cold_covered_read(spec: &BrowserSpec) {
                 .prepare_background_observation(&mut fixture.driver, target)
                 .unwrap();
             let (has_page, web_content) = read(&mut fixture.driver);
-            assert!(has_page, "page lost after being covered again: {web_content}");
+            assert!(
+                has_page,
+                "page lost after being covered again: {web_content}"
+            );
         }
         Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
     });

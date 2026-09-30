@@ -5,18 +5,26 @@
 //! from [`super::engine`]. All structured outputs share the shape
 //! `{"status": "ok" | "refused", ...}`.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, Weak};
 
 use async_trait::async_trait;
+use cua_driver_contract::{
+    PageChangeOp, PageChangeOpKind, PageChanges, PageChangesKind, PageDialog,
+};
 use serde_json::{json, Value};
 
 use crate::protocol::{Content, ToolResult};
+use crate::recording_tools::ReplayRegistrySlot;
 use crate::tool::{ProtectedResourceOwnership, Tool, ToolDef, ToolRegistry};
 use crate::tool_args::ArgsExt;
 
-use super::cdp_ws::CdpConnection;
+use super::cdp_ws::{CdpConnection, CdpDialogState};
 use super::download::BrowserDownloadTool;
-use super::engine::{BrowserEngine, BrowserTabScreenshot};
+use super::engine::{
+    dialog_id, dialog_open_refusal, BrowserEngine, BrowserTabScreenshot, CallStopped, HeldView,
+    PageWatch, SemanticSnapshotOutcome, Settled, ValidatedTab,
+};
+use super::observation::{DiffOp, FullReason, Told};
 use super::platform::{BrowserVisualActionKind, PrepareProfile, PrepareRequest, PrepareStrategy};
 use super::pointer::BrowserPointerTool;
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
@@ -28,11 +36,27 @@ use super::types::BindingQuality;
 /// crates call this from their `register_all` after constructing the
 /// engine with their adapter.
 pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRegistry) {
+    // Page actions read the page afterwards through the registry, so that
+    // read is authorized exactly as a get_browser_state call is.
+    let slot = registry.composite_registry_slot();
     registry.register(Box::new(GetBrowserStateTool::new(engine.clone())));
     registry.register(Box::new(BrowserPrepareTool::new(engine.clone())));
-    registry.register(Box::new(BrowserNavigateTool::new(engine.clone())));
-    registry.register(Box::new(BrowserClickTool::new(engine.clone())));
-    registry.register(Box::new(BrowserTypeTool::new(engine.clone())));
+    registry.register(Box::new(BrowserNavigateTool::with_registry(
+        engine.clone(),
+        slot.clone(),
+    )));
+    registry.register(Box::new(BrowserClickTool::with_registry(
+        engine.clone(),
+        slot.clone(),
+    )));
+    registry.register(Box::new(BrowserTypeTool::with_registry(
+        engine.clone(),
+        slot.clone(),
+    )));
+    registry.register(Box::new(super::steps::BrowserStepsTool::new(
+        engine.clone(),
+        slot,
+    )));
     registry.register(Box::new(BrowserDialogTool::new(engine.clone())));
     registry.register(Box::new(BrowserSetInputFilesTool::new(engine.clone())));
     registry.register(Box::new(BrowserDownloadTool::new(engine.clone())));
@@ -194,21 +218,353 @@ pub(crate) async fn browser_protected_resource_scope(
     Ok(Some(resource))
 }
 
-fn semantic_ref_value(listed: &super::engine::SemanticListedRef) -> Value {
-    let mut value = json!({
-        "ref": listed.external,
-        "role": listed.node.role,
-        "name": listed.node.name,
-        "value": listed.node.value,
-        "states": listed.node.states,
-        "actions": listed.node.actions.iter().map(|action| action.as_str()).collect::<Vec<_>>(),
-        "frame": listed.node.frame.kind.as_str(),
-        "visibility": listed.node.visibility.as_str(),
-    });
-    if let Some(url) = &listed.node.url {
-        value["url"] = json!(url);
+/// Sends the calls that put input into a page, and stops when a JavaScript
+/// dialog opens: a page behind one answers nothing, the call that opened it
+/// included.
+struct Delivery<'a> {
+    engine: &'a BrowserEngine,
+    conn: &'a CdpConnection,
+    cdp: &'a str,
+    target: &'a str,
+    /// The dialog the page opened while handling what was sent.
+    opened: Option<CdpDialogState>,
+}
+
+impl Delivery<'_> {
+    /// Whether a dialog is open now. A dialog can also open after a call was
+    /// answered (a handler that defers its alert), so this is asked before
+    /// every send and again before anything else is asked of the page.
+    fn blocked(&mut self) -> bool {
+        if self.opened.is_none() {
+            self.opened = self.conn.dialog_state(self.target);
+        }
+        self.opened.is_some()
     }
-    value
+
+    /// Completes once a dialog is open.
+    async fn opens(&mut self) {
+        while !self.blocked() {
+            tokio::time::sleep(super::engine::DIALOG_POLL).await;
+        }
+    }
+
+    /// Send one call; `Ok(None)` when it was not sent because a dialog is
+    /// open. A call the page answered is `Ok(Some(..))` even when the dialog
+    /// opened while it ran: what it carried did reach the page.
+    async fn send(&mut self, method: &str, params: Value) -> anyhow::Result<Option<Value>> {
+        if self.blocked() {
+            return Ok(None);
+        }
+        match self
+            .engine
+            .call_until_dialog(self.conn, self.cdp, self.target, method, params)
+            .await
+        {
+            Ok(value) => {
+                self.blocked();
+                Ok(Some(value))
+            }
+            // The call that opened the dialog was delivered; its reply only
+            // comes once the dialog is resolved.
+            Err(CallStopped::Dialog(dialog)) => {
+                self.opened = Some(dialog);
+                Ok(Some(json!({})))
+            }
+            Err(CallStopped::Failed(error)) => Err(error),
+        }
+    }
+}
+
+/// The caller's own session label, for a child call through the registry
+/// (which maps it back into the runtime namespace itself).
+pub(crate) fn public_session(args: &Value) -> Option<String> {
+    args.get("_public_session_label")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            let session = args.get("session")?.as_str()?;
+            match crate::tool::current_dispatch_runtime_scope() {
+                Some(scope) => session
+                    .strip_prefix(&format!("__cua_runtime_{scope}:"))
+                    .map(str::to_owned),
+                None => Some(session.to_owned()),
+            }
+        })
+}
+
+fn no_registry() -> ReplayRegistrySlot {
+    Arc::new(Mutex::new(Weak::new()))
+}
+
+fn snapshot_changes(outcome: &SemanticSnapshotOutcome, reason: Option<FullReason>) -> PageChanges {
+    PageChanges {
+        kind: PageChangesKind::Snapshot,
+        reason: reason.map(|reason| reason.as_str().to_owned()),
+        snapshot_id: Some(format!("p{}", outcome.snapshot_id)),
+        base_revision: None,
+        revision: outcome.revision,
+        ops: None,
+        outline: Some(outcome.outline.clone()),
+        url: Some(outcome.url.clone()),
+        title: Some(outcome.title.clone()),
+        complete: Some(outcome.complete),
+        continuation: outcome.continuation.clone(),
+        dialog: None,
+        settled: None,
+    }
+}
+
+/// What a read asked with `since_revision` tells: the keyed diff when one
+/// was possible and is smaller than the snapshot it would replace, otherwise
+/// the snapshot with the reason.
+fn page_changes(outcome: &SemanticSnapshotOutcome) -> PageChanges {
+    let (base_revision, ops, page_changed) = match &outcome.told {
+        Told::Snapshot { reason } => return snapshot_changes(outcome, *reason),
+        Told::Diff {
+            base_revision,
+            ops,
+            page_changed,
+        } => (*base_revision, ops, *page_changed),
+    };
+    let op =
+        |kind, key: &str, line: Option<&String>, after: Option<&String>, gone: bool| PageChangeOp {
+            op: kind,
+            reference: key.to_owned(),
+            line: line.cloned(),
+            after: after.cloned(),
+            gone: gone.then_some(true),
+        };
+    let diff = PageChanges {
+        kind: PageChangesKind::Diff,
+        reason: None,
+        snapshot_id: Some(format!("p{}", outcome.snapshot_id)),
+        base_revision: Some(base_revision),
+        revision: outcome.revision,
+        ops: Some(
+            ops.iter()
+                .map(|change| match change {
+                    DiffOp::Leave { key, gone } => {
+                        op(PageChangeOpKind::Leave, key, None, None, *gone)
+                    }
+                    DiffOp::Change { key, line } => {
+                        op(PageChangeOpKind::Change, key, Some(line), None, false)
+                    }
+                    DiffOp::Add { key, after, line } => op(
+                        PageChangeOpKind::Add,
+                        key,
+                        Some(line),
+                        after.as_ref(),
+                        false,
+                    ),
+                    DiffOp::Move { key, after, line } => op(
+                        PageChangeOpKind::Move,
+                        key,
+                        Some(line),
+                        after.as_ref(),
+                        false,
+                    ),
+                })
+                .collect(),
+        ),
+        outline: None,
+        url: page_changed.then(|| outcome.url.clone()),
+        title: page_changed.then(|| outcome.title.clone()),
+        complete: None,
+        continuation: None,
+        dialog: None,
+        settled: None,
+    };
+    let chars = |changes: &PageChanges| {
+        serde_json::to_string(changes).map_or(usize::MAX, |json| json.chars().count())
+    };
+    let snapshot = snapshot_changes(outcome, Some(FullReason::DiffLargerThanSnapshot));
+    if chars(&diff) < chars(&snapshot) {
+        diff
+    } else {
+        snapshot
+    }
+}
+
+fn unavailable_changes(reason: &str, dialog: Option<&CdpDialogState>) -> PageChanges {
+    PageChanges {
+        kind: PageChangesKind::Unavailable,
+        reason: Some(reason.to_owned()),
+        snapshot_id: None,
+        base_revision: None,
+        revision: None,
+        ops: None,
+        outline: None,
+        url: None,
+        title: None,
+        complete: None,
+        continuation: None,
+        dialog: dialog.map(|dialog| PageDialog {
+            dialog_id: dialog_id(dialog),
+            kind: dialog.kind.clone(),
+        }),
+        settled: None,
+    }
+}
+
+fn changes_value(changes: &PageChanges) -> Value {
+    serde_json::to_value(changes).expect("page changes serialize")
+}
+
+/// After input reached the page: wait within bounds for the page to settle,
+/// then read what changed since `held`.
+///
+/// The read is a `get_browser_state` call through the registry, so it is
+/// admitted or refused exactly as the caller's own read would be (tool
+/// allowlist, session, live origin, observation consent). `None` means the
+/// result carries no `changes`: the session works from a `dom_refs_v1`
+/// snapshot, whose refs a semantic read would end, or the tool runs outside
+/// a registry.
+// One action's tab, what its session held, and how the wait for the page
+// is to be made or has already ended.
+#[allow(clippy::too_many_arguments)]
+async fn page_changes_after(
+    engine: &BrowserEngine,
+    registry: &ReplayRegistrySlot,
+    args: &Value,
+    target_id: &str,
+    tab_id: &str,
+    validated: &ValidatedTab,
+    held: HeldView,
+    settled: Option<Settled>,
+    watch: Option<PageWatch>,
+) -> Option<Value> {
+    let dialog_changes = |dialog: &CdpDialogState| {
+        Some(changes_value(&unavailable_changes(
+            "javascript_dialog_open",
+            Some(dialog),
+        )))
+    };
+    // A dialog the dispatch itself ran into is reported whatever else holds.
+    if let Some(Settled::Dialog(dialog)) = &settled {
+        return dialog_changes(dialog);
+    }
+    // As a step of browser_steps: settle, so the next step meets a page at
+    // rest, and say only what decides whether there is a next step. The
+    // batch reads the page once at its end.
+    let batch = super::steps::in_steps_batch();
+    if !batch && held == HeldView::DomRefs {
+        return None;
+    }
+    let registry = if batch {
+        None
+    } else {
+        Some(registry.lock().unwrap().upgrade()?)
+    };
+    let settled = match settled {
+        Some(settled) => settled,
+        None => engine.settle(validated, watch).await,
+    };
+    if let Settled::Dialog(dialog) = &settled {
+        return dialog_changes(dialog);
+    }
+    let Some(registry) = registry else {
+        return matches!(settled, Settled::NewDocument { .. })
+            .then(|| changes_value(&unavailable_changes("document_changed", None)));
+    };
+    let mut read = json!({
+        "target_id": target_id,
+        "tab_id": tab_id,
+        "since_revision": match held {
+            HeldView::Semantic(revision) => revision,
+            _ => 0,
+        },
+    });
+    if let Some(session) = public_session(args) {
+        read["session"] = json!(session);
+    }
+    let result = registry.invoke("get_browser_state", read).await;
+    let structured = result.structured_content.unwrap_or(Value::Null);
+    let mut changes = match structured.get("changes") {
+        Some(changes) if structured["status"] == "ok" => changes.clone(),
+        _ => {
+            // The action stands; only its observation was refused or failed.
+            let reason = structured
+                .pointer("/refusal/code")
+                .or_else(|| structured.get("code"))
+                .and_then(Value::as_str)
+                .unwrap_or("observation_failed");
+            return Some(changes_value(&unavailable_changes(reason, None)));
+        }
+    };
+    if matches!(
+        settled,
+        Settled::Deadline | Settled::NewDocument { loaded: false }
+    ) {
+        changes["settled"] = json!(false);
+    }
+    Some(changes)
+}
+
+/// Put `changes` on a result that has structured content.
+fn with_changes(mut result: ToolResult, changes: Option<Value>) -> ToolResult {
+    if let (Some(changes), Some(structured)) = (changes, result.structured_content.as_mut()) {
+        structured["changes"] = changes;
+    }
+    result
+}
+
+/// The result of one semantic snapshot. The outline is the only place the
+/// refs appear: `- role "name" [ref actions] = "value" (states)`.
+fn semantic_snapshot_result(
+    target_id: &str,
+    tab_id: &str,
+    outcome: &super::engine::SemanticSnapshotOutcome,
+) -> ToolResult {
+    let mut result = ToolResult::text(format!(
+        "snapshot p{}: {} action ref(s), {} content ref(s) in the outline",
+        outcome.snapshot_id, outcome.action_refs, outcome.content_refs
+    ))
+    .with_structured(json!({
+        "status": "ok",
+        "mode": "snapshot",
+        "target_id": target_id,
+        "tab_id": tab_id,
+        "snapshot": {
+            "id": format!("p{}", outcome.snapshot_id),
+            "revision": outcome.revision,
+            "format": "semantic_v2",
+            "complete": outcome.complete,
+            "scope": outcome.scope,
+            "selected_nodes": outcome.selected_nodes,
+            "total_nodes": outcome.total_nodes,
+            "node_budget": super::semantic::DEFAULT_SEMANTIC_NODE_BUDGET,
+            "outline_char_budget": outcome.outline_budget,
+            "omitted": {
+                "css_hidden": outcome.omissions.css_hidden,
+                "offscreen": outcome.omissions.offscreen,
+                "page_occluded": outcome.omissions.page_occluded,
+                "no_layout": outcome.omissions.no_layout,
+                "unknown": outcome.omissions.unknown,
+                "budget": outcome.omissions.budget,
+                "unprovable_frame": outcome.omissions.unprovable_frame,
+                "no_dom_node": outcome.omissions.no_dom_node,
+            },
+            "continuation": outcome.continuation,
+        },
+        "page": {
+            "url": outcome.url,
+            "title": outcome.title,
+        },
+        "outline": outcome.outline,
+        "oopif": {
+            "status": outcome.oopif.as_str(),
+            "frames": outcome.oopif.frames(),
+        },
+    }));
+    if let (Some(listed), Some(structured)) = (&outcome.listed, result.structured_content.as_mut())
+    {
+        let (actions, content): (Vec<&Value>, Vec<&Value>) = listed
+            .iter()
+            .partition(|entry| entry["actions"].as_array().is_some_and(|a| !a.is_empty()));
+        structured["refs"] = json!(actions);
+        structured["content_refs"] = json!(content);
+    }
+    result
 }
 
 fn with_tab_screenshot(mut result: ToolResult, screenshot: BrowserTabScreenshot) -> ToolResult {
@@ -249,9 +605,9 @@ impl GetBrowserStateTool {
         let def = ToolDef {
             name: "get_browser_state".into(),
             description: "Read-only browser inspection. Bind with pid + window_id to get a \
-                target_id and tab ids; snapshot with target_id + tab_id to get page refs \
-                (semantic_v2 adds a ranked outline and typed refs). Consent and setup \
-                refusals give the browser_prepare call to make. \
+                target_id and tab ids; snapshot with target_id + tab_id to get the page \
+                outline, one line per element with its ref and actions inline. Consent and \
+                setup refusals give the browser_prepare call to make. \
                 Details: skill://cua-driver/BROWSER.md"
                 .into(),
             input_schema: json!({
@@ -264,9 +620,16 @@ impl GetBrowserStateTool {
                     "session": schema_session(),
                     "snapshot_format": {
                         "type": "string",
-                        "enum": ["dom_refs_v1", "semantic_v2"],
-                        "default": "dom_refs_v1",
-                        "description": "Snapshot format."
+                        "enum": ["semantic_v2", "dom_refs_v1"],
+                        "default": "semantic_v2",
+                        "description": "semantic_v2: ranked outline with inline refs. dom_refs_v1: a flat ref list."
+                    },
+                    "max_chars": {
+                        "type": "integer",
+                        "default": super::engine::DEFAULT_SNAPSHOT_CHARS,
+                        "minimum": super::engine::MIN_SNAPSHOT_CHARS,
+                        "maximum": super::engine::MAX_SNAPSHOT_CHARS,
+                        "description": "Size budget for a semantic_v2 result; the rest is reached by continuation."
                     },
                     "scope_ref": {
                         "type": "string",
@@ -278,7 +641,17 @@ impl GetBrowserStateTool {
                     },
                     "continuation": {
                         "type": "string",
-                        "description": "Continuation from an earlier semantic_v2 response."
+                        "description": "Continuation from an earlier response."
+                    },
+                    "include_refs": {
+                        "type": "boolean",
+                        "default": false,
+                        "description": "Also return the outline's refs as lists (refs, content_refs) for programs; counts against max_chars."
+                    },
+                    "since_revision": {
+                        "type": "integer",
+                        "minimum": 0,
+                        "description": "Return what changed since this snapshot.revision instead of the whole outline."
                     },
                     "include_screenshot": {
                         "type": "boolean",
@@ -348,7 +721,7 @@ impl Tool for GetBrowserStateTool {
             };
             let snapshot_format = args
                 .opt_str("snapshot_format")
-                .unwrap_or_else(|| "dom_refs_v1".into());
+                .unwrap_or_else(|| "semantic_v2".into());
             let include_screenshot = match args.get("include_screenshot") {
                 None => false,
                 Some(Value::Bool(include)) => *include,
@@ -366,12 +739,61 @@ impl Tool for GetBrowserStateTool {
             if snapshot_format == "dom_refs_v1"
                 && (args.opt_str("scope_ref").is_some()
                     || args.opt_str("query").is_some()
-                    || args.opt_str("continuation").is_some())
+                    || args.opt_str("continuation").is_some()
+                    || args.get("max_chars").is_some()
+                    || args.get("include_refs").is_some()
+                    || args.get("since_revision").is_some())
             {
                 return ToolResult::error(
-                    "scope_ref, query, and continuation require snapshot_format=\"semantic_v2\"",
+                    "scope_ref, query, continuation, max_chars, include_refs, and since_revision require snapshot_format=\"semantic_v2\"",
                 );
             }
+            let since =
+                match args.get("since_revision") {
+                    None => None,
+                    Some(value) => match value.as_u64() {
+                        Some(revision) => Some(revision),
+                        None => return ToolResult::error(
+                            "since_revision must be a snapshot.revision (a non-negative integer)",
+                        ),
+                    },
+                };
+            if since.is_some()
+                && (args.opt_str("scope_ref").is_some()
+                    || args.opt_str("query").is_some()
+                    || args.opt_str("continuation").is_some()
+                    || args.get("include_refs").is_some())
+            {
+                return ToolResult::error(
+                    "since_revision compares whole-page snapshots: it cannot be combined with scope_ref, query, continuation, or include_refs",
+                );
+            }
+            let include_refs = match args.get("include_refs") {
+                None => false,
+                Some(Value::Bool(include)) => *include,
+                Some(_) => {
+                    return ToolResult::error("Field include_refs has wrong type: expected boolean")
+                }
+            };
+            let max_chars = match args.get("max_chars") {
+                None => super::engine::DEFAULT_SNAPSHOT_CHARS,
+                Some(value) => match value.as_u64().map(|chars| chars as usize) {
+                    Some(chars)
+                        if (super::engine::MIN_SNAPSHOT_CHARS
+                            ..=super::engine::MAX_SNAPSHOT_CHARS)
+                            .contains(&chars) =>
+                    {
+                        chars
+                    }
+                    _ => {
+                        return ToolResult::error(format!(
+                            "max_chars must be an integer from {} to {}",
+                            super::engine::MIN_SNAPSHOT_CHARS,
+                            super::engine::MAX_SNAPSHOT_CHARS
+                        ))
+                    }
+                },
+            };
             if snapshot_format == "semantic_v2" {
                 let snapshot = match self
                     .engine
@@ -382,64 +804,35 @@ impl Tool for GetBrowserStateTool {
                         args.opt_str("scope_ref").as_deref(),
                         args.opt_str("query").as_deref(),
                         args.opt_str("continuation").as_deref(),
+                        max_chars,
+                        include_refs,
+                        since,
                     )
                     .await
                 {
-                    Ok(outcome) => {
-                        let refs = outcome
-                            .refs
-                            .iter()
-                            .map(semantic_ref_value)
-                            .collect::<Vec<_>>();
-                        let content_refs = outcome
-                            .content_refs
-                            .iter()
-                            .map(semantic_ref_value)
-                            .collect::<Vec<_>>();
-                        ToolResult::text(format!(
-                            "semantic snapshot p{} of {}: {} action ref(s), {} content ref(s)",
-                            outcome.snapshot_id,
-                            outcome.url,
-                            refs.len(),
-                            content_refs.len()
-                        ))
+                    Ok(outcome) if since.is_some() => {
+                        let changes = page_changes(&outcome);
+                        ToolResult::text(match changes.kind {
+                            PageChangesKind::Diff => format!(
+                                "{} change(s) since revision {}",
+                                changes.ops.as_ref().map_or(0, Vec::len),
+                                changes.base_revision.unwrap_or_default()
+                            ),
+                            _ => format!(
+                                "snapshot p{} ({})",
+                                outcome.snapshot_id,
+                                changes.reason.as_deref().unwrap_or("full")
+                            ),
+                        })
                         .with_structured(json!({
                             "status": "ok",
-                            "mode": "snapshot",
+                            "mode": "changes",
                             "target_id": target_id,
                             "tab_id": tab_id,
-                            "snapshot": {
-                                "id": format!("p{}", outcome.snapshot_id),
-                                "format": "semantic_v2",
-                                "complete": outcome.complete,
-                                "scope": outcome.scope,
-                                "selected_nodes": outcome.selected_nodes,
-                                "total_nodes": outcome.total_nodes,
-                                "node_budget": super::semantic::DEFAULT_SEMANTIC_NODE_BUDGET,
-                                "omitted": {
-                                    "css_hidden": outcome.omissions.css_hidden,
-                                    "offscreen": outcome.omissions.offscreen,
-                                    "page_occluded": outcome.omissions.page_occluded,
-                                    "no_layout": outcome.omissions.no_layout,
-                                    "unknown": outcome.omissions.unknown,
-                                    "budget": outcome.omissions.budget,
-                                    "unprovable_frame": outcome.omissions.unprovable_frame,
-                                },
-                                "continuation": outcome.continuation,
-                            },
-                            "page": {
-                                "url": outcome.url,
-                                "title": outcome.title,
-                            },
-                            "outline": outcome.outline,
-                            "refs": refs,
-                            "content_refs": content_refs,
-                            "oopif": {
-                                "status": outcome.oopif.as_str(),
-                                "frames": outcome.oopif.frames(),
-                            },
+                            "changes": changes_value(&changes),
                         }))
                     }
+                    Ok(outcome) => semantic_snapshot_result(&target_id, &tab_id, &outcome),
                     Err(refusal) => return refusal.to_tool_result(),
                 };
                 if include_screenshot {
@@ -722,14 +1115,21 @@ impl Tool for BrowserPrepareTool {
 pub struct BrowserNavigateTool {
     def: ToolDef,
     engine: Arc<BrowserEngine>,
+    registry: ReplayRegistrySlot,
 }
 
 impl BrowserNavigateTool {
     pub fn new(engine: Arc<BrowserEngine>) -> Self {
+        Self::with_registry(engine, no_registry())
+    }
+
+    /// `registry` is what the read of the new page is dispatched through.
+    pub fn with_registry(engine: Arc<BrowserEngine>, registry: ReplayRegistrySlot) -> Self {
         let def = ToolDef {
             name: "browser_navigate".into(),
             description: "Navigate one bound tab to an http, https, or about URL. Invalidates \
-                the tab's page refs. Refused for heuristic bindings."
+                the tab's page refs and returns the new page's outline in changes. Refused \
+                for heuristic bindings."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -747,7 +1147,11 @@ impl BrowserNavigateTool {
             idempotent: false,
             open_world: true,
         };
-        Self { def, engine }
+        Self {
+            def,
+            engine,
+            registry,
+        }
     }
 }
 
@@ -820,6 +1224,7 @@ impl Tool for BrowserNavigateTool {
             Ok(v) => v,
             Err(refusal) => return refusal.to_tool_result(),
         };
+        let held = self.engine.held_view(&session, &target_id, &tab_id);
 
         match validated
             .conn
@@ -838,13 +1243,42 @@ impl Tool for BrowserNavigateTool {
                 self.engine
                     .store
                     .invalidate_tab_snapshots(&session, &target_id, &tab_id);
-                ToolResult::text(format!("navigated {tab_id} to {url}")).with_structured(json!({
-                    "status": "ok",
-                    "target_id": target_id,
-                    "tab_id": tab_id,
-                    "url": url,
-                    "refs_invalidated": true,
-                }))
+                // The new page, once it has loaded (bounded): a full snapshot,
+                // since nothing of the old document can be compared with it.
+                let changes = if held == HeldView::DomRefs {
+                    None
+                } else {
+                    // Page.navigate answers once the new document has
+                    // replaced the old one.
+                    let loaded = self
+                        .engine
+                        .await_document(&validated, None, tokio::time::Instant::now())
+                        .await;
+                    page_changes_after(
+                        &self.engine,
+                        &self.registry,
+                        &args,
+                        &target_id,
+                        &tab_id,
+                        &validated,
+                        HeldView::Nothing,
+                        Some(loaded),
+                        None,
+                    )
+                    .await
+                };
+                with_changes(
+                    ToolResult::text(format!("navigated {tab_id} to {url}")).with_structured(
+                        json!({
+                            "status": "ok",
+                            "target_id": target_id,
+                            "tab_id": tab_id,
+                            "url": url,
+                            "refs_invalidated": true,
+                        }),
+                    ),
+                    changes,
+                )
             }
             Err(e) => ToolResult::error(format!("Page.navigate failed: {e}")),
         }
@@ -856,15 +1290,22 @@ impl Tool for BrowserNavigateTool {
 pub struct BrowserClickTool {
     def: ToolDef,
     engine: Arc<BrowserEngine>,
+    registry: ReplayRegistrySlot,
 }
 
 impl BrowserClickTool {
     pub fn new(engine: Arc<BrowserEngine>) -> Self {
+        Self::with_registry(engine, no_registry())
+    }
+
+    /// `registry` is what the read after the click is dispatched through.
+    pub fn with_registry(engine: Arc<BrowserEngine>, registry: ReplayRegistrySlot) -> Self {
         let def = ToolDef {
             name: "browser_click".into(),
             description: "Click a page ref or viewport x,y in a bound tab with trusted input; \
                 refuses rather than raising a standalone browser. input_route \"dom_event\" \
-                (ref required) only proves dispatch. Refused for heuristic bindings."
+                (ref required) only proves dispatch. Returns what the page changed in \
+                changes. Refused for heuristic bindings."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -890,7 +1331,11 @@ impl BrowserClickTool {
             idempotent: false,
             open_world: true,
         };
-        Self { def, engine }
+        Self {
+            def,
+            engine,
+            registry,
+        }
     }
 }
 
@@ -979,7 +1424,8 @@ impl Tool for BrowserClickTool {
         // and with Chrome fully covered (8 of 8), and Finder stayed frontmost.
         if route == "trusted"
             && validated.record.cdp_window_id.is_some()
-            && validated.record.endpoint_transport != super::types::EndpointTransport::ExtensionRelay
+            && validated.record.endpoint_transport
+                != super::types::EndpointTransport::ExtensionRelay
         {
             if let Some(limitation) = self
                 .engine
@@ -1003,8 +1449,23 @@ impl Tool for BrowserClickTool {
             }
         }
 
+        // What the session holds now is what the changes are made against.
+        let held = self.engine.held_view(&session, &target_id, &tab_id);
+        // A click can open a JavaScript dialog, and a page behind one answers
+        // nothing: hear about it, and do not send input into one already up.
+        let cdp_target = validated.tab.cdp_target_id.as_str();
+        self.engine
+            .watch_dialogs(&validated.conn, &validated.cdp_session, cdp_target)
+            .await;
+        if let Some(dialog) = validated.conn.dialog_state(cdp_target) {
+            return dialog_open_refusal(&dialog).to_tool_result();
+        }
+        // From before the input: a navigation it sets off is seen starting.
+        let watch = self.engine.page_watch(&validated).await;
+
         // Ref path: re-prove the ref's frame/document identity and get
         // the session (tab or contained OOPIF child) its node lives in.
+        let mut ref_frame = None;
         let (backend_node_id, frame_kind, cdp_session) = match &ext_ref {
             Some(r) => {
                 let entry = match self
@@ -1024,18 +1485,13 @@ impl Tool for BrowserClickTool {
                 }
                 let frame_session = match self
                     .engine
-                    .frame_session_for_mutation(
-                        &session,
-                        &target_id,
-                        &tab_id,
-                        &validated,
-                        &entry.frame,
-                    )
+                    .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry)
                     .await
                 {
                     Ok(s) => s,
                     Err(refusal) => return refusal.to_tool_result(),
                 };
+                ref_frame = Some(entry.frame.clone());
                 (
                     Some(entry.backend_node_id),
                     Some(entry.frame.kind.as_str()),
@@ -1112,9 +1568,12 @@ impl Tool for BrowserClickTool {
                         .await;
                 }
             }
-            return match conn
-                .call(
-                    Some(cdp),
+            let opened = match self
+                .engine
+                .call_until_dialog(
+                    conn,
+                    cdp,
+                    cdp_target,
                     "Runtime.callFunctionOn",
                     json!({
                         "objectId": object_id,
@@ -1123,11 +1582,31 @@ impl Tool for BrowserClickTool {
                 )
                 .await
             {
-                Ok(_) => ToolResult::text(format!(
+                Ok(_) => None,
+                // The click handler opened a dialog: it ran.
+                Err(CallStopped::Dialog(dialog)) => Some(Settled::Dialog(dialog)),
+                Err(CallStopped::Failed(e)) => {
+                    return ToolResult::error(format!("DOM click failed: {e}"))
+                }
+            };
+            let changes = page_changes_after(
+                &self.engine,
+                &self.registry,
+                &args,
+                &target_id,
+                &tab_id,
+                &validated,
+                held,
+                opened,
+                watch,
+            )
+            .await;
+            return with_changes(
+                ToolResult::text(format!(
                     "dispatched synthetic DOM click on {} in {tab_id}; application effect not \
-                     verified (trust-gated controls may ignore untrusted events). Read the page \
-                     with get_browser_state to verify; if the control ignored it, click again \
-                     without input_route to use trusted input",
+                     verified (trust-gated controls may ignore untrusted events). Check changes, \
+                     or read the page with get_browser_state, to verify; if the control \
+                     ignored it, click again without input_route to use trusted input",
                     ext_ref.as_deref().unwrap_or("?")
                 ))
                 .with_structured(json!({
@@ -1142,52 +1621,135 @@ impl Tool for BrowserClickTool {
                     // legacy page tool, whose mutations are off by default. The
                     // summary names the real next step.
                 })),
-                Err(e) => ToolResult::error(format!("DOM click failed: {e}")),
-            };
+                changes,
+            );
         }
 
         // Trusted route: resolve a click point, then Input.dispatchMouseEvent.
-        let (x, y) = match (backend_node_id, coords) {
-            (Some(backend), _) => {
-                // Best effort scroll-into-view; ignore failure (older Chromium).
-                let _ = conn
-                    .call(
-                        Some(cdp),
-                        "DOM.scrollIntoViewIfNeeded",
-                        json!({ "backendNodeId": backend }),
-                    )
-                    .await;
-                let box_model = match conn
-                    .call(
-                        Some(cdp),
-                        "DOM.getBoxModel",
-                        json!({ "backendNodeId": backend }),
-                    )
-                    .await
-                {
-                    Ok(v) => v,
-                    Err(_) => {
-                        return BrowserRefusal::new(
-                            BrowserRefusalCode::BrowserRefStale,
-                            "the ref's node has no layout box — it left the DOM or is hidden",
-                        )
-                        .to_tool_result()
-                    }
-                };
-                match quad_center(&box_model) {
-                    Some(pt) => pt,
-                    None => {
-                        return BrowserRefusal::new(
-                            BrowserRefusalCode::BrowserRefStale,
-                            "the ref's node returned an unusable layout box",
-                        )
-                        .to_tool_result()
+        let (x, y) =
+            match (backend_node_id, coords) {
+                (Some(backend), _) => {
+                    // The point is the centre of the element's box, and the click
+                    // goes to whatever is on top there. Ask the page what that
+                    // is before sending it: once more after a scroll and a beat
+                    // (a popover may still be moving), then refuse.
+                    let mut attempt = 0;
+                    loop {
+                        // Best effort scroll-into-view; ignore failure (older Chromium).
+                        let _ = conn
+                            .call(
+                                Some(cdp),
+                                "DOM.scrollIntoViewIfNeeded",
+                                json!({ "backendNodeId": backend }),
+                            )
+                            .await;
+                        let box_model = match conn
+                            .call(
+                                Some(cdp),
+                                "DOM.getBoxModel",
+                                json!({ "backendNodeId": backend }),
+                            )
+                            .await
+                        {
+                            Ok(v) => v,
+                            Err(_) => return BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserRefStale,
+                                "the ref's node has no layout box — it left the DOM or is hidden",
+                            )
+                            .to_tool_result(),
+                        };
+                        let Some(point) = quad_center(&box_model) else {
+                            return BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserRefStale,
+                                "the ref's node returned an unusable layout box",
+                            )
+                            .to_tool_result();
+                        };
+                        let (hit, probe) = hit_test(conn, cdp, backend, point, &box_model).await;
+                        let named = ext_ref.as_deref().unwrap_or("the ref");
+                        let blocked = match hit {
+                            Hit::Receives => break point,
+                            Hit::Gone => {
+                                return BrowserRefusal::new(
+                                    BrowserRefusalCode::BrowserRefStale,
+                                    "the ref's node left the page before the click",
+                                )
+                                .to_tool_result()
+                            }
+                            blocked => blocked,
+                        };
+                        if attempt == 0 {
+                            attempt += 1;
+                            tokio::time::sleep(HIT_TEST_RETRY).await;
+                            continue;
+                        }
+                        // Name what is on top by the ref the session holds for
+                        // it: a ref is something the caller already has. What the
+                        // element says is page content, which only a read tells.
+                        let on_top = match (&blocked, &probe, &ref_frame) {
+                            (Hit::Covered { .. } | Hit::Container, Some(probe), Some(frame)) => {
+                                match probe.element_on_top(conn, cdp).await {
+                                    Some(covering) => self.engine.store.ref_of_node(
+                                        &session, &target_id, &tab_id, frame, covering,
+                                    ),
+                                    None => None,
+                                }
+                            }
+                            _ => None,
+                        };
+                        let by = match (&blocked, &on_top) {
+                            (
+                                Hit::Covered {
+                                    own_indicator: true,
+                                },
+                                _,
+                            ) => "Cua's own \"working in this tab\" pill".to_owned(),
+                            (_, Some(reference)) => reference.clone(),
+                            _ => "an element that has no ref in the outline you hold (read the \
+                              page again to see it)"
+                                .to_owned(),
+                        };
+                        let refusal = match blocked {
+                            Hit::Covered { .. } => BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserTargetCovered,
+                                format!(
+                                "{named} is covered at its centre by {by}: a click there would \
+                                 go to that element, so none was sent. Deal with what covers it \
+                                 (close it or scroll it away), or act on it by its own ref"
+                            ),
+                            ),
+                            Hit::Container => BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserTargetCovered,
+                                format!(
+                                    "{named} takes no click at its centre: the element around it, \
+                                 {by}, would receive it (the ref's element takes no pointer \
+                                 input there, or is drawn elsewhere), so none was sent"
+                                ),
+                            ),
+                            Hit::Outside => BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserTargetCovered,
+                                format!(
+                                    "the centre of {named} is outside the visible page even after \
+                                 scrolling to it, so no click was sent"
+                                ),
+                            ),
+                            _ => BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserActionUnavailable,
+                                format!(
+                                    "the page did not say which element a click at the centre of \
+                                 {named} would reach, so none was sent; input_route \
+                                 \"dom_event\" clicks the element itself"
+                                ),
+                            ),
+                        };
+                        return refusal
+                            .with_detail(json!({ "covered_by_ref": on_top, "click_sent": false }))
+                            .to_tool_result();
                     }
                 }
-            }
-            (None, Some(pt)) => pt,
-            (None, None) => unreachable!("validated above"),
-        };
+                (None, Some(pt)) => pt,
+                (None, None) => unreachable!("validated above"),
+            };
 
         self.engine
             .visualize_browser_action(
@@ -1219,10 +1781,14 @@ impl Tool for BrowserClickTool {
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
         let mut delivery_error = None;
+        let mut opened = None;
         for (event_type, click_count) in [("mousePressed", 1), ("mouseReleased", 1)] {
-            if let Err(error) = conn
-                .call(
-                    Some(cdp),
+            match self
+                .engine
+                .call_until_dialog(
+                    conn,
+                    cdp,
+                    cdp_target,
                     "Input.dispatchMouseEvent",
                     json!({
                         "type": event_type,
@@ -1234,18 +1800,32 @@ impl Tool for BrowserClickTool {
                 )
                 .await
             {
-                delivery_error = Some(error);
-                break;
+                Ok(_) => {}
+                // The page's handler opened a dialog: the event was delivered,
+                // and its reply only comes once the dialog is resolved.
+                Err(CallStopped::Dialog(dialog)) => {
+                    opened = Some(Settled::Dialog(dialog));
+                    break;
+                }
+                Err(CallStopped::Failed(error)) => {
+                    delivery_error = Some(error);
+                    break;
+                }
             }
         }
-        let cleanup_error = conn
-            .call(
+        // With a dialog up the page answers nothing, this included: the
+        // emulation ends with the attachment session instead.
+        let cleanup_error = if opened.is_some() {
+            None
+        } else {
+            conn.call(
                 Some(cdp),
                 "Emulation.setFocusEmulationEnabled",
                 json!({ "enabled": false }),
             )
             .await
-            .err();
+            .err()
+        };
         if let Some(error) = delivery_error {
             // Trusted input is the contract; we never silently fall back to
             // synthetic events. Focus emulation has already been unwound.
@@ -1268,17 +1848,220 @@ impl Tool for BrowserClickTool {
             .with_detail(json!({ "delivery": "unknown", "retryable": false }))
             .to_tool_result();
         }
-        ToolResult::text(format!("clicked ({x:.0}, {y:.0}) in {tab_id}")).with_structured(json!({
-            "status": "ok",
-            "route": "trusted",
-            "target_id": target_id,
-            "tab_id": tab_id,
-            "ref": ext_ref,
-            "frame": frame_kind,
-            "x": x,
-            "y": y,
-        }))
+        let changes = page_changes_after(
+            &self.engine,
+            &self.registry,
+            &args,
+            &target_id,
+            &tab_id,
+            &validated,
+            held,
+            opened,
+            watch,
+        )
+        .await;
+        with_changes(
+            ToolResult::text(format!("clicked ({x:.0}, {y:.0}) in {tab_id}")).with_structured(
+                json!({
+                    "status": "ok",
+                    "route": "trusted",
+                    "target_id": target_id,
+                    "tab_id": tab_id,
+                    "ref": ext_ref,
+                    "frame": frame_kind,
+                    "x": x,
+                    "y": y,
+                }),
+            ),
+            changes,
+        )
     }
+}
+
+/// How long a covered target is given before it is looked at once more.
+const HIT_TEST_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// What is on top at a ref's click point, as the page reports it. Run on the
+/// ref's node; `x`, `y` are the click point and `bx`, `by` the top-left of
+/// the node's border box, both in the coordinates the click is sent in. The
+/// node's own rectangle gives the same corner in its document's coordinates,
+/// so the point is found there whatever frame the node is in. The walk goes
+/// down through open shadow roots and through the (open or closed) roots the
+/// node itself lives in, and up through shadow hosts when it asks whether
+/// one element contains another. With `element` it returns the element on
+/// top itself instead of the facts about it.
+const HIT_TEST: &str = "function(x, y, bx, by, element) { \
+    const target = this.nodeType === 1 ? this : this.parentElement; \
+    if (!target || !target.isConnected) return element ? null : { connected: false }; \
+    const rect = target.getBoundingClientRect(); \
+    const px = x - bx + rect.left, py = y - by + rect.top; \
+    const own = new Map(); \
+    for (let root = target.getRootNode(); root && root.host; root = root.host.getRootNode()) \
+        own.set(root.host, root); \
+    let hit = target.ownerDocument.elementFromPoint(px, py); \
+    while (hit) { \
+        const root = hit.shadowRoot || own.get(hit); \
+        const inner = root ? root.elementFromPoint(px, py) : null; \
+        if (!inner || inner === hit) break; \
+        hit = inner; \
+    } \
+    if (element) return hit; \
+    if (!hit) return { connected: true, hit: false }; \
+    const holds = (outer, node) => { \
+        for (let n = node; n; n = n.parentNode || n.host) if (n === outer) return true; \
+        return false; \
+    }; \
+    const label = hit.closest ? hit.closest('label') : null; \
+    return { connected: true, hit: true, \
+        inside_target: holds(target, hit), \
+        contains_target: holds(hit, target), \
+        label_of_target: !!label && (label.control === target || holds(label, target) \
+            || (!!target.labels && Array.prototype.includes.call(target.labels, label))), \
+        own_indicator: hit.id === 'cua-driver-indicator' }; \
+}";
+
+/// Who would receive a trusted click at a ref's click point.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum Hit {
+    /// The ref's element: itself, something inside it, or its label.
+    Receives,
+    /// Another element is on top. `own_indicator`: it is the extension's
+    /// own notice (see `semantic::CUA_INDICATOR_HOST_ID`).
+    Covered { own_indicator: bool },
+    /// An element around the ref's element: the ref's element takes no
+    /// pointer input at that point, so its own handlers would not run.
+    Container,
+    /// Nothing: the point is outside the visible page.
+    Outside,
+    /// The ref's node is no longer in the page.
+    Gone,
+    /// The page did not answer the question: nothing is proven.
+    Unknown,
+}
+
+/// Read the facts [`HIT_TEST`] returned. Only a positive answer lets a click
+/// through.
+fn classify_hit(facts: &Value) -> Hit {
+    let flag = |name: &str| facts.get(name).and_then(Value::as_bool);
+    match (flag("connected"), flag("hit")) {
+        (Some(false), _) => return Hit::Gone,
+        (Some(true), Some(false)) => return Hit::Outside,
+        (Some(true), Some(true)) => {}
+        _ => return Hit::Unknown,
+    }
+    match (
+        flag("inside_target"),
+        flag("label_of_target"),
+        flag("contains_target"),
+    ) {
+        (Some(true), _, _) | (_, Some(true), _) => Hit::Receives,
+        (Some(false), Some(false), Some(true)) => Hit::Container,
+        (Some(false), Some(false), Some(false)) => Hit::Covered {
+            own_indicator: flag("own_indicator") == Some(true),
+        },
+        _ => Hit::Unknown,
+    }
+}
+
+/// One hit-test's node and arguments, kept to ask which element is on top.
+struct HitProbe {
+    object_id: String,
+    arguments: Vec<Value>,
+}
+
+impl HitProbe {
+    async fn ask(&self, conn: &CdpConnection, cdp: &str, element: bool) -> Option<Value> {
+        let mut arguments = self.arguments.clone();
+        arguments.push(json!({ "value": element }));
+        conn.call(
+            Some(cdp),
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": self.object_id,
+                "functionDeclaration": HIT_TEST,
+                "arguments": arguments,
+                "returnByValue": !element,
+            }),
+        )
+        .await
+        .ok()
+    }
+
+    /// The node id of the element on top at the click point.
+    async fn element_on_top(&self, conn: &CdpConnection, cdp: &str) -> Option<i64> {
+        let answer = self.ask(conn, cdp, true).await?;
+        let object_id = answer.pointer("/result/objectId")?.as_str()?;
+        conn.call(
+            Some(cdp),
+            "DOM.describeNode",
+            json!({ "objectId": object_id }),
+        )
+        .await
+        .ok()?
+        .pointer("/node/backendNodeId")?
+        .as_i64()
+    }
+}
+
+/// Ask the page what is on top at the click point of a ref's node.
+async fn hit_test(
+    conn: &CdpConnection,
+    cdp: &str,
+    backend_node_id: i64,
+    (x, y): (f64, f64),
+    box_model: &Value,
+) -> (Hit, Option<HitProbe>) {
+    // The border box's top-left: the corner the node's own rectangle names.
+    let corner = box_model
+        .pointer("/model/border")
+        .and_then(Value::as_array)
+        .map(|quad| quad.iter().filter_map(Value::as_f64).collect::<Vec<_>>())
+        .filter(|quad| quad.len() == 8)
+        .map(|quad| {
+            (
+                quad.iter()
+                    .step_by(2)
+                    .copied()
+                    .fold(f64::INFINITY, f64::min),
+                quad.iter()
+                    .skip(1)
+                    .step_by(2)
+                    .copied()
+                    .fold(f64::INFINITY, f64::min),
+            )
+        });
+    let Some((bx, by)) = corner else {
+        return (Hit::Unknown, None);
+    };
+    let Some(object_id) = conn
+        .call(
+            Some(cdp),
+            "DOM.resolveNode",
+            json!({ "backendNodeId": backend_node_id }),
+        )
+        .await
+        .ok()
+        .and_then(|resolved| {
+            resolved
+                .pointer("/object/objectId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+    else {
+        return (Hit::Gone, None);
+    };
+    let probe = HitProbe {
+        object_id,
+        arguments: [x, y, bx, by]
+            .into_iter()
+            .map(|value| json!({ "value": value }))
+            .collect(),
+    };
+    let hit = match probe.ask(conn, cdp, false).await {
+        Some(answer) => classify_hit(answer.pointer("/result/value").unwrap_or(&Value::Null)),
+        None => Hit::Unknown,
+    };
+    (hit, Some(probe))
 }
 
 /// Center of the content quad from a `DOM.getBoxModel` result.
@@ -1527,8 +2310,11 @@ fn inserted_at_selection(before: &EditState, text: &str) -> Option<String> {
 /// Exact values (input, textarea): is `after` the old value with `text` put
 /// in at one position, replacing nothing or one range?
 fn field_splice(before: &str, after: &str, text: &str) -> Option<Splice> {
-    let (before, after, text): (Vec<char>, Vec<char>, Vec<char>) =
-        (before.chars().collect(), after.chars().collect(), text.chars().collect());
+    let (before, after, text): (Vec<char>, Vec<char>, Vec<char>) = (
+        before.chars().collect(),
+        after.chars().collect(),
+        text.chars().collect(),
+    );
     // Characters of the old value the edit removed.
     let removed = (before.len() + text.len()).checked_sub(after.len())?;
     if removed > before.len() {
@@ -1540,7 +2326,13 @@ fn field_splice(before: &str, after: &str, text: &str) -> Option<Splice> {
                 && after[at..at + text.len()] == text[..]
                 && after[at + text.len()..] == before[at + removed..]
         })
-        .map(|_| if removed == 0 { Splice::Inserted } else { Splice::ReplacedRange })
+        .map(|_| {
+            if removed == 0 {
+                Splice::Inserted
+            } else {
+                Splice::ReplacedRange
+            }
+        })
 }
 
 /// Old values longer than this skip the range-replacement search for
@@ -1606,28 +2398,39 @@ fn normalize_rendered(value: &str) -> String {
 
 /// Read the node back until it holds what the input should have produced,
 /// for up to half a second (frameworks may re-render after the input event).
+/// `None` when the page opened a dialog meanwhile (a handler that defers its
+/// alert): a blocked page answers no read, so none is sent or waited for.
 async fn await_edit_readback(
-    conn: &CdpConnection,
-    cdp: &str,
+    delivery: &mut Delivery<'_>,
     object_id: &str,
     before: &EditState,
     text: &str,
     mode: EditMode,
-) -> Readback {
+) -> Option<Readback> {
+    let (conn, cdp) = (delivery.conn, delivery.cdp);
     let mut judged = Readback::Unverifiable;
     for attempt in 0..10 {
         if attempt > 0 {
             tokio::time::sleep(std::time::Duration::from_millis(50)).await;
         }
-        let Some(after) = read_edit_state(conn, cdp, object_id).await else {
-            return judged;
+        let after = tokio::select! {
+            biased;
+            _ = delivery.opens() => return None,
+            after = read_edit_state(conn, cdp, object_id) => after,
+        };
+        let Some(after) = after else {
+            break;
         };
         judged = judge_edit(before, &after, text, mode);
-        if matches!(judged, Readback::Confirmed(_) | Readback::Detached) {
-            break;
+        match judged {
+            Readback::Confirmed(_) => return Some(judged),
+            Readback::Detached => break,
+            _ => {}
         }
     }
-    judged
+    // Only a confirmed read is a verdict once a dialog is up: the page was
+    // stopped partway through handling the input.
+    (!delivery.blocked()).then_some(judged)
 }
 
 const SHOWN_VALUE_CHARS: usize = 200;
@@ -1645,7 +2448,10 @@ fn truncate_value(value: &str) -> String {
 /// A value for a message: quoted, shortened, never a password.
 fn shown_value(value: &str, password: bool) -> String {
     if password {
-        format!("{} character(s) (a password; not shown)", value.chars().count())
+        format!(
+            "{} character(s) (a password; not shown)",
+            value.chars().count()
+        )
     } else {
         serde_json::to_string(&truncate_value(value)).unwrap_or_default()
     }
@@ -1796,16 +2602,22 @@ async fn enter_focus_emulation(
 pub struct BrowserTypeTool {
     def: ToolDef,
     engine: Arc<BrowserEngine>,
+    registry: ReplayRegistrySlot,
 }
 
 impl BrowserTypeTool {
     pub fn new(engine: Arc<BrowserEngine>) -> Self {
+        Self::with_registry(engine, no_registry())
+    }
+
+    /// `registry` is what the read after typing is dispatched through.
+    pub fn with_registry(engine: Arc<BrowserEngine>, registry: ReplayRegistrySlot) -> Self {
         let def = ToolDef {
             name: "browser_type".into(),
             description: "Type text into an editable page ref of a bound tab. Appends at the \
                 caret unless replace:true, which replaces the content (empty text clears it). \
-                Reads the field back: confirmed, or an error with the value it holds. \
-                Refused for heuristic bindings."
+                Reads the field back: confirmed, or an error with the value it holds; changes \
+                has what else the page changed. Refused for heuristic bindings."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -1835,7 +2647,11 @@ impl BrowserTypeTool {
             idempotent: false,
             open_world: true,
         };
-        Self { def, engine }
+        Self {
+            def,
+            engine,
+            registry,
+        }
     }
 }
 
@@ -1907,6 +2723,17 @@ impl Tool for BrowserTypeTool {
             Err(refusal) => return refusal.to_tool_result(),
         };
 
+        let held = self.engine.held_view(&session, &target_id, &tab_id);
+        let cdp_target = validated.tab.cdp_target_id.as_str();
+        self.engine
+            .watch_dialogs(&validated.conn, &validated.cdp_session, cdp_target)
+            .await;
+        if let Some(dialog) = validated.conn.dialog_state(cdp_target) {
+            return dialog_open_refusal(&dialog).to_tool_result();
+        }
+        // From before the input: a navigation it sets off is seen starting.
+        let watch = self.engine.page_watch(&validated).await;
+
         let ext_ref = match args.require_str("ref") {
             Ok(value) => value,
             Err(error) => return error,
@@ -1930,7 +2757,7 @@ impl Tool for BrowserTypeTool {
         // own session (tab, or the contained OOPIF child session).
         let cdp_session = match self
             .engine
-            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry.frame)
+            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry)
             .await
         {
             Ok(s) => s,
@@ -2047,10 +2874,19 @@ impl Tool for BrowserTypeTool {
         } else {
             EditMode::Insert
         };
+        // The calls that put the text into the page. A handler there may open
+        // a JavaScript dialog, and a page behind one answers nothing: stop
+        // sending and say so, instead of waiting out every later call.
+        let mut delivery = Delivery {
+            engine: &self.engine,
+            conn,
+            cdp,
+            target: cdp_target,
+            opened: None,
+        };
         let (typed, delivered_chars) = if mode == "set_value" {
-            match conn
-                .call(
-                    Some(cdp),
+            match delivery
+                .send(
                     "Runtime.callFunctionOn",
                     json!({
                         "objectId": object_id,
@@ -2061,13 +2897,17 @@ impl Tool for BrowserTypeTool {
                 )
                 .await
             {
-                Ok(value) if value["result"]["value"].as_bool() == Some(true) => {
+                // Not sent at all: a dialog was already up.
+                Ok(None) => (Ok(()), 0),
+                // Sent, and the page opened a dialog while it handled it.
+                Ok(Some(_)) if delivery.opened.is_some() => (Ok(()), requested_chars),
+                Ok(Some(value)) if value["result"]["value"].as_bool() == Some(true) => {
                     replaced_chars = before
                         .as_ref()
                         .map_or(0, |state| state.value.chars().count());
                     (Ok(()), requested_chars)
                 }
-                Ok(_) => {
+                Ok(Some(_)) => {
                     return BrowserRefusal::new(
                         BrowserRefusalCode::BrowserActionUnavailable,
                         "mode set_value needs an input or textarea ref; use insert_text or \
@@ -2113,11 +2953,10 @@ impl Tool for BrowserTypeTool {
             // same event path as typing; it is not a value assignment.
             let mut call = if replace && text.is_empty() {
                 if replaced_chars == 0 {
-                    Ok(json!({}))
+                    Ok(Some(json!({})))
                 } else {
-                    match conn
-                        .call(
-                            Some(cdp),
+                    match delivery
+                        .send(
                             "Input.dispatchKeyEvent",
                             json!({
                                 "type": "keyDown",
@@ -2129,28 +2968,30 @@ impl Tool for BrowserTypeTool {
                         )
                         .await
                     {
-                        Ok(_) => {
-                            conn.call(
-                                Some(cdp),
-                                "Input.dispatchKeyEvent",
-                                json!({
-                                    "type": "keyUp",
-                                    "key": "Delete",
-                                    "code": "Delete",
-                                    "windowsVirtualKeyCode": 46,
-                                    "nativeVirtualKeyCode": 46,
-                                }),
-                            )
-                            .await
+                        Ok(None) => Ok(None),
+                        Ok(Some(_)) => {
+                            delivery
+                                .send(
+                                    "Input.dispatchKeyEvent",
+                                    json!({
+                                        "type": "keyUp",
+                                        "key": "Delete",
+                                        "code": "Delete",
+                                        "windowsVirtualKeyCode": 46,
+                                        "nativeVirtualKeyCode": 46,
+                                    }),
+                                )
+                                .await
                         }
                         Err(error) => Err(error),
                     }
                 }
             } else {
-                conn.call(Some(cdp), "Input.insertText", json!({ "text": text }))
+                delivery
+                    .send("Input.insertText", json!({ "text": text }))
                     .await
             };
-            if replace {
+            if replace && !delivery.blocked() {
                 if let Err(error) = conn
                     .call(
                         Some(cdp),
@@ -2163,7 +3004,9 @@ impl Tool for BrowserTypeTool {
                 }
             }
             match call {
-                Ok(_) => (Ok(()), requested_chars),
+                Ok(Some(_)) => (Ok(()), requested_chars),
+                // Nothing was sent: a dialog was already up.
+                Ok(None) => (Ok(()), 0),
                 Err(error) => (Err(error), 0),
             }
         } else {
@@ -2300,9 +3143,8 @@ impl Tool for BrowserTypeTool {
             // present, and "cleared" would be a false report.
             if replace && text.is_empty() && replaced_chars > 0 {
                 for phase in ["keyDown", "keyUp"] {
-                    if let Err(error) = conn
-                        .call(
-                            Some(cdp),
+                    if let Err(error) = delivery
+                        .send(
                             "Input.dispatchKeyEvent",
                             json!({
                                 "type": phase,
@@ -2325,201 +3167,275 @@ impl Tool for BrowserTypeTool {
                 } else {
                     (ch.to_string(), ch.to_string())
                 };
-                let down = conn
-                    .call(
-                        Some(cdp),
+                let down = delivery
+                    .send(
                         "Input.dispatchKeyEvent",
                         json!({ "type": "keyDown", "key": key }),
                     )
                     .await;
-                let character = if down.is_ok() {
-                    conn.call(
-                        Some(cdp),
-                        "Input.dispatchKeyEvent",
-                        json!({
-                            "type": "char",
-                            "key": key,
-                            "text": key_text,
-                            "unmodifiedText": key_text,
-                        }),
-                    )
-                    .await
+                // The `char` event carries the text: a character counts as
+                // delivered only when that event was sent. A dialog the
+                // keyDown opened leaves it unsent and uncounted.
+                let character = if matches!(down, Ok(Some(_))) {
+                    delivery
+                        .send(
+                            "Input.dispatchKeyEvent",
+                            json!({
+                                "type": "char",
+                                "key": key,
+                                "text": key_text,
+                                "unmodifiedText": key_text,
+                            }),
+                        )
+                        .await
                 } else {
-                    Ok(json!({}))
+                    Ok(None)
                 };
-                let up = conn
-                    .call(
-                        Some(cdp),
-                        "Input.dispatchKeyEvent",
-                        json!({ "type": "keyUp", "key": key }),
-                    )
-                    .await;
+                let sent = matches!(character, Ok(Some(_)));
+                let up = if sent {
+                    delivery
+                        .send(
+                            "Input.dispatchKeyEvent",
+                            json!({ "type": "keyUp", "key": key }),
+                        )
+                        .await
+                } else {
+                    Ok(None)
+                };
                 if let Err(e) = down.and(character).and(up) {
                     result = Err(e);
                     break;
                 }
-                delivered += 1;
+                if sent {
+                    delivered += 1;
+                }
+                if delivery.blocked() {
+                    break;
+                }
                 tokio::time::sleep(std::time::Duration::from_millis(15)).await;
             }
-            if let Err(error) = conn
-                .call(
-                    Some(cdp),
-                    "Emulation.setFocusEmulationEnabled",
-                    json!({ "enabled": false }),
-                )
-                .await
-            {
-                result = Err(error);
+            if !delivery.blocked() {
+                if let Err(error) = conn
+                    .call(
+                        Some(cdp),
+                        "Emulation.setFocusEmulationEnabled",
+                        json!({ "enabled": false }),
+                    )
+                    .await
+                {
+                    result = Err(error);
+                }
             }
             (result, delivered)
         };
 
-        if typed.is_ok() {
-            if let Some(before) = before.as_ref() {
-                match await_edit_readback(conn, cdp, &object_id, before, &text, edit_mode).await {
-                    Readback::Mismatch { actual, expected } => {
-                        let shown = shown_value(&actual, before.password);
-                        return ToolResult::error(format!(
-                            "typed {requested_chars} char(s) into {tab_id}, but the field now \
-                             holds {shown}{}: the page changed or rejected the input. Read the \
-                             page before typing again.",
-                            expected
-                                .as_deref()
-                                .map(|expected| format!(
-                                    " instead of {}",
-                                    shown_value(expected, before.password)
-                                ))
-                                .unwrap_or_default()
-                        ))
-                        .with_structured(json!({
-                            "code": "browser_type_mismatch",
-                            "effect": "mismatch",
-                            "target_id": target_id,
-                            "tab_id": tab_id,
-                            "ref": ext_ref,
-                            "mode": mode,
-                            "requested_chars": requested_chars,
-                            "delivered_chars": delivered_chars,
-                            "value": (!before.password).then(|| truncate_value(&actual)),
-                            "expected": expected
-                                .filter(|_| !before.password)
-                                .map(|expected| truncate_value(&expected)),
-                        }));
+        // Read the field back, unless a dialog stops the page answering.
+        let readback = match before.as_ref() {
+            Some(before) if typed.is_ok() => {
+                await_edit_readback(&mut delivery, &object_id, before, &text, edit_mode).await
+            }
+            _ => (!delivery.blocked()).then_some(Readback::Unverifiable),
+        };
+        // The page opened a dialog while it handled the input: the text went
+        // in as far as counted, and the field cannot be read back until the
+        // dialog is resolved.
+        if let (None, Some(dialog)) = (&readback, delivery.opened.take()) {
+            let changes = page_changes_after(
+                &self.engine,
+                &self.registry,
+                &args,
+                &target_id,
+                &tab_id,
+                &validated,
+                held,
+                Some(Settled::Dialog(dialog)),
+                None,
+            )
+            .await;
+            return with_changes(
+                ToolResult::text(format!(
+                    "typed {delivered_chars} of {requested_chars} char(s) into {tab_id}, and the \
+                     page opened a JavaScript dialog while it handled the input, so the field \
+                     could not be read back. Resolve the dialog, then read the field."
+                ))
+                .with_structured(json!({
+                    "status": "ok",
+                    "effect": "unverifiable",
+                    "target_id": target_id,
+                    "tab_id": tab_id,
+                    "ref": ext_ref,
+                    "mode": mode,
+                    "requested_chars": requested_chars,
+                    "delivered_chars": delivered_chars,
+                    "readback": "javascript_dialog_open",
+                })),
+                changes,
+            );
+        }
+
+        // Input was sent: from here every outcome also says what the page
+        // changed, read once the page has settled.
+        let outcome = 'outcome: {
+            if let (Some(readback), Some(before)) = (readback, before.as_ref()) {
+                {
+                    match readback {
+                        Readback::Mismatch { actual, expected } => {
+                            let shown = shown_value(&actual, before.password);
+                            break 'outcome ToolResult::error(format!(
+                                "typed {requested_chars} char(s) into {tab_id}, but the field now \
+                                 holds {shown}{}: the page changed or rejected the input. Read the \
+                                 page before typing again.",
+                                expected
+                                    .as_deref()
+                                    .map(|expected| format!(
+                                        " instead of {}",
+                                        shown_value(expected, before.password)
+                                    ))
+                                    .unwrap_or_default()
+                            ))
+                            .with_structured(json!({
+                                "code": "browser_type_mismatch",
+                                "effect": "mismatch",
+                                "target_id": target_id,
+                                "tab_id": tab_id,
+                                "ref": ext_ref,
+                                "mode": mode,
+                                "requested_chars": requested_chars,
+                                "delivered_chars": delivered_chars,
+                                "value": (!before.password).then(|| truncate_value(&actual)),
+                                "expected": expected
+                                    .filter(|_| !before.password)
+                                    .map(|expected| truncate_value(&expected)),
+                            }));
+                        }
+                        Readback::Confirmed(actual) => {
+                            let shown = shown_value(&actual, before.password);
+                            let summary = if replaces {
+                                format!(
+                                    "typed {requested_chars} char(s) into {tab_id}, replacing \
+                                     {replaced_chars} char(s); the field now holds {shown}"
+                                )
+                            } else {
+                                format!(
+                                    "typed {requested_chars} char(s) into {tab_id}; the field now \
+                                     holds {shown}"
+                                )
+                            };
+                            break 'outcome ToolResult::text(summary).with_structured(json!({
+                                "status": "ok",
+                                "effect": "confirmed",
+                                "evidence": [{
+                                    "kind": "browser_readback",
+                                    "detail": format!("the field holds {shown}"),
+                                }],
+                                "target_id": target_id,
+                                "tab_id": tab_id,
+                                "ref": ext_ref,
+                                "frame": entry.frame.kind.as_str(),
+                                "mode": mode,
+                                "chars": requested_chars,
+                                "requested_chars": requested_chars,
+                                "delivered_chars": delivered_chars,
+                                "replace": replaces,
+                                "replaced_chars": replaced_chars,
+                                "value": (!before.password).then(|| truncate_value(&actual)),
+                            }));
+                        }
+                        Readback::Detached => {
+                            break 'outcome ToolResult::text(format!(
+                                "typed {requested_chars} char(s) into {tab_id}, but the page \
+                                 replaced the field while it handled the input, so what it holds \
+                                 now is unknown. Snapshot the tab again and read the new field."
+                            ))
+                            .with_structured(json!({
+                                "status": "ok",
+                                "effect": "unverifiable",
+                                "target_id": target_id,
+                                "tab_id": tab_id,
+                                "ref": ext_ref,
+                                "mode": mode,
+                                "requested_chars": requested_chars,
+                                "delivered_chars": delivered_chars,
+                                "readback": "element_replaced",
+                            }));
+                        }
+                        Readback::Ambiguous(actual) => {
+                            let shown = shown_value(&actual, before.password);
+                            break 'outcome ToolResult::text(format!(
+                                "typed {requested_chars} char(s) into {tab_id}; the field now holds \
+                                 {shown}, which the input could have produced (for example by \
+                                 replacing a selection the driver could not see), but that cannot \
+                                 be confirmed. Check the value before typing again."
+                            ))
+                            .with_structured(json!({
+                                "status": "ok",
+                                "effect": "unverifiable",
+                                "target_id": target_id,
+                                "tab_id": tab_id,
+                                "ref": ext_ref,
+                                "mode": mode,
+                                "requested_chars": requested_chars,
+                                "delivered_chars": delivered_chars,
+                                "readback": "ambiguous",
+                                "value": (!before.password).then(|| truncate_value(&actual)),
+                            }));
+                        }
+                        Readback::Unverifiable => {}
                     }
-                    Readback::Confirmed(actual) => {
-                        let shown = shown_value(&actual, before.password);
-                        let summary = if replaces {
-                            format!(
-                                "typed {requested_chars} char(s) into {tab_id}, replacing \
-                                 {replaced_chars} char(s); the field now holds {shown}"
-                            )
-                        } else {
-                            format!(
-                                "typed {requested_chars} char(s) into {tab_id}; the field now \
-                                 holds {shown}"
-                            )
-                        };
-                        return ToolResult::text(summary).with_structured(json!({
-                            "status": "ok",
-                            "effect": "confirmed",
-                            "evidence": [{
-                                "kind": "browser_readback",
-                                "detail": format!("the field holds {shown}"),
-                            }],
-                            "target_id": target_id,
-                            "tab_id": tab_id,
-                            "ref": ext_ref,
-                            "frame": entry.frame.kind.as_str(),
-                            "mode": mode,
-                            "chars": requested_chars,
-                            "requested_chars": requested_chars,
-                            "delivered_chars": delivered_chars,
-                            "replace": replaces,
-                            "replaced_chars": replaced_chars,
-                            "value": (!before.password).then(|| truncate_value(&actual)),
-                        }));
-                    }
-                    Readback::Detached => {
-                        return ToolResult::text(format!(
-                            "typed {requested_chars} char(s) into {tab_id}, but the page \
-                             replaced the field while it handled the input, so what it holds \
-                             now is unknown. Snapshot the tab again and read the new field."
-                        ))
-                        .with_structured(json!({
-                            "status": "ok",
-                            "effect": "unverifiable",
-                            "target_id": target_id,
-                            "tab_id": tab_id,
-                            "ref": ext_ref,
-                            "mode": mode,
-                            "requested_chars": requested_chars,
-                            "delivered_chars": delivered_chars,
-                            "readback": "element_replaced",
-                        }));
-                    }
-                    Readback::Ambiguous(actual) => {
-                        let shown = shown_value(&actual, before.password);
-                        return ToolResult::text(format!(
-                            "typed {requested_chars} char(s) into {tab_id}; the field now holds \
-                             {shown}, which the input could have produced (for example by \
-                             replacing a selection the driver could not see), but that cannot \
-                             be confirmed. Check the value before typing again."
-                        ))
-                        .with_structured(json!({
-                            "status": "ok",
-                            "effect": "unverifiable",
-                            "target_id": target_id,
-                            "tab_id": tab_id,
-                            "ref": ext_ref,
-                            "mode": mode,
-                            "requested_chars": requested_chars,
-                            "delivered_chars": delivered_chars,
-                            "readback": "ambiguous",
-                            "value": (!before.password).then(|| truncate_value(&actual)),
-                        }));
-                    }
-                    Readback::Unverifiable => {}
                 }
             }
-        }
-        match typed {
-            Ok(()) => ToolResult::text(if replaces {
-                format!(
-                    "typed {requested_chars} char(s) into {tab_id}, replacing \
-                     {replaced_chars} char(s)"
+            match typed {
+                Ok(()) => ToolResult::text(if replaces {
+                    format!(
+                        "typed {requested_chars} char(s) into {tab_id}, replacing \
+                         {replaced_chars} char(s)"
+                    )
+                } else {
+                    format!("typed {requested_chars} char(s) into {tab_id}")
+                })
+                .with_structured(json!({
+                    "status": "ok",
+                    "target_id": target_id,
+                    "tab_id": tab_id,
+                    "ref": ext_ref,
+                    "frame": entry.frame.kind.as_str(),
+                    "mode": mode,
+                    "chars": requested_chars,
+                    "requested_chars": requested_chars,
+                    "delivered_chars": delivered_chars,
+                    // Report what was displaced, not just what was sent: a caller
+                    // that asked to replace needs to distinguish "set an empty
+                    // field" from "overwrote something" without re-reading the page.
+                    "replace": replaces,
+                    "replaced_chars": replaced_chars,
+                })),
+                Err(e) => BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserInputIncomplete,
+                    format!(
+                        "trusted Input typing stopped after {delivered_chars} of {requested_chars} character(s): {e}"
+                    ),
                 )
-            } else {
-                format!("typed {requested_chars} char(s) into {tab_id}")
-            })
-            .with_structured(json!({
-                "status": "ok",
-                "target_id": target_id,
-                "tab_id": tab_id,
-                "ref": ext_ref,
-                "frame": entry.frame.kind.as_str(),
-                "mode": mode,
-                "chars": requested_chars,
-                "requested_chars": requested_chars,
-                "delivered_chars": delivered_chars,
-                // Report what was displaced, not just what was sent: a caller
-                // that asked to replace needs to distinguish "set an empty
-                // field" from "overwrote something" without re-reading the page.
-                "replace": replaces,
-                "replaced_chars": replaced_chars,
-            })),
-            Err(e) => BrowserRefusal::new(
-                BrowserRefusalCode::BrowserInputIncomplete,
-                format!(
-                    "trusted Input typing stopped after {delivered_chars} of {requested_chars} character(s): {e}"
-                ),
-            )
-            .with_detail(json!({
-                "requested_chars": requested_chars,
-                "delivered_chars": delivered_chars,
-                "retryable": false,
-            }))
-            .to_tool_result(),
-        }
+                .with_detail(json!({
+                    "requested_chars": requested_chars,
+                    "delivered_chars": delivered_chars,
+                    "retryable": false,
+                }))
+                .to_tool_result(),
+            }
+        };
+        let changes = page_changes_after(
+            &self.engine,
+            &self.registry,
+            &args,
+            &target_id,
+            &tab_id,
+            &validated,
+            held,
+            None,
+            watch,
+        )
+        .await;
+        with_changes(outcome, changes)
     }
 }
 
@@ -2866,7 +3782,7 @@ impl Tool for BrowserSetInputFilesTool {
         }
         let cdp_session = match self
             .engine
-            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry.frame)
+            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry)
             .await
         {
             Ok(session) => session,
@@ -2934,7 +3850,7 @@ impl Tool for BrowserSetInputFilesTool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn every_browser_type_mode_has_one_postcondition() {
         use EditMode::{Insert, Replace, SetValue};
@@ -3009,9 +3925,13 @@ mod tests {
             let got = judge_edit(&before, &after, text, mode);
             let ok = match (&want, &got) {
                 (Want::Confirmed, Readback::Confirmed(value)) => *value == after.value,
-                (Want::Mismatch(expected), Readback::Mismatch { actual, expected: got }) => {
-                    *actual == after.value && got.as_deref() == *expected
-                }
+                (
+                    Want::Mismatch(expected),
+                    Readback::Mismatch {
+                        actual,
+                        expected: got,
+                    },
+                ) => *actual == after.value && got.as_deref() == *expected,
                 (Want::Detached, Readback::Detached) => true,
                 (Want::Ambiguous, Readback::Ambiguous(value)) => *value == after.value,
                 _ => false,
@@ -3022,21 +3942,31 @@ mod tests {
 
     #[test]
     fn a_confirmed_insertion_always_changed_the_value() {
-        let values = ["", " ", "a", "hello", "hello ", "hello\n", "hello world", "ahello"];
+        let values = [
+            "",
+            " ",
+            "a",
+            "hello",
+            "hello ",
+            "hello\n",
+            "hello world",
+            "ahello",
+        ];
         let texts = [" ", "a", "hello", " world", "  "];
         for field in [true, false] {
             for selection in [None, Some((0, 0)), Some((5, 5))] {
                 for before in values {
                     for after in values {
                         for text in texts {
-                            let state = |value: &str, selection: Option<(usize, usize)>| EditState {
-                                value: value.to_owned(),
-                                start: selection.map(|(start, _)| start),
-                                end: selection.map(|(_, end)| end),
-                                field,
-                                password: false,
-                                connected: true,
-                            };
+                            let state =
+                                |value: &str, selection: Option<(usize, usize)>| EditState {
+                                    value: value.to_owned(),
+                                    start: selection.map(|(start, _)| start),
+                                    end: selection.map(|(_, end)| end),
+                                    field,
+                                    password: false,
+                                    connected: true,
+                                };
                             let verdict = judge_edit(
                                 &state(before, if field { selection } else { None }),
                                 &state(after, None),
@@ -3044,7 +3974,10 @@ mod tests {
                                 EditMode::Insert,
                             );
                             if matches!(verdict, Readback::Confirmed(_)) {
-                                assert_ne!(before, after, "{before:?} -> {after:?} typing {text:?}");
+                                assert_ne!(
+                                    before, after,
+                                    "{before:?} -> {after:?} typing {text:?}"
+                                );
                                 if !field {
                                     assert_ne!(
                                         normalize_rendered(before),
@@ -3189,7 +4122,7 @@ mod tests {
         }
     }
 
-    fn engine() -> Arc<BrowserEngine> {
+    pub(crate) fn engine() -> Arc<BrowserEngine> {
         BrowserEngine::new(Arc::new(MockPlatform))
     }
 
@@ -3198,6 +4131,178 @@ mod tests {
             .structured_content
             .as_ref()
             .expect("structured content")
+    }
+
+    fn outcome(outline: &str, told: Told) -> SemanticSnapshotOutcome {
+        SemanticSnapshotOutcome {
+            snapshot_id: 7,
+            url: "https://example.test/".into(),
+            title: "Example".into(),
+            outline: outline.into(),
+            action_refs: 1,
+            content_refs: 0,
+            complete: true,
+            scope: "viewport",
+            selected_nodes: 1,
+            total_nodes: 1,
+            omissions: Default::default(),
+            continuation: None,
+            oopif: crate::browser::engine::OopifStatus::Unsupported,
+            outline_budget: 5_000,
+            listed: None,
+            revision: Some(12),
+            told,
+        }
+    }
+
+    #[test]
+    fn a_diff_is_returned_only_while_it_is_smaller_than_the_snapshot() {
+        let change = |index: usize| DiffOp::Change {
+            key: format!("p7:{index}"),
+            line: format!("- button \"Row {index}\" [p7:{index} click] (pressed)"),
+        };
+        let small = page_changes(&outcome(
+            &"- button \"Row\" [p7:0 click]\n".repeat(40),
+            Told::Diff {
+                base_revision: 11,
+                ops: vec![change(3)],
+                page_changed: false,
+            },
+        ));
+        assert_eq!(small.kind, PageChangesKind::Diff);
+        assert_eq!((small.base_revision, small.revision), (Some(11), Some(12)));
+        assert_eq!(small.ops.as_ref().map(Vec::len), Some(1));
+        assert_eq!((small.outline, small.url), (None, None));
+
+        // Every line changed: the ops repeat the page, keyed. Send the page.
+        let rows = 0..8;
+        let page = rows
+            .clone()
+            .map(|index| format!("- button \"Row {index}\" [p7:{index} click] (pressed)"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let large = page_changes(&outcome(
+            &page,
+            Told::Diff {
+                base_revision: 11,
+                ops: rows.map(change).collect(),
+                page_changed: false,
+            },
+        ));
+        assert_eq!(large.kind, PageChangesKind::Snapshot);
+        assert_eq!(large.reason.as_deref(), Some("diff_larger_than_snapshot"));
+        assert_eq!(large.revision, Some(12));
+        assert!(large.ops.is_none() && large.outline.is_some());
+    }
+
+    #[test]
+    fn a_diff_names_the_page_address_only_when_it_changed() {
+        let told = |page_changed| Told::Diff {
+            base_revision: 11,
+            ops: Vec::new(),
+            page_changed,
+        };
+        let outline = "- button \"Row\" [p7:0 click]\n".repeat(10);
+        assert_eq!(page_changes(&outcome(&outline, told(false))).url, None);
+        let moved = page_changes(&outcome(&outline, told(true)));
+        assert_eq!(moved.url.as_deref(), Some("https://example.test/"));
+        assert_eq!(moved.title.as_deref(), Some("Example"));
+    }
+
+    #[test]
+    fn page_changes_fit_the_closed_action_result_contract() {
+        let dialog = CdpDialogState {
+            generation: 3,
+            kind: "confirm".into(),
+            session_id: "s".into(),
+        };
+        for changes in [
+            unavailable_changes("javascript_dialog_open", Some(&dialog)),
+            page_changes(&outcome(
+                "- button \"Row\" [p7:0 click]",
+                Told::Snapshot {
+                    reason: Some(FullReason::DocumentChanged),
+                },
+            )),
+        ] {
+            let value = changes_value(&changes);
+            assert!(
+                !value.to_string().contains("null"),
+                "absent fields are left out: {value}"
+            );
+            let back: PageChanges = serde_json::from_value(value).expect("the typed contract");
+            assert_eq!(back, changes);
+        }
+        assert_eq!(
+            changes_value(&unavailable_changes(
+                "javascript_dialog_open",
+                Some(&dialog)
+            ))["dialog"],
+            json!({"dialog_id": "dialog-3", "kind": "confirm"})
+        );
+    }
+
+    #[test]
+    fn a_click_goes_out_only_when_the_page_says_the_refs_element_receives_it() {
+        let facts = |inside: bool, contains: bool, label: bool, own: bool| {
+            json!({"connected": true, "hit": true, "inside_target": inside,
+                "contains_target": contains, "label_of_target": label, "own_indicator": own})
+        };
+        for (case, facts, expected) in [
+            (
+                "the element itself, or a child of it",
+                facts(true, false, false, false),
+                Hit::Receives,
+            ),
+            (
+                "a child, in a closed shadow root it is the host of",
+                facts(true, true, false, false),
+                Hit::Receives,
+            ),
+            ("its label", facts(false, false, true, false), Hit::Receives),
+            (
+                "an element around it: it takes no pointer input there itself",
+                facts(false, true, false, false),
+                Hit::Container,
+            ),
+            (
+                "an unrelated element on top",
+                facts(false, false, false, false),
+                Hit::Covered {
+                    own_indicator: false,
+                },
+            ),
+            (
+                "the extension's own pill",
+                facts(false, false, false, true),
+                Hit::Covered {
+                    own_indicator: true,
+                },
+            ),
+            (
+                "nothing at the point",
+                json!({"connected": true, "hit": false}),
+                Hit::Outside,
+            ),
+            (
+                "the node left the page",
+                json!({"connected": false}),
+                Hit::Gone,
+            ),
+            ("no answer proves nothing", json!(true), Hit::Unknown),
+            (
+                "nor does half an answer",
+                json!({"connected": true, "hit": true}),
+                Hit::Unknown,
+            ),
+            (
+                "nor one without its first fact",
+                json!({"hit": true, "inside_target": true}),
+                Hit::Unknown,
+            ),
+        ] {
+            assert_eq!(classify_hit(&facts), expected, "{case}");
+        }
     }
 
     #[test]
@@ -3299,6 +4404,7 @@ mod tests {
                 "browser_navigate",
                 "browser_click",
                 "browser_type",
+                "browser_steps",
                 "browser_dialog",
                 "browser_set_input_files",
                 "browser_download",
@@ -3602,15 +4708,14 @@ mod tests {
         let tab_id = e.store.mint_tab_id();
         tabs.insert(
             tab_id.clone(),
-            crate::browser::store::TabRecord {
-                tab_id: tab_id.clone(),
-                cdp_target_id: "CDPX".into(),
-                title: "Mock".into(),
-                url: "https://example.test".into(),
-                active: Some(true),
-                generation: 0,
-                snapshots: HashMap::new(),
-            },
+            crate::browser::store::TabRecord::new(
+                tab_id.clone(),
+                "CDPX".into(),
+                "Mock".into(),
+                "https://example.test".into(),
+                Some(true),
+                0,
+            ),
         );
         let target_id = e.store.mint_target(
             "run-1",
@@ -3662,15 +4767,14 @@ mod tests {
         let tab_id = e.store.mint_tab_id();
         tabs.insert(
             tab_id.clone(),
-            crate::browser::store::TabRecord {
-                tab_id: tab_id.clone(),
-                cdp_target_id: "CDPX".into(),
-                title: "Mock".into(),
-                url: "https://example.test".into(),
-                active: Some(true),
-                generation: 0,
-                snapshots: HashMap::new(),
-            },
+            crate::browser::store::TabRecord::new(
+                tab_id.clone(),
+                "CDPX".into(),
+                "Mock".into(),
+                "https://example.test".into(),
+                Some(true),
+                0,
+            ),
         );
         // Bound fingerprint has start_time 999; MockPlatform now reports 1.
         let target_id = e.store.mint_target(

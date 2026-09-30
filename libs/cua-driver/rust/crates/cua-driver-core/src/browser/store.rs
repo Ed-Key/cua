@@ -1,7 +1,7 @@
 //! Session-scoped target / tab / page-ref capability store.
 //!
 //! Browser target ids (`bt-<uuid>`), tab ids (`tab-<uuid>`) and page refs
-//! (`p<snapshot>:<index>`) are opaque, session-scoped capabilities:
+//! (`p<space>:<index>`) are opaque, session-scoped capabilities:
 //! they only resolve in the session that minted them, and the whole
 //! namespace is dropped when that session ends. Ids are minted from a
 //! process-global counter so they never collide across sessions — a
@@ -14,6 +14,10 @@
 //! every snapshot of the navigated tab; stale refs refuse with
 //! `browser_ref_stale`, and frame identity is re-proven against the
 //! live frame tree before any mutation.
+//!
+//! A `dom_refs_v1` snapshot is one [`SnapshotRecord`]; a newer one replaces
+//! it. Semantic refs live in the tab's [`TabRefs`], whose ownership rules
+//! are the table in [`super::observation`].
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -22,6 +26,7 @@ use std::sync::Mutex;
 use serde::Serialize;
 use uuid::Uuid;
 
+use super::observation::{FullReason, TabRefs};
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::semantic::SemanticDocument;
 use super::types::{
@@ -107,7 +112,7 @@ impl FrameKind {
 /// `loader_id` changes on every document load, so equality against the
 /// live frame tree proves the ref's document is still the one that was
 /// snapshotted.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct FrameIdentity {
     pub frame_id: String,
     pub loader_id: String,
@@ -166,8 +171,21 @@ pub struct RefEntry {
     /// Frame identity — internal; only the kind string is surfaced.
     #[serde(skip_serializing)]
     pub frame: FrameRef,
+    /// A link's resolved destination as issued. With the role and label it
+    /// is what the ref named (see [`super::observation::Fingerprint`]).
+    #[serde(skip_serializing)]
+    pub destination: Option<String>,
+    /// Debugger attachment a semantic ref was issued on; `None` for legacy
+    /// DOM refs.
+    #[serde(skip_serializing)]
+    pub attachment: Option<u64>,
+    /// The ref space and index a semantic ref was minted at: which capability
+    /// this is, among those its node has had.
+    #[serde(skip_serializing)]
+    pub minted: Option<(u64, u32)>,
 }
 
+/// One `dom_refs_v1` snapshot.
 #[derive(Debug, Clone)]
 pub struct SnapshotRecord {
     pub id: u64,
@@ -175,8 +193,16 @@ pub struct SnapshotRecord {
     pub url: String,
     /// index → entry; the external ref is `p<id>:<index>`.
     pub refs: HashMap<u32, RefEntry>,
-    pub(crate) semantic: Option<SemanticDocument>,
-    pub(crate) semantic_root_identity: Option<FrameIdentity>,
+}
+
+/// The semantic document last collected for a tab, kept for continuations
+/// and for resolving a step's `{role, name}` target.
+#[derive(Debug, Clone)]
+pub(crate) struct SemanticCache {
+    /// The ref space the document was recorded in.
+    pub(crate) space_id: u64,
+    pub(crate) url: String,
+    pub(crate) document: SemanticDocument,
     pub(crate) continuations: HashMap<String, SemanticContinuation>,
 }
 
@@ -201,6 +227,33 @@ pub struct TabRecord {
     pub active: Option<bool>,
     pub generation: u64,
     pub snapshots: HashMap<u64, SnapshotRecord>,
+    /// Semantic refs and the diff baseline (see [`super::observation`]).
+    pub(crate) stable: TabRefs,
+    pub(crate) semantic: Option<SemanticCache>,
+}
+
+impl TabRecord {
+    /// A tab as the bind found it, with nothing observed yet.
+    pub fn new(
+        tab_id: String,
+        cdp_target_id: String,
+        title: String,
+        url: String,
+        active: Option<bool>,
+        generation: u64,
+    ) -> Self {
+        Self {
+            tab_id,
+            cdp_target_id,
+            title,
+            url,
+            active,
+            generation,
+            snapshots: HashMap::new(),
+            stable: TabRefs::default(),
+            semantic: None,
+        }
+    }
 }
 
 /// One bound browser target: the full evidence set captured at bind
@@ -367,27 +420,34 @@ impl BrowserStore {
             .get(&snap)
             .filter(|snapshot| snapshot.generation == target.generation)
             .and_then(|snapshot| snapshot.refs.get(&idx))
+            .or_else(|| {
+                tab.stable
+                    .space()
+                    .filter(|space| space.identity.generation == target.generation)
+                    .and_then(|_| tab.stable.resolve(snap, idx))
+            })
             .cloned()
             .ok_or_else(|| {
                 BrowserRefusal::new(
                     BrowserRefusalCode::BrowserRefStale,
                     format!(
-                        "ref {external} is stale — the page navigated or the snapshot \
-                         was superseded; re-run get_browser_state to re-snapshot"
+                        "ref {external} is stale — the page navigated, the node left the \
+                         page or became another element, or the snapshot was superseded; \
+                         re-run get_browser_state to re-snapshot"
                     ),
                 )
             })
     }
 
     /// Resolve an opaque continuation within the same session, target, tab,
-    /// snapshot generation, and currently-live snapshot namespace.
-    pub fn resolve_semantic_continuation(
+    /// browser generation, and the ref space its document was recorded in.
+    pub(crate) fn resolve_semantic_continuation(
         &self,
         session: &str,
         target_id: &str,
         tab_id: &str,
         token: &str,
-    ) -> Result<(SnapshotRecord, SemanticContinuation), BrowserRefusal> {
+    ) -> Result<(SemanticCache, SemanticContinuation), BrowserRefusal> {
         let target = self.get_target(session, target_id)?;
         let tab = target.tabs.get(tab_id).ok_or_else(|| {
             BrowserRefusal::new(
@@ -395,19 +455,19 @@ impl BrowserStore {
                 format!("tab {tab_id} is not known for target {target_id}"),
             )
         })?;
-        tab.snapshots
-            .values()
-            .find(|snapshot| {
-                snapshot.generation == target.generation
-                    && snapshot.semantic.is_some()
-                    && snapshot.continuations.contains_key(token)
+        tab.semantic
+            .as_ref()
+            .filter(|cache| {
+                tab.stable.space().is_some_and(|space| {
+                    space.id == cache.space_id && space.identity.generation == target.generation
+                })
             })
-            .and_then(|snapshot| {
-                snapshot
+            .and_then(|cache| {
+                cache
                     .continuations
                     .get(token)
                     .cloned()
-                    .map(|continuation| (snapshot.clone(), continuation))
+                    .map(|continuation| (cache.clone(), continuation))
             })
             .ok_or_else(|| {
                 BrowserRefusal::new(
@@ -417,11 +477,61 @@ impl BrowserStore {
             })
     }
 
+    /// Retire the semantic ref a use just refused (see
+    /// [`TabRefs::retire_refused`]).
+    pub(crate) fn retire_refused(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        issued: &RefEntry,
+    ) {
+        self.update_target(session, target_id, |rec| {
+            if let Some(tab) = rec.tabs.get_mut(tab_id) {
+                tab.stable.retire_refused(issued);
+            }
+        });
+    }
+
+    /// The ref this session holds for one node of a tab, if it holds one.
+    pub(crate) fn ref_of_node(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        frame: &FrameRef,
+        backend_node_id: i64,
+    ) -> Option<String> {
+        let target = self.get_target(session, target_id).ok()?;
+        target
+            .tabs
+            .get(tab_id)?
+            .stable
+            .ref_of(&super::observation::NodeKey::in_frame(
+                frame,
+                backend_node_id,
+            ))
+    }
+
     /// Drop every snapshot of one tab (navigation invalidates refs).
     pub fn invalidate_tab_snapshots(&self, session: &str, target_id: &str, tab_id: &str) {
+        self.invalidate_tab_refs(session, target_id, tab_id, FullReason::DocumentChanged);
+    }
+
+    /// Drop every ref of one tab; `reason` is what the next observation
+    /// reports for its full snapshot.
+    pub(crate) fn invalidate_tab_refs(
+        &self,
+        session: &str,
+        target_id: &str,
+        tab_id: &str,
+        reason: FullReason,
+    ) {
         self.update_target(session, target_id, |rec| {
             if let Some(tab) = rec.tabs.get_mut(tab_id) {
                 tab.snapshots.clear();
+                tab.stable.invalidate(reason);
+                tab.semantic = None;
             }
         });
     }
@@ -517,31 +627,31 @@ mod tests {
                             loader_id: "L1".into(),
                         }),
                     },
+                    destination: None,
+                    attachment: None,
+                    minted: None,
                 },
             );
-            rec.tabs.insert(
-                tab_id.clone(),
-                TabRecord {
-                    tab_id: tab_id.clone(),
-                    cdp_target_id: "CDP1".into(),
-                    title: "Example".into(),
-                    url: "https://example.test".into(),
-                    active: Some(true),
-                    generation: 0,
-                    snapshots: HashMap::from([(
-                        snap_id,
-                        SnapshotRecord {
-                            id: snap_id,
-                            generation: 0,
-                            url: "https://example.test".into(),
-                            refs,
-                            semantic: None,
-                            semantic_root_identity: None,
-                            continuations: HashMap::new(),
-                        },
-                    )]),
-                },
-            );
+            rec.tabs.insert(tab_id.clone(), {
+                let mut tab = TabRecord::new(
+                    tab_id.clone(),
+                    "CDP1".into(),
+                    "Example".into(),
+                    "https://example.test".into(),
+                    Some(true),
+                    0,
+                );
+                tab.snapshots.insert(
+                    snap_id,
+                    SnapshotRecord {
+                        id: snap_id,
+                        generation: 0,
+                        url: "https://example.test".into(),
+                        refs,
+                    },
+                );
+                tab
+            });
         });
         (store, tid, tab_id, ext)
     }
@@ -632,6 +742,144 @@ mod tests {
         store.invalidate_tab_snapshots("sess-a", &tid, &tab);
         let err = store.resolve_ref("sess-a", &tid, &tab, &ext).unwrap_err();
         assert_eq!(err.code, BrowserRefusalCode::BrowserRefStale);
+    }
+
+    /// A target whose tab holds one semantic ref, as a snapshot records it.
+    fn store_with_semantic_ref() -> (BrowserStore, String, String, String) {
+        use crate::browser::observation::{DocumentIdentity, ViewKind, ViewNode, REF_SLOT};
+        let store = BrowserStore::new();
+        let mut record = record();
+        record.generation = 3;
+        let tid = store.mint_target("sess-a", record);
+        let tab_id = store.mint_tab_id();
+        let mut external = String::new();
+        store.update_target("sess-a", &tid, |rec| {
+            let mut tab = TabRecord::new(
+                tab_id.clone(),
+                "CDP1".into(),
+                "Example".into(),
+                "https://example.test".into(),
+                Some(true),
+                3,
+            );
+            let frame = FrameRef {
+                kind: FrameKind::Main,
+                oopif_target_id: None,
+                identity: Some(FrameIdentity {
+                    frame_id: "F_MAIN".into(),
+                    loader_id: "L1".into(),
+                }),
+            };
+            let entry = RefEntry {
+                backend_node_id: 555,
+                node_name: "button".into(),
+                label: Some("Send".into()),
+                actions: vec![BrowserActionKind::Click],
+                visibility: None,
+                semantic: true,
+                frame: frame.clone(),
+                destination: None,
+                attachment: None,
+                minted: None,
+            };
+            let recorded = tab.stable.record(
+                &mut || store.mint_snapshot_id(),
+                DocumentIdentity {
+                    generation: 3,
+                    attachment: 9,
+                    cdp_target_id: "CDP1".into(),
+                    root: frame.identity.clone(),
+                },
+                std::slice::from_ref(&entry),
+                true,
+                vec![ViewNode {
+                    entry: entry.clone(),
+                    template: format!("- button \"Send\" [{REF_SLOT} click]"),
+                }],
+                ("https://example.test", "Example"),
+                None,
+                ViewKind::Default,
+                None,
+            );
+            external = recorded.lines[0].key.clone();
+            rec.tabs.insert(tab_id.clone(), tab);
+        });
+        (store, tid, tab_id, external)
+    }
+
+    #[test]
+    fn semantic_refs_resolve_only_in_their_session_target_and_tab() {
+        let (store, tid, tab, ext) = store_with_semantic_ref();
+        let entry = store.resolve_ref("sess-a", &tid, &tab, &ext).unwrap();
+        assert_eq!(entry.backend_node_id, 555);
+        assert_eq!(entry.attachment, Some(9), "issued on this attachment");
+        assert_eq!(
+            store
+                .resolve_ref("sess-b", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
+            BrowserRefusalCode::BrowserBindingStale
+        );
+        // A rebound window is another target: the ref is not valid there.
+        let (other, other_target, other_tab, _) = store_with_semantic_ref();
+        assert_eq!(
+            other
+                .resolve_ref("sess-a", &other_target, &other_tab, &ext)
+                .unwrap_err()
+                .code,
+            BrowserRefusalCode::BrowserRefStale
+        );
+    }
+
+    #[test]
+    fn session_end_and_a_dropped_connection_generation_take_semantic_refs_with_them() {
+        // Table rows: session end; consent revoked; reconnect.
+        let (store, tid, tab, ext) = store_with_semantic_ref();
+        store.remove_session("sess-a");
+        assert_eq!(
+            store
+                .resolve_ref("sess-a", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
+            BrowserRefusalCode::BrowserBindingStale
+        );
+
+        let (store, tid, tab, ext) = store_with_semantic_ref();
+        assert_eq!(store.invalidate_endpoint_generation(42, 3), 1);
+        assert_eq!(
+            store
+                .resolve_ref("sess-a", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
+            BrowserRefusalCode::BrowserBindingStale
+        );
+    }
+
+    #[test]
+    fn a_ref_from_an_older_connection_generation_does_not_resolve() {
+        let (store, tid, tab, ext) = store_with_semantic_ref();
+        store.update_target("sess-a", &tid, |rec| rec.generation = 4);
+        assert_eq!(
+            store
+                .resolve_ref("sess-a", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
+            BrowserRefusalCode::BrowserRefStale
+        );
+    }
+
+    #[test]
+    fn invalidating_a_tab_drops_semantic_refs_and_remembers_why() {
+        use crate::browser::observation::FullReason;
+        let (store, tid, tab, ext) = store_with_semantic_ref();
+        store.invalidate_tab_refs("sess-a", &tid, &tab, FullReason::AttachmentChanged);
+        assert_eq!(
+            store
+                .resolve_ref("sess-a", &tid, &tab, &ext)
+                .unwrap_err()
+                .code,
+            BrowserRefusalCode::BrowserRefStale
+        );
     }
 
     #[test]

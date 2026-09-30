@@ -64,6 +64,11 @@ pub enum BrowserRefusalCode {
     /// The live top-level document left the origin set approved in the
     /// capability manifest. Further browser input is paused.
     BrowserOriginOutsideScope,
+    /// A page-owned JavaScript dialog is open and blocks the page: nothing
+    /// can be read or sent until `browser_dialog` resolves it.
+    BrowserDialogOpen,
+    /// Another element would receive a trusted click aimed at the ref.
+    BrowserTargetCovered,
 }
 
 impl BrowserRefusalCode {
@@ -86,6 +91,8 @@ impl BrowserRefusalCode {
             Self::BrowserInputIncomplete => "browser_input_incomplete",
             Self::BrowserActionUnavailable => "browser_action_unavailable",
             Self::BrowserOriginOutsideScope => "browser_origin_outside_scope",
+            Self::BrowserDialogOpen => "browser_dialog_open",
+            Self::BrowserTargetCovered => "browser_target_covered",
         }
     }
 }
@@ -189,6 +196,11 @@ mod tests {
             (
                 BrowserRefusalCode::BrowserActionUnavailable,
                 "browser_action_unavailable",
+            ),
+            (BrowserRefusalCode::BrowserDialogOpen, "browser_dialog_open"),
+            (
+                BrowserRefusalCode::BrowserTargetCovered,
+                "browser_target_covered",
             ),
             (
                 BrowserRefusalCode::BrowserOriginOutsideScope,

@@ -2295,9 +2295,471 @@ class _UniffiFfiConverterOptionalBoolean(_UniffiConverterRustBuffer):
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+
+
+
+
+
+class PageChangesKind(enum.Enum):
+    """
+    How a browser action's result describes the page afterwards.
+
+    - `diff`: `ops` turn the outline at `base_revision` into the one at
+    `revision`.
+    - `snapshot`: `outline` is the whole page outline at `revision`; `reason`
+    says why it is not a diff.
+    - `unavailable`: the page was not read after the action; `reason` says
+    why. Nothing the session holds changed.
+"""
+
+    DIFF = 0
+
+    SNAPSHOT = 1
+
+    UNAVAILABLE = 2
+
+
+
+class _UniffiFfiConverterTypePageChangesKind(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return PageChangesKind.DIFF
+        if variant == 2:
+            return PageChangesKind.SNAPSHOT
+        if variant == 3:
+            return PageChangesKind.UNAVAILABLE
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == PageChangesKind.DIFF:
+            return
+        if value == PageChangesKind.SNAPSHOT:
+            return
+        if value == PageChangesKind.UNAVAILABLE:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == PageChangesKind.DIFF:
+            buf.write_i32(1)
+        if value == PageChangesKind.SNAPSHOT:
+            buf.write_i32(2)
+        if value == PageChangesKind.UNAVAILABLE:
+            buf.write_i32(3)
+
+
+
+class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
+    CLASS_NAME = "u64"
+    VALUE_MIN = 0
+    VALUE_MAX = 2**64
+
+    @staticmethod
+    def read(buf):
+        return buf.read_u64()
+
+    @staticmethod
+    def write(value, buf):
+        buf.write_u64(value)
+
+class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterUInt64.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterUInt64.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterUInt64.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+
+
+
+
+
+class PageChangeOpKind(enum.Enum):
+    """
+    What one keyed change does to the outline.
+
+    - `add`: a line that was not in the outline.
+    - `change`: the same element, with another value, state or depth.
+    - `move`: the same element at another place.
+    - `leave`: a line that is no longer in the outline.
+"""
+
+    ADD = 0
+
+    CHANGE = 1
+
+    MOVE = 2
+
+    LEAVE = 3
+
+
+
+class _UniffiFfiConverterTypePageChangeOpKind(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return PageChangeOpKind.ADD
+        if variant == 2:
+            return PageChangeOpKind.CHANGE
+        if variant == 3:
+            return PageChangeOpKind.MOVE
+        if variant == 4:
+            return PageChangeOpKind.LEAVE
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == PageChangeOpKind.ADD:
+            return
+        if value == PageChangeOpKind.CHANGE:
+            return
+        if value == PageChangeOpKind.MOVE:
+            return
+        if value == PageChangeOpKind.LEAVE:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == PageChangeOpKind.ADD:
+            buf.write_i32(1)
+        if value == PageChangeOpKind.CHANGE:
+            buf.write_i32(2)
+        if value == PageChangeOpKind.MOVE:
+            buf.write_i32(3)
+        if value == PageChangeOpKind.LEAVE:
+            buf.write_i32(4)
+
+
+
+@dataclass
+class PageChangeOp:
+    """
+    One keyed change to the page outline. `ref` is the line's ref.
+"""
+    def __init__(self, *, op:PageChangeOpKind, reference:str, line:typing.Optional[str], after:typing.Optional[str], gone:typing.Optional[bool]):
+        self.op = op
+        self.reference = reference
+        self.line = line
+        self.after = after
+        self.gone = gone
+
+
+
+
+    def __str__(self):
+        return "PageChangeOp(op={}, reference={}, line={}, after={}, gone={})".format(self.op, self.reference, self.line, self.after, self.gone)
+    def __eq__(self, other):
+        if self.op != other.op:
+            return False
+        if self.reference != other.reference:
+            return False
+        if self.line != other.line:
+            return False
+        if self.after != other.after:
+            return False
+        if self.gone != other.gone:
+            return False
+        return True
+
+class _UniffiFfiConverterTypePageChangeOp(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return PageChangeOp(
+            op=_UniffiFfiConverterTypePageChangeOpKind.read(buf),
+            reference=_UniffiFfiConverterString.read(buf),
+            line=_UniffiFfiConverterOptionalString.read(buf),
+            after=_UniffiFfiConverterOptionalString.read(buf),
+            gone=_UniffiFfiConverterOptionalBoolean.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypePageChangeOpKind.check_lower(value.op)
+        _UniffiFfiConverterString.check_lower(value.reference)
+        _UniffiFfiConverterOptionalString.check_lower(value.line)
+        _UniffiFfiConverterOptionalString.check_lower(value.after)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.gone)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypePageChangeOpKind.write(value.op, buf)
+        _UniffiFfiConverterString.write(value.reference, buf)
+        _UniffiFfiConverterOptionalString.write(value.line, buf)
+        _UniffiFfiConverterOptionalString.write(value.after, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.gone, buf)
+
+class _UniffiFfiConverterSequenceTypePageChangeOp(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypePageChangeOp.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypePageChangeOp.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypePageChangeOp.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterOptionalSequenceTypePageChangeOp(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterSequenceTypePageChangeOp.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterSequenceTypePageChangeOp.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterSequenceTypePageChangeOp.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class PageDialog:
+    """
+    A page-owned JavaScript dialog that is open; resolve it with
+    `browser_dialog` and this `dialog_id`.
+"""
+    def __init__(self, *, dialog_id:str, kind:str):
+        self.dialog_id = dialog_id
+        self.kind = kind
+
+
+
+
+    def __str__(self):
+        return "PageDialog(dialog_id={}, kind={})".format(self.dialog_id, self.kind)
+    def __eq__(self, other):
+        if self.dialog_id != other.dialog_id:
+            return False
+        if self.kind != other.kind:
+            return False
+        return True
+
+class _UniffiFfiConverterTypePageDialog(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return PageDialog(
+            dialog_id=_UniffiFfiConverterString.read(buf),
+            kind=_UniffiFfiConverterString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.dialog_id)
+        _UniffiFfiConverterString.check_lower(value.kind)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.dialog_id, buf)
+        _UniffiFfiConverterString.write(value.kind, buf)
+
+class _UniffiFfiConverterOptionalTypePageDialog(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypePageDialog.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypePageDialog.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypePageDialog.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class PageChanges:
+    """
+    What the page showed once a browser action settled, against the outline
+    the session held. These are observed changes: the page may have made
+    some of them by itself.
+"""
+    def __init__(self, *, kind:PageChangesKind, reason:typing.Optional[str], snapshot_id:typing.Optional[str], base_revision:typing.Optional[int], revision:typing.Optional[int], ops:typing.Optional[typing.List[PageChangeOp]], outline:typing.Optional[str], url:typing.Optional[str], title:typing.Optional[str], complete:typing.Optional[bool], continuation:typing.Optional[str], dialog:typing.Optional[PageDialog], settled:typing.Optional[bool]):
+        self.kind = kind
+        self.reason = reason
+        self.snapshot_id = snapshot_id
+        self.base_revision = base_revision
+        self.revision = revision
+        self.ops = ops
+        self.outline = outline
+        self.url = url
+        self.title = title
+        self.complete = complete
+        self.continuation = continuation
+        self.dialog = dialog
+        self.settled = settled
+
+
+
+
+    def __str__(self):
+        return "PageChanges(kind={}, reason={}, snapshot_id={}, base_revision={}, revision={}, ops={}, outline={}, url={}, title={}, complete={}, continuation={}, dialog={}, settled={})".format(self.kind, self.reason, self.snapshot_id, self.base_revision, self.revision, self.ops, self.outline, self.url, self.title, self.complete, self.continuation, self.dialog, self.settled)
+    def __eq__(self, other):
+        if self.kind != other.kind:
+            return False
+        if self.reason != other.reason:
+            return False
+        if self.snapshot_id != other.snapshot_id:
+            return False
+        if self.base_revision != other.base_revision:
+            return False
+        if self.revision != other.revision:
+            return False
+        if self.ops != other.ops:
+            return False
+        if self.outline != other.outline:
+            return False
+        if self.url != other.url:
+            return False
+        if self.title != other.title:
+            return False
+        if self.complete != other.complete:
+            return False
+        if self.continuation != other.continuation:
+            return False
+        if self.dialog != other.dialog:
+            return False
+        if self.settled != other.settled:
+            return False
+        return True
+
+class _UniffiFfiConverterTypePageChanges(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return PageChanges(
+            kind=_UniffiFfiConverterTypePageChangesKind.read(buf),
+            reason=_UniffiFfiConverterOptionalString.read(buf),
+            snapshot_id=_UniffiFfiConverterOptionalString.read(buf),
+            base_revision=_UniffiFfiConverterOptionalUInt64.read(buf),
+            revision=_UniffiFfiConverterOptionalUInt64.read(buf),
+            ops=_UniffiFfiConverterOptionalSequenceTypePageChangeOp.read(buf),
+            outline=_UniffiFfiConverterOptionalString.read(buf),
+            url=_UniffiFfiConverterOptionalString.read(buf),
+            title=_UniffiFfiConverterOptionalString.read(buf),
+            complete=_UniffiFfiConverterOptionalBoolean.read(buf),
+            continuation=_UniffiFfiConverterOptionalString.read(buf),
+            dialog=_UniffiFfiConverterOptionalTypePageDialog.read(buf),
+            settled=_UniffiFfiConverterOptionalBoolean.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypePageChangesKind.check_lower(value.kind)
+        _UniffiFfiConverterOptionalString.check_lower(value.reason)
+        _UniffiFfiConverterOptionalString.check_lower(value.snapshot_id)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.base_revision)
+        _UniffiFfiConverterOptionalUInt64.check_lower(value.revision)
+        _UniffiFfiConverterOptionalSequenceTypePageChangeOp.check_lower(value.ops)
+        _UniffiFfiConverterOptionalString.check_lower(value.outline)
+        _UniffiFfiConverterOptionalString.check_lower(value.url)
+        _UniffiFfiConverterOptionalString.check_lower(value.title)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.complete)
+        _UniffiFfiConverterOptionalString.check_lower(value.continuation)
+        _UniffiFfiConverterOptionalTypePageDialog.check_lower(value.dialog)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.settled)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypePageChangesKind.write(value.kind, buf)
+        _UniffiFfiConverterOptionalString.write(value.reason, buf)
+        _UniffiFfiConverterOptionalString.write(value.snapshot_id, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.base_revision, buf)
+        _UniffiFfiConverterOptionalUInt64.write(value.revision, buf)
+        _UniffiFfiConverterOptionalSequenceTypePageChangeOp.write(value.ops, buf)
+        _UniffiFfiConverterOptionalString.write(value.outline, buf)
+        _UniffiFfiConverterOptionalString.write(value.url, buf)
+        _UniffiFfiConverterOptionalString.write(value.title, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.complete, buf)
+        _UniffiFfiConverterOptionalString.write(value.continuation, buf)
+        _UniffiFfiConverterOptionalTypePageDialog.write(value.dialog, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.settled, buf)
+
+class _UniffiFfiConverterOptionalTypePageChanges(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypePageChanges.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypePageChanges.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypePageChanges.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class ActionResult:
-    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], error:typing.Optional[ActionError], idempotent:typing.Optional[bool]):
+    def __init__(self, *, effect:ActionEffect, route:ActionRoute, delivery:typing.Optional[ActionDelivery], evidence:typing.Optional[typing.List[ActionEvidence]], escalation:typing.Optional[ActionEscalation], summary:typing.Optional[str], error:typing.Optional[ActionError], idempotent:typing.Optional[bool], changes:typing.Optional[PageChanges]):
         self.effect = effect
         self.route = route
         self.delivery = delivery
@@ -2306,12 +2768,13 @@ class ActionResult:
         self.summary = summary
         self.error = error
         self.idempotent = idempotent
+        self.changes = changes
 
 
 
 
     def __str__(self):
-        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, summary={}, error={}, idempotent={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.summary, self.error, self.idempotent)
+        return "ActionResult(effect={}, route={}, delivery={}, evidence={}, escalation={}, summary={}, error={}, idempotent={}, changes={})".format(self.effect, self.route, self.delivery, self.evidence, self.escalation, self.summary, self.error, self.idempotent, self.changes)
     def __eq__(self, other):
         if self.effect != other.effect:
             return False
@@ -2329,6 +2792,8 @@ class ActionResult:
             return False
         if self.idempotent != other.idempotent:
             return False
+        if self.changes != other.changes:
+            return False
         return True
 
 class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
@@ -2343,6 +2808,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
             summary=_UniffiFfiConverterOptionalString.read(buf),
             error=_UniffiFfiConverterOptionalTypeActionError.read(buf),
             idempotent=_UniffiFfiConverterOptionalBoolean.read(buf),
+            changes=_UniffiFfiConverterOptionalTypePageChanges.read(buf),
         )
 
     @staticmethod
@@ -2355,6 +2821,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.check_lower(value.summary)
         _UniffiFfiConverterOptionalTypeActionError.check_lower(value.error)
         _UniffiFfiConverterOptionalBoolean.check_lower(value.idempotent)
+        _UniffiFfiConverterOptionalTypePageChanges.check_lower(value.changes)
 
     @staticmethod
     def write(value, buf):
@@ -2366,6 +2833,7 @@ class _UniffiFfiConverterTypeActionResult(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalString.write(value.summary, buf)
         _UniffiFfiConverterOptionalTypeActionError.write(value.error, buf)
         _UniffiFfiConverterOptionalBoolean.write(value.idempotent, buf)
+        _UniffiFfiConverterOptionalTypePageChanges.write(value.changes, buf)
 
 @dataclass
 class AppInfo:
@@ -2527,18 +2995,612 @@ class _UniffiFfiConverterTypeBoundsExpectation(_UniffiConverterRustBuffer):
         _UniffiFfiConverterFloat64.write(value.height, buf)
         _UniffiFfiConverterOptionalFloat64.write(value.tolerance_px, buf)
 
-class _UniffiFfiConverterUInt64(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u64"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**64
 
+
+
+
+
+class BrowserStepAction(enum.Enum):
+
+    CLICK = 0
+
+    TYPE = 1
+
+
+
+class _UniffiFfiConverterTypeBrowserStepAction(_UniffiConverterRustBuffer):
     @staticmethod
     def read(buf):
-        return buf.read_u64()
+        variant = buf.read_i32()
+        if variant == 1:
+            return BrowserStepAction.CLICK
+        if variant == 2:
+            return BrowserStepAction.TYPE
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == BrowserStepAction.CLICK:
+            return
+        if value == BrowserStepAction.TYPE:
+            return
+        raise ValueError(value)
 
     @staticmethod
     def write(value, buf):
-        buf.write_u64(value)
+        if value == BrowserStepAction.CLICK:
+            buf.write_i32(1)
+        if value == BrowserStepAction.TYPE:
+            buf.write_i32(2)
+
+
+
+
+
+
+
+
+class BrowserStepRoute(enum.Enum):
+
+    TRUSTED = 0
+
+    DOM_EVENT = 1
+
+
+
+class _UniffiFfiConverterTypeBrowserStepRoute(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return BrowserStepRoute.TRUSTED
+        if variant == 2:
+            return BrowserStepRoute.DOM_EVENT
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == BrowserStepRoute.TRUSTED:
+            return
+        if value == BrowserStepRoute.DOM_EVENT:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == BrowserStepRoute.TRUSTED:
+            buf.write_i32(1)
+        if value == BrowserStepRoute.DOM_EVENT:
+            buf.write_i32(2)
+
+
+
+class _UniffiFfiConverterOptionalTypeBrowserStepRoute(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeBrowserStepRoute.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeBrowserStepRoute.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeBrowserStepRoute.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class BrowserStepExpect:
+    """
+    What must hold once a step has settled: some element with this role,
+    exact name and/or text (or, with `present: false`, none).
+"""
+    def __init__(self, *, role:typing.Optional[str] = _DEFAULT, name:typing.Optional[str] = _DEFAULT, text:typing.Optional[str] = _DEFAULT, present:bool = True):
+        if role is _DEFAULT:
+            self.role = None
+        else:
+            self.role = role
+        if name is _DEFAULT:
+            self.name = None
+        else:
+            self.name = name
+        if text is _DEFAULT:
+            self.text = None
+        else:
+            self.text = text
+        self.present = present
+
+
+
+
+    def __str__(self):
+        return "BrowserStepExpect(role={}, name={}, text={}, present={})".format(self.role, self.name, self.text, self.present)
+    def __eq__(self, other):
+        if self.role != other.role:
+            return False
+        if self.name != other.name:
+            return False
+        if self.text != other.text:
+            return False
+        if self.present != other.present:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeBrowserStepExpect(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return BrowserStepExpect(
+            role=_UniffiFfiConverterOptionalString.read(buf),
+            name=_UniffiFfiConverterOptionalString.read(buf),
+            text=_UniffiFfiConverterOptionalString.read(buf),
+            present=_UniffiFfiConverterBoolean.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterOptionalString.check_lower(value.role)
+        _UniffiFfiConverterOptionalString.check_lower(value.name)
+        _UniffiFfiConverterOptionalString.check_lower(value.text)
+        _UniffiFfiConverterBoolean.check_lower(value.present)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterOptionalString.write(value.role, buf)
+        _UniffiFfiConverterOptionalString.write(value.name, buf)
+        _UniffiFfiConverterOptionalString.write(value.text, buf)
+        _UniffiFfiConverterBoolean.write(value.present, buf)
+
+class _UniffiFfiConverterOptionalTypeBrowserStepExpect(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeBrowserStepExpect.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeBrowserStepExpect.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeBrowserStepExpect.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
+@dataclass
+class BrowserStep:
+    """
+    One step. Target it with `ref`, or with `role` and `name` (matched
+    exactly against the live page when the step runs).
+"""
+    def __init__(self, *, action:BrowserStepAction, reference:typing.Optional[str] = _DEFAULT, role:typing.Optional[str] = _DEFAULT, name:typing.Optional[str] = _DEFAULT, text:typing.Optional[str] = _DEFAULT, replace:typing.Optional[bool] = _DEFAULT, input_route:typing.Optional[BrowserStepRoute] = _DEFAULT, expect:typing.Optional[BrowserStepExpect] = _DEFAULT):
+        self.action = action
+        if reference is _DEFAULT:
+            self.reference = None
+        else:
+            self.reference = reference
+        if role is _DEFAULT:
+            self.role = None
+        else:
+            self.role = role
+        if name is _DEFAULT:
+            self.name = None
+        else:
+            self.name = name
+        if text is _DEFAULT:
+            self.text = None
+        else:
+            self.text = text
+        if replace is _DEFAULT:
+            self.replace = None
+        else:
+            self.replace = replace
+        if input_route is _DEFAULT:
+            self.input_route = None
+        else:
+            self.input_route = input_route
+        if expect is _DEFAULT:
+            self.expect = None
+        else:
+            self.expect = expect
+
+
+
+
+    def __str__(self):
+        return "BrowserStep(action={}, reference={}, role={}, name={}, text={}, replace={}, input_route={}, expect={})".format(self.action, self.reference, self.role, self.name, self.text, self.replace, self.input_route, self.expect)
+    def __eq__(self, other):
+        if self.action != other.action:
+            return False
+        if self.reference != other.reference:
+            return False
+        if self.role != other.role:
+            return False
+        if self.name != other.name:
+            return False
+        if self.text != other.text:
+            return False
+        if self.replace != other.replace:
+            return False
+        if self.input_route != other.input_route:
+            return False
+        if self.expect != other.expect:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeBrowserStep(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return BrowserStep(
+            action=_UniffiFfiConverterTypeBrowserStepAction.read(buf),
+            reference=_UniffiFfiConverterOptionalString.read(buf),
+            role=_UniffiFfiConverterOptionalString.read(buf),
+            name=_UniffiFfiConverterOptionalString.read(buf),
+            text=_UniffiFfiConverterOptionalString.read(buf),
+            replace=_UniffiFfiConverterOptionalBoolean.read(buf),
+            input_route=_UniffiFfiConverterOptionalTypeBrowserStepRoute.read(buf),
+            expect=_UniffiFfiConverterOptionalTypeBrowserStepExpect.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeBrowserStepAction.check_lower(value.action)
+        _UniffiFfiConverterOptionalString.check_lower(value.reference)
+        _UniffiFfiConverterOptionalString.check_lower(value.role)
+        _UniffiFfiConverterOptionalString.check_lower(value.name)
+        _UniffiFfiConverterOptionalString.check_lower(value.text)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.replace)
+        _UniffiFfiConverterOptionalTypeBrowserStepRoute.check_lower(value.input_route)
+        _UniffiFfiConverterOptionalTypeBrowserStepExpect.check_lower(value.expect)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeBrowserStepAction.write(value.action, buf)
+        _UniffiFfiConverterOptionalString.write(value.reference, buf)
+        _UniffiFfiConverterOptionalString.write(value.role, buf)
+        _UniffiFfiConverterOptionalString.write(value.name, buf)
+        _UniffiFfiConverterOptionalString.write(value.text, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.replace, buf)
+        _UniffiFfiConverterOptionalTypeBrowserStepRoute.write(value.input_route, buf)
+        _UniffiFfiConverterOptionalTypeBrowserStepExpect.write(value.expect, buf)
+
+
+
+
+
+
+class BrowserStepStatus(enum.Enum):
+    """
+    How one step ended.
+
+    - `ok`: it ran and nothing says it failed.
+    - `unconfirmed`: text was typed, but the field could not be read back as
+    holding it.
+    - `failed`: refused, errored, no single target, or its expect did not hold.
+"""
+
+    OK = 0
+
+    UNCONFIRMED = 1
+
+    FAILED = 2
+
+
+
+class _UniffiFfiConverterTypeBrowserStepStatus(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return BrowserStepStatus.OK
+        if variant == 2:
+            return BrowserStepStatus.UNCONFIRMED
+        if variant == 3:
+            return BrowserStepStatus.FAILED
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == BrowserStepStatus.OK:
+            return
+        if value == BrowserStepStatus.UNCONFIRMED:
+            return
+        if value == BrowserStepStatus.FAILED:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == BrowserStepStatus.OK:
+            buf.write_i32(1)
+        if value == BrowserStepStatus.UNCONFIRMED:
+            buf.write_i32(2)
+        if value == BrowserStepStatus.FAILED:
+            buf.write_i32(3)
+
+
+
+@dataclass
+class BrowserStepOutcome:
+    def __init__(self, *, status:BrowserStepStatus, reference:typing.Optional[str], effect:typing.Optional[str], code:typing.Optional[str], detail:typing.Optional[str], delivered_count:typing.Optional[int], retryable:typing.Optional[bool], candidates:typing.Optional[typing.List[str]]):
+        self.status = status
+        self.reference = reference
+        self.effect = effect
+        self.code = code
+        self.detail = detail
+        self.delivered_count = delivered_count
+        self.retryable = retryable
+        self.candidates = candidates
+
+
+
+
+    def __str__(self):
+        return "BrowserStepOutcome(status={}, reference={}, effect={}, code={}, detail={}, delivered_count={}, retryable={}, candidates={})".format(self.status, self.reference, self.effect, self.code, self.detail, self.delivered_count, self.retryable, self.candidates)
+    def __eq__(self, other):
+        if self.status != other.status:
+            return False
+        if self.reference != other.reference:
+            return False
+        if self.effect != other.effect:
+            return False
+        if self.code != other.code:
+            return False
+        if self.detail != other.detail:
+            return False
+        if self.delivered_count != other.delivered_count:
+            return False
+        if self.retryable != other.retryable:
+            return False
+        if self.candidates != other.candidates:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeBrowserStepOutcome(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return BrowserStepOutcome(
+            status=_UniffiFfiConverterTypeBrowserStepStatus.read(buf),
+            reference=_UniffiFfiConverterOptionalString.read(buf),
+            effect=_UniffiFfiConverterOptionalString.read(buf),
+            code=_UniffiFfiConverterOptionalString.read(buf),
+            detail=_UniffiFfiConverterOptionalString.read(buf),
+            delivered_count=_UniffiFfiConverterOptionalUInt32.read(buf),
+            retryable=_UniffiFfiConverterOptionalBoolean.read(buf),
+            candidates=_UniffiFfiConverterOptionalSequenceString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeBrowserStepStatus.check_lower(value.status)
+        _UniffiFfiConverterOptionalString.check_lower(value.reference)
+        _UniffiFfiConverterOptionalString.check_lower(value.effect)
+        _UniffiFfiConverterOptionalString.check_lower(value.code)
+        _UniffiFfiConverterOptionalString.check_lower(value.detail)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.delivered_count)
+        _UniffiFfiConverterOptionalBoolean.check_lower(value.retryable)
+        _UniffiFfiConverterOptionalSequenceString.check_lower(value.candidates)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeBrowserStepStatus.write(value.status, buf)
+        _UniffiFfiConverterOptionalString.write(value.reference, buf)
+        _UniffiFfiConverterOptionalString.write(value.effect, buf)
+        _UniffiFfiConverterOptionalString.write(value.code, buf)
+        _UniffiFfiConverterOptionalString.write(value.detail, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.delivered_count, buf)
+        _UniffiFfiConverterOptionalBoolean.write(value.retryable, buf)
+        _UniffiFfiConverterOptionalSequenceString.write(value.candidates, buf)
+
+class _UniffiFfiConverterSequenceTypeBrowserStep(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeBrowserStep.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeBrowserStep.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeBrowserStep.read(buf) for i in range(count)
+        ]
+
+@dataclass
+class BrowserStepsInput:
+    def __init__(self, *, target_id:str, tab_id:str, session:typing.Optional[str] = _DEFAULT, steps:typing.List[BrowserStep]):
+        self.target_id = target_id
+        self.tab_id = tab_id
+        if session is _DEFAULT:
+            self.session = None
+        else:
+            self.session = session
+        self.steps = steps
+
+
+
+
+    def __str__(self):
+        return "BrowserStepsInput(target_id={}, tab_id={}, session={}, steps={})".format(self.target_id, self.tab_id, self.session, self.steps)
+    def __eq__(self, other):
+        if self.target_id != other.target_id:
+            return False
+        if self.tab_id != other.tab_id:
+            return False
+        if self.session != other.session:
+            return False
+        if self.steps != other.steps:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeBrowserStepsInput(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return BrowserStepsInput(
+            target_id=_UniffiFfiConverterString.read(buf),
+            tab_id=_UniffiFfiConverterString.read(buf),
+            session=_UniffiFfiConverterOptionalString.read(buf),
+            steps=_UniffiFfiConverterSequenceTypeBrowserStep.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.target_id)
+        _UniffiFfiConverterString.check_lower(value.tab_id)
+        _UniffiFfiConverterOptionalString.check_lower(value.session)
+        _UniffiFfiConverterSequenceTypeBrowserStep.check_lower(value.steps)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.target_id, buf)
+        _UniffiFfiConverterString.write(value.tab_id, buf)
+        _UniffiFfiConverterOptionalString.write(value.session, buf)
+        _UniffiFfiConverterSequenceTypeBrowserStep.write(value.steps, buf)
+
+
+
+
+
+
+class BrowserStepsStatus(enum.Enum):
+
+    COMPLETED = 0
+
+    STOPPED = 1
+
+
+
+class _UniffiFfiConverterTypeBrowserStepsStatus(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return BrowserStepsStatus.COMPLETED
+        if variant == 2:
+            return BrowserStepsStatus.STOPPED
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == BrowserStepsStatus.COMPLETED:
+            return
+        if value == BrowserStepsStatus.STOPPED:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == BrowserStepsStatus.COMPLETED:
+            buf.write_i32(1)
+        if value == BrowserStepsStatus.STOPPED:
+            buf.write_i32(2)
+
+
+
+class _UniffiFfiConverterSequenceTypeBrowserStepOutcome(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeBrowserStepOutcome.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeBrowserStepOutcome.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeBrowserStepOutcome.read(buf) for i in range(count)
+        ]
+
+@dataclass
+class BrowserStepsOutput:
+    def __init__(self, *, status:BrowserStepsStatus, steps:typing.List[BrowserStepOutcome], stopped_at:typing.Optional[int], stop_reason:typing.Optional[str], changes:typing.Optional[PageChanges]):
+        self.status = status
+        self.steps = steps
+        self.stopped_at = stopped_at
+        self.stop_reason = stop_reason
+        self.changes = changes
+
+
+
+
+    def __str__(self):
+        return "BrowserStepsOutput(status={}, steps={}, stopped_at={}, stop_reason={}, changes={})".format(self.status, self.steps, self.stopped_at, self.stop_reason, self.changes)
+    def __eq__(self, other):
+        if self.status != other.status:
+            return False
+        if self.steps != other.steps:
+            return False
+        if self.stopped_at != other.stopped_at:
+            return False
+        if self.stop_reason != other.stop_reason:
+            return False
+        if self.changes != other.changes:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeBrowserStepsOutput(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return BrowserStepsOutput(
+            status=_UniffiFfiConverterTypeBrowserStepsStatus.read(buf),
+            steps=_UniffiFfiConverterSequenceTypeBrowserStepOutcome.read(buf),
+            stopped_at=_UniffiFfiConverterOptionalUInt32.read(buf),
+            stop_reason=_UniffiFfiConverterOptionalString.read(buf),
+            changes=_UniffiFfiConverterOptionalTypePageChanges.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterTypeBrowserStepsStatus.check_lower(value.status)
+        _UniffiFfiConverterSequenceTypeBrowserStepOutcome.check_lower(value.steps)
+        _UniffiFfiConverterOptionalUInt32.check_lower(value.stopped_at)
+        _UniffiFfiConverterOptionalString.check_lower(value.stop_reason)
+        _UniffiFfiConverterOptionalTypePageChanges.check_lower(value.changes)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterTypeBrowserStepsStatus.write(value.status, buf)
+        _UniffiFfiConverterSequenceTypeBrowserStepOutcome.write(value.steps, buf)
+        _UniffiFfiConverterOptionalUInt32.write(value.stopped_at, buf)
+        _UniffiFfiConverterOptionalString.write(value.stop_reason, buf)
+        _UniffiFfiConverterOptionalTypePageChanges.write(value.changes, buf)
 
 
 
@@ -3722,31 +4784,6 @@ class _UniffiFfiConverterOptionalTypeDesktopScope(_UniffiConverterRustBuffer):
             return None
         elif flag == 1:
             return _UniffiFfiConverterTypeDesktopScope.read(buf)
-        else:
-            raise InternalError("Unexpected flag byte for optional type")
-
-class _UniffiFfiConverterOptionalUInt64(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        if value is not None:
-            _UniffiFfiConverterUInt64.check_lower(value)
-
-    @classmethod
-    def write(cls, value, buf):
-        if value is None:
-            buf.write_u8(0)
-            return
-
-        buf.write_u8(1)
-        _UniffiFfiConverterUInt64.write(value, buf)
-
-    @classmethod
-    def read(cls, buf):
-        flag = buf.read_u8()
-        if flag == 0:
-            return None
-        elif flag == 1:
-            return _UniffiFfiConverterUInt64.read(buf)
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
@@ -9637,6 +10674,12 @@ __all__ = [
     "ActionEvidenceKind",
     "ActionEffect",
     "ActionRoute",
+    "PageChangesKind",
+    "PageChangeOpKind",
+    "BrowserStepAction",
+    "BrowserStepRoute",
+    "BrowserStepStatus",
+    "BrowserStepsStatus",
     "ActionTarget",
     "ClickPosition",
     "InputDeliveryMode",
@@ -9667,9 +10710,17 @@ __all__ = [
     "ActionError",
     "ActionEscalation",
     "ActionEvidence",
+    "PageChangeOp",
+    "PageDialog",
+    "PageChanges",
     "ActionResult",
     "AppInfo",
     "BoundsExpectation",
+    "BrowserStepExpect",
+    "BrowserStep",
+    "BrowserStepOutcome",
+    "BrowserStepsInput",
+    "BrowserStepsOutput",
     "ClickInput",
     "ClipboardReadInput",
     "ClipboardReadOutput",

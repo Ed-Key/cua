@@ -413,6 +413,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "browser_set_input_files" => &["browser.input.files"],
         "browser_download" => &["browser.download"],
         "browser_pointer" => &["browser.input.pointer"],
+        "browser_steps" => &["browser.steps"],
         "browser_tabs" => &["browser.tabs"],
 
         // ── driver self-service ──────────────────────────────────────
@@ -928,6 +929,12 @@ impl ToolRegistry {
         resolve_binding: crate::perception_tools::CaptureBindingResolver,
     ) {
         crate::perception_tools::register_perception_tool(self, client, resolve_binding);
+    }
+
+    /// The slot composite tools dispatch their child calls through: it holds
+    /// this registry once [`Self::init_self_weak`] has run.
+    pub(crate) fn composite_registry_slot(&self) -> ReplayRegistrySlot {
+        self.replay_registry.clone()
     }
 
     /// Wire up the replay and sequence tools' weak self-reference.
@@ -1594,6 +1601,8 @@ impl ToolRegistry {
                     | "replay_trajectory"
                     | "run_sequence"
                     | "act_and_read"
+                    // Its steps are recorded as the calls they are.
+                    | "browser_steps"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
         let _desktop_action = if requires_desktop_coordination(
@@ -2890,6 +2899,17 @@ fn publish_action_result(result: &mut ToolResult, idempotent: bool) -> Result<()
     // Moves, toggles, typing and submits repeat when resent: say so, so an
     // unconfirmed effect is read before it is sent again.
     public.idempotent = (!idempotent).then_some(false);
+    // A browser action's observation of the page afterwards. The producer
+    // obtained it through an authorized get_browser_state dispatch; here it
+    // only has to fit the closed contract.
+    public.changes = result
+        .structured_content
+        .as_ref()
+        .and_then(|structured| structured.get("changes"))
+        .filter(|changes| !changes.is_null())
+        .map(|changes| serde_json::from_value(changes.clone()))
+        .transpose()
+        .map_err(|error| format!("invalid page changes: {error}"))?;
     public
         .validate_invariants()
         .map_err(|error| format!("invalid public projection: {error}"))?;

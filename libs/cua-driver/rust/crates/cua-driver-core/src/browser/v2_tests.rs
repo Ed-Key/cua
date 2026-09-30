@@ -93,6 +93,46 @@ struct FixtureState {
     /// inactive tab it runs only once focus is emulated.
     field_focus_moves_caret_to_end: bool,
     focus_emulated: bool,
+    /// Accessible names the page changed since the fixture was built, by
+    /// backend node id (a node reused for another entity).
+    renamed: std::collections::HashMap<i64, String>,
+    /// Nodes the page removed, by backend node id.
+    removed: std::collections::HashSet<i64>,
+    /// The debugger was detached from the tab (the user cancelled Chrome's
+    /// banner): reported, as the relay does, before the next attach answers.
+    detached: bool,
+    /// What the page does when it is clicked: rename nodes, remove nodes.
+    click_renames: Vec<(i64, String)>,
+    click_removes: Vec<i64>,
+    /// The click handler calls alert(): the dialog opens and the page
+    /// answers nothing until it is resolved.
+    click_opens_dialog: bool,
+    /// The click handler sets location.href: the main frame starts loading
+    /// the document with this loader id.
+    click_navigates: Option<String>,
+    /// What the page answers the next this-many hit-tests at a ref's click
+    /// point (the facts), and the node that is on top there.
+    hit: Option<(usize, Value, i64)>,
+    /// The input handler calls alert() when text arrives.
+    type_opens_dialog: bool,
+    /// The input handler defers its alert: the insert is answered, and the
+    /// dialog is up by the time the answer arrives.
+    type_opens_dialog_late: bool,
+    /// The alert opens while the field is being read back, at this read
+    /// (0-based, counted from the insert), which is then "unanswered", fails
+    /// ("error"), is "answered" all the same, or finds the field "detached".
+    readback_opens_dialog: Option<(usize, &'static str)>,
+    readbacks: usize,
+    /// The browser does not report a frame tree.
+    frame_tree_unsupported: bool,
+    /// A keydown handler calls alert() on this (0-based) key.
+    key_down_opens_dialog_at: Option<usize>,
+    key_downs: usize,
+    dialog_open: bool,
+    /// The session that enabled the Page domain (it hears dialog events).
+    page_session: Option<String>,
+    /// Mutation records the page made since the settle counter last read.
+    pending_mutations: u64,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -130,6 +170,24 @@ impl Default for FixtureState {
             field_caret: None,
             field_focus_moves_caret_to_end: false,
             focus_emulated: false,
+            renamed: Default::default(),
+            removed: Default::default(),
+            detached: false,
+            click_renames: Vec::new(),
+            click_removes: Vec::new(),
+            click_opens_dialog: false,
+            click_navigates: None,
+            hit: None,
+            type_opens_dialog: false,
+            type_opens_dialog_late: false,
+            readback_opens_dialog: None,
+            readbacks: 0,
+            frame_tree_unsupported: false,
+            key_down_opens_dialog_at: None,
+            key_downs: 0,
+            dialog_open: false,
+            page_session: None,
+            pending_mutations: 0,
             calls: Vec::new(),
         }
     }
@@ -474,6 +532,111 @@ fn oopif_document() -> Value {
     })
 }
 
+/// The DOM the fixture page has now: its document minus removed nodes.
+fn fixture_dom(st: &FixtureState, is_oopif: bool) -> Value {
+    fn prune(node: &mut Value, removed: &std::collections::HashSet<i64>) {
+        for key in ["children", "shadowRoots"] {
+            if let Some(children) = node.get_mut(key).and_then(Value::as_array_mut) {
+                children.retain(|child| {
+                    !child["backendNodeId"]
+                        .as_i64()
+                        .is_some_and(|backend| removed.contains(&backend))
+                });
+                children.iter_mut().for_each(|child| prune(child, removed));
+            }
+        }
+        if let Some(content) = node.get_mut("contentDocument") {
+            prune(content, removed);
+        }
+    }
+    let mut document = if is_oopif {
+        oopif_document()
+    } else if st.semantic_large_page {
+        large_semantic_document()
+    } else {
+        main_document()
+    };
+    if !is_oopif {
+        document["root"]["documentURL"] = json!(st.main_url);
+    }
+    prune(&mut document["root"], &st.removed);
+    document
+}
+
+fn find_dom_node(node: &Value, backend: i64) -> Option<Value> {
+    let node = node.get("root").unwrap_or(node);
+    if node["backendNodeId"].as_i64() == Some(backend) {
+        return Some(node.clone());
+    }
+    ["children", "shadowRoots"]
+        .iter()
+        .filter_map(|key| node.get(*key).and_then(Value::as_array))
+        .flatten()
+        .chain(node.get("contentDocument"))
+        .find_map(|child| find_dom_node(child, backend))
+}
+
+/// The accessibility tree the fixture page has now for one frame.
+fn fixture_ax_tree(st: &FixtureState, is_oopif: bool, frame_id: &str) -> Value {
+    let mut tree = if is_oopif {
+        json!({"nodes": [
+            {"nodeId": "oopif-root", "ignored": false,
+             "role": {"value": "RootWebArea"}, "childIds": ["oopif-input"]},
+            {"nodeId": "oopif-input", "parentId": "oopif-root", "ignored": false,
+             "backendDOMNodeId": 100, "role": {"value": "textbox"},
+             "name": {"value": "Embedded input"},
+             "properties": [{"name": "editable", "value": {"value": "plaintext"}}],
+             "childIds": []}
+        ]})
+    } else if st.semantic_large_page {
+        let mut tree = large_semantic_ax_tree(frame_id);
+        if frame_id == "F_MAIN" {
+            let nodes = tree["nodes"].as_array_mut().unwrap();
+            if !st.semantic_main_root_present {
+                nodes.remove(0);
+            } else if let Some(title) = &st.semantic_title {
+                nodes[0]["name"] = json!({"value": title});
+            } else {
+                nodes[0].as_object_mut().unwrap().remove("name");
+            }
+        }
+        if st.semantic_link_urls {
+            for node in tree["nodes"].as_array_mut().unwrap() {
+                if node["name"]["value"] == "Reply" || node["name"]["value"] == "Archive item 304" {
+                    node["role"] = json!({"value":"link"});
+                    node["properties"] = json!([{"name":"url","value":{"type":"string","value":"https://example.test/book?slot=1#court"}}]);
+                }
+            }
+        }
+        tree
+    } else {
+        json!({"nodes": []})
+    };
+    let nodes = tree["nodes"].as_array_mut().unwrap();
+    nodes.retain(|node| {
+        !node["backendDOMNodeId"]
+            .as_i64()
+            .is_some_and(|backend| st.removed.contains(&backend))
+    });
+    if let Some(value) = &st.field_value {
+        for node in nodes
+            .iter_mut()
+            .filter(|node| node["backendDOMNodeId"] == 2010)
+        {
+            node["value"] = json!({ "value": value });
+        }
+    }
+    for node in nodes {
+        if let Some(name) = node["backendDOMNodeId"]
+            .as_i64()
+            .and_then(|backend| st.renamed.get(&backend))
+        {
+            node["name"] = json!({ "value": name });
+        }
+    }
+    tree
+}
+
 fn fixture_handler(state: SharedState) -> MockHandler {
     Arc::new(move |call| {
         let mut st = state.lock().unwrap();
@@ -486,7 +649,76 @@ fn fixture_handler(state: SharedState) -> MockHandler {
         let is_tab = sess.starts_with("tab-sess-");
         let is_oopif = sess.starts_with("oopif-sess-");
 
+        // The page's own click handler, run by either click route.
+        let clicked = (call.method == "Input.dispatchMouseEvent"
+            && call.params["type"] == "mouseReleased")
+            || (call.method == "Runtime.callFunctionOn"
+                && call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|function| function.contains("this.click()")));
+        if clicked {
+            let renames = std::mem::take(&mut st.click_renames);
+            let removes = std::mem::take(&mut st.click_removes);
+            st.pending_mutations += (renames.len() + removes.len()) as u64;
+            st.renamed.extend(renames);
+            st.removed.extend(removes);
+            if let Some(loader) = st.click_navigates.take() {
+                st.main_loader = loader;
+                return MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Page.frameStartedLoading".into(),
+                    session_id: st.page_session.clone(),
+                    params: json!({"frameId": "F_MAIN"}),
+                }]);
+            }
+            if std::mem::take(&mut st.click_opens_dialog) {
+                st.dialog_open = true;
+                return MockReply::ok(json!({}))
+                    .with_events(vec![MockEvent {
+                        method: "Page.javascriptDialogOpening".into(),
+                        session_id: st.page_session.clone(),
+                        params: json!({"type": "alert", "message": "private dialog text"}),
+                    }])
+                    .unanswered();
+            }
+        }
+        // A page behind a dialog answers only what the browser process does.
+        if st.dialog_open
+            && (is_tab || is_oopif)
+            && !matches!(
+                call.method.as_str(),
+                "Page.handleJavaScriptDialog" | "Page.enable"
+            )
+        {
+            return MockReply::ok(json!({})).unanswered();
+        }
+
         match call.method.as_str() {
+            "Page.enable" if is_tab => {
+                st.page_session = Some(sess.clone());
+                MockReply::ok(json!({}))
+            }
+            "Page.handleJavaScriptDialog" if st.dialog_open => {
+                st.dialog_open = false;
+                MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Page.javascriptDialogClosed".into(),
+                    session_id: st.page_session.clone(),
+                    params: json!({"result": true, "userInput": ""}),
+                }])
+            }
+            "Runtime.evaluate"
+                if call.params["expression"]
+                    .as_str()
+                    .is_some_and(|expression| expression.contains("MutationObserver")) =>
+            {
+                MockReply::ok(json!({"result": {"type": "object", "objectId": "settle-counter"}}))
+            }
+            "Runtime.evaluate" if call.params["expression"] == "document.readyState" => {
+                MockReply::ok(json!({"result": {"type": "string", "value": "complete"}}))
+            }
+            "Runtime.callFunctionOn" if call.params["objectId"] == "settle-counter" => {
+                let records = std::mem::take(&mut st.pending_mutations);
+                MockReply::ok(json!({"result": {"type": "number", "value": records}}))
+            }
             "Target.getTargets" => MockReply::ok(json!({
                 "targetInfos": [{
                     "targetId": "T1",
@@ -501,8 +733,24 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 "bounds": { "left": 0.0, "top": 0.0, "width": 800.0, "height": 600.0 }
             })),
             "Target.attachToTarget" => {
+                let mut events = Vec::new();
+                if std::mem::take(&mut st.detached) {
+                    events.push(MockEvent {
+                        method: "Target.detachedFromTarget".into(),
+                        session_id: None,
+                        params: json!({
+                            "sessionId": format!("tab-sess-{}", st.tab_sessions),
+                            "targetId": "T1",
+                            "reason": "canceled_by_user",
+                        }),
+                    });
+                }
                 st.tab_sessions += 1;
                 MockReply::ok(json!({ "sessionId": format!("tab-sess-{}", st.tab_sessions) }))
+                    .with_events(events)
+            }
+            "Page.getFrameTree" if st.frame_tree_unsupported => {
+                MockReply::err(-32601, "'Page.getFrameTree' wasn't found")
             }
             "Page.getFrameTree" if is_tab => MockReply::ok(json!({
                 "frameTree": {
@@ -539,13 +787,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 } else if st.semantic_truncated_dom && depth == 8 {
                     MockReply::ok(truncated_semantic_document())
                 } else {
-                    let mut document = if st.semantic_large_page {
-                        large_semantic_document()
-                    } else {
-                        main_document()
-                    };
-                    document["root"]["documentURL"] = json!(st.main_url);
-                    MockReply::ok(document)
+                    MockReply::ok(fixture_dom(&st, false))
                 }
             }
             "DOM.describeNode" if is_tab && call.params["backendNodeId"] == 999 => {
@@ -553,45 +795,47 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     "node": large_semantic_document()["root"]["children"][0].clone()
                 }))
             }
-            "DOM.getDocument" if is_oopif => MockReply::ok(oopif_document()),
-            "Accessibility.getFullAXTree" if is_tab => {
-                let frame_id = call.params["frameId"].as_str().unwrap_or("F_MAIN");
-                if st.semantic_large_page {
-                    let mut tree = large_semantic_ax_tree(frame_id);
-                    if frame_id == "F_MAIN" {
-                        let nodes = tree["nodes"].as_array_mut().unwrap();
-                        if !st.semantic_main_root_present {
-                            nodes.remove(0);
-                        } else if let Some(title) = &st.semantic_title {
-                            nodes[0]["name"] = json!({"value": title});
-                        } else {
-                            nodes[0].as_object_mut().unwrap().remove("name");
-                        }
-                    }
-                    if st.semantic_link_urls {
-                        for node in tree["nodes"].as_array_mut().unwrap() {
-                            if node["name"]["value"] == "Reply"
-                                || node["name"]["value"] == "Archive item 304"
-                            {
-                                node["role"] = json!({"value":"link"});
-                                node["properties"] = json!([{"name":"url","value":{"type":"string","value":"https://example.test/book?slot=1#court"}}]);
-                            }
-                        }
-                    }
-                    MockReply::ok(tree)
-                } else {
-                    MockReply::ok(json!({"nodes": []}))
+            "DOM.describeNode" if call.params["objectId"] == "obj-on-top" => {
+                let on_top = st.hit.as_ref().map_or(0, |(_, _, backend)| *backend);
+                MockReply::ok(json!({"node": {"backendNodeId": on_top}}))
+            }
+            "DOM.describeNode" => {
+                let backend = call.params["backendNodeId"].as_i64().unwrap_or(0);
+                match find_dom_node(&fixture_dom(&st, is_oopif), backend) {
+                    Some(node) => MockReply::ok(json!({ "node": node })),
+                    None => MockReply::err(-32000, "No node with given id"),
                 }
             }
-            "Accessibility.getFullAXTree" if is_oopif => MockReply::ok(json!({"nodes": [
-                {"nodeId": "oopif-root", "ignored": false,
-                 "role": {"value": "RootWebArea"}, "childIds": ["oopif-input"]},
-                {"nodeId": "oopif-input", "parentId": "oopif-root", "ignored": false,
-                 "backendDOMNodeId": 100, "role": {"value": "textbox"},
-                 "name": {"value": "Embedded input"},
-                 "properties": [{"name": "editable", "value": {"value": "plaintext"}}],
-                 "childIds": []}
-            ]})),
+            "DOM.getDocument" if is_oopif => MockReply::ok(oopif_document()),
+            "Accessibility.getFullAXTree" if is_tab || is_oopif => {
+                let frame_id = call.params["frameId"].as_str().unwrap_or("F_MAIN");
+                MockReply::ok(fixture_ax_tree(&st, is_oopif, frame_id))
+            }
+            "Accessibility.getPartialAXTree" if is_tab || is_oopif => {
+                let backend = call.params["backendNodeId"].as_i64();
+                let node = ["F_MAIN", "F_IFRAME"]
+                    .iter()
+                    .flat_map(|frame_id| {
+                        fixture_ax_tree(&st, is_oopif, frame_id)["nodes"]
+                            .as_array()
+                            .cloned()
+                            .unwrap_or_default()
+                    })
+                    .find(|node| node["backendDOMNodeId"].as_i64() == backend);
+                match node {
+                    Some(node) => MockReply::ok(json!({ "nodes": [node] })),
+                    // Chromium answers for any live DOM node; one with no
+                    // accessibility object of its own comes back ignored.
+                    None if find_dom_node(&fixture_dom(&st, is_oopif), backend.unwrap_or(0))
+                        .is_some() =>
+                    {
+                        MockReply::ok(json!({ "nodes": [{
+                            "nodeId": "ignored", "ignored": true, "backendDOMNodeId": backend,
+                        }] }))
+                    }
+                    None => MockReply::err(-32000, "No node with given id"),
+                }
+            }
             "DOMSnapshot.captureSnapshot" if is_tab => {
                 let mut snapshot = if st.semantic_large_page {
                     let mut backends = vec![999, 2000, 2003, 2010, 2011];
@@ -730,12 +974,28 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     let (x, y) = ((backend * 10) as f64, (backend * 10) as f64);
                     MockReply::ok(json!({
                         "model": {
-                            "content": [x, y, x + 20.0, y, x + 20.0, y + 10.0, x, y + 10.0]
+                            "content": [x, y, x + 20.0, y, x + 20.0, y + 10.0, x, y + 10.0],
+                            "border": [x - 1.0, y - 1.0, x + 21.0, y - 1.0, x + 21.0, y + 11.0, x - 1.0, y + 11.0]
                         }
                     }))
                 } else {
                     MockReply::err(-32000, "No node with given id")
                 }
+            }
+            "Input.dispatchKeyEvent"
+                if call.params["type"] == "keyDown" && {
+                    st.key_downs += 1;
+                    st.key_down_opens_dialog_at == Some(st.key_downs - 1)
+                } =>
+            {
+                st.dialog_open = true;
+                MockReply::ok(json!({}))
+                    .with_events(vec![MockEvent {
+                        method: "Page.javascriptDialogOpening".into(),
+                        session_id: st.page_session.clone(),
+                        params: json!({"type": "alert", "message": "private dialog text"}),
+                    }])
+                    .unanswered()
             }
             "Input.dispatchKeyEvent" => {
                 let event_type = call.params["type"].as_str().unwrap_or_default();
@@ -758,7 +1018,29 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     MockReply::ok(json!({}))
                 }
             }
+            "Input.insertText" if std::mem::take(&mut st.type_opens_dialog_late) => {
+                st.dialog_open = true;
+                if let Some(value) = st.field_value.as_mut() {
+                    value.push_str(call.params["text"].as_str().unwrap_or_default());
+                }
+                MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Page.javascriptDialogOpening".into(),
+                    session_id: st.page_session.clone(),
+                    params: json!({"type": "alert", "message": "private dialog text"}),
+                }])
+            }
+            "Input.insertText" if std::mem::take(&mut st.type_opens_dialog) => {
+                st.dialog_open = true;
+                MockReply::ok(json!({}))
+                    .with_events(vec![MockEvent {
+                        method: "Page.javascriptDialogOpening".into(),
+                        session_id: st.page_session.clone(),
+                        params: json!({"type": "confirm", "message": "private dialog text"}),
+                    }])
+                    .unanswered()
+            }
             "Input.insertText" => {
+                st.pending_mutations += 1;
                 let digits_only = st.field_digits_only;
                 if let Some(value) = st.field_value.as_mut() {
                     value.extend(
@@ -789,8 +1071,67 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             "DOM.resolveNode" => MockReply::ok(json!({
                 "object": { "objectId": format!("obj-{}", call.params["backendNodeId"]) }
             })),
+            "Runtime.callFunctionOn"
+                if call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|function| function.contains("elementFromPoint")) =>
+            {
+                // The second form asks for the element on top itself.
+                if call.params["arguments"][4]["value"] == true {
+                    return MockReply::ok(
+                        json!({"result": {"type": "object", "objectId": "obj-on-top"}}),
+                    );
+                }
+                let scripted = match st.hit.as_mut() {
+                    Some((remaining, facts, _)) if *remaining > 0 => {
+                        *remaining -= 1;
+                        Some(facts.clone())
+                    }
+                    _ => None,
+                };
+                MockReply::ok(
+                    json!({"result": {"value": scripted.unwrap_or_else(|| json!({
+                        "connected": true, "hit": true, "inside_target": true,
+                        "contains_target": false, "label_of_target": false, "own_indicator": false,
+                    }))}}),
+                )
+            }
+            "Runtime.callFunctionOn"
+                if st.readback_opens_dialog.is_some()
+                    && st
+                        .calls
+                        .iter()
+                        .any(|(_, method, _)| method == "Input.insertText")
+                    && call.params["functionDeclaration"]
+                        .as_str()
+                        .is_some_and(|function| function.contains("selectionStart"))
+                    && {
+                        st.readbacks += 1;
+                        st.readback_opens_dialog.map(|(at, _)| at) == Some(st.readbacks - 1)
+                    } =>
+            {
+                st.dialog_open = true;
+                let reply = match st.readback_opens_dialog.unwrap().1 {
+                    "unanswered" => MockReply::ok(json!({})).unanswered(),
+                    "error" => MockReply::err(-32000, "fixture read failure"),
+                    read => MockReply::ok(json!({
+                        "result": { "value": {
+                            "value": st.field_value.clone(), "start": null, "end": null,
+                            "field": true, "password": false,
+                            "connected": read != "detached",
+                        } }
+                    })),
+                };
+                reply.with_events(vec![MockEvent {
+                    method: "Page.javascriptDialogOpening".into(),
+                    session_id: st.page_session.clone(),
+                    params: json!({"type": "alert", "message": "private dialog text"}),
+                }])
+            }
             "Runtime.callFunctionOn" => {
-                let function = call.params["functionDeclaration"].as_str().unwrap_or_default();
+                let function = call.params["functionDeclaration"]
+                    .as_str()
+                    .unwrap_or_default();
                 let digits_only = st.field_digits_only;
                 let typed = st
                     .calls
@@ -1317,7 +1658,12 @@ async fn an_existing_profile_attach_changes_its_claim_only_under_the_browser_gat
     );
     drop(gate);
     let prepared = prepare.await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     crate::session::fire_session_end(TRANSPORT);
 }
 
@@ -1335,7 +1681,12 @@ async fn a_cancelled_reprepare_never_leaves_a_claim_without_a_grant() {
         "strategy": { "kind": "existing_profile" }
     });
     let prepared = tool.invoke(request.clone()).await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let first = f
         .engine
         .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
@@ -1401,7 +1752,12 @@ async fn a_revocation_cancelled_on_a_busy_pool_still_releases_the_claim() {
             "strategy": { "kind": "existing_profile" }
         }))
         .await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let generation = f
         .engine
         .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
@@ -1442,7 +1798,10 @@ async fn a_revocation_cancelled_on_a_busy_pool_still_releases_the_claim() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert!(released, "generation {generation} kept the socket after its grant was revoked");
+    assert!(
+        released,
+        "generation {generation} kept the socket after its grant was revoked"
+    );
 }
 
 #[tokio::test]
@@ -1459,7 +1818,12 @@ async fn a_session_ended_from_a_thread_without_a_runtime_releases_its_claim() {
             "strategy": { "kind": "existing_profile" }
         }))
         .await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let generation = f
         .engine
         .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
@@ -1480,7 +1844,10 @@ async fn a_session_ended_from_a_thread_without_a_runtime_releases_its_claim() {
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
     }
-    assert!(released, "generation {generation} kept the socket after its session ended");
+    assert!(
+        released,
+        "generation {generation} kept the socket after its session ended"
+    );
 }
 
 /// Forwards WebSocket connections to the mock endpoint after a delay, so a
@@ -1560,9 +1927,12 @@ async fn a_prepare_cancelled_mid_handshake_leaves_a_grant_the_next_bind_can_use(
     prepare_args["strategy"] = json!({ "kind": "existing_profile" });
     let tool = BrowserPrepareTool::new(engine.clone());
     assert!(
-        tokio::time::timeout(std::time::Duration::from_millis(150), tool.invoke(prepare_args))
-            .await
-            .is_err(),
+        tokio::time::timeout(
+            std::time::Duration::from_millis(150),
+            tool.invoke(prepare_args)
+        )
+        .await
+        .is_err(),
         "the prepare must still be in its handshake"
     );
     assert!(
@@ -1629,14 +1999,28 @@ async fn an_explicitly_approved_grant_stays_tied_to_its_window() {
     };
     let mut prepare = args(7);
     prepare["strategy"] = json!({ "kind": "existing_profile" });
-    let prepared = BrowserPrepareTool::new(f.engine.clone()).invoke(prepare).await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
-    let first = GetBrowserStateTool::new(f.engine.clone()).invoke(args(7)).await;
+    let prepared = BrowserPrepareTool::new(f.engine.clone())
+        .invoke(prepare)
+        .await;
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
+    let first = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(args(7))
+        .await;
     assert_eq!(structured(&first)["status"], "ok", "{}", structured(&first));
-    let second = GetBrowserStateTool::new(f.engine.clone()).invoke(args(8)).await;
+    let second = GetBrowserStateTool::new(f.engine.clone())
+        .invoke(args(8))
+        .await;
     let second = structured(&second).clone();
     assert_eq!(second["status"], "refused", "{second}");
-    assert_eq!(second["refusal"]["code"], "browser_binding_stale", "{second}");
+    assert_eq!(
+        second["refusal"]["code"], "browser_binding_stale",
+        "{second}"
+    );
     crate::session::fire_session_end(TRANSPORT);
 }
 
@@ -1672,7 +2056,10 @@ async fn connected_extension_is_consent_for_the_extension_route_only() {
                     "strategy": { "kind": "existing_profile" }
                 }))
                 .await;
-            assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+            assert!(
+                !setup_invoked.load(Ordering::SeqCst),
+                "never the setup page"
+            );
             structured(&result).clone()
         }
     };
@@ -1714,7 +2101,12 @@ async fn connected_extension_is_consent_for_the_extension_route_only() {
             "_transport_session_id": "transport-extension-slow"
         }))
         .await;
-    assert_eq!(structured(&rebound)["status"], "ok", "{}", structured(&rebound));
+    assert_eq!(
+        structured(&rebound)["status"],
+        "ok",
+        "{}",
+        structured(&rebound)
+    );
     assert!(proxy.connections() >= 2, "the bind must have reconnected");
     crate::session::fire_session_end("transport-extension-slow");
 
@@ -1762,17 +2154,19 @@ async fn a_connected_extension_lets_the_bind_attach_without_a_prepare_step() {
     assert_eq!(bound["status"], "ok", "{bound}");
     assert_eq!(bound["endpoint_access_class"], "existing_profile_approved");
     assert_eq!(bound["endpoint_transport"], "extension_relay");
-    assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+    assert!(
+        !setup_invoked.load(Ordering::SeqCst),
+        "never the setup page"
+    );
     crate::session::fire_session_end(TRANSPORT);
 
     // The extension appears connected but its route is gone by the time the
     // bind attaches: refused, never a fallback to another endpoint.
     let platform = standard_mode_platform(server.ws_url(), EndpointTransport::ExtensionRelay);
-    platform
-        .route_script
-        .lock()
-        .unwrap()
-        .extend([Some(EndpointTransport::ExtensionRelay), Some(EndpointTransport::LegacyJsonVersion)]);
+    platform.route_script.lock().unwrap().extend([
+        Some(EndpointTransport::ExtensionRelay),
+        Some(EndpointTransport::LegacyJsonVersion),
+    ]);
     let setup_invoked = platform.setup_invoked.clone();
     let refused = GetBrowserStateTool::new(BrowserEngine::new(Arc::new(platform)))
         .invoke(json!({
@@ -1785,7 +2179,10 @@ async fn a_connected_extension_lets_the_bind_attach_without_a_prepare_step() {
     let refused = structured(&refused).clone();
     assert_eq!(refused["status"], "refused", "{refused}");
     assert_eq!(refused["refusal"]["code"], "browser_consent_required");
-    assert!(!setup_invoked.load(Ordering::SeqCst), "never the setup page");
+    assert!(
+        !setup_invoked.load(Ordering::SeqCst),
+        "never the setup page"
+    );
 }
 
 #[tokio::test]
@@ -1799,7 +2196,10 @@ async fn a_shared_existing_profile_socket_outlives_one_of_its_sessions() {
     let second = pool.claim_existing(&url, 2, || true).await.unwrap();
     assert!(Arc::ptr_eq(&first, &second));
     first.register_dialog_session("sess-b", "target-b");
-    assert!(pool.get_existing(&url, 1).await.is_ok(), "an earlier claim stays usable");
+    assert!(
+        pool.get_existing(&url, 1).await.is_ok(),
+        "an earlier claim stays usable"
+    );
 
     // Ending the first session keeps the socket, and the second session's
     // dialog routing on it, alive.
@@ -1825,20 +2225,31 @@ async fn relay_tab_attach_carries_the_session_cursor_color() {
     )));
     let args = |extra: Value| {
         let mut args = json!({ "session": SESSION, "_transport_session_id": TRANSPORT });
-        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         args
     };
     let prepared = BrowserPrepareTool::new(engine.clone())
-        .invoke(args(json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } })))
+        .invoke(args(
+            json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } }),
+        ))
         .await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let bound = GetBrowserStateTool::new(engine.clone())
         .invoke(args(json!({ "pid": 1, "window_id": 7 })))
         .await;
     let bound = structured(&bound).clone();
     let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
     GetBrowserStateTool::new(engine)
-        .invoke(args(json!({ "target_id": bound["target_id"], "tab_id": tab })))
+        .invoke(args(
+            json!({ "target_id": bound["target_id"], "tab_id": tab }),
+        ))
         .await;
     let attaches: Vec<Value> = state
         .lock()
@@ -1850,7 +2261,12 @@ async fn relay_tab_attach_carries_the_session_cursor_color() {
         .collect();
     assert!(!attaches.is_empty());
     let color = cua_driver_contract::cursor::session_fill_hex(SESSION);
-    assert!(attaches.iter().all(|params| params["cuaSessionColor"] == json!(color)), "{attaches:?}");
+    assert!(
+        attaches
+            .iter()
+            .all(|params| params["cuaSessionColor"] == json!(color)),
+        "{attaches:?}"
+    );
     crate::session::fire_session_end(TRANSPORT);
 
     // A real DevTools endpoint never receives the relay-only field.
@@ -1859,29 +2275,47 @@ async fn relay_tab_attach_carries_the_session_cursor_color() {
     snapshot(&f, &target_id, &tab_id).await;
     let attaches = recorded_calls(&f, "Target.attachToTarget");
     assert!(!attaches.is_empty());
-    assert!(attaches.iter().all(|(_, params)| params.get("cuaSessionColor").is_none()));
+    assert!(attaches
+        .iter()
+        .all(|(_, params)| params.get("cuaSessionColor").is_none()));
 }
 
 /// Prepare and bind one Cua session on the relay fixture and return the
 /// relay holder its tab attaches named.
-async fn relay_bind(engine: &Arc<BrowserEngine>, state: &SharedState, session: &str, transport: &str) -> String {
+async fn relay_bind(
+    engine: &Arc<BrowserEngine>,
+    state: &SharedState,
+    session: &str,
+    transport: &str,
+) -> String {
     let attaches_before = relay_calls(state, "Target.attachToTarget").len();
     let args = |extra: Value| {
         let mut args = json!({ "session": session, "_transport_session_id": transport });
-        args.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+        args.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
         args
     };
     let prepared = BrowserPrepareTool::new(engine.clone())
-        .invoke(args(json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } })))
+        .invoke(args(
+            json!({ "pid": 1, "window_id": 7, "strategy": { "kind": "existing_profile" } }),
+        ))
         .await;
-    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    assert_eq!(
+        structured(&prepared)["status"],
+        "ok",
+        "{}",
+        structured(&prepared)
+    );
     let bound = GetBrowserStateTool::new(engine.clone())
         .invoke(args(json!({ "pid": 1, "window_id": 7 })))
         .await;
     let bound = structured(&bound).clone();
     let tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
     GetBrowserStateTool::new(engine.clone())
-        .invoke(args(json!({ "target_id": bound["target_id"], "tab_id": tab })))
+        .invoke(args(
+            json!({ "target_id": bound["target_id"], "tab_id": tab }),
+        ))
         .await;
     let holders: Vec<String> = relay_calls(state, "Target.attachToTarget")
         .into_iter()
@@ -1911,7 +2345,10 @@ async fn relay_releases_eventually(state: &SharedState, holders: &[&str]) -> Vec
             .into_iter()
             .filter_map(|params| params["cuaSession"].as_str().map(str::to_owned))
             .collect();
-        if holders.iter().all(|holder| released.iter().any(|r| r == holder)) {
+        if holders
+            .iter()
+            .all(|holder| released.iter().any(|r| r == holder))
+        {
             return released;
         }
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
@@ -1942,7 +2379,10 @@ async fn a_late_release_from_an_ended_episode_never_names_the_restarted_one() {
     // End the session, start it again under the same name, and bind.
     crate::session::fire_session_end(TRANSPORT);
     let second = relay_bind(&engine, &state, EPISODE_SESSION, TRANSPORT).await;
-    assert_ne!(first, second, "each episode holds its tabs under its own name");
+    assert_ne!(
+        first, second,
+        "each episode holds its tabs under its own name"
+    );
 
     // The ended episode's release lands only now.
     super::engine::release_grant_claim(&engine.pool, &ended).await;
@@ -2243,25 +2683,93 @@ async fn cancelled_prepare_aborts_the_exact_pending_setup() {
     stalled_server.abort();
 }
 
+/// A `dom_refs_v1` snapshot (the flat ref list).
 async fn snapshot(f: &Fixture, target_id: &str, tab_id: &str) -> Value {
     let tool = GetBrowserStateTool::new(f.engine.clone());
     let result = tool
-        .invoke(json!({ "target_id": target_id, "tab_id": tab_id, "session": SESSION }))
+        .invoke(
+            json!({ "target_id": target_id, "tab_id": tab_id, "session": SESSION,
+            "snapshot_format": "dom_refs_v1" }),
+        )
         .await;
     structured(&result).clone()
 }
 
+/// One outline line read back into its parts: `- role "name" [ref actions]
+/// = "value" -> "url" (states)`.
+fn parse_outline_line(line: &str) -> Value {
+    fn quoted(text: &str) -> Option<(String, &str)> {
+        let mut stream = serde_json::Deserializer::from_str(text).into_iter::<String>();
+        let value = stream.next()?.ok()?;
+        Some((value, &text[stream.byte_offset()..]))
+    }
+    let rest = line
+        .trim_start()
+        .strip_prefix("- ")
+        .expect("an outline line");
+    let (role, mut rest) = rest.split_once(' ').expect("a role and a bracket");
+    let mut name = Value::Null;
+    if rest.starts_with('"') {
+        let (text, after) = quoted(rest).expect("a quoted name");
+        name = json!(text);
+        rest = after.trim_start();
+    }
+    let (bracket, mut rest) = rest
+        .strip_prefix('[')
+        .and_then(|rest| rest.split_once(']'))
+        .expect("a ref bracket");
+    let (reference, actions) = bracket.split_once(' ').unwrap_or((bracket, ""));
+    let actions: Vec<&str> = actions
+        .split(',')
+        .filter(|action| !action.is_empty())
+        .collect();
+    let (mut value, mut url) = (Value::Null, Value::Null);
+    if let Some(after) = rest.strip_prefix(" = ") {
+        let (text, after) = quoted(after).expect("a quoted value");
+        value = json!(text);
+        rest = after;
+    }
+    if let Some(after) = rest.strip_prefix(" -> ") {
+        let (text, after) = quoted(after).expect("a quoted url");
+        url = json!(text);
+        rest = after;
+    }
+    let states: Vec<&str> = rest
+        .trim()
+        .trim_start_matches('(')
+        .trim_end_matches(')')
+        .split(", ")
+        .filter(|state| !state.is_empty())
+        .collect();
+    let frame = ["iframe", "oopif"]
+        .into_iter()
+        .find(|kind| states.contains(kind))
+        .unwrap_or("main");
+    json!({
+        "ref": reference, "role": role, "name": name, "value": value, "url": url,
+        "actions": actions, "states": states, "frame": frame, "line": line,
+    })
+}
+
+/// A semantic snapshot's outline as entries: `refs` for lines that declare
+/// an action, `content_refs` for the rest. The result itself has only the
+/// outline; these two keys exist for the assertions below.
+fn with_outline_entries(mut snapshot: Value) -> Value {
+    let Some(outline) = snapshot["outline"].as_str().map(str::to_owned) else {
+        return snapshot;
+    };
+    assert!(snapshot.get("refs").is_none() && snapshot.get("content_refs").is_none());
+    let (actions, content): (Vec<Value>, Vec<Value>) = outline
+        .lines()
+        .map(parse_outline_line)
+        .partition(|entry| !entry["actions"].as_array().unwrap().is_empty());
+    snapshot["refs"] = json!(actions);
+    snapshot["content_refs"] = json!(content);
+    snapshot
+}
+
 async fn semantic_snapshot(f: &Fixture, target_id: &str, tab_id: &str) -> Value {
-    let tool = GetBrowserStateTool::new(f.engine.clone());
-    let result = tool
-        .invoke(json!({
-            "target_id": target_id,
-            "tab_id": tab_id,
-            "session": SESSION,
-            "snapshot_format": "semantic_v2"
-        }))
-        .await;
-    structured(&result).clone()
+    semantic_snapshot_with(f, target_id, tab_id, json!({})).await
 }
 
 async fn semantic_snapshot_with(f: &Fixture, target_id: &str, tab_id: &str, extra: Value) -> Value {
@@ -2269,7 +2777,6 @@ async fn semantic_snapshot_with(f: &Fixture, target_id: &str, tab_id: &str, extr
         "target_id": target_id,
         "tab_id": tab_id,
         "session": SESSION,
-        "snapshot_format": "semantic_v2"
     });
     args.as_object_mut()
         .unwrap()
@@ -2277,7 +2784,32 @@ async fn semantic_snapshot_with(f: &Fixture, target_id: &str, tab_id: &str, extr
     let result = GetBrowserStateTool::new(f.engine.clone())
         .invoke(args)
         .await;
-    structured(&result).clone()
+    with_outline_entries(structured(&result).clone())
+}
+
+/// Follow continuations from `page` until one lists an action named `name`.
+async fn continue_to(
+    f: &Fixture,
+    target_id: &str,
+    tab_id: &str,
+    mut page: Value,
+    name: &str,
+) -> Value {
+    for _ in 0..64 {
+        if page["refs"]
+            .as_array()
+            .is_some_and(|refs| refs.iter().any(|entry| entry["name"] == name))
+        {
+            return page;
+        }
+        let token = page["snapshot"]["continuation"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name:?} was never reached: {page}"))
+            .to_owned();
+        page = semantic_snapshot_with(f, target_id, tab_id, json!({"continuation": token})).await;
+        assert_eq!(page["status"], "ok", "{page}");
+    }
+    panic!("{name:?} was not reached within 64 pages")
 }
 
 /// The `ref` string of the first snapshot entry in the given frame kind
@@ -2690,19 +3222,140 @@ async fn semantic_continuation_is_opaque_single_use_and_reaches_offscreen_conten
     let continued = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
     assert_eq!(continued["status"], "ok", "{continued}");
     assert_eq!(continued["snapshot"]["scope"], "continuation");
-    assert_eq!(continued["page"]["title"], "Current fixture title", "{continued}");
-    assert!(
-        continued["refs"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|entry| { entry["name"] == "Archive item 304" }),
-        "last offscreen action was not reachable: {continued}"
+    assert_eq!(
+        continued["page"]["title"], "Current fixture title",
+        "{continued}"
     );
+    // Each page is cut to the size budget; the last action is some pages on.
+    let last = continue_to(&f, &target, &tab, continued, "Archive item 304").await;
+    assert!(last["snapshot"]["continuation"].is_null(), "{last}");
+    assert_eq!(last["snapshot"]["complete"], true, "{last}");
 
     let reused = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
     assert_eq!(reused["status"], "refused", "{reused}");
     assert_eq!(reused["refusal"]["code"], "browser_ref_stale");
+}
+
+/// The `tools/call` response line a client receives for `result`.
+fn wire_chars(result: &ToolResult) -> usize {
+    json!({"jsonrpc": "2.0", "id": 123_456, "result": result})
+        .to_string()
+        .chars()
+        .count()
+}
+
+#[tokio::test]
+async fn a_semantic_snapshot_is_the_default_and_fits_its_size_budget() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        // A long address and title spend the budget too.
+        st.main_url = format!("https://fixture.test/inbox/{}", "segment/".repeat(40));
+        set_page_title(st, Some(&"A long page title ".repeat(12)));
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let tool = GetBrowserStateTool::new(f.engine.clone());
+    let default = tool
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION}))
+        .await;
+    let snapshot = structured(&default);
+    assert_eq!(snapshot["snapshot"]["format"], "semantic_v2", "{snapshot}");
+    assert!(
+        snapshot.get("refs").is_none(),
+        "refs are inline in the outline"
+    );
+    assert!(
+        wire_chars(&default) <= 6_000,
+        "{} chars",
+        wire_chars(&default)
+    );
+    assert!(
+        snapshot["snapshot"]["continuation"].is_string(),
+        "{snapshot}"
+    );
+    assert!(snapshot["snapshot"]["omitted"]["budget"].as_u64() > Some(0));
+
+    let larger = tool
+        .invoke(
+            json!({"target_id": target, "tab_id": tab, "session": SESSION, "max_chars": 20_000}),
+        )
+        .await;
+    assert!(wire_chars(&larger) <= 20_000 && wire_chars(&larger) > 6_000);
+    assert!(
+        structured(&larger)["snapshot"]["selected_nodes"].as_u64()
+            > snapshot["snapshot"]["selected_nodes"].as_u64()
+    );
+
+    for bad in [json!(100), json!(1_000_000), json!("big")] {
+        let refused = tool
+            .invoke(
+                json!({"target_id": target, "tab_id": tab, "session": SESSION, "max_chars": bad}),
+            )
+            .await;
+        assert_eq!(refused.is_error, Some(true));
+    }
+    let legacy = tool
+        .invoke(
+            json!({"target_id": target, "tab_id": tab, "session": SESSION,
+            "snapshot_format": "dom_refs_v1"}),
+        )
+        .await;
+    assert!(
+        structured(&legacy)["refs"].is_array(),
+        "dom_refs_v1 stays available by name"
+    );
+}
+
+#[tokio::test]
+async fn include_refs_lists_the_outline_refs_for_programs_within_the_same_budget() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let tool = GetBrowserStateTool::new(f.engine.clone());
+    let plain = tool
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION}))
+        .await;
+    let listed = tool
+        .invoke(
+            json!({"target_id": target, "tab_id": tab, "session": SESSION, "include_refs": true}),
+        )
+        .await;
+    assert!(
+        wire_chars(&listed) <= 6_000,
+        "{} chars",
+        wire_chars(&listed)
+    );
+    let listed = structured(&listed).clone();
+    assert!(
+        listed["snapshot"]["selected_nodes"].as_u64()
+            < structured(&plain)["snapshot"]["selected_nodes"].as_u64(),
+        "the list spends part of the budget"
+    );
+    // The lists say what the outline says, line for line.
+    let outline = listed["outline"].as_str().unwrap();
+    let from_outline: Vec<Value> = outline.lines().map(parse_outline_line).collect();
+    let from_lists: Vec<&Value> = listed["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(listed["content_refs"].as_array().unwrap())
+        .collect();
+    assert_eq!(from_lists.len(), from_outline.len());
+    for entry in from_lists {
+        let line = from_outline
+            .iter()
+            .find(|line| line["ref"] == entry["ref"])
+            .unwrap_or_else(|| panic!("{entry} is not in the outline"));
+        for field in ["role", "name", "value"] {
+            assert_eq!(line[field], entry[field], "{entry}");
+        }
+    }
+    let reply = listed["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry["name"] == "Reply")
+        .expect("Reply action");
+    assert_eq!(reply["actions"][0], "click", "{reply}");
 }
 
 #[tokio::test]
@@ -2752,13 +3405,16 @@ async fn semantic_query_and_content_scope_are_read_only_and_precise() {
     let natural =
         semantic_snapshot_with(&f, &target, &tab, json!({"query": "reply archive 304"})).await;
     assert_eq!(natural["snapshot"]["scope"], "query", "{natural}");
-    assert_eq!(natural["refs"][0]["name"], "Archive item 304", "{natural}");
-    assert!(
+    // Ranked by the query: the best match and the visible Reply make the
+    // first page, ahead of the archive items that only share a word.
+    let named = |name: &str| {
         natural["refs"]
             .as_array()
-            .is_some_and(|refs| refs.iter().any(|entry| entry["name"] == "Reply")),
-        "{natural}"
-    );
+            .is_some_and(|refs| refs.iter().any(|entry| entry["name"] == name))
+    };
+    assert!(named("Archive item 304") && named("Reply"), "{natural}");
+    assert!(!named("Archive item 303"), "{natural}");
+    assert!(natural["snapshot"]["continuation"].is_string(), "{natural}");
 
     let fresh = semantic_snapshot(&f, &target, &tab).await;
     let heading_ref = fresh["content_refs"]
@@ -2908,6 +3564,220 @@ async fn semantic_refs_enforce_declared_action_kinds_before_delivery() {
     );
     assert!(recorded_calls(&f, "Input.insertText").is_empty());
     assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+}
+
+// ── Stable semantic refs (the ownership table in observation.rs) ───────────
+
+fn named_ref(snapshot: &Value, name: &str) -> String {
+    snapshot["refs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .chain(snapshot["content_refs"].as_array().unwrap())
+        .find(|entry| entry["name"] == name)
+        .and_then(|entry| entry["ref"].as_str())
+        .unwrap_or_else(|| panic!("no line named {name:?}: {snapshot}"))
+        .to_owned()
+}
+
+async fn dom_click(f: &Fixture, target: &str, tab: &str, reference: &str) -> Value {
+    let result = BrowserClickTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "session": SESSION,
+            "ref": reference, "input_route": "dom_event"
+        }))
+        .await;
+    structured(&result).clone()
+}
+
+#[tokio::test]
+async fn a_semantic_ref_keeps_its_name_across_snapshots_of_one_document() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_eq!(
+        second["snapshot"]["id"], first["snapshot"]["id"],
+        "{second}"
+    );
+    assert_eq!(named_ref(&second, "Reply"), reply);
+    assert_eq!(second["outline"], first["outline"]);
+
+    // The ref read in the first snapshot still acts after the second.
+    let clicked = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(clicked["status"], "ok", "{clicked}");
+    // It was re-read in the live page first.
+    let reread = recorded_calls(&f, "Accessibility.getPartialAXTree");
+    assert_eq!(reread.len(), 1);
+    assert_eq!(reread[0].1["backendNodeId"], 2011);
+}
+
+#[tokio::test]
+async fn a_ref_whose_node_became_another_element_is_stale_and_never_renamed() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    // The page reuses the button's node for something else.
+    f.state
+        .lock()
+        .unwrap()
+        .renamed
+        .insert(2011, "Delete thread".into());
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+    assert!(
+        recorded_calls(&f, "Runtime.callFunctionOn").is_empty(),
+        "nothing was clicked"
+    );
+
+    // The next snapshot gives the new element a new ref; the old one stays dead.
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_eq!(second["snapshot"]["id"], first["snapshot"]["id"]);
+    let delete = named_ref(&second, "Delete thread");
+    assert_ne!(delete, reply);
+    assert_eq!(
+        dom_click(&f, &target, &tab, &reply).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
+    assert_eq!(dom_click(&f, &target, &tab, &delete).await["status"], "ok");
+    // Its neighbours kept their refs.
+    assert_eq!(
+        named_ref(&second, "Reply body"),
+        named_ref(&first, "Reply body")
+    );
+}
+
+#[tokio::test]
+async fn a_ref_whose_node_left_the_page_is_stale_at_use_and_after_the_next_snapshot() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    f.state.lock().unwrap().removed.insert(2011);
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert!(
+        !second["outline"].as_str().unwrap().contains("\"Reply\""),
+        "{second}"
+    );
+    // Back in the page, the node is a new entity to this session's refs.
+    f.state.lock().unwrap().removed.clear();
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+    let third = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(named_ref(&third, "Reply"), reply);
+}
+
+#[tokio::test]
+async fn a_new_document_retires_every_semantic_ref() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    f.state.lock().unwrap().main_loader = "L_MAIN_2".into();
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(
+        second["snapshot"]["id"], first["snapshot"]["id"],
+        "{second}"
+    );
+    assert_ne!(
+        named_ref(&second, "Reply"),
+        reply,
+        "same node id, another document"
+    );
+    assert_eq!(
+        dom_click(&f, &target, &tab, &reply).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+}
+
+#[tokio::test]
+async fn a_debugger_detach_makes_every_semantic_ref_stale() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    // Detached and attached again: the node may well be the same, but the
+    // attachment that proved it is gone.
+    f.state.lock().unwrap().detached = true;
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+    assert!(
+        refused["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("detached"),
+        "{refused}"
+    );
+    assert!(recorded_calls(&f, "Accessibility.getPartialAXTree").is_empty());
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn").is_empty());
+
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(
+        second["snapshot"]["id"], first["snapshot"]["id"],
+        "{second}"
+    );
+    assert_eq!(
+        dom_click(&f, &target, &tab, &reply).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
+    assert_eq!(
+        dom_click(&f, &target, &tab, &named_ref(&second, "Reply")).await["status"],
+        "ok"
+    );
+}
+
+#[tokio::test]
+async fn a_dom_refs_snapshot_replaces_the_semantic_refs_and_the_other_way_round() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let semantic = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&semantic, "Reply");
+
+    let legacy = snapshot(&f, &target, &tab).await;
+    assert_eq!(legacy["status"], "ok", "{legacy}");
+    assert_eq!(
+        dom_click(&f, &target, &tab, &reply).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
+
+    let legacy_ref = legacy["refs"][0]["ref"].as_str().unwrap().to_owned();
+    let again = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(again["snapshot"]["id"], semantic["snapshot"]["id"]);
+    assert_eq!(
+        dom_click(&f, &target, &tab, &legacy_ref).await["refusal"]["code"],
+        "browser_ref_stale"
+    );
+}
+
+#[tokio::test]
+async fn a_query_read_and_a_continuation_use_the_same_refs() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+    let queried = semantic_snapshot_with(&f, &target, &tab, json!({"query": "Reply"})).await;
+    assert_eq!(queried["snapshot"]["id"], first["snapshot"]["id"]);
+    assert_eq!(named_ref(&queried, "Reply"), reply);
+
+    // A node the first page did not reach gets its ref from a query, and
+    // keeps it when a later default snapshot pages to it.
+    let far = semantic_snapshot_with(&f, &target, &tab, json!({"query": "Archive item 304"})).await;
+    let far_ref = named_ref(&far, "Archive item 304");
+    let fresh = semantic_snapshot(&f, &target, &tab).await;
+    let paged = continue_to(&f, &target, &tab, fresh, "Archive item 304").await;
+    assert_eq!(named_ref(&paged, "Archive item 304"), far_ref);
+    assert_eq!(dom_click(&f, &target, &tab, &far_ref).await["status"], "ok");
 }
 
 #[tokio::test]
@@ -3465,13 +4335,15 @@ async fn set_value_uses_the_native_setter_and_verifies() {
     assert_eq!(s["value"], "new");
     assert_eq!(s["replaced_chars"], 3);
     assert!(recorded_calls(&f, "Input.insertText").is_empty());
-    assert!(recorded_calls(&f, "Runtime.callFunctionOn").iter().any(|(_, params)| {
-        params["arguments"][0]["value"] == "new"
-            && params["functionDeclaration"]
-                .as_str()
-                .unwrap()
-                .contains("dispatchEvent(new view.Event('input'")
-    }));
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn")
+        .iter()
+        .any(|(_, params)| {
+            params["arguments"][0]["value"] == "new"
+                && params["functionDeclaration"]
+                    .as_str()
+                    .unwrap()
+                    .contains("dispatchEvent(new view.Event('input'")
+        }));
 }
 
 #[tokio::test]
@@ -3599,6 +4471,7 @@ async fn semantic_link_urls_reach_query_and_continuation_outputs() {
     assert!(reply["value"].is_null());
     let token = first["snapshot"]["continuation"].as_str().unwrap();
     let continued = semantic_snapshot_with(&f, &target, &tab, json!({"continuation":token})).await;
+    let continued = continue_to(&f, &target, &tab, continued, "Archive item 304").await;
     let archive = continued["refs"]
         .as_array()
         .unwrap()
@@ -3614,4 +4487,1304 @@ async fn semantic_link_urls_reach_query_and_continuation_outputs() {
         .find(|r| r["name"] == "Reply")
         .unwrap();
     assert_eq!(reply["url"], "https://example.test/book?slot=1#court");
+}
+
+// ── Page changes in action results (through the real registry) ──────────────
+//
+// The tools run inside a ToolRegistry here, as they do in the daemon: the
+// read after an action is a get_browser_state call the registry dispatches.
+
+fn unrestricted() -> Arc<crate::session_authorization::EffectiveAuthorizationContext> {
+    use crate::authorization::PermissionMode;
+    use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+    SessionAuthorizationRegistry::with_ceiling(
+        SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Unrestricted],
+            true,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    )
+    .compatibility_context(PermissionMode::Unrestricted, None)
+    .unwrap()
+}
+
+/// A registry with the browser tools of one fixture, bound to a tab, and a
+/// session label of its own.
+struct Agent {
+    registry: Arc<crate::tool::ToolRegistry>,
+    context: Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+    session: String,
+    target: String,
+    tab: String,
+}
+
+impl Agent {
+    async fn bound(f: &Fixture, session: &str) -> Self {
+        Self::bound_as(f, session, unrestricted()).await
+    }
+
+    async fn bound_as(
+        f: &Fixture,
+        session: &str,
+        context: Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+    ) -> Self {
+        let mut registry = crate::tool::ToolRegistry::new();
+        super::tools::register_browser_tools(&f.engine, &mut registry);
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        let mut agent = Self {
+            registry,
+            context,
+            session: session.to_owned(),
+            target: String::new(),
+            tab: String::new(),
+        };
+        let bound = agent
+            .call("get_browser_state", json!({ "pid": 1, "window_id": 7 }))
+            .await;
+        assert_eq!(bound["status"], "ok", "{bound}");
+        agent.target = bound["target_id"].as_str().unwrap().to_owned();
+        agent.tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
+        agent
+    }
+
+    /// Call a tool on the bound tab; returns its structured content.
+    async fn call(&self, name: &str, mut args: Value) -> Value {
+        let object = args.as_object_mut().unwrap();
+        object.insert("session".into(), json!(self.session));
+        if !self.target.is_empty() && !object.contains_key("pid") {
+            object.insert("target_id".into(), json!(self.target));
+            object.insert("tab_id".into(), json!(self.tab));
+        }
+        let result = self
+            .registry
+            .invoke_with_context(name, args, self.context.clone())
+            .await;
+        result.structured_content.unwrap_or_else(|| {
+            panic!(
+                "{name} returned no structured content: {:?}",
+                result.content
+            )
+        })
+    }
+
+    async fn snapshot(&self) -> Value {
+        with_outline_entries(self.call("get_browser_state", json!({})).await)
+    }
+}
+
+/// Apply a diff's keyed ops to an outline, as an agent would.
+fn apply_changes(outline: &str, changes: &Value) -> String {
+    let mut lines: Vec<(String, String)> = outline
+        .lines()
+        .map(|line| {
+            (
+                parse_outline_line(line)["ref"].as_str().unwrap().to_owned(),
+                line.to_owned(),
+            )
+        })
+        .collect();
+    let ops = changes["ops"].as_array().expect("diff ops");
+    for op in ops {
+        let key = op["ref"].as_str().unwrap();
+        match op["op"].as_str().unwrap() {
+            "leave" | "move" => lines.retain(|(held, _)| held != key),
+            "change" => {
+                lines
+                    .iter_mut()
+                    .find(|(held, _)| held == key)
+                    .expect("changed line")
+                    .1 = op["line"].as_str().unwrap().to_owned()
+            }
+            _ => {}
+        }
+    }
+    for op in ops {
+        if matches!(op["op"].as_str(), Some("add" | "move")) {
+            let at = match op["after"].as_str() {
+                None => 0,
+                Some(after) => {
+                    lines
+                        .iter()
+                        .position(|(held, _)| held == after)
+                        .expect("anchor")
+                        + 1
+                }
+            };
+            lines.insert(
+                at,
+                (
+                    op["ref"].as_str().unwrap().to_owned(),
+                    op["line"].as_str().unwrap().to_owned(),
+                ),
+            );
+        }
+    }
+    lines
+        .into_iter()
+        .map(|(_, line)| line)
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// Two outlines of one page state agree line for line up to where the size
+/// budget cut the shorter one. (A diffed read stops where its baseline was
+/// cut; a plain read is cut afresh.)
+fn assert_same_page(applied: &str, fresh: &str) {
+    let (shorter, longer) = if applied.len() <= fresh.len() {
+        (applied, fresh)
+    } else {
+        (fresh, applied)
+    };
+    assert!(
+        longer.starts_with(shorter) && shorter.lines().count() > 3,
+        "the diff does not lead to the page as read:\n{applied}\n--- fresh:\n{fresh}"
+    );
+}
+
+#[tokio::test]
+async fn typing_returns_the_changed_line_as_a_diff_from_the_held_revision() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+    })
+    .await;
+    let agent = Agent::bound(&f, "changes-type").await;
+    let first = agent.snapshot().await;
+    let editor = named_ref(&first, "Reply body");
+
+    let typed = agent
+        .call("browser_type", json!({ "ref": editor, "text": "hello" }))
+        .await;
+    assert_eq!(typed["effect"], "confirmed", "{typed}");
+    let changes = &typed["changes"];
+    assert_eq!(changes["kind"], "diff", "{typed}");
+    assert_eq!(
+        changes["base_revision"], first["snapshot"]["revision"],
+        "{typed}"
+    );
+    assert_eq!(changes["snapshot_id"], first["snapshot"]["id"]);
+    let ops = changes["ops"].as_array().unwrap();
+    assert_eq!(ops.len(), 1, "{typed}");
+    assert_eq!(ops[0]["op"], "change");
+    assert_eq!(ops[0]["ref"], editor);
+    assert_eq!(
+        ops[0]["line"],
+        format!("- textbox \"Reply body\" [{editor} type] = \"hello\"")
+    );
+    // The whole result is small: one changed line, not a page.
+    assert!(typed.to_string().chars().count() < 1_500, "{typed}");
+
+    // Applying the diff to the outline held gives what a fresh read shows.
+    let fresh = agent.snapshot().await;
+    assert_same_page(
+        &apply_changes(first["outline"].as_str().unwrap(), changes),
+        fresh["outline"].as_str().unwrap(),
+    );
+    assert!(fresh["snapshot"]["revision"].as_u64() > changes["revision"].as_u64());
+}
+
+#[tokio::test]
+async fn a_click_reports_gone_and_new_elements_and_what_the_page_did_by_itself() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-click").await;
+    let first = agent.snapshot().await;
+    let reply = named_ref(&first, "Reply");
+
+    {
+        let mut state = f.state.lock().unwrap();
+        // Before the action, by itself, the page dropped a visible line.
+        state.removed.insert(2003);
+        // The click turns the Reply button into a Sent button.
+        state.click_renames.push((2011, "Sent".into()));
+    }
+    let clicked = agent
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
+        .await;
+    let changes = &clicked["changes"];
+    assert_eq!(changes["kind"], "diff", "{clicked}");
+    let ops = changes["ops"].as_array().unwrap();
+    let gone: Vec<&str> = ops
+        .iter()
+        .filter(|op| op["op"] == "leave" && op["gone"] == true)
+        .map(|op| op["ref"].as_str().unwrap())
+        .collect();
+    assert!(
+        gone.contains(&reply.as_str()),
+        "the old button is gone: {clicked}"
+    );
+    assert_eq!(
+        gone.len(),
+        2,
+        "and so is the line the page dropped by itself: {clicked}"
+    );
+    let added: Vec<&Value> = ops.iter().filter(|op| op["op"] == "add").collect();
+    assert_eq!(added.len(), 1, "{clicked}");
+    assert!(added[0]["line"]
+        .as_str()
+        .unwrap()
+        .contains("button \"Sent\""));
+    assert_ne!(added[0]["ref"], reply, "another element, another ref");
+
+    let fresh = agent.snapshot().await;
+    assert_same_page(
+        &apply_changes(first["outline"].as_str().unwrap(), changes),
+        fresh["outline"].as_str().unwrap(),
+    );
+    // The new ref acts; the old one is stale.
+    let sent = added[0]["ref"].as_str().unwrap();
+    let again = agent
+        .call(
+            "browser_click",
+            json!({ "ref": sent, "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(again["changes"]["kind"], "diff", "{again}");
+    assert_eq!(
+        again["changes"]["ops"],
+        json!([]),
+        "nothing changed this time"
+    );
+    let stale = agent
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(stale["error"]["code"], "browser_ref_stale", "{stale}");
+}
+
+#[tokio::test]
+async fn navigation_returns_the_new_page_as_a_full_snapshot_with_the_reason() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-navigate").await;
+    let first = agent.snapshot().await;
+    let reply = named_ref(&first, "Reply");
+
+    {
+        // The browser publishes the new document when Page.navigate lands.
+        let mut state = f.state.lock().unwrap();
+        state.main_loader = "L_MAIN_2".into();
+        state.main_url = "https://fixture.test/second".into();
+        set_page_title(&mut state, Some("Second page"));
+    }
+    let navigated = agent
+        .call(
+            "browser_navigate",
+            json!({ "url": "https://fixture.test/second" }),
+        )
+        .await;
+    assert_eq!(navigated["status"], "ok", "{navigated}");
+    let changes = &navigated["changes"];
+    assert_eq!(changes["kind"], "snapshot", "{navigated}");
+    assert_eq!(changes["reason"], "document_changed");
+    assert_eq!(changes["url"], "https://fixture.test/second");
+    assert_eq!(changes["title"], "Second page");
+    assert!(changes["outline"]
+        .as_str()
+        .unwrap()
+        .contains("button \"Reply\""));
+    assert_ne!(changes["snapshot_id"], first["snapshot"]["id"]);
+
+    let stale = agent
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(stale["error"]["code"], "browser_ref_stale", "{stale}");
+    // The snapshot in the result is a baseline like any other.
+    let next = with_outline_entries(json!({ "outline": changes["outline"] }));
+    let clicked = agent
+        .call(
+            "browser_click",
+            json!({ "ref": named_ref(&next, "Reply"), "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(clicked["changes"]["kind"], "diff", "{clicked}");
+    assert_eq!(clicked["changes"]["base_revision"], changes["revision"]);
+}
+
+#[tokio::test]
+async fn an_action_with_nothing_held_returns_a_full_snapshot() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-nothing-held").await;
+    let clicked = agent
+        .call("browser_click", json!({ "x": 30, "y": 40 }))
+        .await;
+    assert_eq!(clicked["changes"]["kind"], "snapshot", "{clicked}");
+    assert_eq!(clicked["changes"]["reason"], "no_baseline");
+    assert!(clicked["changes"]["outline"]
+        .as_str()
+        .unwrap()
+        .contains("Reply body"));
+}
+
+#[tokio::test]
+async fn a_session_on_dom_refs_gets_no_changes_and_keeps_its_refs() {
+    let f = fixture().await;
+    let agent = Agent::bound(&f, "changes-dom-refs").await;
+    let legacy = agent
+        .call(
+            "get_browser_state",
+            json!({ "snapshot_format": "dom_refs_v1" }),
+        )
+        .await;
+    let button = ref_of(&legacy, "main", "main-btn");
+    for _ in 0..2 {
+        let clicked = agent.call("browser_click", json!({ "ref": button })).await;
+        assert_eq!(clicked["route"], "trusted_input", "{clicked}");
+        assert!(clicked.get("changes").is_none(), "{clicked}");
+    }
+    assert!(recorded_calls(&f, "Accessibility.getFullAXTree").is_empty());
+}
+
+#[tokio::test]
+async fn a_dialog_the_click_opened_is_reported_with_its_capability_and_nothing_else_moves() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-dialog").await;
+    let first = agent.snapshot().await;
+    let reply = named_ref(&first, "Reply");
+
+    f.state.lock().unwrap().click_opens_dialog = true;
+    let started = std::time::Instant::now();
+    let clicked = agent
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "no timeout was waited out"
+    );
+    let changes = &clicked["changes"];
+    assert_eq!(changes["kind"], "unavailable", "{clicked}");
+    assert_eq!(changes["reason"], "javascript_dialog_open");
+    assert_eq!(changes["dialog"]["kind"], "alert");
+    let dialog_id = changes["dialog"]["dialog_id"].as_str().unwrap().to_owned();
+
+    // While it is up, reads and input say so at once instead of hanging.
+    let read = agent.call("get_browser_state", json!({})).await;
+    assert_eq!(read["refusal"]["code"], "browser_dialog_open", "{read}");
+    assert_eq!(read["refusal"]["detail"]["dialog_id"], dialog_id);
+    let blocked = agent
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(blocked["error"]["code"], "browser_dialog_open", "{blocked}");
+    assert!(blocked["error"]["hint"]
+        .as_str()
+        .unwrap()
+        .contains(&dialog_id));
+
+    // The capability resolves it, and the baseline held before still diffs.
+    let accepted = agent
+        .call(
+            "browser_dialog",
+            json!({ "action": "accept", "dialog_id": dialog_id }),
+        )
+        .await;
+    assert_eq!(accepted["status"], "ok", "{accepted}");
+    let after = agent
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(after["changes"]["kind"], "diff", "{after}");
+    assert_eq!(
+        after["changes"]["base_revision"],
+        first["snapshot"]["revision"]
+    );
+}
+
+#[tokio::test]
+async fn since_revision_answers_with_a_diff_only_from_the_revision_held() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-since").await;
+    let first = agent.snapshot().await;
+    let revision = first["snapshot"]["revision"].as_u64().unwrap();
+
+    f.state
+        .lock()
+        .unwrap()
+        .renamed
+        .insert(2003, "Edited message".into());
+    let changed = agent
+        .call("get_browser_state", json!({ "since_revision": revision }))
+        .await;
+    assert_eq!(changed["mode"], "changes", "{changed}");
+    assert_eq!(changed["changes"]["kind"], "diff");
+    // Text that says something else: the same ref, a changed line.
+    assert_eq!(changed["changes"]["ops"][0]["op"], "change", "{changed}");
+    assert_eq!(
+        changed["changes"]["ops"][0]["ref"],
+        named_ref(&first, "Please review the attached fixture report.")
+    );
+
+    // The revision the agent held is no longer the baseline.
+    let stale = agent
+        .call("get_browser_state", json!({ "since_revision": revision }))
+        .await;
+    assert_eq!(stale["changes"]["kind"], "snapshot", "{stale}");
+    assert_eq!(stale["changes"]["reason"], "revision_unknown");
+    assert!(stale["changes"]["outline"]
+        .as_str()
+        .unwrap()
+        .contains("Edited message"));
+
+    let refused = agent
+        .registry
+        .invoke_with_context(
+            "get_browser_state",
+            json!({ "target_id": agent.target, "tab_id": agent.tab, "session": agent.session,
+                "since_revision": revision, "query": "Reply" }),
+            agent.context.clone(),
+        )
+        .await;
+    assert_eq!(
+        refused.is_error,
+        Some(true),
+        "a diff is of the whole-page view only"
+    );
+}
+
+// ── browser_steps against the scripted page ─────────────────────────────────
+
+#[tokio::test]
+async fn steps_run_as_single_tools_and_return_one_diff_for_the_batch() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+    })
+    .await;
+    let agent = Agent::bound(&f, "steps-real").await;
+    let first = agent.snapshot().await;
+    f.state
+        .lock()
+        .unwrap()
+        .click_renames
+        .push((2011, "Sent".into()));
+    let reads_before = recorded_calls(&f, "Accessibility.getFullAXTree").len();
+
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "type", "ref": named_ref(&first, "Reply body"), "text": "hello"},
+                {"action": "click", "role": "button", "name": "Reply", "input_route": "dom_event",
+                 "expect": {"role": "button", "name": "Sent"}},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "completed", "{output}");
+    let outcomes = output["steps"].as_array().unwrap();
+    assert_eq!(outcomes[0]["effect"], "confirmed", "{output}");
+    assert_eq!(
+        outcomes[1]["ref"],
+        named_ref(&first, "Reply"),
+        "resolved to the ref held"
+    );
+
+    // One diff, from the revision held before the batch, with both steps in it.
+    let changes = &output["changes"];
+    assert_eq!(changes["kind"], "diff", "{output}");
+    assert_eq!(changes["base_revision"], first["snapshot"]["revision"]);
+    let ops = changes["ops"].as_array().unwrap();
+    assert!(
+        ops.iter()
+            .any(|op| op["op"] == "change" && op["line"].as_str().unwrap().contains("= \"hello\"")),
+        "{output}"
+    );
+    assert!(ops.iter().any(|op| op["op"] == "add"
+        && op["line"].as_str().unwrap().contains("button \"Sent\"")), "{output}");
+    assert!(output.to_string().chars().count() < 1_500, "{output}");
+
+    // The steps did not each read the page: one read to aim the named step,
+    // one for its expect, one at the end. Each main-frame read is two trees.
+    let reads = recorded_calls(&f, "Accessibility.getFullAXTree")
+        .into_iter()
+        .skip(reads_before)
+        .filter(|(_, params)| params["frameId"] == "F_MAIN")
+        .count();
+    assert_eq!(reads, 3, "aim, expect, final");
+    // Both steps re-read their own node before acting on it.
+    assert_eq!(
+        recorded_calls(&f, "Accessibility.getPartialAXTree").len(),
+        2
+    );
+}
+
+#[tokio::test]
+async fn unconfirmed_typing_stops_a_real_batch_before_the_click() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+        st.field_detached_after_input = true;
+    })
+    .await;
+    let agent = Agent::bound(&f, "steps-real-unconfirmed").await;
+    let first = agent.snapshot().await;
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "type", "ref": named_ref(&first, "Reply body"), "text": "hello"},
+                {"action": "click", "ref": named_ref(&first, "Reply"), "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!(output["stop_reason"], "typing_unconfirmed");
+    assert_eq!(output["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(output["steps"][0]["status"], "unconfirmed");
+    assert!(
+        recorded_calls(&f, "Runtime.callFunctionOn")
+            .iter()
+            .all(|(_, params)| !params["functionDeclaration"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("this.click()")),
+        "the button was never clicked"
+    );
+    assert_eq!(output["changes"]["kind"], "diff", "{output}");
+}
+
+#[tokio::test]
+async fn a_dialog_stops_a_real_batch_and_the_capability_resolves_it() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "steps-real-dialog").await;
+    let first = agent.snapshot().await;
+    f.state.lock().unwrap().click_opens_dialog = true;
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "click", "ref": named_ref(&first, "Reply"), "input_route": "dom_event"},
+                {"action": "click", "ref": named_ref(&first, "Archive item 0"), "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(1), &json!("javascript_dialog_open"))
+    );
+    let dialog_id = output["changes"]["dialog"]["dialog_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let accepted = agent
+        .call(
+            "browser_dialog",
+            json!({ "action": "accept", "dialog_id": dialog_id }),
+        )
+        .await;
+    assert_eq!(accepted["status"], "ok", "{accepted}");
+}
+
+#[cfg(feature = "yaml")]
+#[tokio::test]
+async fn every_step_and_read_of_a_batch_is_admitted_as_its_own_tool() {
+    use crate::authorization::PermissionMode;
+    use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+    // One runtime, so a session keeps its binding when its manifest narrows.
+    let runtime = SessionAuthorizationRegistry::with_ceiling(
+        SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Bounded],
+            false,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let allowing = |tools: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [{tools}]\n\
+                 resources:\n  desktop:\n    windows:\n      - pid: 1\n        window_id: 7\n  \
+                 browser:\n    origins: [\"https://fixture.test\"]\n"
+            ),
+        )
+        .unwrap();
+        let manifest = Arc::new(crate::session_manifest::load_manifest(&path).unwrap());
+        runtime
+            .compatibility_context(PermissionMode::Bounded, Some(manifest))
+            .unwrap()
+    };
+    let everything = "get_browser_state, browser_steps, browser_click, browser_type";
+
+    // The batch tool is allowed, typing is not: the typing step is refused
+    // exactly as a browser_type call would be, and nothing after it runs.
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+    })
+    .await;
+    let mut agent = Agent::bound_as(&f, "steps-no-type", allowing(everything)).await;
+    let first = agent.snapshot().await;
+    assert_eq!(first["status"], "ok", "{first}");
+    agent.context = allowing("get_browser_state, browser_steps, browser_click");
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "click", "ref": named_ref(&first, "Reply"), "input_route": "dom_event"},
+                {"action": "type", "ref": named_ref(&first, "Reply body"), "text": "hello"},
+                {"action": "click", "ref": named_ref(&first, "Archive item 0"), "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(2), &json!("step_failed"))
+    );
+    assert_eq!(output["steps"][0]["status"], "ok", "{output}");
+    assert_eq!(output["steps"][1]["code"], "permission_denied", "{output}");
+    assert!(
+        output["steps"][1].get("retryable").is_none(),
+        "nothing was typed"
+    );
+    assert!(recorded_calls(&f, "Input.insertText").is_empty());
+    assert_eq!(output["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(
+        output["changes"]["kind"], "diff",
+        "reading is allowed here: {output}"
+    );
+
+    // Steps and clicks allowed, reading not: a step aimed by role and name
+    // cannot be aimed, and what the batch changed cannot be told. No read
+    // slips through because it happened inside a batch.
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let mut agent = Agent::bound_as(&f, "steps-no-read", allowing(everything)).await;
+    let first = agent.snapshot().await;
+    let reply = named_ref(&first, "Reply");
+    agent.context = allowing("browser_steps, browser_click");
+    let trees = recorded_calls(&f, "Accessibility.getFullAXTree").len();
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "click", "ref": reply, "input_route": "dom_event"},
+                {"action": "click", "role": "button", "name": "Archive item 0", "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!(output["steps"][0]["status"], "ok", "{output}");
+    assert_eq!(output["steps"][1]["code"], "permission_denied", "{output}");
+    assert_eq!(output["changes"]["kind"], "unavailable", "{output}");
+    assert_eq!(output["changes"]["reason"], "permission_denied");
+    assert_eq!(
+        recorded_calls(&f, "Accessibility.getFullAXTree").len(),
+        trees,
+        "the page was not read at all"
+    );
+
+    // And the batch tool itself is a tool like any other.
+    agent.context = allowing("get_browser_state, browser_click, browser_type");
+    let refused = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [{"action": "click", "ref": reply}] }),
+        )
+        .await;
+    assert_eq!(refused["refusal"]["code"], "permission_denied", "{refused}");
+}
+
+#[tokio::test]
+async fn a_step_that_navigates_stops_the_batch_and_the_result_is_the_new_page() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "steps-real-navigation").await;
+    let first = agent.snapshot().await;
+    {
+        let mut state = f.state.lock().unwrap();
+        state.click_navigates = Some("L_MAIN_2".into());
+        state.renamed.insert(2000, "The next page".into());
+    }
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "click", "ref": named_ref(&first, "Reply"), "input_route": "dom_event"},
+                // On the new page there is a button of this name too; the
+                // step was planned against the old one and must not reach it.
+                {"action": "click", "role": "button", "name": "Archive item 0", "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(2), &json!("document_changed"))
+    );
+    assert_eq!(output["steps"].as_array().unwrap().len(), 1);
+    let clicks = recorded_calls(&f, "Runtime.callFunctionOn")
+        .iter()
+        .filter(|(_, params)| {
+            params["functionDeclaration"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("this.click()")
+        })
+        .count();
+    assert_eq!(clicks, 1, "only the first step clicked");
+    let changes = &output["changes"];
+    assert_eq!(changes["kind"], "snapshot", "{output}");
+    assert_eq!(changes["reason"], "document_changed");
+    assert!(changes["outline"]
+        .as_str()
+        .unwrap()
+        .contains("The next page"));
+    assert_ne!(changes["snapshot_id"], first["snapshot"]["id"]);
+}
+
+#[tokio::test]
+async fn a_single_click_that_navigates_returns_the_new_page_not_a_diff_of_the_old() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-click-navigates").await;
+    let first = agent.snapshot().await;
+    f.state.lock().unwrap().click_navigates = Some("L_MAIN_2".into());
+    let clicked = agent
+        .call(
+            "browser_click",
+            json!({ "ref": named_ref(&first, "Reply"), "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(clicked["changes"]["kind"], "snapshot", "{clicked}");
+    assert_eq!(clicked["changes"]["reason"], "document_changed");
+}
+
+// ── Hit-test before a trusted click ─────────────────────────────────────────
+
+fn covered() -> Value {
+    json!({"connected": true, "hit": true, "inside_target": false,
+        "contains_target": false, "label_of_target": false, "own_indicator": false})
+}
+
+#[tokio::test]
+async fn a_trusted_click_on_a_covered_ref_is_refused_and_names_the_cover_by_its_ref() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    let button = named_ref(&snap, "main-btn");
+    let cover = named_ref(&snap, "Shadow Input");
+    // Node 20 (the shadow input) is on top at the button's centre.
+    f.state.lock().unwrap().hit = Some((2, covered(), 20));
+
+    let click = BrowserClickTool::new(f.engine.clone());
+    let refused = click
+        .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
+        .await;
+    let refused = structured(&refused);
+    assert_eq!(
+        refused["refusal"]["code"], "browser_target_covered",
+        "{refused}"
+    );
+    assert_eq!(
+        refused["refusal"]["detail"]["covered_by_ref"], cover,
+        "{refused}"
+    );
+    assert_eq!(refused["refusal"]["detail"]["click_sent"], false);
+    let message = refused["refusal"]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("covered at its centre by {cover}")),
+        "{message}"
+    );
+    // The refusal names a ref the session holds, and nothing the page says.
+    assert!(!message.contains("Shadow Input"), "{message}");
+    assert!(
+        recorded_calls(&f, "Input.dispatchMouseEvent").is_empty(),
+        "the element on top must not receive the click"
+    );
+    // It was looked at twice: before and after the scroll and the beat.
+    assert_eq!(recorded_calls(&f, "DOM.scrollIntoViewIfNeeded").len(), 2);
+}
+
+#[tokio::test]
+async fn a_cover_the_session_holds_no_ref_for_is_not_described() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    f.state.lock().unwrap().hit = Some((2, covered(), 20));
+    let refused = BrowserClickTool::new(f.engine.clone())
+        .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
+        .await;
+    let refused = structured(&refused);
+    assert_eq!(
+        refused["refusal"]["code"], "browser_target_covered",
+        "{refused}"
+    );
+    assert!(refused["refusal"]["detail"]["covered_by_ref"].is_null());
+    assert!(
+        refused["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("has no ref in the outline you hold"),
+        "{refused}"
+    );
+}
+
+#[tokio::test]
+async fn a_click_is_not_sent_on_an_unproven_or_container_hit() {
+    for (facts, code, says) in [
+        // The page did not answer the question.
+        (
+            json!(true),
+            "browser_action_unavailable",
+            "did not say which element",
+        ),
+        // The element around the button would receive it, not the button.
+        (
+            json!({"connected": true, "hit": true, "inside_target": false,
+                "contains_target": true, "label_of_target": false, "own_indicator": false}),
+            "browser_target_covered",
+            "takes no click at its centre",
+        ),
+        (
+            json!({"connected": true, "hit": false}),
+            "browser_target_covered",
+            "outside the visible page",
+        ),
+        (
+            json!({"connected": true, "hit": true, "inside_target": false,
+                "contains_target": false, "label_of_target": false, "own_indicator": true}),
+            "browser_target_covered",
+            "Cua's own",
+        ),
+    ] {
+        let f = fixture().await;
+        let (target, tab) = bind(&f).await;
+        let snap = snapshot(&f, &target, &tab).await;
+        let button = ref_of(&snap, "main", "main-btn");
+        f.state.lock().unwrap().hit = Some((2, facts.clone(), 0));
+        let refused = BrowserClickTool::new(f.engine.clone())
+            .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
+            .await;
+        let refused = structured(&refused);
+        assert_eq!(refused["refusal"]["code"], code, "{facts}: {refused}");
+        assert!(
+            refused["refusal"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(says),
+            "{facts}: {refused}"
+        );
+        assert!(
+            recorded_calls(&f, "Input.dispatchMouseEvent").is_empty(),
+            "{facts}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_cover_that_clears_within_the_beat_does_not_stop_the_click() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    f.state.lock().unwrap().hit = Some((1, covered(), 20));
+    let clicked = BrowserClickTool::new(f.engine.clone())
+        .invoke(json!({"target_id": target, "tab_id": tab, "ref": button, "session": SESSION}))
+        .await;
+    assert_eq!(structured(&clicked)["status"], "ok", "{clicked:?}");
+    assert_eq!(recorded_calls(&f, "Input.dispatchMouseEvent").len(), 2);
+}
+
+#[tokio::test]
+async fn a_coordinate_click_and_a_dom_event_click_are_not_hit_tested() {
+    let f = fixture().await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let button = ref_of(&snap, "main", "main-btn");
+    f.state.lock().unwrap().hit = Some((9, covered(), 20));
+    let click = BrowserClickTool::new(f.engine.clone());
+    // The caller named a point, not an element: there is no target to be covered.
+    let by_point = click
+        .invoke(
+            json!({"target_id": target, "tab_id": tab, "x": 105.0, "y": 105.0, "session": SESSION}),
+        )
+        .await;
+    assert_eq!(structured(&by_point)["status"], "ok");
+    // A DOM click is dispatched on the element itself, whatever is on top.
+    let synthetic = click
+        .invoke(json!({"target_id": target, "tab_id": tab, "ref": button,
+            "input_route": "dom_event", "session": SESSION}))
+        .await;
+    assert_eq!(structured(&synthetic)["status"], "ok");
+    assert!(recorded_calls(&f, "Runtime.callFunctionOn")
+        .iter()
+        .all(|(_, params)| !params["functionDeclaration"]
+            .as_str()
+            .unwrap()
+            .contains("elementFromPoint")));
+}
+
+// ── Found by review ─────────────────────────────────────────────────────────
+
+#[tokio::test]
+async fn a_stale_refusal_says_nothing_the_page_says_and_retires_the_ref_for_good() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let reply = named_ref(&first, "Reply");
+
+    f.state
+        .lock()
+        .unwrap()
+        .renamed
+        .insert(2011, "Wire 4,000 USD".into());
+    let refused = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+    assert!(
+        !refused.to_string().contains("Wire"),
+        "what the element reads as now is for a read to tell: {refused}"
+    );
+
+    // The page puts the old name back before anything is read again: the
+    // ref was refused once and does not come back.
+    f.state.lock().unwrap().renamed.clear();
+    let again = dom_click(&f, &target, &tab, &reply).await;
+    assert_eq!(again["refusal"]["code"], "browser_ref_stale", "{again}");
+    assert!(
+        recorded_calls(&f, "Runtime.callFunctionOn").is_empty(),
+        "nothing was clicked"
+    );
+    let second = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(named_ref(&second, "Reply"), reply);
+}
+
+#[tokio::test]
+async fn a_continuation_is_refused_after_a_detach_even_on_the_same_document() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let token = first["snapshot"]["continuation"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    f.state.lock().unwrap().detached = true;
+    let stale = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
+    assert_eq!(stale["refusal"]["code"], "browser_ref_stale", "{stale}");
+    let fresh = semantic_snapshot(&f, &target, &tab).await;
+    assert_ne!(fresh["snapshot"]["id"], first["snapshot"]["id"]);
+}
+
+#[tokio::test]
+async fn typing_that_opens_a_dialog_returns_at_once_with_the_dialog() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+        st.type_opens_dialog = true;
+    })
+    .await;
+    let agent = Agent::bound(&f, "changes-type-dialog").await;
+    let first = agent.snapshot().await;
+    let started = std::time::Instant::now();
+    let typed = agent
+        .call(
+            "browser_type",
+            json!({ "ref": named_ref(&first, "Reply body"), "text": "hello" }),
+        )
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "no call was waited out behind the dialog: {:?}",
+        started.elapsed()
+    );
+    assert_eq!(typed["effect"], "unverifiable", "{typed}");
+    assert_eq!(typed["changes"]["kind"], "unavailable", "{typed}");
+    assert_eq!(typed["changes"]["reason"], "javascript_dialog_open");
+    assert_eq!(typed["changes"]["dialog"]["kind"], "confirm");
+    // The tab is not held: the dialog tool gets to it.
+    let dialog_id = typed["changes"]["dialog"]["dialog_id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let dismissed = agent
+        .call(
+            "browser_dialog",
+            json!({ "action": "dismiss", "dialog_id": dialog_id }),
+        )
+        .await;
+    assert_eq!(dismissed["status"], "ok", "{dismissed}");
+}
+
+#[cfg(feature = "yaml")]
+#[tokio::test]
+async fn a_caller_that_may_click_but_not_read_learns_nothing_the_page_says() {
+    use crate::authorization::PermissionMode;
+    use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+    let runtime = SessionAuthorizationRegistry::with_ceiling(
+        SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Bounded],
+            false,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let allowing = |tools: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [{tools}]\n\
+                 resources:\n  desktop:\n    windows:\n      - pid: 1\n        window_id: 7\n  \
+                 browser:\n    origins: [\"https://fixture.test\"]\n"
+            ),
+        )
+        .unwrap();
+        let manifest = Arc::new(crate::session_manifest::load_manifest(&path).unwrap());
+        runtime
+            .compatibility_context(PermissionMode::Bounded, Some(manifest))
+            .unwrap()
+    };
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let mut agent = Agent::bound_as(
+        &f,
+        "click-no-read",
+        allowing("get_browser_state, browser_click"),
+    )
+    .await;
+    let first = agent.snapshot().await;
+    let (reply, archive) = (
+        named_ref(&first, "Reply"),
+        named_ref(&first, "Archive item 0"),
+    );
+    // Reading is taken away; the refs already held still act.
+    agent.context = allowing("browser_click");
+    {
+        let mut state = f.state.lock().unwrap();
+        state.renamed.insert(2011, "Wire 4,000 USD".into());
+        state
+            .click_renames
+            .push((2000, "Balance: 12,000 USD".into()));
+    }
+    let stale = agent
+        .call(
+            "browser_click",
+            json!({ "ref": reply, "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(stale["error"]["code"], "browser_ref_stale", "{stale}");
+    let clicked = agent
+        .call(
+            "browser_click",
+            json!({ "ref": archive, "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(
+        clicked["effect"], "unverifiable",
+        "the click itself is allowed: {clicked}"
+    );
+    assert_eq!(clicked["changes"]["kind"], "unavailable", "{clicked}");
+    assert_eq!(clicked["changes"]["reason"], "permission_denied");
+    for result in [&stale, &clicked] {
+        let said = result.to_string();
+        assert!(
+            !said.contains("Wire") && !said.contains("Balance"),
+            "{said}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn a_dialog_that_opens_after_the_insert_was_answered_is_still_seen_at_once() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+        st.type_opens_dialog_late = true;
+    })
+    .await;
+    let agent = Agent::bound(&f, "changes-type-late-dialog").await;
+    let first = agent.snapshot().await;
+    let started = std::time::Instant::now();
+    let typed = agent
+        .call(
+            "browser_type",
+            json!({ "ref": named_ref(&first, "Reply body"), "text": "hello" }),
+        )
+        .await;
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(3),
+        "{:?}",
+        started.elapsed()
+    );
+    assert_eq!(
+        typed["changes"]["reason"], "javascript_dialog_open",
+        "{typed}"
+    );
+    assert_eq!(
+        typed["delivery"]["delivered_count"], 5,
+        "the text was inserted: {typed}"
+    );
+    // Nothing was asked of the blocked page after the insert.
+    let after_insert: Vec<String> = {
+        let state = f.state.lock().unwrap();
+        let insert = state
+            .calls
+            .iter()
+            .position(|(_, method, _)| method == "Input.insertText")
+            .unwrap();
+        state.calls[insert + 1..]
+            .iter()
+            .map(|(_, method, _)| method.clone())
+            .collect()
+    };
+    assert!(after_insert.is_empty(), "{after_insert:?}");
+}
+
+#[tokio::test]
+async fn a_dialog_that_opens_during_the_read_back_is_not_waited_out() {
+    // The page keeps only digits, so the first read is a mismatch and the
+    // read-back asks again. The alert opens at one of those reads, which the
+    // blocked page never answers, fails, or answered just before.
+    for (at, read) in [
+        (1, "unanswered"),
+        (1, "error"),
+        (0, "error"),
+        (0, "answered"),
+        (0, "detached"),
+    ] {
+        let f = fixture_with(|st| {
+            st.semantic_large_page = true;
+            st.field_value = Some(String::new());
+            st.field_digits_only = true;
+            st.readback_opens_dialog = Some((at, read));
+        })
+        .await;
+        let agent = Agent::bound(&f, "changes-readback-dialog").await;
+        let first = agent.snapshot().await;
+        let started = std::time::Instant::now();
+        let typed = agent
+            .call(
+                "browser_type",
+                json!({ "ref": named_ref(&first, "Reply body"), "text": "hello" }),
+            )
+            .await;
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(3),
+            "{read} at {at}: {:?}",
+            started.elapsed()
+        );
+        assert_eq!(typed["effect"], "unverifiable", "{read} at {at}: {typed}");
+        assert_eq!(
+            typed["changes"]["reason"], "javascript_dialog_open",
+            "{read} at {at}: {typed}"
+        );
+        let said = typed.to_string();
+        assert!(!said.contains("browser_type_mismatch"), "{said}");
+        assert!(!said.contains("private dialog text"), "{said}");
+    }
+}
+
+#[tokio::test]
+async fn a_dialog_during_the_read_back_is_reported_to_a_dom_refs_caller_too() {
+    // No page changes come back with dom_refs_v1, so the result itself has
+    // to say a dialog is why the field was not read.
+    for read in ["unanswered", "detached"] {
+        let f = fixture_with(|st| {
+            st.field_value = Some(String::new());
+            st.readback_opens_dialog = Some((0, read));
+        })
+        .await;
+        let (target, tab) = bind(&f).await;
+        let snap = snapshot(&f, &target, &tab).await;
+        let typed = BrowserTypeTool::new(f.engine.clone())
+            .invoke(json!({
+                "target_id": target, "tab_id": tab, "session": SESSION,
+                "ref": ref_of(&snap, "main", "Shadow Input"), "text": "ada"
+            }))
+            .await;
+        let s = structured(&typed);
+        assert_eq!(s["effect"], "unverifiable", "{read}: {s}");
+        assert_eq!(s["readback"], "javascript_dialog_open", "{read}: {s}");
+    }
+}
+
+#[tokio::test]
+async fn a_key_whose_keydown_opened_a_dialog_is_not_counted_as_typed() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+        st.field_caret = Some(0);
+        // The second key's keydown handler opens the dialog.
+        st.key_down_opens_dialog_at = Some(1);
+    })
+    .await;
+    let agent = Agent::bound(&f, "changes-keys-dialog").await;
+    let first = agent.snapshot().await;
+    let typed = agent
+        .call(
+            "browser_type",
+            json!({ "ref": named_ref(&first, "Reply body"), "text": "abc", "mode": "keystrokes" }),
+        )
+        .await;
+    assert_eq!(
+        typed["changes"]["reason"], "javascript_dialog_open",
+        "{typed}"
+    );
+    assert_eq!(
+        typed["delivery"]["delivered_count"], 1,
+        "only the first character's text event was sent: {typed}"
+    );
+    assert_eq!(f.state.lock().unwrap().field_value.as_deref(), Some("a"));
+    let chars = recorded_calls(&f, "Input.dispatchKeyEvent")
+        .iter()
+        .filter(|(_, params)| params["type"] == "char")
+        .count();
+    assert_eq!(chars, 1);
+}
+
+#[tokio::test]
+async fn a_browser_that_cannot_prove_its_document_gets_no_continuation() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let token = first["snapshot"]["continuation"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The space was recorded with a document identity; drop it, as a browser
+    // that reports no frame tree would never have had one.
+    f.engine.store.update_target(SESSION, &target, |record| {
+        let tab = record.tabs.get_mut(&tab).unwrap();
+        let mut unproven = tab.stable.space().unwrap().identity.clone();
+        unproven.root = None;
+        tab.stable.set_identity_for_test(unproven);
+    });
+    let refused = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+}
+
+#[tokio::test]
+async fn a_browser_without_a_frame_tree_gets_no_continuation() {
+    // Neither the read that issued the token nor the one that uses it can
+    // name the document: two unknowns are not the same document.
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.frame_tree_unsupported = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let first = semantic_snapshot(&f, &target, &tab).await;
+    let token = first["snapshot"]["continuation"].as_str().unwrap();
+    let refused = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
+    assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
 }

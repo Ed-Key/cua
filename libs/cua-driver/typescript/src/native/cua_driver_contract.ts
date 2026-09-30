@@ -913,6 +913,322 @@ const FfiConverterTypeActionRoute = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * How a browser action's result describes the page afterwards.
+ *
+ * - `diff`: `ops` turn the outline at `base_revision` into the one at
+ * `revision`.
+ * - `snapshot`: `outline` is the whole page outline at `revision`; `reason`
+ * says why it is not a diff.
+ * - `unavailable`: the page was not read after the action; `reason` says
+ * why. Nothing the session holds changed.
+ */
+export enum PageChangesKind {
+    Diff,
+    Snapshot,
+    Unavailable
+}
+
+const FfiConverterTypePageChangesKind = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = PageChangesKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return PageChangesKind.Diff;
+                case 2: return PageChangesKind.Snapshot;
+                case 3: return PageChangesKind.Unavailable;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case PageChangesKind.Diff: return ordinalConverter.write(1, into);
+                case PageChangesKind.Snapshot: return ordinalConverter.write(2, into);
+                case PageChangesKind.Unavailable: return ordinalConverter.write(3, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * What one keyed change does to the outline.
+ *
+ * - `add`: a line that was not in the outline.
+ * - `change`: the same element, with another value, state or depth.
+ * - `move`: the same element at another place.
+ * - `leave`: a line that is no longer in the outline.
+ */
+export enum PageChangeOpKind {
+    Add,
+    Change,
+    Move,
+    Leave
+}
+
+const FfiConverterTypePageChangeOpKind = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = PageChangeOpKind;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return PageChangeOpKind.Add;
+                case 2: return PageChangeOpKind.Change;
+                case 3: return PageChangeOpKind.Move;
+                case 4: return PageChangeOpKind.Leave;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case PageChangeOpKind.Add: return ordinalConverter.write(1, into);
+                case PageChangeOpKind.Change: return ordinalConverter.write(2, into);
+                case PageChangeOpKind.Move: return ordinalConverter.write(3, into);
+                case PageChangeOpKind.Leave: return ordinalConverter.write(4, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * One keyed change to the page outline. `ref` is the line's ref.
+ */
+export type PageChangeOp = {
+    op: PageChangeOpKind,
+    reference: string,
+    /**
+     * The line as it is now (add, change, move).
+     */
+    line?: string,
+    /**
+     * The ref of the line directly above it (add, move); absent when it is
+     * the first line.
+     */
+    after?: string,
+    /**
+     * leave only. `true`: the element is gone and its ref is stale. Absent:
+     * the element only left the ranked outline; its ref still works.
+     */
+    gone?: boolean
+}
+
+/**
+ * Generated factory for {@link PageChangeOp} record objects.
+ */
+export const PageChangeOp = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<PageChangeOp, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<PageChangeOp>,
+    });
+})();
+
+const FfiConverterTypePageChangeOp = (() => {
+    type TypeName = PageChangeOp;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                op: FfiConverterTypePageChangeOpKind.read(from),
+                reference: FfiConverterString.read(from),
+                line: FfiConverterOptionalString.read(from),
+                after: FfiConverterOptionalString.read(from),
+                gone: FfiConverterOptionalBoolean.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypePageChangeOpKind.write(value.op, into);
+            FfiConverterString.write(value.reference, into);
+            FfiConverterOptionalString.write(value.line, into);
+            FfiConverterOptionalString.write(value.after, into);
+            FfiConverterOptionalBoolean.write(value.gone, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypePageChangeOpKind.allocationSize(value.op) +
+             FfiConverterString.allocationSize(value.reference) +
+             FfiConverterOptionalString.allocationSize(value.line) +
+             FfiConverterOptionalString.allocationSize(value.after) +
+             FfiConverterOptionalBoolean.allocationSize(value.gone);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * A page-owned JavaScript dialog that is open; resolve it with
+ * `browser_dialog` and this `dialog_id`.
+ */
+export type PageDialog = {
+    dialogId: string,
+    kind: string
+}
+
+/**
+ * Generated factory for {@link PageDialog} record objects.
+ */
+export const PageDialog = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<PageDialog, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<PageDialog>,
+    });
+})();
+
+const FfiConverterTypePageDialog = (() => {
+    type TypeName = PageDialog;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                dialogId: FfiConverterString.read(from),
+                kind: FfiConverterString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.dialogId, into);
+            FfiConverterString.write(value.kind, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.dialogId) +
+             FfiConverterString.allocationSize(value.kind);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * What the page showed once a browser action settled, against the outline
+ * the session held. These are observed changes: the page may have made
+ * some of them by itself.
+ */
+export type PageChanges = {
+    kind: PageChangesKind,
+    /**
+     * snapshot: `no_baseline`, `document_changed`, `attachment_changed`,
+     * `revision_unknown`, `coverage_changed`, `diff_larger_than_snapshot`.
+     * unavailable: `javascript_dialog_open`, or the refusal code or error of
+     * the read.
+     */
+    reason?: string,
+    /**
+     * The ref space (`p7` in `p7:12`).
+     */
+    snapshotId?: string,
+    /**
+     * diff: the revision `ops` apply to. If the caller does not hold it,
+     * it asks `get_browser_state` for a full snapshot.
+     */
+    baseRevision?: bigint,
+    revision?: bigint,
+    ops?: Array<PageChangeOp>,
+    outline?: string,
+    /**
+     * The page address: always with a snapshot, with a diff only when it
+     * changed.
+     */
+    url?: string,
+    title?: string,
+    /**
+     * snapshot: `false` when more of the page is reached by `continuation`.
+     */
+    complete?: boolean,
+    continuation?: string,
+    dialog?: PageDialog,
+    /**
+     * `false`: the page was still changing when the bounded wait ended.
+     */
+    settled?: boolean
+}
+
+/**
+ * Generated factory for {@link PageChanges} record objects.
+ */
+export const PageChanges = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<PageChanges, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<PageChanges>,
+    });
+})();
+
+const FfiConverterTypePageChanges = (() => {
+    type TypeName = PageChanges;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                kind: FfiConverterTypePageChangesKind.read(from),
+                reason: FfiConverterOptionalString.read(from),
+                snapshotId: FfiConverterOptionalString.read(from),
+                baseRevision: FfiConverterOptionalUInt64.read(from),
+                revision: FfiConverterOptionalUInt64.read(from),
+                ops: FfiConverterOptionalSequenceTypePageChangeOp.read(from),
+                outline: FfiConverterOptionalString.read(from),
+                url: FfiConverterOptionalString.read(from),
+                title: FfiConverterOptionalString.read(from),
+                complete: FfiConverterOptionalBoolean.read(from),
+                continuation: FfiConverterOptionalString.read(from),
+                dialog: FfiConverterOptionalTypePageDialog.read(from),
+                settled: FfiConverterOptionalBoolean.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypePageChangesKind.write(value.kind, into);
+            FfiConverterOptionalString.write(value.reason, into);
+            FfiConverterOptionalString.write(value.snapshotId, into);
+            FfiConverterOptionalUInt64.write(value.baseRevision, into);
+            FfiConverterOptionalUInt64.write(value.revision, into);
+            FfiConverterOptionalSequenceTypePageChangeOp.write(value.ops, into);
+            FfiConverterOptionalString.write(value.outline, into);
+            FfiConverterOptionalString.write(value.url, into);
+            FfiConverterOptionalString.write(value.title, into);
+            FfiConverterOptionalBoolean.write(value.complete, into);
+            FfiConverterOptionalString.write(value.continuation, into);
+            FfiConverterOptionalTypePageDialog.write(value.dialog, into);
+            FfiConverterOptionalBoolean.write(value.settled, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypePageChangesKind.allocationSize(value.kind) +
+             FfiConverterOptionalString.allocationSize(value.reason) +
+             FfiConverterOptionalString.allocationSize(value.snapshotId) +
+             FfiConverterOptionalUInt64.allocationSize(value.baseRevision) +
+             FfiConverterOptionalUInt64.allocationSize(value.revision) +
+             FfiConverterOptionalSequenceTypePageChangeOp.allocationSize(value.ops) +
+             FfiConverterOptionalString.allocationSize(value.outline) +
+             FfiConverterOptionalString.allocationSize(value.url) +
+             FfiConverterOptionalString.allocationSize(value.title) +
+             FfiConverterOptionalBoolean.allocationSize(value.complete) +
+             FfiConverterOptionalString.allocationSize(value.continuation) +
+             FfiConverterOptionalTypePageDialog.allocationSize(value.dialog) +
+             FfiConverterOptionalBoolean.allocationSize(value.settled);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export type ActionResult = {
     effect: ActionEffect,
     route: ActionRoute,
@@ -934,7 +1250,11 @@ export type ActionResult = {
      * `false`: sending this call again repeats its effect (it moves, toggles,
      * types or submits). Read state before resending it.
      */
-    idempotent?: boolean
+    idempotent?: boolean,
+    /**
+     * Browser page actions only: what the page showed afterwards.
+     */
+    changes?: PageChanges
 }
 
 /**
@@ -965,7 +1285,8 @@ const FfiConverterTypeActionResult = (() => {
                 escalation: FfiConverterOptionalTypeActionEscalation.read(from),
                 summary: FfiConverterOptionalString.read(from),
                 error: FfiConverterOptionalTypeActionError.read(from),
-                idempotent: FfiConverterOptionalBoolean.read(from)
+                idempotent: FfiConverterOptionalBoolean.read(from),
+                changes: FfiConverterOptionalTypePageChanges.read(from)
             };
         }
         write(value: TypeName, into: RustBuffer): void {
@@ -977,6 +1298,7 @@ const FfiConverterTypeActionResult = (() => {
             FfiConverterOptionalString.write(value.summary, into);
             FfiConverterOptionalTypeActionError.write(value.error, into);
             FfiConverterOptionalBoolean.write(value.idempotent, into);
+            FfiConverterOptionalTypePageChanges.write(value.changes, into);
         }
         allocationSize(value: TypeName): number {
             return FfiConverterTypeActionEffect.allocationSize(value.effect) +
@@ -986,7 +1308,8 @@ const FfiConverterTypeActionResult = (() => {
              FfiConverterOptionalTypeActionEscalation.allocationSize(value.escalation) +
              FfiConverterOptionalString.allocationSize(value.summary) +
              FfiConverterOptionalTypeActionError.allocationSize(value.error) +
-             FfiConverterOptionalBoolean.allocationSize(value.idempotent);
+             FfiConverterOptionalBoolean.allocationSize(value.idempotent) +
+             FfiConverterOptionalTypePageChanges.allocationSize(value.changes);
 
         }
     };
@@ -1109,6 +1432,520 @@ const FfiConverterTypeBoundsExpectation = (() => {
              FfiConverterFloat64.allocationSize(value.width) +
              FfiConverterFloat64.allocationSize(value.height) +
              FfiConverterOptionalFloat64.allocationSize(value.tolerancePx);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+export enum BrowserStepAction {
+    Click,
+    Type
+}
+
+const FfiConverterTypeBrowserStepAction = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = BrowserStepAction;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return BrowserStepAction.Click;
+                case 2: return BrowserStepAction.Type;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case BrowserStepAction.Click: return ordinalConverter.write(1, into);
+                case BrowserStepAction.Type: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export enum BrowserStepRoute {
+    Trusted,
+    DomEvent
+}
+
+const FfiConverterTypeBrowserStepRoute = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = BrowserStepRoute;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return BrowserStepRoute.Trusted;
+                case 2: return BrowserStepRoute.DomEvent;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case BrowserStepRoute.Trusted: return ordinalConverter.write(1, into);
+                case BrowserStepRoute.DomEvent: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * What must hold once a step has settled: some element with this role,
+ * exact name and/or text (or, with `present: false`, none).
+ */
+export type BrowserStepExpect = {
+    role?: string,
+    /**
+     * Exact accessible name.
+     */
+    name?: string,
+    /**
+     * Text contained in the element's name or value.
+     */
+    text?: string,
+    /**
+     * `false`: no such element may be there. Default true.
+     */
+    present: boolean
+}
+
+/**
+ * Generated factory for {@link BrowserStepExpect} record objects.
+ */
+export const BrowserStepExpect = (() => {
+    const defaults = () => ({
+        role: undefined,
+        name: undefined,
+        text: undefined,
+        present: true
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStepExpect, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStepExpect>,
+    });
+})();
+
+const FfiConverterTypeBrowserStepExpect = (() => {
+    type TypeName = BrowserStepExpect;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                role: FfiConverterOptionalString.read(from),
+                name: FfiConverterOptionalString.read(from),
+                text: FfiConverterOptionalString.read(from),
+                present: FfiConverterBool.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterOptionalString.write(value.role, into);
+            FfiConverterOptionalString.write(value.name, into);
+            FfiConverterOptionalString.write(value.text, into);
+            FfiConverterBool.write(value.present, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalString.allocationSize(value.role) +
+             FfiConverterOptionalString.allocationSize(value.name) +
+             FfiConverterOptionalString.allocationSize(value.text) +
+             FfiConverterBool.allocationSize(value.present);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * One step. Target it with `ref`, or with `role` and `name` (matched
+ * exactly against the live page when the step runs).
+ */
+export type BrowserStep = {
+    action: BrowserStepAction,
+    /**
+     * Page ref from an outline.
+     */
+    reference?: string,
+    /**
+     * With name, instead of ref.
+     */
+    role?: string,
+    name?: string,
+    /**
+     * type: the text.
+     */
+    text?: string,
+    /**
+     * type: replace the field's content instead of appending.
+     */
+    replace?: boolean,
+    /**
+     * click: trusted (default) or dom_event (ref or role and name).
+     */
+    inputRoute?: BrowserStepRoute,
+    /**
+     * Checked after the step; the batch stops when it does not hold.
+     */
+    expect?: BrowserStepExpect
+}
+
+/**
+ * Generated factory for {@link BrowserStep} record objects.
+ */
+export const BrowserStep = (() => {
+    const defaults = () => ({
+        reference: undefined,
+        role: undefined,
+        name: undefined,
+        text: undefined,
+        replace: undefined,
+        inputRoute: undefined,
+        expect: undefined
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStep, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStep>,
+    });
+})();
+
+const FfiConverterTypeBrowserStep = (() => {
+    type TypeName = BrowserStep;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                action: FfiConverterTypeBrowserStepAction.read(from),
+                reference: FfiConverterOptionalString.read(from),
+                role: FfiConverterOptionalString.read(from),
+                name: FfiConverterOptionalString.read(from),
+                text: FfiConverterOptionalString.read(from),
+                replace: FfiConverterOptionalBoolean.read(from),
+                inputRoute: FfiConverterOptionalTypeBrowserStepRoute.read(from),
+                expect: FfiConverterOptionalTypeBrowserStepExpect.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeBrowserStepAction.write(value.action, into);
+            FfiConverterOptionalString.write(value.reference, into);
+            FfiConverterOptionalString.write(value.role, into);
+            FfiConverterOptionalString.write(value.name, into);
+            FfiConverterOptionalString.write(value.text, into);
+            FfiConverterOptionalBoolean.write(value.replace, into);
+            FfiConverterOptionalTypeBrowserStepRoute.write(value.inputRoute, into);
+            FfiConverterOptionalTypeBrowserStepExpect.write(value.expect, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeBrowserStepAction.allocationSize(value.action) +
+             FfiConverterOptionalString.allocationSize(value.reference) +
+             FfiConverterOptionalString.allocationSize(value.role) +
+             FfiConverterOptionalString.allocationSize(value.name) +
+             FfiConverterOptionalString.allocationSize(value.text) +
+             FfiConverterOptionalBoolean.allocationSize(value.replace) +
+             FfiConverterOptionalTypeBrowserStepRoute.allocationSize(value.inputRoute) +
+             FfiConverterOptionalTypeBrowserStepExpect.allocationSize(value.expect);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * How one step ended.
+ *
+ * - `ok`: it ran and nothing says it failed.
+ * - `unconfirmed`: text was typed, but the field could not be read back as
+ * holding it.
+ * - `failed`: refused, errored, no single target, or its expect did not hold.
+ */
+export enum BrowserStepStatus {
+    Ok,
+    Unconfirmed,
+    Failed
+}
+
+const FfiConverterTypeBrowserStepStatus = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = BrowserStepStatus;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return BrowserStepStatus.Ok;
+                case 2: return BrowserStepStatus.Unconfirmed;
+                case 3: return BrowserStepStatus.Failed;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case BrowserStepStatus.Ok: return ordinalConverter.write(1, into);
+                case BrowserStepStatus.Unconfirmed: return ordinalConverter.write(2, into);
+                case BrowserStepStatus.Failed: return ordinalConverter.write(3, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export type BrowserStepOutcome = {
+    status: BrowserStepStatus,
+    /**
+     * The ref the step acted on: the one given, or the one its role and
+     * name resolved to.
+     */
+    reference?: string,
+    /**
+     * The effect the step's tool reported: confirmed, unverifiable, partial,
+     * mismatch, refused.
+     */
+    effect?: string,
+    /**
+     * Not ok: the tool's refusal or error code, or `target_not_found`,
+     * `target_ambiguous`, `coverage_incomplete`, `expectation_unmet`.
+     */
+    code?: string,
+    /**
+     * What the step's tool said: the field's read-back, or the refusal.
+     */
+    detail?: string,
+    /**
+     * Characters delivered when typing stopped part way.
+     */
+    deliveredCount?: number,
+    /**
+     * `false`: input may have reached the page. Read the page before
+     * sending the step again.
+     */
+    retryable?: boolean,
+    /**
+     * The outline lines that matched the step's role and name, when it was
+     * not exactly one (or the nearest ones when there was none).
+     */
+    candidates?: Array<string>
+}
+
+/**
+ * Generated factory for {@link BrowserStepOutcome} record objects.
+ */
+export const BrowserStepOutcome = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStepOutcome, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStepOutcome>,
+    });
+})();
+
+const FfiConverterTypeBrowserStepOutcome = (() => {
+    type TypeName = BrowserStepOutcome;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                status: FfiConverterTypeBrowserStepStatus.read(from),
+                reference: FfiConverterOptionalString.read(from),
+                effect: FfiConverterOptionalString.read(from),
+                code: FfiConverterOptionalString.read(from),
+                detail: FfiConverterOptionalString.read(from),
+                deliveredCount: FfiConverterOptionalUInt32.read(from),
+                retryable: FfiConverterOptionalBoolean.read(from),
+                candidates: FfiConverterOptionalSequenceString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeBrowserStepStatus.write(value.status, into);
+            FfiConverterOptionalString.write(value.reference, into);
+            FfiConverterOptionalString.write(value.effect, into);
+            FfiConverterOptionalString.write(value.code, into);
+            FfiConverterOptionalString.write(value.detail, into);
+            FfiConverterOptionalUInt32.write(value.deliveredCount, into);
+            FfiConverterOptionalBoolean.write(value.retryable, into);
+            FfiConverterOptionalSequenceString.write(value.candidates, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeBrowserStepStatus.allocationSize(value.status) +
+             FfiConverterOptionalString.allocationSize(value.reference) +
+             FfiConverterOptionalString.allocationSize(value.effect) +
+             FfiConverterOptionalString.allocationSize(value.code) +
+             FfiConverterOptionalString.allocationSize(value.detail) +
+             FfiConverterOptionalUInt32.allocationSize(value.deliveredCount) +
+             FfiConverterOptionalBoolean.allocationSize(value.retryable) +
+             FfiConverterOptionalSequenceString.allocationSize(value.candidates);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+export type BrowserStepsInput = {
+    /**
+     * Target id from get_browser_state.
+     */
+    targetId: string,
+    /**
+     * Tab id from get_browser_state.
+     */
+    tabId: string,
+    session?: string,
+    /**
+     * 1 to 8 steps, run in order.
+     */
+    steps: Array<BrowserStep>
+}
+
+/**
+ * Generated factory for {@link BrowserStepsInput} record objects.
+ */
+export const BrowserStepsInput = (() => {
+    const defaults = () => ({
+        session: undefined,
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStepsInput, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStepsInput>,
+    });
+})();
+
+const FfiConverterTypeBrowserStepsInput = (() => {
+    type TypeName = BrowserStepsInput;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                targetId: FfiConverterString.read(from),
+                tabId: FfiConverterString.read(from),
+                session: FfiConverterOptionalString.read(from),
+                steps: FfiConverterSequenceTypeBrowserStep.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.targetId, into);
+            FfiConverterString.write(value.tabId, into);
+            FfiConverterOptionalString.write(value.session, into);
+            FfiConverterSequenceTypeBrowserStep.write(value.steps, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.targetId) +
+             FfiConverterString.allocationSize(value.tabId) +
+             FfiConverterOptionalString.allocationSize(value.session) +
+             FfiConverterSequenceTypeBrowserStep.allocationSize(value.steps);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+export enum BrowserStepsStatus {
+    Completed,
+    Stopped
+}
+
+const FfiConverterTypeBrowserStepsStatus = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = BrowserStepsStatus;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return BrowserStepsStatus.Completed;
+                case 2: return BrowserStepsStatus.Stopped;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case BrowserStepsStatus.Completed: return ordinalConverter.write(1, into);
+                case BrowserStepsStatus.Stopped: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export type BrowserStepsOutput = {
+    status: BrowserStepsStatus,
+    /**
+     * The steps that ran, in order.
+     */
+    steps: Array<BrowserStepOutcome>,
+    /**
+     * 1-based index of the step the batch stopped at: the one that failed,
+     * or the first one not run.
+     */
+    stoppedAt?: number,
+    /**
+     * `step_failed`, `typing_unconfirmed`, `javascript_dialog_open`,
+     * `document_changed`.
+     */
+    stopReason?: string,
+    /**
+     * What the page changed over the whole batch.
+     */
+    changes?: PageChanges
+}
+
+/**
+ * Generated factory for {@link BrowserStepsOutput} record objects.
+ */
+export const BrowserStepsOutput = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStepsOutput, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStepsOutput>,
+    });
+})();
+
+const FfiConverterTypeBrowserStepsOutput = (() => {
+    type TypeName = BrowserStepsOutput;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                status: FfiConverterTypeBrowserStepsStatus.read(from),
+                steps: FfiConverterSequenceTypeBrowserStepOutcome.read(from),
+                stoppedAt: FfiConverterOptionalUInt32.read(from),
+                stopReason: FfiConverterOptionalString.read(from),
+                changes: FfiConverterOptionalTypePageChanges.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeBrowserStepsStatus.write(value.status, into);
+            FfiConverterSequenceTypeBrowserStepOutcome.write(value.steps, into);
+            FfiConverterOptionalUInt32.write(value.stoppedAt, into);
+            FfiConverterOptionalString.write(value.stopReason, into);
+            FfiConverterOptionalTypePageChanges.write(value.changes, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeBrowserStepsStatus.allocationSize(value.status) +
+             FfiConverterSequenceTypeBrowserStepOutcome.allocationSize(value.steps) +
+             FfiConverterOptionalUInt32.allocationSize(value.stoppedAt) +
+             FfiConverterOptionalString.allocationSize(value.stopReason) +
+             FfiConverterOptionalTypePageChanges.allocationSize(value.changes);
 
         }
     };
@@ -7141,8 +7978,35 @@ const FfiConverterOptionalTypeActionError = new FfiConverterOptional(FfiConverte
 // FfiConverter for boolean | undefined
 const FfiConverterOptionalBoolean = new FfiConverterOptional(FfiConverterBool);
 
+// FfiConverter for bigint | undefined
+const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
+
+// FfiConverter for Array<PageChangeOp>
+const FfiConverterSequenceTypePageChangeOp = new FfiConverterArray(FfiConverterTypePageChangeOp);
+
+// FfiConverter for Array<PageChangeOp> | undefined
+const FfiConverterOptionalSequenceTypePageChangeOp = new FfiConverterOptional(FfiConverterSequenceTypePageChangeOp);
+
+// FfiConverter for PageDialog | undefined
+const FfiConverterOptionalTypePageDialog = new FfiConverterOptional(FfiConverterTypePageDialog);
+
+// FfiConverter for PageChanges | undefined
+const FfiConverterOptionalTypePageChanges = new FfiConverterOptional(FfiConverterTypePageChanges);
+
 // FfiConverter for number | undefined
 const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64);
+
+// FfiConverter for BrowserStepRoute | undefined
+const FfiConverterOptionalTypeBrowserStepRoute = new FfiConverterOptional(FfiConverterTypeBrowserStepRoute);
+
+// FfiConverter for BrowserStepExpect | undefined
+const FfiConverterOptionalTypeBrowserStepExpect = new FfiConverterOptional(FfiConverterTypeBrowserStepExpect);
+
+// FfiConverter for Array<BrowserStep>
+const FfiConverterSequenceTypeBrowserStep = new FfiConverterArray(FfiConverterTypeBrowserStep);
+
+// FfiConverter for Array<BrowserStepOutcome>
+const FfiConverterSequenceTypeBrowserStepOutcome = new FfiConverterArray(FfiConverterTypeBrowserStepOutcome);
 
 // FfiConverter for ClickButton | undefined
 const FfiConverterOptionalTypeClickButton = new FfiConverterOptional(FfiConverterTypeClickButton);
@@ -7152,9 +8016,6 @@ const FfiConverterOptionalTypeActionTarget = new FfiConverterOptional(FfiConvert
 
 // FfiConverter for DesktopScope | undefined
 const FfiConverterOptionalTypeDesktopScope = new FfiConverterOptional(FfiConverterTypeDesktopScope);
-
-// FfiConverter for bigint | undefined
-const FfiConverterOptionalUInt64 = new FfiConverterOptional(FfiConverterUInt64);
 
 // FfiConverter for TextSelectionPredicate | undefined
 const FfiConverterOptionalTypeTextSelectionPredicate = new FfiConverterOptional(FfiConverterTypeTextSelectionPredicate);
@@ -7314,6 +8175,15 @@ export default Object.freeze({
     FfiConverterTypeActionTarget,
     FfiConverterTypeAppInfo,
     FfiConverterTypeBoundsExpectation,
+    FfiConverterTypeBrowserStep,
+    FfiConverterTypeBrowserStepAction,
+    FfiConverterTypeBrowserStepExpect,
+    FfiConverterTypeBrowserStepOutcome,
+    FfiConverterTypeBrowserStepRoute,
+    FfiConverterTypeBrowserStepStatus,
+    FfiConverterTypeBrowserStepsInput,
+    FfiConverterTypeBrowserStepsOutput,
+    FfiConverterTypeBrowserStepsStatus,
     FfiConverterTypeCaptureScope,
     FfiConverterTypeClickButton,
     FfiConverterTypeClickInput,
@@ -7358,6 +8228,11 @@ export default Object.freeze({
     FfiConverterTypeListWindowsInput,
     FfiConverterTypeListWindowsOutput,
     FfiConverterTypeMoveCursorInput,
+    FfiConverterTypePageChangeOp,
+    FfiConverterTypePageChangeOpKind,
+    FfiConverterTypePageChanges,
+    FfiConverterTypePageChangesKind,
+    FfiConverterTypePageDialog,
     FfiConverterTypeParseVisualRegionsInput,
     FfiConverterTypeParseVisualRegionsOptions,
     FfiConverterTypeParseVisualRegionsOutput,

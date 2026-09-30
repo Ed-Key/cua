@@ -1900,6 +1900,7 @@ fn run_browser_tool_roundtrip(fixture: &mut Fixture) -> Observation {
         "get_browser_state",
         serde_json::json!({
             "target_id": target_id,
+            "snapshot_format": "dom_refs_v1",
             "tab_id": tab_id,
             "session": session,
         }),
@@ -1933,6 +1934,7 @@ fn run_browser_tool_roundtrip(fixture: &mut Fixture) -> Observation {
         "get_browser_state",
         serde_json::json!({
             "target_id": target_id,
+            "snapshot_format": "dom_refs_v1",
             "tab_id": tab_id,
             "session": session,
         }),
@@ -1999,6 +2001,7 @@ fn run_browser_tool_roundtrip(fixture: &mut Fixture) -> Observation {
         "get_browser_state",
         serde_json::json!({
             "target_id": target_id,
+            "snapshot_format": "dom_refs_v1",
             "tab_id": tab_id,
             "session": session,
         }),

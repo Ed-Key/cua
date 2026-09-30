@@ -342,7 +342,7 @@ impl Tool for BrowserDownloadTool {
         }
         let ref_session = match self
             .engine
-            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry.frame)
+            .frame_session_for_mutation(&session, &target_id, &tab_id, &validated, &entry)
             .await
         {
             Ok(session) => session,

@@ -342,6 +342,7 @@ async def run(args: argparse.Namespace) -> str:
                         "target_id": target_id,
                         "tab_id": tab_id,
                         "snapshot_format": "semantic_v2",
+                        "include_refs": True,
                     },
                 )
                 candidates, visual, visual_record = await candidates_for_step(
