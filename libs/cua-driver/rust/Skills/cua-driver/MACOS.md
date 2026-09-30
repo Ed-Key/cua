@@ -424,8 +424,8 @@ screenshot is the only truth.**
 field) also ignore `AXFocused` writes, so only typed keys reach them, and
 keys go to the field that has keyboard focus. `type_text` never sends
 them the AX write: a focused field gets keys, and an addressed field
-without focus is refused before anything is sent, with
-`code:"catalyst_text_needs_focus"`. Next: `click` the field (a background
+without focus is refused before anything is sent (background or
+foreground), with `code:"catalyst_text_needs_focus"`. Next: `click` the field (a background
 click is enough), then call `type_text` again. The AX value is often
 unreadable, so expect `⚠️ Not confirmed:` and check the screenshot.
 

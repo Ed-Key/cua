@@ -449,6 +449,9 @@ impl Tool for TypeTextTool {
                 let wid = window_id.expect("background refusals require a window target");
                 return super::background_refusal_result(pid, wid, &refusal);
             }
+            Ok(Ok(TypeTextDelivery::CatalystNeedsFocus)) => {
+                return catalyst_text_needs_focus_result(pid, window_id);
+            }
             Ok(Ok(TypeTextDelivery::SynthesisRefused {
                 path,
                 refusal,
@@ -818,8 +821,8 @@ fn electron_background_ax_refusal(
     })
 }
 
-/// A background type_text into a Mac Catalyst text view without keyboard
-/// focus, refused before any input.
+/// A type_text addressed to a Mac Catalyst text view without keyboard focus,
+/// refused before any input.
 const CATALYST_TEXT_NEEDS_FOCUS: &str = "catalyst_text_needs_focus";
 
 /// Whether a `(role, subrole)` chain (the target first, then its ancestors)
@@ -874,18 +877,31 @@ unsafe fn ax_role_chain(element: AXUIElementRef) -> Vec<(String, String)> {
     chain
 }
 
-/// The refusal for an addressed Catalyst text view without keyboard focus.
-fn catalyst_text_needs_focus() -> BackgroundRefusal {
-    BackgroundRefusal {
-        code: CATALYST_TEXT_NEEDS_FOCUS,
-        reason: "This Mac Catalyst text view does not have keyboard focus. Catalyst \
-                 ignores accessibility text writes and focus requests, so only typed keys \
-                 reach it, and keys go to the field that has focus. Nothing was sent. Next: \
-                 click the field (its element_token; a background click is enough), then \
-                 call type_text again."
-            .to_owned(),
-        advice: None,
-    }
+/// The refusal for an addressed Catalyst text view without keyboard focus,
+/// on the background and the foreground route alike.
+fn catalyst_text_needs_focus_result(pid: i32, window_id: Option<u32>) -> ToolResult {
+    let reason = "This Mac Catalyst text view does not have keyboard focus. Catalyst ignores \
+                  accessibility text writes and focus requests, so only typed keys reach it, \
+                  and keys go to the field that has focus. Nothing was sent. Next: click the \
+                  field (its element_token; a background click is enough), then call \
+                  type_text again.";
+    ToolResult::error(format!(
+        "type_text refused ({CATALYST_TEXT_NEEDS_FOCUS}): {reason}"
+    ))
+    .with_structured(serde_json::json!({
+        "code": CATALYST_TEXT_NEEDS_FOCUS,
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "reason": reason,
+    }))
+}
+
+/// Whether `element` is an addressed Mac Catalyst text view that does not
+/// have keyboard focus: keys sent now would go to whatever has it.
+fn is_unfocused_catalyst_text_view(pid: i32, element: AXUIElementRef, window_id: Option<u32>) -> bool {
+    is_catalyst_text_view(&unsafe { ax_role_chain(element) })
+        && !addressed_element_has_focus(pid, element, window_id)
 }
 
 const DELIVERY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
@@ -916,6 +932,8 @@ enum BackgroundKeyboardPolicy {
 enum TypeTextDelivery {
     Typed(TypeTextOutcome),
     Refused(BackgroundRefusal),
+    /// An addressed Catalyst text view without keyboard focus; nothing sent.
+    CatalystNeedsFocus,
     SynthesisRefused {
         path: &'static str,
         refusal: SynthesisRefusal,
@@ -1432,6 +1450,14 @@ fn type_text_blocking(
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
+        // Catalyst ignores the AXFocused write this rung relies on: keys for an
+        // addressed text view without focus would go to whatever has it, and a
+        // readable unchanged target would then report "delivered 0" wrongly.
+        if element_ptr_and_idx
+            .is_some_and(|(ptr, _)| is_unfocused_catalyst_text_view(pid, ptr as AXUIElementRef, window_id))
+        {
+            return Ok(TypeTextDelivery::CatalystNeedsFocus);
+        }
         let screen_sharing_target = crate::input::keyboard::is_screen_sharing_pid(pid);
         if let Some(refusal) = synthesis_preflight(
             if screen_sharing_target {
@@ -1610,7 +1636,8 @@ fn type_text_blocking(
     // and ignores AXFocused writes too: never send that write. Keys reach the
     // field when it has keyboard focus (the focused element, or an addressed
     // one that is focused in its window); an addressed field without focus is
-    // refused, since keys would go to whatever has it.
+    // refused, since keys would go to whatever has it (the foreground rung
+    // above applies the same rule).
     let ax_target = match ax_target {
         Some((element, owns, _))
             if is_catalyst_text_view(&unsafe { ax_role_chain(element) }) =>
@@ -1620,7 +1647,7 @@ fn type_text_blocking(
                 unsafe { CFRelease(element as CFTypeRef) };
             }
             if !focused {
-                return Ok(TypeTextDelivery::Refused(catalyst_text_needs_focus()));
+                return Ok(TypeTextDelivery::CatalystNeedsFocus);
             }
             tracing::debug!("type_text: pid {pid} target is a focused Catalyst text view; keys only");
             None
@@ -2319,16 +2346,24 @@ mod tests {
         assert_eq!(outcome.delivered_chars, None);
     }
 
-    /// A background insert into a Catalyst text view never sends the AX text
-    /// write the view would ignore: a focused view (the window's focused
-    /// element, or an addressed one that has focus) goes to keys, and an
-    /// addressed view without focus is refused before any input.
+    /// A Catalyst text view never gets the AX text write it would ignore. A
+    /// focused view (the window's focused element, or an addressed one that
+    /// has focus) goes to keys; an addressed view without focus is refused
+    /// before any input, on the background and the foreground route alike.
     #[test]
     fn catalyst_text_views_get_keys_when_focused_and_a_refusal_otherwise() {
+        use super::super::DeliveryMode::{Background, Foreground};
         // The oversized payload stops the key rung at its synthesis budget, so
         // reaching it posts no real key events from this unit test.
         let text = "x".repeat(6_500);
-        for (addressed, focused) in [(false, true), (true, true), (true, false)] {
+        for (mode, addressed, focused) in [
+            (Background, false, true),
+            (Background, true, true),
+            (Background, true, false),
+            (Foreground, false, true),
+            (Foreground, true, true),
+            (Foreground, true, false),
+        ] {
             let fixture =
                 crate::ax::bindings::test_support::EditorScope::install("AXTextArea", None, || {});
             fixture.catalyst();
@@ -2341,29 +2376,40 @@ mod tests {
                 addressed.then(|| (fixture.element_ptr(), Some(3))),
                 0,
                 false,
-                super::super::DeliveryMode::Background,
+                mode,
                 Some(42),
                 BackgroundKeyboardPolicy::Allowed,
                 true,
             )
             .expect("a Catalyst target is decided before any input");
-            assert_eq!(fixture.value(), "", "no AX text write (addressed {addressed})");
+            let case = format!("{mode:?} addressed {addressed} focused {focused}");
+            assert_eq!(fixture.value(), "", "no AX text write ({case})");
             match (result, focused) {
                 (
                     TypeTextDelivery::SynthesisRefused {
-                        path: PATH_KEY_EVENTS,
                         ax_attempt: AxAttempt::NotAttempted,
                         ..
                     },
                     true,
                 ) => {}
-                (TypeTextDelivery::Refused(refusal), false) => {
-                    assert_eq!(refusal.code, CATALYST_TEXT_NEEDS_FOCUS);
-                    assert!(refusal.reason.contains("click the field"), "{}", refusal.reason);
-                }
-                _ => panic!("addressed {addressed} focused {focused}: wrong route"),
+                (TypeTextDelivery::CatalystNeedsFocus, false) => {}
+                _ => panic!("{case}: wrong route"),
             }
         }
+    }
+
+    #[test]
+    fn the_catalyst_focus_refusal_names_the_next_step() {
+        let result = catalyst_text_needs_focus_result(7, Some(42));
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.as_ref().unwrap();
+        assert_eq!(data["code"], "catalyst_text_needs_focus");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["window_id"], 42);
+        let text = summary_of(&result);
+        assert!(text.starts_with("type_text refused (catalyst_text_needs_focus)"), "{text}");
+        assert!(text.contains("click the field"), "{text}");
+        assert!(text.contains("Nothing was sent"), "{text}");
     }
 
     #[test]

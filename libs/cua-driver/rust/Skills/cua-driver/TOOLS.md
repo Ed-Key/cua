@@ -82,7 +82,7 @@ check `describe <tool>` there.
 - For a browser tab, the typed browser tools ([BROWSER.md](BROWSER.md)) are the reliable route. For an embedded web view, use the `x`,`y` form.
 - The typing response has no screenshot; request one with `get_window_state` when accessibility cannot establish the result.
 - The summary's first words state the evidence: `✅ Inserted` only when a read-back shows the text; otherwise `⚠️ Not confirmed:` with the reason. Read the field or take a screenshot before typing again.
-- Mac Catalyst text views (WhatsApp, Messages, Stocks search) take only typed keys, which reach the field with keyboard focus. An addressed one without focus is refused with `catalyst_text_needs_focus` before any input: click it (background is fine), then call `type_text` again.
+- Mac Catalyst text views (WhatsApp, Messages, Stocks search) take only typed keys, which reach the field with keyboard focus. An addressed one without focus is refused with `catalyst_text_needs_focus` before any input, in either delivery mode: click it (background is fine), then call `type_text` again.
 - Background keystrokes can miss other focus-sensitive surfaces. Retry with `delivery_mode:"foreground"` only when a fresh read shows the text did not appear. Foreground delivery requires explicit authorization.
 
 ## press_key and hotkey
