@@ -1154,6 +1154,18 @@ impl BrowserEngine {
             || previous_grant
                 .as_ref()
                 .is_some_and(|grant| grant.cleanup_remote_debugging);
+        // Release the previous claim before minting its replacement: a
+        // cancellation between the two then leaves a grant without a claim
+        // (released harmlessly), never a claim without a grant.
+        if let Some(previous) = previous_grant {
+            self.release_grant_socket(&previous).await;
+            if let Some(protected) = previous.protected_consent.as_ref() {
+                self.approval_broker.revoke(protected).await;
+            }
+            if previous.endpoint_ws_url != endpoint.ws_url {
+                self.pool.release_claim_marker(&previous.endpoint_ws_url);
+            }
+        }
         let grant = self.existing_profile_grants.mint(
             &request.session,
             request.transport_session.as_deref(),
@@ -1166,15 +1178,6 @@ impl BrowserEngine {
             cleanup_remote_debugging,
             protected_consent,
         );
-        if let Some(previous) = previous_grant {
-            self.release_grant_socket(&previous).await;
-            if let Some(protected) = previous.protected_consent.as_ref() {
-                self.approval_broker.revoke(protected).await;
-            }
-            if previous.endpoint_ws_url != endpoint.ws_url {
-                self.pool.release_claim_marker(&previous.endpoint_ws_url);
-            }
-        }
         let (claimed, displayed_consent_prompt) = {
             let ws_url = endpoint.ws_url.clone();
             let mut claim = Box::pin(self.pool.claim_existing(&ws_url, grant.generation));

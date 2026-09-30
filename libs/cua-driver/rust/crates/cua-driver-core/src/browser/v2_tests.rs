@@ -1289,6 +1289,60 @@ async fn an_existing_profile_attach_changes_its_claim_only_under_the_endpoint_ga
     crate::session::fire_session_end(TRANSPORT);
 }
 
+#[tokio::test]
+async fn a_cancelled_reprepare_never_leaves_a_claim_without_a_grant() {
+    const TRANSPORT: &str = "transport-v2-reprepare-cancel";
+    let (f, _provider) = protected_existing_profile_fixture().await;
+    let url = f._server.ws_url();
+    let tool = BrowserPrepareTool::new(f.engine.clone());
+    let request = json!({
+        "pid": 1,
+        "window_id": 7,
+        "session": SESSION,
+        "_transport_session_id": TRANSPORT,
+        "strategy": { "kind": "existing_profile" }
+    });
+    let prepared = tool.invoke(request.clone()).await;
+    assert_eq!(structured(&prepared)["status"], "ok", "{}", structured(&prepared));
+    let first = f
+        .engine
+        .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await
+        .unwrap()
+        .unwrap()
+        .generation;
+
+    // An ordinary dial stalled in its handshake holds the pool lock, so the
+    // re-prepare stops at its first pool step; cancel it there.
+    let stalled = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let stalled_url = format!(
+        "ws://127.0.0.1:{}/devtools/browser/stalled",
+        stalled.local_addr().unwrap().port()
+    );
+    let holder = tokio::spawn({
+        let engine = f.engine.clone();
+        async move { engine.pool.get(&stalled_url).await.map(|_| ()) }
+    });
+    let _accepted = stalled.accept().await.unwrap();
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(300), tool.invoke(request))
+            .await
+            .is_err(),
+        "the re-prepare must reach the stalled pool"
+    );
+    holder.abort();
+    let _ = holder.await;
+
+    // Whatever grant survived, releasing it releases every claim.
+    f.engine
+        .revoke_existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+        .await;
+    let Err(error) = f.engine.pool.get_existing(&url, first).await else {
+        panic!("generation {first} still owns the socket after its session ended")
+    };
+    assert!(error.to_string().contains("missing"), "{error}");
+}
+
 /// Forwards WebSocket connections to the mock endpoint after a delay, so a
 /// claim outlasts the 500 ms prompt window; `cut` drops every open link.
 struct SlowProxy {

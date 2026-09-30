@@ -990,7 +990,7 @@ impl BrowserEngine {
                 || {
                     let new_generation = self
                         .existing_profile_grants
-                        .bump_generation(session, transport_session, pid)?;
+                        .bump_generation(session, transport_session, pid, old_generation)?;
                     self.store
                         .invalidate_endpoint_generation(pid, old_generation);
                     Ok(new_generation)

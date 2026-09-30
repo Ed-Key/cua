@@ -194,11 +194,14 @@ impl ExistingProfileGrants {
         removed
     }
 
+    /// Advance the grant from `expected` only: a grant another prepare
+    /// already replaced is not this reconnect's to move.
     pub fn bump_generation(
         &self,
         public_session: &str,
         transport_session: Option<&str>,
         pid: i64,
+        expected: u64,
     ) -> Result<u64, BrowserRefusal> {
         let key = Self::key(public_session, transport_session, pid);
         let mut grants = self.inner.lock().unwrap();
@@ -208,6 +211,12 @@ impl ExistingProfileGrants {
                 "no live existing-profile grant remains for reconnect",
             )
         })?;
+        if grant.generation != expected {
+            return Err(BrowserRefusal::new(
+                BrowserRefusalCode::BrowserBindingStale,
+                "the existing-profile grant was replaced while reconnecting; retry the call",
+            ));
+        }
         if grant.reconnect_attempts_remaining == 0 {
             return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserReconnectExhausted,
@@ -361,8 +370,10 @@ mod tests {
         };
         let first = mint("public-a");
         let second = mint("public-b");
-        let bumped = grants.bump_generation("public-a", None, 42).unwrap();
+        let bumped = grants.bump_generation("public-a", None, 42, first).unwrap();
         assert!(first != second && bumped != second && bumped > first);
+        let stale = grants.bump_generation("public-a", None, 42, first).unwrap_err();
+        assert_eq!(stale.code, BrowserRefusalCode::BrowserBindingStale);
     }
 
     #[test]
