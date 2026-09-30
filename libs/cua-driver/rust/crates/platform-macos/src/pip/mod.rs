@@ -45,7 +45,8 @@
 //!   keeps its place and holds no slot, and an ended session's dragged
 //!   position and resized size are remembered while the daemon runs.
 //! - 8 s without a new frame for that session: fade out (0.25 s), then
-//!   `orderOut`. The next frame fades it back in.
+//!   `orderOut`. The next frame fades it back in. Going idle is only that:
+//!   nothing is marked finished (see `finish`).
 //! - While the session's target window is fully visible to the user (see
 //!   `visibility`), the panel stays hidden; it returns when the window is
 //!   covered, moves off screen or to another Space. Every frame carries a
@@ -54,7 +55,10 @@
 //! - The header's close button hides the panel until the session's next
 //!   frame; the focus button brings the target window forward through the
 //!   same code path as the `bring_to_front` tool.
-//! - Session end: fade out, close, release.
+//! - Session end (`end_session`, or its control connection closing): the
+//!   session is done; its finished state plays if the panel may show it,
+//!   then fade out, close, release. A session the idle sweep reclaimed
+//!   (300 s idle; it may be revived) only fades out and closes.
 //!
 //! ## Live mirror
 //!
@@ -98,11 +102,14 @@
 //! ## Finished state
 //!
 //! `verify_state` results arrive as labelled claims (`push_verification`)
-//! straight to the main queue. When the session finishes (8 s idle after
-//! acting, or `end_session`) while its panel is up, the front card shows a
-//! checklist of its recent claims, rows coming in 80 ms apart, (or, with no
-//! claims, the windows it touched as chips), holds 2.5 s, then the panel
-//! fades. A new action cancels it and the panel is live again.
+//! straight to the main queue. A window a verification proves gets its
+//! check at once (a chip behind, a badge on the front card). On proof
+//! (8 s of quiet after a satisfied claim) the front card shows a checklist
+//! of the session's recent claims, rows coming in 70 ms apart; when the
+//! session ends it shows that checklist or, with no claims, the windows it
+//! touched as chips. The finished state holds 2 s, then the panel fades. A
+//! new action cancels it and the panel is live again. Idle alone shows
+//! none of this.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
@@ -112,7 +119,7 @@ use std::time::{Duration, Instant};
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use pip_preview::{PipBackend, PipConfig, PipFrame};
+use pip_preview::{PipBackend, PipConfig, PipFrame, PipSessionEnd};
 
 mod cursor;
 mod finish;
@@ -124,8 +131,8 @@ mod visibility;
 use cursor::{cursor_in_well, sprite_placement, sprite_window, Sprite};
 pub(crate) use cursor::sprite_box;
 use finish::{
-    checklist_fit, chip_grid, row_width, Claim, Finale, Lifecycle, Rows, Verdicts, CAPTION_GAP,
-    CAPTION_LINE, LABEL_X, MARK_SIZE, MORE_LINE, ROW_INSET, ROW_PAD,
+    checklist_fit, chip_grid, row_width, Claim, Ending, Finale, Lifecycle, News, Rows, Verdicts,
+    CAPTION_GAP, CAPTION_LINE, LABEL_X, MARK_SIZE, MORE_LINE, ROW_INSET, ROW_PAD,
 };
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
@@ -474,6 +481,9 @@ struct Panel {
     trail_motion: Trail,
     /// What the session verified and finished.
     verdicts: Verdicts,
+    /// When the newest proof arrived (its finale waits out a quiet period
+    /// from here or from the last action, whichever is later).
+    proof_at: Option<Instant>,
     /// Windows logged as finished (so each is logged once per finish).
     finished_seen: HashSet<u32>,
     lifecycle: Lifecycle,
@@ -989,9 +999,34 @@ impl PipBackend for MacosPipBackend {
         dispatch_to_main(verification, apply_verify_cb);
     }
 
-    fn end_session(&self, session_key: &str) {
+    fn end_session(&self, session_key: &str, end: PipSessionEnd) {
+        let target = lock(&self.worker.active)
+            .get(session_key)
+            .map(|(target, _)| *target);
         self.worker.forget(session_key);
-        dispatch_to_main(session_key.to_owned(), end_session_cb);
+        // A finished session's hidden panel may come back for its finale,
+        // but never over a window the user can see: the poll stopped
+        // answering when the session went idle, so ask now (WindowServer
+        // calls, so here and not on the main queue).
+        let target_visible = target
+            .filter(|_| end == PipSessionEnd::Finished)
+            .map(|target| {
+                let (windows, displays) = visibility::snapshot();
+                visibility::target_fully_visible(
+                    target,
+                    &windows,
+                    &displays,
+                    std::process::id() as i32,
+                )
+            });
+        dispatch_to_main(
+            SessionEnd {
+                key: session_key.to_owned(),
+                end,
+                target_visible,
+            },
+            end_session_cb,
+        );
     }
 
     fn shutdown(self: Box<Self>) {
@@ -1439,6 +1474,7 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
         if !worker.is_live(&key) {
             return;
         }
+        // Proof among it waits for the panel (see `create_panel`).
         state.early.entry(key).or_default().verify(
             target_pid,
             window,
@@ -1448,7 +1484,7 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
         );
         return;
     };
-    let mut news = false;
+    let mut news = News::None;
     let restacked = restack(panel, &key, &worker, |panel| {
         news = panel
             .verdicts
@@ -1458,18 +1494,24 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
     if restacked {
         announce_stack(panel, &key);
     }
-    // Older than what is known: nothing to show.
-    if !news {
+    // Older than what is known, or a repeat of it: nothing to show.
+    if news == News::None {
         return;
     }
-    // News that lands while the finale plays (verify_state can outlast the
-    // idle timer) replays it, so nothing is shown stale.
+    // News that lands while the finale plays replays it, so nothing is
+    // shown stale.
     if let Some(generation) = panel.lifecycle.restart() {
-        play_finale(panel, &key, &panel.verdicts.finale(), generation);
-    } else if panel.lifecycle.news_arrived() {
-        // It landed after the finale for this stretch was over: it gets a
-        // finale of its own (unless the user closed the panel).
-        refresh(state, &key);
+        let finale = finish::replayed(&mut panel.verdicts);
+        play_finale(panel, &key, &finale, generation);
+    } else if news == News::Proof {
+        // Proof: its finale plays once the session has been quiet for the
+        // idle period from now (see `refresh`). Until then the visibility
+        // poll keeps answering for the target, so a hidden panel comes back
+        // only over a window the user cannot see.
+        let now = Instant::now();
+        panel.proof_at = Some(now);
+        worker.mark_delivered(&key, now);
+        dispatch_to_main_after(IDLE_HIDE_AFTER + Duration::from_millis(20), key, idle_check_cb);
     }
 }
 
@@ -1942,7 +1984,6 @@ unsafe fn refresh(state: &mut State, key: &str) {
         next_stream_generation,
         image_size,
         anchor,
-        worker,
         ..
     } = state;
     // An ended session's panel keeps its slot while its finale is up.
@@ -1956,15 +1997,26 @@ unsafe fn refresh(state: &mut State, key: &str) {
     let Some(panel) = panels.get_mut(key) else {
         return;
     };
-    let active = !idle_hide_due(panel.last_action, Instant::now());
-    // Gone idle after acting: the session finished. The finale plays if the
-    // panel is up; the panel stays up for it whatever else happens.
-    if panel.lifecycle.due(active) {
-        finish_session(panel, key, worker);
+    let now = Instant::now();
+    // Going idle only fades the panel: idle is not done.
+    let active = !idle_hide_due(panel.last_action, now);
+    // The proof timer row of the table in `finish`: proof the session has
+    // been quiet on plays its checklist, on a hidden panel too if it may
+    // come up.
+    let quiet = finish::proof_quiet(panel.last_action, panel.proof_at, now);
+    let may_show = finish::may_show(panel.shown, panel.target_visible);
+    if let Some((finale, generation)) =
+        finish::proof_finale(&mut panel.verdicts, &mut panel.lifecycle, quiet, may_show)
+    {
+        play_finale(panel, key, &finale, generation);
     }
+    // The panel stays up for a finale whatever else happens, and a shown
+    // panel stays up while proof waits for its finale (no fade out and back
+    // in between the idle deadline and the proof timer).
     let finale = panel.lifecycle.playing();
+    let waiting = panel.shown && panel.verdicts.proof_waiting();
     if panel_should_show(
-        active || finale,
+        active || finale || waiting,
         panel.lifecycle.closed(),
         panel.target_visible && !finale,
     ) {
@@ -2031,29 +2083,6 @@ fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
-}
-
-/// The session finished (idle after acting, or ended): its windows count as
-/// finished, so back cards collapse into chips, and if the panel is up the
-/// finale plays, ending on its own timer.
-unsafe fn finish_session(panel: &mut Panel, key: &str, worker: &CaptureWorker) {
-    let at = now_ms();
-    if restack(panel, key, worker, |panel| {
-        panel.verdicts.finish_session(at)
-    }) {
-        announce_stack(panel, key);
-    }
-    note_finished(panel, key);
-    let finale = panel.verdicts.finale();
-    // Late claims (a verification that finished after the last finale) are
-    // shown even if that finale's fade hid the panel, wherever the panel
-    // would be allowed to show; a user's close is always respected.
-    let late = panel.lifecycle.late();
-    let visible = finale.len() > 0 && (panel.shown || (late && !panel.target_visible));
-    let Some(generation) = panel.lifecycle.start(visible) else {
-        return;
-    };
-    play_finale(panel, key, &finale, generation);
 }
 
 /// Show `finale` (from the top) and time its end under `generation`.
@@ -2611,8 +2640,21 @@ unsafe extern "C" fn order_out_cb(ctx: *mut c_void) {
     });
 }
 
+/// A session's panel is going away.
+struct SessionEnd {
+    key: String,
+    end: PipSessionEnd,
+    /// Whether the user can see the whole target window right now (asked
+    /// only for a finished session that had a target).
+    target_visible: Option<bool>,
+}
+
 unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
-    let key: String = *Box::from_raw(ctx as *mut String);
+    let SessionEnd {
+        key,
+        end,
+        target_visible,
+    } = *Box::from_raw(ctx as *mut SessionEnd);
     with_state(|state| {
         state.early.remove(&key);
         let Some(mut panel) = state.panels.remove(&key) else {
@@ -2632,13 +2674,33 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         if remembered.origin.is_some() || remembered.card.is_some() {
             state.remembered.insert(key.clone(), remembered);
         }
-        // Ending is finishing: the finale plays (or keeps playing) if the
-        // panel is up, and the panel closes when it is over.
-        if panel.lifecycle.due(false) {
-            finish_session(&mut panel, &key, &state.worker);
+        if let Some(visible) = target_visible {
+            panel.target_visible = visible;
         }
-        if panel.lifecycle.playing() {
-            // Owed late claims can bring a hidden panel back for its finale.
+        // The `end_session` and idle-TTL eviction rows of the table in
+        // `finish`. A finished session is done whatever its finale is doing:
+        // its windows count as finished, so back cards collapse into chips.
+        // Then its finale plays (or keeps playing) and the panel closes when
+        // it is over. An expired session only closes.
+        tracing::info!(target: "pip", session = %key, ?end, "PiP session ended");
+        let at = now_ms();
+        let may_show = finish::may_show(panel.shown, panel.target_visible);
+        let mut ending = Ending::Close;
+        if restack(&mut panel, &key, &state.worker, |panel| {
+            ending = finish::end_session(
+                &mut panel.verdicts,
+                &mut panel.lifecycle,
+                end,
+                at,
+                may_show,
+            )
+        }) {
+            announce_stack(&panel, &key);
+        }
+        note_finished(&mut panel, &key);
+        if let Ending::Play(finale, generation) = &ending {
+            play_finale(&mut panel, &key, finale, *generation);
+            // A hidden panel comes back for its finale.
             if !panel.shown {
                 let others: Vec<usize> = state
                     .panels
@@ -2649,9 +2711,10 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
                 place_on_show(&mut panel, others, state.image_size, state.anchor);
                 show(&mut panel);
             }
-            state.ending.push(panel);
-        } else {
-            close_panel(panel, FADE);
+        }
+        match ending {
+            Ending::Close => close_panel(panel, FADE),
+            Ending::Playing | Ending::Play(..) => state.ending.push(panel),
         }
     });
 }
@@ -3174,7 +3237,10 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         layout: vec![Slot::Front],
         motion: Default::default(),
         trail_motion: Trail::default(),
+        // Evidence from before the panel existed; proof among it counts its
+        // quiet period from the first frame's action (`proof_at` is `None`).
         verdicts: state.early.remove(key).unwrap_or_default(),
+        proof_at: None,
         finished_seen: HashSet::new(),
         lifecycle: Lifecycle::default(),
         finale_view: None,
@@ -4867,7 +4933,13 @@ mod tests {
 
         worker.push(frame("s", "before end"));
         started.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Before its first capture the session is live: a verification now
+        // is kept for its panel.
+        assert!(worker.is_live("s"));
         worker.forget("s"); // end_session while the capture runs
+        // Ended before its first capture: no panel ever comes, so nothing
+        // is kept for one and nothing is shown.
+        assert!(!worker.is_live("s"));
         release.send(()).unwrap();
         let (label, epoch, _) = delivered.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(label, "before end");
