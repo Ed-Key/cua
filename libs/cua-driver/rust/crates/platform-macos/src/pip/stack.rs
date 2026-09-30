@@ -130,8 +130,8 @@ impl<K: PartialEq + Copy, V: Default> CardStack<K, V> {
     }
 
     /// The session acted in `key` at `now`: it becomes (or stays) the front
-    /// card, the others keep their order behind it, and the deepest card
-    /// beyond `MAX_CARDS` drops.
+    /// card and the others keep their order behind it. Nothing drops here:
+    /// `prune` decides who leaves.
     pub(super) fn act(&mut self, key: K, now: Instant) {
         if !self.raise(key) {
             self.cards.insert(
@@ -142,9 +142,30 @@ impl<K: PartialEq + Copy, V: Default> CardStack<K, V> {
                     data: V::default(),
                 },
             );
-            self.cards.truncate(MAX_CARDS);
         }
         self.cards[0].acted = now;
+    }
+
+    /// The session acted in `key` at `now` while the user's pick is the
+    /// front card: the window joins, or refreshes, as the first back card
+    /// and the front stays. Acting in the front card itself only refreshes
+    /// its time.
+    pub(super) fn act_behind(&mut self, key: K, now: Instant) {
+        let mut card = match self.cards.iter().position(|card| card.key == key) {
+            Some(0) => return self.cards[0].acted = now,
+            Some(index) => self.cards.remove(index),
+            None => Card {
+                key,
+                acted: now,
+                data: V::default(),
+            },
+        };
+        card.acted = now;
+        self.cards.insert(1.min(self.cards.len()), card);
+    }
+
+    pub(super) fn card_mut(&mut self, key: K) -> Option<&mut Card<K, V>> {
+        self.cards.iter_mut().find(|card| card.key == key)
     }
 
     /// Bring a card already in the stack to the front without counting as
@@ -158,18 +179,51 @@ impl<K: PartialEq + Copy, V: Default> CardStack<K, V> {
         true
     }
 
-    /// Drop back cards the session has not acted in for `BACK_CARD_TTL`, and
-    /// back cards whose window is `gone`. The front card always stays.
-    /// Whether anything dropped.
-    pub(super) fn prune(&mut self, now: Instant, gone: impl Fn(&K) -> bool) -> bool {
+    /// Who leaves the stack at `now`. A back card whose window is `gone`
+    /// always does. Unless `keep` holds the stack (the user's hands are on
+    /// the panel), so does a back card the session has not acted in for
+    /// `BACK_CARD_TTL`, and the deepest back cards beyond `MAX_CARDS`; a
+    /// window `keep` protects (the user's pick) stays whatever its age or
+    /// depth, and the next deepest goes instead. The front card always
+    /// stays. Whether anything dropped.
+    pub(super) fn prune(&mut self, now: Instant, keep: &Keep<K>, gone: impl Fn(&K) -> bool) -> bool {
         let before = self.cards.len();
         let mut depth = 0;
         self.cards.retain(|card| {
             depth += 1;
             depth == 1
-                || (now.saturating_duration_since(card.acted) < BACK_CARD_TTL && !gone(&card.key))
+                || (!gone(&card.key)
+                    && (keep.held
+                        || keep.protects(&card.key)
+                        || now.saturating_duration_since(card.acted) < BACK_CARD_TTL))
         });
+        while !keep.held && self.cards.len() > MAX_CARDS {
+            let deepest = self.cards.iter().rposition(|card| !keep.protects(&card.key));
+            match deepest {
+                Some(index) if index > 0 => self.cards.remove(index),
+                _ => break,
+            };
+        }
         self.cards.len() != before
+    }
+}
+
+/// What `CardStack::prune` may not drop now (see `hands`).
+#[derive(Debug, Clone, Copy, Default)]
+pub(super) struct Keep<K> {
+    /// The user holds the panel (the pointer is on it, a press, or an
+    /// interaction less than the idle period old): no back card expires and
+    /// none is evicted by capacity.
+    pub(super) held: bool,
+    /// Windows that stay whatever their age or depth: the user's pick, and
+    /// behind it the window the agent last acted in (what the panel follows
+    /// again when the pick is over).
+    pub(super) windows: [Option<K>; 2],
+}
+
+impl<K: PartialEq> Keep<K> {
+    fn protects(&self, key: &K) -> bool {
+        self.windows.iter().flatten().any(|window| window == key)
     }
 }
 
@@ -997,6 +1051,9 @@ mod tests {
         start + Duration::from_secs(secs)
     }
 
+    /// Nobody's hands on the panel and no pick.
+    const NOBODY: Keep<u32> = Keep { held: false, windows: [None, None] };
+
     #[test]
     fn acting_in_a_new_window_pushes_it_in_front_and_keeps_three_back_items() {
         let t = Instant::now();
@@ -1008,6 +1065,7 @@ mod tests {
         for key in [3, 4, 5] {
             stack.act(key, t);
         }
+        assert!(stack.prune(t, &NOBODY, |_| false));
         assert_eq!(
             stack.keys(),
             [5, 4, 3, 2],
@@ -1128,10 +1186,10 @@ mod tests {
         stack.act(1, t);
         stack.act(2, at(t, 20));
         stack.act(3, at(t, 25));
-        assert!(!stack.prune(at(t, 29), |_| false));
-        assert!(stack.prune(at(t, 30), |_| false));
+        assert!(!stack.prune(at(t, 29), &NOBODY, |_| false));
+        assert!(stack.prune(at(t, 30), &NOBODY, |_| false));
         assert_eq!(stack.keys(), [3, 2]);
-        assert!(stack.prune(at(t, 100), |_| false));
+        assert!(stack.prune(at(t, 100), &NOBODY, |_| false));
         assert_eq!(stack.keys(), [3], "the front card stays however old");
     }
 
@@ -1142,11 +1200,75 @@ mod tests {
         for key in [1, 2, 3] {
             stack.act(key, t);
         }
-        assert!(stack.prune(t, |key| *key == 2));
+        assert!(stack.prune(t, &NOBODY, |key| *key == 2));
         assert_eq!(stack.keys(), [3, 1]);
         // The front card's window is the panel's business, not the stack's.
-        assert!(!stack.prune(t, |key| *key == 3));
+        assert!(!stack.prune(t, &NOBODY, |key| *key == 3));
         assert_eq!(stack.keys(), [3, 1]);
+    }
+
+    /// The back cards column of the hands table (see `hands`): nothing
+    /// expires and nothing is evicted while the user holds the panel, and
+    /// their action times are left alone, so they go once the hold is over.
+    #[test]
+    fn a_held_panel_drops_no_back_card_by_age_or_capacity() {
+        let t = Instant::now();
+        let held = Keep { held: true, windows: [None, None] };
+        let mut stack = Stack::new();
+        for key in [1, 2, 3, 4] {
+            stack.act(key, t);
+        }
+        assert!(!stack.prune(at(t, 100), &held, |_| false), "no expiry under the user's hands");
+        // A fifth window the agent acts in joins without evicting anyone.
+        stack.act(5, at(t, 100));
+        assert!(!stack.prune(at(t, 100), &held, |_| false));
+        assert_eq!(stack.keys(), [5, 4, 3, 2, 1]);
+        assert_eq!(stack.cards()[4].acted, t, "the hold rewrites no action time");
+        // A closed window still goes.
+        assert!(stack.prune(at(t, 100), &held, |key| *key == 3));
+        assert_eq!(stack.keys(), [5, 4, 2, 1]);
+        // The hold over, the old back cards expire as ever.
+        assert!(stack.prune(at(t, 101), &NOBODY, |_| false));
+        assert_eq!(stack.keys(), [5]);
+    }
+
+    /// The pick rows: the agent acting elsewhere joins behind the picked
+    /// front card, and the pick (with the agent's latest window behind it)
+    /// keeps its place in the stack whatever its age or depth.
+    #[test]
+    fn a_pick_stays_in_front_and_keeps_its_membership() {
+        let t = Instant::now();
+        let mut stack = Stack::new();
+        stack.act(1, t);
+        stack.act(2, at(t, 1));
+        assert!(stack.raise(1), "the user picks window 1");
+        // H6: the agent acts in another window, new or known.
+        stack.act_behind(3, at(t, 2));
+        assert_eq!(stack.keys(), [1, 3, 2]);
+        stack.act_behind(2, at(t, 3));
+        assert_eq!(stack.keys(), [1, 2, 3], "a known window refreshes as the first back card");
+        assert_eq!(stack.cards()[1].acted, at(t, 3));
+        // H7: the agent acts in the picked window.
+        stack.act_behind(1, at(t, 4));
+        assert_eq!(stack.keys(), [1, 2, 3]);
+        assert_eq!(stack.cards()[0].acted, at(t, 4));
+        // Capacity evicts the deepest item that is not protected.
+        let keep = Keep { held: false, windows: [Some(1), Some(3)] };
+        stack.act_behind(4, at(t, 5));
+        stack.act_behind(5, at(t, 5));
+        assert_eq!(stack.keys(), [1, 5, 4, 2, 3]);
+        assert!(stack.prune(at(t, 5), &keep, |_| false));
+        assert_eq!(stack.keys(), [1, 5, 4, 3], "window 2 goes, not the protected window 3 behind it");
+        // Age does not expire a protected back card; the rest expire.
+        assert!(stack.prune(at(t, 60), &keep, |_| false));
+        assert_eq!(stack.keys(), [1, 3]);
+        // A pick that went behind (the agent's card was clicked later)
+        // would be protected the same way.
+        let picked_behind = Keep { held: false, windows: [Some(3), None] };
+        assert!(!stack.prune(at(t, 600), &picked_behind, |_| false));
+        // A closed window goes even when protected.
+        assert!(stack.prune(at(t, 600), &picked_behind, |key| *key == 3));
+        assert_eq!(stack.keys(), [1]);
     }
 
     #[test]

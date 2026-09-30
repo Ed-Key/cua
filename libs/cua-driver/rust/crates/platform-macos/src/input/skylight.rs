@@ -428,6 +428,45 @@ pub fn main_connection_id() -> Option<u32> {
     connection_id_fn().map(|f| unsafe { f() })
 }
 
+/// `CGError SLSSetConnectionProperty(uint32_t cid, uint32_t target, CFStringRef key, CFTypeRef value)`
+type SetConnectionPropertyFn = unsafe extern "C" fn(u32, u32, *const c_void, *const c_void) -> i32;
+
+fn set_connection_property_fn() -> Option<SetConnectionPropertyFn> {
+    static SYM: OnceLock<Option<SetConnectionPropertyFn>> = OnceLock::new();
+    *SYM.get_or_init(|| {
+        find_sym(b"SLSSetConnectionProperty\0")
+            .or_else(|| find_sym(b"CGSSetConnectionProperty\0"))
+            .map(|p| unsafe { as_fn(p) })
+    })
+}
+
+/// Let this process change the system cursor while it is not the active
+/// app (`on`), or stop doing so. WindowServer ignores `[NSCursor set]` from
+/// a background process unless its connection carries the
+/// `SetsCursorInBackground` property. Returns `false` when the private
+/// symbols are missing or the call fails: the cursor then stays whatever
+/// the active app shows.
+pub fn set_cursor_in_background(on: bool) -> bool {
+    use core_foundation::base::TCFType;
+    let (Some(cid), Some(set)) = (main_connection_id(), set_connection_property_fn()) else {
+        return false;
+    };
+    let key = core_foundation::string::CFString::from_static_string("SetsCursorInBackground");
+    let value = if on {
+        core_foundation::boolean::CFBoolean::true_value()
+    } else {
+        core_foundation::boolean::CFBoolean::false_value()
+    };
+    unsafe {
+        set(
+            cid,
+            cid,
+            key.as_concrete_TypeRef() as *const c_void,
+            value.as_concrete_TypeRef() as *const c_void,
+        ) == 0
+    }
+}
+
 /// Return the current active macOS Space (desktop) ID.
 ///
 /// Uses the private `CGSGetActiveSpace` SPI from SkyLight.  Returns `None`
