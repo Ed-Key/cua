@@ -6,8 +6,14 @@
 //! column left of the cards. Back items trail the front card on a loose
 //! spring when the panel is dragged.
 //!
-//! Everything here is pure (unit tested): the stack model, where each item
-//! rests, the springs that animate items back to rest (after a promotion)
+//! The front card takes its window's shape (`card_shape`): the window's
+//! proportions fitted into the panel's size box, so a tall window gives a
+//! tall card and a wide one a wide card, and the picture fills it. The box's
+//! bottom-right corner is the card's anchor: a shape change grows or shrinks
+//! it up and left (`shaped_frame`), and the back items follow its top-left.
+//!
+//! Everything here is pure (unit tested): the stack model, the front card's
+//! shape, where each item rests, the springs that animate items back to rest (after a promotion)
 //! and the trail after a drag, resize clamping, and the header layout at
 //! small sizes. AppKit lives in `mod.rs`.
 //!
@@ -264,6 +270,69 @@ pub(super) fn slot_frame(card: (f64, f64), slot: Slot, back_cards: usize) -> Are
             w: CHIP_W,
             h: CHIP_H,
         },
+    }
+}
+
+// ── Card shape ────────────────────────────────────────────────────────────
+
+/// The front card is never wider than this times its height, nor taller
+/// than this times its width. A window past that keeps its own proportions
+/// inside the clamped card.
+pub(super) const MAX_ASPECT: f64 = 2.2;
+/// A window smaller than the size box is mirrored at its own size, but
+/// never below this fraction of the size that fills the box (a tiny window
+/// still gives a usable card).
+pub(super) const SMALL_FLOOR: f64 = 0.75;
+
+/// The largest size with `shape`'s proportions inside `bounds` (`bounds`
+/// itself for a degenerate shape).
+pub(super) fn fit(bounds: (f64, f64), shape: (f64, f64)) -> (f64, f64) {
+    if shape.0 <= 0.0 || shape.1 <= 0.0 {
+        return bounds;
+    }
+    let scale = (bounds.0 / shape.0).min(bounds.1 / shape.1);
+    (shape.0 * scale, shape.1 * scale)
+}
+
+/// Front card size (whole points) for a target window of `window` size in
+/// a panel whose size box is `bounds` (the default box, or the one the user
+/// set by resizing): the window's proportions, clamped to `MAX_ASPECT`,
+/// scaled down to fit the box. A window smaller than the box keeps its own
+/// size, raised to the `SMALL_FLOOR` and never past the box. The whole box
+/// while the window's size is unknown.
+pub(super) fn card_shape(bounds: (f64, f64), window: Option<(f64, f64)>) -> (f64, f64) {
+    let Some((w, h)) = window.filter(|(w, h)| *w > 0.0 && *h > 0.0) else {
+        return bounds;
+    };
+    // The card that holds the window at its own size.
+    let own = if w > h * MAX_ASPECT {
+        (w, w / MAX_ASPECT)
+    } else if h > w * MAX_ASPECT {
+        (h / MAX_ASPECT, h)
+    } else {
+        (w, h)
+    };
+    let fill = (bounds.0 / own.0).min(bounds.1 / own.1);
+    let scale = fill.min(1f64.max(SMALL_FLOOR * fill));
+    ((own.0 * scale).round().max(1.0), (own.1 * scale).round().max(1.0))
+}
+
+/// Resting frame of `slot` for a front card of `card` size in a panel whose
+/// size box is `bounds`: `slot_frame`, with the front card's bottom-right
+/// corner on the box's. That corner is the panel's anchor (its cascade slot,
+/// or where the user dragged it), so a card that changes shape grows or
+/// shrinks up and left, and the back items keep their places against its
+/// top and left edges.
+pub(super) fn shaped_frame(
+    bounds: (f64, f64),
+    card: (f64, f64),
+    slot: Slot,
+    back_cards: usize,
+) -> Area {
+    let frame = slot_frame(card, slot, back_cards);
+    Area {
+        x: frame.x + bounds.0 - card.0,
+        ..frame
     }
 }
 
@@ -688,6 +757,9 @@ pub(super) fn resize_settled(changed: Instant, now: Instant) -> bool {
 pub(super) const BAR_HEIGHT: f64 = 30.0;
 pub(super) const BAR_OVERLAP: f64 = 6.0;
 pub(super) const BAR_INSET: f64 = 12.0;
+/// The narrowest bar: the client icon, the dot, a few letters of title and
+/// the two buttons.
+pub(super) const BAR_MIN_WIDTH: f64 = 136.0;
 /// The bar fades in this fast on hover and out this long after the pointer
 /// leaves the card and the bar.
 pub(super) const BAR_FADE_IN: Duration = Duration::from_millis(150);
@@ -700,9 +772,11 @@ pub(super) const BAR_DOT: f64 = 6.0;
 /// Where the bar sits for a front card at `card` (panel coordinates) with
 /// `room_above` points of screen above the card's top: attached to the top
 /// edge, protruding above it, unless there is no room, when it sits just
-/// inside the card's top instead.
+/// inside the card's top instead. It spans the card's width less the inset,
+/// but a narrow card (a tall window's) gets a bar of `BAR_MIN_WIDTH` that
+/// reaches past its left edge.
 pub(super) fn bar_frame(card: Area, room_above: f64) -> Area {
-    let w = (card.w - 2.0 * BAR_INSET).max(0.0);
+    let w = (card.w - 2.0 * BAR_INSET).max(BAR_MIN_WIDTH);
     let top = card.y + card.h;
     let protrude = BAR_HEIGHT - BAR_OVERLAP;
     let y = if room_above >= protrude {
@@ -711,7 +785,7 @@ pub(super) fn bar_frame(card: Area, room_above: f64) -> Area {
         top - BAR_HEIGHT
     };
     Area {
-        x: card.x + (card.w - w) / 2.0,
+        x: card.x + card.w - BAR_INSET - w,
         y,
         w,
         h: BAR_HEIGHT,
@@ -774,6 +848,84 @@ pub(super) fn bar_layout(width: f64) -> BarLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The default size box.
+    const BOX: (f64, f64) = (320.0, 200.0);
+
+    #[test]
+    fn the_front_card_takes_its_windows_shape_inside_the_size_box() {
+        for (name, window, card) in [
+            // Bigger than the box: scaled down to touch it on one side.
+            ("landscape 3:2", (900.0, 600.0), (300.0, 200.0)),
+            ("a TextEdit document", (673.0, 439.0), (307.0, 200.0)),
+            ("portrait, like Calculator", (230.0, 410.0), (112.0, 200.0)),
+            ("square", (500.0, 500.0), (200.0, 200.0)),
+            ("the box's own shape", (1280.0, 800.0), (320.0, 200.0)),
+            // Smaller than the box: its own size, raised to 75% of the fill.
+            ("tiny", (200.0, 120.0), (240.0, 144.0)),
+            ("small, above the floor", (300.0, 190.0), (300.0, 190.0)),
+            // Past 2.2:1 either way: the clamped card (the picture keeps its
+            // own shape inside it).
+            ("very wide", (1400.0, 300.0), (320.0, 145.0)),
+            ("very tall", (300.0, 1400.0), (91.0, 200.0)),
+        ] {
+            let got = card_shape(BOX, Some(window));
+            assert_eq!(got, card, "{name}");
+            assert!(got.0 <= BOX.0 && got.1 <= BOX.1, "{name}: inside the box");
+            let aspect = got.0 / got.1;
+            assert!(aspect < MAX_ASPECT + 0.02 && aspect > 1.0 / MAX_ASPECT - 0.02, "{name}");
+        }
+        // Unknown or degenerate: the whole box.
+        assert_eq!(card_shape(BOX, None), BOX);
+        assert_eq!(card_shape(BOX, Some((0.0, 300.0))), BOX);
+        // The user's resize sets the box; the shape still follows the window.
+        assert_eq!(card_shape((500.0, 320.0), Some((230.0, 410.0))), (180.0, 320.0));
+        // A box bigger than the window: the window's own size, not blown up.
+        assert_eq!(card_shape((800.0, 600.0), Some((673.0, 439.0))), (673.0, 439.0));
+        // The picture inside a clamped card keeps the window's proportions.
+        let (w, h) = fit((320.0, 145.0), (1400.0, 300.0));
+        assert_eq!((w, h.round()), (320.0, 69.0));
+        assert_eq!(fit(BOX, (0.0, 0.0)), BOX);
+    }
+
+    #[test]
+    fn a_shape_change_keeps_the_front_cards_bottom_right_corner() {
+        let corner = |frame: Area| (frame.x + frame.w, frame.y);
+        let anchor = corner(shaped_frame(BOX, BOX, Slot::Front, 0));
+        assert_eq!(anchor, (STACK_MARGIN + BOX.0, 0.0), "the box's corner");
+        for window in [(900.0, 600.0), (230.0, 410.0), (1400.0, 300.0), (200.0, 120.0)] {
+            let card = card_shape(BOX, Some(window));
+            let front = shaped_frame(BOX, card, Slot::Front, 2);
+            assert_eq!(corner(front), anchor, "{window:?}");
+            assert_eq!((front.w, front.h), card);
+            // The back items keep their places against its top-left: each
+            // card a step up and left, the chips left of the last card.
+            let back = shaped_frame(BOX, card, Slot::Card(1), 2);
+            assert_eq!(back.x, front.x - CARD_STEP);
+            assert_eq!(back.y + back.h, front.y + front.h + CARD_STEP);
+            let chip = shaped_frame(BOX, card, Slot::Chip(0), 2);
+            assert_eq!(chip.x + chip.w, front.x - 2.0 * CARD_STEP - CHIP_GAP);
+            assert_eq!(chip.y, 0.0);
+        }
+    }
+
+    #[test]
+    fn a_narrow_cards_bar_keeps_its_buttons_apart() {
+        // A tall window's card is narrower than the bar's content: the bar
+        // keeps its least width and its right end, reaching past the card's
+        // left edge.
+        let narrow = shaped_frame(BOX, (112.0, 200.0), Slot::Front, 0);
+        let bar = bar_frame(narrow, 100.0);
+        assert_eq!(bar.w, BAR_MIN_WIDTH);
+        assert_eq!(bar.x + bar.w, narrow.x + narrow.w - BAR_INSET);
+        let layout = bar_layout(bar.w);
+        assert!(layout.title.w >= 20.0, "{layout:?}");
+        assert!(layout.title.x + layout.title.w < layout.focus.x);
+        // A card wide enough: inset on both sides, as before.
+        let wide = shaped_frame(BOX, BOX, Slot::Front, 0);
+        let bar = bar_frame(wide, 100.0);
+        assert_eq!((bar.x, bar.w), (wide.x + BAR_INSET, wide.w - 2.0 * BAR_INSET));
+    }
 
     type Stack = CardStack<u32, ()>;
 

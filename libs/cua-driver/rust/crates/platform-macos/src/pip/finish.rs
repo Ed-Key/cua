@@ -33,7 +33,7 @@
 //! | Event | Verdicts (per window) | Claims (per label) | Lifecycle: finale, idle deadline, user close | Picture and stack |
 //! |---|---|---|---|---|
 //! | Action note (on push) | records the action at its event ms (the session's last action is the newest of them), and the window it touched (identity and app, titled with the app name until a frame names it); ends a session finish older than it | none are dropped, but a claim older than the session's last action is no longer proof: it waits for a later finale | only if newer than the last applied action: cancels the finale (one playing, or a proof finale still waiting for its quiet period), restarts the idle deadline, lifts a user close | none |
-//! | Captured frame | resolves a pid-only action to its window at the action's event ms (replacing that action's app-only chip) and names the touched window (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card, back items, window titles |
+//! | Captured frame | resolves a pid-only action to its window at the action's event ms (replacing that action's app-only chip) and names the touched window (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card (and its shape, from the window's size), back items, window titles |
 //! | Verification | latest by event ms per window (an older one never wins; a repeat with the same event time and status is not news) | latest by event ms per predicate (its identity on its window, not its display label, which may collide: two predicates with one label are two rows), kept across finales; an older one is ignored, and so is a repeat with the same event time and status | if it brought news: replays a playing finale. Proof (a satisfied claim newer than the session's last action) starts the proof timer; unsatisfied or unknown news starts nothing by itself. Before the session's first capture the panel does not exist yet: the evidence is kept for it, and its proof timer starts with the panel | chips and cards follow the verdicts; the front card shows its check badge while its window is finished; a shown panel stays up while proof waits for its finale, and fades as soon as news calls that proof off |
 //! | Idle timer (8 s after the last action) | none: idle is not done | none | none: no finale | the panel fades (a quiet hide), unless proof is waiting for its finale |
 //! | Proof timer (8 s after the later of the session's last action and the proof's arrival, with no newer action) | none | the waiting proof is settled: it never comes due again by itself, played or not (its claims stay unshown until a finale displays them) | if a satisfied claim newer than the last action is still unshown and unsettled, the checklist plays (every unshown claim, latest status per predicate: a claim that flipped to unsatisfied shows as that): on the panel if it is up, and a quietly hidden panel is shown for it, unless the user closed the panel or the target window is fully visible (then nothing plays) | the panel fades after |
@@ -608,12 +608,50 @@ pub(super) fn checklist_fit(well_h: f64, rows: usize) -> ChecklistFit {
     fit(row_height, gap, visible, rows - visible)
 }
 
-/// Chips per row when `chips` wrap in a well `well_w` wide, `chip_w` each
-/// and `gap` apart (at least one per row), and how many rows that makes.
-pub(super) fn chip_grid(well_w: f64, chips: usize, chip_w: f64, gap: f64) -> (usize, usize) {
-    let room = (well_w - 2.0 * FINALE_PAD + gap).max(0.0);
-    let per_row = (((room) / (chip_w + gap)).floor() as usize).max(1);
-    (per_row, chips.div_ceil(per_row))
+/// How a row of chips fits a well: `per_row` chips to a row (at least one),
+/// the first `visible` of them in `rows` rows, and the `hidden` rest counted
+/// by a "+n more" line under the rows when they do not all fit the height
+/// (a tall window's card is narrow), so every window is shown or counted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct ChipFit {
+    pub(super) per_row: usize,
+    pub(super) rows: usize,
+    pub(super) visible: usize,
+    pub(super) hidden: usize,
+}
+
+impl ChipFit {
+    /// Height of the whole block: the rows of `chip_h` chips `gap` apart,
+    /// and the more line.
+    pub(super) fn height(&self, chip_h: f64, gap: f64) -> f64 {
+        let more = if self.hidden > 0 { MORE_LINE } else { 0.0 };
+        self.rows as f64 * chip_h + self.rows.saturating_sub(1) as f64 * gap + more
+    }
+}
+
+/// Fit `chips` chips of `chip` size, `gap` apart, into a `well`.
+pub(super) fn chip_grid(well: (f64, f64), chips: usize, chip: (f64, f64), gap: f64) -> ChipFit {
+    let room = (well.0 - 2.0 * FINALE_PAD + gap).max(0.0);
+    let per_row = ((room / (chip.0 + gap)).floor() as usize).max(1);
+    let all = ChipFit {
+        per_row,
+        rows: chips.div_ceil(per_row),
+        visible: chips,
+        hidden: 0,
+    };
+    let available = (well.1 - 2.0 * FINALE_PAD).max(0.0);
+    if all.height(chip.1, gap) <= available {
+        return all;
+    }
+    // Rows that fit above the more line (at least one).
+    let rows = (((available - MORE_LINE + gap) / (chip.1 + gap)).floor() as usize).clamp(1, all.rows);
+    let visible = chips.min(rows * per_row);
+    ChipFit {
+        per_row,
+        rows,
+        visible,
+        hidden: chips - visible,
+    }
 }
 
 /// When row `index` of a finale starts to come in, and when its mark
@@ -1581,9 +1619,20 @@ mod tests {
         assert_eq!(checklist_fit(10.0, 1).visible + checklist_fit(10.0, 1).hidden, 1);
         // Chips: five in one row at the default width, wrapped in two at
         // the smallest.
-        assert_eq!(chip_grid(320.0, 5, 48.0, 12.0), (5, 1));
-        assert_eq!(chip_grid(228.0, 5, 48.0, 12.0), (3, 2));
-        assert_eq!(chip_grid(20.0, 2, 48.0, 12.0), (1, 2));
+        let chips = |well, count| chip_grid(well, count, (48.0, 48.0), 12.0);
+        let fit = |per_row, rows, visible, hidden| ChipFit { per_row, rows, visible, hidden };
+        assert_eq!(chips((320.0, 200.0), 5), fit(5, 1, 5, 0));
+        assert_eq!(chips((228.0, 144.0), 5), fit(3, 2, 5, 0));
+        // A tall window's card (Calculator's, 113x200) takes one chip a row
+        // and three rows: the other two are counted.
+        let tall = chips((113.0, 200.0), 5);
+        assert_eq!(tall, fit(1, 3, 3, 2));
+        assert!(tall.height(48.0, 12.0) <= 200.0 - 2.0 * FINALE_PAD, "{tall:?}");
+        assert_eq!(chips((113.0, 200.0), 3), fit(1, 3, 3, 0));
+        // A very wide window's card (320x145): one row.
+        assert_eq!(chips((320.0, 145.0), 5), fit(5, 1, 5, 0));
+        // Never fewer than one chip, even in a well too small for it.
+        assert_eq!(chips((20.0, 30.0), 2), fit(1, 1, 1, 1));
     }
 
     #[test]

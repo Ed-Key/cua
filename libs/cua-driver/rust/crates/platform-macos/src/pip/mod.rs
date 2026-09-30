@@ -68,6 +68,21 @@
 //! gone) or it stops, the layer clears and the still (or "Preview
 //! unavailable") shows through.
 //!
+//! ## Card shape
+//!
+//! The front card takes its window's proportions, whatever they are: the
+//! window's size (from each capture and the visibility poll) fitted into the
+//! panel's size box (`stack::card_shape`), which is the default card size or
+//! what the user resized the panel to. A tall window gives a tall card, a
+//! wide one a wide card, and the picture fills it edge to edge. The box's
+//! bottom-right corner (the panel's cascade slot, or where it was dragged)
+//! is the card's anchor: when the target window changes, or its size does,
+//! the card glides to its new shape up and left of that corner and the back
+//! items follow its top-left. The window itself stays sized for the box, so
+//! placement never moves. Past 2.2:1 either way the card is clamped and the
+//! picture keeps its own shape inside it, over a blurred backdrop. The live
+//! stream is sized for the picture, so it is never padded.
+//!
 //! ## Card stack
 //!
 //! The panel is a deck (see `stack`): the front card is the target described
@@ -137,8 +152,9 @@ use finish::{
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
-    back_cards, bar_frame, bar_layout, card_size, deck_size, item_at, max_card, own_pixels,
-    panel_point, press_edges, pressed_item, resize_settled, resize_window, slot_frame, to_window,
+    back_cards, bar_frame, bar_layout, card_shape, card_size, deck_size, item_at, max_card,
+    own_pixels, panel_point, press_edges, pressed_item, resize_settled, resize_window,
+    shaped_frame, slot_frame, to_window,
     window_origin, window_size, CardStack, Motion, Slot, Trail, BAR_BUTTON, BAR_FADE_IN,
     BAR_FADE_OUT, CHIP_REACH, DRAG_SLOP, GLASS_SPACING, MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, VIEWS,
 };
@@ -509,12 +525,19 @@ struct Panel {
     /// Private session key (for logs from callbacks that only have the
     /// panel).
     key: String,
-    /// Front card size in points.
+    /// The panel's size box in points: the largest front card (the default
+    /// size, or what the user resized it to). The window is sized for it.
     card: (f64, f64),
+    /// Front card size as drawn: the target window's shape fitted into the
+    /// box (`stack::card_shape`), its bottom-right corner on the box's.
+    front: (f64, f64),
+    /// Size of the displayed window, as far as it is known.
+    shape: Option<(f64, f64)>,
     /// Front card size its views were last laid out for.
     laid_out: (f64, f64),
-    /// Image well size the live stream is sized for: follows `card` once a
-    /// resize has settled.
+    /// Size of the picture in the image well (the window's own proportions
+    /// inside the front card), which the live stream is sized for: follows
+    /// the front card, once a resize by the user has settled.
     stream_well: (f64, f64),
     /// When the front card last changed size.
     well_changed: Instant,
@@ -566,6 +589,9 @@ struct CardInfo {
     /// The window's last still while its card is behind, with the window it
     /// was captured from (shown only if that is the card's own window).
     still: Option<(Tag, Image)>,
+    /// The window's size when its card went behind: the shape the front
+    /// card takes at once when it comes back.
+    shape: Option<(f64, f64)>,
 }
 
 /// A retained `NSImage`, released on drop (like all panel state, only on
@@ -1182,7 +1208,7 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
     let Some(panel) = state.panels.get_mut(&update.key) else {
         return false;
     };
-    let well = well_size(panel.card);
+    let well = well_size(panel.front);
     panel.cursor_at = update.image.map(|_| (update.x, update.y));
     panel.cursor_box = update.sprite_box;
     panel.cursor_window = update.window;
@@ -1237,7 +1263,7 @@ unsafe fn place_sprite(panel: &Panel) {
         sprite_placement(
             sprite_window(panel.cursor_window, displayed, panel.target_frame),
             panel.cursor_at,
-            well_size(panel.card),
+            well_size(panel.front),
             panel.cursor_box,
         )
     };
@@ -1416,7 +1442,64 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     panel.target_visible = target_visible;
     panel.resolved_window = resolved_window;
     panel.target_frame = target_frame;
+    sync_shape(panel);
     refresh(state, &key);
+}
+
+/// Resting frame of `slot` with the front card as it is drawn now (the
+/// size box fitted to the displayed window's shape).
+fn resting(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
+    shaped_frame(panel.card, panel.front, slot, back_cards)
+}
+
+/// Size of the picture in the front card's well: the window's own
+/// proportions (the whole well while they are unknown). It fills the well
+/// unless the card's shape was clamped.
+fn picture_size(panel: &Panel) -> (f64, f64) {
+    let well = well_size(panel.front);
+    panel.shape.map_or(well, |shape| stack::fit(well, shape))
+}
+
+/// The displayed window's size, if the last known frame is that window's:
+/// the front card takes its shape. Whether anything changed.
+unsafe fn sync_shape(panel: &mut Panel) -> bool {
+    let displayed = current_tag(panel.target, panel.resolved_window).and_then(|tag| tag.1);
+    match panel.target_frame {
+        Some((window, frame)) if Some(window) == displayed => set_shape(panel, (frame.w, frame.h)),
+        _ => false,
+    }
+}
+
+/// The displayed window is `shape` points: fit the front card to it (see
+/// `stack::card_shape`) and size the live stream for the picture. On a
+/// shown panel every item glides to its new frame (the card's bottom-right
+/// corner stays put, the back items follow its top-left); a hidden one is
+/// laid out at once. The caller refreshes, which resizes the stream.
+/// Whether anything changed.
+unsafe fn set_shape(panel: &mut Panel, shape: (f64, f64)) -> bool {
+    if panel.shape == Some(shape) {
+        return false;
+    }
+    panel.shape = Some(shape);
+    let front = card_shape(panel.card, panel.shape);
+    if front != panel.front {
+        let cards = back_cards(&panel.layout);
+        let drawn = settle_frames(panel);
+        panel.front = front;
+        if panel.shown {
+            for (index, slot) in panel.layout.clone().into_iter().enumerate() {
+                let rest = resting(panel, slot, cards);
+                if drawn[index] != rest {
+                    panel.motion[slot.view()].restack(drawn[index], rest);
+                }
+            }
+            start_ticking();
+        }
+        apply_card_frames(panel);
+        tracing::info!(target: "pip", session = %panel.key, card = ?front, bounds = ?panel.card, window = ?shape, "PiP card shape");
+    }
+    panel.stream_well = picture_size(panel);
+    true
 }
 
 /// Apply an action's lifecycle (the action note row of the table in
@@ -1735,7 +1818,7 @@ unsafe fn restack(
             continue;
         };
         let views = slot_views(panel, slot);
-        let rest = slot_frame(panel.card, slot, cards);
+        let rest = resting(panel, slot, cards);
         match from {
             Some(from) => {
                 // Moved, or its place moved (chips shift when cards come
@@ -1793,6 +1876,7 @@ unsafe fn switch_front(
             let _: *mut AnyObject = msg_send![image, retain];
             front.data.still = Some((front.key, Image(image as usize)));
         }
+        front.data.shape = panel.shape;
     }
     let changed = restack(panel, key, worker, |panel| match acted {
         Some(now) => panel.cards.act(tag, now),
@@ -1810,6 +1894,11 @@ unsafe fn switch_front(
                 panel.still_tag = Some(still_tag);
             }
         }
+    }
+    // A card coming back brings its window's shape; a new window keeps the
+    // old shape until its frame is known (the capture or the next poll).
+    if let Some(shape) = panel.cards.front_mut().and_then(|front| front.data.shape) {
+        set_shape(panel, shape);
     }
     changed
 }
@@ -1910,20 +1999,27 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
                     tag.1.is_some_and(|window| gone.contains(&window))
                 });
             });
+            let mut reshaped = false;
             if panel.target == update.target {
-                // The window may have moved: the cursor maps into its new
-                // place even when nothing else changed, without waiting for
-                // the overlay to render again.
+                // The window may have moved or changed size: the cursor maps
+                // into its new place and the card takes its new shape even
+                // when nothing else changed, without waiting for the overlay
+                // to render again.
                 panel.target_frame = update.target_frame;
                 place_sprite(panel);
+                reshaped = sync_shape(panel);
             }
-            // An answer about an older target, or no change: nothing more.
+            // An answer about an older target, or no change: nothing more
+            // (but a new shape resizes the stream).
             if panel.target != update.target
                 || (panel.target_visible == update.visible
                     && panel.resolved_window == update.resolved_window)
             {
                 if restacked {
                     announce_stack(panel, key);
+                }
+                if reshaped {
+                    refresh(state, key);
                 }
                 return;
             }
@@ -1944,6 +2040,9 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
                     restacked = true;
                 }
             }
+            // The frame may be of the window the target resolves to now
+            // (after the old front card took its own shape behind).
+            sync_shape(panel);
             if restacked {
                 announce_stack(panel, key);
             }
@@ -2213,7 +2312,7 @@ const FINALE_FADE: Duration = Duration::from_millis(400);
 /// stay in).
 unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
     remove_finale_view(panel);
-    let (well_w, well_h) = well_size(panel.card);
+    let (well_w, well_h) = well_size(panel.front);
     let overlay = new_view(
         decor_view_class(),
         ns_rect(Area {
@@ -2351,19 +2450,47 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
         }
         Rows::Chips(chips) => {
             use stack::{CHIP_H, CHIP_W};
-            // Wrapped into rows that fit the well's width, the block centered.
-            let (per_row, grid_rows) = chip_grid(well_w, chips.len(), CHIP_W, FINALE_CHIP_GAP);
-            let block_h = grid_rows as f64 * CHIP_H + grid_rows.saturating_sub(1) as f64 * FINALE_CHIP_GAP;
+            // Wrapped into rows that fit the well's width, the block
+            // centered; what does not fit a narrow card's height is counted.
+            let fit = chip_grid(
+                (well_w, well_h),
+                chips.len(),
+                (CHIP_W, CHIP_H),
+                FINALE_CHIP_GAP,
+            );
+            let per_row = fit.per_row;
+            let block_h = fit.height(CHIP_H, FINALE_CHIP_GAP);
             let block_top = (well_h + block_h) / 2.0;
+            if fit.hidden > 0 {
+                let more = new_label(
+                    NSRect::new(
+                        NSPoint::new(0.0, block_top - block_h),
+                        NSSize::new(well_w, MORE_LINE),
+                    ),
+                    11.0,
+                    0.23,
+                    false,
+                );
+                let dim: *mut AnyObject = msg_send![white, colorWithAlphaComponent: 0.7_f64];
+                let _: () = msg_send![more, setTextColor: dim];
+                let _: () = msg_send![more, setAlignment: TEXT_CENTER];
+                // Width sizable, flexible top and bottom: stays centered.
+                let _: () = msg_send![more, setAutoresizingMask: 2u64 | 8 | 32];
+                set_text(more as usize, &format!("+{} more", fit.hidden));
+                let _: () = msg_send![more, setWantsLayer: true];
+                let more_layer: *mut AnyObject = msg_send![more, layer];
+                animate_row(more_layer, std::ptr::null_mut(), std::ptr::null_mut(), fit.visible, start, (0.0, -6.0));
+                let _: () = msg_send![overlay, addSubview: more];
+            }
             // Badges above every chip's glass (see `new_chip`).
             let badges = new_view(
                 decor_view_class(),
                 NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(well_w, well_h)),
             );
             let _: () = msg_send![badges, setAutoresizingMask: 18u64];
-            for (index, chip) in chips.iter().enumerate() {
+            for (index, chip) in chips.iter().take(fit.visible).enumerate() {
                 let (row, column) = (index / per_row, index % per_row);
-                let in_row = per_row.min(chips.len() - row * per_row) as f64;
+                let in_row = per_row.min(fit.visible - row * per_row) as f64;
                 let row_w = in_row * CHIP_W + (in_row - 1.0).max(0.0) * FINALE_CHIP_GAP;
                 let x = (well_w - row_w) / 2.0 + column as f64 * (CHIP_W + FINALE_CHIP_GAP);
                 let y = block_top - (row + 1) as f64 * CHIP_H - row as f64 * FINALE_CHIP_GAP;
@@ -3159,22 +3286,26 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         .collect();
 
     // Front card: the picture itself, with continuous rounded corners and
-    // the window's shadow; a faint dark backing shows only while it is
-    // empty. Its chrome is the hover bar below.
-    let front_view = new_view(card_view_class(), ns_rect(slot_frame(card, Slot::Front, 0)));
+    // the window's shadow, shaped like its window (see `set_shape`). Its
+    // chrome is the hover bar below.
+    let front_frame = slot_frame(card, Slot::Front, 0);
+    let front_view = new_view(card_view_class(), ns_rect(front_frame));
     let card_layer = host_layer(front_view);
     let _: () = msg_send![card_layer, setCornerRadius: CORNER_RADIUS];
     let _: () = msg_send![card_layer, setCornerCurve: ns_string("continuous")];
     let _: () = msg_send![card_layer, setMasksToBounds: true];
-    let backing: *mut AnyObject = msg_send![
-        class!(NSColor),
-        colorWithSRGBRed: 0.0_f64
-        green: 0.0_f64
-        blue: 0.0_f64
-        alpha: 0.28_f64
-    ];
-    let backing: *mut CGColor = msg_send![backing, CGColor];
-    let _: () = msg_send![card_layer, setBackgroundColor: backing];
+    // Behind the picture, a blurred neutral backdrop (never a black band):
+    // it shows while the well is empty, and beside the picture of a window
+    // whose proportions are past the card's clamp.
+    let backdrop = new_view(
+        class!(NSVisualEffectView),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(front_frame.w, front_frame.h)),
+    );
+    let _: () = msg_send![backdrop, setMaterial: 6isize]; // NSVisualEffectMaterialPopover
+    let _: () = msg_send![backdrop, setBlendingMode: 0isize]; // behind the window
+    let _: () = msg_send![backdrop, setState: 1isize]; // active: the panel is never key
+    let _: () = msg_send![backdrop, setAutoresizingMask: 18u64];
+    add_subview(front_view, backdrop);
     // MouseEnteredAndExited (0x01) | MouseMoved (0x02) | ActiveAlways (0x80)
     // | InVisibleRect (0x200): the hover bar and resize cursors over a
     // non-key panel, only over the card itself.
@@ -3222,6 +3353,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         true,
     );
     set_text(placeholder_text as usize, "Waiting for the first frame");
+    // Over the backdrop, which follows the appearance.
+    on_glass(placeholder_text, true);
     let _: () = msg_send![placeholder_text, setAlignment: TEXT_CENTER];
     let _: () = msg_send![placeholder, addSubview: placeholder_text];
     let _: () = msg_send![placeholder, setHidden: true];
@@ -3229,11 +3362,13 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
 
     // The front window's check badge (see `sync_front_badge`): the chips'
     // badge, inside the card's bottom-right corner, above the picture.
-    let front = slot_frame(card, Slot::Front, 0);
     let front_badge = new_view(
         decor_view_class(),
         NSRect::new(
-            NSPoint::new(front.w - stack::CHIP_BADGE - FRONT_BADGE_INSET, FRONT_BADGE_INSET),
+            NSPoint::new(
+                front_frame.w - stack::CHIP_BADGE - FRONT_BADGE_INSET,
+                FRONT_BADGE_INSET,
+            ),
             NSSize::new(stack::CHIP_BADGE, stack::CHIP_BADGE),
         ),
     );
@@ -3345,6 +3480,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         after_finale: false,
         key: key.to_owned(),
         card,
+        front: card,
+        shape: None,
         laid_out: (0.0, 0.0),
         stream_well: well_size(card),
         well_changed: Instant::now(),
@@ -3810,7 +3947,7 @@ unsafe fn white_color() -> *mut AnyObject {
 /// Excludes the trail lag, so a restack starts from where the item would
 /// be without it.
 fn settle_frame(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
-    panel.motion[slot.view()].frame(slot_frame(panel.card, slot, back_cards))
+    panel.motion[slot.view()].frame(resting(panel, slot, back_cards))
 }
 
 /// Where the view for `slot` is drawn now: its settle frame moved by the
@@ -4299,6 +4436,8 @@ unsafe fn on_resized(state: &mut State, window: usize, size: (f64, f64)) {
         return;
     }
     panel.card = card;
+    // The user's resize sets the box; the shape still follows the window.
+    panel.front = card_shape(card, panel.shape);
     // A panel the user sized stays where they put it, like a dragged one.
     panel.resized = true;
     panel.dragged = true;
@@ -4323,7 +4462,7 @@ unsafe extern "C" fn resize_settle_cb(ctx: *mut c_void) {
         if !resize_settled(panel.well_changed, Instant::now()) {
             return;
         }
-        panel.stream_well = well_size(panel.card);
+        panel.stream_well = picture_size(panel);
         refresh(state, &key);
     });
 }
