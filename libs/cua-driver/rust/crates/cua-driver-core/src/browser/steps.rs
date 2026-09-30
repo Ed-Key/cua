@@ -246,18 +246,39 @@ pub(crate) fn resolve_named(outline: &str, complete: bool, role: &str, name: &st
 
 /// Whether `expect` holds on one read of the page. Absence is only proven by
 /// a read that covered every element that could match.
+///
+/// `text` is looked for in the element's own name and value and in those of
+/// its descendants: a status region says what it says in a text child. The
+/// outline is indented by depth, so an element's descendants are the lines
+/// after it that are indented further, up to the first that is not.
 pub(crate) fn expect_holds(outline: &str, complete: bool, expect: &BrowserStepExpect) -> bool {
-    let found = outline.lines().filter_map(parse_outline_line).any(|line| {
+    let lines: Vec<(usize, OutlineLine)> = outline
+        .lines()
+        .filter_map(|line| {
+            Some((
+                line.len() - line.trim_start().len(),
+                parse_outline_line(line)?,
+            ))
+        })
+        .collect();
+    let says = |line: &OutlineLine, text: &str| {
+        [&line.name, &line.value]
+            .into_iter()
+            .flatten()
+            .any(|held| held.contains(text))
+    };
+    let found = lines.iter().enumerate().any(|(index, (indent, line))| {
         expect.role.as_ref().is_none_or(|role| &line.role == role)
             && expect
                 .name
                 .as_ref()
                 .is_none_or(|name| line.name.as_ref() == Some(name))
             && expect.text.as_ref().is_none_or(|text| {
-                [&line.name, &line.value]
-                    .into_iter()
-                    .flatten()
-                    .any(|held| held.contains(text.as_str()))
+                says(line, text)
+                    || lines[index + 1..]
+                        .iter()
+                        .take_while(|(deeper, _)| deeper > indent)
+                        .any(|(_, below)| says(below, text))
             })
     });
     if expect.present {
@@ -842,7 +863,10 @@ mod tests {
         - link \"Remove\" [p3:12 click] -> \"https://x.test/remove\"\n\
         - status \"state\" [p3:13]\n\
         \x20 - statictext \"ada@x.com (Editor)\" [p3:14]\n\
-        - combobox \"Region\" [p3:15 click] = \"Europe\" (collapsed)";
+        - combobox \"Region\" [p3:15 click] = \"Europe\" (collapsed)\n\
+        - status [p3:16]\n\
+        \x20 - group [p3:17]\n\
+        \x20   - statictext \"{\\\"invites\\\":[{\\\"role\\\":\\\"Editor\\\"}]}\" [p3:18]";
 
     #[test]
     fn a_named_target_is_exactly_one_element_with_that_role_and_name() {
@@ -894,7 +918,7 @@ mod tests {
     }
 
     #[test]
-    fn expect_matches_role_exact_name_and_contained_text() {
+    fn expect_matches_role_exact_name_and_text_in_the_element_or_below_it() {
         let expect = |role: Option<&str>, name: Option<&str>, text: Option<&str>, present: bool| {
             BrowserStepExpect {
                 role: role.map(str::to_owned),
@@ -931,6 +955,66 @@ mod tests {
             (
                 "role must agree",
                 expect(Some("button"), Some("Editor"), None, true),
+                true,
+                false,
+            ),
+            (
+                "text in a descendant of the element with that role",
+                expect(Some("status"), None, Some("ada@x.com (Editor)"), true),
+                true,
+                true,
+            ),
+            (
+                "text in a descendant, with the exact name too",
+                expect(Some("status"), Some("state"), Some("(Editor)"), true),
+                true,
+                true,
+            ),
+            (
+                "an option under the button that opened it",
+                expect(Some("button"), Some("Role"), Some("Viewer"), true),
+                true,
+                true,
+            ),
+            (
+                "a later sibling is not a descendant",
+                expect(Some("option"), Some("Viewer"), Some("Editor"), true),
+                true,
+                false,
+            ),
+            (
+                "nor is the line after a subtree ends",
+                expect(Some("status"), None, Some("Europe"), true),
+                true,
+                false,
+            ),
+            (
+                "two levels down, in text the outline had to escape",
+                expect(Some("status"), None, Some("\"role\":\"Editor\""), true),
+                true,
+                true,
+            ),
+            (
+                "the group between them holds it too",
+                expect(Some("group"), None, Some("invites"), true),
+                true,
+                true,
+            ),
+            (
+                "a read that was cut short cannot prove no status says it",
+                expect(Some("status"), None, Some("ada@y.com"), false),
+                false,
+                false,
+            ),
+            (
+                "no status says it: holds as absent",
+                expect(Some("status"), None, Some("ada@y.com"), false),
+                true,
+                true,
+            ),
+            (
+                "a status says it in a descendant: not absent",
+                expect(Some("status"), None, Some("ada@x.com"), false),
                 true,
                 false,
             ),

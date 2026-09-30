@@ -1498,7 +1498,8 @@ const FfiConverterTypeBrowserStepRoute = (() => {
 
 /**
  * What must hold once a step has settled: some element with this role,
- * exact name and/or text (or, with `present: false`, none).
+ * exact name and/or text (or, with `present: false`, none). The text may be
+ * the element's own or that of anything inside it.
  */
 export type BrowserStepExpect = {
     role?: string,
@@ -1507,7 +1508,7 @@ export type BrowserStepExpect = {
      */
     name?: string,
     /**
-     * Text contained in the element's name or value.
+     * Text contained in the element's name or value, or in those of its descendants.
      */
     text?: string,
     /**

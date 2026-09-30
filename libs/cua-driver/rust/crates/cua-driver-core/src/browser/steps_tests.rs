@@ -54,6 +54,8 @@ struct Script {
     /// tool has been called (another session loaded another page meanwhile).
     space: String,
     space_after_input: Option<String>,
+    /// What the page shows once this ref was clicked (a menu it opens).
+    reveals: HashMap<String, String>,
 }
 
 type Shared = Arc<Mutex<Script>>;
@@ -96,6 +98,9 @@ impl Tool for PageDouble {
         let typing = self.def.name == "browser_type";
         if let Some(space) = script.space_after_input.take() {
             script.space = space;
+        }
+        if let Some(outline) = script.reveals.get(&reference).cloned() {
+            script.outline = Some(outline);
         }
         match script.acts.get(&reference).cloned() {
             Some(Acts::Refuses(code)) => BrowserRefusal::new(code, "refused by the page double").to_tool_result(),
@@ -404,6 +409,87 @@ async fn a_target_that_is_not_exactly_one_element_fails_with_candidates_and_send
     assert!(calls(&script)
         .iter()
         .all(|call| !call.starts_with("browser_click")));
+}
+
+#[tokio::test]
+async fn a_step_aimed_by_role_and_name_finds_what_the_step_before_it_revealed() {
+    const CLOSED: &str = "- textbox \"Email\" [p3:1 type]\n\
+        - button \"Role\" [p3:2 click] (collapsed)\n\
+        - button \"Send invite\" [p3:6 click]";
+    let page = |options: &str| {
+        let (registry, script) = page_registry();
+        {
+            let mut script = script.lock().unwrap();
+            script.outline = Some(CLOSED.to_owned());
+            script
+                .reveals
+                .insert("p3:2".into(), format!("{CLOSED}\n{options}"));
+        }
+        (registry, script)
+    };
+    let flow = json!([
+        {"action": "type", "ref": "p3:1", "text": "ada@x.com"},
+        {"action": "click", "ref": "p3:2"},
+        {"action": "click", "role": "option", "name": "Editor"},
+        {"action": "click", "role": "button", "name": "Send invite"},
+    ]);
+
+    // The option has no ref until the click before it opens the menu; the
+    // whole flow still runs in the one call.
+    let (registry, script) =
+        page("- option \"Viewer\" [p3:7 click] (selected)\n- option \"Editor\" [p3:8 click]");
+    let output = steps(&registry, "steps-revealed", flow.clone()).await;
+    assert_eq!(output["status"], "completed", "{output}");
+    assert_eq!(output["steps"][2]["ref"], "p3:8");
+    assert_eq!(
+        calls(&script),
+        [
+            "browser_type p3:1",
+            "browser_click p3:2",
+            "get_browser_state Editor",
+            "browser_click p3:8",
+            "get_browser_state Send invite",
+            "browser_click p3:6",
+            "get_browser_state since 0",
+        ]
+    );
+
+    // Aimed before anything opened the menu, it is not there to find.
+    let (registry, _) = page("- option \"Editor\" [p3:8 click]");
+    let early = steps(
+        &registry,
+        "steps-not-revealed",
+        json!([{"action": "click", "role": "option", "name": "Editor"}]),
+    )
+    .await;
+    assert_eq!(early["steps"][0]["code"], "target_not_found", "{early}");
+
+    // Two revealed options with one name: refused with both, neither clicked,
+    // and Send is not pressed.
+    let (registry, script) =
+        page("- option \"Editor\" [p3:8 click]\n- option \"Editor\" [p3:9 click]");
+    let twice = steps(&registry, "steps-revealed-twice", flow).await;
+    assert_eq!(
+        (&twice["stopped_at"], &twice["stop_reason"]),
+        (&json!(3), &json!("step_failed"))
+    );
+    assert_eq!(twice["steps"][2]["code"], "target_ambiguous", "{twice}");
+    assert_eq!(
+        twice["steps"][2]["candidates"],
+        json!([
+            "- option \"Editor\" [p3:8 click]",
+            "- option \"Editor\" [p3:9 click]"
+        ])
+    );
+    assert_eq!(
+        calls(&script),
+        [
+            "browser_type p3:1",
+            "browser_click p3:2",
+            "get_browser_state Editor",
+            "get_browser_state since 0",
+        ]
+    );
 }
 
 #[tokio::test]

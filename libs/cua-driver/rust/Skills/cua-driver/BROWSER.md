@@ -7,13 +7,22 @@ engines remain native windows: inspect and operate them with
 
 ## Workflow
 
-Three calls do most page tasks:
+Two calls do most page tasks:
 
 ```text
-get_browser_state {pid, window_id, session}            # bind: target_id, tab ids
-get_browser_state {target_id, tab_id, session}         # snapshot: the page outline
-browser_steps     {target_id, tab_id, session, steps}  # act, then what changed
+get_browser_state {app}                       # bind, and the active tab's outline
+browser_steps     {target_id, tab_id, steps}  # act, then what changed
 ```
+
+The first call binds the browser window and reads the tab it shows: the result
+has `target_id`, the `tabs`, and the active tab's `tab_id`, `page` and
+`outline`. `app` is an app name or bundle id and means the app's only window
+(macOS only). With several windows the call is refused with the candidates;
+pass `pid` + `window_id` for one, as on Windows and Linux. To read again, or
+to read another tab, pass `target_id` + `tab_id`.
+
+`session` is optional on all of these. Without it the calls run in the
+connection's own session; with it, pass the same label on every call.
 
 The outline has one line per element, with its ref and what the ref allows:
 
@@ -27,19 +36,21 @@ The outline has one line per element, with its ref and what the ref allows:
 `[p3:6]` with no action is a ref you can read under (`scope_ref`) but not act
 on. `browser_steps` takes up to 8 `click` and `type` steps. Aim a step with a
 `ref`, or with an exact `role` and `name` that is looked up on the live page
-when the step runs:
+when the step runs. Use `role` and `name` for an element an earlier step
+reveals (a menu option, a dialog button): it has no ref until that step has
+run, so the whole flow still fits one call:
 
 ```text
-browser_steps {target_id, tab_id, session, steps: [
+browser_steps {target_id, tab_id, steps: [
   {action: "type",  ref: "p3:4", text: "ada@x.com"},
-  {action: "click", role: "button", name: "Role"},
+  {action: "click", ref: "p3:5"},
   {action: "click", role: "option", name: "Editor"},
   {action: "click", role: "button", name: "Send invite",
    expect: {text: "ada@x.com (Editor)"}}]}
 ```
 
 The result has each step's outcome and one `changes`: the lines that changed,
-appeared or left since your snapshot. Read the result from `changes`; a new
+appeared or left since your last read. Read the result from `changes`; a new
 snapshot call is not needed. The batch stops, and says where and why, at the
 first step that fails, at typing it could not confirm, at a JavaScript
 dialog, and when a step loads another page.
@@ -59,13 +70,13 @@ For supported page content, prefer the typed browser tools over the legacy
 typed route binds an exact native `(pid, window_id)` to a browser target and
 mints session-scoped tab and element capabilities.
 
-The full set of tools around the three calls above:
+The full set of tools around the two calls above:
 
 ```text
 start_session(session?)                                  # optional; can name before acting
-list_windows or launch_app
-get_browser_state(pid, window_id, session?)               # bind
-get_browser_state(target_id, tab_id, session?)            # snapshot
+list_windows or launch_app                                # when app does not name one window
+get_browser_state(app | pid + window_id, session?)        # bind, and the active tab's outline
+get_browser_state(target_id, tab_id, session?)            # snapshot again, or another tab
 browser_steps / browser_click / browser_type / browser_navigate / browser_pointer
 browser_dialog / browser_set_input_files / browser_download
 end_session(session?)                                     # optional cleanup
@@ -133,11 +144,28 @@ get_browser_state
   '{"pid":4242,"window_id":991,"session":"browser-run-1"}'
 ```
 
+`get_browser_state '{"app":"Google Chrome"}'` does both steps when the app
+has exactly one window on the current Space (macOS). `app` with `pid`,
+`window_id`, `target_id` or `tab_id` is an error: one target form per call.
+
 Continue to mutation only when the bind result reports:
 
 - `status: "ok"`;
 - `binding_quality: "exact"`; and
 - `mutation_allowed: true`.
+
+A bind also reads the window's active tab, as the `get_browser_state
+{target_id, tab_id}` call it would otherwise take, with the same checks. When
+that read succeeds the result carries its `tab_id`, `page`, `outline` and
+`snapshot`, and later actions report `changes` against it. When it is refused
+or fails, the bind stands and the result has `observation` instead: its
+`status`, the `tab_id` it was for, and the `refusal` with the call that
+recovers. Then nothing of the page was read: there is no outline, and the next
+action returns a full snapshot. The active tab is the one the window's title
+proves; when the title proves none (`active: null` on every tab), no tab is
+read in its place and `observation` says so: choose a `tab_id` from `tabs`.
+`snapshot_format`, `max_chars`, `query`, `include_refs` and
+`include_screenshot` on a bind apply to that read.
 
 A heuristic title match is read-only. Same-bounds windows, stale native
 geometry, a moved tab, process restart, endpoint-owner mismatch, or any other
@@ -580,7 +608,9 @@ what else the page changed (a button that became enabled, a suggestion list).
   `input_route`.
 - `expect: {role?, name?, text?, present?}` must hold after the step settles
   (it is given up to 2 s): some element with that role, exact name, and/or
-  `text` contained in its name or value; with `present: false`, none.
+  `text` contained in its name or value or in those of an element inside it
+  (`{role: "status", text: "Saved"}` holds when the status region's text
+  child says Saved); with `present: false`, none.
 - Each step is admitted as the `browser_click` or `browser_type` call it is,
   and each read as a `get_browser_state` call. A step you could not make as a
   single call fails in a batch too.

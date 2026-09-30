@@ -295,7 +295,7 @@
     },
     {
       "name": "browser_steps",
-      "description": "Run up to 8 page steps (click, type) on one bound tab in order, then return what the page changed. A step targets a ref, or an exact role and name resolved when it runs. Stops at the first failure, unconfirmed typing, dialog or navigation; never retries. Details: skill://cua-driver/BROWSER.md",
+      "description": "Run up to 8 page steps (click, type) on one bound tab in order, then return what the page changed. A step targets a ref, or an exact role and name resolved when it runs. Use role and name for elements an earlier step reveals (menu options, dialogs): they have no ref until then, so the whole flow fits one call. Stops at the first failure, unconfirmed typing, dialog or navigation; never retries. Details: skill://cua-driver/BROWSER.md",
       "platforms": [
         "macos",
         "windows",
@@ -348,7 +348,7 @@
                       "type": "string"
                     },
                     "text": {
-                      "description": "Text contained in the element's name or value.",
+                      "description": "Text contained in the element's name or value, or in those of its descendants.",
                       "type": "string"
                     }
                   },

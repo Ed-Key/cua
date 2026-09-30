@@ -61,7 +61,8 @@ pub enum BrowserStepRoute {
 }
 
 /// What must hold once a step has settled: some element with this role,
-/// exact name and/or text (or, with `present: false`, none).
+/// exact name and/or text (or, with `present: false`, none). The text may be
+/// the element's own or that of anything inside it.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserStepExpect {
@@ -82,7 +83,7 @@ pub struct BrowserStepExpect {
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub name: Option<String>,
-    /// Text contained in the element's name or value.
+    /// Text contained in the element's name or value, or in those of its descendants.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",
@@ -321,8 +322,10 @@ pub fn contracts() -> Vec<ToolContract> {
         name: BrowserStepsInput::TOOL_NAME.into(),
         description: "Run up to 8 page steps (click, type) on one bound tab in order, then \
             return what the page changed. A step targets a ref, or an exact role and name \
-            resolved when it runs. Stops at the first failure, unconfirmed typing, dialog or \
-            navigation; never retries. Details: skill://cua-driver/BROWSER.md"
+            resolved when it runs. Use role and name for elements an earlier step reveals \
+            (menu options, dialogs): they have no ref until then, so the whole flow fits one \
+            call. Stops at the first failure, unconfirmed typing, dialog or navigation; never \
+            retries. Details: skill://cua-driver/BROWSER.md"
             .into(),
         platforms: vec![Platform::Macos, Platform::Windows, Platform::Linux],
         aliases: vec![],

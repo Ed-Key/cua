@@ -3104,7 +3104,8 @@ class _UniffiFfiConverterOptionalTypeBrowserStepRoute(_UniffiConverterRustBuffer
 class BrowserStepExpect:
     """
     What must hold once a step has settled: some element with this role,
-    exact name and/or text (or, with `present: false`, none).
+    exact name and/or text (or, with `present: false`, none). The text may be
+    the element's own or that of anything inside it.
 """
     def __init__(self, *, role:typing.Optional[str] = _DEFAULT, name:typing.Optional[str] = _DEFAULT, text:typing.Optional[str] = _DEFAULT, present:bool = True):
         if role is _DEFAULT:

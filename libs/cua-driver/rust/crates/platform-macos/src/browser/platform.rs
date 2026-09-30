@@ -911,6 +911,15 @@ async fn browser_websocket_url(port: u16) -> Option<String> {
 
 #[async_trait]
 impl BrowserPlatform for MacOsBrowserPlatform {
+    async fn resolve_app_window(
+        &self,
+        app: &str,
+    ) -> Result<(i64, u64), cua_driver_core::protocol::ToolResult> {
+        crate::tools::get_window_state::app_window(app)
+            .await
+            .map(|(pid, window_id)| (i64::from(pid), u64::from(window_id)))
+    }
+
     fn isolated_browser_executable(&self) -> Result<String, BrowserRefusal> {
         for (candidate, identifier, team_identifier) in isolated_browser_candidates() {
             let Ok(executable) = select_isolated_browser_executable([candidate]) else {

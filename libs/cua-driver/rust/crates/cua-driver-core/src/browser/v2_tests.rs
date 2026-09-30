@@ -133,6 +133,13 @@ struct FixtureState {
     page_session: Option<String>,
     /// Mutation records the page made since the settle counter last read.
     pending_mutations: u64,
+    /// The tab's title as the browser lists it. The fixture's native window
+    /// is titled "Fixture - Chrome", so any other title leaves the window's
+    /// active tab unproven.
+    tab_title: String,
+    /// The user switches to another tab when a debugger attaches to this
+    /// one (a bind lists tabs; its read is the first to attach).
+    hide_tab_on_attach: bool,
     /// Every incoming CDP call: (sessionId, method, params).
     calls: Vec<(Option<String>, String, Value)>,
 }
@@ -188,6 +195,8 @@ impl Default for FixtureState {
             dialog_open: false,
             page_session: None,
             pending_mutations: 0,
+            tab_title: "Fixture".into(),
+            hide_tab_on_attach: false,
             calls: Vec::new(),
         }
     }
@@ -723,7 +732,7 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 "targetInfos": [{
                     "targetId": "T1",
                     "type": "page",
-                    "title": "Fixture",
+                    "title": st.tab_title.clone(),
                     "url": "https://fixture.test/",
                     "attached": false,
                 }]
@@ -746,6 +755,9 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     });
                 }
                 st.tab_sessions += 1;
+                if st.hide_tab_on_attach {
+                    st.tab_visible = false;
+                }
                 MockReply::ok(json!({ "sessionId": format!("tab-sess-{}", st.tab_sessions) }))
                     .with_events(events)
             }
@@ -1186,6 +1198,29 @@ impl BrowserPlatform for FixturePlatform {
     fn standalone_trusted_input_background_limitation(&self) -> Option<&'static str> {
         self.trusted_input_limited
             .then_some("fixture trusted input raises the standalone window")
+    }
+
+    /// "Fixture Browser" has one window (pid 1, window 7); "Two Windows" has
+    /// two. Anything else is not running.
+    async fn resolve_app_window(&self, app: &str) -> Result<(i64, u64), ToolResult> {
+        match app {
+            "Fixture Browser" => Ok((1, 7)),
+            "Two Windows" => Err(ToolResult::error(
+                "\"Two Windows\" has 2 windows on the current Space; pass pid + window_id for one:\n\
+                 window_id 7 (pid 1): Inbox\nwindow_id 8 (pid 1): Docs",
+            )
+            .with_structured(json!({
+                "code": "app_window_ambiguous",
+                "app": app,
+                "candidates": [
+                    { "window_id": 7, "pid": 1, "title": "Inbox" },
+                    { "window_id": 8, "pid": 1, "title": "Docs" },
+                ],
+                "suggestion": "pass pid + window_id for one of the candidates",
+            }))),
+            _ => Err(ToolResult::error(format!("no running app named \"{app}\""))
+                .with_structured(json!({ "code": "app_not_running", "app": app }))),
+        }
     }
 
     async fn classify_browser(&self, _pid: i64) -> Result<BrowserClassification, BrowserRefusal> {
@@ -4518,6 +4553,8 @@ struct Agent {
     session: String,
     target: String,
     tab: String,
+    /// What the bind returned: the binding, and its read of the active tab.
+    bound: Value,
 }
 
 impl Agent {
@@ -4540,6 +4577,7 @@ impl Agent {
             session: session.to_owned(),
             target: String::new(),
             tab: String::new(),
+            bound: Value::Null,
         };
         let bound = agent
             .call("get_browser_state", json!({ "pid": 1, "window_id": 7 }))
@@ -4547,6 +4585,7 @@ impl Agent {
         assert_eq!(bound["status"], "ok", "{bound}");
         agent.target = bound["target_id"].as_str().unwrap().to_owned();
         agent.tab = bound["tabs"][0]["tab_id"].as_str().unwrap().to_owned();
+        agent.bound = bound;
         agent
     }
 
@@ -4812,7 +4851,12 @@ async fn navigation_returns_the_new_page_as_a_full_snapshot_with_the_reason() {
 
 #[tokio::test]
 async fn an_action_with_nothing_held_returns_a_full_snapshot() {
-    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    // A bind that could not prove which tab the window shows read none.
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.tab_title = "Another title".into();
+    })
+    .await;
     let agent = Agent::bound(&f, "changes-nothing-held").await;
     let clicked = agent
         .call("browser_click", json!({ "x": 30, "y": 40 }))
@@ -4829,6 +4873,8 @@ async fn an_action_with_nothing_held_returns_a_full_snapshot() {
 async fn a_session_on_dom_refs_gets_no_changes_and_keeps_its_refs() {
     let f = fixture().await;
     let agent = Agent::bound(&f, "changes-dom-refs").await;
+    // The bind read the page once, semantically; nothing reads it so again.
+    let semantic_reads = recorded_calls(&f, "Accessibility.getFullAXTree").len();
     let legacy = agent
         .call(
             "get_browser_state",
@@ -4841,7 +4887,10 @@ async fn a_session_on_dom_refs_gets_no_changes_and_keeps_its_refs() {
         assert_eq!(clicked["route"], "trusted_input", "{clicked}");
         assert!(clicked.get("changes").is_none(), "{clicked}");
     }
-    assert!(recorded_calls(&f, "Accessibility.getFullAXTree").is_empty());
+    assert_eq!(
+        recorded_calls(&f, "Accessibility.getFullAXTree").len(),
+        semantic_reads
+    );
 }
 
 #[tokio::test]
@@ -5787,4 +5836,519 @@ async fn a_browser_without_a_frame_tree_gets_no_continuation() {
     let token = first["snapshot"]["continuation"].as_str().unwrap();
     let refused = semantic_snapshot_with(&f, &target, &tab, json!({"continuation": token})).await;
     assert_eq!(refused["refusal"]["code"], "browser_ref_stale", "{refused}");
+}
+
+// ── A session the caller did not name (through the real registry) ───────────
+//
+// An MCP transport that gets no `session` argument runs the call in its own
+// implicit session: the lease it holds. These calls are delivered as that
+// transport delivers them, in standard mode, where a read attests its tab.
+
+fn standard() -> Arc<crate::session_authorization::EffectiveAuthorizationContext> {
+    use crate::authorization::PermissionMode;
+    use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+    SessionAuthorizationRegistry::with_ceiling(
+        SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Standard],
+            false,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    )
+    .compatibility_context(PermissionMode::Standard, None)
+    .unwrap()
+}
+
+/// One transport's calls on a fixture's browser tools, none naming a session.
+struct Unnamed {
+    registry: Arc<crate::tool::ToolRegistry>,
+    context: Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+    transport: &'static str,
+}
+
+impl Unnamed {
+    fn over(
+        f: &Fixture,
+        context: &Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+        transport: &'static str,
+    ) -> Self {
+        let mut registry = crate::tool::ToolRegistry::new();
+        super::tools::register_browser_tools(&f.engine, &mut registry);
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        Self {
+            registry,
+            context: context.clone(),
+            transport,
+        }
+    }
+
+    async fn call(&self, name: &str, mut args: Value) -> Value {
+        assert!(args.get("session").is_none(), "these calls name no session");
+        args["_session_id"] = json!(self.transport);
+        args["_transport_session_id"] = json!(self.transport);
+        let evidence = crate::tool::TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
+        let result = self
+            .registry
+            .invoke_with_context_and_evidence(name, args, self.context.clone(), evidence)
+            .await;
+        result.structured_content.unwrap_or_else(|| {
+            panic!(
+                "{name} returned no structured content: {:?}",
+                result.content
+            )
+        })
+    }
+
+    /// The transport closed: its implicit session ends.
+    fn end(&self) {
+        crate::session::fire_session_end(&self.context.runtime_session_key(self.transport));
+    }
+}
+
+#[tokio::test]
+async fn a_bind_and_a_read_agree_on_a_session_the_caller_did_not_name() {
+    let f = fixture().await;
+    let agent = Unnamed::over(&f, &standard(), "unnamed-bind-read");
+    let bound = agent
+        .call("get_browser_state", json!({ "pid": 1, "window_id": 7 }))
+        .await;
+    assert_eq!(bound["status"], "ok", "{bound}");
+    let tab = json!({ "target_id": bound["target_id"], "tab_id": bound["tabs"][0]["tab_id"] });
+    let read = agent.call("get_browser_state", tab.clone()).await;
+    assert_eq!(read["status"], "ok", "{read}");
+    assert!(read["outline"].as_str().is_some_and(|o| !o.is_empty()));
+    agent.end();
+
+    // And on one it did name.
+    let named = Agent::bound_as(&f, "named-bind-read", standard()).await;
+    assert_eq!(named.snapshot().await["status"], "ok");
+}
+
+#[tokio::test]
+async fn an_unnamed_session_runs_a_whole_batch_from_the_binds_own_read() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+    })
+    .await;
+    let agent = Unnamed::over(&f, &standard(), "unnamed-batch");
+    // Call 1: the bind, with the active tab's outline in it.
+    let bound = agent
+        .call("get_browser_state", json!({ "pid": 1, "window_id": 7 }))
+        .await;
+    assert_eq!(bound["status"], "ok", "{bound}");
+    assert_eq!(bound["tab_id"], bound["tabs"][0]["tab_id"]);
+    let first = with_outline_entries(bound.clone());
+    f.state
+        .lock()
+        .unwrap()
+        .click_renames
+        .push((2011, "Sent".into()));
+
+    // Call 2: a step by ref, a step aimed by role and name, an expect, and
+    // the diff from what the bind read. Every nested read and step runs in
+    // the transport's session, as the two calls themselves did.
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "target_id": bound["target_id"], "tab_id": bound["tab_id"], "steps": [
+                {"action": "type", "ref": named_ref(&first, "Reply body"), "text": "hello"},
+                {"action": "click", "role": "button", "name": "Reply", "input_route": "dom_event",
+                 "expect": {"role": "button", "name": "Sent"}},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "completed", "{output}");
+    assert_eq!(output["steps"][0]["effect"], "confirmed", "{output}");
+    assert_eq!(output["steps"][1]["ref"], named_ref(&first, "Reply"));
+    assert_eq!(output["changes"]["kind"], "diff", "{output}");
+    assert_eq!(
+        output["changes"]["base_revision"],
+        bound["snapshot"]["revision"]
+    );
+    agent.end();
+}
+
+#[tokio::test]
+async fn two_transports_that_name_no_session_do_not_share_bindings() {
+    let f = fixture().await;
+    let context = standard();
+    let first = Unnamed::over(&f, &context, "unnamed-transport-a");
+    let second = Unnamed::over(&f, &context, "unnamed-transport-b");
+    let bound = first
+        .call("get_browser_state", json!({ "pid": 1, "window_id": 7 }))
+        .await;
+    let tab = json!({ "target_id": bound["target_id"], "tab_id": bound["tab_id"] });
+
+    // The other transport holds no such target: nothing is read or sent.
+    let reads = recorded_calls(&f, "Accessibility.getFullAXTree").len();
+    let foreign = second.call("get_browser_state", tab.clone()).await;
+    assert_eq!(foreign["status"], "refused", "{foreign}");
+    let mut click = tab.clone();
+    click["x"] = json!(30);
+    click["y"] = json!(40);
+    let foreign = second.call("browser_click", click).await;
+    assert_eq!(foreign["status"], "refused", "{foreign}");
+    assert_eq!(
+        recorded_calls(&f, "Accessibility.getFullAXTree").len(),
+        reads
+    );
+    assert!(recorded_calls(&f, "Input.dispatchMouseEvent").is_empty());
+
+    // Its owner still reads it; once the owner's transport ends, nobody does.
+    assert_eq!(
+        first.call("get_browser_state", tab.clone()).await["status"],
+        "ok"
+    );
+    first.end();
+    let ended = first.call("get_browser_state", tab).await;
+    assert_eq!(ended["status"], "refused", "{ended}");
+    assert_eq!(
+        f.engine
+            .store
+            .target_count(&context.runtime_session_key("unnamed-transport-a")),
+        0
+    );
+    second.end();
+}
+
+// ── One call in: a bind that reads the active tab ───────────────────────────
+
+#[tokio::test]
+async fn a_binds_own_read_is_the_baseline_the_next_action_diffs_against() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "bind-reads").await;
+    let bound = &agent.bound;
+    assert_eq!(bound["mode"], "bind", "{bound}");
+    assert_eq!(bound["tab_id"], bound["tabs"][0]["tab_id"]);
+    assert_eq!(bound["page"]["url"], "https://fixture.test/");
+    assert!(bound.get("observation").is_none(), "{bound}");
+    // The page was read once.
+    let reads = recorded_calls(&f, "Accessibility.getFullAXTree")
+        .into_iter()
+        .filter(|(_, params)| params["frameId"] == "F_MAIN")
+        .count();
+    assert_eq!(reads, 1);
+
+    let first = with_outline_entries(bound.clone());
+    f.state
+        .lock()
+        .unwrap()
+        .click_renames
+        .push((2011, "Sent".into()));
+    let clicked = agent
+        .call(
+            "browser_click",
+            json!({ "ref": named_ref(&first, "Reply"), "input_route": "dom_event" }),
+        )
+        .await;
+    assert_eq!(clicked["changes"]["kind"], "diff", "{clicked}");
+    assert_eq!(
+        clicked["changes"]["base_revision"],
+        bound["snapshot"]["revision"]
+    );
+}
+
+#[tokio::test]
+async fn a_bind_passes_a_first_reads_options_on_and_nothing_else() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let mut registry = crate::tool::ToolRegistry::new();
+    super::tools::register_browser_tools(&f.engine, &mut registry);
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+    let result = registry
+        .invoke_with_context(
+            "get_browser_state",
+            json!({ "pid": 1, "window_id": 7, "session": "bind-options",
+                "include_screenshot": true, "query": "Reply", "since_revision": 3 }),
+            unrestricted(),
+        )
+        .await;
+    let bound = structured(&result);
+    assert_eq!(bound["status"], "ok", "{bound}");
+    assert_eq!(bound["screenshot"]["source"], "cdp_tab", "{bound}");
+    assert!(matches!(result.content[0], Content::Image { .. }));
+    let outline = bound["outline"].as_str().unwrap();
+    assert!(
+        outline.contains("Reply") && !outline.contains("Archive item 0"),
+        "{outline}"
+    );
+    assert!(
+        bound.get("changes").is_none(),
+        "a first read is never a diff"
+    );
+}
+
+#[tokio::test]
+async fn a_bind_whose_read_is_refused_keeps_the_binding_and_says_why() {
+    // A JavaScript dialog is up when the second session binds the window.
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let opener = Agent::bound(&f, "bind-dialog-opener").await;
+    f.state.lock().unwrap().click_opens_dialog = true;
+    let opened = opener
+        .call(
+            "browser_click",
+            json!({ "ref": named_ref(&with_outline_entries(opener.bound.clone()), "Reply"),
+                "input_route": "dom_event" }),
+        )
+        .await;
+    let dialog_id = opened["changes"]["dialog"]["dialog_id"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{opened}"))
+        .to_owned();
+
+    let agent = Agent::bound(&f, "bind-dialog").await;
+    let bound = &agent.bound;
+    assert_eq!(
+        (&bound["status"], &bound["mode"]),
+        (&json!("ok"), &json!("bind"))
+    );
+    assert!(bound["target_id"].as_str().is_some() && bound["tabs"][0]["tab_id"].is_string());
+    let observation = &bound["observation"];
+    assert_eq!(observation["status"], "refused", "{bound}");
+    assert_eq!(observation["refusal"]["code"], "browser_dialog_open");
+    assert_eq!(observation["tab_id"], bound["tabs"][0]["tab_id"]);
+    assert!(
+        observation["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("browser_dialog"),
+        "the refusal names the call that clears it: {observation}"
+    );
+    // Nothing of a page that was not read.
+    for absent in ["outline", "snapshot", "page", "tab_id"] {
+        assert!(bound.get(absent).is_none(), "{absent}: {bound}");
+    }
+
+    // And no baseline: once the dialog is gone, the first action's result is
+    // a full snapshot, not a diff from a read that never happened.
+    let accepted = opener
+        .call(
+            "browser_dialog",
+            json!({ "action": "accept", "dialog_id": dialog_id }),
+        )
+        .await;
+    assert_eq!(accepted["status"], "ok", "{accepted}");
+    let clicked = agent
+        .call("browser_click", json!({ "x": 30, "y": 40 }))
+        .await;
+    assert_eq!(clicked["changes"]["kind"], "snapshot", "{clicked}");
+    assert_eq!(clicked["changes"]["reason"], "no_baseline");
+}
+
+#[tokio::test]
+async fn a_bind_reads_no_tab_when_the_active_one_is_not_proven() {
+    // The window's title names no tab of it.
+    let f = fixture_with(|st| st.tab_title = "Another title".into()).await;
+    let agent = Agent::bound(&f, "bind-no-active-tab").await;
+    let bound = &agent.bound;
+    assert_eq!(bound["tabs"].as_array().unwrap().len(), 1);
+    assert_ne!(bound["tabs"][0]["active"], true, "{bound}");
+    assert_eq!(bound["observation"]["status"], "refused", "{bound}");
+    assert_eq!(
+        bound["observation"]["refusal"]["code"],
+        "browser_tab_required"
+    );
+    assert!(bound["observation"]["refusal"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("a tab_id from tabs"));
+    for absent in ["outline", "snapshot", "page", "tab_id"] {
+        assert!(bound.get(absent).is_none(), "{absent}: {bound}");
+    }
+    assert!(
+        recorded_calls(&f, "Accessibility.getFullAXTree").is_empty(),
+        "the only tab was not read in the active one's place"
+    );
+    // The tab is still there to read by id.
+    assert_eq!(agent.snapshot().await["status"], "ok");
+}
+
+#[tokio::test]
+async fn a_tab_the_user_left_between_the_bind_and_its_read_is_read_where_it_is() {
+    let f = fixture_with(|st| st.hide_tab_on_attach = true).await;
+    let agent = Agent::bound(&f, "bind-tab-switched").await;
+    let bound = &agent.bound;
+    assert!(!f.state.lock().unwrap().tab_visible, "the read attached");
+    // The result is about the tab it names: that tab's id and that tab's
+    // page. The tab was not brought back to the front to be read.
+    assert_eq!(bound["tab_id"], bound["tabs"][0]["tab_id"], "{bound}");
+    assert_eq!(bound["page"]["url"], "https://fixture.test/");
+    assert!(bound["outline"].as_str().is_some_and(|o| !o.is_empty()));
+    assert!(f.state.lock().unwrap().calls.iter().all(|(_, method, _)| {
+        method != "Target.activateTarget" && method != "Page.bringToFront"
+    }));
+}
+
+#[tokio::test]
+async fn app_is_resolved_to_its_one_window_or_refused_before_anything_is_bound() {
+    let f = fixture().await;
+    let mut registry = crate::tool::ToolRegistry::new();
+    super::tools::register_browser_tools(&f.engine, &mut registry);
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+    let call = |args: Value| {
+        let registry = registry.clone();
+        async move {
+            let mut args = args;
+            args["session"] = json!("bind-by-app");
+            registry
+                .invoke_with_context("get_browser_state", args, unrestricted())
+                .await
+        }
+    };
+    let text = |result: &ToolResult| match &result.content[0] {
+        Content::Text { text, .. } => text.clone(),
+        other => panic!("{other:?}"),
+    };
+
+    // One window: bound and read, in the one call.
+    let result = call(json!({ "app": "Fixture Browser" })).await;
+    let bound = structured(&result);
+    assert_eq!(bound["status"], "ok", "{bound}");
+    assert_eq!(bound["native_title"], "Fixture - Chrome");
+    assert_eq!(bound["tab_id"], bound["tabs"][0]["tab_id"]);
+    assert!(bound["outline"].as_str().is_some_and(|o| !o.is_empty()));
+
+    // Several windows, or none: the resolver's own refusal, and no browser
+    // was asked anything.
+    let asked = recorded_calls(&f, "Target.getTargets").len();
+    let several = call(json!({ "app": "Two Windows" })).await;
+    assert_eq!(several.is_error, Some(true));
+    let refused = structured(&several);
+    assert_eq!(refused["code"], "app_window_ambiguous", "{refused}");
+    assert_eq!(
+        refused["candidates"],
+        json!([
+            { "window_id": 7, "pid": 1, "title": "Inbox" },
+            { "window_id": 8, "pid": 1, "title": "Docs" },
+        ])
+    );
+    assert!(text(&several).contains("pass pid + window_id for one"));
+    let absent = call(json!({ "app": "Not Running" })).await;
+    assert_eq!(absent.is_error, Some(true));
+    assert_eq!(structured(&absent)["code"], "app_not_running");
+
+    // One target form per call.
+    for mixed in [
+        json!({ "app": "Fixture Browser", "pid": 1, "window_id": 7 }),
+        json!({ "app": "Fixture Browser", "pid": 1 }),
+        json!({ "app": "Fixture Browser", "target_id": bound["target_id"], "tab_id": bound["tab_id"] }),
+    ] {
+        let result = call(mixed).await;
+        assert_eq!(result.is_error, Some(true));
+        assert!(
+            text(&result).contains("pass one target form"),
+            "{}",
+            text(&result)
+        );
+    }
+    let blank = call(json!({ "app": " " })).await;
+    assert!(text(&blank).contains("nonblank"), "{}", text(&blank));
+    assert_eq!(recorded_calls(&f, "Target.getTargets").len(), asked);
+
+    // A platform with no app resolver says what to pass instead.
+    let mut registry = crate::tool::ToolRegistry::new();
+    super::tools::register_browser_tools(&super::tools::tests::engine(), &mut registry);
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+    let elsewhere = registry
+        .invoke_with_context(
+            "get_browser_state",
+            json!({ "app": "Google Chrome", "session": "bind-by-app-elsewhere" }),
+            unrestricted(),
+        )
+        .await;
+    assert_eq!(elsewhere.is_error, Some(true));
+    assert!(
+        text(&elsewhere).contains("macOS-only") && text(&elsewhere).contains("pid + window_id")
+    );
+}
+
+#[cfg(feature = "yaml")]
+#[tokio::test]
+async fn a_manifest_judges_the_window_app_resolved_to_and_the_binds_read() {
+    use crate::authorization::PermissionMode;
+    use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+    let runtime = SessionAuthorizationRegistry::with_ceiling(
+        SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Bounded],
+            false,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let allowing = |window: u64, origin: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [get_browser_state]\n\
+                 resources:\n  desktop:\n    windows:\n      - pid: 1\n        window_id: {window}\n  \
+                 browser:\n    origins: [\"{origin}\"]\n"
+            ),
+        )
+        .unwrap();
+        let manifest = Arc::new(crate::session_manifest::load_manifest(&path).unwrap());
+        runtime
+            .compatibility_context(PermissionMode::Bounded, Some(manifest))
+            .unwrap()
+    };
+    let f = fixture().await;
+    let mut registry = crate::tool::ToolRegistry::new();
+    super::tools::register_browser_tools(&f.engine, &mut registry);
+    let registry = Arc::new(registry);
+    registry.init_self_weak();
+    let by_app = |session: &'static str, context| {
+        let registry = registry.clone();
+        async move {
+            let result = registry
+                .invoke_with_context(
+                    "get_browser_state",
+                    json!({ "app": "Fixture Browser", "session": session }),
+                    context,
+                )
+                .await;
+            structured(&result).clone()
+        }
+    };
+
+    // The window app names is not the one the manifest allows: refused as
+    // pid 1, window 7 would be, and no browser was asked anything.
+    let other_window = by_app("manifest-other-window", allowing(8, "https://fixture.test")).await;
+    assert_eq!(other_window["status"], "refused", "{other_window}");
+    assert!(recorded_calls(&f, "Target.getTargets").is_empty());
+
+    // The window is allowed, its page's origin is not: bound, not read.
+    let other_origin = by_app(
+        "manifest-other-origin",
+        allowing(7, "https://elsewhere.test"),
+    )
+    .await;
+    assert_eq!(other_origin["status"], "ok", "{other_origin}");
+    assert!(other_origin["target_id"].as_str().is_some());
+    assert_eq!(
+        other_origin["observation"]["status"], "refused",
+        "{other_origin}"
+    );
+    assert!(other_origin["observation"]["refusal"]["code"].is_string());
+    for absent in ["outline", "snapshot", "page", "tab_id"] {
+        assert!(
+            other_origin.get(absent).is_none(),
+            "{absent}: {other_origin}"
+        );
+    }
+    assert!(recorded_calls(&f, "Accessibility.getFullAXTree").is_empty());
+
+    // Both allowed: bound and read.
+    let allowed = by_app("manifest-allowed", allowing(7, "https://fixture.test")).await;
+    assert_eq!(allowed["status"], "ok", "{allowed}");
+    assert!(
+        allowed["outline"].as_str().is_some_and(|o| !o.is_empty()),
+        "{allowed}"
+    );
 }

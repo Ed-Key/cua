@@ -39,7 +39,10 @@ pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRe
     // Page actions read the page afterwards through the registry, so that
     // read is authorized exactly as a get_browser_state call is.
     let slot = registry.composite_registry_slot();
-    registry.register(Box::new(GetBrowserStateTool::new(engine.clone())));
+    registry.register(Box::new(GetBrowserStateTool::with_registry(
+        engine.clone(),
+        slot.clone(),
+    )));
     registry.register(Box::new(BrowserPrepareTool::new(engine.clone())));
     registry.register(Box::new(BrowserNavigateTool::with_registry(
         engine.clone(),
@@ -68,24 +71,40 @@ pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRe
 
 // ── Shared helpers ───────────────────────────────────────────────────────────
 
-/// The public caller session id, falling back to the daemon's internal mirror.
+/// The session a browser call runs in: the caller's label, else the session
+/// its transport gave it (the implicit one of a call that named none).
 pub(crate) fn session_of(args: &Value) -> String {
     args.opt_str("session")
         .or_else(|| args.opt_str("_session_id"))
         .unwrap_or_else(|| "default".into())
 }
 
-/// Target/ref minting requires an explicit (non-default) session so the
-/// capability namespace has a real owner whose end event cleans it up.
-fn require_explicit_session(args: &Value) -> Result<String, ToolResult> {
+/// Targets and refs are minted into a session with a real owner, whose end
+/// cleans them up: a label the caller chose, or its transport's implicit
+/// session. Only a call with neither (no transport, no label) is refused.
+fn require_session(args: &Value) -> Result<String, ToolResult> {
     let sid = session_of(args);
     if sid.is_empty() || sid == "default" {
         return Err(ToolResult::error(
-            "Browser targets and page refs are session-scoped capabilities — declare an \
-             explicit session (start_session) and pass its id on this call.",
+            "Browser targets and page refs belong to a session, and this call has none: \
+             pass session: \"<any short label>\" on this and later browser calls.",
         ));
     }
     Ok(sid)
+}
+
+/// The session `args` selects, as the tool will see it once dispatched. The
+/// adapters that run before a tool (ownership, resource attestation) get the
+/// caller's public arguments; this gives them the tool's own answer, the
+/// implicit session of an unnamed call included, so a bind and the read after
+/// it are judged in one session. Outside a dispatch the arguments are already
+/// the tool's.
+fn dispatched_session(args: &Value) -> Option<String> {
+    let session = match crate::tool::current_dispatch_runtime_args(args) {
+        Some(runtime_args) => session_of(&runtime_args),
+        None => session_of(args),
+    };
+    (!session.is_empty() && session != "default").then_some(session)
 }
 
 fn schema_target_id() -> Value {
@@ -114,16 +133,10 @@ pub(crate) fn browser_resource_ownership(
     engine: &BrowserEngine,
     args: &Value,
 ) -> ProtectedResourceOwnership {
-    let Some(session) = args
-        .get("session")
-        .and_then(Value::as_str)
-        .filter(|session| !session.is_empty())
-    else {
+    let Some(runtime_session) = dispatched_session(args) else {
         return ProtectedResourceOwnership::UserOwned;
     };
-    let runtime_session = crate::tool::current_dispatch_authorization_context()
-        .map(|context| context.runtime_session_key(session))
-        .unwrap_or_else(|| session.to_owned());
+    let public_label = args.get("session").and_then(Value::as_str);
     let pid = args.get("pid").and_then(Value::as_i64).or_else(|| {
         args.get("target_id")
             .and_then(Value::as_str)
@@ -132,7 +145,8 @@ pub(crate) fn browser_resource_ownership(
     });
     if pid.is_some_and(|pid| {
         engine.is_driver_owned_pid_for_session(&runtime_session, pid)
-            || engine.is_driver_owned_pid_for_session(session, pid)
+            || public_label
+                .is_some_and(|session| engine.is_driver_owned_pid_for_session(session, pid))
     }) {
         ProtectedResourceOwnership::DriverOwned
     } else {
@@ -145,11 +159,8 @@ pub(crate) async fn browser_protected_resource_scope(
     args: &Value,
     tool_name: &str,
 ) -> Result<Option<Value>, String> {
-    let session = args
-        .get("session")
-        .and_then(Value::as_str)
-        .filter(|session| !session.is_empty())
-        .ok_or_else(|| "the browser operation requires an explicit session".to_owned())?;
+    let runtime_session = dispatched_session(args)
+        .ok_or_else(|| "the browser operation has no session".to_owned())?;
     let target_id = args
         .get("target_id")
         .and_then(Value::as_str)
@@ -160,9 +171,6 @@ pub(crate) async fn browser_protected_resource_scope(
         .and_then(Value::as_str)
         .filter(|tab| !tab.is_empty())
         .ok_or_else(|| "the browser operation requires an exact tab_id".to_owned())?;
-    let runtime_session = crate::tool::current_dispatch_authorization_context()
-        .map(|context| context.runtime_session_key(session))
-        .unwrap_or_else(|| session.to_owned());
     let (validated, live_origin) = engine
         .attest_protected_tab(&runtime_session, target_id, tab_id)
         .await
@@ -598,21 +606,46 @@ fn with_tab_screenshot(mut result: ToolResult, screenshot: BrowserTabScreenshot)
 pub struct GetBrowserStateTool {
     def: ToolDef,
     engine: Arc<BrowserEngine>,
+    /// Where a bind dispatches its read of the active tab.
+    registry: ReplayRegistrySlot,
 }
 
+/// Private argument that carries a failed `app` lookup from `resolve_target`
+/// to `invoke`. Clients cannot send it: the registry strips underscore
+/// arguments before `resolve_target` runs.
+const APP_REFUSAL_ARG: &str = "_app_resolution_refusal";
+
+/// What a bind passes on to its read of the active tab. The rest of a read's
+/// options (a diff, a scope, a continuation) are about a page already read.
+const FIRST_READ_OPTIONS: &[&str] = &[
+    "snapshot_format",
+    "max_chars",
+    "query",
+    "include_refs",
+    "include_screenshot",
+];
+
 impl GetBrowserStateTool {
+    /// Outside a registry: a bind returns the binding alone, because nothing
+    /// there can authorize a read.
     pub fn new(engine: Arc<BrowserEngine>) -> Self {
+        Self::with_registry(engine, no_registry())
+    }
+
+    pub fn with_registry(engine: Arc<BrowserEngine>, registry: ReplayRegistrySlot) -> Self {
         let def = ToolDef {
             name: "get_browser_state".into(),
-            description: "Read-only browser inspection. Bind with pid + window_id to get a \
-                target_id and tab ids; snapshot with target_id + tab_id to get the page \
-                outline, one line per element with its ref and actions inline. Consent and \
+            description: "Read-only browser inspection. Start with app (macOS: the app's only \
+                window) or pid + window_id: it binds the window and returns target_id, the \
+                tabs, and the active tab's tab_id and outline, one line per element with its \
+                ref and actions inline. Later reads pass target_id + tab_id. Consent and \
                 setup refusals give the browser_prepare call to make. \
                 Details: skill://cua-driver/BROWSER.md"
                 .into(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
+                    "app": { "type": "string", "description": "Browser app name or bundle id (bind): its only window on the current Space. macOS only; elsewhere, and when it has several windows, pass pid + window_id." },
                     "pid": { "type": "integer", "description": "Browser process id (bind)." },
                     "window_id": { "type": "integer", "description": "Browser window id owned by pid (bind)." },
                     "target_id": schema_target_id(),
@@ -666,7 +699,124 @@ impl GetBrowserStateTool {
             idempotent: true,
             open_world: false,
         };
-        Self { def, engine }
+        Self {
+            def,
+            engine,
+            registry,
+        }
+    }
+
+    /// Add to a good bind the read of the window's active tab.
+    ///
+    /// The read is a `get_browser_state {target_id, tab_id}` call dispatched
+    /// through the registry, so it is admitted or refused exactly as that
+    /// call would be alone (policy, manifest, live origin, consent) and it
+    /// records the session's refs and diff baseline the one way a read does.
+    /// A read that was refused or failed leaves the bind as it is and is
+    /// reported under `observation`: nothing of a page is returned that was
+    /// not read, and no baseline exists.
+    async fn with_first_read(
+        &self,
+        args: &Value,
+        mut bound: ToolResult,
+        target_id: &str,
+        record: &super::store::TargetRecord,
+    ) -> ToolResult {
+        let Some(registry) = self.registry.lock().unwrap().upgrade() else {
+            return bound;
+        };
+        let not_read =
+            |mut bound: ToolResult, tab_id: Option<&str>, mut observation: Value, why: &str| {
+                if let (Some(tab_id), Some(fields)) = (tab_id, observation.as_object_mut()) {
+                    fields.insert("tab_id".into(), json!(tab_id));
+                }
+                if let Some(structured) = bound.structured_content.as_mut() {
+                    structured["observation"] = observation;
+                }
+                if let Some(Content::Text { text, .. }) = bound.content.first_mut() {
+                    text.push_str(&format!("; no tab was read: {why}"));
+                }
+                bound
+            };
+        // Only a tab proven to be the one the window shows is read. The bind
+        // proves it by the window's title; a title that names no tab, or
+        // more than one, proves nothing, and no tab is picked in its place.
+        let active: Vec<&super::store::TabRecord> = record
+            .tabs
+            .values()
+            .filter(|tab| tab.active == Some(true))
+            .collect();
+        let [tab] = active.as_slice() else {
+            let refusal = BrowserRefusal::new(
+                BrowserRefusalCode::BrowserTabRequired,
+                "the window's active tab could not be proven from its title; call \
+                 get_browser_state with this target_id and a tab_id from tabs to read one",
+            );
+            let why = refusal.message.clone();
+            return not_read(
+                bound,
+                None,
+                json!({ "status": "refused", "refusal": refusal }),
+                &why,
+            );
+        };
+        let mut read = json!({ "target_id": target_id, "tab_id": tab.tab_id });
+        for option in FIRST_READ_OPTIONS {
+            if let Some(value) = args.get(*option) {
+                read[*option] = value.clone();
+            }
+        }
+        if let Some(session) = public_session(args) {
+            read["session"] = json!(session);
+        }
+        let result = registry.invoke("get_browser_state", read).await;
+        let said = result.content.iter().find_map(|content| match content {
+            Content::Text { text, .. } => Some(text.clone()),
+            _ => None,
+        });
+        let observed = match result.structured_content {
+            Some(observed) if result.is_error != Some(true) && observed["status"] == "ok" => {
+                observed
+            }
+            // Refused by the registry or the tool: its own words, whole.
+            Some(refused) => {
+                return not_read(
+                    bound,
+                    Some(&tab.tab_id),
+                    refused,
+                    said.as_deref().unwrap_or("the read was refused"),
+                )
+            }
+            None => {
+                let why = said.unwrap_or_else(|| "the read failed".to_owned());
+                return not_read(
+                    bound,
+                    Some(&tab.tab_id),
+                    json!({ "status": "failed", "message": why }),
+                    &why,
+                );
+            }
+        };
+        // The read's own fields, beside the bind's: tab_id, outline,
+        // snapshot, page. The bind's fields are never overwritten.
+        if let (Some(structured), Value::Object(observed)) =
+            (bound.structured_content.as_mut(), observed)
+        {
+            for (key, value) in observed {
+                if structured.get(&key).is_none() {
+                    structured[key] = value;
+                }
+            }
+        }
+        if let (Some(Content::Text { text, .. }), Some(said)) = (bound.content.first_mut(), said) {
+            text.push_str(&format!("; {said}"));
+        }
+        let images = result
+            .content
+            .into_iter()
+            .filter(|content| matches!(content, Content::Image { .. }));
+        bound.content.splice(0..0, images);
+        bound
     }
 }
 
@@ -674,6 +824,45 @@ impl GetBrowserStateTool {
 impl Tool for GetBrowserStateTool {
     fn def(&self) -> &ToolDef {
         &self.def
+    }
+
+    /// `app` that names exactly one window becomes that pid + window_id
+    /// before authorization, so policy and consent judge the real window.
+    /// Otherwise the call stays as `app`, is authorized like any call that
+    /// names no window, and carries the refusal for `invoke` to return.
+    async fn resolve_target(&self, args: &mut Value) {
+        let Some(app) = args.get("app").and_then(Value::as_str).map(str::to_owned) else {
+            return;
+        };
+        // `app` beside another target form is refused by `invoke`.
+        if app.trim().is_empty()
+            || ["pid", "window_id", "target_id", "tab_id"]
+                .iter()
+                .any(|other| args.get(*other).is_some())
+        {
+            return;
+        }
+        let resolved = self.engine.platform.resolve_app_window(&app).await;
+        let Some(fields) = args.as_object_mut() else {
+            return;
+        };
+        match resolved {
+            Ok((pid, window_id)) => {
+                fields.remove("app");
+                fields.insert("pid".into(), pid.into());
+                fields.insert("window_id".into(), window_id.into());
+            }
+            Err(refusal) => {
+                let message = refusal.content.iter().find_map(|content| match content {
+                    Content::Text { text, .. } => Some(text.clone()),
+                    _ => None,
+                });
+                fields.insert(
+                    APP_REFUSAL_ARG.into(),
+                    json!({ "message": message, "structured": refusal.structured_content }),
+                );
+            }
+        }
     }
 
     async fn protected_resource_ownership(
@@ -703,9 +892,33 @@ impl Tool for GetBrowserStateTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
+        // `app` was resolved to pid + window_id before authorization, or it
+        // could not be: the stored refusal, or a form that is not one target.
+        if let Some(stored) = args.get(APP_REFUSAL_ARG) {
+            let refusal =
+                ToolResult::error(stored["message"].as_str().unwrap_or("app lookup failed"));
+            return match stored.get("structured").filter(|s| !s.is_null()) {
+                Some(structured) => refusal.with_structured(structured.clone()),
+                None => refusal,
+            };
+        }
+        if let Some(app) = args.get("app") {
+            return ToolResult::error(if app.as_str().is_none_or(|app| app.trim().is_empty()) {
+                "app must be a nonblank app name or bundle id"
+            } else if ["pid", "window_id", "target_id", "tab_id"]
+                .iter()
+                .any(|other| args.get(*other).is_some())
+            {
+                "pass one target form: app, or pid + window_id, or target_id + tab_id"
+            } else {
+                "app was not resolved before authorization; call list_windows and pass \
+                 pid + window_id."
+            });
+        }
+
         // Snapshot mode: target_id (+ tab_id) — uses existing capabilities.
         if let Some(target_id) = args.opt_str("target_id") {
-            let session = match require_explicit_session(&args) {
+            let session = match require_session(&args) {
                 Ok(s) => s,
                 Err(e) => return e,
             };
@@ -910,7 +1123,7 @@ impl Tool for GetBrowserStateTool {
             Ok(v) => v,
             Err(e) => return e,
         };
-        let session = match require_explicit_session(&args) {
+        let session = match require_session(&args) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -943,7 +1156,7 @@ impl Tool for GetBrowserStateTool {
                 } else {
                     "embedded_single_page"
                 };
-                ToolResult::text(format!(
+                let bound = ToolResult::text(format!(
                     "bound target {target_id} ({quality}) with {} tab(s)",
                     tabs.len()
                 ))
@@ -958,7 +1171,9 @@ impl Tool for GetBrowserStateTool {
                     "mutation_allowed": record.quality == BindingQuality::Exact,
                     "native_title": record.native_title,
                     "tabs": tabs,
-                }))
+                }));
+                self.with_first_read(&args, bound, &target_id, &record)
+                    .await
             }
             Err(refusal) => refusal.to_tool_result(),
         }
@@ -1033,7 +1248,7 @@ impl Tool for BrowserPrepareTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        let session = match require_explicit_session(&args) {
+        let session = match require_session(&args) {
             Ok(session) => session,
             Err(error) => return error,
         };
@@ -1194,7 +1409,7 @@ impl Tool for BrowserNavigateTool {
             (Ok(t), Ok(tab), Ok(u)) => (t, tab, u),
             (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
         };
-        let session = match require_explicit_session(&args) {
+        let session = match require_session(&args) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -1375,7 +1590,7 @@ impl Tool for BrowserClickTool {
             (Ok(t), Ok(tab)) => (t, tab),
             (Err(e), _) | (_, Err(e)) => return e,
         };
-        let session = match require_explicit_session(&args) {
+        let session = match require_session(&args) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -2694,7 +2909,7 @@ impl Tool for BrowserTypeTool {
             (Ok(t), Ok(tab), Ok(x)) => (t, tab, x),
             (Err(e), _, _) | (_, Err(e), _) | (_, _, Err(e)) => return e,
         };
-        let session = match require_explicit_session(&args) {
+        let session = match require_session(&args) {
             Ok(s) => s,
             Err(e) => return e,
         };
@@ -3535,7 +3750,7 @@ impl Tool for BrowserDialogTool {
         if !matches!(delivery_mode.as_str(), "background" | "foreground") {
             return ToolResult::error("delivery_mode must be background or foreground");
         }
-        let session = match require_explicit_session(&args) {
+        let session = match require_session(&args) {
             Ok(session) => session,
             Err(error) => return error,
         };
@@ -3745,7 +3960,7 @@ impl Tool for BrowserSetInputFilesTool {
             Ok(files) => files,
             Err(error) => return error,
         };
-        let session = match require_explicit_session(&args) {
+        let session = match require_session(&args) {
             Ok(session) => session,
             Err(error) => return error,
         };
@@ -4427,7 +4642,9 @@ pub(crate) mod tests {
     }
 
     #[tokio::test]
-    async fn bind_requires_an_explicit_session() {
+    async fn a_bind_with_no_session_at_all_is_refused_with_the_fix() {
+        // No label and no transport session: the registry gives every call
+        // it dispatches one or the other, so this is only a direct call.
         let e = engine();
         let tool = GetBrowserStateTool::new(e);
         for args in [
@@ -4436,6 +4653,10 @@ pub(crate) mod tests {
         ] {
             let result = tool.invoke(args).await;
             assert_eq!(result.is_error, Some(true));
+            assert!(matches!(
+                &result.content[0],
+                Content::Text { text, .. } if text.contains("pass session: \"<any short label>\"")
+            ));
         }
     }
 

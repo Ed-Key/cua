@@ -17,6 +17,7 @@ use super::refusal::BrowserRefusal;
 use super::types::{
     BrowserClassification, BrowserProduct, NativeWindowInfo, OwnedEndpoint, ProcessFingerprint,
 };
+use crate::protocol::ToolResult;
 
 /// Root process of a driver-owned isolated browser that core launched.
 ///
@@ -359,6 +360,19 @@ pub trait BrowserPlatform: Send + Sync {
     /// not change behavior. Implementations must not deliver input or alter
     /// focus/z-order; failures are intentionally not part of browser results.
     async fn visualize_browser_action(&self, _action: BrowserVisualAction) {}
+
+    /// The (pid, window_id) that `get_browser_state {app}` binds: the one
+    /// window of the app with this name or bundle id. A platform answers with
+    /// the resolver behind its `get_window_state {app}`, so both tools mean
+    /// the same window and refuse the same way (not running, no window,
+    /// several windows with the candidates to choose from). The error is the
+    /// tool result to return as it is. The default is a platform without
+    /// that resolver.
+    async fn resolve_app_window(&self, _app: &str) -> Result<(i64, u64), ToolResult> {
+        Err(ToolResult::error(
+            "app targeting is macOS-only for now; pass pid + window_id from list_windows.",
+        ))
+    }
 
     /// Classify `pid`: is it a browser, which engine family, can it do
     /// CDP at all. Must not have side effects.
