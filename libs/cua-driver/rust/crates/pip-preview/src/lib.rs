@@ -299,6 +299,17 @@ pub struct PipVerification {
     pub claims: Vec<PipClaim>,
 }
 
+/// Why a session's panel goes away.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipSessionEnd {
+    /// `end_session`, or the session's control connection closed: the
+    /// session is done, and its panel may say so.
+    Finished,
+    /// The idle sweep reclaimed the session, and its connection may revive
+    /// it: not a finish. The panel closes without any finished mark.
+    Expired,
+}
+
 /// A live PiP window. Owned by `main.rs` for the lifetime of the
 /// process; `shutdown()` consumes it and closes the window.
 pub trait PipBackend: Send + Sync {
@@ -311,8 +322,9 @@ pub trait PipBackend: Send + Sync {
     /// A `verify_state` call finished. Non-blocking, like `push_frame`.
     fn push_verification(&self, _verification: PipVerification) {}
 
-    /// The session with this private key ended: drop its panel.
-    fn end_session(&self, _session_key: &str) {}
+    /// The session with this private key is gone: drop its panel, as a
+    /// finished session's or an expired one's (see `PipSessionEnd`).
+    fn end_session(&self, _session_key: &str, _end: PipSessionEnd) {}
 
     /// Close the window and release native resources. Called from
     /// `main.rs` on shutdown.

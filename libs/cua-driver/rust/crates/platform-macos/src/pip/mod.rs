@@ -45,7 +45,8 @@
 //!   keeps its place and holds no slot, and an ended session's dragged
 //!   position and resized size are remembered while the daemon runs.
 //! - 8 s without a new frame for that session: fade out (0.25 s), then
-//!   `orderOut`. The next frame fades it back in.
+//!   `orderOut`. The next frame fades it back in. Going idle is only that:
+//!   nothing is marked finished (see `finish`).
 //! - While the session's target window is fully visible to the user (see
 //!   `visibility`), the panel stays hidden; it returns when the window is
 //!   covered, moves off screen or to another Space. Every frame carries a
@@ -54,7 +55,10 @@
 //! - The header's close button hides the panel until the session's next
 //!   frame; the focus button brings the target window forward through the
 //!   same code path as the `bring_to_front` tool.
-//! - Session end: fade out, close, release.
+//! - Session end (`end_session`, or its control connection closing): the
+//!   session is done; its finished state plays if the panel may show it,
+//!   then fade out, close, release. A session the idle sweep reclaimed
+//!   (300 s idle; it may be revived) only fades out and closes.
 //!
 //! ## Live mirror
 //!
@@ -63,6 +67,23 @@
 //! arriving underneath: when no stream can run (no permission, window
 //! gone) or it stops, the layer clears and the still (or "Preview
 //! unavailable") shows through.
+//!
+//! ## Card shape
+//!
+//! The front card takes its window's proportions, whatever they are: the
+//! window's size (from each capture and the visibility poll) fitted into the
+//! panel's size box (`stack::card_shape`), which is the default card size or
+//! what the user resized the panel to. The box is orientation-neutral: it
+//! gives the card's longest side and its area, so a tall window gives a
+//! tall card as roomy as a wide window's wide one, and the picture fills it
+//! edge to edge. The window is sized for the square that holds any such
+//! card, and that square's bottom-right corner (the panel's cascade slot,
+//! or where it was dragged) is the card's anchor: when the target window
+//! changes, or its size does, the card glides to its new shape up and left
+//! of that corner and the back items follow its top-left. The window itself
+//! never changes with the shape, so placement never moves. Past 2.2:1 either way the card is clamped and the
+//! picture keeps its own shape inside it, over a blurred backdrop. The live
+//! stream is sized for the picture, so it is never padded.
 //!
 //! ## Card stack
 //!
@@ -98,11 +119,14 @@
 //! ## Finished state
 //!
 //! `verify_state` results arrive as labelled claims (`push_verification`)
-//! straight to the main queue. When the session finishes (8 s idle after
-//! acting, or `end_session`) while its panel is up, the front card shows a
-//! checklist of its recent claims, rows coming in 80 ms apart, (or, with no
-//! claims, the windows it touched as chips), holds 2.5 s, then the panel
-//! fades. A new action cancels it and the panel is live again.
+//! straight to the main queue. A window a verification proves gets its
+//! check at once (a chip behind, a badge on the front card). On proof
+//! (8 s of quiet after a satisfied claim) the front card shows a checklist
+//! of the session's recent claims, rows coming in 70 ms apart; when the
+//! session ends it shows that checklist or, with no claims, the windows it
+//! touched as chips. The finished state holds 2 s, then the panel fades. A
+//! new action cancels it and the panel is live again. Idle alone shows
+//! none of this.
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::ffi::c_void;
@@ -112,7 +136,7 @@ use std::time::{Duration, Instant};
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use pip_preview::{PipBackend, PipConfig, PipFrame};
+use pip_preview::{PipBackend, PipConfig, PipFrame, PipSessionEnd};
 
 mod cursor;
 mod finish;
@@ -124,14 +148,15 @@ mod visibility;
 use cursor::{cursor_in_well, sprite_placement, sprite_window, Sprite};
 pub(crate) use cursor::sprite_box;
 use finish::{
-    checklist_fit, chip_grid, row_width, Claim, Finale, Lifecycle, Rows, Verdicts, CAPTION_GAP,
-    CAPTION_LINE, LABEL_X, MARK_SIZE, MORE_LINE, ROW_INSET, ROW_PAD,
+    checklist_fit, chip_grid, row_width, Claim, Ending, Finale, Lifecycle, News, Rows, Verdicts,
+    CAPTION_GAP, CAPTION_LINE, LABEL_X, MARK_SIZE, MORE_LINE, ROW_INSET, ROW_PAD,
 };
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
-    back_cards, bar_frame, bar_layout, card_size, deck_size, item_at, max_card, own_pixels,
-    panel_point, press_edges, pressed_item, resize_settled, resize_window, slot_frame, to_window,
+    back_cards, bar_frame, bar_layout, card_shape, deck_size, hold, item_at, max_card,
+    own_pixels, panel_point, press_edges, pressed_item, resize_panel, resize_settled,
+    shaped_frame, slot_frame, to_window,
     window_origin, window_size, CardStack, Motion, Slot, Trail, BAR_BUTTON, BAR_FADE_IN,
     BAR_FADE_OUT, CHIP_REACH, DRAG_SLOP, GLASS_SPACING, MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, VIEWS,
 };
@@ -198,6 +223,10 @@ const EDGE_INSET: f64 = 16.0;
 const STACK_GAP: f64 = 12.0;
 /// How often active sessions re-check whether their window is fully visible.
 const VISIBILITY_POLL: Duration = Duration::from_millis(500);
+/// `NSTextAlignmentCenter` for `setAlignment:`. AppKit swaps center and
+/// right between its two ABIs (center is 1 on Apple silicon and 2 on Intel),
+/// so never pass a literal.
+const TEXT_CENTER: isize = objc2_app_kit::NSTextAlignment::Center.0;
 
 // ── Pure placement / timing decisions (unit tested) ───────────────────────
 
@@ -451,8 +480,14 @@ struct Panel {
     target_icon: usize,
     target_title: usize,
     /// The front card's view (it holds the picture, the cursor sprite, the
-    /// placeholder and any finale overlay).
+    /// placeholder, the check badge and any finale overlay).
     front_view: usize,
+    /// The front card's check badge (see `sync_front_badge`): its view, its
+    /// mark and glyph layers, and whether it is showing.
+    front_badge: usize,
+    front_badge_mark: usize,
+    front_badge_glyph: usize,
+    front_badge_on: bool,
     focus: usize,
     close: usize,
     /// Back card views, depth 1 first.
@@ -474,6 +509,9 @@ struct Panel {
     trail_motion: Trail,
     /// What the session verified and finished.
     verdicts: Verdicts,
+    /// When the newest proof arrived (its finale waits out a quiet period
+    /// from here or from the last action, whichever is later).
+    proof_at: Option<Instant>,
     /// Windows logged as finished (so each is logged once per finish).
     finished_seen: HashSet<u32>,
     lifecycle: Lifecycle,
@@ -489,12 +527,25 @@ struct Panel {
     /// Private session key (for logs from callbacks that only have the
     /// panel).
     key: String,
-    /// Front card size in points.
+    /// The panel's size box in points (the default size, or what the user
+    /// resized it to): it gives the front card's longest side and its area,
+    /// whichever way the card is turned. The window is sized for the square
+    /// that holds any such card (`stack::hold`).
     card: (f64, f64),
-    /// Front card size its views were last laid out for.
+    /// Front card size as drawn: the target window's shape at the size the
+    /// box allows (`stack::card_shape`), its bottom-right corner on that
+    /// square's.
+    front: (f64, f64),
+    /// Size of the displayed window, as far as it is known.
+    shape: Option<(f64, f64)>,
+    /// Front card size its views were last laid out for: the card as it is
+    /// drawn right now (`front` once at rest, sizes in between while it
+    /// glides to a new shape). The cursor maps into this, and a finale is
+    /// laid out for it.
     laid_out: (f64, f64),
-    /// Image well size the live stream is sized for: follows `card` once a
-    /// resize has settled.
+    /// Size of the picture in the image well (the window's own proportions
+    /// inside the front card), which the live stream is sized for: follows
+    /// the front card, once a resize by the user has settled.
     stream_well: (f64, f64),
     /// When the front card last changed size.
     well_changed: Instant,
@@ -546,6 +597,9 @@ struct CardInfo {
     /// The window's last still while its card is behind, with the window it
     /// was captured from (shown only if that is the card's own window).
     still: Option<(Tag, Image)>,
+    /// The window's size when its card went behind: the shape the front
+    /// card takes at once when it comes back.
+    shape: Option<(f64, f64)>,
 }
 
 /// A retained `NSImage`, released on drop (like all panel state, only on
@@ -573,9 +627,10 @@ struct Remembered {
 struct Gesture {
     /// The pressed panel's id (it may be a live or an ending panel).
     id: i64,
-    /// Pointer (screen points) and window frame at the press.
+    /// Pointer (screen points), window frame and size box at the press.
     mouse: (f64, f64),
     start: Area,
+    start_card: (f64, f64),
     /// Window origin after the last drag step.
     origin: (f64, f64),
     /// Front card edges being resized (0 = not a resize).
@@ -585,6 +640,9 @@ struct Gesture {
     pressed: Option<Tag>,
     /// The pointer went past `DRAG_SLOP`: a drag, not a click.
     moved: bool,
+    /// Since when the button has been seen up with no mouse-up delivered
+    /// (see `release_missed`).
+    up_since: Option<Instant>,
     /// Largest front card on the panel's screen.
     max: (f64, f64),
 }
@@ -989,9 +1047,34 @@ impl PipBackend for MacosPipBackend {
         dispatch_to_main(verification, apply_verify_cb);
     }
 
-    fn end_session(&self, session_key: &str) {
+    fn end_session(&self, session_key: &str, end: PipSessionEnd) {
+        let target = lock(&self.worker.active)
+            .get(session_key)
+            .map(|(target, _)| *target);
         self.worker.forget(session_key);
-        dispatch_to_main(session_key.to_owned(), end_session_cb);
+        // A finished session's hidden panel may come back for its finale,
+        // but never over a window the user can see: the poll stopped
+        // answering when the session went idle, so ask now (WindowServer
+        // calls, so here and not on the main queue).
+        let target_visible = target
+            .filter(|_| end == PipSessionEnd::Finished)
+            .map(|target| {
+                let (windows, displays) = visibility::snapshot();
+                visibility::target_fully_visible(
+                    target,
+                    &windows,
+                    &displays,
+                    std::process::id() as i32,
+                )
+            });
+        dispatch_to_main(
+            SessionEnd {
+                key: session_key.to_owned(),
+                end,
+                target_visible,
+            },
+            end_session_cb,
+        );
     }
 
     fn shutdown(self: Box<Self>) {
@@ -1137,7 +1220,7 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
     let Some(panel) = state.panels.get_mut(&update.key) else {
         return false;
     };
-    let well = well_size(panel.card);
+    let well = well_size(panel.laid_out);
     panel.cursor_at = update.image.map(|_| (update.x, update.y));
     panel.cursor_box = update.sprite_box;
     panel.cursor_window = update.window;
@@ -1192,7 +1275,7 @@ unsafe fn place_sprite(panel: &Panel) {
         sprite_placement(
             sprite_window(panel.cursor_window, displayed, panel.target_frame),
             panel.cursor_at,
-            well_size(panel.card),
+            well_size(panel.laid_out),
             panel.cursor_box,
         )
     };
@@ -1371,7 +1454,97 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     panel.target_visible = target_visible;
     panel.resolved_window = resolved_window;
     panel.target_frame = target_frame;
+    sync_shape(panel);
     refresh(state, &key);
+}
+
+/// Resting frame of `slot` with the front card as it is drawn now (the
+/// size box fitted to the displayed window's shape).
+fn resting(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
+    shaped_frame(hold(panel.card), panel.front, slot, back_cards)
+}
+
+/// Size of the picture in the front card's well: the window's own
+/// proportions (the whole well while they are unknown). It fills the well
+/// unless the card's shape was clamped.
+fn picture_size(panel: &Panel) -> (f64, f64) {
+    let well = well_size(panel.front);
+    panel.shape.map_or(well, |shape| stack::fit(well, shape))
+}
+
+/// The displayed window's size, if the last known frame is that window's:
+/// the front card takes its shape. Whether anything changed.
+unsafe fn sync_shape(panel: &mut Panel) -> bool {
+    let displayed = current_tag(panel.target, panel.resolved_window).and_then(|tag| tag.1);
+    match panel.target_frame {
+        Some((window, frame)) if Some(window) == displayed => {
+            set_shape(panel, Some((frame.w, frame.h)))
+        }
+        _ => false,
+    }
+}
+
+/// The displayed window is `shape` points (`None`: not known, so the card is
+/// the whole box, never another window's shape): fit the front card to it
+/// (see `stack::card_shape`) and size the live stream for the picture. On a
+/// shown panel every item glides to its new frame from where it is drawn
+/// (the card's bottom-right corner stays put, the back items follow its
+/// top-left); a hidden one is laid out at rest, so it shows with everything
+/// in place. The caller refreshes, which resizes the stream. Whether
+/// anything changed.
+unsafe fn set_shape(panel: &mut Panel, shape: Option<(f64, f64)>) -> bool {
+    if panel.shape == shape {
+        return false;
+    }
+    panel.shape = shape;
+    let front = card_shape(panel.card, shape);
+    if front != panel.front {
+        let cards = back_cards(&panel.layout);
+        let drawn = settle_frames(panel);
+        panel.front = front;
+        if panel.shown {
+            for (index, slot) in panel.layout.clone().into_iter().enumerate() {
+                let rest = resting(panel, slot, cards);
+                if drawn[index] != rest {
+                    panel.motion[slot.view()].restack(drawn[index], rest);
+                }
+            }
+            start_ticking();
+        } else {
+            panel.motion = Default::default();
+        }
+        apply_card_frames(panel);
+        log_shape(panel);
+    }
+    panel.stream_well = picture_size(panel);
+    true
+}
+
+/// Log the front card's size, the size box and the window's size
+/// (`window=(0.0, 0.0)`: not known), for checks.
+fn log_shape(panel: &Panel) {
+    tracing::info!(target: "pip", session = %panel.key, card = ?panel.front, bounds = ?panel.card, window = ?panel.shape.unwrap_or_default(), "PiP card shape");
+}
+
+/// The user resized the panel: `card` is its size box now, and the front
+/// card takes its window's shape in it. The caller sets the window's frame
+/// and lays the cards out; the live stream follows once the size settles.
+fn set_box(panel: &mut Panel, card: (f64, f64)) {
+    if card == panel.card {
+        return;
+    }
+    panel.card = card;
+    panel.front = card_shape(card, panel.shape);
+    // A panel the user sized stays where they put it, like a dragged one.
+    panel.resized = true;
+    panel.dragged = true;
+    panel.slot = None;
+    panel.well_changed = Instant::now();
+    dispatch_to_main_after(
+        RESIZE_DEBOUNCE + Duration::from_millis(5),
+        panel.key.clone(),
+        resize_settle_cb,
+    );
 }
 
 /// Apply an action's lifecycle (the action note row of the table in
@@ -1439,6 +1612,7 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
         if !worker.is_live(&key) {
             return;
         }
+        // Proof among it waits for the panel (see `create_panel`).
         state.early.entry(key).or_default().verify(
             target_pid,
             window,
@@ -1448,7 +1622,7 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
         );
         return;
     };
-    let mut news = false;
+    let mut news = News::None;
     let restacked = restack(panel, &key, &worker, |panel| {
         news = panel
             .verdicts
@@ -1458,19 +1632,34 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
     if restacked {
         announce_stack(panel, &key);
     }
-    // Older than what is known: nothing to show.
-    if !news {
+    // Older than what is known, or a repeat of it: nothing to show.
+    if news == News::None {
         return;
     }
-    // News that lands while the finale plays (verify_state can outlast the
-    // idle timer) replays it, so nothing is shown stale.
+    // News that lands while the finale plays replays it, so nothing is
+    // shown stale.
     if let Some(generation) = panel.lifecycle.restart() {
-        play_finale(panel, &key, &panel.verdicts.finale(), generation);
-    } else if panel.lifecycle.news_arrived() {
-        // It landed after the finale for this stretch was over: it gets a
-        // finale of its own (unless the user closed the panel).
-        refresh(state, &key);
+        let finale = finish::replayed(&mut panel.verdicts);
+        play_finale(panel, &key, &finale, generation);
+        return;
     }
+    if news == News::Proof {
+        // Proof: its finale plays once the session has been quiet for the
+        // idle period from now (see `refresh`). Until then the visibility
+        // poll keeps answering for the target, so a hidden panel comes back
+        // only over a window the user cannot see.
+        let now = Instant::now();
+        panel.proof_at = Some(now);
+        worker.mark_delivered(&key, now);
+        dispatch_to_main_after(
+            IDLE_HIDE_AFTER + Duration::from_millis(20),
+            key.clone(),
+            idle_check_cb,
+        );
+    }
+    // Other news can call waiting proof off (its claim now fails): an idle
+    // panel that stayed up for that proof fades now, not at the old timer.
+    refresh(state, &key);
 }
 
 /// An action as it was pushed, before its capture.
@@ -1544,6 +1733,35 @@ unsafe fn note_finished(panel: &mut Panel, key: &str) {
         }
     }
     panel.finished_seen = finished;
+}
+
+/// Show the check badge on the front card while its window is finished
+/// (proved, or its session ended), and log each change. A finale covers the
+/// card and says the same in full, so the badge hides under one.
+unsafe fn sync_front_badge(panel: &mut Panel) {
+    let window = panel.cards.front_key().and_then(|tag| tag.1);
+    let on = panel.finale_view.is_none()
+        && window.is_some_and(|window| panel.verdicts.finished(window));
+    if on == panel.front_badge_on {
+        return;
+    }
+    panel.front_badge_on = on;
+    let badge = panel.front_badge as *mut AnyObject;
+    let _: () = msg_send![badge, setHidden: !on];
+    if on {
+        // It comes in like a finale row's mark: a fade, a pop, the check
+        // drawn.
+        let layer: *mut AnyObject = msg_send![badge, layer];
+        animate_row(
+            layer,
+            panel.front_badge_mark as *mut AnyObject,
+            panel.front_badge_glyph as *mut AnyObject,
+            0,
+            CACurrentMediaTime(),
+            (0.0, 0.0),
+        );
+    }
+    tracing::info!(target: "pip", session = %panel.key, window = window.unwrap_or(0), on, "PiP front badge");
 }
 
 /// Show the target app's icon and `title` (else the app's name) in the
@@ -1631,6 +1849,8 @@ unsafe fn restack(
     let old_layout = panel.layout.clone();
     let drawn = settle_frames(panel);
     change(panel);
+    // The front window, or what is known about it, may have changed.
+    sync_front_badge(panel);
     let new = panel.cards.keys();
     let layout = item_slots(panel);
     if new == old && layout == old_layout {
@@ -1643,7 +1863,7 @@ unsafe fn restack(
             continue;
         };
         let views = slot_views(panel, slot);
-        let rest = slot_frame(panel.card, slot, cards);
+        let rest = resting(panel, slot, cards);
         match from {
             Some(from) => {
                 // Moved, or its place moved (chips shift when cards come
@@ -1701,6 +1921,7 @@ unsafe fn switch_front(
             let _: *mut AnyObject = msg_send![image, retain];
             front.data.still = Some((front.key, Image(image as usize)));
         }
+        front.data.shape = panel.shape;
     }
     let changed = restack(panel, key, worker, |panel| match acted {
         Some(now) => panel.cards.act(tag, now),
@@ -1719,6 +1940,12 @@ unsafe fn switch_front(
             }
         }
     }
+    // A card coming back brings its window's shape. A window whose size is
+    // not known yet takes the whole box until its frame arrives (with this
+    // capture, or the next poll): never the old window's shape, which would
+    // be saved as its own when it goes behind.
+    let shape = panel.cards.front_mut().and_then(|front| front.data.shape);
+    set_shape(panel, shape);
     changed
 }
 
@@ -1818,20 +2045,27 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
                     tag.1.is_some_and(|window| gone.contains(&window))
                 });
             });
+            let mut reshaped = false;
             if panel.target == update.target {
-                // The window may have moved: the cursor maps into its new
-                // place even when nothing else changed, without waiting for
-                // the overlay to render again.
+                // The window may have moved or changed size: the cursor maps
+                // into its new place and the card takes its new shape even
+                // when nothing else changed, without waiting for the overlay
+                // to render again.
                 panel.target_frame = update.target_frame;
                 place_sprite(panel);
+                reshaped = sync_shape(panel);
             }
-            // An answer about an older target, or no change: nothing more.
+            // An answer about an older target, or no change: nothing more
+            // (but a new shape resizes the stream).
             if panel.target != update.target
                 || (panel.target_visible == update.visible
                     && panel.resolved_window == update.resolved_window)
             {
                 if restacked {
                     announce_stack(panel, key);
+                }
+                if reshaped {
+                    refresh(state, key);
                 }
                 return;
             }
@@ -1852,6 +2086,9 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
                     restacked = true;
                 }
             }
+            // The frame may be of the window the target resolves to now
+            // (after the old front card took its own shape behind).
+            sync_shape(panel);
             if restacked {
                 announce_stack(panel, key);
             }
@@ -1942,7 +2179,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
         next_stream_generation,
         image_size,
         anchor,
-        worker,
+        gesture,
         ..
     } = state;
     // An ended session's panel keeps its slot while its finale is up.
@@ -1956,15 +2193,29 @@ unsafe fn refresh(state: &mut State, key: &str) {
     let Some(panel) = panels.get_mut(key) else {
         return;
     };
-    let active = !idle_hide_due(panel.last_action, Instant::now());
-    // Gone idle after acting: the session finished. The finale plays if the
-    // panel is up; the panel stays up for it whatever else happens.
-    if panel.lifecycle.due(active) {
-        finish_session(panel, key, worker);
+    let now = Instant::now();
+    // Going idle only fades the panel: idle is not done.
+    let active = !idle_hide_due(panel.last_action, now);
+    // The proof timer row of the table in `finish`: proof the session has
+    // been quiet on plays its checklist, on a hidden panel too if it may
+    // come up.
+    let quiet = finish::proof_quiet(panel.last_action, panel.proof_at, now);
+    let may_show = finish::may_show(panel.shown, panel.target_visible);
+    if let Some((finale, generation)) =
+        finish::proof_finale(&mut panel.verdicts, &mut panel.lifecycle, quiet, may_show)
+    {
+        play_finale(panel, key, &finale, generation);
     }
+    // The panel stays up for a finale whatever else happens, and a shown
+    // panel stays up while proof waits for its finale (no fade out and back
+    // in between the idle deadline and the proof timer).
     let finale = panel.lifecycle.playing();
+    let waiting = panel.shown && panel.verdicts.proof_waiting();
+    // Nor does it fade from under a press: a panel being dragged or resized
+    // stays until the button comes up (`end_gesture` re-checks it).
+    let held = gesture.as_ref().is_some_and(|gesture| gesture.id == panel.id);
     if panel_should_show(
-        active || finale,
+        active || finale || waiting || held,
         panel.lifecycle.closed(),
         panel.target_visible && !finale,
     ) {
@@ -2033,29 +2284,6 @@ fn now_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// The session finished (idle after acting, or ended): its windows count as
-/// finished, so back cards collapse into chips, and if the panel is up the
-/// finale plays, ending on its own timer.
-unsafe fn finish_session(panel: &mut Panel, key: &str, worker: &CaptureWorker) {
-    let at = now_ms();
-    if restack(panel, key, worker, |panel| {
-        panel.verdicts.finish_session(at)
-    }) {
-        announce_stack(panel, key);
-    }
-    note_finished(panel, key);
-    let finale = panel.verdicts.finale();
-    // Late claims (a verification that finished after the last finale) are
-    // shown even if that finale's fade hid the panel, wherever the panel
-    // would be allowed to show; a user's close is always respected.
-    let late = panel.lifecycle.late();
-    let visible = finale.len() > 0 && (panel.shown || (late && !panel.target_visible));
-    let Some(generation) = panel.lifecycle.start(visible) else {
-        return;
-    };
-    play_finale(panel, key, &finale, generation);
-}
-
 /// Show `finale` (from the top) and time its end under `generation`.
 unsafe fn play_finale(panel: &mut Panel, key: &str, finale: &Finale, generation: u64) {
     tracing::info!(target: "pip", session = %key, rows = ?finale.log_rows(), kind = %finale.kind(), "PiP finished state");
@@ -2102,7 +2330,9 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
     });
 }
 
-/// Take the finale overlay off the front card.
+/// Take the finale overlay off the front card. The caller brings the front
+/// badge back in line (`sync_front_badge`, directly or through the restack
+/// that follows an action).
 unsafe fn remove_finale_view(panel: &mut Panel) {
     panel.displayed = None;
     if let Some(view) = panel.finale_view.take() {
@@ -2116,6 +2346,12 @@ const FINALE_CHIP_GAP: f64 = 12.0;
 /// The scrim under the finale, and the white of a row's capsule over it.
 const SCRIM_ALPHA: f64 = 0.6;
 const ROW_FILL: f64 = 0.16;
+/// The white of a finale chip's disc over the scrim: a little more than a
+/// row's capsule, since it carries an icon, not text.
+const DISC_FILL: f64 = 0.28;
+/// The front card's check badge sits this far inside its bottom-right
+/// corner (clear of the corner's curve).
+const FRONT_BADGE_INSET: f64 = 8.0;
 /// The panel fades slower after a finale than after going idle.
 const FINALE_FADE: Duration = Duration::from_millis(400);
 
@@ -2126,7 +2362,9 @@ const FINALE_FADE: Duration = Duration::from_millis(400);
 /// stay in).
 unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
     remove_finale_view(panel);
-    let (well_w, well_h) = well_size(panel.card);
+    // The well as it is drawn now (mid-glide during a shape change), which
+    // the overlay's frame must match to resize with it.
+    let (well_w, well_h) = well_size(panel.laid_out);
     let overlay = new_view(
         decor_view_class(),
         ns_rect(Area {
@@ -2264,24 +2502,53 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
         }
         Rows::Chips(chips) => {
             use stack::{CHIP_H, CHIP_W};
-            // Wrapped into rows that fit the well's width, the block centered.
-            let (per_row, grid_rows) = chip_grid(well_w, chips.len(), CHIP_W, FINALE_CHIP_GAP);
-            let block_h = grid_rows as f64 * CHIP_H + grid_rows.saturating_sub(1) as f64 * FINALE_CHIP_GAP;
+            // Wrapped into rows that fit the well's width, the block
+            // centered; what does not fit a narrow card's height is counted.
+            let fit = chip_grid(
+                (well_w, well_h),
+                chips.len(),
+                (CHIP_W, CHIP_H),
+                FINALE_CHIP_GAP,
+            );
+            let per_row = fit.per_row;
+            let block_h = fit.height(CHIP_H, FINALE_CHIP_GAP);
             let block_top = (well_h + block_h) / 2.0;
+            if fit.hidden > 0 {
+                let more = new_label(
+                    NSRect::new(
+                        NSPoint::new(0.0, block_top - block_h),
+                        NSSize::new(well_w, MORE_LINE),
+                    ),
+                    11.0,
+                    0.23,
+                    false,
+                );
+                let dim: *mut AnyObject = msg_send![white, colorWithAlphaComponent: 0.7_f64];
+                let _: () = msg_send![more, setTextColor: dim];
+                let _: () = msg_send![more, setAlignment: TEXT_CENTER];
+                // Width sizable, flexible top and bottom: stays centered.
+                let _: () = msg_send![more, setAutoresizingMask: 2u64 | 8 | 32];
+                set_text(more as usize, &format!("+{} more", fit.hidden));
+                let _: () = msg_send![more, setWantsLayer: true];
+                let more_layer: *mut AnyObject = msg_send![more, layer];
+                animate_row(more_layer, std::ptr::null_mut(), std::ptr::null_mut(), fit.visible, start, (0.0, -6.0));
+                let _: () = msg_send![overlay, addSubview: more];
+            }
             // Badges above every chip's glass (see `new_chip`).
             let badges = new_view(
                 decor_view_class(),
                 NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(well_w, well_h)),
             );
             let _: () = msg_send![badges, setAutoresizingMask: 18u64];
-            for (index, chip) in chips.iter().enumerate() {
+            for (index, chip) in chips.iter().take(fit.visible).enumerate() {
                 let (row, column) = (index / per_row, index % per_row);
-                let in_row = per_row.min(chips.len() - row * per_row) as f64;
+                let in_row = per_row.min(fit.visible - row * per_row) as f64;
                 let row_w = in_row * CHIP_W + (in_row - 1.0).max(0.0) * FINALE_CHIP_GAP;
                 let x = (well_w - row_w) / 2.0 + column as f64 * (CHIP_W + FINALE_CHIP_GAP);
                 let y = block_top - (row + 1) as f64 * CHIP_H - row as f64 * FINALE_CHIP_GAP;
-                // The same chip as in the trail, so one shape means finished.
-                let view = new_chip(overlay, badges, chip.finished);
+                // The same chip as in the trail, so one shape means finished;
+                // a plain disc, since glass in here would cover its badge.
+                let view = new_chip(overlay, badges, chip.finished, false);
                 for part in [view.view, view.badge].into_iter().filter(|&part| part != 0) {
                     let part = part as *mut AnyObject;
                     let _: () = msg_send![part, setFrameOrigin: NSPoint::new(x, y)];
@@ -2322,6 +2589,7 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
     panel.displayed = Some(finale.clone());
     panel.finale_start = start;
     place_sprite(panel);
+    sync_front_badge(panel);
 }
 
 /// The main screen's backing scale (2 on Retina), for crisp layer contents.
@@ -2391,6 +2659,17 @@ unsafe fn new_mark(size: f64, kind: Mark) -> (*mut AnyObject, *mut AnyObject) {
     let _: () = msg_send![circle, setContentsScale: scale];
     let _: () = msg_send![circle, addSublayer: glyph];
     (circle, glyph)
+}
+
+/// The finished badge, `size` points wide: a check mark with a white ring,
+/// so it reads over an icon or a picture. Its mark and glyph layers
+/// (autoreleased), as `new_mark` returns them.
+unsafe fn new_check_badge(size: f64) -> (*mut AnyObject, *mut AnyObject) {
+    let (mark, glyph) = new_mark(size, Mark::Check);
+    let white: *mut CGColor = msg_send![white_color(), CGColor];
+    let _: () = msg_send![mark, setBorderWidth: stack::CHIP_BADGE_RING];
+    let _: () = msg_send![mark, setBorderColor: white];
+    (mark, glyph)
 }
 
 /// Animate finale row `index` in (see `finish::row_timing`): the row fades
@@ -2499,7 +2778,7 @@ unsafe fn place_on_show(
     let Some(slot) = panel.slot else {
         return;
     };
-    let Some(origin) = slot_origin(panel_size(image_size), anchor, slot) else {
+    let Some(origin) = slot_origin(hold(panel_size(image_size)), anchor, slot) else {
         return;
     };
     let _: () = msg_send![window, setFrameOrigin: NSPoint::new(origin.0, origin.1)];
@@ -2606,13 +2885,27 @@ unsafe extern "C" fn order_out_cb(ctx: *mut c_void) {
                 // The fade is over: release the retained live frame.
                 clear_live(panel);
                 remove_finale_view(panel);
+                sync_front_badge(panel);
             }
         }
     });
 }
 
+/// A session's panel is going away.
+struct SessionEnd {
+    key: String,
+    end: PipSessionEnd,
+    /// Whether the user can see the whole target window right now (asked
+    /// only for a finished session that had a target).
+    target_visible: Option<bool>,
+}
+
 unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
-    let key: String = *Box::from_raw(ctx as *mut String);
+    let SessionEnd {
+        key,
+        end,
+        target_visible,
+    } = *Box::from_raw(ctx as *mut SessionEnd);
     with_state(|state| {
         state.early.remove(&key);
         let Some(mut panel) = state.panels.remove(&key) else {
@@ -2632,13 +2925,33 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         if remembered.origin.is_some() || remembered.card.is_some() {
             state.remembered.insert(key.clone(), remembered);
         }
-        // Ending is finishing: the finale plays (or keeps playing) if the
-        // panel is up, and the panel closes when it is over.
-        if panel.lifecycle.due(false) {
-            finish_session(&mut panel, &key, &state.worker);
+        if let Some(visible) = target_visible {
+            panel.target_visible = visible;
         }
-        if panel.lifecycle.playing() {
-            // Owed late claims can bring a hidden panel back for its finale.
+        // The `end_session` and idle-TTL eviction rows of the table in
+        // `finish`. A finished session is done whatever its finale is doing:
+        // its windows count as finished, so back cards collapse into chips.
+        // Then its finale plays (or keeps playing) and the panel closes when
+        // it is over. An expired session only closes.
+        tracing::info!(target: "pip", session = %key, ?end, "PiP session ended");
+        let at = now_ms();
+        let may_show = finish::may_show(panel.shown, panel.target_visible);
+        let mut ending = Ending::Close;
+        if restack(&mut panel, &key, &state.worker, |panel| {
+            ending = finish::end_session(
+                &mut panel.verdicts,
+                &mut panel.lifecycle,
+                end,
+                at,
+                may_show,
+            )
+        }) {
+            announce_stack(&panel, &key);
+        }
+        note_finished(&mut panel, &key);
+        if let Ending::Play(finale, generation) = &ending {
+            play_finale(&mut panel, &key, finale, *generation);
+            // A hidden panel comes back for its finale.
             if !panel.shown {
                 let others: Vec<usize> = state
                     .panels
@@ -2649,9 +2962,10 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
                 place_on_show(&mut panel, others, state.image_size, state.anchor);
                 show(&mut panel);
             }
-            state.ending.push(panel);
-        } else {
-            close_panel(panel, FADE);
+        }
+        match ending {
+            Ending::Close => close_panel(panel, FADE),
+            Ending::Playing | Ending::Play(..) => state.ending.push(panel),
         }
     });
 }
@@ -2722,6 +3036,26 @@ const HOVER_POLL: Duration = Duration::from_millis(120);
 unsafe extern "C" fn hover_poll_cb(ctx: *mut c_void) {
     let id = *Box::from_raw(ctx as *mut i64);
     with_state(|state| {
+        // A press holds its panel up (see `refresh`). If its mouse-up never
+        // reached the panel, end it here, or it would hold the panel for
+        // good: once the button has been up for `RELEASE_GRACE`, so a
+        // mouse-up (or the last drags) still queued behind this poll is
+        // handled as the release it is.
+        let now = Instant::now();
+        let missed = state
+            .gesture
+            .as_mut()
+            .filter(|gesture| gesture.id == id)
+            .is_some_and(|gesture| {
+                if primary_button_down() {
+                    gesture.up_since = None;
+                    return false;
+                }
+                release_missed(*gesture.up_since.get_or_insert(now), now)
+            });
+        if missed {
+            end_gesture(state, false);
+        }
         let Some(panel) = panel_by_id(state, id) else {
             return;
         };
@@ -2934,8 +3268,9 @@ unsafe fn set_frame(view: usize, area: Area) {
 }
 
 /// AppKit origin of the panel window in cascade `slot` on the main screen
-/// for a front card of `card` size (its deck is what is placed); `None`
-/// when there is no screen (headless).
+/// for a window that holds cards up to `card` (`hold` of the size box; its
+/// deck is what is placed, so panels keep their spacing whatever shape their
+/// cards take); `None` when there is no screen (headless).
 unsafe fn slot_origin(
     card: (f64, f64),
     anchor: Option<(i32, i32)>,
@@ -2976,10 +3311,11 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let card = remembered
         .card
         .unwrap_or_else(|| panel_size(state.image_size));
-    let (width, height) = window_size(card);
+    // The window holds the tallest and the widest card of this box.
+    let (width, height) = window_size(hold(card));
     let origin = match remembered.origin {
         Some(origin) => origin,
-        None => slot_origin(card, state.anchor, 0)?, // None: headless (CI)
+        None => slot_origin(hold(card), state.anchor, 0)?, // None: headless (CI)
     };
     let rect = NSRect::new(NSPoint::new(origin.0, origin.1), NSSize::new(width, height));
     let window = new_pip_window(rect)?;
@@ -3019,25 +3355,31 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let badges = new_view(decor_view_class(), bounds);
     let _: () = msg_send![badges, setAutoresizingMask: 18u64];
     add_subview(stack_view, badges);
-    let chips: Vec<ChipView> = (1..MAX_CARDS).map(|_| new_chip(deck, badges, true)).collect();
+    let chips: Vec<ChipView> = (1..MAX_CARDS)
+        .map(|_| new_chip(deck, badges, true, true))
+        .collect();
 
     // Front card: the picture itself, with continuous rounded corners and
-    // the window's shadow; a faint dark backing shows only while it is
-    // empty. Its chrome is the hover bar below.
-    let front_view = new_view(card_view_class(), ns_rect(slot_frame(card, Slot::Front, 0)));
+    // the window's shadow, shaped like its window (see `set_shape`). Its
+    // chrome is the hover bar below.
+    let front_frame = slot_frame(card, Slot::Front, 0);
+    let front_view = new_view(card_view_class(), ns_rect(front_frame));
     let card_layer = host_layer(front_view);
     let _: () = msg_send![card_layer, setCornerRadius: CORNER_RADIUS];
     let _: () = msg_send![card_layer, setCornerCurve: ns_string("continuous")];
     let _: () = msg_send![card_layer, setMasksToBounds: true];
-    let backing: *mut AnyObject = msg_send![
-        class!(NSColor),
-        colorWithSRGBRed: 0.0_f64
-        green: 0.0_f64
-        blue: 0.0_f64
-        alpha: 0.28_f64
-    ];
-    let backing: *mut CGColor = msg_send![backing, CGColor];
-    let _: () = msg_send![card_layer, setBackgroundColor: backing];
+    // Behind the picture, a blurred neutral backdrop (never a black band):
+    // it shows while the well is empty, and beside the picture of a window
+    // whose proportions are past the card's clamp.
+    let backdrop = new_view(
+        class!(NSVisualEffectView),
+        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(front_frame.w, front_frame.h)),
+    );
+    let _: () = msg_send![backdrop, setMaterial: 6isize]; // NSVisualEffectMaterialPopover
+    let _: () = msg_send![backdrop, setBlendingMode: 0isize]; // behind the window
+    let _: () = msg_send![backdrop, setState: 1isize]; // active: the panel is never key
+    let _: () = msg_send![backdrop, setAutoresizingMask: 18u64];
+    add_subview(front_view, backdrop);
     // MouseEnteredAndExited (0x01) | MouseMoved (0x02) | ActiveAlways (0x80)
     // | InVisibleRect (0x200): the hover bar and resize cursors over a
     // non-key panel, only over the card itself.
@@ -3085,10 +3427,32 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         true,
     );
     set_text(placeholder_text as usize, "Waiting for the first frame");
-    let _: () = msg_send![placeholder_text, setAlignment: 2isize]; // NSTextAlignmentCenter (NSInteger)
+    // Over the backdrop, which follows the appearance.
+    on_glass(placeholder_text, true);
+    let _: () = msg_send![placeholder_text, setAlignment: TEXT_CENTER];
     let _: () = msg_send![placeholder, addSubview: placeholder_text];
     let _: () = msg_send![placeholder, setHidden: true];
     add_subview(front_view, placeholder);
+
+    // The front window's check badge (see `sync_front_badge`): the chips'
+    // badge, inside the card's bottom-right corner, above the picture.
+    let front_badge = new_view(
+        decor_view_class(),
+        NSRect::new(
+            NSPoint::new(
+                front_frame.w - stack::CHIP_BADGE - FRONT_BADGE_INSET,
+                FRONT_BADGE_INSET,
+            ),
+            NSSize::new(stack::CHIP_BADGE, stack::CHIP_BADGE),
+        ),
+    );
+    let front_badge_layer = host_layer(front_badge);
+    let (front_badge_mark, front_badge_glyph) = new_check_badge(stack::CHIP_BADGE);
+    let _: () = msg_send![front_badge_layer, addSublayer: front_badge_mark];
+    // Flexible left and top margins: it stays in that corner.
+    let _: () = msg_send![front_badge, setAutoresizingMask: 1u64 | 32];
+    let _: () = msg_send![front_badge, setHidden: true];
+    add_subview(front_view, front_badge);
     add_subview(deck, front_view);
 
     // The hover bar: frosted glass above the card holding the client icon,
@@ -3165,6 +3529,10 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         target_icon: target_icon as usize,
         target_title: target_title as usize,
         front_view: front_view as usize,
+        front_badge: front_badge as usize,
+        front_badge_mark: front_badge_mark as usize,
+        front_badge_glyph: front_badge_glyph as usize,
+        front_badge_on: false,
         focus: focus as usize,
         close: close as usize,
         backs: backs.try_into().ok()?,
@@ -3174,7 +3542,10 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         layout: vec![Slot::Front],
         motion: Default::default(),
         trail_motion: Trail::default(),
+        // Evidence from before the panel existed; proof among it counts its
+        // quiet period from the first frame's action (`proof_at` is `None`).
         verdicts: state.early.remove(key).unwrap_or_default(),
+        proof_at: None,
         finished_seen: HashSet::new(),
         lifecycle: Lifecycle::default(),
         finale_view: None,
@@ -3183,6 +3554,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         after_finale: false,
         key: key.to_owned(),
         card,
+        front: card,
+        shape: None,
         laid_out: (0.0, 0.0),
         stream_well: well_size(card),
         well_changed: Instant::now(),
@@ -3370,17 +3743,25 @@ unsafe fn glass_container(parent: *mut AnyObject, bounds: NSRect) -> *mut AnyObj
     deck
 }
 
-/// A chip inside `parent`: a glass circle holding the app icon, with a
-/// green check badge (white ring) on its lower right when `finished`. The
-/// badge is its own view in `badges`, which must sit above `parent`'s glass
-/// (glass draws over non-glass siblings in its container, so a badge next
-/// to the circle would sit under its rim); it has the chip's frame, and
-/// whoever places, hides or fades the chip does the same to it. Its parts
+/// A chip inside `parent`: a circle holding the app icon, with a green
+/// check badge (white ring) on its lower right when `finished`. The badge
+/// is its own view in `badges`, which must draw above the circle; it has
+/// the chip's frame, and whoever places, hides or fades the chip does the
+/// same to it. The circle is `glass` in the trail, whose `badges` sit above
+/// the glass container (glass draws over every non-glass view in its
+/// container, so a badge inside it would sit under the circle). Where
+/// `badges` cannot be outside that container (the finale's row, inside the
+/// front card), the circle is a plain translucent disc instead. Its parts
 /// stay centered (flexible margins) while the chip's frame springs from
 /// where its window was drawn. Hidden until used; the window title is its
 /// tooltip.
-unsafe fn new_chip(parent: *mut AnyObject, badges: *mut AnyObject, finished: bool) -> ChipView {
-    use stack::{CHIP, CHIP_BADGE, CHIP_BADGE_RING, CHIP_H, CHIP_ICON, CHIP_W};
+unsafe fn new_chip(
+    parent: *mut AnyObject,
+    badges: *mut AnyObject,
+    finished: bool,
+    glass: bool,
+) -> ChipView {
+    use stack::{CHIP, CHIP_BADGE, CHIP_H, CHIP_ICON, CHIP_W};
     // NSViewMinXMargin 1 | MaxXMargin 4 | MinYMargin 8 | MaxYMargin 32.
     const CENTERED: u64 = 1 | 4 | 8 | 32;
     let view = new_view(
@@ -3395,16 +3776,27 @@ unsafe fn new_chip(parent: *mut AnyObject, badges: *mut AnyObject, finished: boo
     );
     let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP, CHIP));
     let body = new_view(class!(NSView), bounds);
+    if !glass {
+        let layer = host_layer(body);
+        let fill: *mut AnyObject = msg_send![white_color(), colorWithAlphaComponent: DISC_FILL];
+        let fill: *mut CGColor = msg_send![fill, CGColor];
+        let _: () = msg_send![layer, setBackgroundColor: fill];
+        let _: () = msg_send![layer, setCornerRadius: CHIP / 2.0];
+    }
     let inset = (CHIP - CHIP_ICON) / 2.0;
     let icon = new_icon_view(NSRect::new(
         NSPoint::new(inset, inset),
         NSSize::new(CHIP_ICON, CHIP_ICON),
     ));
     let _: () = msg_send![body, addSubview: icon];
-    let glass = glass_background(bounds, body, CHIP / 2.0);
-    let _: () = msg_send![glass, setFrame: circle];
-    let _: () = msg_send![glass, setAutoresizingMask: CENTERED];
-    add_subview(view, glass);
+    let disc = if glass {
+        glass_background(bounds, body, CHIP / 2.0)
+    } else {
+        body
+    };
+    let _: () = msg_send![disc, setFrame: circle];
+    let _: () = msg_send![disc, setAutoresizingMask: CENTERED];
+    add_subview(view, disc);
 
     let (mut mark, mut glyph) = (std::ptr::null_mut(), std::ptr::null_mut());
     let mut host: *mut AnyObject = std::ptr::null_mut();
@@ -3424,11 +3816,7 @@ unsafe fn new_chip(parent: *mut AnyObject, badges: *mut AnyObject, finished: boo
             ),
         );
         let badge_layer = host_layer(badge);
-        (mark, glyph) = new_mark(CHIP_BADGE, Mark::Check);
-        let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
-        let white: *mut CGColor = msg_send![white, CGColor];
-        let _: () = msg_send![mark, setBorderWidth: CHIP_BADGE_RING];
-        let _: () = msg_send![mark, setBorderColor: white];
+        (mark, glyph) = new_check_badge(CHIP_BADGE);
         let _: () = msg_send![badge_layer, addSublayer: mark];
         let _: () = msg_send![badge, setAutoresizingMask: CENTERED];
         add_subview(host, badge);
@@ -3633,7 +4021,7 @@ unsafe fn white_color() -> *mut AnyObject {
 /// Excludes the trail lag, so a restack starts from where the item would
 /// be without it.
 fn settle_frame(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
-    panel.motion[slot.view()].frame(slot_frame(panel.card, slot, back_cards))
+    panel.motion[slot.view()].frame(resting(panel, slot, back_cards))
 }
 
 /// Where the view for `slot` is drawn now: its settle frame moved by the
@@ -3839,8 +4227,8 @@ unsafe extern "C" fn tick_cb(ctx: *mut c_void) {
 // The content view (`CuaPipStack`) takes every press that is not on a
 // header button (its `hitTest:` returns itself over any card, nothing over
 // the transparent margin) and accepts the first mouse, so the panel never
-// needs to become key. Resizing sets the window frame outside the state
-// lock: AppKit calls `setFrameSize:` synchronously, which lays the cards out.
+// needs to become key. Resizing sets the panel's size box, then the window
+// frame outside the state lock, then lays the cards out.
 
 /// The panel (live, or ended and playing its finale) whose window is
 /// `window`.
@@ -3928,6 +4316,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
             };
             let (key, id) = (panel.key.clone(), panel.id);
             let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
+            let card = panel.card;
             let point = panel_point(point);
             let frames = item_frames(panel);
             let bar = bar_area(panel).map(|bar| {
@@ -3946,10 +4335,12 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
                 id,
                 mouse,
                 start: area_of(frame),
+                start_card: card,
                 origin: (frame.origin.x, frame.origin.y),
                 edges,
                 pressed,
                 moved: false,
+                up_since: None,
                 max,
             });
         });
@@ -3973,7 +4364,14 @@ extern "C" fn stack_mouse_dragged(_this: *mut AnyObject, _cmd: Sel, _event: *mut
                 .find(|panel| panel.id == gesture.id)?;
             let delta = (mouse.0 - gesture.mouse.0, mouse.1 - gesture.mouse.1);
             if gesture.edges != 0 {
-                let frame = resize_window(gesture.start, gesture.edges, delta, gesture.max);
+                let (card, frame) = resize_panel(
+                    gesture.start,
+                    gesture.start_card,
+                    gesture.edges,
+                    delta,
+                    gesture.max,
+                );
+                set_box(panel, card);
                 return Some((panel.window, frame));
             }
             if !gesture.moved && delta.0.hypot(delta.1) < DRAG_SLOP {
@@ -4008,29 +4406,60 @@ extern "C" fn stack_mouse_dragged(_this: *mut AnyObject, _cmd: Sel, _event: *mut
 }
 
 extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    with_state(|state| {
-        let Some(gesture) = state.gesture.take() else {
-            return;
-        };
-        let Some(panel) = panel_by_id(state, gesture.id) else {
-            return;
-        };
-        if gesture.moved {
-            // The user placed it: keep it there and free its slot.
-            panel.dragged = true;
-            panel.slot = None;
-            panel.trail_motion.release(Instant::now());
-            report_trail(panel, Instant::now());
-            start_ticking();
-            return;
-        }
+    with_state(|state| unsafe { end_gesture(state, true) });
+}
+
+/// The press on a panel is over. With `click` (its mouse-up arrived), a
+/// press that did not move raises the back card it was on; without (the
+/// button was found up with no mouse-up, see `hover_poll_cb`), it only
+/// ends. Either way an idle panel the press held up may fade now.
+unsafe fn end_gesture(state: &mut State, click: bool) {
+    let Some(gesture) = state.gesture.take() else {
+        return;
+    };
+    let Some(panel) = panel_by_id(state, gesture.id) else {
+        return;
+    };
+    let key = panel.key.clone();
+    if gesture.moved {
+        // The user placed it: keep it there and free its slot.
+        panel.dragged = true;
+        panel.slot = None;
+        panel.trail_motion.release(Instant::now());
+        report_trail(panel, Instant::now());
+        start_ticking();
+    } else if click {
         // A click (not a resize) on a back card raises its window, if that
         // window is still behind the front card.
         let pressed = gesture.pressed.filter(|_| gesture.edges == 0);
         if let Some(tag) = stack::click_target(pressed, &panel.cards.keys()) {
-            unsafe { raise_card(state, gesture.id, tag) };
+            raise_card(state, gesture.id, tag);
         }
-    });
+    }
+    // Only a live session's panel is under that key for sure.
+    let live = state.panels.get(&key).is_some_and(|panel| panel.id == gesture.id);
+    if live {
+        refresh(state, &key);
+    }
+}
+
+/// A press counts as released without its mouse-up once the button has
+/// been up this long: far longer than a queued mouse-up takes to arrive.
+const RELEASE_GRACE: Duration = Duration::from_secs(1);
+
+/// Whether a press whose button was first seen up at `up_since` (with no
+/// mouse-up delivered) has missed its release by `now`. Not at the first
+/// sighting: the button's state runs ahead of event delivery, so the
+/// mouse-up and the last drags may still be queued, and ending the press
+/// before them would drop a click's raise or a drag's last step.
+fn release_missed(up_since: Instant, now: Instant) -> bool {
+    now.saturating_duration_since(up_since) >= RELEASE_GRACE
+}
+
+/// Whether the primary mouse button is down right now.
+unsafe fn primary_button_down() -> bool {
+    let buttons: usize = msg_send![class!(NSEvent), pressedMouseButtons];
+    buttons & 1 != 0
 }
 
 extern "C" fn card_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
@@ -4100,41 +4529,6 @@ unsafe fn set_resize_cursor(edges: u8) {
     }
 }
 
-extern "C" fn stack_set_frame_size(this: *mut AnyObject, _cmd: Sel, size: NSSize) {
-    unsafe {
-        let _: () = msg_send![super(this, class!(NSView)), setFrameSize: size];
-        let window = window_of(this);
-        // Inside a state operation (the panel being built) the caller lays
-        // out itself.
-        try_with_state(|state| on_resized(state, window, (size.width, size.height)));
-    }
-}
-
-/// The panel window is now `size`: lay the cards out for the new front card
-/// and resize the live stream once the size settles.
-unsafe fn on_resized(state: &mut State, window: usize, size: (f64, f64)) {
-    let Some(panel) = panel_for(state, window) else {
-        return;
-    };
-    let key = panel.key.clone();
-    let card = card_size(size);
-    if card == panel.card || card.0 <= 0.0 || card.1 <= 0.0 {
-        return;
-    }
-    panel.card = card;
-    // A panel the user sized stays where they put it, like a dragged one.
-    panel.resized = true;
-    panel.dragged = true;
-    panel.slot = None;
-    apply_card_frames(panel);
-    panel.well_changed = Instant::now();
-    dispatch_to_main_after(
-        RESIZE_DEBOUNCE + Duration::from_millis(5),
-        key,
-        resize_settle_cb,
-    );
-}
-
 /// Debounced end of a resize: size the live stream to the new well.
 unsafe extern "C" fn resize_settle_cb(ctx: *mut c_void) {
     let key: String = *Box::from_raw(ctx as *mut String);
@@ -4146,7 +4540,8 @@ unsafe extern "C" fn resize_settle_cb(ctx: *mut c_void) {
         if !resize_settled(panel.well_changed, Instant::now()) {
             return;
         }
-        panel.stream_well = well_size(panel.card);
+        panel.stream_well = picture_size(panel);
+        log_shape(panel);
         refresh(state, &key);
     });
 }
@@ -4170,10 +4565,6 @@ fn stack_view_class() -> &'static AnyClass {
                 stack_mouse_dragged as extern "C" fn(_, _, _),
             );
             builder.add_method(sel!(mouseUp:), stack_mouse_up as extern "C" fn(_, _, _));
-            builder.add_method(
-                sel!(setFrameSize:),
-                stack_set_frame_size as extern "C" fn(_, _, _),
-            );
         })
     })
 }
@@ -4787,6 +5178,30 @@ mod tests {
     }
 
     #[test]
+    fn centered_text_uses_this_architectures_value() {
+        // Center and right trade places: 1 and 2 on Apple silicon, 2 and 1
+        // on Intel. A literal 2 right-aligned every centered label on arm64.
+        #[cfg(target_arch = "aarch64")]
+        assert_eq!(TEXT_CENTER, 1);
+        #[cfg(target_arch = "x86_64")]
+        assert_eq!(TEXT_CENTER, 2);
+        assert_eq!(TEXT_CENTER + objc2_app_kit::NSTextAlignment::Right.0, 3);
+    }
+
+    #[test]
+    fn a_press_is_ended_without_its_mouse_up_only_after_a_grace() {
+        let up = Instant::now();
+        // The poll that first sees the button up runs before a queued
+        // mouse-up: the press is still the mouse-up's to end.
+        assert!(!release_missed(up, up));
+        assert!(!release_missed(up, up + HOVER_POLL));
+        assert!(!release_missed(up, up + Duration::from_millis(999)));
+        // No mouse-up for a second: it was missed, the press ends.
+        assert!(release_missed(up, up + RELEASE_GRACE));
+        assert!(RELEASE_GRACE >= 4 * HOVER_POLL, "several polls of grace");
+    }
+
+    #[test]
     fn idle_hide_after_eight_quiet_seconds() {
         let start = Instant::now();
         assert!(!idle_hide_due(start, start));
@@ -4867,7 +5282,13 @@ mod tests {
 
         worker.push(frame("s", "before end"));
         started.recv_timeout(Duration::from_secs(5)).unwrap();
+        // Before its first capture the session is live: a verification now
+        // is kept for its panel.
+        assert!(worker.is_live("s"));
         worker.forget("s"); // end_session while the capture runs
+        // Ended before its first capture: no panel ever comes, so nothing
+        // is kept for one and nothing is shown.
+        assert!(!worker.is_live("s"));
         release.send(()).unwrap();
         let (label, epoch, _) = delivered.recv_timeout(Duration::from_secs(5)).unwrap();
         assert_eq!(label, "before end");

@@ -34,9 +34,10 @@ use objc2_foundation::{NSPoint, NSRect, NSSize};
 
 use super::{
     add_subview, add_tracking, app_icon, area_of, cua_mark, decor_view_class,
-    dispatch_to_main_after, focus_window, glass_background, host_layer, new_icon_view, new_label,
-    new_mark, new_view, ns_rect, ns_string, on_glass, register_class, session_ns_color, set_text,
-    try_with_state, with_state, Area, CGColor, Mark, Panel, State, Tag,
+    dispatch_to_main_after, focus_window, glass_background, host_layer, new_check_badge,
+    new_icon_view, new_label, new_view, ns_rect, ns_string, on_glass, register_class,
+    session_ns_color, set_text, try_with_state, with_state, Area, CGColor, Panel, State, Tag,
+    TEXT_CENTER,
 };
 
 // ── Pure model ────────────────────────────────────────────────────────────
@@ -929,7 +930,7 @@ unsafe fn build(overview: &mut Overview, screen: (f64, f64), pictures: &[GroupPi
         );
         on_glass(line, true);
         set_text(line as usize, "No agents are working right now");
-        let _: () = msg_send![line, setAlignment: 2isize]; // NSTextAlignmentCenter
+        let _: () = msg_send![line, setAlignment: TEXT_CENTER];
         let _: () = msg_send![body, addSubview: line];
     }
     for ((row, group), group_pictures) in layout.rows.iter().zip(&overview.model.groups).zip(pictures) {
@@ -1009,7 +1010,7 @@ unsafe fn build(overview: &mut Overview, screen: (f64, f64), pictures: &[GroupPi
             let line = new_label(ns_rect(local(area)), 12.0, 0.0, true);
             on_glass(line, true);
             set_text(line as usize, &format!("+{more} more"));
-            let _: () = msg_send![line, setAlignment: 2isize];
+            let _: () = msg_send![line, setAlignment: TEXT_CENTER];
             let _: () = msg_send![body, addSubview: line];
         }
         tiles.push(row_tiles);
@@ -1021,7 +1022,7 @@ unsafe fn build(overview: &mut Overview, screen: (f64, f64), pictures: &[GroupPi
             line as usize,
             &format!("+{more} more agent{}", if more == 1 { "" } else { "s" }),
         );
-        let _: () = msg_send![line, setAlignment: 2isize];
+        let _: () = msg_send![line, setAlignment: TEXT_CENTER];
         let _: () = msg_send![body, addSubview: line];
     }
     let glass = glass_background(bounds, body, SHEET_RADIUS);
@@ -1086,18 +1087,14 @@ unsafe fn new_tile(
             ),
         );
         let badge_layer = host_layer(badge);
-        let (mark, _) = new_mark(BADGE, Mark::Check);
-        let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
-        let white: *mut CGColor = msg_send![white, CGColor];
-        let _: () = msg_send![mark, setBorderWidth: 1.5_f64];
-        let _: () = msg_send![mark, setBorderColor: white];
+        let (mark, _) = new_check_badge(BADGE);
         let _: () = msg_send![badge_layer, addSublayer: mark];
         add_subview(body, badge);
     }
     let title = new_label(ns_rect(title_area), 11.0, 0.0, true);
     on_glass(title, true);
     set_text(title as usize, &thumb.title);
-    let _: () = msg_send![title, setAlignment: 2isize];
+    let _: () = msg_send![title, setAlignment: TEXT_CENTER];
     let _: () = msg_send![body, addSubview: title];
     let views = TileViews {
         view: view as usize,
