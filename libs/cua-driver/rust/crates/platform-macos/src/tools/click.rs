@@ -1835,6 +1835,10 @@ mod action_name_tests {
         assert_eq!(resolve_element_action("ÖFFNEN", &advertised).as_deref(), Ok(advertised[0].as_str()));
         assert_eq!(resolve_element_action("éditer", &advertised).as_deref(), Ok(advertised[1].as_str()));
         assert!(resolve_element_action("offnen", &advertised).is_err());
+        let axis = vec!["Name:AXAxis\nTarget:0x0\nSelector:(null)".to_owned()];
+        for requested in ["AXIS", "axis", "AXAxis"] {
+            assert_eq!(resolve_element_action(requested, &axis).as_ref(), Ok(&axis[0]), "{requested}");
+        }
     }
 
     #[test]
@@ -1921,9 +1925,12 @@ fn resolve_element_action(requested: &str, advertised: &[String]) -> Result<Stri
     let requested_key = crate::ax::tree::action_key(requested);
     let matched = advertised.iter().find(|raw| {
         let display = crate::ax::tree::display_action_name((*raw).clone());
+        let display_key = crate::ax::tree::action_key(&display);
         raw.as_str() == requested
             || requested.to_lowercase() == display.to_lowercase()
-            || requested_key == crate::ax::tree::action_key(&display)
+            || requested_key == display_key
+            // A bare name that itself starts with "AX" ("AXIS" for "AXAxis").
+            || requested.to_lowercase() == display_key
     });
     match (matched, alias) {
         (Some(raw), _) => Ok(raw.clone()),
