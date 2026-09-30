@@ -427,7 +427,8 @@ them the AX write: a focused field gets keys, and an addressed field
 without focus is refused before anything is sent (background or
 foreground), with `code:"catalyst_text_needs_focus"`. Next: `click` the field (a background
 click is enough), then call `type_text` again. The AX value is often
-unreadable, so expect `⚠️ Not confirmed:` and check the screenshot.
+unreadable, so expect `⚠️ Not confirmed:` and check the screenshot. `set_value` on them is refused
+(`catalyst_text_needs_typing`); see WORKFLOW.md "Find content".
 
 Electron fix — **one call**: `type_text({pid, window_id, x, y, text})`. Passing
 `x,y` (no `element_index`) is the **element px action** form of

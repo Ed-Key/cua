@@ -832,15 +832,57 @@ const CATALYST_TEXT_NEEDS_FOCUS: &str = "catalyst_text_needs_focus";
 /// field) accept an `AXSelectedText` write and then ignore it, and ignore
 /// `AXFocused` writes too. A chain that stops early proves nothing.
 fn is_catalyst_text_view(chain: &[(String, String)]) -> bool {
+    catalyst_text_control(chain) == CatalystText::Yes
+}
+
+/// What a `(role, subrole)` chain says about a Mac Catalyst text control.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum CatalystText {
+    /// A text control under an `iOSContentGroup`.
+    Yes,
+    /// Not a text control, or its ancestry reached the window (or the
+    /// application) without an `iOSContentGroup`.
+    No,
+    /// A text control whose ancestry could not be read to the window: an
+    /// unreadable role, a missing parent, or the 40-step cap. Not proof of a
+    /// native field.
+    Unknown,
+}
+
+pub(crate) fn catalyst_text_control(chain: &[(String, String)]) -> CatalystText {
     let Some(((role, _), ancestors)) = chain.split_first() else {
-        return false;
+        return CatalystText::Unknown;
     };
-    matches!(
+    // The target's role could not be read (the caller may have read a text
+    // role a moment earlier): unknown, not proof of a non-text control.
+    if role.is_empty() {
+        return CatalystText::Unknown;
+    }
+    if !matches!(
         role.as_str(),
         "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
-    ) && ancestors
+    ) {
+        return CatalystText::No;
+    }
+    if ancestors
         .iter()
         .any(|(role, subrole)| role == "AXGroup" && subrole == "iOSContentGroup")
+    {
+        return CatalystText::Yes;
+    }
+    match ancestors.last().map(|(role, _)| role.as_str()) {
+        Some("AXWindow" | "AXApplication") => CatalystText::No,
+        _ => CatalystText::Unknown,
+    }
+}
+
+/// [`catalyst_text_control`] for a live element.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+pub(crate) unsafe fn catalyst_text_control_of(element: AXUIElementRef) -> CatalystText {
+    catalyst_text_control(&ax_role_chain(element))
 }
 
 /// `(AXRole, AXSubrole)` of `element` and its ancestors up to the window.
@@ -2230,6 +2272,24 @@ mod tests {
         assert!(!is_catalyst_text_view(&chain(&[content, window])));
         assert!(!is_catalyst_text_view(&chain(&[("AXTextArea", "")])));
         assert!(!is_catalyst_text_view(&[]));
+
+        // Known versus unknown: only a chain that reached the window (or the
+        // application) without a content group proves a native field.
+        use CatalystText::*;
+        assert_eq!(catalyst_text_control(&chain(&[("AXTextField", ""), ("AXGroup", ""), content, window])), Yes);
+        assert_eq!(catalyst_text_control(&chain(&[("AXTextArea", ""), ("AXScrollArea", ""), window])), No);
+        assert_eq!(catalyst_text_control(&chain(&[("AXTextField", ""), ("AXApplication", "")])), No);
+        assert_eq!(catalyst_text_control(&chain(&[("AXButton", ""), ("AXGroup", "")])), No, "not a text control");
+        // A parent that could not be read, an unreadable role, a missing chain.
+        assert_eq!(catalyst_text_control(&chain(&[("AXTextField", "")])), Unknown);
+        assert_eq!(catalyst_text_control(&chain(&[("AXTextField", ""), ("AXGroup", "")])), Unknown);
+        assert_eq!(catalyst_text_control(&chain(&[("AXTextField", ""), ("AXGroup", ""), ("", "")])), Unknown);
+        assert_eq!(catalyst_text_control(&[]), Unknown);
+        // The target's own role unreadable (the live chain reads [("", "")]).
+        assert_eq!(catalyst_text_control(&chain(&[("", "")])), Unknown);
+        assert!(!is_catalyst_text_view(&chain(&[("", "")])));
+        // A content group proves Catalyst even when the chain stops above it.
+        assert_eq!(catalyst_text_control(&chain(&[("AXTextField", ""), content])), Yes);
     }
 
     #[test]

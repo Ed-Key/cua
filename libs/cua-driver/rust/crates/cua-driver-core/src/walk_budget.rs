@@ -254,10 +254,17 @@ pub fn truncation_note(
         Some(other) => other.to_owned(),
         None => "the walk stopped early".to_owned(),
     };
+    // A larger budget is what lets a stopped walk reach more. A query does
+    // not: on macOS it filters the collected tree after the walk.
+    let remedy = match reason {
+        Some("node_budget") => "retry with a larger max_elements",
+        _ => "retry with a larger timeout_ms (e.g. 5000)",
+    };
     format!(
         "⚠️ PARTIAL TREE: {why} after {visited} node(s) ({pending} discovered but not visited). \
-         Every element listed is real; elements after the cut are missing. If the element you \
-         need is absent, retry with a larger timeout_ms (e.g. 5000) or narrow with query / max_depth."
+         Every element listed is real; elements after the cut are missing, so an absence proves \
+         nothing. If the element you need is absent, {remedy}. On macOS a query filters after \
+         the walk and does not make it cheaper."
     )
 }
 
@@ -372,10 +379,11 @@ mod tests {
         assert!(note.contains("1000 ms"));
         assert!(note.contains("240 node(s)"));
         assert!(note.contains("88 discovered"));
-        assert!(note.contains("timeout_ms"));
-        assert!(note.contains("query"));
+        assert!(note.contains("retry with a larger timeout_ms"));
+        assert!(!note.contains("narrow with query"), "a query does not reduce walk work: {note}");
+        assert!(note.contains("does not make it cheaper"));
         let note = truncation_note(Some("node_budget"), 1000, 5000, 3);
-        assert!(note.contains("max_elements"));
+        assert!(note.contains("retry with a larger max_elements"));
         let note = truncation_note(Some("app_unresponsive"), 1000, 3, 0);
         assert!(note.contains("stopped answering"));
         let note = truncation_note(Some("app_lookup_timeout"), 250, 0, 0);
