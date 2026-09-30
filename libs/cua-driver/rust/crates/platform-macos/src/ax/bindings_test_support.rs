@@ -105,8 +105,16 @@ pub(super) fn copy_string_attr(element: AXUIElementRef, attr: &str) -> Option<Op
     if let Some(value) = typing_focus_value(element, attr) {
         return Some(value);
     }
+    if let Some(value) = with_content_group(element, |_| match attr {
+        "AXRole" => Some("AXGroup".into()),
+        "AXSubrole" => Some("iOSContentGroup".into()),
+        _ => panic!("unexpected content group attribute: {attr}"),
+    }) {
+        return Some(value);
+    }
     if let Some(value) = with_editor(element, |fixture| match attr {
         "AXRole" => Some(fixture.role.clone()),
+        "AXSubrole" => None,
         "AXTitle" => Some("Editor".into()),
         "AXValue" if fixture.hide_value_after_write && !fixture.value.is_empty() => None,
         "AXValue" => Some(fixture.value.clone()),
@@ -154,6 +162,19 @@ pub(super) fn copy_element_attr(
     element: AXUIElementRef,
     attr: &str,
 ) -> Option<Option<AXUIElementRef>> {
+    // A Catalyst editor sits in its content group, which is the top here.
+    if let Some(parent) = with_content_group(element, |_| None) {
+        return Some(parent);
+    }
+    if let Some(parent) = with_editor(element, |fixture| {
+        assert_eq!(attr, "AXParent");
+        fixture.content_group.as_ref().map(|group| unsafe {
+            core_foundation::base::CFRetain(group.as_concrete_TypeRef() as CFTypeRef)
+                as AXUIElementRef
+        })
+    }) {
+        return Some(parent);
+    }
     with_fixture(element, |fixture| {
         assert_eq!(attr, "AXParent");
         if element as usize == usize::MAX {
@@ -196,6 +217,10 @@ struct EditorFixture {
     value: String,
     hide_value_after_write: bool,
     before_write: Option<Box<dyn FnOnce()>>,
+    /// Set by `EditorScope::catalyst`: the editor's `iOSContentGroup` parent.
+    content_group: Option<core_foundation::string::CFString>,
+    /// Whether the exact window reports the editor as its focused element.
+    focused: bool,
 }
 pub(crate) struct EditorScope {
     _element: core_foundation::string::CFString,
@@ -217,6 +242,8 @@ impl EditorScope {
                 value: String::new(),
                 hide_value_after_write: false,
                 before_write: Some(Box::new(before_write)),
+                content_group: None,
+                focused: true,
             });
         });
         Self { _element: element }
@@ -224,6 +251,27 @@ impl EditorScope {
 
     pub fn hide_value_after_write(&self) {
         EDITOR.with(|slot| slot.borrow_mut().as_mut().unwrap().hide_value_after_write = true);
+    }
+
+    /// Place the editor inside a Mac Catalyst `iOSContentGroup`.
+    pub fn catalyst(&self) {
+        EDITOR.with(|slot| {
+            slot.borrow_mut().as_mut().unwrap().content_group =
+                Some(core_foundation::string::CFString::new("Scoped fake content group"));
+        });
+    }
+
+    /// Report no focused element in the exact window.
+    pub fn unfocus(&self) {
+        EDITOR.with(|slot| slot.borrow_mut().as_mut().unwrap().focused = false);
+    }
+
+    pub fn element_ptr(&self) -> usize {
+        EDITOR.with(|slot| slot.borrow().as_ref().unwrap().element)
+    }
+
+    pub fn value(&self) -> String {
+        EDITOR.with(|slot| slot.borrow().as_ref().unwrap().value.clone())
     }
 }
 impl Drop for EditorScope {
@@ -244,10 +292,9 @@ pub(crate) fn focused_editor(pid: i32, wid: u32) -> Option<Option<AXUIElementRef
     );
     EDITOR.with(|slot| {
         slot.borrow().as_ref().map(|fixture| {
-            Some(
-                unsafe { core_foundation::base::CFRetain(fixture.element as CFTypeRef) }
-                    as AXUIElementRef,
-            )
+            fixture.focused.then(|| unsafe {
+                core_foundation::base::CFRetain(fixture.element as CFTypeRef) as AXUIElementRef
+            })
         })
     })
 }
@@ -370,6 +417,17 @@ pub(crate) fn typing_focus_range(
             .iter()
             .position(|&ptr| ptr == element as usize)?;
         Some(fixture.ranges[index])
+    })
+}
+fn with_content_group<T>(
+    element: AXUIElementRef,
+    f: impl FnOnce(&mut EditorFixture) -> T,
+) -> Option<T> {
+    EDITOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let fixture = slot.as_mut()?;
+        let group = fixture.content_group.as_ref()?.as_concrete_TypeRef() as usize;
+        (group == element as usize).then(|| f(fixture))
     })
 }
 fn with_editor<T>(element: AXUIElementRef, f: impl FnOnce(&mut EditorFixture) -> T) -> Option<T> {

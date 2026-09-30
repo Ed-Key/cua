@@ -126,6 +126,18 @@ fn is_system_chrome(app_name: &str) -> bool {
     )
 }
 
+/// `kCGCursorWindowLevel`. WindowServer draws the pointer ("Cursor", when it
+/// is composited as a window) and the capture and microphone dots
+/// ("StatusIndicator") in windows of its own at this level.
+const CURSOR_LAYER: i32 = 2_147_483_630;
+
+/// Only a window that can receive a click covers a target. WindowServer's
+/// own windows at the cursor level are images drawn over everything: a click
+/// passes through them to the window beneath.
+fn receives_no_clicks(window: &WindowInfo) -> bool {
+    window.app_name == "Window Server" && window.layer >= CURSOR_LAYER
+}
+
 /// Who a pointer event at a screen point reaches.
 #[derive(Debug)]
 pub(crate) enum PointOwner<'a> {
@@ -139,7 +151,8 @@ pub(crate) enum PointOwner<'a> {
 }
 
 /// The owner of the topmost window at `(x, y)` in `front_to_back` (composited
-/// on-screen windows in WindowServer order). Display-sized system chrome and
+/// on-screen windows in WindowServer order). WindowServer's pointer and
+/// indicator images, display-sized system chrome and
 /// the driver's own click-through windows (`own_click_through`: the cursor
 /// overlay ignores mouse events) are transparent to the check; the driver's
 /// interactive windows (PiP panels, the overview) take a click like any
@@ -168,7 +181,10 @@ pub(crate) fn point_owner<'a>(
     for window in front_to_back {
         let b = &window.bounds;
         let inside = x >= b.x && x < b.x + b.width && y >= b.y && y < b.y + b.height;
-        if !inside || (window.pid == own_pid && own_click_through(window.window_id)) {
+        if !inside
+            || receives_no_clicks(window)
+            || (window.pid == own_pid && own_click_through(window.window_id))
+        {
             continue;
         }
         if belongs_to_target(window.window_id)
@@ -569,6 +585,37 @@ mod tests {
             PointOwner::Other(WindowInfo { window_id: 20, pid: 7, .. })
         ));
         assert!(matches!(point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, click_through, belongs), PointOwner::Target));
+        // The real pointer sitting on the point (WindowServer's "Cursor"
+        // window) and the capture indicator are images, not click targets;
+        // another app's window at that level still takes the click.
+        let server = |id, name: &str, frame| WindowInfo {
+            app_name: "Window Server".into(),
+            title: name.into(),
+            ..at(id, 175, CURSOR_LAYER, frame)
+        };
+        let pointer = server(16, "Cursor", (0.0, 0.0, 2000.0, 2000.0));
+        let indicator = server(14, "StatusIndicator", (880.0, 680.0, 29.0, 29.0));
+        let windows = [pointer.clone(), indicator, target.clone()];
+        assert!(matches!(point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs), PointOwner::Target));
+        // A real cover under the pointer still covers.
+        let windows = [pointer, finder.clone(), target.clone()];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 3, pid: 60, .. })
+        ));
+        let top_level_app = at(15, 70, CURSOR_LAYER, (890.0, 690.0, 28.0, 40.0));
+        let windows = [top_level_app, target.clone()];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (900.0, 700.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 15, .. })
+        ));
+        // WindowServer's menu bar (layer 24) does take the click.
+        let menu_bar = WindowInfo { app_name: "Window Server".into(), ..at(4, 175, 24, (0.0, 0.0, 2000.0, 30.0)) };
+        let windows = [menu_bar, target.clone()];
+        assert!(matches!(
+            point_owner(&windows, &SCREENS, (900.0, 10.0), 40, 7, click_through, belongs),
+            PointOwner::Other(WindowInfo { window_id: 4, .. })
+        ));
         // Another window of the same app that is not the target's covers it.
         let other_own = at(13, 40, 0, (300.0, 300.0, 400.0, 300.0));
         let windows = [other_own, target];

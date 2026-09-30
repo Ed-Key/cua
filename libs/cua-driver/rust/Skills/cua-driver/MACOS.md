@@ -417,11 +417,19 @@ The driver **detects Electron and refuses to trust that echo**: an
 AX-path `type_text` on an Electron app returns `effect:"unverifiable"` +
 `escalation:{target:"pixel",reason:"effect_unconfirmed"}`, **never** a
 false `effect:"confirmed"`.
-(On Catalyst the AX value reads back unreadable, so it reports
-unverified too.) Bottom line: on these surfaces **do not trust the AX
-confirm — the screenshot in the same response is the only truth.**
+Bottom line: on these surfaces **do not trust the AX confirm — the
+screenshot is the only truth.**
 
-Fix — **one call**: `type_text({pid, window_id, x, y, text})`. Passing
+**Catalyst text views** (Messages compose, WhatsApp, the Stocks search
+field) also ignore `AXFocused` writes, so only typed keys reach them, and
+keys go to the field that has keyboard focus. `type_text` never sends
+them the AX write: a focused field gets keys, and an addressed field
+without focus is refused before anything is sent (background or
+foreground), with `code:"catalyst_text_needs_focus"`. Next: `click` the field (a background
+click is enough), then call `type_text` again. The AX value is often
+unreadable, so expect `⚠️ Not confirmed:` and check the screenshot.
+
+Electron fix — **one call**: `type_text({pid, window_id, x, y, text})`. Passing
 `x,y` (no `element_index`) is the **element px action** form of
 `type_text` — the tool pixel-clicks at `(x,y)` to give the Chromium /
 UIKit renderer the real keyboard focus the AX layer can't, then types

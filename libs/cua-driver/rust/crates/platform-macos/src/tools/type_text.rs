@@ -163,7 +163,10 @@ impl Tool for TypeTextTool {
             .await;
             return match result {
                 Ok(Ok(())) => {
-                    ToolResult::text("Typed text into the frontmost desktop application.")
+                    ToolResult::text(format!(
+                        "{UNCONFIRMED_PREFIX} the keys were sent to the frontmost desktop \
+                         application, which gives no read-back here. {OBSERVE_BEFORE_RETYPING}"
+                    ))
                         .with_structured(serde_json::json!({
                             "scope": "desktop",
                             "path": "hid",
@@ -446,6 +449,9 @@ impl Tool for TypeTextTool {
                 let wid = window_id.expect("background refusals require a window target");
                 return super::background_refusal_result(pid, wid, &refusal);
             }
+            Ok(Ok(TypeTextDelivery::CatalystNeedsFocus)) => {
+                return catalyst_text_needs_focus_result(pid, window_id);
+            }
             Ok(Ok(TypeTextDelivery::SynthesisRefused {
                 path,
                 refusal,
@@ -509,6 +515,7 @@ fn completed_typing_result(
         path,
         verified,
         delivered_chars,
+        unconfirmed,
     } = outcome;
     // SURFACE-AWARE VERIFICATION. On any web-content surface (Chromium,
     // WebKit, Electron) AXValue is not independent renderer evidence: it can
@@ -520,41 +527,44 @@ fn completed_typing_result(
     let untrusted_web_readback = verification.untrusted_web_readback;
     let electron_web_content = untrusted_web_readback && is_electron;
 
-    // `verified:false` means the driver could not confirm the text landed
-    // (Electron AX echo, unreadable AXValue on Catalyst, a CGEvent rung the
-    // app may have dropped, or an accepted AX write that never became
-    // readable). Unknown is not failure: the text may already be there, so the
-    // guidance is to observe before typing again, never to retype blind.
-    let (mark, note) = if verified {
-        ("✅ Inserted", String::new())
-    } else if untrusted_web_readback {
-        let next_step = if electron_web_content && used_pixel_focus {
-            "The pixel-focus rung already ran, so do not repeat it; verify the \
-             result via the screenshot."
-        } else {
-            "In Chrome, bind the tab with get_browser_state and type with \
-             browser_type, which the page observes and reads back; for an embedded \
-             web view, re-type with the px form (x,y)."
-        };
-        (
-            "📨 Sent (unverified)",
-            format!(
-                " — web-content surface (Chromium / WebKit / Electron): \
-                 AXValue read-back is not independent proof that the \
-                 renderer/DOM observed the input. {next_step}"
-            ),
-        )
+    // The summary's first words state the evidence: "✅ Inserted" only when a
+    // trusted read-back shows the text; every other completed outcome starts
+    // "⚠️ Not confirmed:" with the missing evidence and the next step. Unknown
+    // is not failure: the text may already be there, so the guidance is to
+    // observe before typing again, never to retype blind. (Partial delivery
+    // and refusals have their own results before this point.)
+    let summary = if verified {
+        format!("✅ Inserted {char_count} char(s){detail}.")
     } else {
-        (
-            "📨 Sent (unverified)",
-            " — driver could not confirm the edit. Read the current target state \
-             before typing again: the text may already be present, and repeating \
-             it can duplicate the edit. Use a screenshot when accessibility cannot \
-             establish the result."
-                .to_string(),
+        let (reason, web_next_step) = if untrusted_web_readback {
+            let next_step = if electron_web_content && used_pixel_focus {
+                " The pixel-focus rung already ran, so do not repeat it."
+            } else {
+                " In Chrome, bind the tab with get_browser_state and type with \
+                 browser_type, which the page observes and reads back; for an embedded \
+                 web view, use the px form (x,y)."
+            };
+            (
+                "on web content (Chromium / WebKit / Electron) the accessibility \
+                 read-back is not proof that the page received the input"
+                    .to_string(),
+                next_step,
+            )
+        } else {
+            let sent = if path == PATH_AX {
+                "the app accepted the accessibility write, but "
+            } else {
+                "the keys were sent, but "
+            };
+            let why = unconfirmed.unwrap_or(Unconfirmed::Unreadable).describe();
+            (format!("{sent}{why}"), "")
+        };
+        format!(
+            "{UNCONFIRMED_PREFIX} {reason} ({char_count} char(s){detail}).{web_next_step} \
+             {OBSERVE_BEFORE_RETYPING}"
         )
     };
-    ToolResult::text(format!("{mark} {char_count} char(s){detail}.{note}{suffix}")).with_structured({
+    ToolResult::text(format!("{summary}{suffix}")).with_structured({
         // `effect` mirrors `verified`'s read-back tri-state: a TRUSTED positive
         // read-back is "confirmed"; anything else is "unverifiable".
         let mut s = serde_json::json!({
@@ -610,6 +620,10 @@ fn completed_typing_result(
 const PATH_AX: &str = "ax";
 const PATH_KEY_EVENTS: &str = "key_events";
 const PATH_KEY_EVENTS_FG: &str = "key_events_fg";
+
+const UNCONFIRMED_PREFIX: &str = "⚠️ Not confirmed:";
+const OBSERVE_BEFORE_RETYPING: &str = "Read the field or take a screenshot before typing again; \
+     retyping can duplicate the edit.";
 
 // The daemon transport has a 120-second request deadline. Character synthesis
 // is synchronous and costs at least one 8ms key-down gap plus either the
@@ -807,6 +821,89 @@ fn electron_background_ax_refusal(
     })
 }
 
+/// A type_text addressed to a Mac Catalyst text view without keyboard focus,
+/// refused before any input.
+const CATALYST_TEXT_NEEDS_FOCUS: &str = "catalyst_text_needs_focus";
+
+/// Whether a `(role, subrole)` chain (the target first, then its ancestors)
+/// is a Mac Catalyst text view: a text control inside the `AXGroup` with
+/// subrole `iOSContentGroup` that hosts a Catalyst window's UIKit content.
+/// UIKit text views there (Messages compose, WhatsApp, the Stocks search
+/// field) accept an `AXSelectedText` write and then ignore it, and ignore
+/// `AXFocused` writes too. A chain that stops early proves nothing.
+fn is_catalyst_text_view(chain: &[(String, String)]) -> bool {
+    let Some(((role, _), ancestors)) = chain.split_first() else {
+        return false;
+    };
+    matches!(
+        role.as_str(),
+        "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
+    ) && ancestors
+        .iter()
+        .any(|(role, subrole)| role == "AXGroup" && subrole == "iOSContentGroup")
+}
+
+/// `(AXRole, AXSubrole)` of `element` and its ancestors up to the window.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn ax_role_chain(element: AXUIElementRef) -> Vec<(String, String)> {
+    let mut chain = Vec::new();
+    let mut current = element;
+    let mut owned = false;
+    for _ in 0..40 {
+        let role = copy_string_attr(current, "AXRole").unwrap_or_default();
+        let subrole = copy_string_attr(current, "AXSubrole").unwrap_or_default();
+        let top = matches!(role.as_str(), "" | "AXWindow" | "AXApplication");
+        chain.push((role, subrole));
+        let parent = if top {
+            None
+        } else {
+            crate::ax::bindings::copy_element_attr(current, "AXParent")
+        };
+        if owned {
+            CFRelease(current as CFTypeRef);
+        }
+        let Some(parent) = parent else {
+            return chain;
+        };
+        current = parent;
+        owned = true;
+    }
+    if owned {
+        CFRelease(current as CFTypeRef);
+    }
+    chain
+}
+
+/// The refusal for an addressed Catalyst text view without keyboard focus,
+/// on the background and the foreground route alike.
+fn catalyst_text_needs_focus_result(pid: i32, window_id: Option<u32>) -> ToolResult {
+    let reason = "This Mac Catalyst text view does not have keyboard focus. Catalyst ignores \
+                  accessibility text writes and focus requests, so only typed keys reach it, \
+                  and keys go to the field that has focus. Nothing was sent. Next: click the \
+                  field (its element_token; a background click is enough), then call \
+                  type_text again.";
+    ToolResult::error(format!(
+        "type_text refused ({CATALYST_TEXT_NEEDS_FOCUS}): {reason}"
+    ))
+    .with_structured(serde_json::json!({
+        "code": CATALYST_TEXT_NEEDS_FOCUS,
+        "effect": "refused",
+        "pid": pid,
+        "window_id": window_id,
+        "reason": reason,
+    }))
+}
+
+/// Whether `element` is an addressed Mac Catalyst text view that does not
+/// have keyboard focus: keys sent now would go to whatever has it.
+fn is_unfocused_catalyst_text_view(pid: i32, element: AXUIElementRef, window_id: Option<u32>) -> bool {
+    is_catalyst_text_view(&unsafe { ax_role_chain(element) })
+        && !addressed_element_has_focus(pid, element, window_id)
+}
+
 const DELIVERY_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
 const DELIVERY_DRAIN_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
@@ -835,6 +932,8 @@ enum BackgroundKeyboardPolicy {
 enum TypeTextDelivery {
     Typed(TypeTextOutcome),
     Refused(BackgroundRefusal),
+    /// An addressed Catalyst text view without keyboard focus; nothing sent.
+    CatalystNeedsFocus,
     SynthesisRefused {
         path: &'static str,
         refusal: SynthesisRefusal,
@@ -897,6 +996,53 @@ struct TypeTextOutcome {
     /// Exact when AX exposed the target value. `None` means delivery could not
     /// be observed, so the existing unverifiable contract remains in force.
     delivered_chars: Option<usize>,
+    /// The missing evidence behind `verified: false`, stated in the summary.
+    unconfirmed: Option<Unconfirmed>,
+}
+
+/// Why a completed, non-partial delivery is not confirmed.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Unconfirmed {
+    /// Screen Sharing: the field is on the remote Mac.
+    NoReadback,
+    /// The field's text cannot be read (Catalyst text views).
+    Unreadable,
+    /// Readable after typing but not before, so a change cannot be attributed.
+    UnreadableBefore,
+    /// Readable and unchanged, without a caret to prove that nothing landed
+    /// (or web content, whose accessibility value can lag the page).
+    Unchanged,
+    /// Readable, but the change is not exactly the typed text.
+    Mismatch,
+}
+
+impl Unconfirmed {
+    fn from_readback(before: Option<&str>, after: Option<&str>) -> Self {
+        match (before, after) {
+            (_, None) => Self::Unreadable,
+            (None, Some(_)) => Self::UnreadableBefore,
+            (Some(before), Some(after)) if before == after => Self::Unchanged,
+            _ => Self::Mismatch,
+        }
+    }
+
+    fn describe(self) -> &'static str {
+        match self {
+            Self::NoReadback => "the field is on the remote Mac and cannot be read from here",
+            Self::Unreadable => "the field's text cannot be read through accessibility",
+            Self::UnreadableBefore => {
+                "the field's text was unreadable before typing, so its current text \
+                 cannot be attributed to this call"
+            }
+            Self::Unchanged => {
+                "the field's text reads unchanged, which does not prove that nothing landed"
+            }
+            Self::Mismatch => {
+                "the field's text changed, but not by exactly the typed text \
+                 (autocorrect, autocapitalization, or another edit)"
+            }
+        }
+    }
 }
 
 fn foreground_settle_ms(pid: i32, frontmost_pid: Option<i32>) -> u64 {
@@ -1150,7 +1296,7 @@ fn cgevent_type_verified(
     readback: &TypingReadback,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
-) -> anyhow::Result<(bool, Option<usize>)> {
+) -> anyhow::Result<(bool, Option<usize>, Option<Unconfirmed>)> {
     // Focus the target element so the keystrokes land in IT. Critical in
     // foreground mode: a freshly-fronted window's keyboard focus may be on the
     // search box or nowhere, so without this the text goes into the void (or the
@@ -1188,12 +1334,16 @@ fn cgevent_type_verified(
     // visible instead of treating any growth as success. If the deadline
     // expires after observable growth, surface the exact partial count.
     let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
-    Ok(delivery_from_progress(
+    let (verified, delivered_chars) = delivery_from_progress(
         await_typed_progress_with_selection(before.as_deref(), selection, text, deadline, || {
             readback.sample()
         }),
         text,
-    ))
+    );
+    let unconfirmed = delivered_chars
+        .is_none()
+        .then(|| Unconfirmed::from_readback(before.as_deref(), readback.read().as_deref()));
+    Ok((verified, delivered_chars, unconfirmed))
 }
 
 #[cfg(test)]
@@ -1300,6 +1450,14 @@ fn type_text_blocking(
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
     if delivery_mode.is_foreground() {
+        // Catalyst ignores the AXFocused write this rung relies on: keys for an
+        // addressed text view without focus would go to whatever has it, and a
+        // readable unchanged target would then report "delivered 0" wrongly.
+        if element_ptr_and_idx
+            .is_some_and(|(ptr, _)| is_unfocused_catalyst_text_view(pid, ptr as AXUIElementRef, window_id))
+        {
+            return Ok(TypeTextDelivery::CatalystNeedsFocus);
+        }
         let screen_sharing_target = crate::input::keyboard::is_screen_sharing_pid(pid);
         if let Some(refusal) = synthesis_preflight(
             if screen_sharing_target {
@@ -1339,7 +1497,7 @@ fn type_text_blocking(
                 foreground_settle_ms,
             )
         };
-        let ((verified, delivered_chars), fronted) = match window_id {
+        let ((verified, delivered_chars, unconfirmed), fronted) = match window_id {
             Some(wid) if screen_sharing_target => {
                 // Screen Sharing forwards physical HID transitions to the
                 // guest. PID-routed Unicode events all carry keycode 0 (the A
@@ -1359,14 +1517,14 @@ fn type_text_blocking(
                         crate::input::keyboard::type_text_physical_global(text, delay_ms)
                     },
                 )?;
-                ((false, None), true)
+                ((false, None, Some(Unconfirmed::NoReadback)), true)
             }
             Some(wid) => {
                 // Front → type → restore. The closure returns the read-back
                 // result; with_foreground_assist returns whether it actually
                 // fronted (Ok(false) when the fronting SPIs are unavailable —
                 // the keystrokes still ran, just as background input).
-                let mut typed_delivery = (false, None);
+                let mut typed_delivery = (false, None, None);
                 let fronted = crate::input::skylight::with_foreground_assist(
                     pid as libc::pid_t,
                     wid,
@@ -1380,8 +1538,9 @@ fn type_text_blocking(
             // No window to front — best-effort background keystrokes instead.
             None => (do_type()?, false),
         };
-        let delivered_chars = web_zero_is_unknown(
+        let (delivered_chars, unconfirmed) = web_zero_is_unknown(
             delivered_chars,
+            unconfirmed,
             target_in_web_area(pid, element_ptr_and_idx, window_id),
         );
         // Only claim the `_fg` path when a front actually happened; when no
@@ -1396,6 +1555,7 @@ fn type_text_blocking(
             },
             delivered_chars,
             verified,
+            unconfirmed,
         }));
     }
 
@@ -1422,7 +1582,7 @@ fn type_text_blocking(
             "type_text: pid {pid} is a terminal emulator; skipping AX value-set, \
              using CGEvent key-event synthesis"
         );
-        let (verified, delivered_chars) = cgevent_type_verified(
+        let (verified, delivered_chars, unconfirmed) = cgevent_type_verified(
             pid,
             text,
             delay_ms,
@@ -1435,6 +1595,7 @@ fn type_text_blocking(
             path: PATH_KEY_EVENTS,
             verified,
             delivered_chars,
+            unconfirmed,
         }));
     }
 
@@ -1471,6 +1632,28 @@ fn type_text_blocking(
         }
         keep
     });
+    // A Mac Catalyst text view accepts an AX text write and then ignores it,
+    // and ignores AXFocused writes too: never send that write. Keys reach the
+    // field when it has keyboard focus (the focused element, or an addressed
+    // one that is focused in its window); an addressed field without focus is
+    // refused, since keys would go to whatever has it (the foreground rung
+    // above applies the same rule).
+    let ax_target = match ax_target {
+        Some((element, owns, _))
+            if is_catalyst_text_view(&unsafe { ax_role_chain(element) }) =>
+        {
+            let focused = owns || addressed_element_has_focus(pid, element, window_id);
+            if owns {
+                unsafe { CFRelease(element as CFTypeRef) };
+            }
+            if !focused {
+                return Ok(TypeTextDelivery::CatalystNeedsFocus);
+            }
+            tracing::debug!("type_text: pid {pid} target is a focused Catalyst text view; keys only");
+            None
+        }
+        other => other,
+    };
     let mut ax_attempt = AxAttempt::NotAttempted;
     if let Some((element, owns, idx_opt)) = ax_target {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
@@ -1534,6 +1717,7 @@ fn type_text_blocking(
                 path: PATH_AX,
                 verified: true,
                 delivered_chars: Some(text.chars().count()),
+                unconfirmed: None,
             }));
         }
         if let Some(TypedProgress::Partial(delivered_chars)) = ax_progress {
@@ -1543,6 +1727,7 @@ fn type_text_blocking(
                 path: PATH_AX,
                 verified: false,
                 delivered_chars: Some(delivered_chars),
+                unconfirmed: None,
             }));
         }
         ax_attempt = match ax_progress {
@@ -1556,11 +1741,17 @@ fn type_text_blocking(
             // The write was accepted. Unreadable or untrusted unchanged state
             // cannot establish that nothing landed, so another input route
             // could insert the same text twice within this single request.
+            let unconfirmed = if unchanged_web_readback {
+                Unconfirmed::Unchanged
+            } else {
+                Unconfirmed::from_readback(readback.before.as_deref(), readback.read().as_deref())
+            };
             return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
                 detail: format!(" via accepted AX write into {role} \"{title}\""),
                 path: PATH_AX,
                 verified: false,
                 delivered_chars: None,
+                unconfirmed: Some(unconfirmed),
             }));
         }
         tracing::debug!(
@@ -1568,7 +1759,7 @@ fn type_text_blocking(
              falling back to CGEvent keystrokes"
         );
     } else {
-        tracing::debug!("No focused element for pid {pid}; using CGEvent keystrokes");
+        tracing::debug!("No AX text target for pid {pid}; using CGEvent keystrokes");
     }
 
     // The semantic AX rung did not land and this request is restricted to it:
@@ -1595,7 +1786,7 @@ fn type_text_blocking(
     // insert-at-cursor semantics.
     // Web content: select the exact window as its process's key window for
     // the keystrokes and their readback, without raising it.
-    let (verified, delivered_chars) = super::with_background_web_key_window(
+    let (verified, delivered_chars, unconfirmed) = super::with_background_web_key_window(
         pid,
         window_id,
         element_ptr_and_idx.map(|(ptr, _)| ptr),
@@ -1610,8 +1801,9 @@ fn type_text_blocking(
             )
         },
     )?;
-    let delivered_chars = web_zero_is_unknown(
+    let (delivered_chars, unconfirmed) = web_zero_is_unknown(
         delivered_chars,
+        unconfirmed,
         target_in_web_area(pid, element_ptr_and_idx, window_id),
     );
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
@@ -1619,18 +1811,39 @@ fn type_text_blocking(
         path: PATH_KEY_EVENTS,
         verified,
         delivered_chars,
+        unconfirmed,
     }))
+}
+
+/// Whether `element` is the focused element of its window (`window_id`), or
+/// of the process when no window is given.
+fn addressed_element_has_focus(pid: i32, element: AXUIElementRef, window_id: Option<u32>) -> bool {
+    let Some(wid) = window_id else {
+        return crate::input::ax_actions::is_element_focused(pid, element as usize);
+    };
+    unsafe {
+        let Some(focused) = crate::ax::exact_target::focused_element_in_window(pid, wid) else {
+            return false;
+        };
+        let same = CFEqual(focused as CFTypeRef, element as CFTypeRef) != 0;
+        CFRelease(focused as CFTypeRef);
+        same
+    }
 }
 
 /// Key events into web content whose AXValue did not change: the page may
 /// have taken every key (a combobox moves accessibility focus to a
 /// suggestion, AX lags the renderer), so "0 delivered" would be a false
 /// count. Report it as unknown instead.
-fn web_zero_is_unknown(delivered_chars: Option<usize>, web_content: bool) -> Option<usize> {
+fn web_zero_is_unknown(
+    delivered_chars: Option<usize>,
+    unconfirmed: Option<Unconfirmed>,
+    web_content: bool,
+) -> (Option<usize>, Option<Unconfirmed>) {
     if web_content && delivered_chars == Some(0) {
-        None
+        (None, Some(Unconfirmed::Unchanged))
     } else {
-        delivered_chars
+        (delivered_chars, unconfirmed)
     }
 }
 
@@ -1658,10 +1871,14 @@ mod tests {
     #[test]
     fn an_unchanged_web_value_is_unknown_not_zero() {
         use super::web_zero_is_unknown;
-        assert_eq!(web_zero_is_unknown(Some(0), true), None);
-        assert_eq!(web_zero_is_unknown(Some(0), false), Some(0));
-        assert_eq!(web_zero_is_unknown(Some(3), true), Some(3));
-        assert_eq!(web_zero_is_unknown(None, true), None);
+        use super::Unconfirmed::{Unchanged, Unreadable};
+        assert_eq!(web_zero_is_unknown(Some(0), None, true), (None, Some(Unchanged)));
+        assert_eq!(web_zero_is_unknown(Some(0), None, false), (Some(0), None));
+        assert_eq!(web_zero_is_unknown(Some(3), None, true), (Some(3), None));
+        assert_eq!(
+            web_zero_is_unknown(None, Some(Unreadable), true),
+            (None, Some(Unreadable))
+        );
     }
 
     #[test]
@@ -1899,32 +2116,130 @@ mod tests {
     }
 
 
+    fn summary_of(result: &ToolResult) -> &str {
+        let cua_driver_core::protocol::Content::Text { text, .. } = &result.content[0] else {
+            panic!("typing result must include a summary")
+        };
+        text
+    }
+
+    /// Every completed outcome kind maps to one summary prefix and effect: the
+    /// summary's first words state the evidence, and nothing says "Sent".
     #[test]
-    fn unknown_native_typing_requests_observation_without_another_input_route() {
-        for path in [PATH_AX, PATH_KEY_EVENTS, PATH_KEY_EVENTS_FG] {
-            let result = completed_typing_result(
-                TypeTextOutcome {
-                    detail: String::new(),
-                    path,
-                    verified: false,
-                    delivered_chars: None,
-                },
-                16,
-                false,
-                false,
-                false,
+    fn typing_summaries_state_the_evidence() {
+        use Unconfirmed::*;
+        let outcome = |path, verified, delivered_chars, unconfirmed| TypeTextOutcome {
+            detail: " into [1] AXTextArea \"\"".into(),
+            path,
+            verified,
+            delivered_chars,
+            unconfirmed,
+        };
+        // (outcome, web target) -> summary prefix, effect, words of the reason
+        let cases = [
+            (
+                (outcome(PATH_AX, true, Some(5), None), false),
+                "✅ Inserted 5 char(s) into [1] AXTextArea",
+                "confirmed",
                 "",
-            );
+            ),
+            (
+                (outcome(PATH_AX, false, None, Some(Unreadable)), false),
+                UNCONFIRMED_PREFIX,
+                "unverifiable",
+                "accepted the accessibility write, but the field's text cannot be read",
+            ),
+            (
+                (outcome(PATH_AX, false, None, Some(Unchanged)), false),
+                UNCONFIRMED_PREFIX,
+                "unverifiable",
+                "accepted the accessibility write, but the field's text reads unchanged",
+            ),
+            (
+                (outcome(PATH_KEY_EVENTS, false, None, Some(UnreadableBefore)), false),
+                UNCONFIRMED_PREFIX,
+                "unverifiable",
+                "the keys were sent, but the field's text was unreadable before typing",
+            ),
+            (
+                (outcome(PATH_KEY_EVENTS_FG, false, None, Some(Mismatch)), false),
+                UNCONFIRMED_PREFIX,
+                "unverifiable",
+                "the keys were sent, but the field's text changed, but not by exactly",
+            ),
+            (
+                (outcome(PATH_KEY_EVENTS_FG, false, None, Some(NoReadback)), false),
+                UNCONFIRMED_PREFIX,
+                "unverifiable",
+                "remote Mac",
+            ),
+            // A positive AX read-back in web content is not renderer evidence.
+            (
+                (outcome(PATH_AX, true, Some(5), None), true),
+                UNCONFIRMED_PREFIX,
+                "unverifiable",
+                "not proof that the page received the input",
+            ),
+        ];
+        for ((outcome, web), prefix, effect, reason) in cases {
+            let result =
+                completed_typing_result(outcome, 5, web, false, false, " (window unchanged)");
+            let text = summary_of(&result);
             let data = result.structured_content.as_ref().unwrap();
-            assert_eq!(data["effect"], "unverifiable");
-            assert_eq!(data["verified"], false);
-            assert!(data.get("escalation").is_none(), "{data}");
-            let cua_driver_core::protocol::Content::Text { text, .. } = &result.content[0] else {
-                panic!("typing result must include guidance")
-            };
-            assert!(text.contains("before typing again"), "{text}");
-            assert!(text.contains("duplicate"), "{text}");
+            assert!(text.starts_with(prefix), "{text}");
+            assert!(text.contains(reason), "{text}");
+            assert!(text.ends_with("(window unchanged)"), "{text}");
+            assert!(!text.contains("Sent"), "{text}");
+            assert_eq!(data["effect"], effect, "{text}");
+            assert_eq!(data["verified"], effect == "confirmed", "{text}");
+            if effect != "confirmed" {
+                assert!(text.contains("before typing again"), "{text}");
+                assert!(text.contains("duplicate"), "{text}");
+            }
+            if !web {
+                // An unknown native edit gives no evidence that another route is needed.
+                assert!(data.get("escalation").is_none(), "{data}");
+            }
         }
+    }
+
+    #[test]
+    fn catalyst_text_views_are_detected_by_their_ios_content_group() {
+        let chain = |links: &[(&str, &str)]| -> Vec<(String, String)> {
+            links.iter().map(|(r, s)| (r.to_string(), s.to_string())).collect()
+        };
+        let window = ("AXWindow", "AXStandardWindow");
+        let content = ("AXGroup", "iOSContentGroup");
+        // Chains read on macOS 26 (checks/axq ancestors): the Catalyst probe's
+        // UITextView and UITextField, and the Stocks search field.
+        assert!(is_catalyst_text_view(&chain(&[("AXTextArea", ""), ("AXGroup", ""), content, window])));
+        assert!(is_catalyst_text_view(&chain(&[("AXTextField", ""), ("AXGroup", ""), content, window])));
+        assert!(is_catalyst_text_view(&chain(&[
+            ("AXTextField", "AXSearchField"),
+            ("AXGroup", ""),
+            ("AXGroup", ""),
+            ("AXGroup", ""),
+            content,
+            window,
+        ])));
+        // TextEdit (AppKit): no content group.
+        assert!(!is_catalyst_text_view(&chain(&[("AXTextArea", ""), ("AXScrollArea", ""), window])));
+        // A Catalyst button is not a text view.
+        assert!(!is_catalyst_text_view(&chain(&[("AXButton", ""), content, window])));
+        // The target itself being the content group, or an unproven chain.
+        assert!(!is_catalyst_text_view(&chain(&[content, window])));
+        assert!(!is_catalyst_text_view(&chain(&[("AXTextArea", "")])));
+        assert!(!is_catalyst_text_view(&[]));
+    }
+
+    #[test]
+    fn unconfirmed_reason_names_the_missing_readback() {
+        use Unconfirmed::*;
+        assert_eq!(Unconfirmed::from_readback(Some("a"), None), Unreadable);
+        assert_eq!(Unconfirmed::from_readback(None, None), Unreadable);
+        assert_eq!(Unconfirmed::from_readback(None, Some("a")), UnreadableBefore);
+        assert_eq!(Unconfirmed::from_readback(Some("a"), Some("a")), Unchanged);
+        assert_eq!(Unconfirmed::from_readback(Some(""), Some("Cua probe")), Mismatch);
     }
 
     #[test]
@@ -1935,6 +2250,7 @@ mod tests {
                 path: PATH_AX,
                 verified: true,
                 delivered_chars: None,
+                unconfirmed: None,
             },
             3,
             true,
@@ -1955,6 +2271,7 @@ mod tests {
                 path: PATH_AX,
                 verified: true,
                 delivered_chars: Some(16),
+                unconfirmed: None,
             },
             16,
             false,
@@ -2027,6 +2344,72 @@ mod tests {
         assert_eq!(outcome.path, PATH_AX);
         assert!(!outcome.verified);
         assert_eq!(outcome.delivered_chars, None);
+    }
+
+    /// A Catalyst text view never gets the AX text write it would ignore. A
+    /// focused view (the window's focused element, or an addressed one that
+    /// has focus) goes to keys; an addressed view without focus is refused
+    /// before any input, on the background and the foreground route alike.
+    #[test]
+    fn catalyst_text_views_get_keys_when_focused_and_a_refusal_otherwise() {
+        use super::super::DeliveryMode::{Background, Foreground};
+        // The oversized payload stops the key rung at its synthesis budget, so
+        // reaching it posts no real key events from this unit test.
+        let text = "x".repeat(6_500);
+        for (mode, addressed, focused) in [
+            (Background, false, true),
+            (Background, true, true),
+            (Background, true, false),
+            (Foreground, false, true),
+            (Foreground, true, true),
+            (Foreground, true, false),
+        ] {
+            let fixture =
+                crate::ax::bindings::test_support::EditorScope::install("AXTextArea", None, || {});
+            fixture.catalyst();
+            if !focused {
+                fixture.unfocus();
+            }
+            let result = type_text_blocking(
+                -9876,
+                &text,
+                addressed.then(|| (fixture.element_ptr(), Some(3))),
+                0,
+                false,
+                mode,
+                Some(42),
+                BackgroundKeyboardPolicy::Allowed,
+                true,
+            )
+            .expect("a Catalyst target is decided before any input");
+            let case = format!("{mode:?} addressed {addressed} focused {focused}");
+            assert_eq!(fixture.value(), "", "no AX text write ({case})");
+            match (result, focused) {
+                (
+                    TypeTextDelivery::SynthesisRefused {
+                        ax_attempt: AxAttempt::NotAttempted,
+                        ..
+                    },
+                    true,
+                ) => {}
+                (TypeTextDelivery::CatalystNeedsFocus, false) => {}
+                _ => panic!("{case}: wrong route"),
+            }
+        }
+    }
+
+    #[test]
+    fn the_catalyst_focus_refusal_names_the_next_step() {
+        let result = catalyst_text_needs_focus_result(7, Some(42));
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.as_ref().unwrap();
+        assert_eq!(data["code"], "catalyst_text_needs_focus");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["window_id"], 42);
+        let text = summary_of(&result);
+        assert!(text.starts_with("type_text refused (catalyst_text_needs_focus)"), "{text}");
+        assert!(text.contains("click the field"), "{text}");
+        assert!(text.contains("Nothing was sent"), "{text}");
     }
 
     #[test]

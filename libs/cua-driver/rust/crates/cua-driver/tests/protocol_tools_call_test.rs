@@ -566,11 +566,14 @@ fn type_text_chars_tool() {
     );
     let msg = resp["result"]["content"][0]["text"].as_str().unwrap_or("");
     // type_text reports "Inserted" when an AX read-back verified the text, and
-    // "Sent (unverified)" when it dispatched but couldn't confirm (e.g. the field
-    // wasn't focused/frontmost) — both are accepted invocations. "Typed" covers
-    // the standalone type_text_chars wording.
+    // on macOS "Not confirmed" when it dispatched but couldn't confirm (e.g. the
+    // field wasn't focused/frontmost); other platforms still say "Sent". All are
+    // accepted invocations. "Typed" covers the standalone type_text_chars wording.
     assert!(
-        msg.contains("Typed") || msg.contains("Inserted") || msg.contains("Sent"),
+        msg.contains("Typed")
+            || msg.contains("Inserted")
+            || msg.contains("Not confirmed")
+            || msg.contains("Sent"),
         "Unexpected message: {msg}"
     );
 }

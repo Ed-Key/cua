@@ -81,7 +81,9 @@ check `describe <tool>` there.
 - Web content (Chromium, WebKit, Electron: browser tabs, Slack, VS Code) is detected by an `AXWebArea` ancestor. There, `AXValue` does not prove the renderer saw the write, so the driver never reports a false `confirmed`: Electron targets that cannot be proven native refuse background delivery before mutation (use the `x`,`y` form or foreground), and other web paths return `effect:"unverifiable"` with an escalation. A browser's native address bar and toolbar stay trusted.
 - For a browser tab, the typed browser tools ([BROWSER.md](BROWSER.md)) are the reliable route. For an embedded web view, use the `x`,`y` form.
 - The typing response has no screenshot; request one with `get_window_state` when accessibility cannot establish the result.
-- Background keystrokes can miss focus-sensitive surfaces such as WhatsApp and other Catalyst apps. Retry with `delivery_mode:"foreground"` only when a fresh read shows the text did not appear. Foreground delivery requires explicit authorization.
+- The summary's first words state the evidence: `✅ Inserted` only when a read-back shows the text; otherwise `⚠️ Not confirmed:` with the reason. Read the field or take a screenshot before typing again.
+- Mac Catalyst text views (WhatsApp, Messages, Stocks search) take only typed keys, which reach the field with keyboard focus. An addressed one without focus is refused with `catalyst_text_needs_focus` before any input, in either delivery mode: click it (background is fine), then call `type_text` again.
+- Background keystrokes can miss other focus-sensitive surfaces. Retry with `delivery_mode:"foreground"` only when a fresh read shows the text did not appear. Foreground delivery requires explicit authorization.
 
 ## press_key and hotkey
 
