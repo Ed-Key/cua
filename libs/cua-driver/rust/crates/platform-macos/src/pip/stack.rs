@@ -766,6 +766,26 @@ pub(super) fn resize_edges(point: (f64, f64), card: Area) -> u8 {
     edges
 }
 
+/// How far to move a card drawn at `card` (screen rect, AppKit bottom-left
+/// origin) so it lies inside `visible` (the screen's visible frame: below
+/// the menu bar, above the Dock), by the least distance: (dx, dy). A card
+/// wider or taller than the frame keeps its left edge, or its top, inside.
+pub(super) fn keep_inside(card: Area, visible: Area) -> (f64, f64) {
+    let axis = |at: f64, size: f64, lo: f64, extent: f64, keep_high: bool| {
+        let hi = lo + extent - size;
+        let to = if hi < lo {
+            if keep_high { hi } else { lo }
+        } else {
+            at.clamp(lo, hi)
+        };
+        to - at
+    };
+    (
+        axis(card.x, card.w, visible.x, visible.w, false),
+        axis(card.y, card.h, visible.y, visible.h, true),
+    )
+}
+
 /// Largest size box on a screen whose visible frame is `visible` (w, h):
 /// `MAX_SCREEN_FRACTION` of the screen's shorter side each way, so the
 /// square that holds its cards (`hold`) fits the screen.
@@ -1534,6 +1554,22 @@ mod tests {
             }
             assert_eq!((spring.ox, spring.vx), (0.0, 0.0));
         }
+    }
+
+    /// Break-it finding: a card dragged onto the Dock (or past any edge of
+    /// the visible frame) comes back inside it, by the least distance.
+    #[test]
+    fn a_card_released_outside_the_visible_frame_comes_back_inside() {
+        // 1440x900 screen, Dock 70 pt, menu bar 25 pt.
+        let visible = Area { x: 0.0, y: 70.0, w: 1440.0, h: 805.0 };
+        let card = |x, y| Area { x, y, w: 320.0, h: 200.0 };
+        assert_eq!(keep_inside(card(500.0, 300.0), visible), (0.0, 0.0), "inside: stays");
+        assert_eq!(keep_inside(card(500.0, 20.0), visible), (0.0, 50.0), "on the Dock: up just above it");
+        assert_eq!(keep_inside(card(1300.0, 300.0), visible), (-180.0, 0.0), "past the right edge");
+        assert_eq!(keep_inside(card(-40.0, 700.0), visible), (40.0, -25.0), "past the left edge and under the menu bar");
+        // Larger than the frame: its left edge and its top stay inside.
+        let big = Area { x: -10.0, y: 0.0, w: 1500.0, h: 900.0 };
+        assert_eq!(keep_inside(big, visible), (10.0, -25.0));
     }
 
     #[test]

@@ -1553,7 +1553,9 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     if restacked {
         announce_stack(panel, &key);
     }
-    set_panel_target(panel, &key, &worker, new_target);
+    // While a pick is set the target stays the concrete picked window: a
+    // pid-only frame resolved to it must not reopen which window it is.
+    set_panel_target(panel, &key, &worker, hands::front_target(pick, tag, new_target));
     panel.target_visible = target_visible;
     panel.resolved_window = resolved_window;
     panel.target_frame = target_frame;
@@ -2257,7 +2259,10 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
                 if panel.hands.pick().is_none() {
                     panel.agent = Some(tag);
                 }
-                if switch_front(panel, key, &worker, tag, Some(panel.last_action)) {
+                // A resolution never takes the front from the user's pick.
+                if hands::may_promote(panel.hands.pick(), tag)
+                    && switch_front(panel, key, &worker, tag, Some(panel.last_action))
+                {
                     let title =
                         ns_to_string(msg_send![panel.target_title as *mut AnyObject, stringValue]);
                     let status = panel.action.clone();
@@ -3246,20 +3251,19 @@ unsafe extern "C" fn hover_poll_cb(ctx: *mut c_void) {
         if missed {
             end_gesture(state, false);
         }
-        let pressed = state.gesture.as_ref().filter(|gesture| gesture.id == id);
-        let (pressed, resizing) = (pressed.is_some(), pressed.map_or(0, |gesture| gesture.edges));
+        let gesture = state.gesture.as_ref().map(|gesture| (gesture.id, gesture.edges));
+        let pressed = gesture.is_some_and(|(owner, _)| owner == id);
         let worker = state.worker.clone();
         let mut cursor = state.cursor;
         let polled = panel_by_id(state, id).filter(|panel| panel.shown).map(|panel| {
             let on = pointer_on(panel);
             panel.hands.pointer(on, mouse_location(), now);
             // The cursor of the press that is resizing, else of the band
-            // under the pointer.
-            let edges = match (resizing, on) {
-                (0, true) => pointer_edges(panel),
-                (edges, _) => edges,
-            };
-            sync_cursor(&mut cursor, id, edges);
+            // under the pointer; nothing while another panel is pressed.
+            let band = if on { pointer_edges(panel) } else { 0 };
+            if let Some(edges) = hands::poll_edges(gesture, id, band) {
+                sync_cursor(&mut cursor, id, edges);
+            }
             if !panel.bar_shown && pointer_over(panel) {
                 show_bar(panel);
             }
@@ -4699,6 +4703,13 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
     // The release row of the table in `hands`: delivered or not, inside the
     // panel or not, a full idle period follows it.
     panel.hands.touch(Instant::now());
+    if gesture.moved || gesture.edges != 0 {
+        // A card dragged or resized past the screen's visible frame (onto
+        // the Dock, under the menu bar) comes back inside it: under the Dock
+        // a press would reach the Dock, and the card could never be grabbed
+        // again.
+        keep_card_on_screen(panel);
+    }
     if gesture.moved {
         // The user placed it: keep it there and free its slot.
         panel.dragged = true;
@@ -4723,6 +4734,49 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
     if live {
         refresh(state, &key);
     }
+}
+
+/// Move the panel so its front card lies inside the visible frame of the
+/// screen its window is on, by the least distance (`stack::keep_inside`).
+/// The window jumps; every item glides there on the restack spring from
+/// where it was drawn (at most `LAG_ROOM` away, the room the window has).
+unsafe fn keep_card_on_screen(panel: &mut Panel) {
+    let window = panel.window as *mut AnyObject;
+    let Some(visible) = visible_frame_of(window) else {
+        return;
+    };
+    let frame: NSRect = msg_send![window, frame];
+    let cards = back_cards(&panel.layout);
+    let front = to_window(settle_frame(panel, Slot::Front, cards));
+    let card = Area {
+        x: frame.origin.x + front.x,
+        y: frame.origin.y + front.y,
+        ..front
+    };
+    let (dx, dy) = stack::keep_inside(card, visible);
+    if dx == 0.0 && dy == 0.0 {
+        return;
+    }
+    let drawn = settle_frames(panel);
+    let origin = (frame.origin.x + dx, frame.origin.y + dy);
+    let _: () = msg_send![window, setFrameOrigin: NSPoint::new(origin.0, origin.1)];
+    let room = stack::LAG_ROOM;
+    let (sx, sy) = (dx.clamp(-room, room), dy.clamp(-room, room));
+    for (index, slot) in panel.layout.clone().into_iter().enumerate() {
+        let rest = resting(panel, slot, cards);
+        let from = drawn[index];
+        panel.motion[slot.view()].restack(
+            Area {
+                x: from.x - sx,
+                y: from.y - sy,
+                ..from
+            },
+            rest,
+        );
+    }
+    apply_card_frames(panel);
+    start_ticking();
+    tracing::info!(target: "pip", session = %panel.key, dx, dy, "PiP card kept on screen");
 }
 
 /// A press counts as released without its mouse-up once the button has

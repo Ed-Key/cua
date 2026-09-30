@@ -202,6 +202,38 @@ pub(super) fn agent_takes_front<K: PartialEq>(pick: Option<K>, acted: K) -> bool
     pick.is_none_or(|pick| pick == acted)
 }
 
+/// The panel's target after an agent frame that takes the front card
+/// (`tag` is that frame's resolved window, `frame` the target it named):
+/// the frame's target, but while a pick is set the concrete picked window,
+/// so a pid-only frame resolved to it cannot let a later resolution of the
+/// app's main window move the preview off the pick.
+pub(super) fn front_target<K: Copy>(pick: Option<K>, tag: Option<K>, frame: K) -> K {
+    match pick {
+        Some(_) => tag.unwrap_or(frame),
+        None => frame,
+    }
+}
+
+/// Whether resolving the panel's target to `tag` may bring that window's
+/// card to the front: always without a pick, else only the pick itself.
+pub(super) fn may_promote<K: PartialEq>(pick: Option<K>, tag: K) -> bool {
+    agent_takes_front(pick, tag)
+}
+
+/// What panel `id`'s pointer poll asks of the system cursor, `gesture` being
+/// the press in progress (its panel and resize edges) and `band` the resize
+/// edges under the pointer on this panel (0 when off its bands). `None`:
+/// leave the cursor alone, because another panel's press owns it (a resize
+/// dragged past its clamp can pass over this panel's band). Otherwise the
+/// edges to show: the own press's resize, else the band.
+pub(super) fn poll_edges(gesture: Option<(i64, u8)>, id: i64, band: u8) -> Option<u8> {
+    match gesture {
+        Some((owner, _)) if owner != id => None,
+        Some((_, edges)) if edges != 0 => Some(edges),
+        _ => Some(band),
+    }
+}
+
 /// Which panel last set the system cursor, and to which resize edges.
 pub(super) type CursorOwner = Option<(i64, u8)>;
 
@@ -407,6 +439,50 @@ mod tests {
         // It is already the front card, or the agent never acted.
         assert_eq!(click_target(Some(1), &[1, 3]), None);
         assert_eq!(click_target(None::<u32>, &[1, 3]), None);
+    }
+
+    /// Review finding: a pick holds against pid-only frames and window
+    /// resolution. The picked window B is (7, Some(2)).
+    #[test]
+    fn a_pick_keeps_its_concrete_window_as_the_target() {
+        type T = (Option<i32>, Option<u32>);
+        let b: T = (Some(7), Some(2));
+        let other: T = (Some(7), Some(3));
+        // A pid-only frame from the agent resolved to B: the target stays B.
+        assert_eq!(front_target(Some(b), Some(b), (Some(7), None)), b);
+        // No pick: the frame's own target, pid-only included.
+        assert_eq!(front_target(None, Some(b), (Some(7), None)), (Some(7), None));
+        // The app's main window changes to another window: not promoted
+        // over the pick; the pick itself, or anything without a pick, is.
+        assert!(!may_promote(Some(b), other));
+        assert!(may_promote(Some(b), b));
+        assert!(may_promote(None, other));
+    }
+
+    /// Review finding: while panel 1 is resizing, panel 2's poll must not
+    /// touch the cursor even with the pointer on panel 2's band.
+    #[test]
+    fn only_the_pressed_panel_touches_the_cursor_during_a_press() {
+        let resizing_1 = Some((1, 8));
+        assert_eq!(poll_edges(resizing_1, 2, 2), None, "panel 2 leaves it alone");
+        assert_eq!(poll_edges(resizing_1, 1, 0), Some(8), "panel 1 keeps its resize cursor off the band");
+        // A drag (no edges) of panel 1 also leaves panel 2 alone.
+        assert_eq!(poll_edges(Some((1, 0)), 2, 2), None);
+        assert_eq!(poll_edges(Some((1, 0)), 1, 4), Some(4));
+        // No press: the band under the pointer, or the arrow.
+        assert_eq!(poll_edges(None, 2, 2), Some(2));
+        assert_eq!(poll_edges(None, 2, 0), Some(0));
+        // Together with the owner rule: the cursor never alternates.
+        let mut owner = None;
+        for _ in 0..3 {
+            for id in [1, 2] {
+                let band = if id == 2 { 2 } else { 0 };
+                if let Some(edges) = poll_edges(resizing_1, id, band) {
+                    cursor_step(&mut owner, id, edges);
+                }
+            }
+            assert_eq!(owner, Some((1, 8)));
+        }
     }
 
     /// H11 with two panels: the pointer goes from panel 1's band straight
