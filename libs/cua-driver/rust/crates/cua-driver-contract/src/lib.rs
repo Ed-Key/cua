@@ -61,10 +61,10 @@ pub use outputs::{
     CursorMotionOutput, CursorPointOutput, CursorPositionOutput, CursorThemeOutput,
     CursorVisualOutput, DesktopStateOutput, EffectiveScope, EndSessionOutput,
     GetAgentCursorStateOutput, ListSessionsOutput, PageChangeOp, PageChangeOpKind, PageChanges,
-    PageChangesKind, PageDialog, ScreenSizeOutput, SessionClientKindOutput,
-    SessionLifecycleState, SessionOutput, SessionStateOutput, SessionTransportOutput,
-    SetAgentCursorEnabledOutput, SetAgentCursorMotionOutput, SetAgentCursorThemeOutput,
-    StartSessionOutput, ToolOutput, TOOL_INVOCATION_FAILED_CODE,
+    PageChangesKind, PageDialog, ScreenSizeOutput, SessionClientKindOutput, SessionLifecycleState,
+    SessionOutput, SessionStateOutput, SessionTransportOutput, SetAgentCursorEnabledOutput,
+    SetAgentCursorMotionOutput, SetAgentCursorThemeOutput, StartSessionOutput, ToolOutput,
+    TOOL_INVOCATION_FAILED_CODE,
 };
 pub use verification::{
     BoundsExpectation, ElementPredicate, ElementSelector, PredicateOutcome, StatePredicate,

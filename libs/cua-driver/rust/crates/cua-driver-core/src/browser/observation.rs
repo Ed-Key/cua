@@ -469,7 +469,11 @@ impl TabRefs {
 
     /// The space for `identity`: the current one when it is provably the same
     /// document on the same attachment, otherwise a new one.
-    fn enter(&mut self, identity: DocumentIdentity, mint: &mut dyn FnMut() -> u64) -> &mut RefSpace {
+    fn enter(
+        &mut self,
+        identity: DocumentIdentity,
+        mint: &mut dyn FnMut() -> u64,
+    ) -> &mut RefSpace {
         let kept = self
             .space
             .as_ref()
@@ -645,7 +649,12 @@ mod tests {
         }
 
         /// A default-view observation that shows the whole document.
-        fn observe(&mut self, identity: DocumentIdentity, document: &[RefEntry], since: Option<u64>) -> Recorded {
+        fn observe(
+            &mut self,
+            identity: DocumentIdentity,
+            document: &[RefEntry],
+            since: Option<u64>,
+        ) -> Recorded {
             let view: Vec<(&RefEntry, &str)> = document.iter().map(|entry| (entry, "")).collect();
             self.record(identity, document, &view, ViewKind::Default, since)
         }
@@ -716,7 +725,10 @@ mod tests {
         assert_eq!(second.space_id, first.space_id);
         assert_eq!(keys(&second)[..2], keys(&first)[..]);
         assert_eq!(keys(&second).len(), 3);
-        assert!(second.revision > first.revision, "the baseline is this view now");
+        assert!(
+            second.revision > first.revision,
+            "the baseline is this view now"
+        );
         // A plain read is always a full snapshot, never a diff.
         assert_eq!(second.told, Told::Snapshot { reason: None });
     }
@@ -736,7 +748,10 @@ mod tests {
             ViewKind::Default,
             first.revision,
         );
-        let Told::Diff { base_revision, ops, .. } = &after.told else {
+        let Told::Diff {
+            base_revision, ops, ..
+        } = &after.told
+        else {
             panic!("an action's observation is a diff: {:?}", after.told)
         };
         assert_eq!(Some(*base_revision), first.revision);
@@ -770,7 +785,10 @@ mod tests {
 
         // The page reuses the node for Bob. Nothing here hears about it.
         assert!(session.resolves(&held));
-        assert_eq!(session.refs.space().unwrap().baseline_revision(), first.revision);
+        assert_eq!(
+            session.refs.space().unwrap().baseline_revision(),
+            first.revision
+        );
 
         // At use the live fingerprint is compared with the issued one.
         let (space, index) = crate::browser::store::parse_ref(&held).unwrap();
@@ -797,7 +815,13 @@ mod tests {
         let Told::Diff { ops, .. } = &second.told else {
             panic!("{:?}", second.told)
         };
-        assert_eq!(ops[0], DiffOp::Leave { key: held, gone: true });
+        assert_eq!(
+            ops[0],
+            DiffOp::Leave {
+                key: held,
+                gone: true
+            }
+        );
     }
 
     #[test]
@@ -857,7 +881,11 @@ mod tests {
             "textbox",
             "Card",
         );
-        let second = session.observe(identity("L1", 1), &[main.clone(), navigated.clone()], first.revision);
+        let second = session.observe(
+            identity("L1", 1),
+            &[main.clone(), navigated.clone()],
+            first.revision,
+        );
         assert_eq!(second.space_id, first.space_id);
         assert_eq!(keys(&second)[0], main_ref);
         assert_ne!(keys(&second)[1], card_ref);
@@ -865,7 +893,13 @@ mod tests {
         let Told::Diff { ops, .. } = &second.told else {
             panic!("{:?}", second.told)
         };
-        assert_eq!(ops[0], DiffOp::Leave { key: card_ref, gone: true });
+        assert_eq!(
+            ops[0],
+            DiffOp::Leave {
+                key: card_ref,
+                gone: true
+            }
+        );
 
         // The frame moved to its own process: another node key again.
         let swapped = node_in(
@@ -899,7 +933,13 @@ mod tests {
         );
         assert_eq!(keys(&second), keys(&first));
         assert!(
-            matches!(second.told, Told::Diff { page_changed: false, .. }),
+            matches!(
+                second.told,
+                Told::Diff {
+                    page_changed: false,
+                    ..
+                }
+            ),
             "{:?}",
             second.told
         );
@@ -926,7 +966,10 @@ mod tests {
         let first = ours.observe(identity("L1", 1), &[count.clone()], None);
         let other = theirs.observe(identity("L1", 2), &[count.clone()], None);
         assert_ne!(keys(&first), keys(&other));
-        assert!(!ours.resolves(&keys(&other)[0]), "a ref is its session's alone");
+        assert!(
+            !ours.resolves(&keys(&other)[0]),
+            "a ref is its session's alone"
+        );
 
         // Their action changed the page; our baseline did not move.
         theirs.record(
@@ -936,7 +979,10 @@ mod tests {
             ViewKind::Default,
             other.revision,
         );
-        assert_eq!(ours.refs.space().unwrap().baseline_revision(), first.revision);
+        assert_eq!(
+            ours.refs.space().unwrap().baseline_revision(),
+            first.revision
+        );
         // Our next diff reports their effect as an observed change.
         let ours_next = ours.record(
             identity("L1", 1),
@@ -960,7 +1006,11 @@ mod tests {
         let first = old_target.observe(identity("L1", 1), &[node(10, "button", "Send")], None);
         let mut rebound = Session::new(100);
         assert!(!rebound.resolves(&keys(&first)[0]));
-        let again = rebound.observe(identity("L1", 1), &[node(10, "button", "Send")], first.revision);
+        let again = rebound.observe(
+            identity("L1", 1),
+            &[node(10, "button", "Send")],
+            first.revision,
+        );
         assert_eq!(
             again.told,
             Told::Snapshot {
@@ -1034,7 +1084,11 @@ mod tests {
         // Session end removes the namespace; the revived one is new.
         let mut revived = Session::new(session.next);
         assert!(!revived.resolves(&keys(&first)[0]));
-        let again = revived.observe(identity("L1", 1), &[node(10, "button", "Send")], first.revision);
+        let again = revived.observe(
+            identity("L1", 1),
+            &[node(10, "button", "Send")],
+            first.revision,
+        );
         assert_eq!(
             again.told,
             Told::Snapshot {
@@ -1051,7 +1105,10 @@ mod tests {
         // The click opened confirm(): the page cannot be observed, so nothing
         // is recorded and the result says `unavailable`.
         assert!(session.resolves(&keys(&first)[0]));
-        assert_eq!(session.refs.space().unwrap().baseline_revision(), first.revision);
+        assert_eq!(
+            session.refs.space().unwrap().baseline_revision(),
+            first.revision
+        );
         // After the dialog is resolved the same baseline still diffs.
         let after = session.observe(identity("L1", 1), &[delete], first.revision);
         assert_eq!(
@@ -1174,7 +1231,10 @@ mod tests {
             }])
             .unwrap();
         assert!(session.resolves(&extended[0].key));
-        assert_eq!(session.refs.space().unwrap().baseline_revision(), first.revision);
+        assert_eq!(
+            session.refs.space().unwrap().baseline_revision(),
+            first.revision
+        );
 
         // The next action still diffs from the default view it replaced.
         let after = session.observe(identity("L1", 1), &document, first.revision);
@@ -1235,16 +1295,31 @@ mod tests {
                 gone: false
             }]
         );
-        assert!(session.resolves(&far_ref), "out of view, still a capability");
+        assert!(
+            session.resolves(&far_ref),
+            "out of view, still a capability"
+        );
 
         // Gone from the document: retired, and said so.
-        let removed = session.observe(identity("L1", 1), &[top.clone(), far.clone()], scrolled.revision);
-        assert!(matches!(&removed.told, Told::Diff { ops, .. } if matches!(ops[..], [DiffOp::Add { .. }])));
+        let removed = session.observe(
+            identity("L1", 1),
+            &[top.clone(), far.clone()],
+            scrolled.revision,
+        );
+        assert!(
+            matches!(&removed.told, Told::Diff { ops, .. } if matches!(ops[..], [DiffOp::Add { .. }]))
+        );
         let gone = session.observe(identity("L1", 1), &[top], removed.revision);
         let Told::Diff { ops, .. } = &gone.told else {
             panic!("{:?}", gone.told)
         };
-        assert_eq!(ops, &vec![DiffOp::Leave { key: far_ref.clone(), gone: true }]);
+        assert_eq!(
+            ops,
+            &vec![DiffOp::Leave {
+                key: far_ref.clone(),
+                gone: true
+            }]
+        );
         assert!(!session.resolves(&far_ref));
     }
 
@@ -1333,7 +1408,10 @@ mod tests {
         let mut session = Session::new(0);
         let first = session.observe(identity("L1", 41), &[node(10, "button", "Send")], None);
         let (space, index) = crate::browser::store::parse_ref(&keys(&first)[0]).unwrap();
-        assert_eq!(session.refs.resolve(space, index).unwrap().attachment, Some(41));
+        assert_eq!(
+            session.refs.resolve(space, index).unwrap().attachment,
+            Some(41)
+        );
     }
 
     // ── Diff properties ─────────────────────────────────────────────────
@@ -1369,10 +1447,19 @@ mod tests {
 
     #[test]
     fn duplicate_lines_stay_apart_because_ops_are_keyed() {
-        let old = vec![line("a", "- text \"Remove\""), line("b", "- text \"Remove\"")];
+        let old = vec![
+            line("a", "- text \"Remove\""),
+            line("b", "- text \"Remove\""),
+        ];
         let new = vec![line("b", "- text \"Remove\"")];
         let ops = diff(&old, &new, &HashSet::from(["a".to_owned()]));
-        assert_eq!(ops, vec![DiffOp::Leave { key: "a".into(), gone: true }]);
+        assert_eq!(
+            ops,
+            vec![DiffOp::Leave {
+                key: "a".into(),
+                gone: true
+            }]
+        );
         assert_eq!(apply(&old, &ops), new);
     }
 
@@ -1400,7 +1487,11 @@ mod tests {
             let old = view(&mut next);
             let new = view(&mut next);
             let ops = diff(&old, &new, &HashSet::new());
-            assert_eq!(apply(&old, &ops), new, "case {case}: {old:?} -> {new:?} via {ops:?}");
+            assert_eq!(
+                apply(&old, &ops),
+                new,
+                "case {case}: {old:?} -> {new:?} via {ops:?}"
+            );
             if old == new {
                 assert!(ops.is_empty(), "case {case}");
             }

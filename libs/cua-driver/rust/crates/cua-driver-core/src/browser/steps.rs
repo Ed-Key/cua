@@ -179,8 +179,8 @@ pub(crate) fn judge(action: BrowserStepAction, result: &ToolResult) -> Judged {
             .map(|detail| detail.chars().take(MAX_DETAIL_CHARS).collect())
             .or_else(|| first_text(result));
         // The registry's own refusals are decided before the tool runs.
-        let nothing_sent = (error && field("/refusal/code").is_some())
-            || NOTHING_SENT.contains(&code.as_str());
+        let nothing_sent =
+            (error && field("/refusal/code").is_some()) || NOTHING_SENT.contains(&code.as_str());
         outcome.retryable = (!nothing_sent).then_some(false);
         outcome.delivered_count = delivered_count.filter(|_| !nothing_sent);
         outcome.code = Some(code);
@@ -273,13 +273,20 @@ struct Read {
 impl BrowserStepsTool {
     /// Read the page, filtered to `query`, through the registry. A read is a
     /// side read: it shares the session's refs and leaves its baseline alone.
-    async fn read(registry: &ToolRegistry, base: &Value, query: &str) -> Result<Read, BrowserStepOutcome> {
+    async fn read(
+        registry: &ToolRegistry,
+        base: &Value,
+        query: &str,
+    ) -> Result<Read, BrowserStepOutcome> {
         let mut call = base.clone();
         call["query"] = json!(query);
         call["max_chars"] = json!(RESOLVE_CHARS);
         let result = registry.invoke("get_browser_state", call).await;
         let structured = result.structured_content.as_ref();
-        match structured.and_then(|structured| structured.get("outline")).and_then(Value::as_str) {
+        match structured
+            .and_then(|structured| structured.get("outline"))
+            .and_then(Value::as_str)
+        {
             Some(outline) if result.is_error != Some(true) => Ok(Read {
                 outline: outline.to_owned(),
                 complete: structured
@@ -306,7 +313,11 @@ impl BrowserStepsTool {
         }
     }
 
-    async fn expect(registry: &ToolRegistry, base: &Value, expect: &BrowserStepExpect) -> Result<(), BrowserStepOutcome> {
+    async fn expect(
+        registry: &ToolRegistry,
+        base: &Value,
+        expect: &BrowserStepExpect,
+    ) -> Result<(), BrowserStepOutcome> {
         let query = expect
             .text
             .as_deref()
@@ -335,7 +346,12 @@ impl BrowserStepsTool {
         }
     }
 
-    async fn run(&self, registry: &ToolRegistry, input: &BrowserStepsInput, held: HeldView) -> BrowserStepsOutput {
+    async fn run(
+        &self,
+        registry: &ToolRegistry,
+        input: &BrowserStepsInput,
+        held: HeldView,
+    ) -> BrowserStepsOutput {
         let mut base = json!({ "target_id": input.target_id, "tab_id": input.tab_id });
         if let Some(session) = &input.session {
             base["session"] = json!(session);
@@ -374,7 +390,9 @@ impl BrowserStepsTool {
                 _ => unreachable!("validated: a ref, or a role and a name"),
             };
 
-            let result = registry.invoke(step.action.tool(), step_call(&base, step, &reference)).await;
+            let result = registry
+                .invoke(step.action.tool(), step_call(&base, step, &reference))
+                .await;
             let Judged {
                 mut outcome,
                 mut stop,
@@ -384,7 +402,9 @@ impl BrowserStepsTool {
 
             // What the step reported about the page decides whether anything
             // after it can run.
-            let dialog = step_reported.as_ref().is_some_and(|changes| changes.dialog.is_some());
+            let dialog = step_reported
+                .as_ref()
+                .is_some_and(|changes| changes.dialog.is_some());
             let new_document = step_reported
                 .as_ref()
                 .is_some_and(|changes| changes.reason.as_deref() == Some("document_changed"));
@@ -418,8 +438,11 @@ impl BrowserStepsTool {
 
         // One read for the whole batch, against what the session held before
         // it. A dialog that is still up has already said the page is closed.
+        // A session working from a dom_refs_v1 snapshot keeps it: a semantic
+        // read would end its refs.
         let changes = match reported {
             Some(dialog) => Some(dialog),
+            None if held == HeldView::DomRefs => None,
             None => final_changes(registry, &base, held).await,
         };
         BrowserStepsOutput {
@@ -460,7 +483,11 @@ fn step_call(base: &Value, step: &BrowserStep, reference: &str) -> Value {
 }
 
 /// The batch's one read: what changed since the session's baseline.
-async fn final_changes(registry: &ToolRegistry, base: &Value, held: HeldView) -> Option<PageChanges> {
+async fn final_changes(
+    registry: &ToolRegistry,
+    base: &Value,
+    held: HeldView,
+) -> Option<PageChanges> {
     let mut read = base.clone();
     read["since_revision"] = json!(match held {
         HeldView::Semantic(revision) => revision,
@@ -505,14 +532,19 @@ impl Tool for BrowserStepsTool {
         static DEF: OnceLock<ToolDef> = OnceLock::new();
         DEF.get_or_init(|| {
             ToolDef::from_contract(
-                &cua_driver_contract::tool_contract("browser_steps").expect("browser_steps contract"),
+                &cua_driver_contract::tool_contract("browser_steps")
+                    .expect("browser_steps contract"),
             )
         })
     }
 
     // The batch as a whole is tab input on this exact tab; each step is
     // admitted again as its own tool.
-    async fn protected_resource_ownership(&self, adapter_id: &str, args: &Value) -> ProtectedResourceOwnership {
+    async fn protected_resource_ownership(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> ProtectedResourceOwnership {
         if adapter_id == "browser_bound_input" {
             browser_resource_ownership(&self.engine, args)
         } else {
@@ -520,7 +552,11 @@ impl Tool for BrowserStepsTool {
         }
     }
 
-    async fn protected_resource_scope(&self, adapter_id: &str, args: &Value) -> Result<Option<Value>, String> {
+    async fn protected_resource_scope(
+        &self,
+        adapter_id: &str,
+        args: &Value,
+    ) -> Result<Option<Value>, String> {
         if adapter_id == "browser_bound_input" {
             browser_protected_resource_scope(&self.engine, args, "browser_steps").await
         } else {
@@ -594,33 +630,110 @@ mod tests {
         };
         // (what ran, its result, status, code, retryable, delivered, stop)
         let table = [
-            ("a click reports no proof and goes on", Click,
-             result(json!({"effect": "unverifiable", "route": "trusted_input"})),
-             Fine, None, None, None, None),
-            ("typing read back", Type,
-             result(json!({"effect": "confirmed", "evidence": [{"kind": "value_readback", "detail": "the field holds \"ada\""}]})),
-             Fine, None, None, None, None),
-            ("typing not read back stops the batch", Type,
-             result(json!({"effect": "unverifiable", "delivery": {"mode": "background", "delivered_count": 3}})),
-             Unconfirmed, None, Some(false), Some(3), Some("typing_unconfirmed")),
-            ("a field that rejected the text", Type,
-             error(json!({"code": "browser_type_mismatch", "effect": "mismatch", "delivered_chars": 6, "value": "1234"})),
-             Failed, Some("browser_type_mismatch"), Some(false), Some(6), Some("step_failed")),
-            ("typing that stopped part way", Type,
-             result(json!({"effect": "partial", "delivery": {"mode": "background", "delivered_count": 2}})),
-             Failed, Some("browser_input_incomplete"), Some(false), Some(2), Some("step_failed")),
-            ("a stale ref sent nothing", Click,
-             result(json!({"effect": "refused", "error": {"code": "browser_ref_stale", "hint": "snapshot again"}})),
-             Failed, Some("browser_ref_stale"), None, None, Some("step_failed")),
-            ("a refusal after delivery is not retryable", Click,
-             result(json!({"effect": "refused", "error": {"code": "browser_input_trust_unavailable", "hint": "delivery is unknown"}})),
-             Failed, Some("browser_input_trust_unavailable"), Some(false), None, Some("step_failed")),
-            ("the registry refused the step's tool", Type,
-             error(json!({"status": "refused", "refusal": {"code": "permission_denied", "message": "browser_type is not allowed"}})),
-             Failed, Some("permission_denied"), None, None, Some("step_failed")),
-            ("a tool error with no structure", Click,
-             ToolResult::error("DOM click failed: socket closed"),
-             Failed, Some("tool_error"), Some(false), None, Some("step_failed")),
+            (
+                "a click reports no proof and goes on",
+                Click,
+                result(json!({"effect": "unverifiable", "route": "trusted_input"})),
+                Fine,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typing read back",
+                Type,
+                result(
+                    json!({"effect": "confirmed", "evidence": [{"kind": "value_readback", "detail": "the field holds \"ada\""}]}),
+                ),
+                Fine,
+                None,
+                None,
+                None,
+                None,
+            ),
+            (
+                "typing not read back stops the batch",
+                Type,
+                result(
+                    json!({"effect": "unverifiable", "delivery": {"mode": "background", "delivered_count": 3}}),
+                ),
+                Unconfirmed,
+                None,
+                Some(false),
+                Some(3),
+                Some("typing_unconfirmed"),
+            ),
+            (
+                "a field that rejected the text",
+                Type,
+                error(
+                    json!({"code": "browser_type_mismatch", "effect": "mismatch", "delivered_chars": 6, "value": "1234"}),
+                ),
+                Failed,
+                Some("browser_type_mismatch"),
+                Some(false),
+                Some(6),
+                Some("step_failed"),
+            ),
+            (
+                "typing that stopped part way",
+                Type,
+                result(
+                    json!({"effect": "partial", "delivery": {"mode": "background", "delivered_count": 2}}),
+                ),
+                Failed,
+                Some("browser_input_incomplete"),
+                Some(false),
+                Some(2),
+                Some("step_failed"),
+            ),
+            (
+                "a stale ref sent nothing",
+                Click,
+                result(
+                    json!({"effect": "refused", "error": {"code": "browser_ref_stale", "hint": "snapshot again"}}),
+                ),
+                Failed,
+                Some("browser_ref_stale"),
+                None,
+                None,
+                Some("step_failed"),
+            ),
+            (
+                "a refusal after delivery is not retryable",
+                Click,
+                result(
+                    json!({"effect": "refused", "error": {"code": "browser_input_trust_unavailable", "hint": "delivery is unknown"}}),
+                ),
+                Failed,
+                Some("browser_input_trust_unavailable"),
+                Some(false),
+                None,
+                Some("step_failed"),
+            ),
+            (
+                "the registry refused the step's tool",
+                Type,
+                error(
+                    json!({"status": "refused", "refusal": {"code": "permission_denied", "message": "browser_type is not allowed"}}),
+                ),
+                Failed,
+                Some("permission_denied"),
+                None,
+                None,
+                Some("step_failed"),
+            ),
+            (
+                "a tool error with no structure",
+                Click,
+                ToolResult::error("DOM click failed: socket closed"),
+                Failed,
+                Some("tool_error"),
+                Some(false),
+                None,
+                Some("step_failed"),
+            ),
         ];
         for (case, action, result, status, code, retryable, delivered, stop) in table {
             let judged = judge(action, &result);
@@ -630,23 +743,38 @@ mod tests {
             assert_eq!(judged.outcome.delivered_count, delivered, "{case}");
             assert_eq!(judged.stop, stop, "{case}");
         }
-        let refused = judge(Click, &result(json!({"effect": "refused",
-            "error": {"code": "browser_ref_stale", "hint": "snapshot again"}})));
+        let refused = judge(
+            Click,
+            &result(json!({"effect": "refused",
+            "error": {"code": "browser_ref_stale", "hint": "snapshot again"}})),
+        );
         assert_eq!(refused.outcome.detail.as_deref(), Some("snapshot again"));
-        let confirmed = judge(Type, &result(json!({"effect": "confirmed",
-            "evidence": [{"kind": "value_readback", "detail": "the field holds \"ada\""}]})));
-        assert_eq!(confirmed.outcome.detail.as_deref(), Some("the field holds \"ada\""));
+        let confirmed = judge(
+            Type,
+            &result(json!({"effect": "confirmed",
+            "evidence": [{"kind": "value_readback", "detail": "the field holds \"ada\""}]})),
+        );
+        assert_eq!(
+            confirmed.outcome.detail.as_deref(),
+            Some("the field holds \"ada\"")
+        );
     }
 
     #[test]
     fn a_step_passes_on_the_dialog_or_the_new_document_it_reported() {
         let dialog = judge(
             BrowserStepAction::Click,
-            &result(json!({"effect": "unverifiable", "changes": {"kind": "unavailable",
+            &result(
+                json!({"effect": "unverifiable", "changes": {"kind": "unavailable",
                 "reason": "javascript_dialog_open",
-                "dialog": {"dialog_id": "dialog-4", "kind": "confirm"}}})),
+                "dialog": {"dialog_id": "dialog-4", "kind": "confirm"}}}),
+            ),
         );
-        assert_eq!(dialog.outcome.status, BrowserStepStatus::Ok, "the click itself landed");
+        assert_eq!(
+            dialog.outcome.status,
+            BrowserStepStatus::Ok,
+            "the click itself landed"
+        );
         assert_eq!(
             dialog.reported.unwrap().dialog.unwrap().dialog_id,
             "dialog-4"
@@ -656,7 +784,10 @@ mod tests {
             &result(json!({"effect": "unverifiable",
                 "changes": {"kind": "unavailable", "reason": "document_changed"}})),
         );
-        assert_eq!(navigated.reported.unwrap().reason.as_deref(), Some("document_changed"));
+        assert_eq!(
+            navigated.reported.unwrap().reason.as_deref(),
+            Some("document_changed")
+        );
     }
 
     const PAGE: &str = "- textbox \"Email\" [p3:1 type]\n\
@@ -672,9 +803,15 @@ mod tests {
 
     #[test]
     fn a_named_target_is_exactly_one_element_with_that_role_and_name() {
-        assert_eq!(resolve_named(PAGE, true, "option", "Editor"), Named::One("p3:8".into()));
+        assert_eq!(
+            resolve_named(PAGE, true, "option", "Editor"),
+            Named::One("p3:8".into())
+        );
         // The role is part of the match: the link named Remove is not a button.
-        assert_eq!(resolve_named(PAGE, true, "link", "Remove"), Named::One("p3:12".into()));
+        assert_eq!(
+            resolve_named(PAGE, true, "link", "Remove"),
+            Named::One("p3:12".into())
+        );
         // Exact, not a prefix, not another case.
         for (role, name) in [("option", "Edit"), ("option", "editor"), ("tab", "Editor")] {
             let Named::Not(code, candidates) = resolve_named(PAGE, true, role, name) else {
@@ -707,7 +844,10 @@ mod tests {
             panic!("uniqueness needs the whole page")
         };
         assert_eq!(code, "coverage_incomplete");
-        assert_eq!(candidates, vec!["- option \"Editor\" [p3:8 click]".to_owned()]);
+        assert_eq!(
+            candidates,
+            vec!["- option \"Editor\" [p3:8 click]".to_owned()]
+        );
     }
 
     #[test]
@@ -721,15 +861,60 @@ mod tests {
             }
         };
         for (case, predicate, complete, holds) in [
-            ("text in a name", expect(None, None, Some("(Editor)"), true), true, true),
-            ("text in a value", expect(Some("combobox"), None, Some("Europe"), true), true, true),
-            ("exact name", expect(Some("option"), Some("Editor"), None, true), true, true),
-            ("name is exact, not contained", expect(None, Some("Edit"), None, true), true, false),
-            ("role must agree", expect(Some("button"), Some("Editor"), None, true), true, false),
-            ("absent", expect(None, None, Some("ada@y.com"), false), true, true),
-            ("still there", expect(None, None, Some("ada@x.com"), false), true, false),
-            ("absence needs the whole page", expect(None, None, Some("ada@y.com"), false), false, false),
-            ("presence does not", expect(None, None, Some("ada@x.com"), true), false, true),
+            (
+                "text in a name",
+                expect(None, None, Some("(Editor)"), true),
+                true,
+                true,
+            ),
+            (
+                "text in a value",
+                expect(Some("combobox"), None, Some("Europe"), true),
+                true,
+                true,
+            ),
+            (
+                "exact name",
+                expect(Some("option"), Some("Editor"), None, true),
+                true,
+                true,
+            ),
+            (
+                "name is exact, not contained",
+                expect(None, Some("Edit"), None, true),
+                true,
+                false,
+            ),
+            (
+                "role must agree",
+                expect(Some("button"), Some("Editor"), None, true),
+                true,
+                false,
+            ),
+            (
+                "absent",
+                expect(None, None, Some("ada@y.com"), false),
+                true,
+                true,
+            ),
+            (
+                "still there",
+                expect(None, None, Some("ada@x.com"), false),
+                true,
+                false,
+            ),
+            (
+                "absence needs the whole page",
+                expect(None, None, Some("ada@y.com"), false),
+                false,
+                false,
+            ),
+            (
+                "presence does not",
+                expect(None, None, Some("ada@x.com"), true),
+                false,
+                true,
+            ),
         ] {
             assert_eq!(expect_holds(PAGE, complete, &predicate), holds, "{case}");
         }

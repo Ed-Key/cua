@@ -3553,6 +3553,11 @@ const SETTLE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_milli
 const NAVIGATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 /// A mutation counter for the main document: `n` counts records the
 /// observer's callback has seen, `o` is the observer.
+// ponytail: the main document only (open shadow roots and frames are not
+// observed), and the counter's handle is not released: Runtime.releaseObject
+// is outside the existing-profile allowlist, and the handle is a few bytes
+// that die with the document. Observe frames, and release the handle, if a
+// long-lived single-page app ever shows either as a problem.
 const SETTLE_COUNTER: &str = "(() => { const s = { n: 0 }; \
     s.o = new MutationObserver((records) => { s.n += records.length; }); \
     s.o.observe(document, { subtree: true, childList: true, attributes: true, characterData: true }); \

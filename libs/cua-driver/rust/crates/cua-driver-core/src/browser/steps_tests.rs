@@ -70,8 +70,11 @@ impl Tool for PageDouble {
         script.log.push((self.def.name.clone(), args.clone()));
         if self.def.name == "get_browser_state" {
             let Some(outline) = script.outline.clone() else {
-                return BrowserRefusal::new(BrowserRefusalCode::BrowserOriginOutsideScope, "outside scope")
-                    .to_tool_result();
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserOriginOutsideScope,
+                    "outside scope",
+                )
+                .to_tool_result();
             };
             return match args.get("since_revision") {
                 Some(since) => ToolResult::text("changes").with_structured(json!({
@@ -182,7 +185,10 @@ fn calls(script: &Shared) -> Vec<String> {
                 .or_else(|| args.get("query"))
                 .and_then(Value::as_str)
                 .map(str::to_owned)
-                .or_else(|| args.get("since_revision").map(|since| format!("since {since}")))
+                .or_else(|| {
+                    args.get("since_revision")
+                        .map(|since| format!("since {since}"))
+                })
                 .unwrap_or_default();
             format!("{tool} {what}")
         })
@@ -221,12 +227,18 @@ async fn every_step_is_its_own_tool_call_in_order_and_the_page_is_read_once_at_t
     assert!(output.get("stopped_at").is_none() && output.get("stop_reason").is_none());
     let outcomes = output["steps"].as_array().unwrap();
     assert_eq!(outcomes.len(), 4);
-    assert!(outcomes.iter().all(|outcome| outcome["status"] == "ok"), "{output}");
+    assert!(
+        outcomes.iter().all(|outcome| outcome["status"] == "ok"),
+        "{output}"
+    );
     assert_eq!(outcomes[0]["effect"], "confirmed");
     assert_eq!(outcomes[0]["detail"], "the field holds \"ada@x.com\"");
     // A named target reports the ref it resolved to.
     assert_eq!(outcomes[2]["ref"], "p3:8");
-    assert_eq!(output["changes"]["kind"], "diff", "one diff for the whole batch");
+    assert_eq!(
+        output["changes"]["kind"], "diff",
+        "one diff for the whole batch"
+    );
 
     // Each child call is the caller's own: its session label (mapped into the
     // runtime's namespace by the registry), its tab, and only its step's
@@ -234,7 +246,10 @@ async fn every_step_is_its_own_tool_call_in_order_and_the_page_is_read_once_at_t
     let script = script.lock().unwrap();
     for (tool, args) in &script.log {
         assert_eq!(args["_public_session_label"], "steps-order", "{tool}");
-        assert_eq!((&args["target_id"], &args["tab_id"]), (&json!("bt-1"), &json!("tab-1")));
+        assert_eq!(
+            (&args["target_id"], &args["tab_id"]),
+            (&json!("bt-1"), &json!("tab-1"))
+        );
     }
     assert_eq!(script.log[0].1["text"], "ada@x.com");
     assert_eq!(script.log[0].1["replace"], true);
@@ -247,11 +262,10 @@ async fn every_step_is_its_own_tool_call_in_order_and_the_page_is_read_once_at_t
 #[tokio::test]
 async fn a_batch_stops_at_the_first_failure_and_still_reads_the_page() {
     let (registry, script) = page_registry();
-    script
-        .lock()
-        .unwrap()
-        .acts
-        .insert("p3:2".into(), Acts::Refuses(BrowserRefusalCode::BrowserRefStale));
+    script.lock().unwrap().acts.insert(
+        "p3:2".into(),
+        Acts::Refuses(BrowserRefusalCode::BrowserRefStale),
+    );
     let output = steps(
         &registry,
         "steps-failure",
@@ -264,24 +278,41 @@ async fn a_batch_stops_at_the_first_failure_and_still_reads_the_page() {
     .await;
     assert_eq!(
         calls(&script),
-        ["browser_type p3:1", "browser_click p3:2", "get_browser_state since 0"],
+        [
+            "browser_type p3:1",
+            "browser_click p3:2",
+            "get_browser_state since 0"
+        ],
         "the third step was never sent, and nothing was retried"
     );
     assert_eq!(output["status"], "stopped");
-    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(2), &json!("step_failed")));
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(2), &json!("step_failed"))
+    );
     let outcomes = output["steps"].as_array().unwrap();
     assert_eq!(outcomes.len(), 2, "only the steps that ran");
     assert_eq!(outcomes[1]["status"], "failed");
     assert_eq!(outcomes[1]["code"], "browser_ref_stale");
     assert_eq!(outcomes[1]["effect"], "refused");
-    assert!(outcomes[1].get("retryable").is_none(), "a stale ref sent nothing");
-    assert_eq!(output["changes"]["kind"], "diff", "what the first step changed is still told");
+    assert!(
+        outcomes[1].get("retryable").is_none(),
+        "a stale ref sent nothing"
+    );
+    assert_eq!(
+        output["changes"]["kind"], "diff",
+        "what the first step changed is still told"
+    );
 }
 
 #[tokio::test]
 async fn typing_that_was_not_confirmed_stops_the_batch_before_the_next_step() {
     let (registry, script) = page_registry();
-    script.lock().unwrap().acts.insert("p3:1".into(), Acts::Unverifiable);
+    script
+        .lock()
+        .unwrap()
+        .acts
+        .insert("p3:1".into(), Acts::Unverifiable);
     let output = steps(
         &registry,
         "steps-unconfirmed",
@@ -296,7 +327,10 @@ async fn typing_that_was_not_confirmed_stops_the_batch_before_the_next_step() {
         ["browser_type p3:1", "get_browser_state since 0"],
         "Send was neither aimed nor pressed on text nobody confirmed"
     );
-    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(1), &json!("typing_unconfirmed")));
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(1), &json!("typing_unconfirmed"))
+    );
     let typed = &output["steps"][0];
     assert_eq!(typed["status"], "unconfirmed");
     assert_eq!(typed["effect"], "unverifiable");
@@ -315,14 +349,26 @@ async fn a_target_that_is_not_exactly_one_element_fails_with_candidates_and_send
         ]),
     )
     .await;
-    assert_eq!(calls(&script), ["get_browser_state Remove", "get_browser_state since 0"]);
-    assert_eq!((&ambiguous["stopped_at"], &ambiguous["stop_reason"]), (&json!(1), &json!("step_failed")));
+    assert_eq!(
+        calls(&script),
+        ["get_browser_state Remove", "get_browser_state since 0"]
+    );
+    assert_eq!(
+        (&ambiguous["stopped_at"], &ambiguous["stop_reason"]),
+        (&json!(1), &json!("step_failed"))
+    );
     assert_eq!(ambiguous["steps"][0]["code"], "target_ambiguous");
     assert_eq!(
         ambiguous["steps"][0]["candidates"],
-        json!(["- button \"Remove\" [p3:10 click]", "- button \"Remove\" [p3:11 click]"])
+        json!([
+            "- button \"Remove\" [p3:10 click]",
+            "- button \"Remove\" [p3:11 click]"
+        ])
     );
-    assert!(ambiguous["steps"][0].get("ref").is_none(), "nothing was chosen");
+    assert!(
+        ambiguous["steps"][0].get("ref").is_none(),
+        "nothing was chosen"
+    );
 
     let (registry, script) = page_registry();
     let missing = steps(
@@ -331,7 +377,10 @@ async fn a_target_that_is_not_exactly_one_element_fails_with_candidates_and_send
         json!([{"action": "click", "role": "button", "name": "Delete"}]),
     )
     .await;
-    assert_eq!(calls(&script), ["get_browser_state Delete", "get_browser_state since 0"]);
+    assert_eq!(
+        calls(&script),
+        ["get_browser_state Delete", "get_browser_state since 0"]
+    );
     assert_eq!(missing["steps"][0]["code"], "target_not_found");
 
     // One match on a page that was not read completely is not proven unique.
@@ -344,13 +393,19 @@ async fn a_target_that_is_not_exactly_one_element_fails_with_candidates_and_send
     )
     .await;
     assert_eq!(partial["steps"][0]["code"], "coverage_incomplete");
-    assert!(calls(&script).iter().all(|call| !call.starts_with("browser_click")));
+    assert!(calls(&script)
+        .iter()
+        .all(|call| !call.starts_with("browser_click")));
 }
 
 #[tokio::test]
 async fn a_dialog_a_step_opened_stops_the_batch_and_is_passed_on_with_its_capability() {
     let (registry, script) = page_registry();
-    script.lock().unwrap().acts.insert("p3:10".into(), Acts::OpensDialog);
+    script
+        .lock()
+        .unwrap()
+        .acts
+        .insert("p3:10".into(), Acts::OpensDialog);
     let output = steps(
         &registry,
         "steps-dialog",
@@ -365,16 +420,29 @@ async fn a_dialog_a_step_opened_stops_the_batch_and_is_passed_on_with_its_capabi
         ["browser_click p3:10"],
         "no later step, and no read of a page that cannot answer"
     );
-    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(1), &json!("javascript_dialog_open")));
-    assert_eq!(output["steps"][0]["status"], "ok", "the click itself landed");
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(1), &json!("javascript_dialog_open"))
+    );
+    assert_eq!(
+        output["steps"][0]["status"], "ok",
+        "the click itself landed"
+    );
     assert_eq!(output["changes"]["kind"], "unavailable");
-    assert_eq!(output["changes"]["dialog"], json!({"dialog_id": "dialog-5", "kind": "confirm"}));
+    assert_eq!(
+        output["changes"]["dialog"],
+        json!({"dialog_id": "dialog-5", "kind": "confirm"})
+    );
 }
 
 #[tokio::test]
 async fn a_new_document_stops_the_steps_planned_against_the_old_one() {
     let (registry, script) = page_registry();
-    script.lock().unwrap().acts.insert("p3:2".into(), Acts::Navigates);
+    script
+        .lock()
+        .unwrap()
+        .acts
+        .insert("p3:2".into(), Acts::Navigates);
     let output = steps(
         &registry,
         "steps-navigation",
@@ -390,13 +458,25 @@ async fn a_new_document_stops_the_steps_planned_against_the_old_one() {
         "the second step was not even aimed at the new page"
     );
     assert_eq!(output["status"], "stopped");
-    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(2), &json!("document_changed")));
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(2), &json!("document_changed"))
+    );
     assert_eq!(output["steps"].as_array().unwrap().len(), 1);
 
     // As the last step, a navigation is simply how the batch ended.
     let (registry, script) = page_registry();
-    script.lock().unwrap().acts.insert("p3:2".into(), Acts::Navigates);
-    let output = steps(&registry, "steps-navigation-last", json!([{"action": "click", "ref": "p3:2"}])).await;
+    script
+        .lock()
+        .unwrap()
+        .acts
+        .insert("p3:2".into(), Acts::Navigates);
+    let output = steps(
+        &registry,
+        "steps-navigation-last",
+        json!([{"action": "click", "ref": "p3:2"}]),
+    )
+    .await;
     assert_eq!(output["status"], "completed", "{output}");
 }
 
@@ -412,14 +492,24 @@ async fn an_expectation_that_does_not_hold_stops_the_batch() {
         ]),
     )
     .await;
-    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(1), &json!("step_failed")));
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(1), &json!("step_failed"))
+    );
     assert_eq!(output["steps"][0]["status"], "failed");
     assert_eq!(output["steps"][0]["code"], "expectation_unmet");
     let calls = calls(&script);
-    assert_eq!(calls.first().map(String::as_str), Some("browser_click p3:6"));
+    assert_eq!(
+        calls.first().map(String::as_str),
+        Some("browser_click p3:6")
+    );
     assert!(!calls.contains(&"browser_click p3:10".to_owned()));
     assert!(
-        calls.iter().filter(|call| call.contains("grace@x.com")).count() > 1,
+        calls
+            .iter()
+            .filter(|call| call.contains("grace@x.com"))
+            .count()
+            > 1,
         "the page was given time to get there: {calls:?}"
     );
 
@@ -439,7 +529,10 @@ async fn an_expectation_that_does_not_hold_stops_the_batch() {
         json!([{"action": "click", "ref": "p3:6", "expect": {"text": "grace@x.com", "present": false}}]),
     )
     .await;
-    assert_eq!(unproven["steps"][0]["code"], "expectation_unmet", "{unproven}");
+    assert_eq!(
+        unproven["steps"][0]["code"], "expectation_unmet",
+        "{unproven}"
+    );
 }
 
 #[tokio::test]
@@ -457,9 +550,16 @@ async fn a_read_that_is_refused_fails_the_step_it_was_for_and_is_reported_for_th
     .await;
     assert_eq!(
         calls(&script),
-        ["browser_click p3:2", "get_browser_state Editor", "get_browser_state since 0"]
+        [
+            "browser_click p3:2",
+            "get_browser_state Editor",
+            "get_browser_state since 0"
+        ]
     );
-    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(2), &json!("step_failed")));
+    assert_eq!(
+        (&output["stopped_at"], &output["stop_reason"]),
+        (&json!(2), &json!("step_failed"))
+    );
     assert_eq!(output["steps"][1]["code"], "browser_origin_outside_scope");
     // The step that ran stands; what it changed could not be read.
     assert_eq!(output["steps"][0]["status"], "ok");

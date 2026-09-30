@@ -65,17 +65,29 @@ pub enum BrowserStepRoute {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, Eq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct BrowserStepExpect {
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub role: Option<String>,
     /// Exact accessible name.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub name: Option<String>,
     /// Text contained in the element's name or value.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub text: Option<String>,
@@ -102,31 +114,55 @@ pub struct BrowserStep {
     #[uniffi(default = None)]
     pub reference: Option<String>,
     /// With name, instead of ref.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub role: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub name: Option<String>,
     /// type: the text.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub text: Option<String>,
     /// type: replace the field's content instead of appending.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "boolean")]
     #[uniffi(default = None)]
     pub replace: Option<bool>,
     /// click: trusted (default) or dom_event (ref or role and name).
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "route")]
     #[uniffi(default = None)]
     pub input_route: Option<BrowserStepRoute>,
     /// Checked after the step; the batch stops when it does not hold.
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "expect")]
     #[uniffi(default = None)]
     pub expect: Option<BrowserStepExpect>,
@@ -176,7 +212,11 @@ pub struct BrowserStepsInput {
     pub target_id: String,
     /// Tab id from get_browser_state.
     pub tab_id: String,
-    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "present")]
+    #[serde(
+        default,
+        skip_serializing_if = "Option::is_none",
+        deserialize_with = "present"
+    )]
     #[schemars(schema_with = "session")]
     #[uniffi(default = None)]
     pub session: Option<String>,
@@ -267,7 +307,7 @@ pub struct BrowserStepsOutput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stopped_at: Option<u32>,
     /// `step_failed`, `typing_unconfirmed`, `javascript_dialog_open`,
-    /// `document_changed`, `origin_changed`.
+    /// `document_changed`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_reason: Option<String>,
     /// What the page changed over the whole batch.
@@ -324,19 +364,46 @@ mod tests {
         ]))
         .unwrap();
         assert_eq!(parsed.steps[0].reference.as_deref(), Some("p3:4"));
-        assert_eq!(parsed.steps[2].expect.as_ref().map(|e| e.present), Some(true));
+        assert_eq!(
+            parsed.steps[2].expect.as_ref().map(|e| e.present),
+            Some(true)
+        );
         for (steps, error) in [
             (json!([{"action": "click"}]), "ref, or with role and name"),
-            (json!([{"action": "click", "role": "button"}]), "ref, or with role and name"),
-            (json!([{"action": "click", "ref": "p1:1", "role": "button", "name": "x"}]), "ref, or with role and name"),
+            (
+                json!([{"action": "click", "role": "button"}]),
+                "ref, or with role and name",
+            ),
+            (
+                json!([{"action": "click", "ref": "p1:1", "role": "button", "name": "x"}]),
+                "ref, or with role and name",
+            ),
             (json!([{"action": "click", "ref": " "}]), "nonblank"),
-            (json!([{"action": "type", "ref": "p1:1"}]), "text is required"),
-            (json!([{"action": "click", "ref": "p1:1", "text": "x"}]), "only allowed for type"),
-            (json!([{"action": "type", "ref": "p1:1", "text": "x", "input_route": "dom_event"}]), "only allowed for click"),
-            (json!([{"action": "click", "ref": "p1:1", "expect": {"present": false}}]), "role, a name or a text"),
+            (
+                json!([{"action": "type", "ref": "p1:1"}]),
+                "text is required",
+            ),
+            (
+                json!([{"action": "click", "ref": "p1:1", "text": "x"}]),
+                "only allowed for type",
+            ),
+            (
+                json!([{"action": "type", "ref": "p1:1", "text": "x", "input_route": "dom_event"}]),
+                "only allowed for click",
+            ),
+            (
+                json!([{"action": "click", "ref": "p1:1", "expect": {"present": false}}]),
+                "role, a name or a text",
+            ),
             (json!([]), "between 1 and 8"),
-            (json!([{"action": "select", "ref": "p1:1"}]), "unknown variant"),
-            (json!([{"action": "click", "ref": "p1:1", "wait": 5}]), "unknown field"),
+            (
+                json!([{"action": "select", "ref": "p1:1"}]),
+                "unknown variant",
+            ),
+            (
+                json!([{"action": "click", "ref": "p1:1", "wait": 5}]),
+                "unknown field",
+            ),
         ] {
             let refused = input(steps.clone()).unwrap_err();
             assert!(refused.contains(error), "{steps}: {refused}");
@@ -351,8 +418,14 @@ mod tests {
         assert_eq!(schema["type"], "object");
         assert_eq!(schema["required"], json!(["target_id", "tab_id", "steps"]));
         let steps = &schema["properties"]["steps"];
-        assert_eq!((steps["minItems"].as_u64(), steps["maxItems"].as_u64()), (Some(1), Some(8)));
-        assert_eq!(steps["items"]["properties"]["action"]["enum"], json!(["click", "type"]));
+        assert_eq!(
+            (steps["minItems"].as_u64(), steps["maxItems"].as_u64()),
+            (Some(1), Some(8))
+        );
+        assert_eq!(
+            steps["items"]["properties"]["action"]["enum"],
+            json!(["click", "type"])
+        );
         assert!(steps["items"]["properties"].get("ref").is_some());
     }
 
