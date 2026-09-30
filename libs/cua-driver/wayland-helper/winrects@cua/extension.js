@@ -25,7 +25,7 @@ const IFACE = `<node><interface name="org.cua.WinRects">
 // GNOME cannot host the Rust renderer directly, so this Shell actor mirrors
 // the embedded cua.default vector theme and semantic state vocabulary.
 const CANVAS_SIZE = 128;
-const DISPLAY_SIZE = 42;
+const DISPLAY_SIZE = 21;
 const ACTOR_SIZE = 112;
 const ACTOR_CENTER = ACTOR_SIZE / 2;
 const SCALE = DISPLAY_SIZE / CANVAS_SIZE;

@@ -8,17 +8,14 @@ use cua_driver_testkit::e2e::{
     OracleKind, Scope, Targeting,
 };
 use cua_driver_testkit::{Driver, McpDriver};
-use cursor_overlay::{BADGE_CURSOR_GAP, BADGE_HEIGHT, BADGE_MAX_WIDTH};
+use cursor_overlay::{default_anchor_for_tip, BADGE_CURSOR_GAP, BADGE_HEIGHT, BADGE_MAX_WIDTH};
 use image::RgbaImage;
 
 const CELL_ID: &str = "desktop-agent-cursor-showcase-px";
 const SESSION: &str = "Cursor showcase";
-// MoveTo offsets the artwork centre by a 16-point vector at 45 degrees so the
-// cursor tip lands on the requested coordinate. Each axis moves by 16/sqrt(2),
-// and the session badge follows that artwork centre.
-const CURSOR_ANCHOR_OFFSET_MAGNITUDE: f64 = 16.0;
-const CURSOR_ANCHOR_OFFSET_PER_AXIS: f64 =
-    CURSOR_ANCHOR_OFFSET_MAGNITUDE * std::f64::consts::FRAC_1_SQRT_2;
+// MoveTo offsets the artwork centre so the cursor tip lands on the requested
+// coordinate at the 45 degree end heading (`default_anchor_for_tip`), and
+// the session badge follows that artwork centre.
 const POINTER_ORACLE_RADIUS: f64 = 24.0;
 const BADGE_CURSOR_EXCLUSION: f64 = 34.0;
 
@@ -293,11 +290,12 @@ fn cursor_oracle_regions(
 ) -> CursorOracleRegions {
     let scale_x = f64::from(image_width) / logical_width;
     let scale_y = f64::from(image_height) / logical_height;
-    let anchor_x = (logical_x + CURSOR_ANCHOR_OFFSET_PER_AXIS) * scale_x;
-    let anchor_y = (logical_y + CURSOR_ANCHOR_OFFSET_PER_AXIS) * scale_y;
+    let (anchor_x, anchor_y) =
+        default_anchor_for_tip((logical_x, logical_y), std::f64::consts::FRAC_PI_4);
+    let (anchor_x, anchor_y) = (anchor_x * scale_x, anchor_y * scale_y);
 
-    // The production artwork is 42 points across. A 24-point radius includes
-    // its outline while remaining one logical point above the badge. Floor the
+    // The production artwork is 21 points across. A 24-point radius includes
+    // its outline and glow while remaining one logical point above the badge. Floor the
     // pointer bottom and ceil the badge top so fractional and unequal scales
     // cannot round the two regions onto the same pixel row.
     let pointer = PixelRect {
@@ -635,19 +633,42 @@ mod pixel_oracle_tests {
     const CURSOR_X: f64 = 200.0;
     const CURSOR_Y: f64 = 150.0;
 
+    /// Where the artwork centre must be, in image pixels, for the tip to sit
+    /// on the cursor point: at the neutral 45 degree heading the canvas is
+    /// not rotated, so the centre sits the hotspot's offset from the canvas
+    /// centre (64, 64) away, scaled from canvas units to points. With the
+    /// default hotspot (46, 30) that is (18, 34) * 21/128 = (2.95, 5.58) pt,
+    /// right of and below the tip. The painted tip landing on that hotspot
+    /// is checked by cursor-overlay's `the_hotspot_lands_on_the_target_at_any_heading`.
+    fn tip_on_target_anchor(scale_x: f64, scale_y: f64) -> (i64, i64) {
+        let [hx, hy] = cursor_overlay::embedded_default_theme().hotspot;
+        let points = f64::from(cursor_overlay::DISPLAY_SIZE) / 128.0;
+        let x = CURSOR_X + (64.0 - f64::from(hx)) * points;
+        let y = CURSOR_Y + (64.0 - f64::from(hy)) * points;
+        ((x * scale_x).round() as i64, (y * scale_y).round() as i64)
+    }
+
     #[test]
     fn accepts_colocated_pointer_and_badge_at_1x() {
-        assert_colocated_overlay(400, 300, 400.0, 300.0, (211, 161));
+        let anchor = tip_on_target_anchor(1.0, 1.0);
+        assert_eq!(anchor, (203, 156));
+        assert_colocated_overlay(400, 300, 400.0, 300.0, anchor);
     }
 
     #[test]
     fn accepts_colocated_pointer_and_badge_at_2x() {
-        assert_colocated_overlay(800, 600, 400.0, 300.0, (423, 323));
+        assert_colocated_overlay(800, 600, 400.0, 300.0, tip_on_target_anchor(2.0, 2.0));
     }
 
     #[test]
     fn accepts_colocated_pointer_and_badge_at_fractional_unequal_scale() {
-        assert_colocated_overlay(500, 525, 400.0, 300.0, (264, 282));
+        assert_colocated_overlay(
+            500,
+            525,
+            400.0,
+            300.0,
+            tip_on_target_anchor(500.0 / 400.0, 525.0 / 300.0),
+        );
     }
 
     #[test]

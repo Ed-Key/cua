@@ -104,6 +104,29 @@ pub struct RenderStateCore {
 }
 
 impl RenderStateCore {
+    /// The anchor (`pos`) that puts the current theme's hotspot on `tip` at
+    /// `heading`; see `theme::anchor_for_tip`.
+    pub fn anchor_for_tip(&self, tip: (f64, f64), heading: f64) -> (f64, f64) {
+        crate::theme::anchor_for_tip(tip, heading, self.hotspot())
+    }
+
+    /// The active theme's hotspot (canvas units), or the embedded default's.
+    pub fn hotspot(&self) -> [u16; 2] {
+        self.theme
+            .as_deref()
+            .map(|theme| theme.hotspot)
+            .unwrap_or_else(|| crate::embedded_default_theme().hotspot)
+    }
+
+    /// Where the artwork's tip is now: the inverse of `anchor_for_tip` at
+    /// the current `pos` and `heading` (the tip-to-anchor offset is fixed
+    /// for a heading, so it is `pos` minus the anchor that would put the tip
+    /// on `pos`, reflected).
+    pub fn tip(&self) -> (f64, f64) {
+        let anchor = self.anchor_for_tip(self.pos, self.heading);
+        (2.0 * self.pos.0 - anchor.0, 2.0 * self.pos.1 - anchor.1)
+    }
+
     /// Build the core from a launch-time CursorConfig.
     /// `pos` starts at the off-screen sentinel `(-200, -200)` to indicate
     /// "never placed on screen yet" — the click path uses this to detect
@@ -296,7 +319,7 @@ impl RenderStateCore {
     /// Update hover state from a platform-native hardware pointer sample.
     ///
     /// `self.pos` is the centre of the cursor artwork. The hit radius is a
-    /// little larger than the 42 point production artwork so the interaction
+    /// little larger than the production artwork's canvas so the interaction
     /// remains comfortable around the white outline and glow.
     pub fn update_session_badge_hover(&mut self, pointer: Option<(f64, f64)>) -> bool {
         const HOVER_RADIUS: f64 = crate::theme::DISPLAY_SIZE as f64 * 0.82;
@@ -644,14 +667,10 @@ impl RenderStateCore {
                 end_heading_radians,
             } => {
                 let reveal_badge = !self.is_revealed();
-                // Apply click offset (16 pt along end_heading) before planning,
-                // matching Swift `moveTo(point:endAngleRadians:)`:
-                //   tx = clickPoint.x + cos(endAngle) * clickOffset
-                //   ty = clickPoint.y + sin(endAngle) * clickOffset
-                const CLICK_OFFSET: f64 = 16.0;
+                // Plan toward the anchor that puts the artwork's tip on the
+                // click point at the end heading.
                 let turn_radius = self.motion.turn_radius;
-                let tx = x + end_heading_radians.cos() * CLICK_OFFSET;
-                let ty = y + end_heading_radians.sin() * CLICK_OFFSET;
+                let (tx, ty) = self.anchor_for_tip((x, y), end_heading_radians);
 
                 // macOS-only: if the cursor is still at the initial off-screen
                 // sentinel, snap it to the offset target so the path starts on-screen.
@@ -681,6 +700,19 @@ impl RenderStateCore {
                     self.reveal_session_badge();
                 }
                 true
+            }
+            OverlayCommand::TrackPointer { x, y } => {
+                let heading = std::f64::consts::FRAC_PI_4;
+                let (x, y) = self.anchor_for_tip((x, y), heading);
+                self.apply_command_base(
+                    OverlayCommand::SnapTo {
+                        x,
+                        y,
+                        heading_radians: Some(heading),
+                    },
+                    move_to_snap_sentinel,
+                    click_pulse_sentinel_only,
+                )
             }
             OverlayCommand::SnapTo {
                 x,
@@ -717,13 +749,8 @@ impl RenderStateCore {
                     // macOS: only snap position on first placement (sentinel state).
                     // After that the cursor stays where the animation landed.
                     if self.pos.0 < -50.0 {
-                        // Apply same click offset so tip lands at click point.
-                        const CLICK_OFFSET: f64 = 16.0;
-                        let angle = std::f64::consts::FRAC_PI_4;
-                        self.pos = (
-                            x + angle.cos() * CLICK_OFFSET,
-                            y + angle.sin() * CLICK_OFFSET,
-                        );
+                        // Same anchoring, so the tip lands on the click point.
+                        self.pos = self.anchor_for_tip((x, y), std::f64::consts::FRAC_PI_4);
                     }
                 } else {
                     self.pos = (x, y);
@@ -1101,13 +1128,15 @@ mod path_straightness_tests {
         // At rest the arrow points up-left, as after any previous move.
         core.heading = FRAC_PI_4;
         let (x0, y0) = core.pos;
-        // MoveTo aims 16 pt past the click point along the end heading; pick
-        // the click point so the planned target sits 300 pt away at `angle`.
+        // MoveTo aims at the anchor that puts the tip on the click point;
+        // pick the click point so the planned target sits 300 pt away at
+        // `angle`.
         let (x1, y1) = (x0 + 300.0 * angle.cos(), y0 + 300.0 * angle.sin());
+        let (ox, oy) = crate::default_anchor_for_tip((0.0, 0.0), FRAC_PI_4);
         core.apply_command_base(
             OverlayCommand::MoveTo {
-                x: x1 - FRAC_PI_4.cos() * 16.0,
-                y: y1 - FRAC_PI_4.sin() * 16.0,
+                x: x1 - ox,
+                y: y1 - oy,
                 end_heading_radians: FRAC_PI_4,
             },
             false,
@@ -1465,6 +1494,56 @@ mod session_badge_and_action_tests {
 mod backing_scale_tests {
     use super::*;
     use crate::CursorConfig;
+
+    #[test]
+    fn tip_inverts_anchor_for_tip_at_any_heading() {
+        let mut core = RenderStateCore::new(CursorConfig::default());
+        for heading in [0.0, 0.3, std::f64::consts::FRAC_PI_4, 2.0, -1.2] {
+            core.heading = heading;
+            core.pos = core.anchor_for_tip((300.0, 200.0), heading);
+            let (x, y) = core.tip();
+            assert!((x - 300.0).abs() < 1e-9 && (y - 200.0).abs() < 1e-9, "{heading}: {x},{y}");
+        }
+    }
+
+    #[test]
+    fn a_drag_sample_at_the_glide_target_keeps_the_tip_fixed_for_any_hotspot() {
+        use std::sync::Arc;
+        for hotspot in [[64, 64], [10, 100], [46, 30]] {
+            let mut core = RenderStateCore::new(CursorConfig::default());
+            core.motion.idle_hide_ms = 0.0;
+            let mut theme = (*crate::embedded_default_theme()).clone();
+            theme.hotspot = hotspot;
+            core.theme = Some(Arc::new(theme));
+            core.pos = (400.0, 300.0);
+            core.apply_command_base(
+                OverlayCommand::MoveTo {
+                    x: 100.0,
+                    y: 100.0,
+                    end_heading_radians: std::f64::consts::FRAC_PI_4,
+                },
+                true,
+                true,
+            );
+            for _ in 0..4800 {
+                core.tick_motion(1.0 / 240.0);
+                if core.path.is_none() && core.spring.is_none() {
+                    break;
+                }
+            }
+            let glided = core.tip();
+            assert!(
+                (glided.0 - 100.0).abs() < 1e-6 && (glided.1 - 100.0).abs() < 1e-6,
+                "{hotspot:?}: MoveTo left the tip at {glided:?}"
+            );
+            core.apply_command_base(crate::track_pointer_command(100.0, 100.0), true, true);
+            let tracked = core.tip();
+            assert!(
+                (tracked.0 - 100.0).abs() < 1e-9 && (tracked.1 - 100.0).abs() < 1e-9,
+                "{hotspot:?}: the drag sample moved the tip to {tracked:?}"
+            );
+        }
+    }
 
     fn visible_pixel_count(pm: &tiny_skia::Pixmap) -> u32 {
         // Count strongly visible coverage, not the halo's feather pixels.

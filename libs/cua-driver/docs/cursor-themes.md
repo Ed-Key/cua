@@ -170,7 +170,7 @@ unbounded archives, and other unsupported Lottie features are rejected.
     "semantics": 2
   },
   "canvas": { "width": 128, "height": 128, "fps": 30 },
-  "hotspot": { "x": 55, "y": 30 },
+  "hotspot": { "x": 46, "y": 30 },
   "actions": {
     "idle": { "animation": "action_idle", "still_frame": 0 },
     "observe": { "animation": "action_observe", "still_frame": 18 },
