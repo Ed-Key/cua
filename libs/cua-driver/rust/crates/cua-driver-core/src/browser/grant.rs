@@ -5,6 +5,7 @@
 //! grant, connection generation, and reconnect budget.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
@@ -73,11 +74,21 @@ impl ExistingProfileGrant {
 #[derive(Default)]
 pub(crate) struct ExistingProfileGrants {
     inner: Mutex<HashMap<GrantKey, ExistingProfileGrant>>,
+    /// Generations are unique across every grant in the registry, not just
+    /// per grant key: the socket pool counts each generation as one Cua
+    /// session's claim, and the store invalidates targets by (pid,
+    /// generation), so two sessions sharing a generation would release or
+    /// invalidate each other's state.
+    last_generation: AtomicU64,
 }
 
 impl ExistingProfileGrants {
     pub fn new() -> Self {
         Self::default()
+    }
+
+    fn next_generation(&self) -> u64 {
+        self.last_generation.fetch_add(1, Ordering::Relaxed) + 1
     }
 
     fn key(public_session: &str, transport_session: Option<&str>, pid: i64) -> GrantKey {
@@ -106,12 +117,7 @@ impl ExistingProfileGrants {
     ) -> ExistingProfileGrant {
         let now = Instant::now();
         let key = Self::key(public_session, transport_session, pid);
-        let generation = self
-            .inner
-            .lock()
-            .unwrap()
-            .get(&key)
-            .map_or(1, |grant| grant.generation.saturating_add(1));
+        let generation = self.next_generation();
         let grant = ExistingProfileGrant {
             public_session: public_session.to_owned(),
             transport_session: transport_session.unwrap_or(public_session).to_owned(),
@@ -209,7 +215,7 @@ impl ExistingProfileGrants {
             ));
         }
         grant.reconnect_attempts_remaining -= 1;
-        grant.generation = grant.generation.saturating_add(1);
+        grant.generation = self.next_generation();
         grant.last_used_at = Instant::now();
         Ok(grant.generation)
     }
@@ -332,6 +338,31 @@ mod tests {
             grants.lookup("public-a", Some("transport-a"), 42),
             GrantLookup::Missing
         ));
+    }
+
+    #[test]
+    fn generations_are_unique_across_sessions() {
+        let grants = ExistingProfileGrants::new();
+        let mint = |session: &str| {
+            grants
+                .mint(
+                    session,
+                    None,
+                    42,
+                    9,
+                    fingerprint(42),
+                    "chromium".to_owned(),
+                    BrowserProduct::GoogleChrome,
+                    "ws://127.0.0.1:1/devtools/browser/x".to_owned(),
+                    false,
+                    None,
+                )
+                .generation
+        };
+        let first = mint("public-a");
+        let second = mint("public-b");
+        let bumped = grants.bump_generation("public-a", None, 42).unwrap();
+        assert!(first != second && bumped != second && bumped > first);
     }
 
     #[test]

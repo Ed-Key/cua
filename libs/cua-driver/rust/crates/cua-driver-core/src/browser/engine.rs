@@ -979,21 +979,25 @@ impl BrowserEngine {
             }
 
             let old_generation = grant.generation;
-            let new_generation =
-                self.existing_profile_grants
-                    .bump_generation(session, transport_session, pid)?;
-            self.store
-                .invalidate_endpoint_generation(pid, old_generation);
             let attempt = super::grant::MAX_RECONNECT_ATTEMPTS
                 .saturating_sub(grant.reconnect_attempts_remaining)
                 .saturating_add(1);
+            // The grant advances inside the pool's claim transfer, so no
+            // cancellation or concurrent release can separate the two.
             let mut reconnect = Box::pin(self.pool.reconnect_existing(
                 &endpoint.ws_url,
                 old_generation,
-                new_generation,
+                || {
+                    let new_generation = self
+                        .existing_profile_grants
+                        .bump_generation(session, transport_session, pid)?;
+                    self.store
+                        .invalidate_endpoint_generation(pid, old_generation);
+                    Ok(new_generation)
+                },
             ));
             let reconnected = tokio::select! {
-                result = &mut reconnect => result,
+                result = &mut reconnect => result?,
                 // As in prepare: no Chrome prompt exists on the extension route.
                 _ = tokio::time::sleep(std::time::Duration::from_millis(500)),
                     if endpoint.transport != super::types::EndpointTransport::ExtensionRelay => {
@@ -1003,7 +1007,7 @@ impl BrowserEngine {
                         attempt,
                     }).await {
                         Ok(BrowserConsentOutcome::Accepted | BrowserConsentOutcome::NotPresent) => {
-                            reconnect.await
+                            reconnect.await?
                         }
                         Err(error) => {
                             // The reconnect future may be waiting on browser
