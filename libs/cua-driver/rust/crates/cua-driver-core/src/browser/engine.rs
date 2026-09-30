@@ -991,6 +991,14 @@ impl BrowserEngine {
                         .invalidate_endpoint_generation(pid, old_generation);
                     Ok(new_generation)
                 },
+                |generation| {
+                    self.existing_profile_grants.is_current(
+                        session,
+                        transport_session,
+                        pid,
+                        generation,
+                    )
+                },
             ));
             let reconnected = tokio::select! {
                 result = &mut reconnect => result?,

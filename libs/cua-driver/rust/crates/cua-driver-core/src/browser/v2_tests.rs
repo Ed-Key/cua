@@ -1542,6 +1542,44 @@ impl Drop for SlowProxy {
     }
 }
 
+#[tokio::test]
+async fn a_prepare_cancelled_mid_handshake_leaves_a_grant_the_next_bind_can_use() {
+    const TRANSPORT: &str = "transport-prepare-cancel-handshake";
+    let state = Arc::new(StdMutex::new(FixtureState::default()));
+    let server = MockCdpServer::start(fixture_handler(state)).await;
+    // A slow endpoint: every handshake takes 400 ms.
+    let proxy = SlowProxy::start(&server.ws_url(), std::time::Duration::from_millis(400)).await;
+    let engine = BrowserEngine::new(Arc::new(standard_mode_platform(
+        proxy.ws_url.clone(),
+        EndpointTransport::ExtensionRelay,
+    )));
+    let args = json!({
+        "pid": 1, "window_id": 7, "session": SESSION, "_transport_session_id": TRANSPORT,
+    });
+    let mut prepare_args = args.clone();
+    prepare_args["strategy"] = json!({ "kind": "existing_profile" });
+    let tool = BrowserPrepareTool::new(engine.clone());
+    assert!(
+        tokio::time::timeout(std::time::Duration::from_millis(150), tool.invoke(prepare_args))
+            .await
+            .is_err(),
+        "the prepare must still be in its handshake"
+    );
+    assert!(
+        engine
+            .existing_profile_grant(SESSION, Some(TRANSPORT), 1)
+            .await
+            .unwrap()
+            .is_some(),
+        "the cancelled prepare left its grant"
+    );
+
+    // The endpoint answers (slowly) again: the next bind dials for the grant.
+    let bound = GetBrowserStateTool::new(engine.clone()).invoke(args).await;
+    assert_eq!(structured(&bound)["status"], "ok", "{}", structured(&bound));
+    crate::session::fire_session_end(TRANSPORT);
+}
+
 fn standard_mode_platform(ws_url: String, transport: EndpointTransport) -> FixturePlatform {
     FixturePlatform {
         ws_url,

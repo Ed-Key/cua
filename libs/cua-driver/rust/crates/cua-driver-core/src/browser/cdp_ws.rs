@@ -546,7 +546,7 @@ impl CdpPool {
         generation: u64,
         is_live: impl FnOnce() -> bool,
     ) -> anyhow::Result<Arc<CdpConnection>> {
-        let port = loopback_port(ws_url)
+        loopback_port(ws_url)
             .ok_or_else(|| anyhow::anyhow!("existing-profile endpoint has no loopback port"))?;
         let mut conns = self.lock_conns().await;
         let (conn, mut holders) = match conns.get(ws_url) {
@@ -567,9 +567,7 @@ impl CdpPool {
                 holders,
             },
         );
-        if self.claimed_loopback_ports.lock().unwrap().insert(port) {
-            *claimed_ports().lock().unwrap().entry(port).or_default() += 1;
-        }
+        self.mark_claimed(ws_url);
         Ok(conn)
     }
 
@@ -596,19 +594,21 @@ impl CdpPool {
 
     /// Replace one dead grant-owned socket with exactly one new generation.
     ///
-    /// Ownership rule: `advance` moves the grant to its new generation, and
-    /// it runs under the pool lock together with moving the grant's claim
-    /// from `old_generation` to that generation, before dialing. The claim
-    /// stays there whether the dial succeeds, fails, or is cancelled, and a
-    /// reconnect cancelled before it takes the lock advances nothing. The
-    /// pool therefore always holds the grant's current generation: a retry
-    /// transfers from exactly the claim the failed attempt left, and the
-    /// grant's final release (with its current generation) closes the
-    /// socket. A reconnect whose source claim is gone installs nothing, and
-    /// a claim released while dialing discards the new socket. Other
-    /// sessions sharing the socket keep their claims (generations are unique
-    /// per session, see `ExistingProfileGrants`) and move to the new socket
-    /// with it.
+    /// Ownership rule: `advance` moves the grant to its new generation (only
+    /// from `old_generation`, so it also proves the grant live), and it runs
+    /// under the pool lock together with moving the grant's claim to that
+    /// generation, before dialing. The claim stays there whether the dial
+    /// succeeds, fails, or is cancelled, and a reconnect cancelled before it
+    /// takes the lock advances nothing. The pool therefore always holds the
+    /// grant's current generation: a retry transfers from exactly the claim
+    /// the failed attempt left, and the grant's final release (with its
+    /// current generation) closes the socket. A live grant with no claim at
+    /// all (its prepare was cancelled before the claim) joins the socket or
+    /// dials one. `is_live` is checked under the lock before a dialed socket
+    /// is recorded for a claim the pool does not hold: a grant released while
+    /// dialing installs nothing. Other sessions sharing the socket keep their
+    /// claims (generations are unique per session, see
+    /// `ExistingProfileGrants`) and move to the new socket with it.
     ///
     /// The outer error is `advance`'s; the inner result is the reconnect's.
     pub async fn reconnect_existing<E>(
@@ -616,34 +616,32 @@ impl CdpPool {
         ws_url: &str,
         old_generation: u64,
         advance: impl FnOnce() -> Result<u64, E>,
+        is_live: impl FnOnce(u64) -> bool,
     ) -> Result<anyhow::Result<Arc<CdpConnection>>, E> {
         let new_generation;
         {
             let mut conns = self.lock_conns().await;
             new_generation = advance()?;
-            let Some(entry) = conns.get_mut(ws_url) else {
-                return Ok(Err(anyhow::anyhow!(
-                    "the reconnect source claim was released"
-                )));
-            };
-            if !entry.holders.remove(&old_generation) {
-                return Ok(Err(anyhow::anyhow!(
-                    "the reconnect source generation is no longer current"
-                )));
-            }
-            entry.holders.insert(new_generation);
-            entry.generation = entry.holders.iter().max().copied();
-            if !entry.conn.is_closed() {
-                return Ok(Ok(entry.conn.clone()));
+            if let Some(entry) = conns.get_mut(ws_url) {
+                entry.holders.remove(&old_generation);
+                entry.holders.insert(new_generation);
+                entry.generation = entry.holders.iter().max().copied();
+                if !entry.conn.is_closed() {
+                    entry.conn.restrict_to_existing_profile();
+                    let conn = entry.conn.clone();
+                    self.mark_claimed(ws_url);
+                    return Ok(Ok(conn));
+                }
             }
         }
-        Ok(self.redial_claim(ws_url, new_generation).await)
+        Ok(self.redial_claim(ws_url, new_generation, is_live).await)
     }
 
     async fn redial_claim(
         &self,
         ws_url: &str,
         generation: u64,
+        is_live: impl FnOnce(u64) -> bool,
     ) -> anyhow::Result<Arc<CdpConnection>> {
         // A WebSocket handshake can wait for browser-owned consent UI. Never
         // hold the pool mutex across that wait: grant revocation must remain
@@ -651,16 +649,39 @@ impl CdpPool {
         let conn = Arc::new(CdpConnection::connect(ws_url).await?);
         conn.restrict_to_existing_profile();
         let mut conns = self.lock_conns().await;
-        let Some(entry) = conns
-            .get_mut(ws_url)
-            .filter(|e| e.holders.contains(&generation))
-        else {
+        let held = conns
+            .get(ws_url)
+            .is_some_and(|entry| entry.holders.contains(&generation));
+        if !held && !is_live(generation) {
             anyhow::bail!("the reconnecting grant was released while dialing");
-        };
+        }
+        let entry = conns
+            .entry(ws_url.to_owned())
+            .or_insert_with(|| PoolEntry {
+                conn: conn.clone(),
+                generation: None,
+                holders: HashSet::new(),
+            });
         if entry.conn.is_closed() {
             entry.conn = conn;
         }
-        Ok(entry.conn.clone())
+        entry.conn.restrict_to_existing_profile();
+        entry.holders.insert(generation);
+        entry.generation = entry.holders.iter().max().copied();
+        let conn = entry.conn.clone();
+        drop(conns);
+        self.mark_claimed(ws_url);
+        Ok(conn)
+    }
+
+    /// Mark the endpoint's listener as owned by a first-class attachment
+    /// (see [`endpoint_port_is_grant_owned`]), once per pool.
+    fn mark_claimed(&self, ws_url: &str) {
+        if let Some(port) = loopback_port(ws_url) {
+            if self.claimed_loopback_ports.lock().unwrap().insert(port) {
+                *claimed_ports().lock().unwrap().entry(port).or_default() += 1;
+            }
+        }
     }
 
     /// Drop a (likely dead) driver-owned connection so the next call
@@ -1027,7 +1048,10 @@ mod tests {
         let claimed = pool.claim_existing(&url, 1, || true).await.unwrap();
         claimed.demux.close();
 
-        let mut reconnect = Box::pin(pool.reconnect_existing(&url, 1, || Ok::<_, ()>(2)));
+        // The grant is released while the handshake stalls, so it is no
+        // longer live when the socket arrives.
+        let mut reconnect =
+            Box::pin(pool.reconnect_existing(&url, 1, || Ok::<_, ()>(2), |_| false));
         tokio::select! {
             _ = &mut reconnect => panic!("reconnect unexpectedly completed"),
             _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
@@ -1069,8 +1093,8 @@ mod tests {
         let pool = CdpPool::new();
         pool.claim_existing(&url, 1, || true).await.unwrap().demux.close();
 
-        assert!(pool.reconnect_existing(&url, 1, || Ok::<_, ()>(2)).await.unwrap().is_err());
-        let live = pool.reconnect_existing(&url, 2, || Ok::<_, ()>(3)).await.unwrap().unwrap();
+        assert!(pool.reconnect_existing(&url, 1, || Ok::<_, ()>(2), |_| true).await.unwrap().is_err());
+        let live = pool.reconnect_existing(&url, 2, || Ok::<_, ()>(3), |_| true).await.unwrap().unwrap();
         assert!(!live.is_closed());
         for stale in [1, 2] {
             let Err(error) = pool.get_existing(&url, stale).await else {
@@ -1119,10 +1143,15 @@ mod tests {
         let _accepted = stalled.accept().await.unwrap();
 
         let advanced = std::sync::atomic::AtomicBool::new(false);
-        let reconnect = pool.reconnect_existing(&url, 1, || {
-            advanced.store(true, Ordering::SeqCst);
-            Ok::<_, ()>(2)
-        });
+        let reconnect = pool.reconnect_existing(
+            &url,
+            1,
+            || {
+                advanced.store(true, Ordering::SeqCst);
+                Ok::<_, ()>(2)
+            },
+            |_| true,
+        );
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(100), reconnect)
                 .await
@@ -1135,7 +1164,7 @@ mod tests {
 
         // The claim is still generation 1, so the grant's next attempt moves it.
         let live = pool
-            .reconnect_existing(&url, 1, || Ok::<_, ()>(2))
+            .reconnect_existing(&url, 1, || Ok::<_, ()>(2), |_| true)
             .await
             .unwrap()
             .unwrap();
