@@ -4,8 +4,15 @@
 //! and download tools over an exact-or-refused binding model:
 //!
 //! - The native entrypoint is `pid + window_id`. Browser target ids,
-//!   tab ids, and page refs (`p<snapshot>:<index>`) are opaque,
-//!   session-scoped capabilities minted by core.
+//!   tab ids, and page refs (`p<space>:<index>`) are opaque,
+//!   session-scoped capabilities minted by core. A semantic ref names one
+//!   node of one live document and keeps its name across that session's
+//!   reads of it; [`observation`] has the rules (who owns a ref, when it
+//!   goes stale, what a read may be diffed against).
+//! - Page actions return what the page changed as a keyed diff against
+//!   the outline the session held, and [`steps`] runs several of them in
+//!   one call. Both read the page through a `get_browser_state` dispatch,
+//!   so the read is admitted exactly as the caller's own would be.
 //! - Mutation is permitted only for **exact** bindings (unique
 //!   bounds-correlated, optionally title-tie-broken). Heuristic
 //!   bindings are read-only; everything else is a structured refusal

@@ -82,8 +82,10 @@ repository checkout is required. The installer keeps the flat Markdown layout.
 
 Browser work starts from the same native `(pid, window_id)` selection as every
 other app. `get_browser_state` binds that exact window to a session-scoped
-target and tab, then returns short-lived page refs for `browser_click`,
-`browser_type`, and `browser_navigate`.
+target and tab, then returns the page outline with a ref on every line.
+`browser_steps` runs several clicks and typings on those refs in one call;
+`browser_click`, `browser_type`, and `browser_navigate` do one. Each returns
+what the page changed.
 
 Setup is never a hidden read side effect. `browser_prepare` requires explicit
 approval before launching a driver-managed profile or attaching to an existing

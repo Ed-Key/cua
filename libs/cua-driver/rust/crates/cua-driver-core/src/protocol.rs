@@ -387,9 +387,9 @@ fn agent_instructions() -> String {
 
     // act_and_read is registered only on macOS; elsewhere keep the one-action step.
     let act_step = if cfg!(target_os = "macos") {
-        "Apps: act and read in one `act_and_read` (`steps`). Chrome pages: `get_browser_state`, then `browser_click`/`browser_type`."
+        "Apps: act and read in one `act_and_read` (`steps`). Chrome: `get_browser_state` snapshot, then `browser_steps`."
     } else {
-        "Act with the fresh index."
+        "Act with the fresh index. Chrome: `get_browser_state` snapshot, then `browser_steps`."
     };
 
     format!(
@@ -517,6 +517,15 @@ mod agent_instruction_tests {
             instructions.split_whitespace().count() <= 200,
             "initialize instructions should stay within the documented context budget"
         );
+    }
+
+    #[test]
+    fn instructions_name_the_browser_flow_within_budget() {
+        let instructions = agent_instructions();
+        assert!(instructions
+            .contains("Chrome: `get_browser_state` snapshot, then `browser_steps`."));
+        let words = instructions.split_whitespace().count();
+        assert!(words <= 200, "instructions are {words} words");
     }
 
     #[test]

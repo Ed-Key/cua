@@ -5,6 +5,49 @@ Browser chrome, permission prompts, downloads, file pickers, and unsupported
 engines remain native windows: inspect and operate them with
 `get_window_state` and the native action loop in [WORKFLOW.md](WORKFLOW.md).
 
+## Workflow
+
+Three calls do most page tasks:
+
+```text
+get_browser_state {pid, window_id, session}            # bind: target_id, tab ids
+get_browser_state {target_id, tab_id, session}         # snapshot: the page outline
+browser_steps     {target_id, tab_id, session, steps}  # act, then what changed
+```
+
+The outline has one line per element, with its ref and what the ref allows:
+
+```text
+- textbox "Email" [p3:4 type] = "ada@x.com" (focused)
+- button "Role" [p3:5 click] (collapsed)
+- button "Send invite" [p3:6] (disabled)
+- statictext "No invites yet" [p3:9]
+```
+
+`[p3:6]` with no action is a ref you can read under (`scope_ref`) but not act
+on. `browser_steps` takes up to 8 `click` and `type` steps. Aim a step with a
+`ref`, or with an exact `role` and `name` that is looked up on the live page
+when the step runs:
+
+```text
+browser_steps {target_id, tab_id, session, steps: [
+  {action: "type",  ref: "p3:4", text: "ada@x.com"},
+  {action: "click", role: "button", name: "Role"},
+  {action: "click", role: "option", name: "Editor"},
+  {action: "click", role: "button", name: "Send invite",
+   expect: {text: "ada@x.com (Editor)"}}]}
+```
+
+The result has each step's outcome and one `changes`: the lines that changed,
+appeared or left since your snapshot. Read the result from `changes`; a new
+snapshot call is not needed. The batch stops, and says where and why, at the
+first step that fails, at typing it could not confirm, at a JavaScript
+dialog, and when a step loads another page.
+
+`browser_click`, `browser_type` and `browser_navigate` do one action and
+return `changes` the same way. Refs stay valid across reads and actions while
+the tab shows the same document. Sections 3 and 4 have the details.
+
 ## Choose the page-aware route first
 
 Use this route only when the user's requested interaction method permits
@@ -16,18 +59,15 @@ For supported page content, prefer the typed browser tools over the legacy
 typed route binds an exact native `(pid, window_id)` to a browser target and
 mints session-scoped tab and element capabilities.
 
-The canonical loop is:
+The full set of tools around the three calls above:
 
 ```text
 start_session(session?)                                  # optional; can name before acting
 list_windows or launch_app
 get_browser_state(pid, window_id, session?)               # bind
-get_browser_state(target_id, tab_id, session?,
-                  snapshot_format=semantic_v2)            # snapshot
-browser_navigate / browser_click / browser_type / browser_pointer
+get_browser_state(target_id, tab_id, session?)            # snapshot
+browser_steps / browser_click / browser_type / browser_navigate / browser_pointer
 browser_dialog / browser_set_input_files / browser_download
-get_browser_state(target_id, tab_id, session?,
-                  snapshot_format=semantic_v2)            # verify and refresh refs
 end_session(session?)                                     # optional cleanup
 ```
 
@@ -284,8 +324,7 @@ selection. Never guess from list order when all tabs are `null`.
 
 ```text
 get_browser_state
-  '{"target_id":"<target>","tab_id":"<tab>",
-    "session":"browser-run-1","snapshot_format":"semantic_v2"}'
+  '{"target_id":"<target>","tab_id":"<tab>","session":"browser-run-1"}'
 ```
 
 Set `include_screenshot:true` when the visual state matters, including when the
@@ -294,8 +333,7 @@ exact tab is open but unselected:
 ```text
 get_browser_state
   '{"target_id":"<target>","tab_id":"<tab>",
-    "session":"browser-run-1","snapshot_format":"semantic_v2",
-    "include_screenshot":true}'
+    "session":"browser-run-1","include_screenshot":true}'
 ```
 
 The result includes a PNG image part, the flat compatibility fields
@@ -312,40 +350,110 @@ tab or foreground the browser window. Capture is opt-in because authenticated
 pages may contain sensitive information, and a requested capture refuses when
 the driver cannot return valid viewport metrics and a valid bounded PNG.
 
-`semantic_v2` composes the page accessibility tree, pierced DOM, layout, and
-viewport state. Read the compact `outline` for page content, use `refs` only
-for actions declared in each entry's `actions` array, and use `content_refs`
-only to scope later reads. A content ref is not an action capability.
+### The outline
+
+The snapshot (`semantic_v2`, the default) composes the page accessibility
+tree, pierced DOM, layout, and viewport state into `outline`, one line per
+element, indented under the element that contains it:
+
+```text
+- role "name" [ref actions] = "value" -> "link destination" (states)
+```
+
+- The bracket holds the ref and the actions it declares: `click`, `type`,
+  `upload`, `scroll`. A ref with none is a content ref: use it as `scope_ref`
+  for a later read, never as an action target. `browser_pointer` works on a
+  ref that declares `click`, `type` or `upload` and has a layout box.
+- States are words such as `disabled`, `checked`, `unchecked`, `expanded`,
+  `collapsed`, `selected`, `focused`, `required`, the frame kind when it is
+  not the main frame (`iframe`, `oopif`), and where the element is when it is
+  not in the viewport (`near_viewport`, `offscreen`, `no_layout`).
+- Unnamed wrappers, the page root, list bullets, the text inside a field that
+  only repeats its value, and the extension's own "Cua is working in this tab"
+  pill are left out.
+
+Programs that want the refs as data pass `include_refs:true` and also get
+`refs` (lines that declare an action) and `content_refs`, each entry
+`{ref, role, name, value, actions, url}`. `dom_refs_v1` remains available by
+name (`snapshot_format:"dom_refs_v1"`): a flat ref list with no outline. A
+session that works from it gets no `changes` from actions.
+
+### Size, ranking, and continuation
 
 The snapshot ranks active dialogs and visible controls before near-viewport
 and offscreen content. It excludes CSS-hidden retained state before applying
-the output budget. Inspect `snapshot.complete`, `snapshot.omitted`, and
-`snapshot.continuation` rather than assuming the first response is exhaustive.
-To continue the same ranked snapshot:
+the budgets. The whole result is fitted to `max_chars` (default 6000, up to
+60000): the ranked set is cut where the outline would pass it. Inspect
+`snapshot.complete`, `snapshot.omitted`, and `snapshot.continuation` rather
+than assuming the first response is exhaustive. To continue the same ranked
+snapshot:
 
 ```text
 get_browser_state
   '{"target_id":"<target>","tab_id":"<tab>",
-    "session":"browser-run-1","snapshot_format":"semantic_v2",
-    "continuation":"<opaque-continuation>"}'
+    "session":"browser-run-1","continuation":"<opaque-continuation>"}'
 ```
 
 Continuations are opaque, single-use, and bound to the current session, tab,
-snapshot, and browser generation. A newer snapshot invalidates them. For a
-bounded read, pass either `query` or a current `scope_ref` from `refs` or
-`content_refs`:
+document, and browser generation. A newer read of the page invalidates them.
+For a bounded read, pass either `query` or a current `scope_ref`:
 
 ```text
 get_browser_state
   '{"target_id":"<target>","tab_id":"<tab>",
-    "session":"browser-run-1","snapshot_format":"semantic_v2",
-    "query":"Account settings"}'
+    "session":"browser-run-1","query":"Account settings"}'
 ```
 
-Refs remain scoped to the session, target, tab, document, frame, and latest
-snapshot. Navigation and newer snapshots invalidate old refs. A stale-ref
-refusal means snapshot again; it is not permission to fall back to a CSS
-selector or coordinate remembered from an earlier page.
+### Refs and revisions
+
+A ref names an element, not a position in one snapshot. While your session
+keeps reading the same document in the same tab, an element keeps its ref
+from one read to the next, across `query`, `scope_ref` and continuation reads
+too, so a ref from an earlier snapshot can be used later. A ref goes stale
+(`browser_ref_stale`) when:
+
+- the tab loads another document, or the frame the element lived in does;
+- the element leaves the page;
+- the element now reads as something else. Before every use the driver reads
+  the element's role, name and link destination again, and refuses when they
+  differ from what the ref was issued for; the next read gives that element a
+  new ref;
+- the debugger is detached from the tab (the user cancelled Chrome's banner
+  or pressed Stop), the extension reconnects, or the session ends.
+
+Refs belong to one session. A stale-ref refusal means read again; it is not
+permission to fall back to a CSS selector or coordinate remembered from an
+earlier page.
+
+Every snapshot carries `snapshot.revision`. `changes` in an action result, or
+`get_browser_state` with `since_revision`, describes the page against a
+revision:
+
+```text
+changes: {kind: "diff", snapshot_id: "p3", base_revision: 12, revision: 13,
+  ops: [
+    {op: "change", ref: "p3:5", line: "- button \"Role\" [p3:5 click] (expanded)"},
+    {op: "add", ref: "p3:21", after: "p3:5", line: "  - option \"Editor\" [p3:21 click]"},
+    {op: "leave", ref: "p3:9", gone: true}]}
+```
+
+- `change`: the same element, with another value, state or depth. `add`: a
+  new line, placed after the line `after` (first when `after` is absent).
+  `move`: the same element at another place. `leave`: the line is no longer
+  in the outline; with `gone: true` the element is gone and its ref is stale,
+  without it the element only left the ranked outline and its ref still works.
+- `kind: "snapshot"` carries the whole `outline` instead, with a `reason`:
+  `no_baseline` (nothing was read yet), `document_changed`,
+  `attachment_changed`, `revision_unknown` (the revision you named is not the
+  one the session holds), `coverage_changed`, `diff_larger_than_snapshot`.
+- `kind: "unavailable"` means the page was not read, with the `reason`
+  (`javascript_dialog_open` and the `dialog` to resolve, or the refusal code
+  of the read). What you hold is unchanged.
+- The ops are what was observed since `base_revision`: the page may have made
+  some of them by itself. If you do not hold `base_revision` (a result was
+  lost), call `get_browser_state` for a full snapshot.
+- `settled: false` says the page was still changing when the bounded wait
+  ended (1.5 s; 8 s for a new document).
 
 Snapshots traverse the main document, open shadow roots, same-process frames,
 and capability-tested out-of-process frames. Each ref reports its frame kind.
@@ -367,7 +475,8 @@ browser_navigate
 ```
 
 Only `http:`, `https:`, and `about:` URLs are accepted. Navigation invalidates
-the tab's refs; snapshot again before the next ref-targeted action.
+the tab's refs. The result's `changes` is the new page's snapshot (reason
+`document_changed`), so its refs are ready for the next action.
 
 ### Click
 
@@ -378,8 +487,11 @@ browser_click
 ```
 
 `trusted` is the default and models browser input through CDP's Input domain.
-Before dispatch, the driver refreshes the element box and hit-tests the point.
-It refuses stale, covered, or ambiguous targets.
+Before dispatch, the driver refreshes the element box and asks the page what
+is on top at the click point. When that is another element (an overlay, a
+badge, a cookie banner), it looks once more after a scroll and a short wait,
+then refuses with `browser_target_covered`, names the covering element, and
+sends nothing. The result's `changes` says what the click did.
 
 Standalone Chromium on macOS and Linux can activate its native window when
 trusted CDP pointer input is used. CUA Driver detects that limitation and
@@ -399,8 +511,9 @@ browser_click
 `dom_event` calls the page element's click behavior without pretending that a
 trusted pointer event occurred. It requires a ref and is the full-background
 alternative where supported. Dispatch is not proof that the control activated:
-trust-gated controls can ignore synthetic events, so refresh page state and
-verify the expected postcondition. Never silently change trust class or
+trust-gated controls can ignore synthetic events, so read `changes` and
+verify the expected postcondition. It is not hit-tested: the element is
+clicked whatever is on top of it. Never silently change trust class or
 foreground the browser after a refusal. Coordinate clicks accept viewport CSS
 `x` and `y`, but only on the trusted route; prefer refs.
 
@@ -436,9 +549,36 @@ cua-driver describe browser_type
 ```
 
 The driver revalidates the binding and ref, verifies editability and focus
-ownership, and reports requested versus delivered characters. Snapshot again
-to verify application state rather than treating transport completion as the
-task result.
+ownership, and reports requested versus delivered characters. `changes` says
+what else the page changed (a button that became enabled, a suggestion list).
+
+### Several steps in one call
+
+`browser_steps` runs 1 to 8 steps on one tab and returns
+`{status, steps, stopped_at, stop_reason, changes}`.
+
+- A step is `{action: "click" | "type", ...}` aimed by `ref`, or by `role`
+  and `name`. Role and name must match one element exactly (the name is the
+  accessible name, compared whole and case-sensitively). No match or several
+  fail the step with `candidates`, the outline lines to choose a ref from; a
+  single match on a page that could not be read completely fails as
+  `coverage_incomplete`.
+- `type` takes `text` and optional `replace`. `click` takes optional
+  `input_route`.
+- `expect: {role?, name?, text?, present?}` must hold after the step settles
+  (it is given up to 2 s): some element with that role, exact name, and/or
+  `text` contained in its name or value; with `present: false`, none.
+- Each step is admitted as the `browser_click` or `browser_type` call it is,
+  and each read as a `get_browser_state` call. A step you could not make as a
+  single call fails in a batch too.
+- `status` is `completed` or `stopped`. `steps` lists the steps that ran:
+  `status` (`ok`, `unconfirmed`, `failed`), the `ref` acted on, the tool's
+  `effect`, a `code` and `detail` when not ok, `delivered_count` when typing
+  stopped part way, and `retryable: false` when input may have reached the
+  page. `stopped_at` is the 1-based step the batch stopped at; `stop_reason`
+  is `step_failed`, `typing_unconfirmed`, `javascript_dialog_open`, or
+  `document_changed`. Nothing is retried.
+- `changes` covers the whole batch, from the revision you held before it.
 
 ### Extended pointer actions
 
@@ -462,8 +602,12 @@ browser_pointer
 ### JavaScript dialogs
 
 `browser_dialog` handles only page-owned `alert`, `confirm`, `prompt`, and
-`beforeunload` dialogs. First inspect the exact tab, then accept or dismiss the
-returned opaque `dialog_id`. A prompt response is allowed only with
+`beforeunload` dialogs. An action that opens one returns at once with
+`changes: {kind: "unavailable", reason: "javascript_dialog_open", dialog:
+{dialog_id, kind}}`. While the dialog is up the page answers nothing, so
+reads and actions refuse `browser_dialog_open` and name the same `dialog_id`.
+Accept or dismiss that `dialog_id` (or inspect the exact tab first to get
+it). A prompt response is allowed only with
 `action:"accept"` on a current prompt. Browser permission UI and native dialogs
 remain outside this tool. Creating Chromium's native modal can activate the
 browser; after the caller restores occlusion, inspecting and resolving the
@@ -547,7 +691,12 @@ result from the current host, process, window, session, and tab.
   request. Do not automate a generic approval dialog.
 - `browser_binding_ambiguous` or heuristic binding: resolve the native-window
   ambiguity and bind again; do not mutate.
-- `browser_ref_stale`: snapshot again and use a new ref.
+- `browser_ref_stale`: the element left the page, became another element, or
+  the document or attachment changed. Read again and use a new ref.
+- `browser_target_covered`: another element is on top of the click point. Act
+  on what covers it (its line is in the outline), or scroll; do not switch to
+  `dom_event` to click through it.
+- `browser_dialog_open`: resolve the named `dialog_id` with `browser_dialog`.
 - `browser_action_unavailable`: choose a ref that declares the requested
   action; never treat a readable `content_ref` as clickable or editable.
 - `browser_input_trust_unavailable`: either request `dom_event` when its
@@ -556,6 +705,7 @@ result from the current host, process, window, session, and tab.
 - closed tab, moved tab, browser restart, or reconnect: discard capabilities
   and bind again.
 
-Always verify the page with a fresh `get_browser_state` snapshot. When the
-result affects native UI as well, also verify the exact native window with
+Verify from the `changes` an action returns, or from a fresh
+`get_browser_state` snapshot when there is none. When the result affects
+native UI as well, also verify the exact native window with
 `get_window_state`.
