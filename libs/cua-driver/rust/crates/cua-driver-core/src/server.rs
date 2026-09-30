@@ -479,7 +479,7 @@ pub fn is_computer_action(tool_name: &str, operation: ToolOperation) -> bool {
     }
     if matches!(
         tool_name,
-        "browser_set_input_files" | "browser_download" | "browser_pointer"
+        "browser_set_input_files" | "browser_download" | "browser_pointer" | "browser_steps"
     ) {
         return true;
     }
@@ -733,6 +733,7 @@ fn structured_refusal_code(tool_name: &str, result: Option<&serde_json::Value>) 
             | "browser_set_input_files"
             | "browser_download"
             | "browser_pointer"
+            | "browser_steps"
     ) {
         return ToolRefusalCode::None;
     }

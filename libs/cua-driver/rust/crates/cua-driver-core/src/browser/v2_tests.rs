@@ -107,6 +107,9 @@ struct FixtureState {
     /// The click handler calls alert(): the dialog opens and the page
     /// answers nothing until it is resolved.
     click_opens_dialog: bool,
+    /// The click handler sets location.href: the main frame starts loading
+    /// the document with this loader id.
+    click_navigates: Option<String>,
     dialog_open: bool,
     /// The session that enabled the Page domain (it hears dialog events).
     page_session: Option<String>,
@@ -155,6 +158,7 @@ impl Default for FixtureState {
             click_renames: Vec::new(),
             click_removes: Vec::new(),
             click_opens_dialog: false,
+            click_navigates: None,
             dialog_open: false,
             page_session: None,
             pending_mutations: 0,
@@ -630,6 +634,14 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             st.pending_mutations += (renames.len() + removes.len()) as u64;
             st.renamed.extend(renames);
             st.removed.extend(removes);
+            if let Some(loader) = st.click_navigates.take() {
+                st.main_loader = loader;
+                return MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Page.frameStartedLoading".into(),
+                    session_id: st.page_session.clone(),
+                    params: json!({"frameId": "F_MAIN"}),
+                }]);
+            }
             if std::mem::take(&mut st.click_opens_dialog) {
                 st.dialog_open = true;
                 return MockReply::ok(json!({}))
@@ -4197,13 +4209,21 @@ struct Agent {
 
 impl Agent {
     async fn bound(f: &Fixture, session: &str) -> Self {
+        Self::bound_as(f, session, unrestricted()).await
+    }
+
+    async fn bound_as(
+        f: &Fixture,
+        session: &str,
+        context: Arc<crate::session_authorization::EffectiveAuthorizationContext>,
+    ) -> Self {
         let mut registry = crate::tool::ToolRegistry::new();
         super::tools::register_browser_tools(&f.engine, &mut registry);
         let registry = Arc::new(registry);
         registry.init_self_weak();
         let mut agent = Self {
             registry,
-            context: unrestricted(),
+            context,
             session: session.to_owned(),
             target: String::new(),
             tab: String::new(),
@@ -4523,4 +4543,265 @@ async fn since_revision_answers_with_a_diff_only_from_the_revision_held() {
         )
         .await;
     assert_eq!(refused.is_error, Some(true), "a diff is of the whole-page view only");
+}
+
+// ── browser_steps against the scripted page ─────────────────────────────────
+
+#[tokio::test]
+async fn steps_run_as_single_tools_and_return_one_diff_for_the_batch() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+    })
+    .await;
+    let agent = Agent::bound(&f, "steps-real").await;
+    let first = agent.snapshot().await;
+    f.state.lock().unwrap().click_renames.push((2011, "Sent".into()));
+    let reads_before = recorded_calls(&f, "Accessibility.getFullAXTree").len();
+
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "type", "ref": named_ref(&first, "Reply body"), "text": "hello"},
+                {"action": "click", "role": "button", "name": "Reply", "input_route": "dom_event",
+                 "expect": {"role": "button", "name": "Sent"}},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "completed", "{output}");
+    let outcomes = output["steps"].as_array().unwrap();
+    assert_eq!(outcomes[0]["effect"], "confirmed", "{output}");
+    assert_eq!(outcomes[1]["ref"], named_ref(&first, "Reply"), "resolved to the ref held");
+
+    // One diff, from the revision held before the batch, with both steps in it.
+    let changes = &output["changes"];
+    assert_eq!(changes["kind"], "diff", "{output}");
+    assert_eq!(changes["base_revision"], first["snapshot"]["revision"]);
+    let ops = changes["ops"].as_array().unwrap();
+    assert!(ops.iter().any(|op| op["op"] == "change"
+        && op["line"].as_str().unwrap().contains("= \"hello\"")), "{output}");
+    assert!(ops.iter().any(|op| op["op"] == "add"
+        && op["line"].as_str().unwrap().contains("button \"Sent\"")), "{output}");
+    assert!(output.to_string().chars().count() < 1_500, "{output}");
+
+    // The steps did not each read the page: one read to aim the named step,
+    // one for its expect, one at the end. Each main-frame read is two trees.
+    let reads = recorded_calls(&f, "Accessibility.getFullAXTree")
+        .into_iter()
+        .skip(reads_before)
+        .filter(|(_, params)| params["frameId"] == "F_MAIN")
+        .count();
+    assert_eq!(reads, 3, "aim, expect, final");
+    // Both steps re-read their own node before acting on it.
+    assert_eq!(recorded_calls(&f, "Accessibility.getPartialAXTree").len(), 2);
+}
+
+#[tokio::test]
+async fn unconfirmed_typing_stops_a_real_batch_before_the_click() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+        st.field_detached_after_input = true;
+    })
+    .await;
+    let agent = Agent::bound(&f, "steps-real-unconfirmed").await;
+    let first = agent.snapshot().await;
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "type", "ref": named_ref(&first, "Reply body"), "text": "hello"},
+                {"action": "click", "ref": named_ref(&first, "Reply"), "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!(output["stop_reason"], "typing_unconfirmed");
+    assert_eq!(output["steps"].as_array().unwrap().len(), 1);
+    assert_eq!(output["steps"][0]["status"], "unconfirmed");
+    assert!(
+        recorded_calls(&f, "Runtime.callFunctionOn")
+            .iter()
+            .all(|(_, params)| !params["functionDeclaration"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("this.click()")),
+        "the button was never clicked"
+    );
+    assert_eq!(output["changes"]["kind"], "diff", "{output}");
+}
+
+#[tokio::test]
+async fn a_dialog_stops_a_real_batch_and_the_capability_resolves_it() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "steps-real-dialog").await;
+    let first = agent.snapshot().await;
+    f.state.lock().unwrap().click_opens_dialog = true;
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "click", "ref": named_ref(&first, "Reply"), "input_route": "dom_event"},
+                {"action": "click", "ref": named_ref(&first, "Archive item 0"), "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(1), &json!("javascript_dialog_open")));
+    let dialog_id = output["changes"]["dialog"]["dialog_id"].as_str().unwrap().to_owned();
+    let accepted = agent
+        .call("browser_dialog", json!({ "action": "accept", "dialog_id": dialog_id }))
+        .await;
+    assert_eq!(accepted["status"], "ok", "{accepted}");
+}
+
+#[cfg(feature = "yaml")]
+#[tokio::test]
+async fn every_step_and_read_of_a_batch_is_admitted_as_its_own_tool() {
+    use crate::authorization::PermissionMode;
+    use crate::session_authorization::{SessionAuthorizationRegistry, SessionModeCeiling};
+    // One runtime, so a session keeps its binding when its manifest narrows.
+    let runtime = SessionAuthorizationRegistry::with_ceiling(
+        SessionModeCeiling::for_trusted_sessions(
+            [PermissionMode::Bounded],
+            false,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::from_secs(30),
+        )
+        .unwrap(),
+    );
+    let allowing = |tools: &str| {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("manifest.yaml");
+        std::fs::write(
+            &path,
+            format!(
+                "version: 3\nexpires_after: 1h\nidle_timeout: 30m\nallow:\n  tools: [{tools}]\n\
+                 resources:\n  desktop:\n    windows:\n      - pid: 1\n        window_id: 7\n  \
+                 browser:\n    origins: [\"https://fixture.test\"]\n"
+            ),
+        )
+        .unwrap();
+        let manifest = Arc::new(crate::session_manifest::load_manifest(&path).unwrap());
+        runtime
+            .compatibility_context(PermissionMode::Bounded, Some(manifest))
+            .unwrap()
+    };
+    let everything = "get_browser_state, browser_steps, browser_click, browser_type";
+
+    // The batch tool is allowed, typing is not: the typing step is refused
+    // exactly as a browser_type call would be, and nothing after it runs.
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.field_value = Some(String::new());
+    })
+    .await;
+    let mut agent = Agent::bound_as(&f, "steps-no-type", allowing(everything)).await;
+    let first = agent.snapshot().await;
+    assert_eq!(first["status"], "ok", "{first}");
+    agent.context = allowing("get_browser_state, browser_steps, browser_click");
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "click", "ref": named_ref(&first, "Reply"), "input_route": "dom_event"},
+                {"action": "type", "ref": named_ref(&first, "Reply body"), "text": "hello"},
+                {"action": "click", "ref": named_ref(&first, "Archive item 0"), "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(2), &json!("step_failed")));
+    assert_eq!(output["steps"][0]["status"], "ok", "{output}");
+    assert_eq!(output["steps"][1]["code"], "permission_denied", "{output}");
+    assert!(output["steps"][1].get("retryable").is_none(), "nothing was typed");
+    assert!(recorded_calls(&f, "Input.insertText").is_empty());
+    assert_eq!(output["steps"].as_array().unwrap().len(), 2);
+    assert_eq!(output["changes"]["kind"], "diff", "reading is allowed here: {output}");
+
+    // Steps and clicks allowed, reading not: a step aimed by role and name
+    // cannot be aimed, and what the batch changed cannot be told. No read
+    // slips through because it happened inside a batch.
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let mut agent = Agent::bound_as(&f, "steps-no-read", allowing(everything)).await;
+    let first = agent.snapshot().await;
+    let reply = named_ref(&first, "Reply");
+    agent.context = allowing("browser_steps, browser_click");
+    let trees = recorded_calls(&f, "Accessibility.getFullAXTree").len();
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "click", "ref": reply, "input_route": "dom_event"},
+                {"action": "click", "role": "button", "name": "Archive item 0", "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!(output["steps"][0]["status"], "ok", "{output}");
+    assert_eq!(output["steps"][1]["code"], "permission_denied", "{output}");
+    assert_eq!(output["changes"]["kind"], "unavailable", "{output}");
+    assert_eq!(output["changes"]["reason"], "permission_denied");
+    assert_eq!(
+        recorded_calls(&f, "Accessibility.getFullAXTree").len(),
+        trees,
+        "the page was not read at all"
+    );
+
+    // And the batch tool itself is a tool like any other.
+    agent.context = allowing("get_browser_state, browser_click, browser_type");
+    let refused = agent
+        .call("browser_steps", json!({ "steps": [{"action": "click", "ref": reply}] }))
+        .await;
+    assert_eq!(refused["refusal"]["code"], "permission_denied", "{refused}");
+}
+
+#[tokio::test]
+async fn a_step_that_navigates_stops_the_batch_and_the_result_is_the_new_page() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "steps-real-navigation").await;
+    let first = agent.snapshot().await;
+    {
+        let mut state = f.state.lock().unwrap();
+        state.click_navigates = Some("L_MAIN_2".into());
+        state.renamed.insert(2000, "The next page".into());
+    }
+    let output = agent
+        .call(
+            "browser_steps",
+            json!({ "steps": [
+                {"action": "click", "ref": named_ref(&first, "Reply"), "input_route": "dom_event"},
+                // On the new page there is a button of this name too; the
+                // step was planned against the old one and must not reach it.
+                {"action": "click", "role": "button", "name": "Archive item 0", "input_route": "dom_event"},
+            ]}),
+        )
+        .await;
+    assert_eq!(output["status"], "stopped", "{output}");
+    assert_eq!((&output["stopped_at"], &output["stop_reason"]), (&json!(2), &json!("document_changed")));
+    assert_eq!(output["steps"].as_array().unwrap().len(), 1);
+    let clicks = recorded_calls(&f, "Runtime.callFunctionOn")
+        .iter()
+        .filter(|(_, params)| params["functionDeclaration"].as_str().unwrap_or_default().contains("this.click()"))
+        .count();
+    assert_eq!(clicks, 1, "only the first step clicked");
+    let changes = &output["changes"];
+    assert_eq!(changes["kind"], "snapshot", "{output}");
+    assert_eq!(changes["reason"], "document_changed");
+    assert!(changes["outline"].as_str().unwrap().contains("The next page"));
+    assert_ne!(changes["snapshot_id"], first["snapshot"]["id"]);
+}
+
+#[tokio::test]
+async fn a_single_click_that_navigates_returns_the_new_page_not_a_diff_of_the_old() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-click-navigates").await;
+    let first = agent.snapshot().await;
+    f.state.lock().unwrap().click_navigates = Some("L_MAIN_2".into());
+    let clicked = agent
+        .call("browser_click", json!({ "ref": named_ref(&first, "Reply"), "input_route": "dom_event" }))
+        .await;
+    assert_eq!(clicked["changes"]["kind"], "snapshot", "{clicked}");
+    assert_eq!(clicked["changes"]["reason"], "document_changed");
 }

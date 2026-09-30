@@ -1438,6 +1438,520 @@ const FfiConverterTypeBoundsExpectation = (() => {
     return new FFIConverter();
 })();
 
+export enum BrowserStepAction {
+    Click,
+    Type
+}
+
+const FfiConverterTypeBrowserStepAction = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = BrowserStepAction;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return BrowserStepAction.Click;
+                case 2: return BrowserStepAction.Type;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case BrowserStepAction.Click: return ordinalConverter.write(1, into);
+                case BrowserStepAction.Type: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export enum BrowserStepRoute {
+    Trusted,
+    DomEvent
+}
+
+const FfiConverterTypeBrowserStepRoute = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = BrowserStepRoute;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return BrowserStepRoute.Trusted;
+                case 2: return BrowserStepRoute.DomEvent;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case BrowserStepRoute.Trusted: return ordinalConverter.write(1, into);
+                case BrowserStepRoute.DomEvent: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+/**
+ * What must hold once a step has settled: some element with this role,
+ * exact name and/or text (or, with `present: false`, none).
+ */
+export type BrowserStepExpect = {
+    role?: string,
+    /**
+     * Exact accessible name.
+     */
+    name?: string,
+    /**
+     * Text contained in the element's name or value.
+     */
+    text?: string,
+    /**
+     * `false`: no such element may be there. Default true.
+     */
+    present: boolean
+}
+
+/**
+ * Generated factory for {@link BrowserStepExpect} record objects.
+ */
+export const BrowserStepExpect = (() => {
+    const defaults = () => ({
+        role: undefined,
+        name: undefined,
+        text: undefined,
+        present: true
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStepExpect, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStepExpect>,
+    });
+})();
+
+const FfiConverterTypeBrowserStepExpect = (() => {
+    type TypeName = BrowserStepExpect;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                role: FfiConverterOptionalString.read(from),
+                name: FfiConverterOptionalString.read(from),
+                text: FfiConverterOptionalString.read(from),
+                present: FfiConverterBool.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterOptionalString.write(value.role, into);
+            FfiConverterOptionalString.write(value.name, into);
+            FfiConverterOptionalString.write(value.text, into);
+            FfiConverterBool.write(value.present, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterOptionalString.allocationSize(value.role) +
+             FfiConverterOptionalString.allocationSize(value.name) +
+             FfiConverterOptionalString.allocationSize(value.text) +
+             FfiConverterBool.allocationSize(value.present);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * One step. Target it with `ref`, or with `role` and `name` (matched
+ * exactly against the live page when the step runs).
+ */
+export type BrowserStep = {
+    action: BrowserStepAction,
+    /**
+     * Page ref from an outline.
+     */
+    reference?: string,
+    /**
+     * With name, instead of ref.
+     */
+    role?: string,
+    name?: string,
+    /**
+     * type: the text.
+     */
+    text?: string,
+    /**
+     * type: replace the field's content instead of appending.
+     */
+    replace?: boolean,
+    /**
+     * click: trusted (default) or dom_event (ref or role and name).
+     */
+    inputRoute?: BrowserStepRoute,
+    /**
+     * Checked after the step; the batch stops when it does not hold.
+     */
+    expect?: BrowserStepExpect
+}
+
+/**
+ * Generated factory for {@link BrowserStep} record objects.
+ */
+export const BrowserStep = (() => {
+    const defaults = () => ({
+        reference: undefined,
+        role: undefined,
+        name: undefined,
+        text: undefined,
+        replace: undefined,
+        inputRoute: undefined,
+        expect: undefined
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStep, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStep>,
+    });
+})();
+
+const FfiConverterTypeBrowserStep = (() => {
+    type TypeName = BrowserStep;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                action: FfiConverterTypeBrowserStepAction.read(from),
+                reference: FfiConverterOptionalString.read(from),
+                role: FfiConverterOptionalString.read(from),
+                name: FfiConverterOptionalString.read(from),
+                text: FfiConverterOptionalString.read(from),
+                replace: FfiConverterOptionalBoolean.read(from),
+                inputRoute: FfiConverterOptionalTypeBrowserStepRoute.read(from),
+                expect: FfiConverterOptionalTypeBrowserStepExpect.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeBrowserStepAction.write(value.action, into);
+            FfiConverterOptionalString.write(value.reference, into);
+            FfiConverterOptionalString.write(value.role, into);
+            FfiConverterOptionalString.write(value.name, into);
+            FfiConverterOptionalString.write(value.text, into);
+            FfiConverterOptionalBoolean.write(value.replace, into);
+            FfiConverterOptionalTypeBrowserStepRoute.write(value.inputRoute, into);
+            FfiConverterOptionalTypeBrowserStepExpect.write(value.expect, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeBrowserStepAction.allocationSize(value.action) +
+             FfiConverterOptionalString.allocationSize(value.reference) +
+             FfiConverterOptionalString.allocationSize(value.role) +
+             FfiConverterOptionalString.allocationSize(value.name) +
+             FfiConverterOptionalString.allocationSize(value.text) +
+             FfiConverterOptionalBoolean.allocationSize(value.replace) +
+             FfiConverterOptionalTypeBrowserStepRoute.allocationSize(value.inputRoute) +
+             FfiConverterOptionalTypeBrowserStepExpect.allocationSize(value.expect);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+/**
+ * How one step ended.
+ *
+ * - `ok`: it ran and nothing says it failed.
+ * - `unconfirmed`: text was typed, but the field could not be read back as
+ * holding it.
+ * - `failed`: refused, errored, no single target, or its expect did not hold.
+ */
+export enum BrowserStepStatus {
+    Ok,
+    Unconfirmed,
+    Failed
+}
+
+const FfiConverterTypeBrowserStepStatus = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = BrowserStepStatus;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return BrowserStepStatus.Ok;
+                case 2: return BrowserStepStatus.Unconfirmed;
+                case 3: return BrowserStepStatus.Failed;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case BrowserStepStatus.Ok: return ordinalConverter.write(1, into);
+                case BrowserStepStatus.Unconfirmed: return ordinalConverter.write(2, into);
+                case BrowserStepStatus.Failed: return ordinalConverter.write(3, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export type BrowserStepOutcome = {
+    status: BrowserStepStatus,
+    /**
+     * The ref the step acted on: the one given, or the one its role and
+     * name resolved to.
+     */
+    reference?: string,
+    /**
+     * The effect the step's tool reported: confirmed, unverifiable, partial,
+     * mismatch, refused.
+     */
+    effect?: string,
+    /**
+     * Not ok: the tool's refusal or error code, or `target_not_found`,
+     * `target_ambiguous`, `coverage_incomplete`, `expectation_unmet`.
+     */
+    code?: string,
+    /**
+     * What the step's tool said: the field's read-back, or the refusal.
+     */
+    detail?: string,
+    /**
+     * Characters delivered when typing stopped part way.
+     */
+    deliveredCount?: number,
+    /**
+     * `false`: input may have reached the page. Read the page before
+     * sending the step again.
+     */
+    retryable?: boolean,
+    /**
+     * The outline lines that matched the step's role and name, when it was
+     * not exactly one (or the nearest ones when there was none).
+     */
+    candidates?: Array<string>
+}
+
+/**
+ * Generated factory for {@link BrowserStepOutcome} record objects.
+ */
+export const BrowserStepOutcome = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStepOutcome, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStepOutcome>,
+    });
+})();
+
+const FfiConverterTypeBrowserStepOutcome = (() => {
+    type TypeName = BrowserStepOutcome;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                status: FfiConverterTypeBrowserStepStatus.read(from),
+                reference: FfiConverterOptionalString.read(from),
+                effect: FfiConverterOptionalString.read(from),
+                code: FfiConverterOptionalString.read(from),
+                detail: FfiConverterOptionalString.read(from),
+                deliveredCount: FfiConverterOptionalUInt32.read(from),
+                retryable: FfiConverterOptionalBoolean.read(from),
+                candidates: FfiConverterOptionalSequenceString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeBrowserStepStatus.write(value.status, into);
+            FfiConverterOptionalString.write(value.reference, into);
+            FfiConverterOptionalString.write(value.effect, into);
+            FfiConverterOptionalString.write(value.code, into);
+            FfiConverterOptionalString.write(value.detail, into);
+            FfiConverterOptionalUInt32.write(value.deliveredCount, into);
+            FfiConverterOptionalBoolean.write(value.retryable, into);
+            FfiConverterOptionalSequenceString.write(value.candidates, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeBrowserStepStatus.allocationSize(value.status) +
+             FfiConverterOptionalString.allocationSize(value.reference) +
+             FfiConverterOptionalString.allocationSize(value.effect) +
+             FfiConverterOptionalString.allocationSize(value.code) +
+             FfiConverterOptionalString.allocationSize(value.detail) +
+             FfiConverterOptionalUInt32.allocationSize(value.deliveredCount) +
+             FfiConverterOptionalBoolean.allocationSize(value.retryable) +
+             FfiConverterOptionalSequenceString.allocationSize(value.candidates);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+export type BrowserStepsInput = {
+    /**
+     * Target id from get_browser_state.
+     */
+    targetId: string,
+    /**
+     * Tab id from get_browser_state.
+     */
+    tabId: string,
+    session?: string,
+    /**
+     * 1 to 8 steps, run in order.
+     */
+    steps: Array<BrowserStep>
+}
+
+/**
+ * Generated factory for {@link BrowserStepsInput} record objects.
+ */
+export const BrowserStepsInput = (() => {
+    const defaults = () => ({
+        session: undefined,
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStepsInput, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStepsInput>,
+    });
+})();
+
+const FfiConverterTypeBrowserStepsInput = (() => {
+    type TypeName = BrowserStepsInput;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                targetId: FfiConverterString.read(from),
+                tabId: FfiConverterString.read(from),
+                session: FfiConverterOptionalString.read(from),
+                steps: FfiConverterSequenceTypeBrowserStep.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.targetId, into);
+            FfiConverterString.write(value.tabId, into);
+            FfiConverterOptionalString.write(value.session, into);
+            FfiConverterSequenceTypeBrowserStep.write(value.steps, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.targetId) +
+             FfiConverterString.allocationSize(value.tabId) +
+             FfiConverterOptionalString.allocationSize(value.session) +
+             FfiConverterSequenceTypeBrowserStep.allocationSize(value.steps);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
+export enum BrowserStepsStatus {
+    Completed,
+    Stopped
+}
+
+const FfiConverterTypeBrowserStepsStatus = (() => {
+    const ordinalConverter = FfiConverterInt32;
+    type TypeName = BrowserStepsStatus;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            switch (ordinalConverter.read(from)) {
+                case 1: return BrowserStepsStatus.Completed;
+                case 2: return BrowserStepsStatus.Stopped;
+                default: throw new UniffiInternalError.UnexpectedEnumCase();
+            }
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            switch (value) {
+                case BrowserStepsStatus.Completed: return ordinalConverter.write(1, into);
+                case BrowserStepsStatus.Stopped: return ordinalConverter.write(2, into);
+            }
+        }
+        allocationSize(value: TypeName): number {
+            return ordinalConverter.allocationSize(0);
+        }
+    }
+    return new FFIConverter();
+})();
+
+export type BrowserStepsOutput = {
+    status: BrowserStepsStatus,
+    /**
+     * The steps that ran, in order.
+     */
+    steps: Array<BrowserStepOutcome>,
+    /**
+     * 1-based index of the step the batch stopped at: the one that failed,
+     * or the first one not run.
+     */
+    stoppedAt?: number,
+    /**
+     * `step_failed`, `typing_unconfirmed`, `javascript_dialog_open`,
+     * `document_changed`, `origin_changed`.
+     */
+    stopReason?: string,
+    /**
+     * What the page changed over the whole batch.
+     */
+    changes?: PageChanges
+}
+
+/**
+ * Generated factory for {@link BrowserStepsOutput} record objects.
+ */
+export const BrowserStepsOutput = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<BrowserStepsOutput, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<BrowserStepsOutput>,
+    });
+})();
+
+const FfiConverterTypeBrowserStepsOutput = (() => {
+    type TypeName = BrowserStepsOutput;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                status: FfiConverterTypeBrowserStepsStatus.read(from),
+                steps: FfiConverterSequenceTypeBrowserStepOutcome.read(from),
+                stoppedAt: FfiConverterOptionalUInt32.read(from),
+                stopReason: FfiConverterOptionalString.read(from),
+                changes: FfiConverterOptionalTypePageChanges.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterTypeBrowserStepsStatus.write(value.status, into);
+            FfiConverterSequenceTypeBrowserStepOutcome.write(value.steps, into);
+            FfiConverterOptionalUInt32.write(value.stoppedAt, into);
+            FfiConverterOptionalString.write(value.stopReason, into);
+            FfiConverterOptionalTypePageChanges.write(value.changes, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterTypeBrowserStepsStatus.allocationSize(value.status) +
+             FfiConverterSequenceTypeBrowserStepOutcome.allocationSize(value.steps) +
+             FfiConverterOptionalUInt32.allocationSize(value.stoppedAt) +
+             FfiConverterOptionalString.allocationSize(value.stopReason) +
+             FfiConverterOptionalTypePageChanges.allocationSize(value.changes);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 
 // Enum: ActionTarget
 export enum ActionTarget_Tags {
@@ -7482,6 +7996,18 @@ const FfiConverterOptionalTypePageChanges = new FfiConverterOptional(FfiConverte
 // FfiConverter for number | undefined
 const FfiConverterOptionalFloat64 = new FfiConverterOptional(FfiConverterFloat64);
 
+// FfiConverter for BrowserStepRoute | undefined
+const FfiConverterOptionalTypeBrowserStepRoute = new FfiConverterOptional(FfiConverterTypeBrowserStepRoute);
+
+// FfiConverter for BrowserStepExpect | undefined
+const FfiConverterOptionalTypeBrowserStepExpect = new FfiConverterOptional(FfiConverterTypeBrowserStepExpect);
+
+// FfiConverter for Array<BrowserStep>
+const FfiConverterSequenceTypeBrowserStep = new FfiConverterArray(FfiConverterTypeBrowserStep);
+
+// FfiConverter for Array<BrowserStepOutcome>
+const FfiConverterSequenceTypeBrowserStepOutcome = new FfiConverterArray(FfiConverterTypeBrowserStepOutcome);
+
 // FfiConverter for ClickButton | undefined
 const FfiConverterOptionalTypeClickButton = new FfiConverterOptional(FfiConverterTypeClickButton);
 
@@ -7649,6 +8175,15 @@ export default Object.freeze({
     FfiConverterTypeActionTarget,
     FfiConverterTypeAppInfo,
     FfiConverterTypeBoundsExpectation,
+    FfiConverterTypeBrowserStep,
+    FfiConverterTypeBrowserStepAction,
+    FfiConverterTypeBrowserStepExpect,
+    FfiConverterTypeBrowserStepOutcome,
+    FfiConverterTypeBrowserStepRoute,
+    FfiConverterTypeBrowserStepStatus,
+    FfiConverterTypeBrowserStepsInput,
+    FfiConverterTypeBrowserStepsOutput,
+    FfiConverterTypeBrowserStepsStatus,
     FfiConverterTypeCaptureScope,
     FfiConverterTypeClickButton,
     FfiConverterTypeClickInput,

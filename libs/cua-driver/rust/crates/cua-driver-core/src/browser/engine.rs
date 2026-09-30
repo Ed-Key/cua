@@ -3251,13 +3251,36 @@ impl BrowserEngine {
         }
     }
 
+    /// Start watching a tab before an action is sent, so a navigation the
+    /// action sets off is seen when it starts, not only once the new
+    /// document has replaced the old. `None` when the browser reports no
+    /// frame tree: then a new document is only noticed when the old one's
+    /// script context goes away.
+    pub(crate) async fn page_watch(&self, validated: &ValidatedTab) -> Option<PageWatch> {
+        // Subscribed first: nothing between here and the action is missed.
+        let events = validated.conn.subscribe();
+        let tree = self
+            .local_frame_tree(&validated.conn, &validated.cdp_session)
+            .await
+            .ok()?;
+        Some(PageWatch {
+            events,
+            main: tree.main_identity(),
+            navigating: false,
+        })
+    }
+
     /// Wait, within bounds, until the page has stopped changing after an
     /// action: two quiet polls of a mutation counter in a row, the deadline,
     /// a new document, or a JavaScript dialog. The counter lives in a page
     /// object only this session can reach; nothing is left for page script
     /// to find, and no page timer is used (timers are throttled in covered
     /// and background tabs).
-    pub(crate) async fn settle(&self, validated: &ValidatedTab) -> Settled {
+    pub(crate) async fn settle(
+        &self,
+        validated: &ValidatedTab,
+        mut watch: Option<PageWatch>,
+    ) -> Settled {
         let conn = &validated.conn;
         let cdp = validated.cdp_session.as_str();
         let target = validated.tab.cdp_target_id.as_str();
@@ -3265,6 +3288,11 @@ impl BrowserEngine {
         let dialog = || conn.dialog_state(target).map(Settled::Dialog);
         if let Some(open) = dialog() {
             return open;
+        }
+        let main = watch.as_ref().map(|watch| watch.main.clone());
+        let mut navigating = move || watch.as_mut().is_some_and(PageWatch::navigating);
+        if navigating() {
+            return self.await_document(validated, main.as_ref(), started).await;
         }
         let bounded = |method: &'static str, params: Value| async move {
             tokio::time::timeout(SETTLE_CALL_TIMEOUT, conn.call(Some(cdp), method, params)).await
@@ -3281,7 +3309,7 @@ impl BrowserEngine {
                 .map(str::to_owned),
             // The document is being replaced under the call.
             Ok(Err(error)) if is_context_gone(&error) => {
-                return self.await_document(validated, started).await
+                return self.await_document(validated, main.as_ref(), started).await
             }
             // The page cannot run the counter: nothing says it settled.
             Ok(Err(_)) => return Settled::Deadline,
@@ -3291,7 +3319,7 @@ impl BrowserEngine {
         let Some(counter) = counter else {
             return match dialog() {
                 Some(open) => open,
-                None => self.await_document(validated, started).await,
+                None => self.await_document(validated, main.as_ref(), started).await,
             };
         };
         let mut quiet = 0;
@@ -3299,6 +3327,10 @@ impl BrowserEngine {
             tokio::time::sleep(SETTLE_POLL).await;
             if let Some(open) = dialog() {
                 return open;
+            }
+            // A page at rest that is about to be replaced has not settled.
+            if navigating() {
+                return self.await_document(validated, main.as_ref(), started).await;
             }
             match bounded(
                 "Runtime.callFunctionOn",
@@ -3324,10 +3356,10 @@ impl BrowserEngine {
                     }
                     Some(_) => quiet = 0,
                     // The counter is gone with its document.
-                    None => return self.await_document(validated, started).await,
+                    None => return self.await_document(validated, main.as_ref(), started).await,
                 },
                 // The counter's document was replaced.
-                Ok(Err(_)) => return self.await_document(validated, started).await,
+                Ok(Err(_)) => return self.await_document(validated, main.as_ref(), started).await,
                 // No answer in time: a dialog shows up at the next poll.
                 Err(_) => {}
             }
@@ -3340,45 +3372,67 @@ impl BrowserEngine {
         Settled::Deadline
     }
 
-    /// A new document is loading: wait, within bounds, until it has loaded.
+    /// A new document is on its way: wait, within bounds, until it has
+    /// replaced `old` (the main frame's document before the action, when
+    /// known) and has loaded. When `old` is still there at the deadline the
+    /// navigation did not happen, and the page is simply not settled.
     pub(crate) async fn await_document(
         &self,
         validated: &ValidatedTab,
+        old: Option<&FrameIdentity>,
         started: tokio::time::Instant,
     ) -> Settled {
         let conn = &validated.conn;
         let target = validated.tab.cdp_target_id.as_str();
+        let mut replaced = old.is_none();
         while started.elapsed() < NAVIGATION_DEADLINE {
             if let Some(dialog) = conn.dialog_state(target) {
                 return Settled::Dialog(dialog);
             }
-            let ready = tokio::time::timeout(
-                SETTLE_CALL_TIMEOUT,
-                conn.call(
-                    Some(&validated.cdp_session),
-                    "Runtime.evaluate",
-                    json!({ "expression": "document.readyState", "returnByValue": true }),
-                ),
-            )
-            .await;
-            match ready {
-                Ok(Ok(value))
-                    if value.pointer("/result/value").and_then(Value::as_str)
-                        == Some("complete") =>
-                {
-                    // One beat for scripts that render on load.
-                    tokio::time::sleep(SETTLE_POLL * 2).await;
-                    return Settled::NewDocument { loaded: true };
+            if !replaced {
+                let tree = tokio::time::timeout(
+                    SETTLE_CALL_TIMEOUT,
+                    self.local_frame_tree(conn, &validated.cdp_session),
+                )
+                .await;
+                replaced = matches!(
+                    (&tree, old),
+                    (Ok(Ok(tree)), Some(old)) if tree.main_identity() != *old
+                );
+            }
+            if replaced {
+                let ready = tokio::time::timeout(
+                    SETTLE_CALL_TIMEOUT,
+                    conn.call(
+                        Some(&validated.cdp_session),
+                        "Runtime.evaluate",
+                        json!({ "expression": "document.readyState", "returnByValue": true }),
+                    ),
+                )
+                .await;
+                match ready {
+                    Ok(Ok(value))
+                        if value.pointer("/result/value").and_then(Value::as_str)
+                            == Some("complete") =>
+                    {
+                        // One beat for scripts that render on load.
+                        tokio::time::sleep(SETTLE_POLL * 2).await;
+                        return Settled::NewDocument { loaded: true };
+                    }
+                    // Still loading, between documents, or slow: ask again.
+                    Ok(Ok(_)) | Err(_) => {}
+                    Ok(Err(error)) if is_context_gone(&error) => {}
+                    // The page cannot be asked at all.
+                    Ok(Err(_)) => break,
                 }
-                // Still loading, between documents, or slow: ask again.
-                Ok(Ok(_)) | Err(_) => {}
-                Ok(Err(error)) if is_context_gone(&error) => {}
-                // The page cannot be asked at all.
-                Ok(Err(_)) => break,
             }
             tokio::time::sleep(SETTLE_POLL).await;
         }
-        Settled::NewDocument { loaded: false }
+        if replaced {
+            Settled::NewDocument { loaded: false }
+        } else {
+            Settled::Deadline
+        }
     }
 
     /// What the session holds for this tab: the baseline revision of its
@@ -3403,6 +3457,44 @@ impl BrowserEngine {
 fn is_context_gone(error: &anyhow::Error) -> bool {
     let message = error.to_string().to_ascii_lowercase();
     message.contains("context") || message.contains("inspected target navigated")
+}
+
+/// One tab watched from before an action: its main frame's document then,
+/// and the connection's events since.
+pub(crate) struct PageWatch {
+    events: tokio::sync::mpsc::UnboundedReceiver<super::cdp_ws::CdpEvent>,
+    main: FrameIdentity,
+    navigating: bool,
+}
+
+impl PageWatch {
+    /// Whether the main frame has started to load another document since
+    /// the watch began. Child frames, new tabs and same-document history
+    /// changes do not count.
+    fn navigating(&mut self) -> bool {
+        while let Ok(event) = self.events.try_recv() {
+            let frame = match event.method.as_str() {
+                "Page.frameRequestedNavigation"
+                    if event
+                        .params
+                        .get("disposition")
+                        .and_then(Value::as_str)
+                        .is_none_or(|disposition| disposition == "currentTab") =>
+                {
+                    event.params.get("frameId")
+                }
+                "Page.frameScheduledNavigation" | "Page.frameStartedLoading" => {
+                    event.params.get("frameId")
+                }
+                "Page.frameNavigated" => event.params.pointer("/frame/id"),
+                _ => None,
+            };
+            if frame.and_then(Value::as_str) == Some(self.main.frame_id.as_str()) {
+                self.navigating = true;
+            }
+        }
+        self.navigating
+    }
 }
 
 /// How a bounded wait for the page ended.

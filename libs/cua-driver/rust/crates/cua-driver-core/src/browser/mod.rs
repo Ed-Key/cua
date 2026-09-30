@@ -56,9 +56,12 @@ mod reconnect;
 pub mod refusal;
 mod semantic;
 mod setup_descriptor;
+mod steps;
 pub mod store;
 pub mod tools;
 pub mod types;
+#[cfg(test)]
+mod steps_tests;
 #[cfg(test)]
 mod v2_tests;
 

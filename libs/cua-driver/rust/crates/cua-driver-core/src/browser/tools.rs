@@ -22,7 +22,7 @@ use super::cdp_ws::{CdpConnection, CdpDialogState};
 use super::download::BrowserDownloadTool;
 use super::engine::{
     dialog_id, dialog_open_refusal, BrowserEngine, BrowserTabScreenshot, CallStopped, HeldView,
-    SemanticSnapshotOutcome, Settled, ValidatedTab,
+    PageWatch, SemanticSnapshotOutcome, Settled, ValidatedTab,
 };
 use super::observation::{DiffOp, FullReason, Told};
 use super::platform::{BrowserVisualActionKind, PrepareProfile, PrepareRequest, PrepareStrategy};
@@ -49,7 +49,14 @@ pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRe
         engine.clone(),
         slot.clone(),
     )));
-    registry.register(Box::new(BrowserTypeTool::with_registry(engine.clone(), slot)));
+    registry.register(Box::new(BrowserTypeTool::with_registry(
+        engine.clone(),
+        slot.clone(),
+    )));
+    registry.register(Box::new(super::steps::BrowserStepsTool::new(
+        engine.clone(),
+        slot,
+    )));
     registry.register(Box::new(BrowserDialogTool::new(engine.clone())));
     registry.register(Box::new(BrowserSetInputFilesTool::new(engine.clone())));
     registry.register(Box::new(BrowserDownloadTool::new(engine.clone())));
@@ -213,7 +220,7 @@ pub(crate) async fn browser_protected_resource_scope(
 
 /// The caller's own session label, for a child call through the registry
 /// (which maps it back into the runtime namespace itself).
-fn public_session(args: &Value) -> Option<String> {
+pub(crate) fn public_session(args: &Value) -> Option<String> {
     args.get("_public_session_label")
         .and_then(Value::as_str)
         .map(str::to_owned)
@@ -348,6 +355,9 @@ fn changes_value(changes: &PageChanges) -> Value {
 /// result carries no `changes`: the session works from a `dom_refs_v1`
 /// snapshot, whose refs a semantic read would end, or the tool runs outside
 /// a registry.
+// One action's tab, what its session held, and how the wait for the page
+// is to be made or has already ended.
+#[allow(clippy::too_many_arguments)]
 async fn page_changes_after(
     engine: &BrowserEngine,
     registry: &ReplayRegistrySlot,
@@ -357,6 +367,7 @@ async fn page_changes_after(
     validated: &ValidatedTab,
     held: HeldView,
     settled: Option<Settled>,
+    watch: Option<PageWatch>,
 ) -> Option<Value> {
     let dialog_changes = |dialog: &CdpDialogState| {
         Some(changes_value(&unavailable_changes(
@@ -368,17 +379,29 @@ async fn page_changes_after(
     if let Some(Settled::Dialog(dialog)) = &settled {
         return dialog_changes(dialog);
     }
-    if held == HeldView::DomRefs {
+    // As a step of browser_steps: settle, so the next step meets a page at
+    // rest, and say only what decides whether there is a next step. The
+    // batch reads the page once at its end.
+    let batch = super::steps::in_steps_batch();
+    if !batch && held == HeldView::DomRefs {
         return None;
     }
-    let registry = registry.lock().unwrap().upgrade()?;
+    let registry = if batch {
+        None
+    } else {
+        Some(registry.lock().unwrap().upgrade()?)
+    };
     let settled = match settled {
         Some(settled) => settled,
-        None => engine.settle(validated).await,
+        None => engine.settle(validated, watch).await,
     };
     if let Settled::Dialog(dialog) = &settled {
         return dialog_changes(dialog);
     }
+    let Some(registry) = registry else {
+        return matches!(settled, Settled::NewDocument { .. })
+            .then(|| changes_value(&unavailable_changes("document_changed", None)));
+    };
     let mut read = json!({
         "target_id": target_id,
         "tab_id": tab_id,
@@ -1160,9 +1183,11 @@ impl Tool for BrowserNavigateTool {
                 let changes = if held == HeldView::DomRefs {
                     None
                 } else {
+                    // Page.navigate answers once the new document has
+                    // replaced the old one.
                     let loaded = self
                         .engine
-                        .await_document(&validated, tokio::time::Instant::now())
+                        .await_document(&validated, None, tokio::time::Instant::now())
                         .await;
                     page_changes_after(
                         &self.engine,
@@ -1173,6 +1198,7 @@ impl Tool for BrowserNavigateTool {
                         &validated,
                         HeldView::Nothing,
                         Some(loaded),
+                        None,
                     )
                     .await
                 };
@@ -1368,6 +1394,8 @@ impl Tool for BrowserClickTool {
         if let Some(dialog) = validated.conn.dialog_state(cdp_target) {
             return dialog_open_refusal(&dialog).to_tool_result();
         }
+        // From before the input: a navigation it sets off is seen starting.
+        let watch = self.engine.page_watch(&validated).await;
 
         // Ref path: re-prove the ref's frame/document identity and get
         // the session (tab or contained OOPIF child) its node lives in.
@@ -1508,6 +1536,7 @@ impl Tool for BrowserClickTool {
                 &validated,
                 held,
                 opened,
+                watch,
             )
             .await;
             return with_changes(
@@ -1683,6 +1712,7 @@ impl Tool for BrowserClickTool {
             &validated,
             held,
             opened,
+            watch,
         )
         .await;
         with_changes(
@@ -2347,6 +2377,8 @@ impl Tool for BrowserTypeTool {
         if let Some(dialog) = validated.conn.dialog_state(cdp_target) {
             return dialog_open_refusal(&dialog).to_tool_result();
         }
+        // From before the input: a navigation it sets off is seen starting.
+        let watch = self.engine.page_watch(&validated).await;
 
         let ext_ref = match args.require_str("ref") {
             Ok(value) => value,
@@ -2974,6 +3006,7 @@ impl Tool for BrowserTypeTool {
             &validated,
             held,
             None,
+            watch,
         )
         .await;
         with_changes(outcome, changes)
@@ -3391,7 +3424,7 @@ impl Tool for BrowserSetInputFilesTool {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     #[test]
     fn every_browser_type_mode_has_one_postcondition() {
         use EditMode::{Insert, Replace, SetValue};
@@ -3646,7 +3679,7 @@ mod tests {
         }
     }
 
-    fn engine() -> Arc<BrowserEngine> {
+    pub(crate) fn engine() -> Arc<BrowserEngine> {
         BrowserEngine::new(Arc::new(MockPlatform))
     }
 
@@ -3856,6 +3889,7 @@ mod tests {
                 "browser_navigate",
                 "browser_click",
                 "browser_type",
+                "browser_steps",
                 "browser_dialog",
                 "browser_set_input_files",
                 "browser_download",

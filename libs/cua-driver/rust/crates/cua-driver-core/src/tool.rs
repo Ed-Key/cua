@@ -413,6 +413,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "browser_set_input_files" => &["browser.input.files"],
         "browser_download" => &["browser.download"],
         "browser_pointer" => &["browser.input.pointer"],
+        "browser_steps" => &["browser.steps"],
         "browser_tabs" => &["browser.tabs"],
 
         // ── driver self-service ──────────────────────────────────────
@@ -1600,6 +1601,8 @@ impl ToolRegistry {
                     | "replay_trajectory"
                     | "run_sequence"
                     | "act_and_read"
+                    // Its steps are recorded as the calls they are.
+                    | "browser_steps"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
         let _desktop_action = if requires_desktop_coordination(

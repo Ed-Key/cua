@@ -1527,6 +1527,53 @@ fn render_view(
     (view, values)
 }
 
+/// An outline line read back into the parts a program matches on.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct OutlineLine {
+    pub(crate) role: String,
+    pub(crate) name: Option<String>,
+    pub(crate) reference: String,
+    pub(crate) actions: Vec<String>,
+    pub(crate) value: Option<String>,
+    /// The line without its indentation.
+    pub(crate) line: String,
+}
+
+/// Read one line written by [`line_template`] (with its ref filled in).
+pub(crate) fn parse_outline_line(line: &str) -> Option<OutlineLine> {
+    fn quoted(text: &str) -> Option<(String, &str)> {
+        let mut stream = serde_json::Deserializer::from_str(text).into_iter::<String>();
+        let value = stream.next()?.ok()?;
+        Some((value, &text[stream.byte_offset()..]))
+    }
+    let trimmed = line.trim_start();
+    let (role, mut rest) = trimmed.strip_prefix("- ")?.split_once(' ')?;
+    let mut name = None;
+    if rest.starts_with('"') {
+        let (text, after) = quoted(rest)?;
+        name = Some(text);
+        rest = after.strip_prefix(' ')?;
+    }
+    let (bracket, rest) = rest.strip_prefix('[')?.split_once(']')?;
+    let (reference, actions) = bracket.split_once(' ').unwrap_or((bracket, ""));
+    let value = rest
+        .strip_prefix(" = ")
+        .and_then(quoted)
+        .map(|(value, _)| value);
+    Some(OutlineLine {
+        role: role.to_owned(),
+        name,
+        reference: reference.to_owned(),
+        actions: actions
+            .split(',')
+            .filter(|action| !action.is_empty())
+            .map(str::to_owned)
+            .collect(),
+        value,
+        line: trimmed.to_owned(),
+    })
+}
+
 /// One outline line: `- role "name" [ref actions] = "value" -> "url" (states)`.
 /// The bracket holds the ref and what it may be used for; a ref with no
 /// action there only scopes a later read.
@@ -1841,6 +1888,51 @@ mod tests {
         // node to hang a ref on.
         assert_eq!(page.omissions.no_dom_node, 1);
         assert_eq!(page.selected_nodes, 6);
+    }
+
+    #[test]
+    fn an_outline_line_reads_back_as_the_node_it_was_written_from() {
+        let page = share_form().page(0, 300, usize::MAX, None, None);
+        let outline = page.outline_with("p3:9");
+        let lines: Vec<OutlineLine> = outline.lines().filter_map(parse_outline_line).collect();
+        assert_eq!(lines.len(), outline.lines().count(), "every line parses");
+        assert_eq!(
+            (lines[0].role.as_str(), lines[0].name.as_deref(), lines[0].value.as_deref()),
+            ("textbox", Some("Email"), Some("ada@x.com"))
+        );
+        assert_eq!(lines[0].actions, vec!["type"]);
+        assert_eq!(lines[3].reference, "p3:9");
+        assert_eq!(lines[3].line, "- option \"Viewer\" [p3:9 click] (selected)", "indent dropped");
+        assert!(lines[5].actions.is_empty(), "a disabled button declares no action");
+        // A name with quotes, a bracket and a newline-free escape survives.
+        let tricky = SemanticNode {
+            name: Some("Say \"hi\" [now] = x".into()),
+            ..page_node("button")
+        };
+        let line = line_template(&tricky, 2).replace(REF_SLOT, "p1:0");
+        let parsed = parse_outline_line(&line).unwrap();
+        assert_eq!(parsed.name.as_deref(), Some("Say \"hi\" [now] = x"));
+        assert_eq!(parsed.reference, "p1:0");
+        assert_eq!(parse_outline_line("not an outline line"), None);
+    }
+
+    fn page_node(role: &str) -> SemanticNode {
+        SemanticNode {
+            ax_id: "n".into(),
+            parent_ax_id: None,
+            child_ax_ids: Vec::new(),
+            backend_node_id: Some(1),
+            role: role.into(),
+            name: None,
+            root_title: None,
+            value: None,
+            url: None,
+            states: BTreeMap::new(),
+            frame: frame(),
+            visibility: BrowserVisibility::InViewport,
+            actions: vec![BrowserActionKind::Click],
+            document_order: 0,
+        }
     }
 
     #[test]
