@@ -73,13 +73,15 @@
 //! The front card takes its window's proportions, whatever they are: the
 //! window's size (from each capture and the visibility poll) fitted into the
 //! panel's size box (`stack::card_shape`), which is the default card size or
-//! what the user resized the panel to. A tall window gives a tall card, a
-//! wide one a wide card, and the picture fills it edge to edge. The box's
-//! bottom-right corner (the panel's cascade slot, or where it was dragged)
-//! is the card's anchor: when the target window changes, or its size does,
-//! the card glides to its new shape up and left of that corner and the back
-//! items follow its top-left. The window itself stays sized for the box, so
-//! placement never moves. Past 2.2:1 either way the card is clamped and the
+//! what the user resized the panel to. The box is orientation-neutral: it
+//! gives the card's longest side and its area, so a tall window gives a
+//! tall card as roomy as a wide window's wide one, and the picture fills it
+//! edge to edge. The window is sized for the square that holds any such
+//! card, and that square's bottom-right corner (the panel's cascade slot,
+//! or where it was dragged) is the card's anchor: when the target window
+//! changes, or its size does, the card glides to its new shape up and left
+//! of that corner and the back items follow its top-left. The window itself
+//! never changes with the shape, so placement never moves. Past 2.2:1 either way the card is clamped and the
 //! picture keeps its own shape inside it, over a blurred backdrop. The live
 //! stream is sized for the picture, so it is never padded.
 //!
@@ -152,8 +154,8 @@ use finish::{
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
-    back_cards, bar_frame, bar_layout, card_shape, card_size, deck_size, item_at, max_card,
-    own_pixels, panel_point, press_edges, pressed_item, resize_settled, resize_window,
+    back_cards, bar_frame, bar_layout, card_shape, deck_size, hold, item_at, max_card,
+    own_pixels, panel_point, press_edges, pressed_item, resize_panel, resize_settled,
     shaped_frame, slot_frame, to_window,
     window_origin, window_size, CardStack, Motion, Slot, Trail, BAR_BUTTON, BAR_FADE_IN,
     BAR_FADE_OUT, CHIP_REACH, DRAG_SLOP, GLASS_SPACING, MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, VIEWS,
@@ -525,11 +527,14 @@ struct Panel {
     /// Private session key (for logs from callbacks that only have the
     /// panel).
     key: String,
-    /// The panel's size box in points: the largest front card (the default
-    /// size, or what the user resized it to). The window is sized for it.
+    /// The panel's size box in points (the default size, or what the user
+    /// resized it to): it gives the front card's longest side and its area,
+    /// whichever way the card is turned. The window is sized for the square
+    /// that holds any such card (`stack::hold`).
     card: (f64, f64),
-    /// Front card size as drawn: the target window's shape fitted into the
-    /// box (`stack::card_shape`), its bottom-right corner on the box's.
+    /// Front card size as drawn: the target window's shape at the size the
+    /// box allows (`stack::card_shape`), its bottom-right corner on that
+    /// square's.
     front: (f64, f64),
     /// Size of the displayed window, as far as it is known.
     shape: Option<(f64, f64)>,
@@ -622,9 +627,10 @@ struct Remembered {
 struct Gesture {
     /// The pressed panel's id (it may be a live or an ending panel).
     id: i64,
-    /// Pointer (screen points) and window frame at the press.
+    /// Pointer (screen points), window frame and size box at the press.
     mouse: (f64, f64),
     start: Area,
+    start_card: (f64, f64),
     /// Window origin after the last drag step.
     origin: (f64, f64),
     /// Front card edges being resized (0 = not a resize).
@@ -1455,7 +1461,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
 /// Resting frame of `slot` with the front card as it is drawn now (the
 /// size box fitted to the displayed window's shape).
 fn resting(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
-    shaped_frame(panel.card, panel.front, slot, back_cards)
+    shaped_frame(hold(panel.card), panel.front, slot, back_cards)
 }
 
 /// Size of the picture in the front card's well: the window's own
@@ -1508,11 +1514,37 @@ unsafe fn set_shape(panel: &mut Panel, shape: Option<(f64, f64)>) -> bool {
             panel.motion = Default::default();
         }
         apply_card_frames(panel);
-        // `window=(0.0, 0.0)`: not known.
-        tracing::info!(target: "pip", session = %panel.key, card = ?front, bounds = ?panel.card, window = ?shape.unwrap_or_default(), "PiP card shape");
+        log_shape(panel);
     }
     panel.stream_well = picture_size(panel);
     true
+}
+
+/// Log the front card's size, the size box and the window's size
+/// (`window=(0.0, 0.0)`: not known), for checks.
+fn log_shape(panel: &Panel) {
+    tracing::info!(target: "pip", session = %panel.key, card = ?panel.front, bounds = ?panel.card, window = ?panel.shape.unwrap_or_default(), "PiP card shape");
+}
+
+/// The user resized the panel: `card` is its size box now, and the front
+/// card takes its window's shape in it. The caller sets the window's frame
+/// and lays the cards out; the live stream follows once the size settles.
+fn set_box(panel: &mut Panel, card: (f64, f64)) {
+    if card == panel.card {
+        return;
+    }
+    panel.card = card;
+    panel.front = card_shape(card, panel.shape);
+    // A panel the user sized stays where they put it, like a dragged one.
+    panel.resized = true;
+    panel.dragged = true;
+    panel.slot = None;
+    panel.well_changed = Instant::now();
+    dispatch_to_main_after(
+        RESIZE_DEBOUNCE + Duration::from_millis(5),
+        panel.key.clone(),
+        resize_settle_cb,
+    );
 }
 
 /// Apply an action's lifecycle (the action note row of the table in
@@ -2746,7 +2778,7 @@ unsafe fn place_on_show(
     let Some(slot) = panel.slot else {
         return;
     };
-    let Some(origin) = slot_origin(panel_size(image_size), anchor, slot) else {
+    let Some(origin) = slot_origin(hold(panel_size(image_size)), anchor, slot) else {
         return;
     };
     let _: () = msg_send![window, setFrameOrigin: NSPoint::new(origin.0, origin.1)];
@@ -3236,8 +3268,9 @@ unsafe fn set_frame(view: usize, area: Area) {
 }
 
 /// AppKit origin of the panel window in cascade `slot` on the main screen
-/// for a front card of `card` size (its deck is what is placed); `None`
-/// when there is no screen (headless).
+/// for a window that holds cards up to `card` (`hold` of the size box; its
+/// deck is what is placed, so panels keep their spacing whatever shape their
+/// cards take); `None` when there is no screen (headless).
 unsafe fn slot_origin(
     card: (f64, f64),
     anchor: Option<(i32, i32)>,
@@ -3278,10 +3311,11 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let card = remembered
         .card
         .unwrap_or_else(|| panel_size(state.image_size));
-    let (width, height) = window_size(card);
+    // The window holds the tallest and the widest card of this box.
+    let (width, height) = window_size(hold(card));
     let origin = match remembered.origin {
         Some(origin) => origin,
-        None => slot_origin(card, state.anchor, 0)?, // None: headless (CI)
+        None => slot_origin(hold(card), state.anchor, 0)?, // None: headless (CI)
     };
     let rect = NSRect::new(NSPoint::new(origin.0, origin.1), NSSize::new(width, height));
     let window = new_pip_window(rect)?;
@@ -4193,8 +4227,8 @@ unsafe extern "C" fn tick_cb(ctx: *mut c_void) {
 // The content view (`CuaPipStack`) takes every press that is not on a
 // header button (its `hitTest:` returns itself over any card, nothing over
 // the transparent margin) and accepts the first mouse, so the panel never
-// needs to become key. Resizing sets the window frame outside the state
-// lock: AppKit calls `setFrameSize:` synchronously, which lays the cards out.
+// needs to become key. Resizing sets the panel's size box, then the window
+// frame outside the state lock, then lays the cards out.
 
 /// The panel (live, or ended and playing its finale) whose window is
 /// `window`.
@@ -4282,6 +4316,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
             };
             let (key, id) = (panel.key.clone(), panel.id);
             let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
+            let card = panel.card;
             let point = panel_point(point);
             let frames = item_frames(panel);
             let bar = bar_area(panel).map(|bar| {
@@ -4300,6 +4335,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
                 id,
                 mouse,
                 start: area_of(frame),
+                start_card: card,
                 origin: (frame.origin.x, frame.origin.y),
                 edges,
                 pressed,
@@ -4328,7 +4364,14 @@ extern "C" fn stack_mouse_dragged(_this: *mut AnyObject, _cmd: Sel, _event: *mut
                 .find(|panel| panel.id == gesture.id)?;
             let delta = (mouse.0 - gesture.mouse.0, mouse.1 - gesture.mouse.1);
             if gesture.edges != 0 {
-                let frame = resize_window(gesture.start, gesture.edges, delta, gesture.max);
+                let (card, frame) = resize_panel(
+                    gesture.start,
+                    gesture.start_card,
+                    gesture.edges,
+                    delta,
+                    gesture.max,
+                );
+                set_box(panel, card);
                 return Some((panel.window, frame));
             }
             if !gesture.moved && delta.0.hypot(delta.1) < DRAG_SLOP {
@@ -4486,43 +4529,6 @@ unsafe fn set_resize_cursor(edges: u8) {
     }
 }
 
-extern "C" fn stack_set_frame_size(this: *mut AnyObject, _cmd: Sel, size: NSSize) {
-    unsafe {
-        let _: () = msg_send![super(this, class!(NSView)), setFrameSize: size];
-        let window = window_of(this);
-        // Inside a state operation (the panel being built) the caller lays
-        // out itself.
-        try_with_state(|state| on_resized(state, window, (size.width, size.height)));
-    }
-}
-
-/// The panel window is now `size`: lay the cards out for the new front card
-/// and resize the live stream once the size settles.
-unsafe fn on_resized(state: &mut State, window: usize, size: (f64, f64)) {
-    let Some(panel) = panel_for(state, window) else {
-        return;
-    };
-    let key = panel.key.clone();
-    let card = card_size(size);
-    if card == panel.card || card.0 <= 0.0 || card.1 <= 0.0 {
-        return;
-    }
-    panel.card = card;
-    // The user's resize sets the box; the shape still follows the window.
-    panel.front = card_shape(card, panel.shape);
-    // A panel the user sized stays where they put it, like a dragged one.
-    panel.resized = true;
-    panel.dragged = true;
-    panel.slot = None;
-    apply_card_frames(panel);
-    panel.well_changed = Instant::now();
-    dispatch_to_main_after(
-        RESIZE_DEBOUNCE + Duration::from_millis(5),
-        key,
-        resize_settle_cb,
-    );
-}
-
 /// Debounced end of a resize: size the live stream to the new well.
 unsafe extern "C" fn resize_settle_cb(ctx: *mut c_void) {
     let key: String = *Box::from_raw(ctx as *mut String);
@@ -4535,6 +4541,7 @@ unsafe extern "C" fn resize_settle_cb(ctx: *mut c_void) {
             return;
         }
         panel.stream_well = picture_size(panel);
+        log_shape(panel);
         refresh(state, &key);
     });
 }
@@ -4558,10 +4565,6 @@ fn stack_view_class() -> &'static AnyClass {
                 stack_mouse_dragged as extern "C" fn(_, _, _),
             );
             builder.add_method(sel!(mouseUp:), stack_mouse_up as extern "C" fn(_, _, _));
-            builder.add_method(
-                sel!(setFrameSize:),
-                stack_set_frame_size as extern "C" fn(_, _, _),
-            );
         })
     })
 }
