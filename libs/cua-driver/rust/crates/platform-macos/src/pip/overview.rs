@@ -742,20 +742,9 @@ unsafe fn snapshot(panels: &std::collections::HashMap<String, Panel>) -> (Vec<Gr
 /// screens]` is walked with its enumerator, not `count`: the array is
 /// Swift-bridged and its `count` is a signed NSInteger, which a debug
 /// build's message check rejects as NSUInteger.
-pub(super) unsafe fn active_screen() -> Option<(Area, f64)> {
+unsafe fn active_screen() -> Option<(Area, f64)> {
     let mouse: NSPoint = msg_send![class!(NSEvent), mouseLocation];
-    let mut screens = Vec::new();
-    let list: *mut AnyObject = msg_send![class!(NSScreen), screens];
-    if !list.is_null() {
-        let each: *mut AnyObject = msg_send![list, objectEnumerator];
-        loop {
-            let screen: *mut AnyObject = msg_send![each, nextObject];
-            if screen.is_null() {
-                break;
-            }
-            screens.push(screen);
-        }
-    }
+    let screens = screens();
     let frames: Vec<Area> = screens
         .iter()
         .map(|&screen| {
@@ -772,6 +761,23 @@ pub(super) unsafe fn active_screen() -> Option<(Area, f64)> {
     }
     let visible: NSRect = msg_send![screen, visibleFrame];
     Some((area_of(visible), primary_screen_height()))
+}
+
+/// `[NSScreen screens]`, walked with its enumerator (see `active_screen`).
+pub(super) unsafe fn screens() -> Vec<*mut AnyObject> {
+    let mut screens = Vec::new();
+    let list: *mut AnyObject = msg_send![class!(NSScreen), screens];
+    if !list.is_null() {
+        let each: *mut AnyObject = msg_send![list, objectEnumerator];
+        loop {
+            let screen: *mut AnyObject = msg_send![each, nextObject];
+            if screen.is_null() {
+                break;
+            }
+            screens.push(screen);
+        }
+    }
+    screens
 }
 
 /// Height of the primary screen (AppKit's coordinate origin).

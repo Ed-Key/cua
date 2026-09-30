@@ -786,6 +786,29 @@ pub(super) fn keep_inside(card: Area, visible: Area) -> (f64, f64) {
     )
 }
 
+/// The screen (index into `screens`, AppKit frames) a card drawn at `card`
+/// (screen rect) is on: the one holding its center, else the one it
+/// overlaps most; `None` when it overlaps none. Never the window's screen
+/// (the window reaches far past its card, so most of it can be on another
+/// display) nor the pointer's (a missed release is handled a second later,
+/// wherever the pointer has gone).
+pub(super) fn card_screen(card: Area, screens: &[Area]) -> Option<usize> {
+    let center = (card.x + card.w / 2.0, card.y + card.h / 2.0);
+    let overlap = |s: &Area| {
+        let w = (card.x + card.w).min(s.x + s.w) - card.x.max(s.x);
+        let h = (card.y + card.h).min(s.y + s.h) - card.y.max(s.y);
+        w.max(0.0) * h.max(0.0)
+    };
+    screens.iter().position(|s| contains(s, center)).or_else(|| {
+        screens
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| overlap(s) > 0.0)
+            .max_by(|a, b| overlap(a.1).total_cmp(&overlap(b.1)))
+            .map(|(index, _)| index)
+    })
+}
+
 /// Largest size box on a screen whose visible frame is `visible` (w, h):
 /// `MAX_SCREEN_FRACTION` of the screen's shorter side each way, so the
 /// square that holds its cards (`hold`) fits the screen.
@@ -1558,6 +1581,29 @@ mod tests {
 
     /// Break-it finding: a card dragged onto the Dock (or past any edge of
     /// the visible frame) comes back inside it, by the least distance.
+    #[test]
+    fn card_screen_is_the_one_holding_the_card() {
+        // A (a short display) left of B (a tall one), C further right.
+        let screens = [
+            Area { x: 0.0, y: 0.0, w: 1440.0, h: 900.0 },
+            Area { x: 1440.0, y: 0.0, w: 1920.0, h: 1200.0 },
+            Area { x: 3360.0, y: 0.0, w: 1440.0, h: 900.0 },
+        ];
+        // Center on A, the window (as big as 1600 wide) mostly on B, the
+        // pointer (not an input) on C: A.
+        let card = Area { x: 1200.0, y: 600.0, w: 400.0, h: 250.0 };
+        let window = Area { x: 1000.0, y: 400.0, w: 1600.0, h: 700.0 };
+        assert!(window.x + window.w - 1440.0 > 1440.0 - window.x, "the window is mostly on B");
+        assert_eq!(card_screen(card, &screens), Some(0));
+        // Center above every screen: the one it overlaps most (B).
+        let high = Area { x: 1300.0, y: 1100.0, w: 400.0, h: 400.0 };
+        assert_eq!(card_screen(high, &screens), Some(1));
+        // On no screen at all: none (the caller falls back).
+        let off = Area { x: -900.0, y: 0.0, w: 400.0, h: 250.0 };
+        assert_eq!(card_screen(off, &screens), None);
+        assert_eq!(card_screen(card, &[]), None);
+    }
+
     #[test]
     fn a_card_released_outside_the_visible_frame_comes_back_inside() {
         // 1440x900 screen, Dock 70 pt, menu bar 25 pt.
