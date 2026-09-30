@@ -2037,7 +2037,8 @@ impl Tool for BrowserTypeTool {
         let requested_chars = text.chars().count();
         let mut replaced_chars = 0usize;
         // What the field held before any input, for the read-back below.
-        let before = read_edit_state(conn, cdp, &object_id).await;
+        // Keystrokes re-read it after their focus preparation (see there).
+        let mut before = read_edit_state(conn, cdp, &object_id).await;
         let replaces = replace || mode == "set_value";
         let edit_mode = if mode == "set_value" {
             EditMode::SetValue
@@ -2284,6 +2285,13 @@ impl Tool for BrowserTypeTool {
                         .to_tool_result();
                     }
                 }
+            }
+            // The insertion baseline is what the field holds right before the
+            // first key: focus emulation and DOM.focus can move the caret (a
+            // focus handler that puts it at the end), and the read-back judges
+            // the edit against this selection.
+            if let Some(state) = read_edit_state(conn, cdp, &object_id).await {
+                before = Some(state);
             }
             let mut result = Ok(());
             let mut delivered = 0;
