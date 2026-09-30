@@ -533,7 +533,10 @@ struct Panel {
     front: (f64, f64),
     /// Size of the displayed window, as far as it is known.
     shape: Option<(f64, f64)>,
-    /// Front card size its views were last laid out for.
+    /// Front card size its views were last laid out for: the card as it is
+    /// drawn right now (`front` once at rest, sizes in between while it
+    /// glides to a new shape). The cursor maps into this, and a finale is
+    /// laid out for it.
     laid_out: (f64, f64),
     /// Size of the picture in the image well (the window's own proportions
     /// inside the front card), which the live stream is sized for: follows
@@ -1208,7 +1211,7 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
     let Some(panel) = state.panels.get_mut(&update.key) else {
         return false;
     };
-    let well = well_size(panel.front);
+    let well = well_size(panel.laid_out);
     panel.cursor_at = update.image.map(|_| (update.x, update.y));
     panel.cursor_box = update.sprite_box;
     panel.cursor_window = update.window;
@@ -1263,7 +1266,7 @@ unsafe fn place_sprite(panel: &Panel) {
         sprite_placement(
             sprite_window(panel.cursor_window, displayed, panel.target_frame),
             panel.cursor_at,
-            well_size(panel.front),
+            well_size(panel.laid_out),
             panel.cursor_box,
         )
     };
@@ -1465,23 +1468,27 @@ fn picture_size(panel: &Panel) -> (f64, f64) {
 unsafe fn sync_shape(panel: &mut Panel) -> bool {
     let displayed = current_tag(panel.target, panel.resolved_window).and_then(|tag| tag.1);
     match panel.target_frame {
-        Some((window, frame)) if Some(window) == displayed => set_shape(panel, (frame.w, frame.h)),
+        Some((window, frame)) if Some(window) == displayed => {
+            set_shape(panel, Some((frame.w, frame.h)))
+        }
         _ => false,
     }
 }
 
-/// The displayed window is `shape` points: fit the front card to it (see
-/// `stack::card_shape`) and size the live stream for the picture. On a
-/// shown panel every item glides to its new frame (the card's bottom-right
-/// corner stays put, the back items follow its top-left); a hidden one is
-/// laid out at once. The caller refreshes, which resizes the stream.
-/// Whether anything changed.
-unsafe fn set_shape(panel: &mut Panel, shape: (f64, f64)) -> bool {
-    if panel.shape == Some(shape) {
+/// The displayed window is `shape` points (`None`: not known, so the card is
+/// the whole box, never another window's shape): fit the front card to it
+/// (see `stack::card_shape`) and size the live stream for the picture. On a
+/// shown panel every item glides to its new frame from where it is drawn
+/// (the card's bottom-right corner stays put, the back items follow its
+/// top-left); a hidden one is laid out at rest, so it shows with everything
+/// in place. The caller refreshes, which resizes the stream. Whether
+/// anything changed.
+unsafe fn set_shape(panel: &mut Panel, shape: Option<(f64, f64)>) -> bool {
+    if panel.shape == shape {
         return false;
     }
-    panel.shape = Some(shape);
-    let front = card_shape(panel.card, panel.shape);
+    panel.shape = shape;
+    let front = card_shape(panel.card, shape);
     if front != panel.front {
         let cards = back_cards(&panel.layout);
         let drawn = settle_frames(panel);
@@ -1494,9 +1501,12 @@ unsafe fn set_shape(panel: &mut Panel, shape: (f64, f64)) -> bool {
                 }
             }
             start_ticking();
+        } else {
+            panel.motion = Default::default();
         }
         apply_card_frames(panel);
-        tracing::info!(target: "pip", session = %panel.key, card = ?front, bounds = ?panel.card, window = ?shape, "PiP card shape");
+        // `window=(0.0, 0.0)`: not known.
+        tracing::info!(target: "pip", session = %panel.key, card = ?front, bounds = ?panel.card, window = ?shape.unwrap_or_default(), "PiP card shape");
     }
     panel.stream_well = picture_size(panel);
     true
@@ -1895,11 +1905,12 @@ unsafe fn switch_front(
             }
         }
     }
-    // A card coming back brings its window's shape; a new window keeps the
-    // old shape until its frame is known (the capture or the next poll).
-    if let Some(shape) = panel.cards.front_mut().and_then(|front| front.data.shape) {
-        set_shape(panel, shape);
-    }
+    // A card coming back brings its window's shape. A window whose size is
+    // not known yet takes the whole box until its frame arrives (with this
+    // capture, or the next poll): never the old window's shape, which would
+    // be saved as its own when it goes behind.
+    let shape = panel.cards.front_mut().and_then(|front| front.data.shape);
+    set_shape(panel, shape);
     changed
 }
 
@@ -2312,7 +2323,9 @@ const FINALE_FADE: Duration = Duration::from_millis(400);
 /// stay in).
 unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
     remove_finale_view(panel);
-    let (well_w, well_h) = well_size(panel.front);
+    // The well as it is drawn now (mid-glide during a shape change), which
+    // the overlay's frame must match to resize with it.
+    let (well_w, well_h) = well_size(panel.laid_out);
     let overlay = new_view(
         decor_view_class(),
         ns_rect(Area {
