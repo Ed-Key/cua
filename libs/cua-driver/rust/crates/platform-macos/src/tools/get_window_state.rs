@@ -2062,6 +2062,13 @@ mod app_target_tests {
         // The default depth: raising max_depth is the way back.
         let (_, line) = read_coverage(true, None, None).unwrap();
         assert!(line.contains("larger max_depth") && line.contains("diff:false"), "{line}");
+        // A caller's cap at or above the default: removing it restores the
+        // same cap, so the advice is a larger one.
+        for depth in [crate::ax::tree::DEFAULT_MAX_DEPTH, 40] {
+            let (_, line) = read_coverage(true, Some(1), Some(depth)).unwrap();
+            assert!(line.contains("larger max_depth"), "{depth}: {line}");
+            assert!(!line.contains("without max_depth"), "{depth}: {line}");
+        }
     }
 
     #[test]
@@ -2163,7 +2170,10 @@ fn read_coverage(
                 .to_owned(),
         });
     }
-    let again = if depth_cut && max_depth.is_none() {
+    // Removing max_depth helps only when the caller's cap was below the
+    // default; a cap at or above it (or the default itself) needs a larger one.
+    let default_or_deeper = max_depth.is_none_or(|d| d >= crate::ax::tree::DEFAULT_MAX_DEPTH);
+    let again = if depth_cut && default_or_deeper {
         "Read again with diff:false, without query and with a larger max_depth to see them."
     } else {
         "Read again with diff:false and without max_depth/query to see them."

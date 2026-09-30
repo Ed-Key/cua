@@ -853,6 +853,11 @@ pub(crate) fn catalyst_text_control(chain: &[(String, String)]) -> CatalystText 
     let Some(((role, _), ancestors)) = chain.split_first() else {
         return CatalystText::Unknown;
     };
+    // The target's role could not be read (the caller may have read a text
+    // role a moment earlier): unknown, not proof of a non-text control.
+    if role.is_empty() {
+        return CatalystText::Unknown;
+    }
     if !matches!(
         role.as_str(),
         "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
@@ -2280,6 +2285,9 @@ mod tests {
         assert_eq!(catalyst_text_control(&chain(&[("AXTextField", ""), ("AXGroup", "")])), Unknown);
         assert_eq!(catalyst_text_control(&chain(&[("AXTextField", ""), ("AXGroup", ""), ("", "")])), Unknown);
         assert_eq!(catalyst_text_control(&[]), Unknown);
+        // The target's own role unreadable (the live chain reads [("", "")]).
+        assert_eq!(catalyst_text_control(&chain(&[("", "")])), Unknown);
+        assert!(!is_catalyst_text_view(&chain(&[("", "")])));
         // A content group proves Catalyst even when the chain stops above it.
         assert_eq!(catalyst_text_control(&chain(&[("AXTextField", ""), content])), Yes);
     }

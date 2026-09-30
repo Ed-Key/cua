@@ -362,11 +362,18 @@ fn apply_catalyst_uncertainty(
     if catalyst != super::type_text::CatalystText::Unknown || ax_echo_surface {
         return false;
     }
-    outcome.detail.push_str(
-        " The field's ancestry could not be read, so it may be a Mac Catalyst field: the \
-         read-back confirms the accessibility value, and whether the app itself reacted is \
-         unverified. Check the app's own result.",
-    );
+    // Claim the read-back only when it matched; otherwise both the value and
+    // the app's reaction stay uncertain.
+    let value = if outcome.verified == Some(true) {
+        "the read-back confirms the accessibility value, and whether the app itself reacted \
+         is unverified"
+    } else {
+        "neither the accessibility value nor whether the app itself reacted is confirmed"
+    };
+    outcome.detail.push_str(&format!(
+        " The field's ancestry could not be read, so it may be a Mac Catalyst field: {value}. \
+         Check the app's own result."
+    ));
     true
 }
 
@@ -889,8 +896,16 @@ mod tests {
     fn unknown_catalyst_ancestry_says_the_app_reaction_is_unverified() {
         let mut outcome = written().unwrap();
         assert!(super::apply_catalyst_uncertainty(&mut outcome, CatalystText::Unknown, false));
+        assert!(outcome.detail.contains("read-back confirms the accessibility value"), "{}", outcome.detail);
         assert!(outcome.detail.contains("whether the app itself reacted is unverified"), "{}", outcome.detail);
         assert_eq!(outcome.verified, Some(true), "the AX read-back itself still matched");
+        // A read-back that did not match, or could not run, confirms nothing.
+        for verified in [Some(false), None] {
+            let mut outcome = SetValueOutcome { verified, ..written().unwrap() };
+            assert!(super::apply_catalyst_uncertainty(&mut outcome, CatalystText::Unknown, false));
+            assert!(!outcome.detail.contains("confirms"), "{verified:?}: {}", outcome.detail);
+            assert!(outcome.detail.contains("neither the accessibility value nor"), "{}", outcome.detail);
+        }
         for (catalyst, web) in [(CatalystText::No, false), (CatalystText::Unknown, true)] {
             let mut outcome = written().unwrap();
             assert!(!super::apply_catalyst_uncertainty(&mut outcome, catalyst, web));
