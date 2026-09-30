@@ -2177,7 +2177,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
     let finale = panel.lifecycle.playing();
     let waiting = panel.shown && panel.verdicts.proof_waiting();
     // Nor does it fade from under a press: a panel being dragged or resized
-    // stays until the button comes up (`stack_mouse_up` re-checks it).
+    // stays until the button comes up (`end_gesture` re-checks it).
     let held = gesture.as_ref().is_some_and(|gesture| gesture.id == panel.id);
     if panel_should_show(
         active || finale || waiting || held,
@@ -3001,6 +3001,13 @@ const HOVER_POLL: Duration = Duration::from_millis(120);
 unsafe extern "C" fn hover_poll_cb(ctx: *mut c_void) {
     let id = *Box::from_raw(ctx as *mut i64);
     with_state(|state| {
+        // A press holds its panel up (see `refresh`). If its mouse-up never
+        // reached the panel, end it here once the button is up, or it would
+        // hold the panel for good.
+        let pressed = state.gesture.as_ref().is_some_and(|gesture| gesture.id == id);
+        if pressed && !primary_button_down() {
+            end_gesture(state, false);
+        }
         let Some(panel) = panel_by_id(state, id) else {
             return;
         };
@@ -4339,36 +4346,47 @@ extern "C" fn stack_mouse_dragged(_this: *mut AnyObject, _cmd: Sel, _event: *mut
 }
 
 extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    with_state(|state| {
-        let Some(gesture) = state.gesture.take() else {
-            return;
-        };
-        let Some(panel) = panel_by_id(state, gesture.id) else {
-            return;
-        };
-        let key = panel.key.clone();
-        if gesture.moved {
-            // The user placed it: keep it there and free its slot.
-            panel.dragged = true;
-            panel.slot = None;
-            panel.trail_motion.release(Instant::now());
-            report_trail(panel, Instant::now());
-            start_ticking();
-        } else {
-            // A click (not a resize) on a back card raises its window, if
-            // that window is still behind the front card.
-            let pressed = gesture.pressed.filter(|_| gesture.edges == 0);
-            if let Some(tag) = stack::click_target(pressed, &panel.cards.keys()) {
-                unsafe { raise_card(state, gesture.id, tag) };
-            }
+    with_state(|state| unsafe { end_gesture(state, true) });
+}
+
+/// The press on a panel is over. With `click` (its mouse-up arrived), a
+/// press that did not move raises the back card it was on; without (the
+/// button was found up with no mouse-up, see `hover_poll_cb`), it only
+/// ends. Either way an idle panel the press held up may fade now.
+unsafe fn end_gesture(state: &mut State, click: bool) {
+    let Some(gesture) = state.gesture.take() else {
+        return;
+    };
+    let Some(panel) = panel_by_id(state, gesture.id) else {
+        return;
+    };
+    let key = panel.key.clone();
+    if gesture.moved {
+        // The user placed it: keep it there and free its slot.
+        panel.dragged = true;
+        panel.slot = None;
+        panel.trail_motion.release(Instant::now());
+        report_trail(panel, Instant::now());
+        start_ticking();
+    } else if click {
+        // A click (not a resize) on a back card raises its window, if that
+        // window is still behind the front card.
+        let pressed = gesture.pressed.filter(|_| gesture.edges == 0);
+        if let Some(tag) = stack::click_target(pressed, &panel.cards.keys()) {
+            raise_card(state, gesture.id, tag);
         }
-        // The press held an idle panel up (see `refresh`): it may fade now.
-        // Only a live session's panel is under that key for sure.
-        let live = state.panels.get(&key).is_some_and(|panel| panel.id == gesture.id);
-        if live {
-            unsafe { refresh(state, &key) };
-        }
-    });
+    }
+    // Only a live session's panel is under that key for sure.
+    let live = state.panels.get(&key).is_some_and(|panel| panel.id == gesture.id);
+    if live {
+        refresh(state, &key);
+    }
+}
+
+/// Whether the primary mouse button is down right now.
+unsafe fn primary_button_down() -> bool {
+    let buttons: usize = msg_send![class!(NSEvent), pressedMouseButtons];
+    buttons & 1 != 0
 }
 
 extern "C" fn card_mouse_moved(this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
