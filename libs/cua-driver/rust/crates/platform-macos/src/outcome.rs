@@ -763,22 +763,27 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
         None
     };
     if let Some(windows) = windows {
+        // Ids first, for every window: presence never depends on the budget.
         let mut others = Vec::new();
+        let mut rest = Vec::new();
         for w in windows {
             match ax_get_window_id(w.0) {
                 Some(id) if id == scope.window_id => window = Some(w),
-                Some(id) => {
-                    if !reader.admit(w.0) {
-                        break;
-                    }
-                    let title = copy_string_attr(w.0, "AXTitle").unwrap_or_default();
-                    others.push(OtherWindow { id, title });
-                }
+                Some(id) => rest.push((id, w)),
                 None => {}
             }
         }
+        let mut titled = true;
+        for (id, w) in rest {
+            if !reader.admit(w.0) {
+                titled = false;
+                break;
+            }
+            let title = copy_string_attr(w.0, "AXTitle").unwrap_or_default();
+            others.push(OtherWindow { id, title });
+        }
         others.sort_by_key(|w| w.id);
-        facts.windows = reader.complete.then_some(others);
+        facts.windows = titled.then_some(others);
         facts.window_present = Some(window.is_some());
     } else {
         reader.complete = false;
@@ -977,12 +982,20 @@ unsafe fn disk_notes(before: &Facts, pass: &Pass) -> DiskNotes {
     notes
 }
 
-/// The window's text area (two levels down at most), as TextEdit has it.
+/// The window's text area (three levels down at most), as TextEdit has it;
+/// every message bounded by a fresh read budget.
 unsafe fn window_text(window: AXUIElementRef) -> Option<String> {
+    let mut reader = Reader::new();
+    if !reader.admit(window) {
+        return None;
+    }
     let mut level = kids(window);
     for _ in 0..3 {
         let mut next = Vec::new();
         for element in level {
+            if !reader.admit(element.0) {
+                return None;
+            }
             if copy_string_attr(element.0, "AXRole").as_deref() == Some("AXTextArea") {
                 return copy_string_attr(element.0, "AXValue");
             }
