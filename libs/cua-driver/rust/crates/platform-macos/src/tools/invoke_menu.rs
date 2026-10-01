@@ -86,6 +86,28 @@ unsafe fn semantic_children(parent: AXUIElementRef) -> Vec<AXUIElementRef> {
     out
 }
 
+/// A menu title as paths compare it: trimmed, with "..." read as the
+/// ellipsis character macOS menus use ("Save As..." finds "Save As…").
+fn menu_title_key(title: &str) -> String {
+    title.trim().replace("...", "…")
+}
+
+/// What a menu holds, for a refusal that names a missing item: its titled
+/// items in order, at most 30.
+fn listing(titles: &[String]) -> String {
+    let shown: Vec<&str> = titles
+        .iter()
+        .map(|title| title.trim())
+        .filter(|title| !title.is_empty())
+        .take(30)
+        .collect();
+    if shown.is_empty() {
+        "no titled items".into()
+    } else {
+        shown.join(", ")
+    }
+}
+
 unsafe fn resolve_exact_prefix(
     menu_bar: AXUIElementRef,
     prefix: &[String],
@@ -99,14 +121,17 @@ unsafe fn resolve_exact_prefix(
             CFRelease(current as CFTypeRef);
         }
 
+        let wanted = menu_title_key(segment);
         let mut matches = Vec::new();
+        let mut titles = Vec::new();
         for child in children {
             let title = copy_string_attr(child, "AXTitle").unwrap_or_default();
-            if title.trim() == segment {
+            if menu_title_key(&title) == wanted {
                 matches.push(child);
             } else {
                 CFRelease(child as CFTypeRef);
             }
+            titles.push(title);
         }
 
         if matches.len() != 1 {
@@ -114,8 +139,16 @@ unsafe fn resolve_exact_prefix(
             for candidate in matches {
                 CFRelease(candidate as CFTypeRef);
             }
+            let parent = if depth == 0 {
+                "the menu bar".to_owned()
+            } else {
+                prefix[depth - 1].clone()
+            };
             return Err(if match_count == 0 {
-                format!("invoke_menu: path segment {depth} was not found")
+                format!(
+                    "invoke_menu: path segment {depth} was not found: {segment:?} is not in {parent}; it has: {}",
+                    listing(&titles)
+                )
             } else {
                 format!("invoke_menu: path segment {depth} is ambiguous")
             });
@@ -129,6 +162,39 @@ unsafe fn resolve_exact_prefix(
     } else {
         Err("invoke_menu: path is empty".into())
     }
+}
+
+/// Close the menu a failed path opened from the menu bar item `top`:
+/// AXCancel on its menu (which ends its submenus too), then a second press
+/// of the item (menu bar items toggle), each read back from WindowServer's
+/// window list.
+unsafe fn close_opened_menu(app: AXUIElementRef, pid: i32, top: &str) -> Option<bool> {
+    if crate::windows::open_menu_windows(pid)? == 0 {
+        return Some(true);
+    }
+    let item = copy_element_attr(app, "AXMenuBar").and_then(|bar| {
+        set_messaging_timeout(bar);
+        let item = resolve_exact_prefix(bar, std::slice::from_ref(&top.to_owned())).ok();
+        CFRelease(bar as CFTypeRef);
+        item
+    });
+    let Some(item) = item else {
+        return Some(false);
+    };
+    set_messaging_timeout(item);
+    for child in copy_children(item) {
+        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
+            let _ = perform_action(child, "AXCancel");
+        }
+        CFRelease(child as CFTypeRef);
+    }
+    let mut closed = crate::windows::wait_for_no_menu(pid);
+    if closed == Some(false) {
+        let _ = perform_action(item, "AXPress");
+        closed = crate::windows::wait_for_no_menu(pid);
+    }
+    CFRelease(item as CFTypeRef);
+    closed
 }
 
 fn choose_action(actions: &[String], final_segment: bool) -> Option<&'static str> {
@@ -148,6 +214,9 @@ unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
     }
     set_messaging_timeout(app);
 
+    // Whether this call pressed a menu item (a press that reports an error
+    // can still open its menu), so a failure must close what it opened.
+    let mut pressed = false;
     let result = (|| {
         for depth in 0..path.len() {
             // Resolve from the live app root for every hop. Opening a menu can
@@ -175,6 +244,7 @@ unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
                     return Err(error);
                 }
             };
+            pressed = true;
             let error = perform_action(target, action);
             CFRelease(target as CFTypeRef);
             if error != kAXErrorSuccess {
@@ -188,6 +258,21 @@ unsafe fn invoke_path(pid: i32, path: &[String]) -> Result<(), String> {
         }
         Ok(())
     })();
+
+    // A failure after a hop opened a menu: close it, so the app is not left
+    // in menu tracking (where later menu commands and keys do nothing).
+    let result = result.map_err(|error| {
+        if !pressed {
+            return error;
+        }
+        match close_opened_menu(app, pid, &path[0]) {
+            Some(true) => format!("{error}. No menu of the app is left open."),
+            _ => format!(
+                "{error}. The {} menu this call opened may still be open: press escape on the window before other input.",
+                path[0]
+            ),
+        }
+    });
 
     CFRelease(app as CFTypeRef);
     result
@@ -482,6 +567,22 @@ mod tests {
         assert_eq!(choose_action(&actions, false), Some("AXPress"));
         assert_eq!(choose_action(&actions, true), Some("AXPress"));
         assert_eq!(choose_action(&["AXShowMenu".into()], true), None);
+    }
+
+    #[test]
+    fn menu_titles_match_three_dots_and_the_ellipsis() {
+        assert_eq!(menu_title_key(" Save As... "), menu_title_key("Save As…"));
+        assert_eq!(menu_title_key("Save…"), "Save…");
+        assert_ne!(menu_title_key("Save"), menu_title_key("Save…"));
+    }
+
+    #[test]
+    fn a_missing_item_lists_what_the_menu_holds() {
+        let titles = vec!["New".to_owned(), "".to_owned(), "Open…".to_owned()];
+        assert_eq!(listing(&titles), "New, Open…");
+        assert_eq!(listing(&[]), "no titled items");
+        let many: Vec<String> = (0..40).map(|n| n.to_string()).collect();
+        assert_eq!(listing(&many).split(", ").count(), 30);
     }
 
     #[test]

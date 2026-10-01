@@ -119,6 +119,12 @@ pub(crate) struct Facts {
     pub focus: Option<Element>,
     pub target: Option<Element>,
     pub collection: Option<Collection>,
+    /// The app's on-screen menu windows (pop-up menus, context menus, a
+    /// menu bar menu), by id.
+    pub menus: Option<Vec<u32>>,
+    /// The element that opened the menu the action picks from (a pop-up
+    /// button), read before and after the pick.
+    pub opener: Option<Element>,
 }
 
 /// What the disk adds to a settled change (read once, after the facts).
@@ -358,6 +364,30 @@ pub(crate) fn describe(
             }
         }
     }
+    if let (Some(a), Some(b)) = (&before.opener, &after.opener) {
+        if a.label != b.label {
+            parts.push(format!("{} is now labelled {}", element_name(a), quote(&b.label)));
+        } else if a.value != b.value {
+            if let Some(value) = &b.value {
+                parts.push(format!("{} now shows {}", element_name(b), shown_value(value)));
+            }
+        } else if let Some(value) = b.value.as_deref().filter(|v| !v.is_empty()) {
+            parts.push(format!("{} still shows {} (the pick did not change it)", element_name(b), quote(value)));
+        } else {
+            // No readable choice: an unchanged label is not proof either way.
+            parts.push(format!(
+                "{} kept its label; whether the pick took is not readable",
+                element_name(b)
+            ));
+        }
+    }
+    if let (Some(a), Some(b)) = (&before.menus, &after.menus) {
+        if b.iter().any(|id| !a.contains(id)) {
+            parts.push("a menu opened".into());
+        } else if !a.is_empty() && b.is_empty() {
+            parts.push("menu closed".into());
+        }
+    }
     let target_is_focus = matches!((&after.target, &after.focus), (Some(t), Some(f)) if same_element(t, f));
     match (&before.focus, &after.focus) {
         (Some(a), Some(b)) if same_element(a, b) => {
@@ -380,10 +410,17 @@ pub(crate) fn describe(
     }
     // A sheet or popover open before and after is still waiting for the
     // agent (a rename popover a confirm did not close): say so every time.
-    let still_open: Vec<String> = match (&before.sheets, &after.sheets) {
+    let mut still_open: Vec<String> = match (&before.sheets, &after.sheets) {
         (Some(a), Some(b)) => b.iter().filter(|s| a.contains(s)).cloned().collect(),
         _ => Vec::new(),
     };
+    // A menu open before and after (one a failed menu path left behind
+    // swallows later keys and menu commands).
+    if let (Some(a), Some(b)) = (&before.menus, &after.menus) {
+        if b.iter().any(|id| a.contains(id)) {
+            still_open.push("a menu".into());
+        }
+    }
     let still_open = (!still_open.is_empty()).then(|| format!("still open: {}", names(&still_open)));
     if parts.is_empty() && before != after {
         let mut line =
@@ -397,7 +434,7 @@ pub(crate) fn describe(
         let seconds = NO_CHANGE_WAIT.as_secs_f32();
         let mut line = if complete {
             format!(
-                "nothing it watches changed within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers, windows)"
+                "nothing it watches changed within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers, menus, windows)"
             )
         } else {
             format!("no change seen within {seconds:.1} s, but the app did not answer every read")
@@ -766,6 +803,13 @@ struct Scope {
     /// after the action even when focus moved out of it (Finder's rename
     /// field is a child window with no list above it).
     collection: Option<usize>,
+    /// For a pick from a menu: the element that opened it (retained by the
+    /// watch).
+    opener: Option<usize>,
+    /// Whether the app's menu windows are watched. Not for invoke_menu: the
+    /// menu it walks fades out after the command, and reading that as "a
+    /// menu opened" would also end the wait before a sheet the command opens.
+    menus: bool,
 }
 
 /// One read of every fact; `keep` also returns the retained window for the
@@ -885,6 +929,14 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
     if let Some(target) = scope.target {
         facts.target = read_element(&mut reader, target as AXUIElementRef);
     }
+    if let Some(opener) = scope.opener {
+        facts.opener = read_element(&mut reader, opener as AXUIElementRef);
+    }
+    facts.menus = scope.menus.then(|| crate::windows::menu_windows_of(scope.pid)).flatten().map(|windows| {
+        let mut ids: Vec<u32> = windows.iter().map(|w| w.window_id).collect();
+        ids.sort_unstable();
+        ids
+    });
     let alive = |ptr: usize| crate::ax::bindings::element_is_alive(ptr as AXUIElementRef);
     let holder = scope
         .collection
@@ -967,6 +1019,137 @@ unsafe fn focused_window_id(pid: i32) -> Option<u32> {
     }
     let window = Owned(copy_element_attr(app.0, "AXFocusedWindow")?);
     reader.admit(window.0).then(|| crate::ax::bindings::surface_window_id(window.0)).flatten()
+}
+
+/// The menu a cua action opened, per window: the element pressed and the
+/// menu windows that appeared. A pick from a detached menu (a Catalyst
+/// pop-up's menu has no AX parent) is known to come from that window only
+/// through this record.
+struct MenuOpener {
+    pid: i32,
+    window_id: u32,
+    opener: RetainedElement,
+    menus: Vec<u32>,
+}
+
+/// ponytail: one record per window, 16 windows, oldest dropped.
+static MENU_OPENERS: std::sync::Mutex<Vec<MenuOpener>> = std::sync::Mutex::new(Vec::new());
+
+/// The app's on-screen menu window ids, for [`note_menu_opened`].
+pub(crate) fn menu_window_ids(pid: i32) -> Option<Vec<u32>> {
+    crate::windows::menu_windows_of(pid).map(|windows| windows.iter().map(|w| w.window_id).collect())
+}
+
+/// Called by a press on `element` in window `window_id` while the action
+/// still holds the input lock (so no other action can open a menu in
+/// between): when menu windows of the app appeared that `before` did not
+/// hold, remember `element` as their opener. A pop-up-like element (a
+/// pop-up or menu button, or a button that shows a menu) gets up to 250 ms
+/// for its menu to appear.
+///
+/// # Safety
+///
+/// `element` must be a valid AXUIElementRef for the duration of the call.
+pub(crate) unsafe fn note_menu_opened(pid: i32, window_id: u32, element: usize, before: Option<Vec<u32>>) {
+    let Some(before) = before else { return };
+    let role = copy_string_attr(element as AXUIElementRef, "AXRole").unwrap_or_default();
+    if role == "AXMenuItem" {
+        return;
+    }
+    let shows_menu = matches!(role.as_str(), "AXPopUpButton" | "AXMenuButton")
+        || (role == "AXButton"
+            && crate::ax::bindings::copy_action_names(element as AXUIElementRef)
+                .iter()
+                .any(|action| action == "AXShowMenu"));
+    let deadline = Instant::now() + if shows_menu { Duration::from_millis(250) } else { Duration::ZERO };
+    loop {
+        let new: Vec<u32> = menu_window_ids(pid)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        if !new.is_empty() {
+            let mut openers = MENU_OPENERS.lock().unwrap_or_else(|e| e.into_inner());
+            openers.retain(|o| (o.pid, o.window_id) != (pid, window_id));
+            if openers.len() >= 16 {
+                openers.remove(0);
+            }
+            let opener = RetainedElement::retain(element);
+            openers.push(MenuOpener { pid, window_id, opener, menus: new });
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+/// Whether `element` is an item of a menu with no AX parent (or the
+/// application as parent): a menu that names no window.
+unsafe fn in_detached_menu(element: AXUIElementRef) -> bool {
+    core_foundation::base::CFRetain(element as CFTypeRef);
+    let mut current = Owned(element);
+    for _ in 0..6 {
+        let role = copy_string_attr(current.0, "AXRole").unwrap_or_default();
+        let parent = copy_element_attr(current.0, "AXParent").map(Owned);
+        if role == "AXMenu" {
+            return parent
+                .as_ref()
+                .is_none_or(|p| copy_string_attr(p.0, "AXRole").as_deref() == Some("AXApplication"));
+        }
+        if matches!(role.as_str(), "AXWindow" | "AXSheet" | "AXApplication" | "") {
+            return false;
+        }
+        match parent {
+            Some(parent) => current = parent,
+            None => return false,
+        }
+    }
+    false
+}
+
+/// The opener a cua action on window `window_id` recorded for the menu that
+/// holds `element`, when `element` is in a detached menu, the recorded menu
+/// window is still on screen and the element's centre lies inside it.
+/// Drops records whose menus are gone.
+pub(crate) unsafe fn recorded_menu_opener(pid: i32, window_id: u32, element: AXUIElementRef) -> Option<RetainedElement> {
+    if !in_detached_menu(element) {
+        return None;
+    }
+    let menus = crate::windows::menu_windows_of(pid)?;
+    let mut openers = MENU_OPENERS.lock().unwrap_or_else(|e| e.into_inner());
+    openers.retain(|o| o.pid != pid || o.menus.iter().any(|id| menus.iter().any(|m| m.window_id == *id)));
+    let record = openers.iter().find(|o| (o.pid, o.window_id) == (pid, window_id))?;
+    if !crate::ax::bindings::element_is_alive(record.opener.as_ptr() as AXUIElementRef) {
+        return None;
+    }
+    let (x, y) = crate::ax::bindings::element_screen_center(element)?;
+    let inside = menus.iter().filter(|m| record.menus.contains(&m.window_id)).any(|m| {
+        let b = &m.bounds;
+        x >= b.x && x <= b.x + b.width && y >= b.y && y <= b.y + b.height
+    });
+    inside.then(|| record.opener.clone())
+}
+
+/// What opened the menu `element` is in, for the pick's outcome: an AppKit
+/// menu's parent (the pop-up button), or the recorded opener of a detached
+/// menu. `None` when `element` is not in a menu.
+unsafe fn menu_opener_of(pid: i32, window_id: u32, element: AXUIElementRef) -> Option<RetainedElement> {
+    if copy_string_attr(element, "AXRole").as_deref() != Some("AXMenuItem") {
+        return None;
+    }
+    if let Some(menu) = copy_element_attr(element, "AXParent").map(Owned) {
+        if copy_string_attr(menu.0, "AXRole").as_deref() == Some("AXMenu") {
+            if let Some(parent) = copy_element_attr(menu.0, "AXParent").map(Owned) {
+                let role = copy_string_attr(parent.0, "AXRole").unwrap_or_default();
+                if !matches!(role.as_str(), "AXApplication" | "AXMenuBarItem" | "AXMenuItem" | "") {
+                    return Some(RetainedElement::retain(parent.0 as usize));
+                }
+            }
+        }
+    }
+    recorded_menu_opener(pid, window_id, element)
 }
 
 unsafe fn retained(ptr: usize) -> AXUIElementRef {
@@ -1064,9 +1247,10 @@ struct Watch {
     scope: Scope,
     before: Facts,
     before_complete: bool,
-    /// Keep the target and the list alive for the after-reads.
+    /// Keep the target, the list and a menu's opener alive for the after-reads.
     _target: Option<RetainedElement>,
     _collection: Option<RetainedElement>,
+    _opener: Option<RetainedElement>,
 }
 
 /// The facts as settling compares them: focus that went nowhere (a menu
@@ -1092,8 +1276,8 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
         .and_then(|id| u32::try_from(id).ok());
     // The action's own element, resolved the way the action resolves it (in
     // this dispatch, so the session's snapshots are the ones consulted).
-    let target = if args.get("element_token").is_some() || args.get("element_index").is_some() {
-        cua_driver_core::element_cache::current_runtime_cache::<CachedSnapshot>()
+    let (target, window_id) = if args.get("element_token").is_some() || args.get("element_index").is_some() {
+        let resolved = cua_driver_core::element_cache::current_runtime_cache::<CachedSnapshot>()
             .and_then(|cache| {
                 cache
                     .resolve_element_args(
@@ -1106,17 +1290,31 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
                     )
                     .ok()
             })
-            .and_then(|resolved| resolved.into_parts(window_id.map(u64::from)).2)
+            .map(|resolved| resolved.into_parts(window_id.map(u64::from)));
+        match resolved {
+            // A token carries its window: watch that one, not the focused one.
+            Some((_, token_window, element)) => (
+                element,
+                window_id.or_else(|| token_window.and_then(|id| u32::try_from(id).ok())),
+            ),
+            None => (None, window_id),
+        }
     } else {
-        None
+        (None, window_id)
     };
+    let watch_menus = tool != "invoke_menu";
     tokio::task::spawn_blocking(move || {
         let window_id = window_id.or_else(|| unsafe { focused_window_id(pid) })?;
+        let opener = target
+            .as_ref()
+            .and_then(|t| unsafe { menu_opener_of(pid, window_id, t.as_ptr() as AXUIElementRef) });
         let mut scope = Scope {
             pid,
             window_id,
             target: target.as_ref().map(RetainedElement::as_ptr),
             collection: None,
+            opener: opener.as_ref().map(RetainedElement::as_ptr),
+            menus: watch_menus,
         };
         let pass = unsafe { read_pass(&scope, false) };
         if pass.facts.window_present != Some(true) {
@@ -1132,6 +1330,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             before_complete: pass.complete,
             _target: target,
             _collection: pass.holder,
+            _opener: opener,
         }) as Box<dyn OutcomeWatch>)
     })
     .await
@@ -1243,6 +1442,43 @@ mod tests {
     }
 
     const FILES: [&str; 5] = ["notes.txt", "photo.jpg", "receipt-feb.pdf", "receipt-jan.pdf", "receipt-mar.pdf"];
+
+    fn button(label: &str) -> Element {
+        Element { role: "AXButton".into(), label: label.into(), value: None, length: None }
+    }
+
+    /// G2: a pop-up press says its menu opened; the pick names the pop-up's
+    /// new choice and the menu closing; a menu left open is still named.
+    #[test]
+    fn menus_opening_closing_and_the_openers_new_choice_are_named() {
+        let mut before = window("CatalystProfile");
+        before.menus = Some(vec![]);
+        let mut after = before.clone();
+        after.menus = Some(vec![27410]);
+        assert_eq!(describe(&before, &after, &DiskNotes::default(), Settle::Settled, true), "a menu opened");
+
+        let mut before = window("CatalystProfile");
+        before.menus = Some(vec![27410]);
+        before.opener = Some(button("Daily"));
+        let mut after = before.clone();
+        after.menus = Some(vec![]);
+        after.opener = Some(button("Weekly"));
+        assert_eq!(
+            describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
+            "AXButton \"Daily\" is now labelled \"Weekly\"; menu closed"
+        );
+        after.opener = Some(button("Daily"));
+        assert_eq!(
+            describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
+            "AXButton \"Daily\" kept its label; whether the pick took is not readable; menu closed"
+        );
+
+        let mut before = window("note.txt");
+        before.menus = Some(vec![9]);
+        let after = before.clone();
+        assert!(describe(&before, &after, &DiskNotes::default(), Settle::Unchanged, true)
+            .ends_with("; still open: a menu"));
+    }
 
     #[test]
     fn a_selection_change_names_the_whole_selected_set() {

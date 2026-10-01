@@ -427,8 +427,10 @@ them the AX write: a focused field gets keys, and an addressed field
 without focus is refused before anything is sent (background or
 foreground), with `code:"catalyst_text_needs_focus"`. Next: `click` the field (a background
 click is enough), then call `type_text` again. The AX value is often
-unreadable, so expect `⚠️ Not confirmed:` and check the screenshot. `set_value` on them is refused
-(`catalyst_text_needs_typing`); see WORKFLOW.md "Find content".
+unreadable, so expect `⚠️ Not confirmed:` and check the screenshot. `set_value` on a Catalyst
+search field is refused (`catalyst_text_needs_typing`); see WORKFLOW.md
+"Find content". On another Catalyst text field it writes the value and reads
+it back, without claiming the app reacted.
 
 Electron fix — **one call**: `type_text({pid, window_id, x, y, text})`. Passing
 `x,y` (no `element_index`) is the **element px action** form of
@@ -470,7 +472,10 @@ application, resolves each immediate child from live AX state, uses only
 `AXPress`/`AXPick`-class actions, and restores the prior application afterward
 on a best-effort basis.
 It refuses missing, duplicate, disabled, or non-actionable segments and never
-falls back to pixels.
+falls back to pixels. A missing segment's refusal lists what that menu holds;
+titles written with "..." match the "…" macOS menus use. When a path fails
+after a menu opened, the tool closes it and says so (an open menu swallows
+later keys and menu commands).
 
 ```bash
 cua-driver invoke_menu \

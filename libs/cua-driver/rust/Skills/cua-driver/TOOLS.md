@@ -95,9 +95,10 @@ check `describe <tool>` there.
 
 ## set_value
 
-- A popup button (`AXPopUpButton`, an HTML `<select>` in Safari, any native `NSPopUpButton`) has the child option whose title or value matches `value` (case-insensitive) pressed directly; the popup menu never opens, so focus is never stolen.
+- A popup button (`AXPopUpButton`, an HTML `<select>` in Safari, any native `NSPopUpButton`) gets the option whose title or value matches `value` (case-insensitive): pressed directly when the popup lists its options, otherwise its menu is opened, the option pressed and the menu closed again. Confirmed only when the popup then shows that option; no match lists the options.
 - Other elements get `AXValue` written directly; the accessibility layer coerces the string to the element's native type.
-- A Mac Catalyst text field is refused with `catalyst_text_needs_typing` before anything is focused or written: the app can take the value without reacting to it. Click the field, confirm focus, select all if replacing, then `type_text`.
+- A file's name as a list shows it (Finder's name cell: `AXFilename` and a file URL, not being edited) is refused with `file_name_needs_rename`: a value write changes only what Finder shows, never the file. Rename: click the item, press return, cmd+a, `type_text` the full name, press return.
+- A Mac Catalyst text field is written and read back after 300 ms; the result says the app was not sent typed keys, so its reaction is unverified. A Catalyst search field (search role, or "search" in its placeholder or name) is refused with `catalyst_text_needs_typing` before anything is written: a search does not run on a value write. Click it, confirm focus, select all if replacing, then `type_text`.
 
 ## act_and_read
 

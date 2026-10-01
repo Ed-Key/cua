@@ -511,6 +511,42 @@ pub fn resolve_main_window_id(pid: i32) -> anyhow::Result<u32> {
     Ok(largest.unwrap().window_id)
 }
 
+/// kCGPopUpMenuWindowLevel: the WindowServer layer of an open menu's window.
+pub(crate) const MENU_WINDOW_LAYER: i32 = 101;
+
+/// The menu windows `pid` has on screen; `None` when WindowServer's list
+/// could not be read (unknown, never "closed").
+pub(crate) fn menu_windows_of(pid: i32) -> Option<Vec<WindowInfo>> {
+    let windows = all_windows_any_layer();
+    (!windows.is_empty()).then(|| {
+        windows
+            .into_iter()
+            .filter(|w| w.pid == pid && w.is_on_screen && w.layer == MENU_WINDOW_LAYER)
+            .collect()
+    })
+}
+
+/// How many menu windows `pid` has on screen; `None` when unknown.
+pub(crate) fn open_menu_windows(pid: i32) -> Option<usize> {
+    menu_windows_of(pid).map(|windows| windows.len())
+}
+
+/// `Some(true)` once no menu of `pid` is on screen (polled briefly),
+/// `Some(false)` when one still is, `None` when that could not be read.
+pub(crate) fn wait_for_no_menu(pid: i32) -> Option<bool> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(400);
+    loop {
+        let open = open_menu_windows(pid)?;
+        if open == 0 {
+            return Some(true);
+        }
+        if std::time::Instant::now() >= deadline {
+            return Some(false);
+        }
+        std::thread::sleep(std::time::Duration::from_millis(40));
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

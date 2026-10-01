@@ -2,11 +2,11 @@
 //!
 //! Two modes, determined by the element's AXRole:
 //!
-//! * **AXPopUpButton**: Find the child option whose AXTitle or AXValue matches
-//!   `value` (case-insensitive) and AXPress it directly.  The native macOS popup
-//!   menu is never opened, so focus is never stolen.  Falls back to Safari
-//!   `osascript do JavaScript` for WebKit `<select>` elements that expose no AX
-//!   children when the popup is closed.
+//! * **AXPopUpButton**: Find the option whose AXTitle or AXValue matches
+//!   `value` (case-insensitive) and AXPress it: directly when the popup lists
+//!   its options, else after opening its menu (closed again on any outcome),
+//!   then read the popup's shown value back.  Safari `<select>` elements that
+//!   expose no AX children use `osascript do JavaScript` instead.
 //!
 //! * **Everything else**: Write `AXValue` directly (sliders, steppers, native
 //!   text fields that expose a settable AXValue).
@@ -47,10 +47,10 @@ fn def() -> &'static ToolDef {
         name: "set_value".into(),
         description:
             "Set an element's value (element_token, or element_index + snapshot_id). A popup or \
-             select gets the matching option pressed without opening its menu; other elements get \
-             AXValue written (sliders, steppers, date pickers, settable text fields). Web pages \
-             ignore value writes: in Chrome use get_browser_state then browser_type, elsewhere \
-             type_text."
+             select gets the matching option picked (its menu is opened and closed again when \
+             the options are not listed) and read back; other elements get AXValue written \
+             (sliders, steppers, date pickers, settable text fields). Web pages ignore value \
+             writes: in Chrome use get_browser_state then browser_type, elsewhere type_text."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -240,7 +240,9 @@ impl Tool for SetValueTool {
                     write_text_control(
                         &role,
                         || unsafe { crate::ax::bindings::attribute_settable(element, "AXValue") },
+                        || unsafe { file_name_cell(element) },
                         || unsafe { super::type_text::catalyst_text_control_of(element) },
+                        || unsafe { search_like(element, &role) },
                         || {
                             if prepare_native_text
                                 && !crate::input::ax_actions::is_element_focused(pid, element_ptr)
@@ -251,7 +253,15 @@ impl Tool for SetValueTool {
                         },
                         // Preparation is best effort, not evidence of delivery.
                         // Keep target-bound readback.
-                        || set_value_blocking(element_ptr, element_index, pid, &value),
+                        |catalyst| {
+                            let outcome = set_value_blocking(element_ptr, element_index, pid, &value)?;
+                            if catalyst == super::type_text::CatalystText::Yes {
+                                return Ok(catalyst_read_back(outcome, &value, || unsafe {
+                                    copy_string_attr(element, "AXValue")
+                                }));
+                            }
+                            Ok(Written::Outcome(outcome))
+                        },
                     )
                 })
                 .await
@@ -263,7 +273,9 @@ impl Tool for SetValueTool {
 
         match result {
             Ok(Ok(SetValueAttempt::Refused)) => nonsettable_text_refusal(),
+            Ok(Ok(SetValueAttempt::FileNameNeedsRename)) => file_name_needs_rename(pid, window_id),
             Ok(Ok(SetValueAttempt::CatalystNeedsTyping)) => catalyst_text_needs_typing(pid, window_id),
+            Ok(Ok(SetValueAttempt::CatalystDidNotTake(now))) => catalyst_text_did_not_take(pid, window_id, now),
             Ok(Ok(SetValueAttempt::Applied(mut outcome, catalyst))) => {
                 apply_surface_trust(&mut outcome, ax_echo_surface);
                 // The caveat rides in the summary, which the public action
@@ -296,9 +308,21 @@ impl Tool for SetValueTool {
 
 enum SetValueAttempt {
     Refused,
-    /// A Mac Catalyst text control: nothing was focused or written.
+    /// A file's name shown in a list: nothing was focused or written.
+    FileNameNeedsRename,
+    /// A Mac Catalyst search-like text control: nothing was focused or written.
     CatalystNeedsTyping,
+    /// A Mac Catalyst text control that did not hold the value written; what
+    /// it holds now.
+    CatalystDidNotTake(Option<String>),
     Applied(SetValueOutcome, super::type_text::CatalystText),
+}
+
+/// What a write produced: an outcome to report, or a Catalyst field that
+/// did not keep the value.
+enum Written {
+    Outcome(SetValueOutcome),
+    DidNotTake(Option<String>),
 }
 
 fn is_text_control_role(role: &str) -> bool {
@@ -307,35 +331,151 @@ fn is_text_control_role(role: &str) -> bool {
 
 /// The ordered route for one set_value on the retained element. Refusals come
 /// before any side effect: a read-only text control first (it keeps
-/// precedence), then a Mac Catalyst text control. Only then is the field
-/// prepared (`prepare_focus`) and the value written.
+/// precedence), then a file's name shown in a list, then a Mac Catalyst
+/// search-like field. Only then is the field prepared (`prepare_focus`, not
+/// for Catalyst fields) and the value written.
+#[allow(clippy::too_many_arguments)]
 fn write_text_control(
     role: &str,
     read_settable: impl FnOnce() -> Option<bool>,
+    file_name: impl FnOnce() -> bool,
     catalyst: impl FnOnce() -> super::type_text::CatalystText,
+    search: impl FnOnce() -> bool,
     prepare_focus: impl FnOnce() -> anyhow::Result<()>,
-    write: impl FnOnce() -> anyhow::Result<SetValueOutcome>,
+    write: impl FnOnce(super::type_text::CatalystText) -> anyhow::Result<Written>,
 ) -> anyhow::Result<SetValueAttempt> {
     use super::type_text::CatalystText;
     if text_value_not_settable(role, read_settable) {
         return Ok(SetValueAttempt::Refused);
     }
+    if role == "AXTextField" && file_name() {
+        return Ok(SetValueAttempt::FileNameNeedsRename);
+    }
     // Only text controls pay for the ancestry read.
     let catalyst = if is_text_control_role(role) { catalyst() } else { CatalystText::No };
     if catalyst == CatalystText::Yes {
-        return Ok(SetValueAttempt::CatalystNeedsTyping);
+        // A field that acts on each keystroke ignores a value write (the
+        // Messages search does not search): it needs typed keys.
+        if search() {
+            return Ok(SetValueAttempt::CatalystNeedsTyping);
+        }
+    } else {
+        prepare_focus()?;
     }
-    prepare_focus()?;
-    write().map(|outcome| SetValueAttempt::Applied(outcome, catalyst))
+    Ok(match write(catalyst)? {
+        Written::Outcome(outcome) => SetValueAttempt::Applied(outcome, catalyst),
+        Written::DidNotTake(now) => SetValueAttempt::CatalystDidNotTake(now),
+    })
+}
+
+/// A file's name as a list shows it (Finder's list and icon views): a text
+/// field naming a file (AXFilename, a file:// AXURL) that is not being
+/// edited. Writing its AXValue changes what the list shows, never the file.
+/// Finder's rename editor is a separate focused field and stays writable.
+unsafe fn file_name_cell(element: AXUIElementRef) -> bool {
+    copy_string_attr(element, "AXFilename").is_some_and(|name| !name.is_empty())
+        && crate::ax::bindings::copy_url_attr(element).is_some_and(|url| url.starts_with("file://"))
+        && crate::ax::bindings::copy_bool_attr(element, "AXFocused") != Some(true)
+}
+
+/// A search-like text field: the role or subrole says so, or its
+/// placeholder, description, identifier or title names a search.
+unsafe fn search_like(element: AXUIElementRef, role: &str) -> bool {
+    let subrole = copy_string_attr(element, "AXSubrole");
+    let texts = ["AXPlaceholderValue", "AXDescription", "AXIdentifier", "AXTitle"]
+        .map(|attribute| copy_string_attr(element, attribute));
+    is_search_like(role, subrole.as_deref(), &texts)
+}
+
+fn is_search_like(role: &str, subrole: Option<&str>, texts: &[Option<String>]) -> bool {
+    role == "AXSearchField"
+        || subrole == Some("AXSearchField")
+        || texts
+            .iter()
+            .flatten()
+            .any(|text| text.to_lowercase().contains("search"))
+}
+
+/// A Catalyst field's value read again after the app had time to process
+/// the write: it must still hold the value, or the write did not take.
+fn catalyst_read_back(
+    mut outcome: SetValueOutcome,
+    value: &str,
+    read: impl Fn() -> Option<String>,
+) -> Written {
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let now = read();
+    let Some(now) = now else {
+        // An unreadable value proves neither that it took nor that it did not.
+        outcome.verified = None;
+        outcome.detail.push_str(
+            " This is a Mac Catalyst field and its value could not be read back, so the write \
+             is unverified; whether the app reacted is unverified too.",
+        );
+        return Written::Outcome(outcome);
+    };
+    if now != value {
+        return Written::DidNotTake(Some(now));
+    }
+    outcome.verified = Some(true);
+    outcome.detail.push_str(
+        " This is a Mac Catalyst field: it holds the value (read back after 300 ms), but the \
+         app was not sent typed keys, so whether it reacted (validation, a live search, \
+         autocomplete) is unverified. For a field that should act on each keystroke, click it \
+         and type_text instead.",
+    );
+    Written::Outcome(outcome)
+}
+
+const FILE_NAME_NEEDS_RENAME: &str = "file_name_needs_rename";
+
+/// The refusal for set_value on a file's name shown in a list.
+fn file_name_needs_rename(pid: i32, window_id: u32) -> ToolResult {
+    let reason = "This is a file's name as the list shows it. A value write changes only what \
+                  the list shows, never the file, so nothing was written. Rename: click the \
+                  item, press return (or invoke_menu File > Rename), select all with cmd+a \
+                  (Finder selects the name without its extension), type_text the full new name, \
+                  press return, then check the list shows it.";
+    ToolResult::error(format!("set_value refused ({FILE_NAME_NEEDS_RENAME}): {reason}"))
+        .with_structured(serde_json::json!({
+            "code": FILE_NAME_NEEDS_RENAME,
+            "effect": "refused",
+            "path": "ax",
+            "pid": pid,
+            "window_id": window_id,
+            "reason": reason,
+        }))
+}
+
+const CATALYST_TEXT_DID_NOT_TAKE: &str = "catalyst_text_did_not_take";
+
+fn catalyst_text_did_not_take(pid: i32, window_id: u32, now: Option<String>) -> ToolResult {
+    let holds = match &now {
+        Some(text) => format!("it holds {}", serde_json::json!(text)),
+        None => "its value could not be read".to_owned(),
+    };
+    let reason = format!(
+        "This Mac Catalyst field did not keep the value written ({holds}). Click the field, \
+         select all (hotkey cmd+a) if replacing, then type_text."
+    );
+    ToolResult::error(format!("set_value failed ({CATALYST_TEXT_DID_NOT_TAKE}): {reason}"))
+        .with_structured(serde_json::json!({
+            "code": CATALYST_TEXT_DID_NOT_TAKE,
+            "effect": "failed",
+            "path": "ax",
+            "pid": pid,
+            "window_id": window_id,
+            "reason": reason,
+        }))
 }
 
 const CATALYST_TEXT_NEEDS_TYPING: &str = "catalyst_text_needs_typing";
 
 /// The refusal for set_value on a Mac Catalyst text control.
 fn catalyst_text_needs_typing(pid: i32, window_id: u32) -> ToolResult {
-    let reason = "This is a Mac Catalyst text field. Catalyst apps can take an accessibility \
-                  value write without reacting to it (Messages search does not search), and \
-                  the value read-back cannot tell the difference, so nothing was written. \
+    let reason = "This is a Mac Catalyst search field. Catalyst apps take an accessibility \
+                  value write without reacting to it (a search does not run), and the value \
+                  read-back cannot tell the difference, so nothing was written. \
                   Next: click the field and confirm it is focused (type_text refuses with \
                   catalyst_text_needs_focus when it is not), select all (hotkey cmd+a) if \
                   replacing, then type_text on it. Then check the app's own result (for a \
@@ -445,14 +585,8 @@ fn set_value_blocking(
 
     if role == "AXPopUpButton" {
         let element_title = unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default();
-        // Menu-item selection, not an AXValue write — no read-back to report.
-        select_popup_option(element, element_index, pid, value, &element_title).map(|detail| {
-            SetValueOutcome {
-                detail,
-                verified: None,
-                changed: None,
-            }
-        })
+        // Menu-item selection, read back from the pop-up's shown value.
+        select_popup_option(element, element_index, pid, value, &element_title)
     } else {
         // Default path: write AXValue directly. Numeric controls (AXSlider /
         // AXStepper) reject a CFString with -25201 and need a CFNumber; text
@@ -630,74 +764,173 @@ fn select_popup_option(
     pid: i32,
     value: &str,
     element_title: &str,
-) -> anyhow::Result<String> {
-    let children = unsafe { copy_children(element) };
-
-    if !children.is_empty() {
-        // Strategy 1: AX children (native AppKit NSPopUpButton).
-        let value_lower = value.to_lowercase();
-        let mut matched_idx: Option<usize> = None;
-        let mut available: Vec<String> = Vec::with_capacity(children.len());
-
-        for (i, &child) in children.iter().enumerate() {
-            let child_title = unsafe { copy_string_attr(child, "AXTitle") }.unwrap_or_default();
-            let child_value = unsafe { copy_string_attr(child, "AXValue") }.unwrap_or_default();
-            available.push(child_title.clone());
-            if child_title.to_lowercase() == value_lower
-                || child_value.to_lowercase() == value_lower
-            {
-                matched_idx = Some(i);
-                break;
-            }
+) -> anyhow::Result<SetValueOutcome> {
+    let mut options = unsafe { popup_options(element) };
+    let mut opened = false;
+    if options.is_empty() {
+        let app_name = crate::apps::get_app_name_for_pid(pid).unwrap_or_default();
+        if app_name == "Safari" {
+            // Safari/WebKit <select>: no AX children while closed.
+            return set_select_via_js(element_index, element_title, value).map(|detail| {
+                SetValueOutcome { detail, verified: None, changed: None }
+            });
         }
-
-        let result = if let Some(i) = matched_idx {
-            let child = children[i];
-            let opt_title =
-                unsafe { copy_string_attr(child, "AXTitle") }.unwrap_or_else(|| value.to_string());
-            let err = unsafe { perform_action(child, "AXPress") };
-            if err == kAXErrorSuccess {
-                Ok(format!(
-                    "✅ Selected '{opt_title}' in AXPopUpButton [{element_index}] \
-                     \"{element_title}\" via AX child AXPress."
-                ))
-            } else {
-                anyhow::bail!("AXPress on child option failed with error {err}")
-            }
-        } else {
-            let avail = available
-                .iter()
-                .map(|t| format!("\"{t}\""))
-                .collect::<Vec<_>>()
-                .join(", ");
+        // A closed AppKit pop-up (a Save panel's encoding) shows its items
+        // only while its menu is open: open it, pick, read back.
+        opened = true;
+        let err = unsafe { perform_action(element, "AXPress") };
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+        while options.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            options = unsafe { popup_options(element) };
+        }
+        if options.is_empty() {
+            let closed = unsafe { close_popup_menu(element, pid) };
             anyhow::bail!(
-                "No AX child matching '{value}' in AXPopUpButton [{element_index}] \
-                 \"{element_title}\". Available: [{avail}]"
-            )
-        };
-
-        // Release children (copy_children retains each one).
-        for &child in &children {
-            unsafe {
-                CFRelease(child as _);
+                "AXPopUpButton [{element_index}] \"{element_title}\" showed no options \
+                 (pressing it to open its menu returned AX error {err}).{}",
+                closed_note(closed)
+            );
+        }
+    }
+    let titles: Vec<String> = options.iter().map(|o| o.title.clone()).filter(|t| !t.is_empty()).collect();
+    let chosen = match_option(&options, value);
+    let result = match chosen {
+        Some(i) => {
+            let err = unsafe { perform_action(options[i].element, "AXPress") };
+            if err == kAXErrorSuccess {
+                Ok((options[i].title.clone(), options[i].value.clone()))
+            } else {
+                Err(format!("AXPress on option '{}' failed with AX error {err}", options[i].title))
             }
         }
-
-        return result;
+        None => Err(format!(
+            "No option matching '{value}' in AXPopUpButton [{element_index}] \"{element_title}\". \
+             Available: [{}]",
+            titles.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ")
+        )),
+    };
+    for option in &options {
+        unsafe { CFRelease(option.element as _) };
     }
+    let (picked_title, picked_value) = match result {
+        Ok(picked) => picked,
+        Err(error) => {
+            let closed = if opened { unsafe { close_popup_menu(element, pid) } } else { Some(true) };
+            anyhow::bail!("{error}.{}", closed_note(closed));
+        }
+    };
+    // The menu closes when its item is chosen; make sure it did.
+    let closed = if opened {
+        match crate::windows::wait_for_no_menu(pid) {
+            Some(true) => Some(true),
+            _ => unsafe { close_popup_menu(element, pid) },
+        }
+    } else {
+        Some(true)
+    };
+    // The pop-up may show the chosen option's title or its own value.
+    let is_picked = |shown: &str| shows_option(shown, &picked_title, &picked_value);
+    let picked = if picked_title.is_empty() { picked_value.clone() } else { picked_title.clone() };
+    let shown = read_back_popup(element, is_picked);
+    let (verified, how) = match &shown {
+        Some(now) if is_picked(now) => (Some(true), format!("it now shows '{now}'")),
+        Some(now) => (Some(false), format!("it still shows '{now}'; verify via screenshot")),
+        None => (None, "its shown value is not readable through AX; could not confirm".to_owned()),
+    };
+    let mark = if verified == Some(true) { "✅ Selected" } else { "📨 Picked (unverified)" };
+    let route = if opened { "opened its menu and pressed the item" } else { "pressed the item without opening the menu" };
+    Ok(SetValueOutcome {
+        detail: format!(
+            "{mark} '{picked}' in AXPopUpButton [{element_index}] \"{element_title}\" ({route}); {how}.{}",
+            if closed == Some(true) { String::new() } else { closed_note(closed) }
+        ),
+        verified,
+        changed: None,
+    })
+}
 
-    // Strategy 2: Safari/WebKit — no AX children when popup is closed.
-    // Use osascript do JavaScript to set the <select> element's DOM value.
-    let app_name = crate::apps::get_app_name_for_pid(pid).unwrap_or_default();
+/// One option of a pop-up: its retained element and title.
+struct PopupOption {
+    element: AXUIElementRef,
+    title: String,
+    value: String,
+}
 
-    if app_name != "Safari" {
-        anyhow::bail!(
-            "AXPopUpButton [{element_index}] '{element_title}' has no AX children and \
-             target is '{app_name}' (not Safari) — no fallback available."
-        )
+/// The pop-up's options: its children, through the AXMenu AppKit puts
+/// between a pop-up and its items while the menu is open. Each element is
+/// retained; the caller releases them.
+unsafe fn popup_options(element: AXUIElementRef) -> Vec<PopupOption> {
+    let mut items = Vec::new();
+    for child in copy_children(element) {
+        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
+            items.extend(copy_children(child));
+            CFRelease(child as _);
+        } else {
+            items.push(child);
+        }
     }
+    items
+        .into_iter()
+        .map(|item| {
+            let title = copy_string_attr(item, "AXTitle").unwrap_or_default();
+            let value = copy_string_attr(item, "AXValue").unwrap_or_default();
+            PopupOption { element: item, title, value }
+        })
+        .collect()
+}
 
-    set_select_via_js(element_index, element_title, value)
+/// Whether a pop-up's shown value names the option: its title, or its own
+/// non-empty value.
+fn shows_option(shown: &str, title: &str, value: &str) -> bool {
+    shown.eq_ignore_ascii_case(title) || (!value.is_empty() && shown.eq_ignore_ascii_case(value))
+}
+
+/// The option whose title, or else non-empty value, matches (case-insensitive).
+fn match_option(options: &[PopupOption], value: &str) -> Option<usize> {
+    option_index(options.iter().map(|o| (o.title.as_str(), o.value.as_str())), value)
+}
+
+fn option_index<'a>(options: impl Iterator<Item = (&'a str, &'a str)>, value: &str) -> Option<usize> {
+    let wanted = value.to_lowercase();
+    options
+        .into_iter()
+        .position(|(title, v)| title.to_lowercase() == wanted || (!v.is_empty() && v.to_lowercase() == wanted))
+}
+
+/// The pop-up's shown choice, polled for up to a second until it reads
+/// the picked option (AppKit updates it after the menu closes).
+fn read_back_popup(element: AXUIElementRef, is_picked: impl Fn(&str) -> bool) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        // Only AXValue is the choice: a title can be a fixed label.
+        let shown = unsafe { copy_string_attr(element, "AXValue") };
+        if shown.as_deref().is_some_and(&is_picked)
+            || std::time::Instant::now() >= deadline
+        {
+            return shown;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
+/// Cancel the pop-up's open menu and read WindowServer's list back.
+unsafe fn close_popup_menu(element: AXUIElementRef, pid: i32) -> Option<bool> {
+    for child in copy_children(element) {
+        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
+            let _ = perform_action(child, "AXCancel");
+        }
+        CFRelease(child as _);
+    }
+    crate::windows::wait_for_no_menu(pid)
+}
+
+fn closed_note(closed: Option<bool>) -> String {
+    match closed {
+        Some(true) => String::new(),
+        Some(false) => " Its menu is still open: press escape on the window before other input.".into(),
+        None => " Whether its menu closed could not be read: check before other input.".into(),
+    }
 }
 
 // ── Safari JavaScript fallback ───────────────────────────────────────────────
@@ -838,24 +1071,36 @@ mod tests {
 
     /// Runs the route with counters on every side effect.
     fn route(role: &str, settable: Option<bool>, catalyst: CatalystText) -> (SetValueAttempt, usize, usize, usize) {
+        route_with(role, settable, false, catalyst, false)
+    }
+
+    fn route_with(
+        role: &str,
+        settable: Option<bool>,
+        file_name: bool,
+        catalyst: CatalystText,
+        search: bool,
+    ) -> (SetValueAttempt, usize, usize, usize) {
         let (ancestry, focus, write) = (Cell::new(0), Cell::new(0), Cell::new(0));
         let attempt = write_text_control(
             role,
             || settable,
+            || file_name,
             || { ancestry.set(ancestry.get() + 1); catalyst },
+            || search,
             || { focus.set(focus.get() + 1); Ok(()) },
-            || { write.set(write.get() + 1); written() },
+            |_| { write.set(write.get() + 1); written().map(super::Written::Outcome) },
         )
         .unwrap();
         (attempt, ancestry.get(), focus.get(), write.get())
     }
 
-    /// R1: a Catalyst text control is refused before any focus preparation
+    /// R1: a Catalyst search field is refused before any focus preparation
     /// or write; a read-only text control keeps its own refusal first.
     #[test]
-    fn catalyst_text_is_refused_before_focus_or_write() {
+    fn catalyst_search_text_is_refused_before_focus_or_write() {
         for role in ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"] {
-            let (attempt, _, focus, write) = route(role, Some(true), CatalystText::Yes);
+            let (attempt, _, focus, write) = route_with(role, Some(true), false, CatalystText::Yes, true);
             assert!(matches!(attempt, SetValueAttempt::CatalystNeedsTyping), "{role}");
             assert_eq!((focus, write), (0, 0), "{role}: nothing prepared or written");
         }
@@ -877,6 +1122,73 @@ mod tests {
         assert_eq!((ancestry, write), (0, 1));
     }
 
+    /// G6: a Catalyst field that is not search-like is written, without the
+    /// native focus preparation, and its read-back decides the result.
+    #[test]
+    fn catalyst_form_field_is_written_without_focus_preparation() {
+        let (attempt, _, focus, write) = route_with("AXTextField", Some(true), false, CatalystText::Yes, false);
+        assert!(matches!(attempt, SetValueAttempt::Applied(_, CatalystText::Yes)));
+        assert_eq!((focus, write), (0, 1));
+        let kept = super::catalyst_read_back(written().unwrap(), "Ada Lovelace", || Some("Ada Lovelace".into()));
+        match kept {
+            super::Written::Outcome(outcome) => {
+                assert_eq!(outcome.verified, Some(true));
+                assert!(outcome.detail.contains("not sent typed keys"), "{}", outcome.detail);
+                assert!(outcome.detail.contains("unverified"), "{}", outcome.detail);
+            }
+            super::Written::DidNotTake(_) => panic!("the field holds the value"),
+        }
+        let lost = super::catalyst_read_back(written().unwrap(), "Ada Lovelace", || Some("Ada".into()));
+        assert!(matches!(lost, super::Written::DidNotTake(Some(ref now)) if now == "Ada"));
+        // Unreadable: unverified, not a failure.
+        match super::catalyst_read_back(written().unwrap(), "Ada Lovelace", || None) {
+            super::Written::Outcome(outcome) => assert_eq!(outcome.verified, None),
+            super::Written::DidNotTake(_) => panic!("an unreadable value is not a failed write"),
+        }
+    }
+
+    #[test]
+    fn a_pop_up_option_matches_its_title_or_its_own_value_only() {
+        let options = [("", ""), ("Daily", ""), ("Weekly", "w")];
+        assert_eq!(super::option_index(options.into_iter(), ""), Some(0), "a blank item stays selectable");
+        assert_eq!(super::option_index(options.into_iter(), "daily"), Some(1));
+        assert_eq!(super::option_index(options.into_iter(), "W"), Some(2));
+        assert_eq!(super::option_index(options.into_iter(), "Monthly"), None);
+        assert!(super::shows_option("w", "Weekly", "w"), "a pop-up that reports the value");
+        assert!(super::shows_option("weekly", "Weekly", "w"));
+        assert!(!super::shows_option("", "Daily", ""), "an empty value proves nothing");
+        assert!(!super::shows_option("Daily", "Weekly", "w"));
+    }
+
+    #[test]
+    fn search_like_fields_are_named_by_role_subrole_or_their_text() {
+        assert!(super::is_search_like("AXSearchField", None, &[]));
+        assert!(super::is_search_like("AXTextField", Some("AXSearchField"), &[]));
+        assert!(super::is_search_like("AXTextField", None, &[Some("Search messages".into())]));
+        assert!(super::is_search_like("AXTextField", None, &[None, Some("probe-search".into())]));
+        assert!(!super::is_search_like("AXTextField", None, &[Some("Display name".into()), None]));
+    }
+
+    /// G1: a file's name as a list shows it is refused before anything is
+    /// focused or written, ahead of the Catalyst checks.
+    #[test]
+    fn a_file_name_cell_is_refused_before_focus_or_write() {
+        let (attempt, ancestry, focus, write) = route_with("AXTextField", Some(true), true, CatalystText::No, false);
+        assert!(matches!(attempt, SetValueAttempt::FileNameNeedsRename));
+        assert_eq!((ancestry, focus, write), (0, 0, 0));
+        // Only text fields: another role keeps its own path.
+        let (attempt, _, _, write) = route_with("AXSlider", Some(true), true, CatalystText::No, false);
+        assert!(matches!(attempt, SetValueAttempt::Applied(..)));
+        assert_eq!(write, 1);
+        let reason = super::file_name_needs_rename(7, 42).structured_content.unwrap()["reason"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        for needed in ["never the file", "nothing was written", "return", "cmd+a", "type_text"] {
+            assert!(reason.contains(needed), "missing {needed:?}: {reason}");
+        }
+    }
+
     #[test]
     fn catalyst_refusal_names_the_typing_route() {
         let result = super::catalyst_text_needs_typing(7, 42);
@@ -885,7 +1197,7 @@ mod tests {
         assert_eq!(data["effect"], "refused");
         assert_eq!((data["pid"].as_i64(), data["window_id"].as_u64()), (Some(7), Some(42)));
         let reason = data["reason"].as_str().unwrap();
-        for needed in ["nothing was written", "click the field", "focused", "select all", "type_text", "results changed"] {
+        for needed in ["search field", "nothing was written", "click the field", "focused", "select all", "type_text", "results changed"] {
             assert!(reason.contains(needed), "missing {needed:?}: {reason}");
         }
     }

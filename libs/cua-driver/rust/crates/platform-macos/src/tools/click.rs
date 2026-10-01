@@ -815,6 +815,18 @@ impl Tool for ClickTool {
                 || async move {
                     tokio::task::spawn_blocking(move || {
                         let element_ptr = element_guard.as_ptr();
+                        // Menus on screen before the press, so a menu it opens
+                        // is tied to this window while the action holds the
+                        // input lock (a Catalyst pop-up's menu names no window).
+                        let menus_before = crate::outcome::menu_window_ids(pid);
+                        let note_menu = |result: anyhow::Result<_>| {
+                            if result.is_ok() {
+                                // SAFETY: the element guard keeps it retained.
+                                unsafe { crate::outcome::note_menu_opened(pid, wid, element_ptr, menus_before.clone()) };
+                            }
+                            result
+                        };
+                        note_menu((|| {
                         if foreground {
                             let mut outcome = None;
                             let has_modifiers = !selection_modifiers.is_empty();
@@ -882,6 +894,7 @@ impl Tool for ClickTool {
                             )
                             .map(|outcome| (outcome, false))
                         }
+                        })())
                     })
                     .await
                 },
@@ -1644,6 +1657,32 @@ fn focus_text_entry(
     ))
 }
 
+/// A press whose effect a toggle's own value shows: AXPress on a radio
+/// button or checkbox that advertises it.
+fn toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
+    ax_action == "AXPress"
+        && matches!(role, "AXRadioButton" | "AXCheckBox")
+        && advertised.iter().any(|action| action == "AXPress")
+}
+
+/// The toggle's new value when, within half a second, it moved away from
+/// `before` and two reads 100 ms apart agree on it.
+fn settled_change(before: &str, mut read: impl FnMut() -> Option<String>) -> Option<String> {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    loop {
+        if let Some(now) = read().filter(|now| now != before) {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            if read().as_deref() == Some(now.as_str()) {
+                return Some(now);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+}
+
 /// Returns `(summary_text, needs_webkit_delay, suspected_noop,
 /// selection_verified, selection_via_pixel)`.
 ///
@@ -1827,6 +1866,12 @@ fn perform_ax_click(
     }
 
     let alive_before = unsafe { crate::ax::bindings::element_is_alive(element) };
+    // A toggle's value before the press: some apps (Finder's toolbar view
+    // switcher) apply the press and still return an AX error.
+    let toggle_before = toggle_press(ax_action, &role, &advertised)
+        .then(|| unsafe { crate::ax::bindings::copy_stringish_attr(element, "AXValue") })
+        .flatten()
+        .map(|value| value.state_value);
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
     if crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
         crate::ax::bindings::element_gone_after_action(element)
@@ -1847,6 +1892,23 @@ fn perform_ax_click(
         ));
     }
     if err != crate::ax::bindings::kAXErrorSuccess {
+        if let Some(before) = toggle_before {
+            let read = || unsafe {
+                crate::ax::bindings::copy_stringish_attr(element, "AXValue").map(|value| value.state_value)
+            };
+            if let Some(now) = settled_change(&before, read) {
+                return Ok((
+                    format!(
+                        "✅ Performed {action_label} on [{idx}] {role} \"{title}\": its value is now \
+                         {now} (was {before}), read back twice, although the app returned AX error {err}."
+                    ),
+                    false,
+                    false,
+                    true,
+                    false,
+                ));
+            }
+        }
         anyhow::bail!("AXUIElementPerformAction({action_label}) returned {err}");
     }
 
@@ -2646,6 +2708,29 @@ fn select_row(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// G3: Finder's toolbar view switcher applies the press and returns an
+    /// AX error; only a toggle's own settled value turns that into success.
+    #[test]
+    fn an_erroring_toggle_press_counts_only_when_its_value_settles_elsewhere() {
+        let press = vec!["AXPress".to_owned()];
+        assert!(toggle_press("AXPress", "AXRadioButton", &press));
+        assert!(toggle_press("AXPress", "AXCheckBox", &press));
+        assert!(!toggle_press("AXPress", "AXButton", &press), "a button has no value to show it");
+        assert!(!toggle_press("AXPick", "AXRadioButton", &press));
+        assert!(!toggle_press("AXPress", "AXRadioButton", &[]), "not advertised");
+
+        let mut reads = vec![Some("1".to_owned()), Some("1".to_owned())].into_iter();
+        assert_eq!(settled_change("0", || reads.next().flatten()), Some("1".to_owned()));
+        // Flickered and came back: no change.
+        let mut reads = vec![Some("1".to_owned()), Some("0".to_owned())]
+            .into_iter()
+            .chain(std::iter::repeat(Some("0".to_owned())));
+        assert_eq!(settled_change("0", || reads.next().flatten()), None);
+        // Never moved, or unreadable.
+        assert_eq!(settled_change("0", || Some("0".to_owned())), None);
+        assert_eq!(settled_change("0", || None), None);
+    }
 
     /// A scripted app for `climb_row_ladder`: which rungs apply, what each
     /// identity check reads, what each send does and what each read-back
