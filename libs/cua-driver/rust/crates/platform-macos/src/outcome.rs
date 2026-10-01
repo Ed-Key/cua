@@ -378,8 +378,20 @@ pub(crate) fn describe(
         }
         _ => {}
     }
+    // A sheet or popover open before and after is still waiting for the
+    // agent (a rename popover a confirm did not close): say so every time.
+    let still_open: Vec<String> = match (&before.sheets, &after.sheets) {
+        (Some(a), Some(b)) => b.iter().filter(|s| a.contains(s)).cloned().collect(),
+        _ => Vec::new(),
+    };
+    let still_open = (!still_open.is_empty()).then(|| format!("still open: {}", names(&still_open)));
     if parts.is_empty() && before != after {
-        return "the window changed in a way this line does not describe; read it if it matters".into();
+        let mut line =
+            "the window changed in a way this line does not describe; read it if it matters".to_owned();
+        if let Some(still) = &still_open {
+            line.push_str(&format!("; {still}"));
+        }
+        return line;
     }
     if parts.is_empty() {
         let seconds = NO_CHANGE_WAIT.as_secs_f32();
@@ -393,8 +405,12 @@ pub(crate) fn describe(
         if after.document.is_some() && after.file.is_none() {
             line.push_str("; the document's file was not checked (protected folder or unreadable)");
         }
+        if let Some(still) = &still_open {
+            line.push_str(&format!("; {still}"));
+        }
         return line;
     }
+    parts.extend(still_open);
     let mut line = parts.join("; ");
     if settle == Settle::StillChanging {
         line.push_str(&format!(
@@ -1395,6 +1411,21 @@ mod tests {
             describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
             "AXDisclosureTriangle \"show less options\" now 1, was 0"
         );
+    }
+
+    #[test]
+    fn a_popover_left_open_is_named_on_every_line() {
+        let mut before = window("note copy");
+        before.sheets = Some(vec!["popover".into()]);
+        before.document = Some("/Users/lume/lab/work/note copy.txt".into());
+        let mut after = before.clone();
+        after.title = Some("groceries".into());
+        assert_eq!(
+            describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
+            "window title now \"groceries\"; still open: popover"
+        );
+        let line = describe(&before, &before, &DiskNotes::default(), Settle::Unchanged, true);
+        assert!(line.starts_with("nothing it watches changed") && line.ends_with("; still open: popover"), "{line}");
     }
 
     #[test]
