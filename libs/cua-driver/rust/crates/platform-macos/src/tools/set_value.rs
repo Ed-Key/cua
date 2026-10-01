@@ -793,7 +793,7 @@ fn select_popup_option(
             );
         }
     }
-    let titles: Vec<String> = options.iter().map(|o| o.title.clone()).collect();
+    let titles: Vec<String> = options.iter().map(|o| o.title.clone()).filter(|t| !t.is_empty()).collect();
     let chosen = match_option(&options, value);
     let result = match chosen {
         Some(i) => {
@@ -870,24 +870,24 @@ unsafe fn popup_options(element: AXUIElementRef) -> Vec<PopupOption> {
     }
     items
         .into_iter()
-        .filter_map(|item| {
+        .map(|item| {
             let title = copy_string_attr(item, "AXTitle").unwrap_or_default();
             let value = copy_string_attr(item, "AXValue").unwrap_or_default();
-            if title.is_empty() && value.is_empty() {
-                // A separator.
-                CFRelease(item as _);
-                return None;
-            }
-            Some(PopupOption { element: item, title, value })
+            PopupOption { element: item, title, value }
         })
         .collect()
 }
 
+/// The option whose title, or else non-empty value, matches (case-insensitive).
 fn match_option(options: &[PopupOption], value: &str) -> Option<usize> {
+    option_index(options.iter().map(|o| (o.title.as_str(), o.value.as_str())), value)
+}
+
+fn option_index<'a>(options: impl Iterator<Item = (&'a str, &'a str)>, value: &str) -> Option<usize> {
     let wanted = value.to_lowercase();
     options
-        .iter()
-        .position(|o| o.title.to_lowercase() == wanted || o.value.to_lowercase() == wanted)
+        .into_iter()
+        .position(|(title, v)| title.to_lowercase() == wanted || (!v.is_empty() && v.to_lowercase() == wanted))
 }
 
 /// The pop-up's shown choice, polled for up to a second until it reads
@@ -895,9 +895,8 @@ fn match_option(options: &[PopupOption], value: &str) -> Option<usize> {
 fn read_back_popup(element: AXUIElementRef, picked: &str) -> Option<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
-        let shown = unsafe { copy_string_attr(element, "AXValue") }
-            .filter(|v| !v.is_empty())
-            .or_else(|| unsafe { copy_string_attr(element, "AXTitle") }.filter(|t| !t.is_empty()));
+        // Only AXValue is the choice: a title can be a fixed label.
+        let shown = unsafe { copy_string_attr(element, "AXValue") };
         if shown.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(picked))
             || std::time::Instant::now() >= deadline
         {
@@ -1138,6 +1137,15 @@ mod tests {
             super::Written::Outcome(outcome) => assert_eq!(outcome.verified, None),
             super::Written::DidNotTake(_) => panic!("an unreadable value is not a failed write"),
         }
+    }
+
+    #[test]
+    fn a_pop_up_option_matches_its_title_or_its_own_value_only() {
+        let options = [("", ""), ("Daily", ""), ("Weekly", "w")];
+        assert_eq!(super::option_index(options.into_iter(), ""), Some(0), "a blank item stays selectable");
+        assert_eq!(super::option_index(options.into_iter(), "daily"), Some(1));
+        assert_eq!(super::option_index(options.into_iter(), "W"), Some(2));
+        assert_eq!(super::option_index(options.into_iter(), "Monthly"), None);
     }
 
     #[test]
