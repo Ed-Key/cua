@@ -926,11 +926,19 @@ fn name_controls_by_row(nodes: &mut [SemanticNode], dom: &DomIndex) {
                 found.sort_by_key(|(order, _)| *order);
                 let joined = found.iter().map(|(_, text)| *text).collect::<Vec<_>>().join(" ");
                 if let Some(mut name) = clean_semantic_text(joined) {
-                    if name.chars().count() > ROW_NAME_CHARS {
+                    let truncated = name.chars().count() > ROW_NAME_CHARS;
+                    if truncated {
                         name = name.chars().take(ROW_NAME_CHARS - 1).collect::<String>();
                         name.push('…');
                     }
-                    names.push((index, RowName { name, levels }));
+                    names.push((
+                        index,
+                        RowName {
+                            name,
+                            levels,
+                            truncated,
+                        },
+                    ));
                 }
                 break;
             }
@@ -2747,7 +2755,8 @@ mod tests {
             entry.row,
             Some(RowName {
                 name: "Call the plumber".into(),
-                levels: 1
+                levels: 1,
+                truncated: false
             })
         );
         assert!(!entry.actions.contains(&BrowserActionKind::Type));

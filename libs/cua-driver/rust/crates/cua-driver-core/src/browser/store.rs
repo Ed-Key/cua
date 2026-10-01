@@ -196,6 +196,8 @@ pub struct RefEntry {
 pub struct RowName {
     pub name: String,
     pub levels: usize,
+    /// The row's text was longer: `name` is its first characters and "…".
+    pub truncated: bool,
 }
 
 /// One `dom_refs_v1` snapshot.

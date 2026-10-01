@@ -893,6 +893,7 @@ mod tests {
             row: Some(crate::browser::store::RowName {
                 name: row.into(),
                 levels: 1,
+                truncated: false,
             }),
             ..node(10, "checkbox", "")
         };

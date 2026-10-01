@@ -2707,6 +2707,9 @@ enum EnterSend {
     Sent,
     /// Nothing was sent, and why.
     NotSent(String),
+    /// Nothing was sent: the field no longer holds the confirmed text; what
+    /// it holds now.
+    Changed(String),
     /// A JavaScript dialog opened; `keys` says whether any Enter event had
     /// reached the page first.
     Dialog { keys: bool },
@@ -2797,16 +2800,33 @@ async fn press_enter(
                     return EnterSend::NotSent("the page took the field out before Enter".to_owned());
                 }
                 if state["value"].as_str() != Some(confirmed) {
-                    let password = state["password"].as_bool().unwrap_or(false);
-                    return EnterSend::NotSent(format!(
-                        "the field changed to {} before Enter",
-                        shown_value(state["value"].as_str().unwrap_or(""), password)
-                    ));
+                    return EnterSend::Changed(state["value"].as_str().unwrap_or("").to_owned());
                 }
             }
             Ok(None) => return blocked(false),
             Err(error) => {
                 return EnterSend::NotSent(format!("the field could not be read before Enter: {error}"))
+            }
+        }
+        // And it is still the element the keys go to (a timer may have
+        // focused another one during the wait).
+        match delivery
+            .send(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": FOCUS_EMULATION_READY_CHECK,
+                    "returnByValue": true,
+                }),
+            )
+            .await
+        {
+            Ok(Some(value)) if value["result"]["value"].as_bool() == Some(true) => {}
+            Ok(None) => return blocked(false),
+            _ => {
+                return EnterSend::NotSent(
+                    "another element took the focus before Enter".to_owned(),
+                )
             }
         }
         let key = |kind: &str| {
@@ -2855,6 +2875,8 @@ async fn press_enter(
 enum AfterEnter {
     /// Enter was not pressed, and why.
     NotSent(String),
+    /// Enter was not pressed: the field changed to this before it.
+    ChangedBeforeEnter(String),
     /// The page opened a JavaScript dialog while it handled Enter.
     Dialog,
     /// The page opened a JavaScript dialog before any Enter event was sent.
@@ -2913,6 +2935,14 @@ fn describe_enter(after: &AfterEnter, before_enter: &str, password: bool) -> (St
             ", then Enter was pressed and the page opened a JavaScript dialog".to_owned(),
             pressed("dialog"),
             true,
+        ),
+        AfterEnter::ChangedBeforeEnter(value) => (
+            format!(
+                ". Enter was NOT pressed: the field changed to {} before it",
+                shown_value(value, password)
+            ),
+            json!({ "pressed": false, "reason": "field_changed" }),
+            false,
         ),
         AfterEnter::DialogBeforeEnter => (
             ". Enter was NOT pressed: the page opened a JavaScript dialog first".to_owned(),
@@ -3831,6 +3861,7 @@ impl Tool for BrowserTypeTool {
             Some(Readback::Confirmed(actual)) if enter => Some(
                 match press_enter(&mut delivery, entry.backend_node_id, &object_id, actual).await {
                     EnterSend::NotSent(reason) => AfterEnter::NotSent(reason),
+                    EnterSend::Changed(value) => AfterEnter::ChangedBeforeEnter(value),
                     EnterSend::Partial(reason) => AfterEnter::Partial(reason),
                     EnterSend::Dialog { keys: false } => AfterEnter::DialogBeforeEnter,
                     EnterSend::Dialog { keys: true } => AfterEnter::Dialog,
@@ -3933,6 +3964,18 @@ impl Tool for BrowserTypeTool {
                                     AfterEnter::Field(state) => {
                                         structured["value"] = json!((!before.password)
                                             .then(|| truncate_value(&state.value)));
+                                    }
+                                    AfterEnter::ChangedBeforeEnter(value) => {
+                                        structured["value"] = json!((!before.password)
+                                            .then(|| truncate_value(value)));
+                                        structured["evidence"] = json!([{
+                                            "kind": "browser_readback",
+                                            "detail": format!(
+                                                "the field held {shown}, then changed to {} \
+                                                 before Enter",
+                                                shown_value(value, before.password)
+                                            ),
+                                        }]);
                                     }
                                     _ => structured["value"] = Value::Null,
                                 }
@@ -4668,6 +4711,14 @@ pub(crate) mod tests {
         assert!(said.contains("NOT pressed: no focus"), "{said}");
         assert_eq!(described["pressed"], false);
         assert!(!confirmed, "typing without the Enter asked for is not confirmed");
+        let (said, described, confirmed) =
+            describe_enter(&AfterEnter::ChangedBeforeEnter("milk!".into()), "milk", false);
+        assert!(said.contains("changed to \"milk!\" before it"), "{said}");
+        assert_eq!(described["reason"], "field_changed");
+        assert!(!confirmed);
+        let (said, _, _) =
+            describe_enter(&AfterEnter::ChangedBeforeEnter("hunter3".into()), "hunter2", true);
+        assert!(!said.contains("hunter"), "{said}");
     }
 
     use super::*;

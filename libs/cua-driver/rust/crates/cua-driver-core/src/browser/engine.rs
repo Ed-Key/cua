@@ -329,7 +329,8 @@ fn viewport_point_to_screen(
 /// host and a frame document's its frame element, as the snapshot's DOM
 /// index counts them) and names the row by the snapshot's rule
 /// ([`super::semantic`]'s `name_controls_by_row`): its visible text in
-/// document order, open shadow roots included, without text inside buttons,
+/// order (children, then a shadow root, as the DOM index walks), open shadow
+/// roots included, without text inside buttons,
 /// links and fields, cleaned the same way, then compared with `name` (a
 /// truncated name by its prefix), ignoring case.
 ///
@@ -338,7 +339,7 @@ fn viewport_point_to_screen(
 /// inline-styled hidden ancestor still counts here, and closed shadow roots
 /// are not seen. Either reads as a changed row (a refusal, never a wrong
 /// click). Move this check onto a fresh snapshot read if that bites.
-const ROW_STILL_READS: &str = "function(levels, name) { \
+const ROW_STILL_READS: &str = "function(levels, name, truncated) { \
     let row = this; \
     for (let i = 0; i < levels && row; i++) { \
         row = row.parentNode || row.host || \
@@ -366,15 +367,15 @@ const ROW_STILL_READS: &str = "function(levels, name) { \
             roles.test(node.getAttribute('role') || '') || \
             node.getAttribute('aria-hidden') === 'true' || node.hidden)) continue; \
         const kids = Array.from(node.childNodes || []); \
-        if (node.shadowRoot) kids.unshift(node.shadowRoot); \
+        if (node.shadowRoot) kids.push(node.shadowRoot); \
         for (let k = kids.length - 1; k >= 0; k--) stack.push(kids[k]); \
     } \
     const clean = (text) => text \
         .replace(/[\\uFEFF\\u200B\\u200C\\u200D\\u2060\\u00A0\\u2007\\u202F\\uE000-\\uF8FF]/g, ' ') \
         .split(/\\s+/).filter(Boolean).join(' ').toLowerCase(); \
     const now = clean(parts.join(' ')); \
-    const want = clean(name.endsWith('…') ? name.slice(0, -1) : name); \
-    return name.endsWith('…') ? now.startsWith(want) : now === want; \
+    const want = clean(truncated ? name.slice(0, -1) : name); \
+    return truncated ? now.startsWith(want) : now === want; \
 }";
 
 /// Whether the row a control was named after (see
@@ -405,7 +406,11 @@ async fn row_still_reads(
         json!({
             "objectId": object_id,
             "functionDeclaration": ROW_STILL_READS,
-            "arguments": [{ "value": row.levels }, { "value": row.name }],
+            "arguments": [
+                { "value": row.levels },
+                { "value": row.name },
+                { "value": row.truncated },
+            ],
             "returnByValue": true,
         }),
     )
