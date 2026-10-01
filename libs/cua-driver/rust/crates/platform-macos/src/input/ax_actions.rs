@@ -364,6 +364,22 @@ impl RowSelection {
             .unwrap_or_default()
     }
 
+    /// `name`, read so that a failed read is told apart from no name: None
+    /// when the row did not answer (a name that cannot be read proves
+    /// nothing about which row this is).
+    pub fn read_name(&self) -> Option<String> {
+        let mut name = String::new();
+        for attribute in ["AXTitle", "AXDescription"] {
+            match unsafe { copy_string_attr_checked(self.row, attribute) } {
+                Ok(text) if name.trim().is_empty() => name = text,
+                Ok(_) => {}
+                Err(kAXErrorAttributeUnsupported | kAXErrorNoValue) => {}
+                Err(_) => return None,
+            }
+        }
+        Some(name)
+    }
+
     /// Whether the row still answers (it was not replaced).
     pub fn readable(&self) -> bool {
         unsafe { copy_bool_attr(self.row, "AXSelected") }.is_some()

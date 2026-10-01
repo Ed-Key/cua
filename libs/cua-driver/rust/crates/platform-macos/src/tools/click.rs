@@ -172,6 +172,48 @@ fn background_pixel_restore_pid(
     }
 }
 
+/// After a raw background left click (AllowTargetWithoutRaise): once the
+/// click has been queued, restore the prior app if the target is still
+/// reported frontmost. The no-raise record can make NSWorkspace report the
+/// target active although its window never moved in z-order. Based on
+/// observed state, not `focus_without_raise`: the private recipe can report
+/// failure after partially activating the target, and the raw click can
+/// self-activate even when that recipe is unavailable. A different app is
+/// never overwritten here; the wildcard suppression lease handles genuine
+/// side effects. Blocks about 50 ms.
+fn restore_after_background_pixel_click(
+    pid: i32,
+    window_id: Option<u32>,
+    prior_front: Option<i32>,
+    focus_without_raise: bool,
+) {
+    if prior_front == Some(pid) {
+        return;
+    }
+    std::thread::sleep(std::time::Duration::from_millis(50));
+    // WindowServer's foreground, not NSWorkspace's cached view.
+    let observed_front = if crate::input::skylight::front_pid_matches(pid) == Some(true) {
+        Some(pid)
+    } else {
+        apps::frontmost_pid()
+    };
+    if let Some(previous_pid) = background_pixel_restore_pid(
+        PixelActivationPolicy::AllowTargetWithoutRaise,
+        prior_front,
+        pid,
+        observed_front,
+    ) {
+        let _ = apps::restore_prior_app(previous_pid);
+    } else if let (Some(previous_pid), Some(wid)) = (prior_front, window_id) {
+        // The prior app is still frontmost, but the no-raise recipe posted it
+        // a defocus record: hand its key window focus back so the user's
+        // typing keeps landing there.
+        if focus_without_raise && apps::frontmost_pid() == Some(previous_pid) {
+            crate::input::skylight::restore_focus_after_without_raise(pid, wid);
+        }
+    }
+}
+
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "click".into(),
@@ -788,6 +830,7 @@ impl Tool for ClickTool {
                                     &selection_modifiers,
                                     foreground,
                                     press_row.as_deref(),
+                                    prior_front,
                                 )?);
                                 std::thread::sleep(std::time::Duration::from_millis(150));
                                 Ok(())
@@ -835,6 +878,7 @@ impl Tool for ClickTool {
                                 &selection_modifiers,
                                 false,
                                 press_row.as_deref(),
+                                prior_front,
                             )
                             .map(|outcome| (outcome, false))
                         }
@@ -1183,6 +1227,7 @@ impl Tool for ClickTool {
                                             row.name()
                                         ),
                                         snapshot_row: None,
+                                        prior_front,
                                     },
                                     Some(pixel),
                                     false,
@@ -1443,35 +1488,11 @@ impl Tool for ClickTool {
             // self-activate even when that recipe is unavailable. Do not
             // overwrite a different app here; the wildcard suppression lease
             // handles genuine side effects.
-            if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise
-                && prior_front != Some(pid)
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-                // WindowServer's foreground, not NSWorkspace's cached view.
-                let observed_front =
-                    if crate::input::skylight::front_pid_matches(pid) == Some(true) {
-                        Some(pid)
-                    } else {
-                        apps::frontmost_pid()
-                    };
-                if let Some(previous_pid) = background_pixel_restore_pid(
-                    activation_policy,
-                    prior_front,
-                    pid,
-                    observed_front,
-                ) {
-                    let _ = apps::restore_prior_app(previous_pid);
-                } else if let (Some(previous_pid), Some(wid)) = (prior_front, window_id) {
-                    // The prior app is still frontmost, but the no-raise
-                    // recipe posted it a defocus record: hand its key window
-                    // focus back so the user's typing keeps landing there.
-                    if focus_without_raise && apps::frontmost_pid() == Some(previous_pid) {
-                        let _ = tokio::task::spawn_blocking(move || {
-                            crate::input::skylight::restore_focus_after_without_raise(pid, wid)
-                        })
-                        .await;
-                    }
-                }
+            if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
+                let _ = tokio::task::spawn_blocking(move || {
+                    restore_after_background_pixel_click(pid, window_id, prior_front, focus_without_raise)
+                })
+                .await;
             }
 
             let changes = super::finish_window_observation(snapshot).await;
@@ -1642,6 +1663,7 @@ fn perform_ax_click(
     modifiers: &[String],
     foreground: bool,
     snapshot_row: Option<&str>,
+    prior_front: Option<i32>,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
     let element = element_ptr as AXUIElementRef;
     let action_label = crate::ax::tree::display_action_name(ax_action.to_owned());
@@ -1682,6 +1704,7 @@ fn perform_ax_click(
                     window_id,
                     label: format!("[{idx}] {role} \"{title}\""),
                     snapshot_row,
+                    prior_front,
                 },
                 selection_pixel,
                 foreground,
@@ -2157,6 +2180,9 @@ struct RowTarget<'a> {
     /// How results name the click: `[3] AXGroup "Message 312 from Lena"`.
     label: String,
     snapshot_row: Option<&'a str>,
+    /// The app in front when the call began, restored after a background
+    /// pointer rung (as the pixel dispatcher does).
+    prior_front: Option<i32>,
 }
 
 const ROW_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(150);
@@ -2314,6 +2340,11 @@ struct LiveRowIo<'a> {
     centre_target: Option<AXUIElementRef>,
     /// Rungs that sent input, in order.
     sent: Vec<RowRung>,
+    prior_front: Option<i32>,
+    /// The row's name when the climb began: a row that later reads another
+    /// name was recycled for other content (a Catalyst list rebuilt under
+    /// the click), whatever the clicked element reads.
+    row_name: String,
 }
 
 impl Drop for LiveRowIo<'_> {
@@ -2321,6 +2352,23 @@ impl Drop for LiveRowIo<'_> {
         if let Some(target) = self.centre_target.take() {
             unsafe { CFRelease(target as CFTypeRef) };
         }
+    }
+}
+
+/// The pointer rung is a raw left click into an exact window, so in the
+/// background it takes the pixel dispatcher's activate-without-raise recipe.
+fn pointer_rung_activates_without_raise(foreground: bool) -> bool {
+    pixel_activation_policy("left", foreground, true) == PixelActivationPolicy::AllowTargetWithoutRaise
+}
+
+/// Whether the row still reads the name it had when the climb began:
+/// `Err(Some(now))` when it reads another (recycled for other content),
+/// `Err(None)` when its name cannot be read (no proof it is the same row).
+fn same_row_name(at_start: &str, now: Option<String>) -> Result<(), Option<String>> {
+    match now {
+        Some(now) if now.trim() == at_start.trim() => Ok(()),
+        Some(now) => Err(Some(now)),
+        None => Err(None),
     }
 }
 
@@ -2393,7 +2441,7 @@ impl RowIo for LiveRowIo<'_> {
                 Err(_) => return Err(None),
             }
         }
-        Ok(())
+        same_row_name(&self.row_name, self.row.read_name())
     }
 
     fn send(&mut self, rung: RowRung) -> anyhow::Result<RungSend> {
@@ -2426,17 +2474,36 @@ impl LiveRowIo<'_> {
             )?,
             RowRung::Pointer => {
                 let point = self.pixel.expect("the pointer rung applies only with a target");
-                crate::input::mouse::click_at_xy_with_window_local(
-                    self.pid,
-                    point.screen_x,
-                    point.screen_y,
-                    point.window_x,
-                    point.window_y,
-                    self.window_id,
-                    1,
-                    &[],
-                    crate::input::mouse::WindowClickDelivery::from_foreground(self.foreground),
-                )?;
+                let click = || {
+                    crate::input::mouse::click_at_xy_with_window_local(
+                        self.pid,
+                        point.screen_x,
+                        point.screen_y,
+                        point.window_x,
+                        point.window_y,
+                        self.window_id,
+                        1,
+                        &[],
+                        crate::input::mouse::WindowClickDelivery::from_foreground(self.foreground),
+                    )
+                };
+                // A raw background left click, as the pixel dispatcher sends
+                // it: the target made AppKit-active without raising (first
+                // mouse, inactive windows), then the prior app restored.
+                if pointer_rung_activates_without_raise(self.foreground) {
+                    let focus_without_raise =
+                        crate::input::mouse::prepare_background_pixel_click(self.pid, self.window_id);
+                    let sent = click();
+                    restore_after_background_pixel_click(
+                        self.pid,
+                        Some(self.window_id),
+                        self.prior_front,
+                        focus_without_raise,
+                    );
+                    sent?;
+                } else {
+                    click()?;
+                }
                 RungSend::Sent
             }
         })
@@ -2465,7 +2532,7 @@ fn select_row(
     pixel: Option<SelectionPixelTarget>,
     foreground: bool,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
-    let RowTarget { idx, pid, window_id, label, snapshot_row } = target;
+    let RowTarget { idx, pid, window_id, label, snapshot_row, prior_front } = target;
     let row_role = &row.role;
     let mut io = LiveRowIo {
         row,
@@ -2479,6 +2546,8 @@ fn select_row(
         pointer_possible: false,
         centre_target: None,
         sent: Vec::new(),
+        prior_front,
+        row_name: row.name(),
     };
     let unverifiable = |text: String, rung: RowRung| {
         Ok((text, false, false, false, rung == RowRung::Pointer))
@@ -2706,6 +2775,52 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// A row recycled for other content during the climb (a Catalyst list
+    /// rebuilt under a pixel click, whose clicked element has no name of its
+    /// own to compare) stops the ladder; an unreadable name proves nothing.
+    #[test]
+    fn a_recycled_row_is_not_the_same_row() {
+        assert_eq!(same_row_name("Message 312 from Lena", Some("Message 312 from Lena".into())), Ok(()));
+        assert_eq!(
+            same_row_name("Message 312 from Lena", Some("Message 4 from Alex".into())),
+            Err(Some("Message 4 from Alex".into()))
+        );
+        assert_eq!(same_row_name("Message 312 from Lena", None), Err(None));
+        // Through the ladder: the centre press reads selected, but the row
+        // now names another message, so nothing is confirmed and no pointer
+        // click follows.
+        let mut io = ScriptedRow {
+            applies: vec![RowRung::PressAtCentre, RowRung::Pointer],
+            identity: vec![Ok(()), same_row_name("Message 312 from Lena", Some("Message 4 from Alex".into()))],
+            sends: vec![RungSend::Sent],
+            reads: vec![RowReadOutcome::Selected],
+            log: vec![],
+        };
+        assert_eq!(
+            climb_row_ladder(&mut io).unwrap(),
+            RowLadderEnd::Changed { now_reads: Some("Message 4 from Alex".into()), after: Some(RowRung::PressAtCentre) }
+        );
+        // Recycled after a miss: no pointer click on the replacement.
+        let mut io = ScriptedRow {
+            applies: vec![RowRung::PressAtCentre, RowRung::Pointer],
+            identity: vec![Ok(()), same_row_name("Message 312 from Lena", Some("Message 4 from Alex".into()))],
+            sends: vec![RungSend::Sent],
+            reads: vec![RowReadOutcome::Missing],
+            log: vec![],
+        };
+        assert!(matches!(climb_row_ladder(&mut io).unwrap(), RowLadderEnd::Changed { .. }));
+        assert!(!io.log.iter().any(|entry| entry == "send Pointer"));
+    }
+
+    /// The background pointer rung activates the target without raising it
+    /// (first-mouse and inactive windows ignore a bare routed click), as the
+    /// pixel dispatcher does; a foreground rung does not take that recipe.
+    #[test]
+    fn background_pointer_rung_uses_the_pixel_activation_recipe() {
+        assert!(pointer_rung_activates_without_raise(false));
+        assert!(!pointer_rung_activates_without_raise(true));
     }
 
     /// Surface 5: schema must advertise the new `button` field with the three
