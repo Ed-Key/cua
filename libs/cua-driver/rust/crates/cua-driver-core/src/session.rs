@@ -1778,6 +1778,9 @@ fn end_session_unless_in_turn(session_id: &str, reason: SessionEndReason) -> boo
 }
 
 fn finish_session_end(session_id: &str, reason: SessionEndReason) {
+    // An ended session leaves its transport's turn: revived, it is held
+    // again on its next action.
+    crate::pip_turn::session_ended(session_id);
     let (first_fire, idle_revivable) = mark_session_ended(session_id, None, reason);
     let mut cursor_readers = CURSOR_OUTCOME_READERS
         .get()

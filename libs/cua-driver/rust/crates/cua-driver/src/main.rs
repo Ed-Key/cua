@@ -331,8 +331,9 @@ fn maybe_init_pip() {
                 }
             });
             // The client's turn (its hooks call `pip_turn`). Its session end
-            // takes the panel down as `end_session` (a Stop came) or a closed
-            // connection (none did) would, the lifecycle session untouched.
+            // takes the panel down as `end_session` would (a Stop came), or
+            // quietly with no finished state (the turn was still open), the
+            // lifecycle session untouched.
             cua_driver_core::pip_turn::set_pip_turn_fn(|session_key, turn| {
                 use cua_driver_core::pip_turn::PipHookTurn;
                 if let Some(slot) = BACKEND.get() {
@@ -347,7 +348,7 @@ fn maybe_init_pip() {
                                 b.end_session(session_key, pip_preview::PipSessionEnd::Finished)
                             }
                             PipHookTurn::End { finished: false } => {
-                                b.end_session(session_key, pip_preview::PipSessionEnd::Disconnected)
+                                b.end_session(session_key, pip_preview::PipSessionEnd::Expired)
                             }
                         }
                     }

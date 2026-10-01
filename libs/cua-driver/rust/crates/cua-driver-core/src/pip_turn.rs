@@ -21,12 +21,13 @@
 //! | Stop | ignored (end without start) | `Stopping`: the debounce starts | ignored (duplicate) | ignored (duplicate) |
 //! | debounce due (1.5 s after the Stop, no action since) | - | - | `Closed`: the turn's labels finish (the finished state plays, the session stays alive) | - |
 //! | StopFailure | ignored | `Closed`: the labels end quietly | as Open | ignored |
-//! | SessionEnd | ignored | the labels' panels go as at a closed connection (fresh work only plays its finale); the entry goes | the labels' panels go as at `end_session` (one finale, never a second); the entry goes | as Stopping |
+//! | SessionEnd | ignored | an interrupted turn: the labels' panels close quietly (no finished state); the entry goes | the labels' panels go as at `end_session` (one finale, never a second); the entry goes | as Stopping |
 //! | Any other event (SubagentStop, SessionStart after compaction, ...) | ignored | ignored | ignored | ignored |
 //! | Action (any tool call but `pip_turn`) | nothing | the lease restarts | back to `Open` (a blocked Stop: Claude went on), the lease restarts | the turn opens again (a Stop another hook blocked, or work after a quiet end) |
 //! | A label acts (its frame or verification is pushed) | nothing | first time this turn: its panel is held open | as Open | as Open |
-//! | Lease due (no action and no turn event for `lease()`, 5 min) | - | `Closed`: the labels end quietly | as Open | - |
-//! | Connection closes | - | the entry goes; panels follow the connection-close rule | as Open | as Open |
+//! | Lease due (no action and no turn event for `DEFAULT_LEASE`, 5 min) | - | `Closed`: the labels end quietly | as Open | - |
+//! | Connection closes | the connection-close rule (fresh work plays its finished state) | an interrupted or dead turn: every label's panel closes quietly, whatever the age of its last action; the entry goes | a Stop came: the connection-close rule; the entry goes | as Stopping |
+//! | A session ends (`end_session`, eviction, its connection) | - | it leaves the turn's labels, so a revived session is held again on its next action | as Open | as Open |
 //!
 //! Stop is not proof that the turn is over: Claude Code runs Stop hooks in
 //! parallel, so another Stop hook (a goal gate exiting 2) can block the stop
@@ -47,18 +48,6 @@ pub const STOP_DEBOUNCE: Duration = Duration::from_millis(1500);
 /// A turn with no action and no turn event this long ends quietly.
 pub const DEFAULT_LEASE: Duration = Duration::from_secs(5 * 60);
 
-/// The lease, overridable for checks with `CUA_DRIVER_RS_PIP_TURN_LEASE_SECS`.
-pub fn lease() -> Duration {
-    static LEASE: OnceLock<Duration> = OnceLock::new();
-    *LEASE.get_or_init(|| {
-        std::env::var("CUA_DRIVER_RS_PIP_TURN_LEASE_SECS")
-            .ok()
-            .and_then(|value| value.parse::<u64>().ok())
-            .filter(|secs| *secs > 0)
-            .map_or(DEFAULT_LEASE, Duration::from_secs)
-    })
-}
-
 /// What one session's panel is told about its turn.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PipHookTurn {
@@ -69,8 +58,9 @@ pub enum PipHookTurn {
     Finished,
     /// The turn ended without a finish: the panel fades, no finale.
     Quiet,
-    /// The client's session ended: the panel goes, as at `end_session`
-    /// (`finished`) or as at a closed connection.
+    /// The client's session or connection ended: the panel goes, as at
+    /// `end_session` (`finished`: a Stop came), or quietly with no finished
+    /// state (the turn was still open: interrupted or dead).
     End { finished: bool },
 }
 
@@ -106,8 +96,8 @@ struct Turn {
     phase: Phase,
     /// Bumped each time a turn opens: the lease timer's identity.
     epoch: u64,
-    /// Bumped by every Stop and everything that calls one off: the
-    /// debounce's identity.
+    /// Fresh (unique across transports and their lives) at every Stop and
+    /// everything that calls one off: the debounce's identity.
     stop: u64,
     /// The last action or turn event.
     last: Instant,
@@ -125,6 +115,7 @@ enum Input {
     Acted(String),
     DebounceDue(u64),
     LeaseDue(u64),
+    Disconnect,
 }
 
 /// A timer to arm for a transport.
@@ -174,19 +165,23 @@ impl Turns {
             turn.acted.clear();
             turn.phase = Phase::Open;
             turn.epoch = epoch;
-            turn.stop += 1;
+            turn.stop = epoch;
             turn.last = now;
             effects.timer = Some((Timer::Lease(epoch), now + lease));
             return effects;
         }
-        if let Input::Hook(TurnEvent::SessionEnd) = input {
+        if let Input::Hook(TurnEvent::SessionEnd) | Input::Disconnect = input {
             if let Some(turn) = self.map.remove(transport) {
-                let finished = turn.phase != Phase::Open;
-                effects.notes = turn
-                    .keys
-                    .into_iter()
-                    .map(|key| (key, PipHookTurn::End { finished }))
-                    .collect();
+                let open = turn.phase == Phase::Open;
+                // A closed connection after a Stop: the sessions' own end
+                // hooks take the panels down by the connection-close rule.
+                if open || input != Input::Disconnect {
+                    effects.notes = turn
+                        .keys
+                        .into_iter()
+                        .map(|key| (key, PipHookTurn::End { finished: !open }))
+                        .collect();
+                }
             }
             return effects;
         }
@@ -197,7 +192,7 @@ impl Turns {
         };
         let close = |turn: &mut Turn, end: PipHookTurn, notes: &mut Vec<(String, PipHookTurn)>| {
             turn.phase = Phase::Closed;
-            turn.stop += 1;
+            turn.stop = next;
             notes.extend(
                 std::mem::take(&mut turn.acted)
                     .into_iter()
@@ -208,7 +203,7 @@ impl Turns {
             Input::Hook(TurnEvent::Stop) => {
                 if turn.phase == Phase::Open {
                     turn.phase = Phase::Stopping;
-                    turn.stop += 1;
+                    turn.stop = next;
                     turn.last = now;
                     effects.timer = Some((Timer::Debounce(turn.stop), now + STOP_DEBOUNCE));
                 }
@@ -223,7 +218,7 @@ impl Turns {
                     Phase::Open => {}
                     Phase::Stopping => {
                         turn.phase = Phase::Open;
-                        turn.stop += 1;
+                        turn.stop = next;
                     }
                     Phase::Closed => {
                         turn.phase = Phase::Open;
@@ -254,9 +249,20 @@ impl Turns {
                     }
                 }
             }
-            Input::Hook(TurnEvent::Start | TurnEvent::SessionEnd) => unreachable!(),
+            Input::Hook(TurnEvent::Start | TurnEvent::SessionEnd) | Input::Disconnect => {
+                unreachable!()
+            }
         }
         effects
+    }
+
+    /// The session `key` ended: it is no turn's label any more (a revived
+    /// session with the same key is told `Open` again on its next action).
+    fn session_ended(&mut self, key: &str) {
+        for turn in self.map.values_mut() {
+            turn.acted.remove(key);
+            turn.keys.remove(key);
+        }
     }
 
     fn defers_eviction(&self, transport: &str, now: Instant, lease: Duration) -> bool {
@@ -285,7 +291,7 @@ fn apply(transport: &str, input: Input) {
     }
     let mut guard = TURNS.lock().unwrap_or_else(|e| e.into_inner());
     let turns = guard.get_or_insert_with(Turns::default);
-    let effects = turns.apply(transport, input, Instant::now(), lease());
+    let effects = turns.apply(transport, input, Instant::now(), DEFAULT_LEASE);
     if !effects.notes.is_empty() {
         tracing::info!(target: "pip", notes = ?effects.notes.iter().map(|(_, note)| note).collect::<Vec<_>>(), "PiP turn notes");
     }
@@ -335,11 +341,18 @@ pub fn acted(transport: &str, session_key: &str) {
     apply(transport, Input::Acted(session_key.to_owned()));
 }
 
-/// The transport's connection closed: its turn state goes. Its panels
-/// follow the connection-close rule through the session end hooks.
+/// The transport's connection closed, before its sessions end: its turn
+/// state goes. A turn still open ends quietly (its panels close with no
+/// finished state); otherwise its panels follow the connection-close rule
+/// through the session end hooks.
 pub fn forget(transport: &str) {
+    apply(transport, Input::Disconnect);
+}
+
+/// The session `session_key` ended (any reason): it leaves every turn.
+pub fn session_ended(session_key: &str) {
     if let Some(turns) = TURNS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
-        turns.map.remove(transport);
+        turns.session_ended(session_key);
     }
 }
 
@@ -350,7 +363,7 @@ pub fn defers_eviction(transport: &str) -> bool {
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .as_ref()
-        .is_some_and(|turns| turns.defers_eviction(transport, Instant::now(), lease()))
+        .is_some_and(|turns| turns.defers_eviction(transport, Instant::now(), DEFAULT_LEASE))
 }
 
 #[cfg(test)]
@@ -655,6 +668,74 @@ mod tests {
         assert_eq!(
             notes(&run.at(22.0, T, Input::Hook(TurnEvent::SessionEnd))),
             [("c", PipHookTurn::End { finished: false })]
+        );
+    }
+
+    #[test]
+    fn a_connection_closing_on_an_open_turn_ends_it_quietly() {
+        // Open (interrupted, or the client died): every label closes quietly,
+        // however fresh its last action.
+        let mut run = Run::new();
+        run.at(0.0, T, START);
+        run.at(1.0, T, acted("a"));
+        let close = run.at(1.5, T, Input::Disconnect);
+        assert_eq!(notes(&close), [("a", PipHookTurn::End { finished: false })]);
+        assert_eq!(run.phase(T), None);
+        // A Stop came (Stopping) or the turn is closed: nothing from the
+        // turn, the connection-close rule decides.
+        run.at(2.0, T, START);
+        run.at(3.0, T, acted("a"));
+        run.at(4.0, T, STOP);
+        assert_eq!(run.at(4.1, T, Input::Disconnect), Effects::default());
+        run.at(5.0, T, START);
+        run.at(6.0, T, acted("a"));
+        let stop = run.at(7.0, T, STOP);
+        run.debounce(&stop, 8.5);
+        assert_eq!(run.at(9.0, T, Input::Disconnect), Effects::default());
+        // Never hooked: nothing.
+        assert_eq!(run.at(10.0, "never", Input::Disconnect), Effects::default());
+    }
+
+    #[test]
+    fn an_ended_session_revived_in_the_same_turn_is_held_again() {
+        let mut run = Run::new();
+        run.at(0.0, T, START);
+        assert_eq!(
+            notes(&run.at(1.0, T, acted("a"))),
+            [("a", PipHookTurn::Open)]
+        );
+        // end_session, then start_session on the same label.
+        run.turns.session_ended("a");
+        assert_eq!(
+            notes(&run.at(2.0, T, acted("a"))),
+            [("a", PipHookTurn::Open)]
+        );
+        // An ended session gets no end note of its own either.
+        run.turns.session_ended("a");
+        let stop = run.at(3.0, T, STOP);
+        assert!(run.debounce(&stop, 4.5).notes.is_empty());
+    }
+
+    #[test]
+    fn a_debounce_from_before_a_session_end_never_finishes_the_next_turn() {
+        let mut run = Run::new();
+        run.at(0.0, T, START);
+        run.at(1.0, T, acted("a"));
+        let old = run.at(2.0, T, STOP);
+        run.at(2.1, T, Input::Hook(TurnEvent::SessionEnd));
+        // /clear: the same connection starts again before the old debounce
+        // is due.
+        run.at(2.2, T, START);
+        run.at(2.5, T, acted("a"));
+        let new = run.at(3.0, T, STOP);
+        assert!(
+            run.debounce(&old, 3.5).notes.is_empty(),
+            "the old debounce went stale"
+        );
+        assert_eq!(run.phase(T), Some(Phase::Stopping));
+        assert_eq!(
+            notes(&run.debounce(&new, 4.5)),
+            [("a", PipHookTurn::Finished)]
         );
     }
 

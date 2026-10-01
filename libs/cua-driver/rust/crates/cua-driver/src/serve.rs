@@ -171,6 +171,13 @@ fn is_session_lifecycle_tool(tool_name: &str) -> bool {
     matches!(tool_name, "start_session" | "end_session")
 }
 
+/// Calls an ended session's id may still make: the lifecycle tools, and a
+/// client hook's turn event (`pip_turn` never touches the session; a hook's
+/// Stop or next UserPromptSubmit after `end_session` must still arrive).
+fn passes_ended_session_guard(tool_name: &str) -> bool {
+    is_session_lifecycle_tool(tool_name) || tool_name == "pip_turn"
+}
+
 fn history_control_response(
     registry: &crate::sdk_adapter::SdkAdapter,
     request: &DaemonRequest,
@@ -467,7 +474,7 @@ async fn invoke_daemon_tool(
     });
 
     if let Some(sid) = &effective_session {
-        if !is_session_lifecycle_tool(&tool_name)
+        if !passes_ended_session_guard(&tool_name)
             && sdk.is_session_ended(sid, req.session_id.as_deref())
             && !sdk.is_session_reclaimable(sid, req.session_id.as_deref())
         {
@@ -2731,6 +2738,44 @@ mod gate_tests {
             1,
             "rejected ended-session call must not invoke the tool — resurrection closed"
         );
+
+        // 3a. A client hook's turn event on the ended id still arrives: no
+        //     error, no content, and the session stays ended.
+        let socket3a = socket.clone();
+        let s3a = sid.to_owned();
+        let turn = DaemonRequest {
+            method: "call".into(),
+            name: Some("pip_turn".into()),
+            args: Some(serde_json::json!({"event": "Stop"})),
+            session_id: Some(s3a),
+            observation_origin: None,
+            client_kind: None,
+        };
+        let resp = tokio::task::spawn_blocking(move || send_request(&socket3a, &turn))
+            .await
+            .unwrap()
+            .expect("pip_turn response");
+        assert!(
+            resp.ok,
+            "pip_turn on an ended id must not be rejected: {:?}",
+            resp.error
+        );
+        assert_eq!(
+            resp.result
+                .as_ref()
+                .and_then(|r| r.pointer("/content/0/text")),
+            Some(&serde_json::json!("")),
+            "pip_turn answers with empty text: {:?}",
+            resp.result
+        );
+        let socket3a2 = socket.clone();
+        let s3a2 = sid.to_owned();
+        let resp =
+            tokio::task::spawn_blocking(move || send_request(&socket3a2, &call_req(Some(&s3a2))))
+                .await
+                .unwrap()
+                .expect("ended call response");
+        assert!(!resp.ok, "pip_turn revived nothing");
 
         // 3b. Explicit re-declare via start_session REVIVES the id.
         let socket3b = socket.clone();
