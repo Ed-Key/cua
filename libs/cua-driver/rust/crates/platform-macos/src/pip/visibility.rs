@@ -54,13 +54,29 @@ pub(super) fn target_fully_visible(
     displays: &[Area],
     own_pid: i32,
 ) -> bool {
-    let window_id = capture_window(target, |pid| {
-        front_to_back
-            .iter()
-            .find(|window| window.pid == pid && window.layer == 0)
-            .map(|window| window.window_id)
-    });
+    let window_id = capture_window(target, |pid| frontmost_window(pid, front_to_back));
     window_id.is_some_and(|id| fully_visible(id, front_to_back, displays, own_pid))
+}
+
+/// The window a pid-only PiP target stands for: the pid's frontmost normal
+/// window in `front_to_back`, never the screen-sharing indicator macOS
+/// draws over a window being captured. That indicator is a small window the
+/// captured app owns (66x20 pt on macOS 26, over the title bar); it appears
+/// when the panel's own live stream starts and goes when it stops, so
+/// taking it for the target flips the panel between the two windows (and
+/// on and off) every poll, for as long as the panel is kept up.
+pub(super) fn frontmost_window(pid: i32, front_to_back: &[WindowInfo]) -> Option<u32> {
+    front_to_back
+        .iter()
+        .find(|window| window.pid == pid && window.layer == 0 && !sharing_indicator(window))
+        .map(|window| window.window_id)
+}
+
+// ponytail: a size cut, so an app's real window smaller than 100x50 pt never
+// stands for a pid-only target; check the window's identity instead (it is
+// no AX window of the app) if such a tiny window ever needs its own panel.
+fn sharing_indicator(window: &WindowInfo) -> bool {
+    window.bounds.width < 100.0 && window.bounds.height < 50.0
 }
 
 /// One WindowServer snapshot: composited on-screen windows front to back,
@@ -171,6 +187,18 @@ mod tests {
         list.push(window(7, 42, 0, (100.0, 100.0, 800.0, 600.0)));
         list.push(window(8, 43, 0, (0.0, 33.0, 1512.0, 900.0))); // below: irrelevant
         list
+    }
+
+    #[test]
+    fn a_pid_only_target_is_never_the_sharing_indicator_over_its_window() {
+        // The live stream's indicator (owned by the captured app) sits above
+        // its window's title bar.
+        let list = desk(vec![window(60, 42, 0, (110.0, 104.0, 66.0, 20.0))]);
+        assert_eq!(frontmost_window(42, &list), Some(7));
+        // A real window is taken as before, small or not.
+        let list = desk(vec![window(61, 42, 0, (110.0, 104.0, 230.0, 400.0))]);
+        assert_eq!(frontmost_window(42, &list), Some(61));
+        assert_eq!(frontmost_window(99, &list), None);
     }
 
     #[test]

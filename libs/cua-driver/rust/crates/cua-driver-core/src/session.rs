@@ -1741,12 +1741,28 @@ pub fn end_session(session_id: &str) {
 }
 
 fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
+    end_session_unless_in_turn(session_id, reason);
+}
+
+/// End the session, unless this is the idle sweep and its transport's turn is
+/// open and inside its lease (see `pip_turn`): decided under the lifecycle
+/// lock, so a sweep that found the session stale before a turn started cannot
+/// evict it after. Whether it ended (or will, once its in-flight call ends).
+fn end_session_unless_in_turn(session_id: &str, reason: SessionEndReason) -> bool {
     if !is_trackable(session_id) {
-        return;
+        return false;
     }
     let defer = {
         let mut records = lifecycle_records().lock().unwrap();
-        match records.get_mut(session_id) {
+        let record = records.get_mut(session_id);
+        if reason == SessionEndReason::IdleTimeout
+            && record
+                .as_ref()
+                .is_some_and(|record| crate::pip_turn::defers_eviction(&record.owner_transport))
+        {
+            return false;
+        }
+        match record {
             Some(record) if record.in_flight > 0 => {
                 record.pending_end.get_or_insert(reason);
                 true
@@ -1755,9 +1771,10 @@ fn end_session_with_reason(session_id: &str, reason: SessionEndReason) {
         }
     };
     if defer {
-        return;
+        return true;
     }
     finish_session_end(session_id, reason);
+    true
 }
 
 fn finish_session_end(session_id: &str, reason: SessionEndReason) {
@@ -1832,10 +1849,10 @@ pub fn evict_idle(ttl: Duration) -> Vec<String> {
             .map(|(id, _)| id.clone())
             .collect()
     };
-    for id in &stale {
-        end_session_with_reason(id, SessionEndReason::IdleTimeout);
-    }
     stale
+        .into_iter()
+        .filter(|id| end_session_unless_in_turn(id, SessionEndReason::IdleTimeout))
+        .collect()
 }
 
 /// Runtime-scoped form of [`evict_idle`]. The namespace prefix is minted by
@@ -1860,10 +1877,10 @@ pub fn evict_idle_with_prefix(ttl: Duration, prefix: &str) -> Vec<String> {
             .map(|(id, _)| id.clone())
             .collect()
     };
-    for id in &stale {
-        end_session_with_reason(id, SessionEndReason::IdleTimeout);
-    }
     stale
+        .into_iter()
+        .filter(|id| end_session_unless_in_turn(id, SessionEndReason::IdleTimeout))
+        .collect()
 }
 
 /// Number of sessions with a live idle-TTL entry. Diagnostics only.

@@ -7643,6 +7643,39 @@ class _UniffiFfiConverterTypeParseVisualRegionsOutput(_UniffiConverterRustBuffer
         _UniffiFfiConverterTypeVisualParseTiming.write(value.timing, buf)
         _UniffiFfiConverterOptionalString.write(value.request_id, buf)
 
+@dataclass
+class PipTurnInput:
+    """
+    A client hook reporting that the agent's turn started or ended.
+"""
+    def __init__(self, *, event:str):
+        self.event = event
+
+
+
+
+    def __str__(self):
+        return "PipTurnInput(event={})".format(self.event)
+    def __eq__(self, other):
+        if self.event != other.event:
+            return False
+        return True
+
+class _UniffiFfiConverterTypePipTurnInput(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return PipTurnInput(
+            event=_UniffiFfiConverterString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.event)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.event, buf)
+
 
 
 
@@ -10770,6 +10803,7 @@ __all__ = [
     "VisualParseWarning",
     "VisualParseTiming",
     "ParseVisualRegionsOutput",
+    "PipTurnInput",
     "PredicateOutcome",
     "PressKeyInput",
     "SequenceArguments",

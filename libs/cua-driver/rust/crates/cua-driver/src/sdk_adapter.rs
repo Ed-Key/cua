@@ -412,10 +412,14 @@ impl SdkAdapter {
 
     pub fn end_transport_sessions(&self, transport_session: &str) -> usize {
         let owner = format!("{}{}", self.runtime_prefix, transport_session);
-        cua_driver_core::session::end_sessions_for_owner(
+        let ended = cua_driver_core::session::end_sessions_for_owner(
             &owner,
             cua_driver_core::session::SessionEndReason::ProcessExit,
-        )
+        );
+        // Its panels went with the sessions (the connection-close rule);
+        // its turn goes too, even with no session left.
+        cua_driver_core::pip_turn::forget(&owner);
+        ended
     }
 
     pub fn operator_sessions_json(&self) -> Value {

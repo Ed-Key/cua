@@ -162,7 +162,7 @@ use std::time::{Duration, Instant};
 use objc2::runtime::{AnyClass, AnyObject, Bool, Sel};
 use objc2::{class, msg_send, sel};
 use objc2_foundation::{NSPoint, NSRect, NSSize};
-use pip_preview::{PipBackend, PipConfig, PipFrame, PipSessionEnd};
+use pip_preview::{PipBackend, PipConfig, PipFrame, PipSessionEnd, PipTurn};
 
 mod cursor;
 mod finish;
@@ -598,6 +598,10 @@ struct Panel {
     finale_start: f64,
     /// The next hide follows a finale: it fades slower.
     after_finale: bool,
+    /// The session's hooked turn ended (finished or quietly) since its last
+    /// action: the panel fades instead of waiting out the idle period, and
+    /// no proof plays its own finale (see the turn rows in `finish`).
+    turn_done: bool,
     /// Private session key (for logs from callbacks that only have the
     /// panel).
     key: String,
@@ -749,6 +753,12 @@ struct State {
     ending: Vec<Panel>,
     /// Verifications of sessions whose first frame is still being captured.
     early: HashMap<String, Verdicts>,
+    /// Sessions acting in an open hooked turn (see `PipTurn::Open`).
+    turn_open: HashSet<String>,
+    /// A turn's end that reached a session before its first captured frame:
+    /// the panel that frame creates plays it (a late frame never reopens
+    /// an ended turn).
+    turn_ended: HashMap<String, PipTurn>,
     /// Each ended session's dragged position and resized size, kept while
     /// the daemon runs.
     // ponytail: one small entry per ended session; cap it if a daemon ever
@@ -931,6 +941,8 @@ struct CaptureWorker {
     /// Windows of each session's back cards, checked for closing by the
     /// visibility poll.
     watched: Mutex<HashMap<String, Vec<u32>>>,
+    /// Sessions in an open hooked turn: polled however long ago they acted.
+    in_turn: Mutex<HashSet<String>>,
 }
 
 impl CaptureWorker {
@@ -948,6 +960,7 @@ impl CaptureWorker {
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             active: Mutex::new(HashMap::new()),
             watched: Mutex::new(HashMap::new()),
+            in_turn: Mutex::new(HashSet::new()),
         });
         let looping = worker.clone();
         std::thread::Builder::new()
@@ -986,16 +999,18 @@ impl CaptureWorker {
         lock(&self.queue).remove(session_key);
         lock(&self.active).remove(session_key);
         lock(&self.watched).remove(session_key);
+        lock(&self.in_turn).remove(session_key);
     }
 
-    /// Sessions that pushed a frame within the idle window, with their
-    /// displayed target, whether it is framed to its page, and the windows
-    /// of their back cards.
+    /// Sessions that pushed a frame within the idle window or act in an open
+    /// turn, with their displayed target, whether it is framed to its page,
+    /// and the windows of their back cards.
     fn active_targets(&self, now: Instant) -> Vec<(String, Target, bool, Vec<u32>)> {
         let watched = lock(&self.watched);
+        let in_turn = lock(&self.in_turn);
         lock(&self.active)
             .iter()
-            .filter(|(_, (_, _, pushed))| !idle_hide_due(*pushed, now))
+            .filter(|(key, (_, _, pushed))| !idle_hide_due(*pushed, now) || in_turn.contains(*key))
             .map(|(key, (target, page, _))| {
                 let windows = watched.get(key).cloned().unwrap_or_default();
                 (key.clone(), *target, *page, windows)
@@ -1087,11 +1102,13 @@ fn capture_window(target: Target, frontmost_of: impl FnOnce(i32) -> Option<u32>)
 }
 
 /// The window a target's captures and stream use right now: `capture_window`
-/// with the pid's main window as the fallback. Does WindowServer lookups, so
-/// never call it on the main thread.
+/// with the pid's frontmost normal window (never the sharing indicator, see
+/// `visibility::frontmost_window`), else its main window, as the fallback.
+/// Does WindowServer lookups, so never call it on the main thread.
 fn resolve_target_window(target: Target) -> Option<u32> {
     capture_window(target, |pid| {
-        crate::windows::resolve_main_window_id(pid).ok()
+        visibility::frontmost_window(pid, &crate::windows::composited_windows())
+            .or_else(|| crate::windows::resolve_main_window_id(pid).ok())
     })
 }
 
@@ -1191,6 +1208,46 @@ impl PipBackend for MacosPipBackend {
                 target_visible,
             },
             end_session_cb,
+        );
+    }
+
+    fn turn(&self, session_key: &str, turn: PipTurn) {
+        // Open comes just before the session's frame (its first one too);
+        // an end is for a session that has frames.
+        if turn == PipTurn::Open {
+            lock(&self.worker.in_turn).insert(session_key.to_owned());
+        } else {
+            let held = lock(&self.worker.in_turn).remove(session_key);
+            if !held && !self.worker.is_live(session_key) {
+                return;
+            }
+        }
+        // As for a session end: a hidden panel comes back for its finale only
+        // over a window the user cannot see, and the poll may have stopped
+        // answering (WindowServer calls, so here and not on the main queue).
+        let target_visible = (turn == PipTurn::Finished)
+            .then(|| {
+                lock(&self.worker.active)
+                    .get(session_key)
+                    .map(|(target, _, _)| *target)
+            })
+            .flatten()
+            .map(|target| {
+                let (windows, displays) = visibility::snapshot();
+                visibility::target_fully_visible(
+                    target,
+                    &windows,
+                    &displays,
+                    std::process::id() as i32,
+                )
+            });
+        dispatch_to_main(
+            TurnNote {
+                key: session_key.to_owned(),
+                turn,
+                target_visible,
+            },
+            turn_cb,
         );
     }
 
@@ -1470,6 +1527,8 @@ pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         panels: HashMap::new(),
         ending: Vec::new(),
         early: HashMap::new(),
+        turn_open: HashSet::new(),
+        turn_ended: HashMap::new(),
         remembered: HashMap::new(),
         next_id: 1,
         worker: worker.clone(),
@@ -1674,6 +1733,9 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     panel.target_frame = target_frame;
     sync_shape(panel);
     refresh(state, &key);
+    if let Some(turn) = state.turn_ended.remove(&key) {
+        apply_turn(state, &key, turn);
+    }
 }
 
 /// A page lookup in `window` answered: keep it for the card's shape and the
@@ -1848,6 +1910,8 @@ unsafe fn resume(panel: &mut Panel, key: &str, worker: &CaptureWorker, at_ms: u6
     // Also a finale that just ended and is still up during the fade.
     remove_finale_view(panel);
     panel.after_finale = false;
+    // Working again after a turn ended (a blocked Stop, or a new turn).
+    panel.turn_done = false;
     let now = Instant::now();
     panel.last_action = panel.last_action.max(now);
     worker.mark_delivered(key, now);
@@ -2575,6 +2639,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
         image_size,
         anchor,
         gesture,
+        turn_open,
         ..
     } = state;
     // An ended session's panel keeps its slot while its finale is up.
@@ -2589,12 +2654,16 @@ unsafe fn refresh(state: &mut State, key: &str) {
         return;
     };
     let now = Instant::now();
-    // Going idle only fades the panel: idle is not done.
-    let active = !idle_hide_due(panel.last_action, now);
+    // Going idle only fades the panel: idle is not done. An open hooked turn
+    // keeps it up however long the agent is quiet; once that turn ended the
+    // panel fades at once (the turn rows of the table in `finish`).
+    let open = turn_open.contains(key);
+    let active = finish::agent_active(open, panel.turn_done, idle_hide_due(panel.last_action, now));
     // The proof timer row of the table in `finish`: proof the session has
     // been quiet on plays its checklist, on a hidden panel too if it may
-    // come up.
-    let quiet = finish::proof_quiet(panel.last_action, panel.proof_at, now);
+    // come up. Inside a hooked turn the turn's end plays it instead.
+    let own_proof = finish::proof_may_play(open, panel.turn_done);
+    let quiet = own_proof && finish::proof_quiet(panel.last_action, panel.proof_at, now);
     let may_show = finish::may_show(panel.shown, panel.target_visible);
     if let Some((finale, generation)) =
         finish::proof_finale(&mut panel.verdicts, &mut panel.lifecycle, quiet, may_show)
@@ -2605,7 +2674,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
     // panel stays up while proof waits for its finale (no fade out and back
     // in between the idle deadline and the proof timer).
     let finale = panel.lifecycle.playing();
-    let waiting = panel.shown && panel.verdicts.proof_waiting();
+    let waiting = own_proof && panel.shown && panel.verdicts.proof_waiting();
     // Nor does it go from under the user's hands (see `hands`): a press
     // that started on it, the pointer resting on it, or an interaction less
     // than the idle period old keeps a shown panel up, idle or with its
@@ -3316,6 +3385,8 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
     } = *Box::from_raw(ctx as *mut SessionEnd);
     with_state(|state| {
         state.early.remove(&key);
+        state.turn_open.remove(&key);
+        state.turn_ended.remove(&key);
         let Some(mut panel) = state.panels.remove(&key) else {
             return;
         };
@@ -3377,6 +3448,80 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
             Ending::Playing | Ending::Play(..) => state.ending.push(panel),
         }
     });
+}
+
+/// A session's turn changed (see `PipTurn`).
+struct TurnNote {
+    key: String,
+    turn: PipTurn,
+    /// For a finish: whether the user can see the whole target window now.
+    target_visible: Option<bool>,
+}
+
+unsafe extern "C" fn turn_cb(ctx: *mut c_void) {
+    let TurnNote {
+        key,
+        turn,
+        target_visible,
+    } = *Box::from_raw(ctx as *mut TurnNote);
+    objc2::rc::autoreleasepool(|_| {
+        with_state(|state| {
+            if let (Some(visible), Some(panel)) = (target_visible, state.panels.get_mut(&key)) {
+                panel.target_visible = visible;
+            }
+            apply_turn(state, &key, turn);
+        })
+    });
+}
+
+/// The turn rows of the table in `finish`. Open holds the panel (nothing
+/// shows until a frame does); a finish plays the finished state as a session
+/// end would but keeps the session and its panel, which then fades; a quiet
+/// end only fades. An end that comes before the session's first captured
+/// frame waits for the panel that frame creates.
+unsafe fn apply_turn(state: &mut State, key: &str, turn: PipTurn) {
+    tracing::info!(target: "pip", session = %key, ?turn, "PiP turn");
+    if turn == PipTurn::Open {
+        state.turn_open.insert(key.to_owned());
+        state.turn_ended.remove(key);
+        if let Some(panel) = state.panels.get_mut(key) {
+            panel.turn_done = false;
+        }
+        return;
+    }
+    state.turn_open.remove(key);
+    let worker = state.worker.clone();
+    let Some(panel) = state.panels.get_mut(key) else {
+        if worker.is_live(key) {
+            state.turn_ended.insert(key.to_owned(), turn);
+        }
+        return;
+    };
+    panel.turn_done = true;
+    if turn == PipTurn::Finished {
+        let at = now_ms();
+        let may_show = finish::may_show(panel.shown, panel.target_visible);
+        let mut ending = Ending::Close;
+        if restack(panel, key, &worker, |panel| {
+            ending = finish::end_session(
+                &mut panel.verdicts,
+                &mut panel.lifecycle,
+                PipSessionEnd::Finished,
+                at,
+                may_show,
+            )
+        }) {
+            announce_stack(panel, key);
+        }
+        note_finished(panel, key);
+        sync_front_badge(panel);
+        // A finale already playing keeps playing; nothing to show: the
+        // panel just fades.
+        if let Ending::Play(finale, generation) = &ending {
+            play_finale(panel, key, finale, *generation);
+        }
+    }
+    refresh(state, key);
 }
 
 /// Fade the panel out over `fade`, then close it.
@@ -4332,6 +4477,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         displayed: None,
         finale_start: 0.0,
         after_finale: false,
+        turn_done: false,
         key: key.to_owned(),
         card,
         front: card,
