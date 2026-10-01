@@ -349,35 +349,27 @@ pub fn initialize_result() -> Value {
     })
 }
 
-/// MCP `instructions` (`InitializeResult.instructions`) sent to every
-/// connecting client. The spec frames this as a "hint... MAY be added
-/// to the system prompt" — eager, every-turn cost. We keep it under
-/// the community-recommended ~200-word ceiling and host the long-form
-/// workflow in `Skills/cua-driver/SKILL.md`.
-///
-/// Templated per-host: the accessibility-tree provider name (AX on
-/// macOS, UIA on Windows, AT-SPI on Linux) is injected so a connecting
-/// agent only sees the path that applies, not all three. Same pattern
-/// Goose uses in its `ComputerController` extension and Open
-/// Interpreter uses for its system message.
-fn agent_instructions() -> String {
-    let (tree_kind, platform_skill_pointer) = if cfg!(target_os = "macos") {
-        (
-            "AX (Accessibility)",
-            "MACOS.md (no-foreground contract, AXMenuBar, SkyLight clicks)",
-        )
-    } else if cfg!(target_os = "windows") {
-        (
-            "UIA (UI Automation)",
-            "WINDOWS.md (UIA tree, UWP/ApplicationFrameHost hosting, Session 0 isolation)",
-        )
-    } else {
-        (
-            "AT-SPI",
-            "LINUX.md (X11/Wayland status, AT-SPI bus, BETA-level support)",
-        )
-    };
+/// The core tools the instructions name: every core tool an agent calls
+/// (pip_turn is for hooks; escalate_session, browser_dialog and the history
+/// pair are named where they apply; act_and_read is registered only on macOS).
+fn instruction_core_tools() -> String {
+    crate::mcp_wire::CORE_TOOLS
+        .iter()
+        .copied()
+        .filter(|tool| !instruction_omits(tool))
+        .collect::<Vec<_>>()
+        .join(", ")
+}
 
+fn instruction_omits(tool: &str) -> bool {
+    matches!(
+        tool,
+        "pip_turn" | "escalate_session" | "browser_dialog" | "history_status" | "history_query"
+    ) || (tool == "act_and_read" && !cfg!(target_os = "macos"))
+}
+
+/// The read and act steps of the per-task workflow, per platform.
+fn workflow_steps() -> (&'static str, &'static str) {
     // App-name targeting in get_window_state is macOS-only for now.
     let read_step = if cfg!(target_os = "macos") {
         "Single-window app: `get_window_state(app)`. Else `launch_app`/`list_windows`, then `get_window_state(pid, window_id)`."
@@ -393,23 +385,61 @@ fn agent_instructions() -> String {
     } else {
         "Act with the fresh index. Chrome pages: `get_browser_state(pid, window_id)`, then `browser_steps`."
     };
+    (read_step, act_step)
+}
+
+/// The instructions a Codex client gets instead of [`agent_instructions`].
+/// Codex code mode shows MCP instructions only inside its ALL_TOOLS catalog,
+/// prefixed to every tool entry, so a long text is paid once per listed tool
+/// and truncation hides most declarations. This keeps the core list and the
+/// per-task workflow; the long form stays in the skill.
+pub fn codex_instructions() -> String {
+    let (read_step, act_step) = workflow_steps();
+    format!(
+        "cua-driver core tools; call them directly, no need to list or describe them first: {}.\n{read_step} {act_step} `verify_state` checks postconditions; `unknown` is not success. Repeat one short `session` label on every call. This server has no shell.",
+        instruction_core_tools()
+    )
+}
+
+/// MCP `instructions` (`InitializeResult.instructions`) sent to every
+/// connecting client. The spec frames this as a "hint... MAY be added
+/// to the system prompt" — eager, every-turn cost. We keep it under
+/// the community-recommended ~200-word ceiling and host the long-form
+/// workflow in `Skills/cua-driver/SKILL.md`.
+///
+/// Templated per-host: the accessibility-tree provider name (AX on
+/// macOS, UIA on Windows, AT-SPI on Linux) is injected so a connecting
+/// agent only sees the path that applies, not all three. Same pattern
+/// Goose uses in its `ComputerController` extension and Open
+/// Interpreter uses for its system message.
+fn agent_instructions() -> String {
+    let (tree_kind, platform_skill_pointer) = if cfg!(target_os = "macos") {
+        ("AX", "MACOS.md")
+    } else if cfg!(target_os = "windows") {
+        ("UIA", "WINDOWS.md")
+    } else {
+        ("AT-SPI", "LINUX.md (beta support)")
+    };
+
+    let (read_step, act_step) = workflow_steps();
+
+    let core_tools = instruction_core_tools();
 
     format!(
-        r#"cua-driver: cross-platform background computer-use automation.
+        r#"cua-driver core tools; call them directly, no need to list or describe them first: {core_tools}.
 
 For non-GUI outcomes, prefer a client-provided app API/SDK, headless/background interface, CLI, or filesystem operation and read the result back in that semantic domain. This server has no shell.
 
 On continuation/recent-work, when available, call `history_status`; if ready, make one bounded initial `history_query` before broad discovery; otherwise continue.
 
-For app/window outcomes, use the narrowest semantic Cua route first: `set_window_frame` plus `list_windows` readback for geometry, typed browser tools for supported page content, and clipboard tools for clipboard state. Then climb: background `element_index` ({tree_kind}), background pixels, foreground delivery, desktop fallback. Never advance on transport success alone.
+For app/window outcomes, use the narrowest semantic Cua route first: `set_window_frame` plus `list_windows` readback for geometry, typed browser tools for supported page content, clipboard tools for clipboard state. Then climb: background `element_index` ({tree_kind}), background pixels, foreground delivery, desktop fallback. Never advance on transport success alone.
 
-Workflow per task:
 0. `start_session` is optional. For multi-call work, prefer a short `session` label and repeat it on every call that accepts it. Unnamed calls use the transport's implicit session. Idle names resume; `start_session` revives others; `end_session` cleans up.
 1. {read_step}
 2. {act_step}
 3. `verify_state(pid, window_id, expect)` checks bounded postconditions. `unknown` is not success; `include_screenshot:true` lets the multimodal agent judge visual evidence.
 
-Read `skill://cua-driver/SKILL.md` via `skills/get` or `resources/read`. Hosts control activation/consent. When activated, follow SKILL.md and {platform_skill_pointer}."#
+Guide: `skill://cua-driver/SKILL.md` (`skills/get` or `resources/read`); when the host activates it, follow it and {platform_skill_pointer}."#
     )
 }
 
@@ -497,6 +527,18 @@ mod action_record_wire_tests {
 mod agent_instruction_tests {
     use super::{agent_instructions, initialize_result};
 
+    /// The documented ~200-word ceiling applies to the prose; the core tool
+    /// names are counted by length instead: the whole text stays about as
+    /// long as it was before the names were added (1,965 characters on
+    /// macOS), so the eager system-prompt cost does not grow.
+    fn assert_within_budget(instructions: &str) {
+        let prose = instructions.replace(&super::instruction_core_tools(), "");
+        let words = prose.split_whitespace().count();
+        assert!(words <= 200, "instructions are {words} words of prose");
+        let chars = instructions.chars().count();
+        assert!(chars <= 2_000, "instructions are {chars} characters");
+    }
+
     #[test]
     fn instructions_route_structured_and_visual_verification_to_the_right_owner() {
         let instructions = agent_instructions();
@@ -515,10 +557,40 @@ mod agent_instruction_tests {
                 < instructions.find("background `element_index`"),
             "semantic/headless operations must precede native UI dispatch"
         );
-        assert!(
-            instructions.split_whitespace().count() <= 200,
-            "initialize instructions should stay within the documented context budget"
-        );
+        assert_within_budget(&instructions);
+    }
+
+    #[test]
+    fn instructions_name_the_core_tools_once_and_say_to_call_them_directly() {
+        let instructions = agent_instructions();
+        assert!(instructions.contains("core tools; call them directly"));
+        assert!(instructions.contains("no need to list or describe them first"));
+        for tool in crate::mcp_wire::CORE_TOOLS {
+            if super::instruction_omits(tool) {
+                continue;
+            }
+            let listed = format!(" {tool},");
+            let last = format!(" {tool}.");
+            assert!(
+                instructions.contains(&listed) || instructions.contains(&last),
+                "{tool} missing from the core list"
+            );
+        }
+        // Hooks call pip_turn; agents never should.
+        assert!(!instructions.contains("pip_turn"));
+    }
+
+    #[test]
+    fn codex_gets_a_compact_text_with_the_core_list_and_workflow() {
+        let codex = super::codex_instructions();
+        assert!(codex.contains(&super::instruction_core_tools()));
+        assert!(codex.contains("call them directly"));
+        assert!(codex.contains("`unknown` is not success"));
+        assert!(codex.contains("`session` label"));
+        assert!(codex.contains("browser_steps"));
+        let chars = codex.chars().count();
+        assert!(chars <= 900, "codex instructions are {chars} characters");
+        assert!(chars * 2 < agent_instructions().chars().count());
     }
 
     #[test]
@@ -529,8 +601,7 @@ mod agent_instruction_tests {
         } else {
             "Chrome pages: `get_browser_state(pid, window_id)`, then `browser_steps`."
         }));
-        let words = instructions.split_whitespace().count();
-        assert!(words <= 200, "instructions are {words} words");
+        assert_within_budget(&instructions);
     }
 
     #[test]
@@ -540,8 +611,7 @@ mod agent_instruction_tests {
             assert!(instructions.contains("Single-window app: `get_window_state(app)`"));
         }
         assert!(instructions.contains("then `get_window_state(pid, window_id)`"));
-        let words = instructions.split_whitespace().count();
-        assert!(words <= 200, "instructions are {words} words");
+        assert_within_budget(&instructions);
     }
 
     #[test]
@@ -580,7 +650,7 @@ mod agent_instruction_tests {
         assert!(bounded_query < discovery);
         assert!(instructions.contains("if ready"));
         assert!(instructions.contains("otherwise continue"));
-        assert!(instructions.split_whitespace().count() <= 200);
+        assert_within_budget(&instructions);
     }
 }
 

@@ -188,6 +188,13 @@ impl ToolDef {
             // https://code.claude.com/docs/en/mcp#raise-the-limit-for-a-specific-tool
             entry["_meta"] = serde_json::json!({"anthropic/maxResultSizeChars": 250_000});
         }
+        if crate::mcp_wire::is_core_tool(&self.name) && self.name != "pip_turn" {
+            // Claude Code defers MCP tools behind ToolSearch whatever their
+            // size; this loads the core tools up front. pip_turn is for client
+            // hooks, which call it without loading it.
+            // https://code.claude.com/docs/en/mcp#configure-tool-search
+            entry["_meta"]["anthropic/alwaysLoad"] = serde_json::json!(true);
+        }
         // Advertise the refusal envelope alongside the success shape. MCP
         // holds every `structuredContent` we emit — refusals included — to
         // the advertised schema, and a success-only schema made strict
@@ -6137,6 +6144,23 @@ mod capability_tests {
     }
 
     #[test]
+    fn core_tools_ask_claude_code_to_load_them_up_front() {
+        for name in crate::mcp_wire::CORE_TOOLS {
+            let entry = dummy_def(name).to_list_entry();
+            assert_eq!(
+                entry["_meta"]["anthropic/alwaysLoad"] == serde_json::json!(true),
+                *name != "pip_turn",
+                "{name}"
+            );
+        }
+        let entry = dummy_def("get_window_state").to_list_entry();
+        assert_eq!(entry["_meta"]["anthropic/maxResultSizeChars"], 250_000);
+        for name in ["start_recording", "set_agent_cursor_theme", "replay_trajectory"] {
+            assert!(dummy_def(name).to_list_entry().get("_meta").is_none(), "{name}");
+        }
+    }
+
+    #[test]
     fn window_observations_advertise_a_bounded_client_text_budget() {
         for name in ["get_window_state", "act_and_read"] {
             let entry = dummy_def(name).to_list_entry();
@@ -6159,7 +6183,9 @@ mod capability_tests {
             "unknown",
         ] {
             assert!(
-                dummy_def(name).to_list_entry().get("_meta").is_none(),
+                dummy_def(name).to_list_entry()["_meta"]
+                    .get("anthropic/maxResultSizeChars")
+                    .is_none(),
                 "{name}"
             );
         }

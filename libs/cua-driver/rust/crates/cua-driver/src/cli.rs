@@ -34,6 +34,9 @@ pub enum Command {
         /// Repeatable trusted launch grants for residual standard-mode
         /// boundaries, for example `--grant existing-profile`.
         grants: Vec<String>,
+        /// `--tools core|full`: the tool profile this MCP connection
+        /// advertises (default full). The daemon and SDK keep every tool.
+        tools: crate::mcp_surface::ToolProfile,
     },
     ListTools,
     Describe(String),
@@ -228,6 +231,7 @@ const VALUE_FLAGS: &[&str] = &[
     "--screenshot-out-file",
     "--client",
     "--socket",
+    "--tools",
     "--permission-mode",
     "--grant",
     "--session-policy",
@@ -648,6 +652,9 @@ pub fn parse_command() -> Command {
             "  --host-bundle-id <id>   Advisory host bundle id label for check_permissions output."
         );
         println!("  --socket <path>         Select an explicit daemon socket/pipe endpoint.");
+        println!("  --tools core|full       Tools this MCP server advertises (default full). core");
+        println!("                          lists the everyday set and refuses the rest; use full");
+        println!("                          for recording, cursor, config and diagnostics tools.");
         println!("  --claude-code-computer-use-compat");
         println!("                          Select the Claude Code computer-use compat surface.");
         println!(
@@ -782,6 +789,13 @@ pub fn parse_command() -> Command {
     let claude_code_compat = args
         .iter()
         .any(|a| a == "--claude-code-computer-use-compat");
+    let tools = match flag_value(&args, "--tools").as_deref() {
+        None => crate::mcp_surface::ToolProfile::Full,
+        Some(value) => crate::mcp_surface::ToolProfile::parse(value).unwrap_or_else(|error| {
+            eprintln!("cua-driver: {error}");
+            process::exit(64);
+        }),
+    };
 
     let mut pos = positionals.into_iter();
     match pos.next() {
@@ -812,6 +826,7 @@ pub fn parse_command() -> Command {
                 direct: args.iter().any(|a| a == "--direct"),
                 claude_code_compat,
                 grants: grants.clone(),
+                tools,
             }
         }
         Some("mcp") => Command::Mcp {
@@ -819,6 +834,7 @@ pub fn parse_command() -> Command {
             direct: args.iter().any(|a| a == "--direct"),
             claude_code_compat,
             grants: grants.clone(),
+            tools,
         },
         Some("list-tools") => Command::ListTools,
         Some("mcp-config") => Command::McpConfig { client: mcp_client },
@@ -1710,6 +1726,7 @@ pub fn run_mcp_via_daemon_proxy<F>(
     socket: Option<String>,
     claude_code_compat: bool,
     grants: &[String],
+    tools: crate::mcp_surface::ToolProfile,
     on_startup: F,
 ) -> anyhow::Result<()>
 where
@@ -1816,7 +1833,7 @@ where
         on_startup(daemon, true);
     }
 
-    run_mcp_runtime(crate::proxy::run_proxy(socket_path))
+    run_mcp_runtime(crate::proxy::run_proxy(socket_path, tools))
 }
 
 pub(crate) fn run_mcp_runtime<T>(future: impl std::future::Future<Output = T>) -> T {
@@ -1913,6 +1930,7 @@ pub fn build_manifest() -> serde_json::Value {
               "args": [
                   { "name": "--socket", "type": "string", "description": "Select an explicit daemon socket or named-pipe endpoint." },
                   { "name": "--direct", "type": "flag", "description": "Own the runtime in the MCP process; on macOS this explicitly accepts host TCC attribution. Mutually exclusive with --socket." },
+                  { "name": "--tools", "type": "string", "description": "Tool profile this MCP server advertises: core (the everyday set; other tools are refused) or full (default)." },
                   { "name": "--claude-code-computer-use-compat", "type": "flag", "description": "Select the Claude Code computer-use compat tool surface." },
                   { "name": "--embedded", "type": "flag", "description": "Declare embedding-host mode. Without --direct, requires the host's private service through --socket instead of auto-launching the standalone app." },
                   { "name": "--host-bundle-id", "type": "string", "description": "Advisory host bundle id label echoed in check_permissions output." },
@@ -3991,6 +4009,7 @@ fn cli_docs_json() -> serde_json::Value {
                 "arguments": no_args,
                 "options": [
                     {"name":"socket","short_name":null,"help":"Select an explicit daemon socket or named-pipe endpoint.","type":"String","default_value":null,"is_optional":true},
+                    {"name":"tools","short_name":null,"help":"Tool profile this MCP server advertises: core (the everyday set; other tools are refused) or full.","type":"String","default_value":"full","is_optional":true},
                     {"name":"host-bundle-id","short_name":null,"help":"Advisory host bundle id label echoed in check_permissions output (embedded mode).","type":"String","default_value":null,"is_optional":true},
                     {"name":"cursor-theme","short_name":null,"help":"Select an installed cursor theme id.","type":"String","default_value":"cua.default","is_optional":true},
                     {"name":"cursor-reduced-motion","short_name":null,"help":"Follow the OS setting, force still frames, or allow animation: auto, on, or off.","type":"String","default_value":"auto","is_optional":true},
