@@ -30,6 +30,7 @@
 
 use std::time::{Duration, Instant};
 
+use super::hands::Hands;
 use super::Area;
 
 /// How long an agent gesture waits for the user's hands to leave a panel it
@@ -96,6 +97,52 @@ pub(super) struct Candidate {
     /// resize, a missed release still pending), or the pointer on it having
     /// moved there. The user clock after a release is not this.
     pub(super) user: bool,
+}
+
+/// One of cua's panels as a gesture's decision finds it, before the user's
+/// hold on it is read.
+pub(super) struct Look<'a, K> {
+    pub(super) id: i64,
+    /// Its window (CoreGraphics, top-left origin).
+    pub(super) area: Area,
+    /// Meant to show, on screen now, and out for how many gestures.
+    pub(super) shown: bool,
+    pub(super) visible: bool,
+    pub(super) aside: u32,
+    /// A press that started on it lasts (a missed release still pending
+    /// included).
+    pub(super) pressed: bool,
+    /// The pointer is over one of its surfaces right now, the panel topmost
+    /// there.
+    pub(super) on: bool,
+    pub(super) hands: &'a mut Hands<K>,
+}
+
+/// The candidates for `step`: every panel on screen or already out for
+/// another gesture. The user's hold is read from the pointer as it is
+/// `now` (at `pointer`), not as the last hover poll left it (up to 120 ms
+/// old), so a pointer that moved onto a panel since then holds it. Through
+/// `Hands`, so a pointer that was resting there when the panel appeared
+/// still holds nothing until it moves.
+pub(super) fn candidates<'a, K: Copy + PartialEq + 'a>(
+    looks: impl IntoIterator<Item = Look<'a, K>>,
+    pointer: (f64, f64),
+    now: Instant,
+) -> Vec<Candidate> {
+    looks
+        .into_iter()
+        .filter(|look| look.visible || look.aside > 0)
+        .map(|look| {
+            if look.shown && look.visible && look.aside == 0 {
+                look.hands.pointer(look.on, pointer, now);
+            }
+            Candidate {
+                id: look.id,
+                area: look.area,
+                user: look.pressed || (look.shown && look.hands.pointer_holds()),
+            }
+        })
+        .collect()
 }
 
 #[derive(Debug, PartialEq)]
@@ -198,28 +245,43 @@ mod tests {
         assert_eq!(step(&panels, &[(1200.0, 700.0), (1200.0, 350.0)]), Step::Wait);
     }
 
-    /// The decision reads the pointer as of now through `Hands`: a pointer
-    /// that moved onto the panel after the last hover poll holds it, and the
-    /// gesture waits; one that was resting there when the panel appeared
-    /// does not.
+    fn look(hands: &mut Hands<u32>, on: bool) -> Look<'_, u32> {
+        Look { id: 1, area: PANEL, shown: true, visible: true, aside: 0, pressed: false, on, hands }
+    }
+
+    /// The decision reads the pointer as of now: a pointer that moved onto
+    /// the panel after the last hover poll holds it, and the gesture waits;
+    /// one that was resting there when the panel appeared does not.
     #[test]
     fn a_pointer_that_arrived_after_the_last_poll_makes_the_gesture_wait() {
-        use super::super::hands::Hands;
         let start = Instant::now();
         let (off, on) = ((10.0, 10.0), (1200.0, 700.0));
         let mut hands: Hands<u32> = Hands::default();
         hands.shown(off);
         hands.pointer(false, off, start); // the last poll: off the panel
-        assert!(!hands.pointer_holds(), "as the poll left it");
-        hands.pointer(true, on, start + Duration::from_millis(60)); // the decision's own look
-        let panels = [candidate(1, PANEL, hands.pointer_holds())];
-        assert_eq!(step(&panels, &[on]), Step::Wait);
+        let found = candidates([look(&mut hands, true)], on, start + Duration::from_millis(60));
+        assert_eq!(step(&found, &[on]), Step::Wait);
 
         let mut resting: Hands<u32> = Hands::default();
         resting.shown(on);
-        resting.pointer(true, on, start + Duration::from_millis(60));
-        let panels = [candidate(1, PANEL, resting.pointer_holds())];
-        assert_eq!(step(&panels, &[on]), Step::Aside(vec![1]));
+        let found = candidates([look(&mut resting, true)], on, start + Duration::from_millis(60));
+        assert_eq!(step(&found, &[on]), Step::Aside(vec![1]));
+    }
+
+    /// Panels off screen and not out for a gesture are no candidates; a
+    /// press holds whatever the pointer does.
+    #[test]
+    fn candidates_are_the_panels_on_screen_or_out_and_a_press_holds() {
+        let start = Instant::now();
+        let mut hidden: Hands<u32> = Hands::default();
+        let off_screen = Look { visible: false, ..look(&mut hidden, false) };
+        assert!(candidates([off_screen], (0.0, 0.0), start).is_empty());
+        let mut out: Hands<u32> = Hands::default();
+        let away = Look { visible: false, aside: 1, ..look(&mut out, false) };
+        assert_eq!(candidates([away], (0.0, 0.0), start).len(), 1);
+        let mut pressed: Hands<u32> = Hands::default();
+        let held = Look { pressed: true, ..look(&mut pressed, false) };
+        assert!(candidates([held], (0.0, 0.0), start)[0].user);
     }
 
     #[test]

@@ -3661,32 +3661,25 @@ pub fn step_aside(path: &[(f64, f64)]) -> Result<Aside, PipHeldByUser> {
 unsafe fn take_aside(state: &mut State, path: Vec<(f64, f64)>) -> Option<u64> {
     let pressed = state.gesture.as_ref().map(|gesture| gesture.id);
     let primary_h = overview::primary_screen_height();
-    // The user's pointer as of now, not the last hover poll (up to 120 ms
-    // old): a pointer that moved onto a panel since then holds it. Through
-    // `Hands`, so a pointer that was resting there when the panel appeared
-    // still holds nothing until it moves.
-    let now = Instant::now();
+    // The user's pointer as of now, not the last hover poll (see
+    // `yields::candidates`).
+    let pointer = mouse_location();
+    let mut looks = Vec::new();
     for panel in state.panels.values_mut().chain(state.ending.iter_mut()) {
         let visible: bool = msg_send![panel.window as *mut AnyObject, isVisible];
-        if panel.shown && visible && panel.aside == 0 {
-            let on = pointer_on(panel);
-            panel.hands.pointer(on, mouse_location(), now);
-        }
-    }
-    let candidates: Vec<yields::Candidate> = state
-        .panels
-        .values()
-        .chain(state.ending.iter())
-        .filter(|panel| {
-            let visible: bool = msg_send![panel.window as *mut AnyObject, isVisible];
-            visible || panel.aside > 0
-        })
-        .map(|panel| yields::Candidate {
+        let on = visible && panel.aside == 0 && pointer_on(panel);
+        looks.push(yields::Look {
             id: panel.id,
             area: panel_screen_area(panel, primary_h),
-            user: pressed == Some(panel.id) || (panel.shown && panel.hands.pointer_holds()),
-        })
-        .collect();
+            shown: panel.shown,
+            visible,
+            aside: panel.aside,
+            pressed: pressed == Some(panel.id),
+            on,
+            hands: &mut panel.hands,
+        });
+    }
+    let candidates = yields::candidates(looks, pointer, Instant::now());
     let ids = match yields::step(&candidates, &path) {
         yields::Step::Wait => return None,
         yields::Step::Aside(ids) => ids,
