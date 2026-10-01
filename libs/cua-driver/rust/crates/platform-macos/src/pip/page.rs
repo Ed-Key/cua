@@ -25,6 +25,8 @@
 //! the card: once a lookup has seen it in a window, that window's crop ends
 //! just above it, for as long as the driver runs, so the card does not change
 //! shape each time the pill hides (4 s after the last command) or comes back.
+//! Every lookup looks for it again, so a pill of another size (page zoom)
+//! replaces the trim.
 
 use std::time::{Duration, Instant};
 
@@ -65,6 +67,13 @@ const PILL_DEPTH: u32 = 4;
 const PILL_NODES: u32 = 32;
 /// Room above the pill for its shadow (points).
 const PILL_GAP: f64 = 10.0;
+/// The extension centers the pill and puts its bottom 16 CSS px above the
+/// page's bottom: that, from half to four times the page's zoom, is what
+/// tells the pill from page text quoting its label. The center is the
+/// page's less half a classic scrollbar (the page's area includes it, the
+/// pill's viewport does not).
+const PILL_CENTER_SLACK: f64 = 10.0;
+const PILL_BOTTOM: std::ops::RangeInclusive<f64> = 7.0..=65.0;
 
 /// The page's area in its window's points (origin at the window's top-left
 /// corner), or why it is not known.
@@ -174,18 +183,14 @@ pub(super) fn capture_page(pid: Option<i32>, window_id: u32) -> Option<super::Sh
 /// of app `pid`. Capture worker and visibility poll only.
 pub(super) fn page_crop(pid: Option<i32>, window_id: u32, window: Area) -> Crop {
     let pid = pid.ok_or("the target has no app")?;
-    let kept = TRIMS.lock().unwrap_or_else(|e| e.into_inner()).get(&window_id).copied();
     let started = Instant::now();
-    let found = unsafe { page_area(pid, window_id, started + LOOKUP_BUDGET, kept.is_none()) };
+    let found = unsafe { page_area(pid, window_id, started + LOOKUP_BUDGET) };
     tracing::debug!(target: "pip", window = window_id, ?found, elapsed_ms = started.elapsed().as_millis() as u64, "PiP page lookup");
     let seen = found.ok().and_then(|(page, pill)| pill_trim(page, pill?));
-    // Read again: a lookup that started before another one kept the trim
-    // (the still's racing the poll) is trimmed all the same.
-    let trim = kept.or_else(|| {
-        let trim = keep_trim(&mut TRIMS.lock().unwrap_or_else(|e| e.into_inner()), window_id, seen)?;
+    let (trim, changed) = keep_trim(&mut TRIMS.lock().unwrap_or_else(|e| e.into_inner()), window_id, seen);
+    if changed {
         tracing::info!(target: "pip", window = window_id, trim, "PiP page pill seen: the card ends above it from now on");
-        Some(trim)
-    });
+    }
     let crop = found.and_then(|(page, _)| crop_in_window(window, page));
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
     remember(&mut known, window_id, (window.w, window.h), crop, started).map(|crop| trimmed(crop, trim))
@@ -194,13 +199,12 @@ pub(super) fn page_crop(pid: Option<i32>, window_id: u32, window: Area) -> Crop 
 /// How much of `page`'s bottom (screen points) to leave out of the card for
 /// cua's pill at `pill` (screen points): from just above the pill (its
 /// shadow) to the page's bottom. `None` when the pill is not where the
-/// extension draws it (inside the page, in its lower half) or the rest of
-/// the page would be too small.
+/// extension draws it (centered, just above the page's bottom, in its lower
+/// half) or the rest of the page would be too small.
 fn pill_trim(page: Area, pill: Area) -> Option<f64> {
-    let inside = pill.x >= page.x - EDGE_SLACK
-        && pill.x + pill.w <= page.x + page.w + EDGE_SLACK
-        && pill.y + pill.h <= page.y + page.h + EDGE_SLACK
-        && pill.y >= page.y + page.h / 2.0;
+    let centered = ((pill.x + pill.w / 2.0) - (page.x + page.w / 2.0)).abs() <= PILL_CENTER_SLACK;
+    let above_bottom = PILL_BOTTOM.contains(&(page.y + page.h - (pill.y + pill.h)));
+    let inside = centered && above_bottom && pill.y >= page.y + page.h / 2.0;
     let trim = page.y + page.h - (pill.y - PILL_GAP);
     (inside && trim > 0.0 && page.h - trim >= MIN_SIDE).then_some(trim)
 }
@@ -218,19 +222,20 @@ fn trimmed(crop: Area, trim: Option<f64>) -> Area {
 static TRIMS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, f64>>> =
     std::sync::LazyLock::new(Default::default);
 
-/// `window_id`'s kept trim, or `seen` now kept as it (the first one wins
-/// when two workers saw the pill at once).
-fn keep_trim(trims: &mut std::collections::HashMap<u32, f64>, window_id: u32, seen: Option<f64>) -> Option<f64> {
-    if let Some(kept) = trims.get(&window_id) {
-        return Some(*kept);
-    }
-    let seen = seen?;
+/// `window_id`'s trim after a lookup that saw the pill's trim `seen` (or
+/// no pill): a pill seen replaces the kept trim (a zoom changed its size),
+/// none keeps it. Whether the kept trim changed.
+fn keep_trim(trims: &mut std::collections::HashMap<u32, f64>, window_id: u32, seen: Option<f64>) -> (Option<f64>, bool) {
+    let kept = trims.get(&window_id).copied();
+    let Some(seen) = seen.filter(|seen| kept.is_none_or(|kept| (kept - seen).abs() > 0.5)) else {
+        return (kept, false);
+    };
     // ponytail: dropped wholesale past 64 windows, as `remember` does.
     if trims.len() >= 64 {
         trims.clear();
     }
     trims.insert(window_id, seen);
-    Some(seen)
+    (Some(seen), true)
 }
 
 /// The last answer each window's lookups gave: the window's size then, the
@@ -337,15 +342,10 @@ unsafe fn bound(element: AXUIElementRef, deadline: Instant) -> bool {
     }
 }
 
-/// The screen area of the one top-level `AXWebArea` in `window_id`, and,
-/// when `find_pill`, cua's pill in it (searched only once the page's answer
-/// is settled, so the search never makes the page late).
-unsafe fn page_area(
-    pid: i32,
-    window_id: u32,
-    deadline: Instant,
-    find_pill: bool,
-) -> Result<(Area, Option<Area>), &'static str> {
+/// The screen area of the one top-level `AXWebArea` in `window_id`, and
+/// cua's pill in it (searched only once the page's answer is settled, so
+/// the search never makes the page late).
+unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<(Area, Option<Area>), &'static str> {
     // A reference of our own: messaging timeouts stick to a reference.
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
@@ -393,9 +393,7 @@ unsafe fn page_area(
         match walk.pages[..] {
             [page] => Ok((
                 page,
-                walk.element
-                    .filter(|_| find_pill)
-                    .and_then(|element| find_pill_in(element, deadline)),
+                walk.element.and_then(|element| find_pill_in(element, deadline)),
             )),
             [] => {
                 Err(if ask_for_pages(pid) {
@@ -664,14 +662,21 @@ mod tests {
     fn a_pill_not_where_the_extension_draws_it_trims_nothing() {
         let page = Area { x: 100.0, y: 117.0, w: 1100.0, h: 702.0 };
         let at = |x, y| Area { x, y, w: 240.0, h: 30.0 };
-        // In the page's upper half (a page quoting the label, say).
+        // Page text quoting the label: in the upper half, off center, or
+        // centered but not just above the bottom.
         assert_eq!(pill_trim(page, at(530.0, 300.0)), None);
+        assert_eq!(pill_trim(page, at(400.0, 773.0)), None);
+        assert_eq!(pill_trim(page, at(530.0, 600.0)), None);
+        // Twice the zoom: twice as far up and tall, still the pill.
+        let zoomed = Area { x: 410.0, y: 819.0 - 32.0 - 60.0, w: 480.0, h: 60.0 };
+        assert_eq!(pill_trim(page, zoomed), Some(32.0 + 60.0 + PILL_GAP));
         // Outside the page.
         assert_eq!(pill_trim(page, at(1000.0, 773.0)), None);
         assert_eq!(pill_trim(page, at(530.0, 800.0)), None);
         // A page too short for a card once trimmed.
         let short = Area { y: 117.0, h: 90.0, ..page };
         assert_eq!(pill_trim(short, at(530.0, 161.0)), None);
+        assert_eq!(pill_trim(page, at(530.0, 773.0)), Some(56.0));
         // A trim kept from a taller page never leaves a sliver.
         let crop = Area { x: 0.0, y: 87.0, w: 1100.0, h: 90.0 };
         assert_eq!(trimmed(crop, Some(56.0)), crop);
@@ -681,16 +686,19 @@ mod tests {
     fn the_trim_is_kept_for_its_window_once_the_pill_was_seen() {
         let mut trims = std::collections::HashMap::new();
         // No pill seen yet: nothing to trim.
-        assert_eq!(keep_trim(&mut trims, 7, None), None);
+        assert_eq!(keep_trim(&mut trims, 7, None), (None, false));
         // Seen: kept ...
-        assert_eq!(keep_trim(&mut trims, 7, Some(56.0)), Some(56.0));
+        assert_eq!(keep_trim(&mut trims, 7, Some(56.0)), (Some(56.0), true));
         // ... through lookups that no longer see it (the pill hid 4 s after
-        // the last command, Stop, a tab without it) ...
-        assert_eq!(keep_trim(&mut trims, 7, None), Some(56.0));
-        // ... and the first one stays (two workers, or a later sighting).
-        assert_eq!(keep_trim(&mut trims, 7, Some(60.0)), Some(56.0));
+        // the last command, Stop, a tab without it), and a lookup that
+        // started before it was kept reads it too ...
+        assert_eq!(keep_trim(&mut trims, 7, None), (Some(56.0), false));
+        assert_eq!(keep_trim(&mut trims, 7, Some(56.2)), (Some(56.0), false));
+        // ... until a pill of another size (page zoom) replaces it.
+        assert_eq!(keep_trim(&mut trims, 7, Some(102.0)), (Some(102.0), true));
+        assert_eq!(keep_trim(&mut trims, 7, None), (Some(102.0), false));
         // Another window has its own.
-        assert_eq!(keep_trim(&mut trims, 8, None), None);
+        assert_eq!(keep_trim(&mut trims, 8, None), (None, false));
     }
 
     #[test]
