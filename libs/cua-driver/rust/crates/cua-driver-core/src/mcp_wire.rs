@@ -12,8 +12,9 @@ pub const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabil
 /// server instructions name them. Usage across every lab run picked the first
 /// rows; the rest are tools a core tool's own guidance or refusal tells the
 /// caller to use (check_permissions, browser_type, browser_prepare, zoom for
-/// `from_zoom`, escalate_session for desktop-scope refusals, the history
-/// pair when the preview is admitted) and pip_turn, which client hooks call.
+/// `from_zoom`, browser_dialog for `browser_dialog_open` refusals,
+/// escalate_session for desktop-scope refusals, the history pair when the
+/// preview is admitted) and pip_turn, which client hooks call.
 /// Every MCP profile marks these `anthropic/alwaysLoad` for Claude Code.
 pub const CORE_TOOLS: &[&str] = &[
     "get_window_state",
@@ -41,6 +42,7 @@ pub const CORE_TOOLS: &[&str] = &[
     "browser_steps",
     "browser_type",
     "browser_prepare",
+    "browser_dialog",
     "get_desktop_state",
     "check_permissions",
     "escalate_session",

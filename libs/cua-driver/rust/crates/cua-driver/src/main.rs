@@ -588,8 +588,11 @@ mod tool_profile_registry_tests {
     fn every_core_tool_exists_and_is_preloaded_for_claude_code() {
         let tools = registry();
         for core in CORE_TOOLS {
-            // The history pair registers only when the preview is admitted.
-            if matches!(*core, "history_status" | "history_query") {
+            // The history pair registers only when the preview is admitted;
+            // act_and_read only on macOS.
+            if matches!(*core, "history_status" | "history_query")
+                || (*core == "act_and_read" && !cfg!(target_os = "macos"))
+            {
                 continue;
             }
             let tool = tools

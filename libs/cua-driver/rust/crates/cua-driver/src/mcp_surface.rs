@@ -14,7 +14,10 @@
 //!   Claude Code already shows its model only `structuredContent`. Images and
 //!   error results are left as they are. Codex also gets the compact
 //!   `codex_instructions`, because it repeats the instructions in every
-//!   ALL_TOOLS entry.
+//!   ALL_TOOLS entry, and a listing without `outputSchema`: code mode
+//!   renders each into a TypeScript return type, about two-thirds of the
+//!   catalog. Results still carry `structuredContent`, which MCP allows
+//!   without an advertised schema; servers still validate against it.
 
 use cua_driver_core::mcp_result::{conforming_tool_result, tool_error_result};
 use cua_driver_core::mcp_wire::{finish_response, is_core_tool, ProtocolEra};
@@ -125,6 +128,11 @@ impl Surface {
                 .and_then(Value::as_str)
                 .is_some_and(|name| self.profile.includes(name))
         });
+        if self.codex {
+            for tool in tools.iter_mut().filter_map(Value::as_object_mut) {
+                tool.remove("outputSchema");
+            }
+        }
     }
 }
 
@@ -233,6 +241,33 @@ mod tests {
         assert_eq!(list["schema_version"], "x");
         assert_eq!(list["tools"][0], listing()["tools"][0]);
         assert_eq!(list["tools"][1], listing()["tools"][1]);
+    }
+
+    #[test]
+    fn codex_listing_drops_output_schemas_and_others_keep_them() {
+        let listed = json!({"tools": [
+            {"name": "click", "inputSchema": {"type": "object"}, "outputSchema": {"type": "object"}},
+            {"name": "zoom", "outputSchema": {"type": "object"}},
+        ]});
+        for (client, kept) in [
+            ("codex-mcp-client", false),
+            ("claude-code", true),
+            ("cua-lab", true),
+        ] {
+            let mut surface = Surface::new(ToolProfile::Core);
+            surface.observe(&initialize(client));
+            let list =
+                result(&surface.render("tools/list", Response::ok(json!(1), listed.clone())));
+            for tool in list["tools"].as_array().unwrap() {
+                assert_eq!(tool.get("outputSchema").is_some(), kept, "{client} {tool}");
+                assert_eq!(tool["name"].is_string(), true);
+            }
+            assert_eq!(
+                list["tools"][0]["inputSchema"],
+                json!({"type": "object"}),
+                "{client}"
+            );
+        }
     }
 
     #[test]

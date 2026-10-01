@@ -350,8 +350,8 @@ pub fn initialize_result() -> Value {
 }
 
 /// The core tools the instructions name: every core tool an agent calls
-/// (pip_turn is for hooks; escalate_session and the history pair are named
-/// where they apply; act_and_read is registered only on macOS).
+/// (pip_turn is for hooks; escalate_session, browser_dialog and the history
+/// pair are named where they apply; act_and_read is registered only on macOS).
 fn instruction_core_tools() -> String {
     crate::mcp_wire::CORE_TOOLS
         .iter()
@@ -364,7 +364,7 @@ fn instruction_core_tools() -> String {
 fn instruction_omits(tool: &str) -> bool {
     matches!(
         tool,
-        "pip_turn" | "escalate_session" | "history_status" | "history_query"
+        "pip_turn" | "escalate_session" | "browser_dialog" | "history_status" | "history_query"
     ) || (tool == "act_and_read" && !cfg!(target_os = "macos"))
 }
 
