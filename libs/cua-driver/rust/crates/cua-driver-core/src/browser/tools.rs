@@ -2700,32 +2700,62 @@ fn plan_newline(text: &str, single_line: bool, keystrokes: bool) -> Newline {
     }
 }
 
+/// How sending Enter went.
+#[derive(Debug, PartialEq, Eq)]
+enum EnterSend {
+    /// keyDown, char and keyUp all reached the page.
+    Sent,
+    /// Nothing was sent, and why.
+    NotSent(String),
+    /// A JavaScript dialog opened; `keys` says whether any Enter event had
+    /// reached the page first.
+    Dialog { keys: bool },
+    /// Some Enter events reached the page, then sending failed: the page
+    /// may have acted on them.
+    Partial(String),
+}
+
 /// Press Enter in the exact field whose text was just confirmed: focus it
 /// under focus emulation (the tab may be in the background), check it is
-/// the active element, then send the key events of a real Enter (keyCode 13
-/// too, for handlers that read it). `Err` says why nothing was sent.
+/// the active element and still holds `confirmed` right before the first
+/// key, then send the key events of a real Enter (keyCode 13 too, for
+/// handlers that read it). Every call goes through `delivery`, so a dialog
+/// the page opens on the way ends the wait at once.
 async fn press_enter(
     delivery: &mut Delivery<'_>,
     backend: i64,
     object_id: &str,
-) -> Result<(), String> {
-    let (conn, cdp) = (delivery.conn, delivery.cdp);
-    conn.call(
-        Some(cdp),
-        "Emulation.setFocusEmulationEnabled",
-        json!({ "enabled": true }),
-    )
-    .await
-    .map_err(|error| format!("the tab could not enter focus emulation: {error}"))?;
+    confirmed: &str,
+) -> EnterSend {
+    let blocked = |keys: bool| EnterSend::Dialog { keys };
+    match delivery
+        .send(
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+        )
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return blocked(false),
+        Err(error) => {
+            return EnterSend::NotSent(format!("the tab could not enter focus emulation: {error}"))
+        }
+    }
     let sent = async {
         let mut ready = false;
         for _ in 0..20 {
-            conn.call(Some(cdp), "DOM.focus", json!({ "backendNodeId": backend }))
+            match delivery
+                .send("DOM.focus", json!({ "backendNodeId": backend }))
                 .await
-                .map_err(|error| format!("the field could not be focused: {error}"))?;
-            let check = conn
-                .call(
-                    Some(cdp),
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => return blocked(false),
+                Err(error) => {
+                    return EnterSend::NotSent(format!("the field could not be focused: {error}"))
+                }
+            }
+            match delivery
+                .send(
                     "Runtime.callFunctionOn",
                     json!({
                         "objectId": object_id,
@@ -2733,18 +2763,52 @@ async fn press_enter(
                         "returnByValue": true,
                     }),
                 )
-                .await;
-            if matches!(check, Ok(ref value) if value["result"]["value"].as_bool() == Some(true)) {
-                ready = true;
-                break;
+                .await
+            {
+                Ok(Some(value)) if value["result"]["value"].as_bool() == Some(true) => {
+                    ready = true;
+                    break;
+                }
+                Ok(None) => return blocked(false),
+                _ => {}
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
         if !ready {
-            return Err("the field did not become the focused element".to_owned());
+            return EnterSend::NotSent("the field did not become the focused element".to_owned());
         }
         // As for keystrokes: the trusted-input path can lag the focus ack.
         tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // What Enter would submit is what the field holds now.
+        match delivery
+            .send(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": READ_EDIT_STATE,
+                    "returnByValue": true,
+                }),
+            )
+            .await
+        {
+            Ok(Some(read)) => {
+                let state = &read["result"]["value"];
+                if state["connected"].as_bool() != Some(true) {
+                    return EnterSend::NotSent("the page took the field out before Enter".to_owned());
+                }
+                if state["value"].as_str() != Some(confirmed) {
+                    let password = state["password"].as_bool().unwrap_or(false);
+                    return EnterSend::NotSent(format!(
+                        "the field changed to {} before Enter",
+                        shown_value(state["value"].as_str().unwrap_or(""), password)
+                    ));
+                }
+            }
+            Ok(None) => return blocked(false),
+            Err(error) => {
+                return EnterSend::NotSent(format!("the field could not be read before Enter: {error}"))
+            }
+        }
         let key = |kind: &str| {
             json!({ "type": kind, "key": "Enter", "code": "Enter",
                     "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13 })
@@ -2754,21 +2818,30 @@ async fn press_enter(
             json!({ "type": "char", "key": "Enter", "text": "\r", "unmodifiedText": "\r" }),
             key("keyUp"),
         ];
-        for event in events {
+        for (index, event) in events.into_iter().enumerate() {
+            let keys = index > 0;
             match delivery.send("Input.dispatchKeyEvent", event).await {
                 Ok(Some(_)) => {}
-                // A dialog is up: the page took the keys so far.
-                Ok(None) => break,
-                Err(error) => return Err(format!("the Enter key could not be sent: {error}")),
+                Ok(None) => return blocked(keys),
+                Err(error) if keys => {
+                    return EnterSend::Partial(format!("sending Enter stopped partway: {error}"))
+                }
+                Err(error) => {
+                    return EnterSend::NotSent(format!("the Enter key could not be sent: {error}"))
+                }
             }
         }
-        Ok(())
+        if delivery.blocked() {
+            return blocked(true);
+        }
+        EnterSend::Sent
     }
     .await;
     if !delivery.blocked() {
-        let _ = conn
+        let _ = delivery
+            .conn
             .call(
-                Some(cdp),
+                Some(delivery.cdp),
                 "Emulation.setFocusEmulationEnabled",
                 json!({ "enabled": false }),
             )
@@ -2784,6 +2857,10 @@ enum AfterEnter {
     NotSent(String),
     /// The page opened a JavaScript dialog while it handled Enter.
     Dialog,
+    /// The page opened a JavaScript dialog before any Enter event was sent.
+    DialogBeforeEnter,
+    /// Enter was sent in part, then sending failed (why).
+    Partial(String),
     /// What the field holds: the first read that differs from the text
     /// before Enter, or that text after half a second.
     Field(EditState),
@@ -2836,6 +2913,19 @@ fn describe_enter(after: &AfterEnter, before_enter: &str, password: bool) -> (St
             ", then Enter was pressed and the page opened a JavaScript dialog".to_owned(),
             pressed("dialog"),
             true,
+        ),
+        AfterEnter::DialogBeforeEnter => (
+            ". Enter was NOT pressed: the page opened a JavaScript dialog first".to_owned(),
+            json!({ "pressed": false, "reason": "javascript_dialog_open" }),
+            false,
+        ),
+        AfterEnter::Partial(reason) => (
+            format!(
+                ". Enter was sent only in part ({reason}); the page may have acted on it: read \
+                 the page before pressing it again"
+            ),
+            json!({ "pressed": "partial", "reason": reason }),
+            false,
         ),
         AfterEnter::Field(state) if state.value.is_empty() && !before_enter.is_empty() => (
             ", then Enter was pressed and the field is now empty".to_owned(),
@@ -3739,10 +3829,12 @@ impl Tool for BrowserTypeTool {
         // submitted (see plan_newline).
         let after_enter = match &readback {
             Some(Readback::Confirmed(actual)) if enter => Some(
-                match press_enter(&mut delivery, entry.backend_node_id, &object_id).await {
-                    Err(reason) => AfterEnter::NotSent(reason),
-                    Ok(()) if delivery.blocked() => AfterEnter::Dialog,
-                    Ok(()) => field_after_enter(&mut delivery, &object_id, actual).await,
+                match press_enter(&mut delivery, entry.backend_node_id, &object_id, actual).await {
+                    EnterSend::NotSent(reason) => AfterEnter::NotSent(reason),
+                    EnterSend::Partial(reason) => AfterEnter::Partial(reason),
+                    EnterSend::Dialog { keys: false } => AfterEnter::DialogBeforeEnter,
+                    EnterSend::Dialog { keys: true } => AfterEnter::Dialog,
+                    EnterSend::Sent => field_after_enter(&mut delivery, &object_id, actual).await,
                 },
             ),
             _ => None,
@@ -3837,7 +3929,7 @@ impl Tool for BrowserTypeTool {
                                 }
                                 // What it holds now, where that is known.
                                 match after {
-                                    AfterEnter::NotSent(_) => {}
+                                    AfterEnter::NotSent(_) | AfterEnter::DialogBeforeEnter => {}
                                     AfterEnter::Field(state) => {
                                         structured["value"] = json!((!before.password)
                                             .then(|| truncate_value(&state.value)));

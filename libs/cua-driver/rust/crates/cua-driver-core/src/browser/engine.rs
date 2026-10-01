@@ -327,52 +327,65 @@ fn viewport_point_to_screen(
 
 /// Walks `levels` up from the control (a shadow root's next level is its
 /// host and a frame document's its frame element, as the snapshot's DOM
-/// index counts them) and says whether that row's text, open shadow roots
-/// included, still holds `words` in order.
-const ROW_STILL_READS: &str = "function(levels, words) { \
+/// index counts them) and names the row by the snapshot's rule
+/// ([`super::semantic`]'s `name_controls_by_row`): its visible text in
+/// document order, open shadow roots included, without text inside buttons,
+/// links and fields, cleaned the same way, then compared with `name` (a
+/// truncated name by its prefix), ignoring case.
+///
+/// ponytail: visibility is the text's own element (display, visibility,
+/// opacity), as the snapshot's layout reads it; text the snapshot drops for an
+/// inline-styled hidden ancestor still counts here, and closed shadow roots
+/// are not seen. Either reads as a changed row (a refusal, never a wrong
+/// click). Move this check onto a fresh snapshot read if that bites.
+const ROW_STILL_READS: &str = "function(levels, name) { \
     let row = this; \
     for (let i = 0; i < levels && row; i++) { \
         row = row.parentNode || row.host || \
             (row.defaultView ? row.defaultView.frameElement : null) || null; \
     } \
     if (!row) return false; \
+    const skip = new Set(['SCRIPT', 'STYLE', 'TEMPLATE', 'NOSCRIPT', 'BUTTON', 'INPUT', \
+        'TEXTAREA', 'SELECT']); \
+    const roles = /^(button|link|textbox|searchbox|combobox|menuitem|tab)$/; \
     const parts = [], stack = [row]; \
     while (stack.length) { \
         const node = stack.pop(); \
-        if (node.nodeType === 3) { parts.push(node.nodeValue); continue; } \
+        if (node.nodeType === 3) { \
+            const host = node.parentElement; \
+            if (host) { \
+                const style = getComputedStyle(host); \
+                if (style.display === 'none' || style.visibility === 'hidden' || \
+                    Number(style.opacity) <= 0) continue; \
+            } \
+            parts.push(node.nodeValue); \
+            continue; \
+        } \
+        if (node.nodeType === 1 && node !== row && (skip.has(node.tagName) || \
+            (node.tagName === 'A' && node.hasAttribute('href')) || \
+            roles.test(node.getAttribute('role') || '') || \
+            node.getAttribute('aria-hidden') === 'true' || node.hidden)) continue; \
         const kids = Array.from(node.childNodes || []); \
         if (node.shadowRoot) kids.unshift(node.shadowRoot); \
         for (let k = kids.length - 1; k >= 0; k--) stack.push(kids[k]); \
     } \
-    const text = parts.join(' ').toLowerCase(); \
-    let at = 0; \
-    for (const word of words) { \
-        const found = text.indexOf(word, at); \
-        if (found < 0) return false; \
-        at = found + word.length; \
-    } \
-    return true; \
+    const clean = (text) => text \
+        .replace(/[\\uFEFF\\u200B\\u200C\\u200D\\u2060\\u00A0\\u2007\\u202F\\uE000-\\uF8FF]/g, ' ') \
+        .split(/\\s+/).filter(Boolean).join(' ').toLowerCase(); \
+    const now = clean(parts.join(' ')); \
+    const want = clean(name.endsWith('…') ? name.slice(0, -1) : name); \
+    return name.endsWith('…') ? now.startsWith(want) : now === want; \
 }";
 
 /// Whether the row a control was named after (see
-/// [`super::store::RefEntry::row`]) still reads as that name: its words, in
-/// order, in the row's live text. A DOM text check, looser than the
-/// snapshot's rule (hidden text and button text also count), so it does not
-/// refuse a row that still reads the same; it catches an element reused for
-/// another item. Closed shadow roots are not visible to it.
+/// [`super::store::RefEntry::row`]) still reads as that name, by the rule in
+/// [`ROW_STILL_READS`]. A control reused for another item is refused.
 async fn row_still_reads(
     conn: &CdpConnection,
     cdp_session: &str,
     backend: i64,
     row: &super::store::RowName,
 ) -> bool {
-    let words: Vec<String> = row
-        .name
-        .trim_end_matches('…')
-        .to_lowercase()
-        .split_whitespace()
-        .map(str::to_owned)
-        .collect();
     let Ok(resolved) = conn
         .call(
             Some(cdp_session),
@@ -392,7 +405,7 @@ async fn row_still_reads(
         json!({
             "objectId": object_id,
             "functionDeclaration": ROW_STILL_READS,
-            "arguments": [{ "value": row.levels }, { "value": words }],
+            "arguments": [{ "value": row.levels }, { "value": row.name }],
             "returnByValue": true,
         }),
     )
@@ -2242,7 +2255,7 @@ impl BrowserEngine {
         let live = self
             .live_fingerprint(&validated.conn, &frame_session, entry)
             .await?;
-        if live != Some(Fingerprint::of(entry)) {
+        if live != Some(Fingerprint::of(entry).accessible()) {
             // Stale for good, even if the node reads as before again later.
             self.store.retire_refused(session, target_id, tab_id, entry);
             // What it reads as now is page content: a read says that, to a
