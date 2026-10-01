@@ -187,7 +187,7 @@ pub(super) fn page_crop(pid: Option<i32>, window_id: u32, window: Area) -> Crop 
     let found = unsafe { page_area(pid, window_id, started + LOOKUP_BUDGET) };
     tracing::debug!(target: "pip", window = window_id, ?found, elapsed_ms = started.elapsed().as_millis() as u64, "PiP page lookup");
     let seen = found.ok().and_then(|(page, pill)| pill_trim(page, pill?));
-    let (trim, changed) = keep_trim(&mut TRIMS.lock().unwrap_or_else(|e| e.into_inner()), window_id, seen);
+    let (trim, changed) = keep_trim(&mut TRIMS.lock().unwrap_or_else(|e| e.into_inner()), window_id, seen, started);
     if changed {
         tracing::info!(target: "pip", window = window_id, trim, "PiP page pill seen: the card ends above it from now on");
     }
@@ -217,25 +217,34 @@ fn trimmed(crop: Area, trim: Option<f64>) -> Area {
     }
 }
 
-/// The pill trim of each window that has shown the pill: never searched
-/// again and never dropped (see the module notes).
-static TRIMS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, f64>>> =
+/// The pill trim of each window that has shown the pill, and when the
+/// lookup that saw it started: never dropped (see the module notes).
+static TRIMS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, (f64, Instant)>>> =
     std::sync::LazyLock::new(Default::default);
 
 /// `window_id`'s trim after a lookup that saw the pill's trim `seen` (or
 /// no pill): a pill seen replaces the kept trim (a zoom changed its size),
-/// none keeps it. Whether the kept trim changed.
-fn keep_trim(trims: &mut std::collections::HashMap<u32, f64>, window_id: u32, seen: Option<f64>) -> (Option<f64>, bool) {
+/// none keeps it, and so does a lookup that started before the one that
+/// saw the kept trim (two workers look up concurrently). Whether the kept
+/// trim changed.
+fn keep_trim(
+    trims: &mut std::collections::HashMap<u32, (f64, Instant)>,
+    window_id: u32,
+    seen: Option<f64>,
+    started: Instant,
+) -> (Option<f64>, bool) {
     let kept = trims.get(&window_id).copied();
-    let Some(seen) = seen.filter(|seen| kept.is_none_or(|kept| (kept - seen).abs() > 0.5)) else {
-        return (kept, false);
+    let newer = kept.is_none_or(|(_, at)| started > at);
+    let Some(seen) = seen.filter(|_| newer) else {
+        return (kept.map(|(trim, _)| trim), false);
     };
+    let changed = kept.is_none_or(|(trim, _)| (trim - seen).abs() > 0.5);
     // ponytail: dropped wholesale past 64 windows, as `remember` does.
     if trims.len() >= 64 {
         trims.clear();
     }
-    trims.insert(window_id, seen);
-    (Some(seen), true)
+    trims.insert(window_id, (seen, started));
+    (Some(seen), changed)
 }
 
 /// The last answer each window's lookups gave: the window's size then, the
@@ -685,20 +694,25 @@ mod tests {
     #[test]
     fn the_trim_is_kept_for_its_window_once_the_pill_was_seen() {
         let mut trims = std::collections::HashMap::new();
+        let t = Instant::now();
+        let at = |ms| t + Duration::from_millis(ms);
         // No pill seen yet: nothing to trim.
-        assert_eq!(keep_trim(&mut trims, 7, None), (None, false));
+        assert_eq!(keep_trim(&mut trims, 7, None, at(0)), (None, false));
         // Seen: kept ...
-        assert_eq!(keep_trim(&mut trims, 7, Some(56.0)), (Some(56.0), true));
+        assert_eq!(keep_trim(&mut trims, 7, Some(56.0), at(500)), (Some(56.0), true));
         // ... through lookups that no longer see it (the pill hid 4 s after
         // the last command, Stop, a tab without it), and a lookup that
         // started before it was kept reads it too ...
-        assert_eq!(keep_trim(&mut trims, 7, None), (Some(56.0), false));
-        assert_eq!(keep_trim(&mut trims, 7, Some(56.2)), (Some(56.0), false));
-        // ... until a pill of another size (page zoom) replaces it.
-        assert_eq!(keep_trim(&mut trims, 7, Some(102.0)), (Some(102.0), true));
-        assert_eq!(keep_trim(&mut trims, 7, None), (Some(102.0), false));
+        assert_eq!(keep_trim(&mut trims, 7, None, at(1000)), (Some(56.0), false));
+        assert_eq!(keep_trim(&mut trims, 7, None, at(100)), (Some(56.0), false));
+        assert_eq!(keep_trim(&mut trims, 7, Some(56.2), at(1500)), (Some(56.2), false));
+        // ... until a pill of another size (page zoom) replaces it ...
+        assert_eq!(keep_trim(&mut trims, 7, Some(102.0), at(2000)), (Some(102.0), true));
+        assert_eq!(keep_trim(&mut trims, 7, None, at(2500)), (Some(102.0), false));
+        // ... and an older lookup answering last never undoes that.
+        assert_eq!(keep_trim(&mut trims, 7, Some(56.0), at(1800)), (Some(102.0), false));
         // Another window has its own.
-        assert_eq!(keep_trim(&mut trims, 8, None), (None, false));
+        assert_eq!(keep_trim(&mut trims, 8, None, at(3000)), (None, false));
     }
 
     #[test]
