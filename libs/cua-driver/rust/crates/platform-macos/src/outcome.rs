@@ -371,11 +371,13 @@ pub(crate) fn describe(
             if let Some(value) = &b.value {
                 parts.push(format!("{} now shows {}", element_name(b), shown_value(value)));
             }
+        } else if let Some(value) = b.value.as_deref().filter(|v| !v.is_empty()) {
+            parts.push(format!("{} still shows {} (the pick did not change it)", element_name(b), quote(value)));
         } else {
+            // No readable choice: an unchanged label is not proof either way.
             parts.push(format!(
-                "{} still shows {} (the pick did not change it)",
-                element_name(b),
-                quote(b.value.as_deref().filter(|v| !v.is_empty()).unwrap_or(&b.label))
+                "{} kept its label; whether the pick took is not readable",
+                element_name(b)
             ));
         }
     }
@@ -1468,7 +1470,7 @@ mod tests {
         after.opener = Some(button("Daily"));
         assert_eq!(
             describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
-            "AXButton \"Daily\" still shows \"Daily\" (the pick did not change it); menu closed"
+            "AXButton \"Daily\" kept its label; whether the pick took is not readable; menu closed"
         );
 
         let mut before = window("note.txt");

@@ -799,7 +799,8 @@ fn select_popup_option(
         Some(i) => {
             let err = unsafe { perform_action(options[i].element, "AXPress") };
             if err == kAXErrorSuccess {
-                Ok(options[i].title.clone())
+                // An option may carry its choice only in AXValue.
+                Ok(if options[i].title.is_empty() { options[i].value.clone() } else { options[i].title.clone() })
             } else {
                 Err(format!("AXPress on option '{}' failed with AX error {err}", options[i].title))
             }
