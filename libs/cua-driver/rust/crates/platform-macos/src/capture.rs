@@ -222,7 +222,10 @@ where
             )),
         },
         Err(native_err) => match fallback(window_id) {
-            Ok(bytes) => Ok(bytes),
+            Ok(bytes) => {
+                tracing::debug!(target: "capture", window_id, error = %format_args!("{native_err:#}"), "window capture used the screencapture fallback");
+                Ok(bytes)
+            }
             Err(fallback_err) => Err(anyhow::anyhow!(
                 "window {window_id} capture failed: native: {native_err:#}; \
                  shell fallback: {fallback_err:#}"

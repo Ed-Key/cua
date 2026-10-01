@@ -38,6 +38,8 @@ const LOOKUP_BUDGET: Duration = Duration::from_millis(300);
 /// The lookup found no page and asked the browser to build its page's
 /// accessibility.
 const ASKED: &str = "the window shows no page yet (its accessibility was asked for)";
+/// The lookup ran past its deadline (a busy browser), at whatever step.
+const LATE: &str = "the lookup did not finish in time";
 /// The page sits a few levels under the window; its own content is never
 /// walked, so these only bound the browser's native views.
 const MAX_DEPTH: u32 = 12;
@@ -129,7 +131,10 @@ fn window_frame(window_id: u32) -> Option<Area> {
 /// Capture worker only.
 pub(super) fn capture_page(pid: Option<i32>, window_id: u32) -> Option<super::Shot> {
     let before = window_frame(window_id);
-    let png = cua_driver_core::recording::screenshot_for(Some(u64::from(window_id)), None)?;
+    let started = Instant::now();
+    let png = cua_driver_core::recording::screenshot_for(Some(u64::from(window_id)), None);
+    tracing::debug!(target: "pip", window = window_id, ok = png.is_some(), elapsed_ms = started.elapsed().as_millis() as u64, "PiP page still captured");
+    let png = png?;
     let framed = before.ok_or("the window's frame is not known").and_then(|frame| {
         let crop = page_crop(pid, window_id, frame)?;
         if window_frame(window_id) != Some(frame) {
@@ -155,7 +160,56 @@ pub(super) fn page_crop(pid: Option<i32>, window_id: u32, window: Area) -> Crop 
     let started = Instant::now();
     let found = unsafe { page_area(pid, window_id, started + LOOKUP_BUDGET) };
     tracing::debug!(target: "pip", window = window_id, ?found, elapsed_ms = started.elapsed().as_millis() as u64, "PiP page lookup");
-    crop_in_window(window, found?)
+    let crop = found.and_then(|page| crop_in_window(window, page));
+    let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
+    remember(&mut known, window_id, (window.w, window.h), crop, started)
+}
+
+/// The last answer each window's lookups gave: the window's size then, the
+/// crop (`None`: the newest answer was not a page), and when that lookup
+/// started.
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct Known {
+    size: (f64, f64),
+    crop: Option<Area>,
+    started: Instant,
+}
+
+static KNOWN: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, Known>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// A lookup in `window_id` (its window `size` now) that started at
+/// `started` answered `crop`: what the card goes by. A late lookup (a busy
+/// browser) keeps the last crop seen in that window at the same size, so
+/// the card does not flicker to the whole window and back; with none, or a
+/// resized window, it stays unknown. Any other answer replaces the kept
+/// crop (a page, no page, several pages), unless a lookup that started
+/// later already answered (two workers look up concurrently).
+fn remember(
+    known: &mut std::collections::HashMap<u32, Known>,
+    window_id: u32,
+    size: (f64, f64),
+    crop: Crop,
+    started: Instant,
+) -> Crop {
+    if crop == Err(LATE) {
+        return match known.get(&window_id) {
+            Some(Known { size: was, crop: Some(last), .. }) if *was == size => Ok(*last),
+            _ => crop,
+        };
+    }
+    if known.get(&window_id).is_some_and(|last| last.started > started) {
+        return crop;
+    }
+    // ponytail: dropped wholesale past 64 windows; per-window removal on
+    // close if a long session ever needs it.
+    if known.len() >= 64 && !known.contains_key(&window_id) {
+        known.clear();
+    }
+    // A non-page answer stays as a marker, so an older lookup's page cannot
+    // come back after it.
+    known.insert(window_id, Known { size, crop: crop.ok(), started });
+    crop
 }
 
 /// Browsers whose page accessibility is being asked for now.
@@ -234,7 +288,12 @@ unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area,
     }
     let Some(root) = root else {
         CFRelease(app as CFTypeRef);
-        return Err("the window is not in its app's accessibility tree");
+        // Past the deadline the AXWindows read itself timed out.
+        return Err(if message_timeout(deadline, Instant::now()).is_none() {
+            LATE
+        } else {
+            "the window is not in its app's accessibility tree"
+        });
     };
     let mut walk = Walk {
         nodes: MAX_NODES,
@@ -247,9 +306,13 @@ unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area,
     }
     CFRelease(root as CFTypeRef);
     // A message that timed out reads as a missing value: past the deadline
-    // nothing the walk saw can be trusted to be all of it.
-    let found = if !walk.complete || Instant::now() >= deadline {
-        Err("the lookup did not finish in time")
+    // nothing the walk saw can be trusted to be all of it. With time left,
+    // an incomplete walk (node budget, a failed read) is not late.
+    // Under a millisecond left counts as spent (`message_timeout`).
+    let found = if message_timeout(deadline, Instant::now()).is_none() {
+        Err(LATE)
+    } else if !walk.complete {
+        Err("the lookup could not read all of the window's views")
     } else {
         match walk.pages[..] {
             [page] => Ok(page),
@@ -403,6 +466,55 @@ mod tests {
         // Half a point over the edge is rounding: clamped.
         let over = Area { h: 702.5, ..page };
         assert_eq!(crop_in_window(WINDOW, over).map(|crop| crop.h), Ok(702.0));
+    }
+
+    #[test]
+    fn a_late_lookup_keeps_the_last_crop_of_the_same_window_at_the_same_size() {
+        let mut known = std::collections::HashMap::new();
+        let t = Instant::now();
+        let at = |ms| t + Duration::from_millis(ms);
+        let page = Area { x: 0.0, y: 87.0, w: 1100.0, h: 702.0 };
+        let size = (1100.0, 789.0);
+        // Late with nothing seen yet: unknown (the whole window), never a guess.
+        assert_eq!(remember(&mut known, 7, size, Err(LATE), at(0)), Err(LATE));
+        // A page, then a late lookup: the page again, not the whole window.
+        assert_eq!(remember(&mut known, 7, size, Ok(page), at(500)), Ok(page));
+        assert_eq!(remember(&mut known, 7, size, Err(LATE), at(1000)), Ok(page));
+        // Not for another window, nor once this one was resized.
+        assert_eq!(remember(&mut known, 8, size, Err(LATE), at(1000)), Err(LATE));
+        assert_eq!(remember(&mut known, 7, (1000.0, 789.0), Err(LATE), at(1100)), Err(LATE));
+        // Any other answer replaces it: a page that moved, or no page at all.
+        let moved = Area { y: 120.0, h: 669.0, ..page };
+        assert_eq!(remember(&mut known, 7, size, Ok(moved), at(1500)), Ok(moved));
+        assert_eq!(remember(&mut known, 7, size, Err(LATE), at(2000)), Ok(moved));
+        assert_eq!(remember(&mut known, 7, size, Err(ASKED), at(2500)), Err(ASKED));
+        assert_eq!(remember(&mut known, 7, size, Err(LATE), at(3000)), Err(LATE));
+        // An incomplete walk with time left is an answer, not late.
+        let incomplete = "the lookup could not read all of the window's views";
+        remember(&mut known, 7, size, Ok(page), at(3500));
+        assert_eq!(remember(&mut known, 7, size, Err(incomplete), at(4000)), Err(incomplete));
+        assert_eq!(remember(&mut known, 7, size, Err(LATE), at(4500)), Err(LATE));
+    }
+
+    #[test]
+    fn an_older_lookup_answering_last_never_replaces_a_newer_crop() {
+        let mut known = std::collections::HashMap::new();
+        let t = Instant::now();
+        let at = |ms| t + Duration::from_millis(ms);
+        let size = (1100.0, 789.0);
+        let old = Area { x: 0.0, y: 87.0, w: 1100.0, h: 702.0 };
+        let new = Area { y: 120.0, h: 669.0, ..old };
+        remember(&mut known, 7, size, Ok(new), at(600));
+        // The capture helper's lookup started first and answers now: it is
+        // its own still's answer, but the kept crop stays the newer one.
+        assert_eq!(remember(&mut known, 7, size, Ok(old), at(100)), Ok(old));
+        assert_eq!(remember(&mut known, 7, size, Err(ASKED), at(100)), Err(ASKED));
+        assert_eq!(remember(&mut known, 7, size, Err(LATE), at(900)), Ok(new));
+        // A newer "no page" is not undone by an older lookup's page: a late
+        // lookup after both shows the whole window.
+        assert_eq!(remember(&mut known, 7, size, Err(ASKED), at(1200)), Err(ASKED));
+        assert_eq!(remember(&mut known, 7, size, Ok(new), at(1000)), Ok(new));
+        assert_eq!(remember(&mut known, 7, size, Err(LATE), at(1500)), Err(LATE));
     }
 
     #[test]
