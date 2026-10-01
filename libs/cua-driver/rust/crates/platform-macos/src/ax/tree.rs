@@ -875,6 +875,11 @@ pub(crate) fn format_node_line(node: &AXNode) -> String {
         if !action_str.is_empty() {
             attrs.push(format!("actions=[{}]", action_str));
         }
+        // The app's own selection (a list row, a tab): visible without a
+        // screenshot, and a diff marks the row when it changes.
+        if node.selected == Some(true) {
+            attrs.push("selected".into());
+        }
         if node.focused == Some(true) {
             attrs.push("focused".into());
             if let Some(selection) = &node.text_selection {
@@ -1015,6 +1020,21 @@ mod tests {
         assert!(rendered.contains("[placeholder=\"Ask for follow-up changes\"]"));
         node.value = Some(String::new());
         assert!(format_node_line(&node).contains(" = \"\""), "an empty field shows as empty");
+    }
+
+    /// A selected row says so in its line (Catalyst message rows have no
+    /// other visible sign); unselected and unknown add nothing.
+    #[test]
+    fn selected_rows_render_selected() {
+        let mut node = row(Some(3), "AXGroup", "", 1, None);
+        node.description = Some("Message 312 from Lena".into());
+        node.actions = vec!["AXCancel".into()];
+        node.selected = Some(true);
+        assert_eq!(format_node_line(&node), "- [3] AXGroup (Message 312 from Lena) [actions=[cancel] selected]");
+        node.selected = Some(false);
+        assert_eq!(format_node_line(&node), "- [3] AXGroup (Message 312 from Lena) [actions=[cancel]]");
+        node.selected = None;
+        assert!(!format_node_line(&node).contains("selected"));
     }
 
     use super::*;
