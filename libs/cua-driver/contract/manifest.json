@@ -380,7 +380,7 @@
                   "type": "string"
                 },
                 "text": {
-                  "description": "type: the text.",
+                  "description": "type: the text; end it with \\n to press Enter once the field holds it.",
                   "type": "string"
                 }
               },

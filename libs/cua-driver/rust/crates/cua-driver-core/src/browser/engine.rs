@@ -325,6 +325,79 @@ fn viewport_point_to_screen(
     ))
 }
 
+/// Walks `levels` up from the control (a shadow root's next level is its
+/// host, as the snapshot's DOM index counts it) and says whether that row's
+/// text, open shadow roots included, still holds `words` in order.
+const ROW_STILL_READS: &str = "function(levels, words) { \
+    let row = this; \
+    for (let i = 0; i < levels && row; i++) row = row.parentNode || row.host || null; \
+    if (!row) return false; \
+    const parts = [], stack = [row]; \
+    while (stack.length) { \
+        const node = stack.pop(); \
+        if (node.nodeType === 3) { parts.push(node.nodeValue); continue; } \
+        const kids = Array.from(node.childNodes || []); \
+        if (node.shadowRoot) kids.unshift(node.shadowRoot); \
+        for (let k = kids.length - 1; k >= 0; k--) stack.push(kids[k]); \
+    } \
+    const text = parts.join(' ').toLowerCase(); \
+    let at = 0; \
+    for (const word of words) { \
+        const found = text.indexOf(word, at); \
+        if (found < 0) return false; \
+        at = found + word.length; \
+    } \
+    return true; \
+}";
+
+/// Whether the row a control was named after (see
+/// [`super::store::RefEntry::row`]) still reads as that name: its words, in
+/// order, in the row's live text. A DOM text check, looser than the
+/// snapshot's rule (hidden text and button text also count), so it does not
+/// refuse a row that still reads the same; it catches an element reused for
+/// another item. Closed shadow roots are not visible to it.
+async fn row_still_reads(
+    conn: &CdpConnection,
+    cdp_session: &str,
+    backend: i64,
+    row: &super::store::RowName,
+) -> bool {
+    let words: Vec<String> = row
+        .name
+        .trim_end_matches('…')
+        .to_lowercase()
+        .split_whitespace()
+        .map(str::to_owned)
+        .collect();
+    let Ok(resolved) = conn
+        .call(
+            Some(cdp_session),
+            "DOM.resolveNode",
+            json!({ "backendNodeId": backend }),
+        )
+        .await
+    else {
+        return false;
+    };
+    let Some(object_id) = resolved.pointer("/object/objectId").and_then(Value::as_str) else {
+        return false;
+    };
+    conn.call(
+        Some(cdp_session),
+        "Runtime.callFunctionOn",
+        json!({
+            "objectId": object_id,
+            "functionDeclaration": ROW_STILL_READS,
+            "arguments": [{ "value": row.levels }, { "value": words }],
+            "returnByValue": true,
+        }),
+    )
+    .await
+    .ok()
+    .and_then(|reply| reply.pointer("/result/value").and_then(Value::as_bool))
+    .unwrap_or(false)
+}
+
 /// Whether a CDP error is Chromium's "method not implemented" shape.
 /// Everything else stays a hard failure — a transient error must never
 /// be misread as a capability gap.
@@ -2182,6 +2255,17 @@ impl BrowserEngine {
                 },
             ));
         }
+        if let Some(row) = &entry.row {
+            if !row_still_reads(&validated.conn, &frame_session, entry.backend_node_id, row).await {
+                self.store.retire_refused(session, target_id, tab_id, entry);
+                return Err(refuse(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the row this control was named after no longer reads as that name (the \
+                     page may have reused the element for another item); re-run \
+                     get_browser_state to re-snapshot",
+                ));
+            }
+        }
         Ok(frame_session)
     }
 
@@ -2578,6 +2662,7 @@ impl BrowserEngine {
                 destination: None,
                 attachment: None,
                 minted: None,
+                row: None,
             });
         }
 
@@ -2639,6 +2724,7 @@ impl BrowserEngine {
                                 destination: None,
                                 attachment: None,
                                 minted: None,
+                                row: None,
                             });
                         }
                         attached += 1;

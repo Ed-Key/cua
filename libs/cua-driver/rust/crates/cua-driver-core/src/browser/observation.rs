@@ -611,6 +611,7 @@ mod tests {
             destination: None,
             attachment: None,
             minted: None,
+            row: None,
         }
     }
 

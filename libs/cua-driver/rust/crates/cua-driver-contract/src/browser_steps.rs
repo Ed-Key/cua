@@ -132,7 +132,7 @@ pub struct BrowserStep {
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub name: Option<String>,
-    /// type: the text.
+    /// type: the text; end it with \n to press Enter once the field holds it.
     #[serde(
         default,
         skip_serializing_if = "Option::is_none",

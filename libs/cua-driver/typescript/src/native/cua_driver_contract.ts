@@ -1584,7 +1584,7 @@ export type BrowserStep = {
      */
     name?: string,
     /**
-     * type: the text.
+     * type: the text; end it with \n to press Enter once the field holds it.
      */
     text?: string,
     /**

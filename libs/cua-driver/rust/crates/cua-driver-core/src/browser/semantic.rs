@@ -11,7 +11,7 @@ use std::collections::{BTreeMap, HashMap, HashSet};
 use serde_json::Value;
 
 use super::observation::{NodeKey, ViewNode, REF_SLOT};
-use super::store::{BrowserActionKind, BrowserVisibility, FrameKind, FrameRef, RefEntry};
+use super::store::{BrowserActionKind, BrowserVisibility, FrameKind, FrameRef, RefEntry, RowName};
 
 pub(crate) const SEMANTIC_COMPUTED_STYLES: &[&str] = &[
     "display",
@@ -129,6 +129,11 @@ pub(crate) struct SemanticNode {
     pub(crate) backend_node_id: Option<i64>,
     pub(crate) role: String,
     pub(crate) name: Option<String>,
+    /// What an unnamed checkbox, radio or switch is called after its row's
+    /// text (see [`name_controls_by_row`]). Shown, searched and matched by
+    /// name like a name, but not the accessible name: a ref's fingerprint
+    /// keeps `name`, which is what its live re-proof reads.
+    pub(crate) row_name: Option<RowName>,
     /// A web-area root's name exactly as reported, for the page title:
     /// cleanup would turn an empty title into "missing" and rewrite others.
     pub(crate) root_title: Option<String>,
@@ -142,6 +147,13 @@ pub(crate) struct SemanticNode {
 }
 
 impl SemanticNode {
+    /// The name an outline shows: the accessible name, else the row's.
+    fn shown_name(&self) -> Option<&str> {
+        self.name
+            .as_deref()
+            .or(self.row_name.as_ref().map(|row| row.name.as_str()))
+    }
+
     pub(crate) fn to_ref_entry(&self) -> Option<RefEntry> {
         let backend_node_id = self.backend_node_id?;
         Some(RefEntry {
@@ -155,6 +167,7 @@ impl SemanticNode {
             destination: self.url.clone(),
             attachment: None,
             minted: None,
+            row: self.row_name.clone(),
         })
     }
 }
@@ -450,7 +463,12 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
             inherited_base_url
         };
         let attrs = attributes(node);
-        let hidden = inherited_hidden || statically_hidden(&attrs);
+        let tag = node
+            .get("nodeName")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_ascii_lowercase();
+        let hidden = inherited_hidden || statically_hidden(&tag, &attrs);
         let own_indicator = inherited_indicator
             || attrs
                 .get("id")
@@ -462,11 +480,6 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
             inherited_frame_id
         };
         if let Some(backend) = backend_node_id {
-            let tag = node
-                .get("nodeName")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .to_ascii_lowercase();
             if node_type == 1 && hidden && !inherited_hidden {
                 index.css_hidden_count += 1;
             }
@@ -760,6 +773,7 @@ pub(crate) fn compose_accessibility_tree(
             url: link_destination(&role, Some(ax), dom_meta),
             role,
             name,
+            row_name: None,
             root_title,
             value,
             states,
@@ -770,8 +784,11 @@ pub(crate) fn compose_accessibility_tree(
         });
     }
 
+    relink_past_dropped_nodes(&mut nodes, ax_nodes);
     supplement_dom_actions(&mut nodes, dom, layout, viewport, &frame);
     apply_page_occlusion(&mut nodes, dom, layout);
+    // Before redundant text goes: a named cell's text is part of its row.
+    name_controls_by_row(&mut nodes, dom);
     remove_redundant_static_text(&mut nodes);
     SemanticDocument {
         title: None,
@@ -779,6 +796,149 @@ pub(crate) fn compose_accessibility_tree(
         css_hidden_dom_count: dom.css_hidden_count,
         unprovable_frame_count: 0,
         complete: true,
+    }
+}
+
+/// Chrome reports the nodes it ignores (a plain wrapper `div`, a table's row
+/// group) with their children still pointing at them. The snapshot drops
+/// them, so each kept node hangs under its nearest kept ancestor, and a
+/// dropped child's own children are listed in its place. Without this the
+/// children of TodoMVC's `div.view` showed at the outline's root and its
+/// `listitem` lines were empty.
+fn relink_past_dropped_nodes(nodes: &mut [SemanticNode], ax_nodes: &[Value]) {
+    let raw: HashMap<&str, &Value> = ax_nodes
+        .iter()
+        .filter_map(|ax| Some((ax.get("nodeId")?.as_str()?, ax)))
+        .collect();
+    let kept: HashSet<String> = nodes.iter().map(|node| node.ax_id.clone()).collect();
+    let field = |id: &str, name: &str| raw.get(id).and_then(|ax| ax.get(name)).cloned();
+    for node in nodes.iter_mut() {
+        let mut parent = node.parent_ax_id.take();
+        let mut seen = HashSet::new();
+        while let Some(id) = parent.clone() {
+            if kept.contains(&id) || !seen.insert(id.clone()) {
+                break;
+            }
+            parent = field(&id, "parentId").and_then(|v| v.as_str().map(str::to_owned));
+        }
+        node.parent_ax_id = parent.filter(|id| kept.contains(id));
+
+        let mut children = Vec::with_capacity(node.child_ax_ids.len());
+        let mut stack: Vec<String> = node.child_ax_ids.drain(..).rev().collect();
+        let mut seen = HashSet::new();
+        while let Some(id) = stack.pop() {
+            if !seen.insert(id.clone()) {
+                continue;
+            }
+            if kept.contains(&id) {
+                children.push(id);
+            } else if let Some(Value::Array(ids)) = field(&id, "childIds") {
+                stack.extend(ids.iter().rev().filter_map(Value::as_str).map(str::to_owned));
+            }
+        }
+        node.child_ax_ids = children;
+    }
+}
+
+/// Longest row name, in characters.
+const ROW_NAME_CHARS: usize = 80;
+/// How far up the DOM a control's row is looked for.
+const ROW_LEVELS: usize = 5;
+/// How far up from a piece of text, or another control, its row may be.
+const ROW_TEXT_LEVELS: usize = ROW_LEVELS + 6;
+
+/// Name each checkbox, radio and switch that has no accessible name after
+/// the text of its row: the nearest DOM ancestor, up to [`ROW_LEVELS`] up,
+/// whose subtree holds visible text and no other such control. Text inside a
+/// button, link or field belongs to that element, not to the row. TodoMVC's
+/// item toggle has no label (the item's text is a sibling `<label>`), nor
+/// has a plain `<li><input type=checkbox> Water plants`; without a name
+/// neither can be told apart in an outline or aimed at by name.
+fn name_controls_by_row(nodes: &mut [SemanticNode], dom: &DomIndex) {
+    let toggle = |role: &str| matches!(role, "checkbox" | "radio" | "switch");
+    if !nodes
+        .iter()
+        .any(|node| toggle(&node.role) && node.name.is_none())
+    {
+        return;
+    }
+    let parent = |backend: i64| dom.nodes.get(&backend)?.parent_backend_node_id;
+    let owners: HashSet<i64> = nodes
+        .iter()
+        .filter(|node| {
+            matches!(
+                node.role.as_str(),
+                "button" | "link" | "textbox" | "searchbox" | "combobox" | "menuitem" | "tab"
+            )
+        })
+        .filter_map(|node| node.backend_node_id)
+        .collect();
+    // Each ancestor's text (in document order) and number of toggles.
+    let mut texts: HashMap<i64, Vec<(usize, &str)>> = HashMap::new();
+    let mut toggles: HashMap<i64, usize> = HashMap::new();
+    for node in nodes.iter() {
+        let Some(backend) = node.backend_node_id else {
+            continue;
+        };
+        if toggle(&node.role) {
+            let mut above = parent(backend);
+            for _ in 0..ROW_TEXT_LEVELS {
+                let Some(ancestor) = above else { break };
+                *toggles.entry(ancestor).or_default() += 1;
+                above = parent(ancestor);
+            }
+        } else if matches!(node.role.as_str(), "statictext" | "text")
+            && node.visibility != BrowserVisibility::CssHidden
+        {
+            let Some(text) = node.name.as_deref() else {
+                continue;
+            };
+            let mut above = parent(backend);
+            for _ in 0..ROW_TEXT_LEVELS {
+                let Some(ancestor) = above else { break };
+                texts
+                    .entry(ancestor)
+                    .or_default()
+                    .push((node.document_order, text));
+                if owners.contains(&ancestor) {
+                    break;
+                }
+                above = parent(ancestor);
+            }
+        }
+    }
+    let mut names = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        if !toggle(&node.role) || node.name.is_some() {
+            continue;
+        }
+        let Some(backend) = node.backend_node_id else {
+            continue;
+        };
+        let mut above = parent(backend);
+        for levels in 1..=ROW_LEVELS {
+            let Some(ancestor) = above else { break };
+            if toggles.get(&ancestor).copied().unwrap_or(0) > 1 {
+                break;
+            }
+            if let Some(found) = texts.get(&ancestor) {
+                let mut found = found.clone();
+                found.sort_by_key(|(order, _)| *order);
+                let joined = found.iter().map(|(_, text)| *text).collect::<Vec<_>>().join(" ");
+                if let Some(mut name) = clean_semantic_text(joined) {
+                    if name.chars().count() > ROW_NAME_CHARS {
+                        name = name.chars().take(ROW_NAME_CHARS - 1).collect::<String>();
+                        name.push('…');
+                    }
+                    names.push((index, RowName { name, levels }));
+                }
+                break;
+            }
+            above = parent(ancestor);
+        }
+    }
+    for (index, row) in names {
+        nodes[index].row_name = Some(row);
     }
 }
 
@@ -872,14 +1032,19 @@ fn supplement_dom_actions(
         let name = dom_name(&meta.attrs);
         nodes.push(SemanticNode {
             ax_id: format!("dom-{backend_node_id}"),
-            parent_ax_id: meta
-                .parent_backend_node_id
-                .and_then(|parent| by_backend.get(&parent).cloned()),
+            // The nearest DOM ancestor the outline has (its parent may be a
+            // wrapper accessibility ignores).
+            parent_ax_id: std::iter::successors(meta.parent_backend_node_id, |id| {
+                dom.nodes.get(id)?.parent_backend_node_id
+            })
+            .take(dom.nodes.len())
+            .find_map(|parent| by_backend.get(&parent).cloned()),
             child_ax_ids: Vec::new(),
             backend_node_id: Some(backend_node_id),
             url: link_destination(&role, None, Some(meta)),
             role,
             name,
+            row_name: None,
             root_title: None,
             value: meta
                 .attrs
@@ -1004,7 +1169,7 @@ fn attributes(node: &Value) -> HashMap<String, String> {
         .unwrap_or_default()
 }
 
-fn statically_hidden(attrs: &HashMap<String, String>) -> bool {
+fn statically_hidden(tag: &str, attrs: &HashMap<String, String>) -> bool {
     if attrs.contains_key("hidden") || attrs.get("aria-hidden").is_some_and(|v| v == "true") {
         return true;
     }
@@ -1012,12 +1177,48 @@ fn statically_hidden(attrs: &HashMap<String, String>) -> bool {
         .get("style")
         .map(|value| value.to_ascii_lowercase())
         .unwrap_or_default();
-    style.contains("display:none")
-        || style.contains("display: none")
-        || style.contains("visibility:hidden")
-        || style.contains("visibility: hidden")
-        || style.contains("opacity:0")
-        || style.contains("opacity: 0")
+    style.split(';').any(|declaration| {
+        let Some((property, value)) = declaration.split_once(':') else {
+            return false;
+        };
+        let value = value.trim().trim_end_matches("!important").trim();
+        match property.trim() {
+            "display" => value == "none",
+            "visibility" => value == "hidden",
+            "opacity" => {
+                !native_control(tag, attrs) && value.parse::<f64>().is_ok_and(|opacity| opacity <= 0.0)
+            }
+            _ => false,
+        }
+    })
+}
+
+/// A native form control: pages lay a transparent (opacity 0) one over the
+/// control they draw, and the click lands on it.
+fn native_control(tag: &str, attrs: &HashMap<String, String>) -> bool {
+    tag == "select"
+        || (tag == "input"
+            && !attrs
+                .get("type")
+                .is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")))
+}
+
+/// Hidden by its computed style, for the working set. Transparency alone
+/// does not hide a native control that still takes clicks (see
+/// [`native_control`]); display and visibility always hide.
+fn hidden_by_layout(dom: Option<&DomMeta>, layout: &LayoutMeta) -> bool {
+    if !layout_hidden(layout) {
+        return false;
+    }
+    let style = |name: &str, value: &str| {
+        layout
+            .styles
+            .get(name)
+            .is_some_and(|held| held.eq_ignore_ascii_case(value))
+    };
+    let transparent_only =
+        !style("display", "none") && !style("visibility", "hidden") && !style("pointer-events", "none");
+    !(transparent_only && dom.is_some_and(|meta| native_control(&meta.tag, &meta.attrs)))
 }
 
 fn layout_hidden(layout: &LayoutMeta) -> bool {
@@ -1041,7 +1242,9 @@ fn classify_visibility(
     layout: Option<&LayoutMeta>,
     viewport: &Viewport,
 ) -> BrowserVisibility {
-    if dom.is_some_and(|meta| meta.css_hidden) || layout.is_some_and(layout_hidden) {
+    if dom.is_some_and(|meta| meta.css_hidden)
+        || layout.is_some_and(|layout| hidden_by_layout(dom, layout))
+    {
         return BrowserVisibility::CssHidden;
     }
     let Some(layout) = layout else {
@@ -1110,11 +1313,28 @@ fn action_kinds(
                 .get("type")
                 .is_some_and(|value| value.eq_ignore_ascii_case("file"))
         });
+    // An input that takes no text (a checkbox, a button) is not typed into;
+    // the same list as browser_type's own editability check.
+    let text_input = tag == "input"
+        && !dom
+            .and_then(|meta| meta.attrs.get("type"))
+            .is_some_and(|kind| {
+                matches!(
+                    kind.to_ascii_lowercase().as_str(),
+                    "button"
+                        | "checkbox"
+                        | "color"
+                        | "hidden"
+                        | "image"
+                        | "radio"
+                        | "range"
+                        | "reset"
+                        | "submit"
+                )
+            });
     if file_input {
         actions.push(BrowserActionKind::Upload);
-    } else if matches!(role, "textbox" | "searchbox")
-        || matches!(tag, "input" | "textarea")
-        || editable
+    } else if matches!(role, "textbox" | "searchbox") || text_input || tag == "textarea" || editable
     {
         actions.push(BrowserActionKind::Type);
     }
@@ -1336,8 +1556,7 @@ fn scoped_indices(
 fn node_contains_query(node: &SemanticNode, query: &str) -> bool {
     node.role.to_ascii_lowercase().contains(query)
         || node
-            .name
-            .as_ref()
+            .shown_name()
             .is_some_and(|name| name.to_ascii_lowercase().contains(query))
         || node
             .value
@@ -1355,7 +1574,7 @@ fn query_score(node: &SemanticNode, query: &str) -> usize {
     }
     let fields = [
         Some(node.role.as_str()),
-        node.name.as_deref(),
+        node.shown_name(),
         node.value.as_deref(),
     ]
     .into_iter()
@@ -1591,7 +1810,7 @@ pub(crate) fn parse_outline_line(line: &str) -> Option<OutlineLine> {
 fn line_template(node: &SemanticNode, depth: usize) -> String {
     let quoted = |text: &str| serde_json::to_string(text).unwrap_or_else(|_| "\"\"".to_owned());
     let mut line = format!("{}- {}", "  ".repeat(depth), node.role);
-    if let Some(name) = &node.name {
+    if let Some(name) = node.shown_name() {
         line.push(' ');
         line.push_str(&quoted(name));
     }
@@ -1613,7 +1832,7 @@ fn line_template(node: &SemanticNode, depth: usize) -> String {
     if let Some(value) = node
         .value
         .as_ref()
-        .filter(|value| node.name.as_ref() != Some(value))
+        .filter(|value| node.shown_name() != Some(value.as_str()))
     {
         line.push_str(" = ");
         line.push_str(&quoted(value));
@@ -1967,6 +2186,7 @@ mod tests {
             backend_node_id: Some(1),
             role: role.into(),
             name: None,
+            row_name: None,
             root_title: None,
             value: None,
             url: None,
@@ -2418,6 +2638,239 @@ mod tests {
             .collect::<Vec<_>>();
         assert_eq!(actions, vec!["Cancel", "Remove"]);
         assert_eq!(page.omissions.page_occluded, 0);
+    }
+
+    /// TodoMVC's list: `li > div.view (ignored) > [input.toggle (opacity 0,
+    /// no label), label > "text", button "Delete todo" > "×"]`.
+    fn todo_list() -> SemanticDocument {
+        let item = |li: i64, title: &str| {
+            json!({"nodeType": 1, "nodeName": "LI", "backendNodeId": li, "children": [
+                {"nodeType": 1, "nodeName": "DIV", "backendNodeId": li + 1, "children": [
+                    {"nodeType": 1, "nodeName": "INPUT", "backendNodeId": li + 2,
+                     "attributes": ["class", "toggle", "type", "checkbox"]},
+                    {"nodeType": 1, "nodeName": "LABEL", "backendNodeId": li + 3, "children": [
+                        {"nodeType": 3, "nodeName": "#text", "backendNodeId": li + 4, "nodeValue": title}]},
+                    {"nodeType": 1, "nodeName": "BUTTON", "backendNodeId": li + 5, "children": [
+                        {"nodeType": 3, "nodeName": "#text", "backendNodeId": li + 6}]}]}]})
+        };
+        let dom = build_dom_index(&json!({"nodeType": 9, "children": [
+            {"nodeType": 1, "nodeName": "UL", "backendNodeId": 1,
+             "children": [item(10, "Buy milk"), item(20, "Call the plumber")]}]}));
+        // Every node shown; the toggles are transparent but take clicks.
+        let shown: Vec<i64> = vec![1, 10, 11, 13, 14, 15, 16, 20, 21, 23, 24, 25, 26];
+        let mut backends = shown.clone();
+        backends.extend([12, 22]);
+        let styles: Vec<Value> = shown
+            .iter()
+            .map(|_| json!([0, 1, 2, 3, 4]))
+            .chain([json!([0, 1, 5, 3, 4]), json!([0, 1, 5, 3, 4])])
+            .collect();
+        let layout = build_layout_index(&json!({
+            "strings": ["block", "visible", "1", "auto", "default", "0"],
+            "documents": [{
+                "nodes": {"backendNodeId": backends},
+                "layout": {
+                    "nodeIndex": (0..backends.len()).collect::<Vec<_>>(),
+                    "bounds": backends.iter().map(|_| json!([0, 10, 300, 40])).collect::<Vec<_>>(),
+                    "styles": styles,
+                    "paintOrders": (0..backends.len()).collect::<Vec<_>>()
+                }
+            }]
+        }));
+        let viewport = parse_viewport(&json!({
+            "cssVisualViewport": {"pageX": 0.0, "pageY": 0.0,
+                                  "clientWidth": 800.0, "clientHeight": 600.0}
+        }));
+        let row = |li: i64, title: &str| {
+            let id = |suffix: &str| format!("{li}{suffix}");
+            vec![
+                json!({"nodeId": id("li"), "parentId": "list", "ignored": false, "backendDOMNodeId": li,
+                       "role": {"value": "listitem"}, "childIds": [id("view")]}),
+                json!({"nodeId": id("view"), "parentId": id("li"), "ignored": true,
+                       "backendDOMNodeId": li + 1, "role": {"value": "generic"},
+                       "childIds": [id("toggle"), id("label"), id("destroy")]}),
+                json!({"nodeId": id("toggle"), "parentId": id("view"), "ignored": false,
+                       "backendDOMNodeId": li + 2, "role": {"value": "checkbox"},
+                       "properties": [{"name": "checked", "value": {"value": "false"}}]}),
+                json!({"nodeId": id("label"), "parentId": id("view"), "ignored": false,
+                       "backendDOMNodeId": li + 3, "role": {"value": "LabelText"},
+                       "childIds": [id("text")]}),
+                json!({"nodeId": id("text"), "parentId": id("label"), "ignored": false,
+                       "backendDOMNodeId": li + 4, "role": {"value": "StaticText"},
+                       "name": {"value": title}}),
+                json!({"nodeId": id("destroy"), "parentId": id("view"), "ignored": false,
+                       "backendDOMNodeId": li + 5, "role": {"value": "button"},
+                       "name": {"value": "Delete todo"}, "childIds": [id("x")]}),
+                json!({"nodeId": id("x"), "parentId": id("destroy"), "ignored": false,
+                       "backendDOMNodeId": li + 6, "role": {"value": "StaticText"},
+                       "name": {"value": "×"}}),
+            ]
+        };
+        let mut nodes = vec![
+            json!({"nodeId": "root", "ignored": false, "role": {"value": "RootWebArea"},
+                   "childIds": ["list"]}),
+            json!({"nodeId": "list", "parentId": "root", "ignored": false, "backendDOMNodeId": 1,
+                   "role": {"value": "list"}, "childIds": ["10li", "20li"]}),
+        ];
+        nodes.extend(row(10, "Buy milk"));
+        nodes.extend(row(20, "Call the plumber"));
+        compose_accessibility_tree(&json!({ "nodes": nodes }), &dom, &layout, &viewport, frame())
+    }
+
+    #[test]
+    fn unlabeled_row_checkboxes_are_listed_under_their_row_named_by_its_text() {
+        let document = todo_list();
+        let page = document.page(0, 300, usize::MAX, None, None);
+        let outline = page.outline_with("r");
+        let expected = [
+            "- list [r]",
+            "  - listitem [r]",
+            "    - checkbox \"Buy milk\" [r click] (unchecked)",
+            "    - labeltext [r]",
+            "      - statictext \"Buy milk\" [r]",
+            "    - button \"Delete todo\" [r click]",
+        ];
+        assert!(
+            outline.starts_with(&expected.join("\n")),
+            "the toggle, the label and the button sit under their listitem:\n{outline}"
+        );
+        let toggle = document
+            .nodes
+            .iter()
+            .find(|node| node.backend_node_id == Some(22))
+            .unwrap();
+        let entry = toggle.to_ref_entry().unwrap();
+        // The row name is shown, not fingerprinted: the live re-proof reads
+        // the accessible name, which is still empty.
+        assert_eq!(entry.label, None);
+        assert_eq!(
+            entry.row,
+            Some(RowName {
+                name: "Call the plumber".into(),
+                levels: 1
+            })
+        );
+        assert!(!entry.actions.contains(&BrowserActionKind::Type));
+        // A query finds it by the row's text; a scoped read of the listitem
+        // reaches the children of the ignored wrapper.
+        let found = document.page(0, 300, usize::MAX, Some("plumber"), None);
+        assert!(found.selected.iter().any(|node| node.backend_node_id == Some(22)));
+        let scoped = document.page(0, 300, usize::MAX, None, Some(20));
+        assert!(scoped.selected.iter().any(|node| node.backend_node_id == Some(24)));
+        let line = parse_outline_line("    - checkbox \"Buy milk\" [p1:2 click] (unchecked)").unwrap();
+        assert_eq!(line.name.as_deref(), Some("Buy milk"));
+    }
+
+    #[test]
+    fn a_row_with_two_checkboxes_names_neither_and_button_text_stays_out() {
+        let dom = build_dom_index(&json!({"nodeType": 9, "children": [
+            {"nodeType": 1, "nodeName": "LI", "backendNodeId": 1, "children": [
+                {"nodeType": 1, "nodeName": "INPUT", "backendNodeId": 2, "attributes": ["type", "checkbox"]},
+                {"nodeType": 3, "nodeName": "#text", "backendNodeId": 3},
+                {"nodeType": 1, "nodeName": "BUTTON", "backendNodeId": 4, "children": [
+                    {"nodeType": 3, "nodeName": "#text", "backendNodeId": 5}]}]},
+            {"nodeType": 1, "nodeName": "DIV", "backendNodeId": 6, "children": [
+                {"nodeType": 1, "nodeName": "INPUT", "backendNodeId": 7, "attributes": ["type", "checkbox"]},
+                {"nodeType": 1, "nodeName": "INPUT", "backendNodeId": 8, "attributes": ["type", "checkbox"]},
+                {"nodeType": 3, "nodeName": "#text", "backendNodeId": 9}]}]}));
+        let ax = json!({"nodes": [
+            {"nodeId": "root", "ignored": false, "role": {"value": "RootWebArea"},
+             "childIds": ["li", "div"]},
+            {"nodeId": "li", "parentId": "root", "ignored": false, "backendDOMNodeId": 1,
+             "role": {"value": "listitem"}, "childIds": ["a", "a-text", "edit"]},
+            {"nodeId": "a", "parentId": "li", "ignored": false, "backendDOMNodeId": 2,
+             "role": {"value": "checkbox"}},
+            {"nodeId": "a-text", "parentId": "li", "ignored": false, "backendDOMNodeId": 3,
+             "role": {"value": "StaticText"}, "name": {"value": "Water plants"}},
+            {"nodeId": "edit", "parentId": "li", "ignored": false, "backendDOMNodeId": 4,
+             "role": {"value": "button"}, "name": {"value": "Edit"}, "childIds": ["edit-text"]},
+            {"nodeId": "edit-text", "parentId": "edit", "ignored": false, "backendDOMNodeId": 5,
+             "role": {"value": "StaticText"}, "name": {"value": "Edit"}},
+            {"nodeId": "div", "parentId": "root", "ignored": false, "backendDOMNodeId": 6,
+             "role": {"value": "generic"}, "childIds": ["b", "c", "shared"]},
+            {"nodeId": "b", "parentId": "div", "ignored": false, "backendDOMNodeId": 7,
+             "role": {"value": "checkbox"}},
+            {"nodeId": "c", "parentId": "div", "ignored": false, "backendDOMNodeId": 8,
+             "role": {"value": "checkbox"}},
+            {"nodeId": "shared", "parentId": "div", "ignored": false, "backendDOMNodeId": 9,
+             "role": {"value": "StaticText"}, "name": {"value": "Both options"}}
+        ]});
+        let document = compose_accessibility_tree(
+            &ax,
+            &dom,
+            &LayoutIndex::default(),
+            &Viewport::default(),
+            frame(),
+        );
+        let row_name = |backend: i64| {
+            document
+                .nodes
+                .iter()
+                .find(|node| node.backend_node_id == Some(backend))
+                .and_then(|node| node.row_name.clone())
+                .map(|row| row.name)
+        };
+        assert_eq!(row_name(2).as_deref(), Some("Water plants"));
+        assert_eq!(row_name(7), None);
+        assert_eq!(row_name(8), None);
+    }
+
+    #[test]
+    fn transparency_hides_a_wrapper_but_not_a_native_control() {
+        let dom = build_dom_index(&json!({"nodeType": 9, "children": [
+            {"nodeType": 1, "nodeName": "DIV", "backendNodeId": 1, "attributes": ["onclick", "go()"]},
+            {"nodeType": 1, "nodeName": "INPUT", "backendNodeId": 2, "attributes": ["type", "checkbox"]},
+            {"nodeType": 1, "nodeName": "INPUT", "backendNodeId": 3,
+             "attributes": ["type", "file", "style", "opacity: 0"]},
+            {"nodeType": 1, "nodeName": "BUTTON", "backendNodeId": 4,
+             "attributes": ["style", "opacity:0.5"]},
+            {"nodeType": 1, "nodeName": "INPUT", "backendNodeId": 5,
+             "attributes": ["type", "checkbox", "style", "pointer-events:none"]}]}));
+        // Computed opacity 0 on the div, the checkbox and the last checkbox,
+        // which also takes no clicks.
+        let layout = build_layout_index(&json!({
+            "strings": ["block", "visible", "1", "auto", "default", "0", "none"],
+            "documents": [{
+                "nodes": {"backendNodeId": [1, 2, 3, 4, 5]},
+                "layout": {
+                    "nodeIndex": [0, 1, 2, 3, 4],
+                    "bounds": [[0, 0, 50, 20], [0, 30, 20, 20], [0, 60, 80, 20],
+                               [0, 90, 80, 20], [0, 120, 20, 20]],
+                    "styles": [[0, 1, 5, 3, 4], [0, 1, 5, 3, 4], [0, 1, 2, 3, 4],
+                               [0, 1, 2, 3, 4], [0, 1, 5, 6, 4]],
+                    "paintOrders": [1, 2, 3, 4, 5]
+                }
+            }]
+        }));
+        let viewport = parse_viewport(&json!({
+            "cssVisualViewport": {"pageX": 0.0, "pageY": 0.0,
+                                  "clientWidth": 800.0, "clientHeight": 600.0}
+        }));
+        let ax = json!({"nodes": [
+            {"nodeId": "root", "ignored": false, "role": {"value": "RootWebArea"}},
+            {"nodeId": "2", "parentId": "root", "ignored": false, "backendDOMNodeId": 2,
+             "role": {"value": "checkbox"}, "name": {"value": "Done"}},
+            {"nodeId": "3", "parentId": "root", "ignored": false, "backendDOMNodeId": 3,
+             "role": {"value": "button"}, "name": {"value": "Choose file"}},
+            {"nodeId": "4", "parentId": "root", "ignored": false, "backendDOMNodeId": 4,
+             "role": {"value": "button"}, "name": {"value": "Half"}},
+            {"nodeId": "5", "parentId": "root", "ignored": false, "backendDOMNodeId": 5,
+             "role": {"value": "checkbox"}, "name": {"value": "Inert"}}
+        ]});
+        let document = compose_accessibility_tree(&ax, &dom, &layout, &viewport, frame());
+        let visibility = |backend: i64| {
+            document
+                .nodes
+                .iter()
+                .find(|node| node.backend_node_id == Some(backend))
+                .map(|node| node.visibility)
+        };
+        // The transparent div with a click handler is not added at all.
+        assert_eq!(visibility(1), None);
+        assert_eq!(visibility(2), Some(BrowserVisibility::InViewport));
+        assert_eq!(visibility(3), Some(BrowserVisibility::InViewport));
+        assert_eq!(visibility(4), Some(BrowserVisibility::InViewport));
+        assert_eq!(visibility(5), Some(BrowserVisibility::CssHidden));
     }
 
     #[test]
