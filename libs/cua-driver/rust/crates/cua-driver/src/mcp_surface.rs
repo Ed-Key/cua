@@ -12,11 +12,13 @@
 //!   the whole result object, a successful result's text blocks become one
 //!   line pointing at `structuredContent`, so the model reads one copy.
 //!   Claude Code already shows its model only `structuredContent`. Images and
-//!   error results are left as they are.
+//!   error results are left as they are. Codex also gets the compact
+//!   `codex_instructions`, because it repeats the instructions in every
+//!   ALL_TOOLS entry.
 
 use cua_driver_core::mcp_result::{conforming_tool_result, tool_error_result};
 use cua_driver_core::mcp_wire::{finish_response, is_core_tool, ProtocolEra};
-use cua_driver_core::protocol::{Request, Response, ResponseBody};
+use cua_driver_core::protocol::{codex_instructions, Request, Response, ResponseBody};
 use serde_json::{json, Value};
 
 /// The text a Codex client gets in place of a result's text blocks.
@@ -102,6 +104,11 @@ impl Surface {
         if let ResponseBody::Result { result } = &mut response.body {
             match method {
                 "tools/list" => self.render_tools(result),
+                "initialize" if self.codex => {
+                    if let Some(result) = result.as_object_mut() {
+                        result.insert("instructions".into(), json!(codex_instructions()));
+                    }
+                }
                 "tools/call" if self.codex => project_for_codex(result),
                 _ => {}
             }
@@ -295,6 +302,22 @@ mod tests {
             projected["structuredContent"],
             sample_result()["structuredContent"]
         );
+    }
+
+    #[test]
+    fn codex_gets_the_compact_instructions_and_others_the_full_ones() {
+        let full = cua_driver_core::protocol::initialize_result();
+        for (client, expected) in [
+            ("codex-mcp-client", json!(codex_instructions())),
+            ("claude-code", full["instructions"].clone()),
+        ] {
+            let mut surface = Surface::new(ToolProfile::Full);
+            surface.observe(&initialize(client));
+            let rendered =
+                result(&surface.render("initialize", Response::ok(json!(0), full.clone())));
+            assert_eq!(rendered["instructions"], expected, "{client}");
+            assert_eq!(rendered["serverInfo"], full["serverInfo"], "{client}");
+        }
     }
 
     #[test]

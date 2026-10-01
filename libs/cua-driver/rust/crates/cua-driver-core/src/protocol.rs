@@ -368,6 +368,39 @@ fn instruction_omits(tool: &str) -> bool {
     ) || (tool == "act_and_read" && !cfg!(target_os = "macos"))
 }
 
+/// The read and act steps of the per-task workflow, per platform.
+fn workflow_steps() -> (&'static str, &'static str) {
+    // App-name targeting in get_window_state is macOS-only for now.
+    let read_step = if cfg!(target_os = "macos") {
+        "Single-window app: `get_window_state(app)`. Else `launch_app`/`list_windows`, then `get_window_state(pid, window_id)`."
+    } else {
+        "`launch_app`, then `get_window_state(pid, window_id)`."
+    };
+
+    // act_and_read is registered only on macOS; elsewhere keep the one-action
+    // step. A web page needs no native read first: get_browser_state binds
+    // the window and returns the page (by app name on macOS only).
+    let act_step = if cfg!(target_os = "macos") {
+        "Apps: act and read in one `act_and_read` (`steps`). Chrome pages: `get_browser_state(app)`, then `browser_steps`."
+    } else {
+        "Act with the fresh index. Chrome pages: `get_browser_state(pid, window_id)`, then `browser_steps`."
+    };
+    (read_step, act_step)
+}
+
+/// The instructions a Codex client gets instead of [`agent_instructions`].
+/// Codex code mode shows MCP instructions only inside its ALL_TOOLS catalog,
+/// prefixed to every tool entry, so a long text is paid once per listed tool
+/// and truncation hides most declarations. This keeps the core list and the
+/// per-task workflow; the long form stays in the skill.
+pub fn codex_instructions() -> String {
+    let (read_step, act_step) = workflow_steps();
+    format!(
+        "cua-driver core tools; call them directly, no need to list or describe them first: {}.\n{read_step} {act_step} `verify_state` checks postconditions; `unknown` is not success. Repeat one short `session` label on every call. This server has no shell.",
+        instruction_core_tools()
+    )
+}
+
 /// MCP `instructions` (`InitializeResult.instructions`) sent to every
 /// connecting client. The spec frames this as a "hint... MAY be added
 /// to the system prompt" — eager, every-turn cost. We keep it under
@@ -388,24 +421,8 @@ fn agent_instructions() -> String {
         ("AT-SPI", "LINUX.md (beta support)")
     };
 
-    // App-name targeting in get_window_state is macOS-only for now.
-    let read_step = if cfg!(target_os = "macos") {
-        "Single-window app: `get_window_state(app)`. Else `launch_app`/`list_windows`, then `get_window_state(pid, window_id)`."
-    } else {
-        "`launch_app`, then `get_window_state(pid, window_id)`."
-    };
+    let (read_step, act_step) = workflow_steps();
 
-    // act_and_read is registered only on macOS; elsewhere keep the one-action
-    // step. A web page needs no native read first: get_browser_state binds
-    // the window and returns the page (by app name on macOS only).
-    let act_step = if cfg!(target_os = "macos") {
-        "Apps: act and read in one `act_and_read` (`steps`). Chrome pages: `get_browser_state(app)`, then `browser_steps`."
-    } else {
-        "Act with the fresh index. Chrome pages: `get_browser_state(pid, window_id)`, then `browser_steps`."
-    };
-
-    // Codex code mode prefixes these instructions to every tool entry in its
-    // ALL_TOOLS catalog, so each word here is paid once per listed tool.
     let core_tools = instruction_core_tools();
 
     format!(
@@ -513,7 +530,7 @@ mod agent_instruction_tests {
     /// The documented ~200-word ceiling applies to the prose; the core tool
     /// names are counted by length instead: the whole text stays about as
     /// long as it was before the names were added (1,965 characters on
-    /// macOS), because Codex repeats it in every ALL_TOOLS entry.
+    /// macOS), so the eager system-prompt cost does not grow.
     fn assert_within_budget(instructions: &str) {
         let prose = instructions.replace(&super::instruction_core_tools(), "");
         let words = prose.split_whitespace().count();
@@ -561,6 +578,19 @@ mod agent_instruction_tests {
         }
         // Hooks call pip_turn; agents never should.
         assert!(!instructions.contains("pip_turn"));
+    }
+
+    #[test]
+    fn codex_gets_a_compact_text_with_the_core_list_and_workflow() {
+        let codex = super::codex_instructions();
+        assert!(codex.contains(&super::instruction_core_tools()));
+        assert!(codex.contains("call them directly"));
+        assert!(codex.contains("`unknown` is not success"));
+        assert!(codex.contains("`session` label"));
+        assert!(codex.contains("browser_steps"));
+        let chars = codex.chars().count();
+        assert!(chars <= 900, "codex instructions are {chars} characters");
+        assert!(chars * 2 < agent_instructions().chars().count());
     }
 
     #[test]
