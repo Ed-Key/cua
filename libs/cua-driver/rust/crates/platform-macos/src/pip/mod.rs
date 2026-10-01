@@ -109,7 +109,11 @@
 //! (only a still tagged with its own window) under a title strip. A window
 //! it finished with (see `finish`) collapses into a chip: a glass circle
 //! with its app icon and a green check badge (its title is the tooltip), in
-//! a column left of the cards.
+//! a column left of the cards. With the card resting near the top of the
+//! screen's visible frame the stack hangs below it instead (title strips at
+//! the cards' bottom edges), and near its left edge it goes right, chips
+//! included (`stack::fan_for`, decided at rest, see `sync_fan`), so back
+//! items never sit under the menu bar or off screen.
 //! Acting in a back item's window, or clicking it, springs it to the front
 //! and tucks the old front behind; a click only re-targets the panel (never
 //! focuses the window or activates cua-driver). A clicked card is the
@@ -187,7 +191,7 @@ use stack::{
     back_cards, bar_frame, bar_layout, card_shape, deck_size, hold, item_at, max_card,
     own_pixels, panel_point, press_edges, pressed_item, resize_panel, resize_settled,
     shaped_frame, slot_frame, to_window,
-    window_origin, window_size, CardStack, Keep, Motion, Slot, Trail, BAR_BUTTON, BAR_FADE_IN,
+    window_origin, window_size, CardStack, Fan, Keep, Motion, Slot, Trail, BAR_BUTTON, BAR_FADE_IN,
     BAR_FADE_OUT, CHIP_REACH, DRAG_SLOP, GLASS_SPACING, MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, VIEWS,
 };
 
@@ -616,6 +620,12 @@ struct Panel {
     front: (f64, f64),
     /// Size of the displayed window, as far as it is known.
     shape: Option<(f64, f64)>,
+    /// Which way the back items fan from the front card (`stack::fan_for`),
+    /// decided where the card rests (see `sync_fan`).
+    fan: Fan,
+    /// A press on this panel is held (a drag, a resize, or a click not yet
+    /// released): the fan waits for the release.
+    pressed: bool,
     /// Front card size its views were last laid out for: the card as it is
     /// drawn right now (`front` once at rest, sizes in between while it
     /// glides to a new shape). The cursor maps into this, and a finale is
@@ -853,6 +863,13 @@ fn dispatch_to_main_after<T: Send + 'static>(
 // only for the newest frame a session has queued.
 
 const CAPTURE_TIMEOUT: Duration = Duration::from_millis(1500);
+/// How long a session's first still may take, until one arrives in its
+/// epoch: a session's panel opens only from a still (`frame_reaches_a_panel`),
+/// and the first still of a just-opened window can take seconds on a busy
+/// machine (a fresh Chrome building its accessibility tree: 1.9 to 2.9 s
+/// measured in the lab VM; later stills of it ~60 ms). The platform's own
+/// ScreenCaptureKit bound is 3 s before its shell fallback.
+const FIRST_CAPTURE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Latest pending item per session, sessions served in arrival order. A
 /// newer item for a queued session replaces the older one in place.
@@ -932,6 +949,11 @@ struct CaptureWorker {
     ready: Condvar,
     capture: Arc<CaptureFn>,
     timeout: Duration,
+    /// The wait for a session's first still (see `FIRST_CAPTURE_TIMEOUT`).
+    first_timeout: Duration,
+    /// The epoch each session last had a still captured in (in time):
+    /// from then on its captures get `timeout`.
+    captured: Mutex<HashMap<String, u64>>,
     /// Targets with a capture still running, including ones that timed out.
     /// A stuck target gets no second capture thread until the first returns.
     in_flight: Arc<Mutex<HashSet<Target>>>,
@@ -949,6 +971,7 @@ impl CaptureWorker {
     fn start(
         capture: Arc<CaptureFn>,
         timeout: Duration,
+        first_timeout: Duration,
         deliver: impl Fn(PipFrame, u64, Option<Shot>) + Send + 'static,
     ) -> anyhow::Result<Arc<Self>> {
         let worker = Arc::new(Self {
@@ -957,6 +980,8 @@ impl CaptureWorker {
             ready: Condvar::new(),
             capture,
             timeout,
+            first_timeout,
+            captured: Mutex::new(HashMap::new()),
             in_flight: Arc::new(Mutex::new(HashSet::new())),
             active: Mutex::new(HashMap::new()),
             watched: Mutex::new(HashMap::new()),
@@ -967,8 +992,17 @@ impl CaptureWorker {
             .name("cua-pip-capture".into())
             .spawn(move || loop {
                 let (frame, epoch) = looping.next();
-                let png = looping
-                    .capture_bounded((frame.target_pid, frame.target_window_id), frame.page);
+                let key = frame.session_key.clone();
+                let first = lock(&looping.captured).get(&key) != Some(&epoch);
+                let wait = if first { looping.first_timeout } else { looping.timeout };
+                let png = looping.capture_bounded(
+                    (frame.target_pid, frame.target_window_id),
+                    frame.page,
+                    wait,
+                );
+                if png.is_some() && first {
+                    lock(&looping.captured).insert(key, epoch);
+                }
                 deliver(frame, epoch, png);
             })?;
         Ok(worker)
@@ -1000,6 +1034,7 @@ impl CaptureWorker {
         lock(&self.active).remove(session_key);
         lock(&self.watched).remove(session_key);
         lock(&self.in_turn).remove(session_key);
+        lock(&self.captured).remove(session_key);
     }
 
     /// Sessions that pushed a frame within the idle window or act in an open
@@ -1068,25 +1103,37 @@ impl CaptureWorker {
     /// Capture `target` (framed to its page when `page`) on a helper thread,
     /// waiting at most `timeout`. `None` on timeout, failure, or while an
     /// earlier capture of the same target is still stuck.
-    fn capture_bounded(&self, target: Target, page: bool) -> Option<Shot> {
+    fn capture_bounded(&self, target: Target, page: bool, timeout: Duration) -> Option<Shot> {
         if !lock(&self.in_flight).insert(target) {
+            tracing::info!(target: "pip", ?target, "PiP capture skipped: an earlier capture of this target is still running");
             return None;
         }
         let (sender, receiver) = mpsc::sync_channel(1);
         let capture = self.capture.clone();
         let in_flight = self.in_flight.clone();
+        let started = Instant::now();
         let spawned = std::thread::Builder::new()
             .name("cua-pip-shot".into())
             .spawn(move || {
                 let png = capture(target, page);
                 lock(&in_flight).remove(&target);
+                let elapsed_ms = started.elapsed().as_millis() as u64;
+                if png.is_none() {
+                    tracing::info!(target: "pip", ?target, elapsed_ms, "PiP capture failed");
+                } else if elapsed_ms >= 1000 {
+                    tracing::info!(target: "pip", ?target, elapsed_ms, "PiP capture was slow");
+                }
                 let _ = sender.send(png);
             });
         if spawned.is_err() {
             lock(&self.in_flight).remove(&target);
             return None;
         }
-        receiver.recv_timeout(self.timeout).ok().flatten()
+        let shot = receiver.recv_timeout(timeout);
+        if shot.is_err() {
+            tracing::info!(target: "pip", ?target, timeout_ms = timeout.as_millis() as u64, "PiP capture timed out");
+        }
+        shot.ok().flatten()
     }
 }
 
@@ -1513,7 +1560,7 @@ pub fn start(cfg: &PipConfig) -> anyhow::Result<Box<dyn PipBackend>> {
         cua_driver_core::recording::screenshot_for(Some(u64::from(window_id)), None)
             .map(|png| (window_id, png, None))
     });
-    let worker = CaptureWorker::start(capture, CAPTURE_TIMEOUT, deliver_to_main)?;
+    let worker = CaptureWorker::start(capture, CAPTURE_TIMEOUT, FIRST_CAPTURE_TIMEOUT, deliver_to_main)?;
     let streams = Streams::start(deliver_live)?;
     let polled = worker.clone();
     std::thread::Builder::new()
@@ -1802,9 +1849,57 @@ fn keep(panel: &Panel, pressed: Option<i64>, now: Instant) -> Keep<Tag> {
 }
 
 /// Resting frame of `slot` with the front card as it is drawn now (the
-/// size box fitted to the displayed window's shape).
+/// size box fitted to the displayed window's shape), on the side the stack
+/// fans to (`Panel::fan`).
 fn resting(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
-    shaped_frame(hold(panel.card), panel.front, slot, back_cards)
+    let bounds = hold(panel.card);
+    let front = shaped_frame(bounds, panel.front, Slot::Front, back_cards);
+    stack::fanned(shaped_frame(bounds, panel.front, slot, back_cards), front, panel.fan)
+}
+
+/// Decide which way the back items fan (`stack::fan_for`) from where the
+/// front card rests on screen now (the F rows of the polish plan). On a
+/// change the back items glide to the new side (a hidden panel is laid out
+/// at rest) and each back card's title strip moves to the edge that peeks
+/// out. Never while a press on the panel is held: the release decides.
+unsafe fn sync_fan(panel: &mut Panel) {
+    if panel.pressed {
+        return;
+    }
+    let window = panel.window as *mut AnyObject;
+    let frame: NSRect = msg_send![window, frame];
+    let cards = back_cards(&panel.layout);
+    let front = to_window(resting(panel, Slot::Front, cards));
+    let Some(visible) = card_visible_frame(window, front) else {
+        return;
+    };
+    let card = Area {
+        x: frame.origin.x + front.x,
+        y: frame.origin.y + front.y,
+        ..front
+    };
+    let fan = stack::fan_for(card, visible);
+    if fan == panel.fan {
+        return;
+    }
+    let drawn = settle_frames(panel);
+    panel.fan = fan;
+    if panel.shown {
+        for (index, slot) in panel.layout.clone().into_iter().enumerate() {
+            let rest = resting(panel, slot, cards);
+            if drawn[index] != rest {
+                panel.motion[slot.view()].restack(drawn[index], rest);
+            }
+        }
+        start_ticking();
+    } else {
+        panel.motion = Default::default();
+    }
+    for back in &panel.backs {
+        place_strip(back, fan.below);
+    }
+    apply_card_frames(panel);
+    tracing::info!(target: "pip", session = %panel.key, below = fan.below, right = fan.right, "PiP stack fan");
 }
 
 /// Size of the picture in the front card's well: the window's own
@@ -1859,6 +1954,9 @@ unsafe fn set_shape(panel: &mut Panel, shape: Option<(f64, f64)>) -> bool {
             panel.motion = Default::default();
         }
         apply_card_frames(panel);
+        // The card grew or shrank up and left of its anchor: near the top
+        // or left edge its stack may now fan the other way.
+        sync_fan(panel);
     }
     // Every new shape, also one the card already had (a page framed out of
     // a window the box fits the same way), so checks see what it follows.
@@ -3251,14 +3349,15 @@ unsafe fn place_on_show(
     let frame: NSRect = msg_send![window, frame];
     panel.dragged |= moved_from((frame.origin.x, frame.origin.y), panel.placed);
     panel.slot = slot_on_show(others, panel.dragged);
-    let Some(slot) = panel.slot else {
-        return;
-    };
-    let Some(origin) = slot_origin(hold(panel_size(image_size)), anchor, slot) else {
-        return;
-    };
-    let _: () = msg_send![window, setFrameOrigin: NSPoint::new(origin.0, origin.1)];
-    panel.placed = origin;
+    if let Some(origin) = panel
+        .slot
+        .and_then(|slot| slot_origin(hold(panel_size(image_size)), anchor, slot))
+    {
+        let _: () = msg_send![window, setFrameOrigin: NSPoint::new(origin.0, origin.1)];
+        panel.placed = origin;
+    }
+    // A cascade slot, or where the user left it (a remembered panel).
+    sync_fan(panel);
 }
 
 /// What happened to a live frame handed to the panel.
@@ -4482,6 +4581,8 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         card,
         front: card,
         shape: None,
+        fan: Fan::default(),
+        pressed: false,
         laid_out: (0.0, 0.0),
         stream_well: well_size(card),
         well_changed: Instant::now(),
@@ -4575,51 +4676,52 @@ unsafe fn new_back_card(parent: *mut AnyObject, card: (f64, f64), depth: usize) 
     let _: () = msg_send![glass, setAutoresizingMask: 18u64]; // width + height sizable
     add_subview(view, glass);
 
-    // Autoresizing: 2 width sizable, 4 max-x margin, 8 min-y margin (pinned
-    // to the top), 16 height sizable.
-    let strip_y = h - stack::CARD_STEP;
-    let icon = new_icon_view(NSRect::new(
-        NSPoint::new(10.0, strip_y + 1.0),
-        NSSize::new(12.0, 12.0),
-    ));
-    let _: () = msg_send![icon, setAutoresizingMask: 12u64];
+    // Framed by `place_strip`.
+    let icon = new_icon_view(NSRect::ZERO);
     let _: () = msg_send![body, addSubview: icon];
-    let title = new_label(
-        NSRect::new(
-            NSPoint::new(26.0, strip_y - 1.0),
-            NSSize::new((w - 36.0).max(0.0), stack::CARD_STEP),
-        ),
-        11.0,
-        0.23, // NSFontWeightMedium
-        false,
-    );
+    let title = new_label(NSRect::ZERO, 11.0, 0.23 /* NSFontWeightMedium */, false);
     on_glass(title, false);
-    let _: () = msg_send![title, setAutoresizingMask: 10u64];
     let _: () = msg_send![body, addSubview: title];
 
-    let image_view = new_view(
-        class!(NSImageView),
-        NSRect::new(
-            NSPoint::new(PAD, PAD),
-            NSSize::new((w - 2.0 * PAD).max(0.0), (strip_y - 2.0 - PAD).max(0.0)),
-        ),
-    );
+    let image_view = new_view(class!(NSImageView), NSRect::ZERO);
     let _: () = msg_send![image_view, setImageScaling: 3u64];
     let _: () = msg_send![image_view, setWantsLayer: true];
     let image_layer: *mut AnyObject = msg_send![image_view, layer];
     let _: () = msg_send![image_layer, setCornerRadius: WELL_RADIUS];
     let _: () = msg_send![image_layer, setMasksToBounds: true];
-    let _: () = msg_send![image_view, setAutoresizingMask: 18u64];
     add_subview(body, image_view);
 
     let _: () = msg_send![view, setHidden: true];
     add_subview(parent, view);
-    BackView {
+    let back = BackView {
         view: view as usize,
         image_view: image_view as usize,
         icon: icon as usize,
         title: title as usize,
-    }
+    };
+    place_strip(&back, false);
+    back
+}
+
+/// Put a back card's title strip (app icon and title) along its top edge,
+/// or along its bottom edge when the stack hangs `below` the front card
+/// (the edge that peeks out), with the still filling the rest. Autoresizing
+/// keeps the strip on that edge as the card's frame changes: 2 width
+/// sizable, 4 max-x margin, 8 min-y margin (pinned to the top), 16 height
+/// sizable, 32 max-y margin (pinned to the bottom).
+unsafe fn place_strip(back: &BackView, below: bool) {
+    let frame: NSRect = msg_send![back.view as *mut AnyObject, frame];
+    let (w, h) = (frame.size.width, frame.size.height);
+    let step = stack::CARD_STEP;
+    let (strip_y, pin, image_y) = if below { (0.0, 32u64, step + 2.0) } else { (h - step, 8u64, PAD) };
+    let place = |view: usize, x: f64, y: f64, w: f64, h: f64, mask: u64| {
+        let view = view as *mut AnyObject;
+        let _: () = msg_send![view, setFrame: NSRect::new(NSPoint::new(x, y), NSSize::new(w.max(0.0), h.max(0.0)))];
+        let _: () = msg_send![view, setAutoresizingMask: mask];
+    };
+    place(back.icon, 10.0, strip_y + 1.0, 12.0, 12.0, 4 | pin);
+    place(back.title, 26.0, strip_y - 1.0, w - 36.0, step, 2 | pin);
+    place(back.image_view, PAD, image_y, w - 2.0 * PAD, h - step - 2.0 - PAD, 18);
 }
 
 /// Liquid Glass (`NSGlassEffectView`, macOS 26) hosting `body`, or an
@@ -5301,6 +5403,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
             tracing::info!(target: "pip", session = %key, region, x = point.0, y = point.1, "PiP panel press");
             // A press holds the panel even with a pointer that never moved.
             panel.hands.press();
+            panel.pressed = true;
             state.gesture = Some(Gesture {
                 id,
                 mouse,
@@ -5396,6 +5499,7 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
     // The release row of the table in `hands`: delivered or not, inside the
     // panel or not, a full idle period follows it.
     panel.hands.touch(Instant::now());
+    panel.pressed = false;
     if gesture.moved || gesture.edges != 0 {
         // A card dragged or resized past the screen's visible frame (onto
         // the Dock, under the menu bar) comes back inside it: under the Dock
@@ -5403,6 +5507,9 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
         // again.
         keep_card_on_screen(panel);
     }
+    // Where the card came to rest decides which way its stack fans (also
+    // after a click: a shape change during the press waited for this).
+    sync_fan(panel);
     if gesture.moved {
         // The user placed it: keep it there and free its slot.
         panel.dragged = true;
@@ -6355,9 +6462,17 @@ mod tests {
     type Delivered = mpsc::Receiver<(String, u64, Option<Shot>)>;
 
     fn worker(capture: Arc<CaptureFn>, timeout: Duration) -> (Arc<CaptureWorker>, Delivered) {
+        worker_with_first(capture, timeout, timeout)
+    }
+
+    fn worker_with_first(
+        capture: Arc<CaptureFn>,
+        timeout: Duration,
+        first: Duration,
+    ) -> (Arc<CaptureWorker>, Delivered) {
         let (sender, delivered) = mpsc::channel();
         let sender = Mutex::new(sender);
-        let worker = CaptureWorker::start(capture, timeout, move |frame, epoch, png| {
+        let worker = CaptureWorker::start(capture, timeout, first, move |frame, epoch, png| {
             let _ = lock(&sender).send((frame.action_label, epoch, png));
         })
         .unwrap();
@@ -6681,6 +6796,44 @@ mod tests {
         worker.push(frame("s", "second"));
         assert_eq!(recv(&delivered), ("second".to_owned(), None));
         assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_sessions_first_still_may_take_longer_than_the_rest() {
+        // Each capture takes 200 ms: past the steady 100 ms wait, inside the
+        // first still's 1 s (a fresh Chrome window under load, P3).
+        let capture: Arc<CaptureFn> = Arc::new(|_, _| {
+            std::thread::sleep(Duration::from_millis(200));
+            Some((7, vec![1], None))
+        });
+        let (worker, delivered) =
+            worker_with_first(capture, Duration::from_millis(100), Duration::from_secs(1));
+        worker.push(frame("s", "first"));
+        assert!(recv(&delivered).1.is_some(), "the first still opens the panel");
+        // From then on the steady wait: a slow still is dropped as today.
+        worker.push(frame("s", "second"));
+        assert_eq!(recv(&delivered), ("second".to_owned(), None));
+        std::thread::sleep(Duration::from_millis(250)); // let the helper finish
+        // A session that ended and restarted under the same key starts over.
+        worker.forget("s");
+        worker.push(frame("s", "again"));
+        assert!(recv(&delivered).1.is_some(), "a restarted session's first still");
+        // A first capture that fails fast keeps the allowance for the next.
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counted = calls.clone();
+        let capture: Arc<CaptureFn> = Arc::new(move |_, _| {
+            if counted.fetch_add(1, std::sync::atomic::Ordering::SeqCst) == 0 {
+                return None;
+            }
+            std::thread::sleep(Duration::from_millis(200));
+            Some((7, vec![1], None))
+        });
+        let (worker, delivered) =
+            worker_with_first(capture, Duration::from_millis(100), Duration::from_secs(1));
+        worker.push(frame("t", "fails"));
+        assert_eq!(recv(&delivered), ("fails".to_owned(), None));
+        worker.push(frame("t", "slow"));
+        assert!(recv(&delivered).1.is_some(), "still the first still's wait");
     }
 
     #[test]

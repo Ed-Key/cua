@@ -4,7 +4,9 @@
 //! front one, each a few points up and to the left of the card in front of
 //! it; a finished one collapses into a chip (app icon, green check) in a
 //! column left of the cards. Back items trail the front card on a loose
-//! spring when the panel is dragged.
+//! spring when the panel is dragged. Near the top or left edge of the
+//! screen the whole stack is mirrored through the front card (`Fan`):
+//! below it, or right of it, so it stays on screen.
 //!
 //! The front card takes its window's shape (`card_shape`): the window's
 //! proportions at the size the panel's size box allows, so a tall window
@@ -406,6 +408,50 @@ pub(super) fn shaped_frame(
     }
 }
 
+/// Which way the back items fan out from the front card. By default up and
+/// left (title strips peek above, chips sit left); near the top of the
+/// screen's visible frame they hang below instead, near its left edge they
+/// go right, so they stay on screen where a click reaches them.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) struct Fan {
+    pub(super) below: bool,
+    pub(super) right: bool,
+}
+
+/// How far the back items reach left of the front card at most: the
+/// deepest card that still leaves room for a chip, and that chip.
+pub(super) const LEFT_REACH: f64 = (MAX_CARDS - 2) as f64 * CARD_STEP + CHIP_GAP + CHIP_W;
+
+/// The fan for a front card drawn at `card` (screen rect, AppKit
+/// bottom-left origin) on a screen whose visible frame is `visible`: below
+/// when the strips above would leave the frame's top, right when the cards
+/// and chips on the left would leave its left edge.
+pub(super) fn fan_for(card: Area, visible: Area) -> Fan {
+    Fan {
+        below: visible.y + visible.h - (card.y + card.h) < STACK_MARGIN,
+        right: card.x - visible.x < LEFT_REACH,
+    }
+}
+
+/// `frame` (a resting frame, panel coordinates) mirrored through the
+/// front card `front` along the axes `fan` flips, so a back card peeks
+/// below or right of it and a chip column sits on its right.
+pub(super) fn fanned(frame: Area, front: Area, fan: Fan) -> Area {
+    Area {
+        x: if fan.right {
+            2.0 * front.x + front.w - frame.x - frame.w
+        } else {
+            frame.x
+        },
+        y: if fan.below {
+            2.0 * front.y + front.h - frame.y - frame.h
+        } else {
+            frame.y
+        },
+        ..frame
+    }
+}
+
 /// The stack item under `point` (panel coordinates): the front card first,
 /// then chips (they never overlap cards), then cards front to back. `frames`
 /// are where each item of `layout` is drawn.
@@ -734,13 +780,21 @@ pub(super) fn pressed_item(point: (f64, f64), item: Option<usize>, bar: Option<A
 }
 
 /// The front card's edges a press on `point` resizes (0 = none): only a
-/// press on the front card (`item` 0), and never one inside the hover bar
-/// `bar` (when shown), which is always a drag handle, even where it
-/// overlaps the card's resize band (its bottom over the card's top edge,
-/// or its top when it drops inside the card near the screen's top).
+/// press on the front card (`item` 0) in its resize band, also where the
+/// hover bar `bar` (when shown) overlaps the band (its bottom over the
+/// card's top edge, or its top when it drops inside the card near the
+/// screen's top), but never on the bar's buttons. The rest of the bar is a
+/// drag handle.
 pub(super) fn press_edges(point: (f64, f64), item: Option<usize>, front: Area, bar: Option<Area>) -> u8 {
-    if item != Some(0) || bar.is_some_and(|bar| contains(&bar, point)) {
+    if item != Some(0) {
         return 0;
+    }
+    if let Some(bar) = bar {
+        let layout = bar_layout(bar.w);
+        let local = (point.0 - bar.x, point.1 - bar.y);
+        if [layout.focus, layout.close].iter().any(|button| contains(button, local)) {
+            return 0;
+        }
     }
     resize_edges(point, front)
 }
@@ -1771,25 +1825,144 @@ mod tests {
         assert_eq!(pressed(strip, &layout, &frames), Some(1));
         assert_eq!(pressed_item(strip, Some(1), Some(bar)), Some(0));
         assert_eq!(pressed_item(strip, Some(1), None), Some(1));
-        // The bar's bottom overlaps the card's top resize band: a press
-        // there is a drag, not a resize. Without the bar, it resizes.
+        // The bar's bottom overlaps the card's top resize band: the band
+        // wins (R1, the polish round: the card's top edge resizes like its
+        // other edges), with the bar up or not. Above the band the bar is
+        // still a drag handle.
         let overlap = (bar.x + bar.w / 2.0, front.y + front.h - 2.0);
         assert!(contains(&bar, overlap) && resize_edges(overlap, front) == TOP);
-        assert_eq!(press_edges(overlap, Some(0), front, Some(bar)), 0);
-        assert_eq!(press_region(overlap, Some(0), 0, front, Some(bar)), "bar");
+        assert_eq!(press_edges(overlap, Some(0), front, Some(bar)), TOP);
+        assert_eq!(press_region(overlap, Some(0), TOP, front, Some(bar)), "edge");
         assert_eq!(press_edges(overlap, Some(0), front, None), TOP);
-        // Near the screen's top the bar drops inside the card: its top
-        // edge sits in the band too, and still drags.
+        let above = (bar.x + bar.w / 2.0, front.y + front.h + 8.0);
+        assert_eq!(press_edges(above, Some(0), front, Some(bar)), 0);
+        assert_eq!(press_region(above, Some(0), 0, front, Some(bar)), "bar");
+        // Near the screen's top the bar drops inside the card: its top edge
+        // sits in the band too, and resizes; the rest of it drags.
         let inside = bar_frame(front, 0.0);
         let top = (inside.x + inside.w / 2.0, inside.y + inside.h - 1.0);
         assert!(resize_edges(top, front) == TOP);
-        assert_eq!(press_edges(top, Some(0), front, Some(inside)), 0);
+        assert_eq!(press_edges(top, Some(0), front, Some(inside)), TOP);
+        let lower = (inside.x + inside.w / 2.0, inside.y + inside.h / 2.0);
+        assert_eq!(press_edges(lower, Some(0), front, Some(inside)), 0);
+        // Never on the bar's buttons (R3), where a button dips into the
+        // band: the button takes the press, and no resize arrow shows.
+        let layout = bar_layout(inside.w);
+        let close = (
+            inside.x + layout.close.x + layout.close.w / 2.0,
+            inside.y + layout.close.y + layout.close.h - 1.0,
+        );
+        assert!(resize_edges(close, front) == TOP, "the close button reaches into the band");
+        assert_eq!(press_edges(close, Some(0), front, Some(inside)), 0);
+        let focus = (
+            inside.x + layout.focus.x + 2.0,
+            inside.y + layout.focus.y + layout.focus.h - 1.0,
+        );
+        assert_eq!(press_edges(focus, Some(0), front, Some(inside)), 0);
         // The card's top edge beside the bar still resizes, and a press
         // off the front card never does.
         let beside = (front.x + 2.0, front.y + front.h - 2.0);
         assert!(!contains(&bar, beside));
         assert_eq!(press_edges(beside, Some(0), front, Some(bar)), TOP | LEFT);
         assert_eq!(press_edges(overlap, Some(1), front, None), 0);
+    }
+
+    #[test]
+    fn the_stack_fans_below_near_the_top_and_right_near_the_left_edge() {
+        let visible = Area { x: 0.0, y: 0.0, w: 1440.0, h: 875.0 };
+        // A card `top` points under the visible top, its left edge at `x`.
+        let card = |x: f64, top: f64| Area { x, y: visible.h - top - 233.0, w: 274.0, h: 233.0 };
+        // The default spot (bottom right) and the middle: up and left.
+        let home = Area { x: 1150.0, y: 16.0, w: 274.0, h: 233.0 };
+        assert_eq!(fan_for(home, visible), Fan::default());
+        assert_eq!(fan_for(card(600.0, 300.0), visible), Fan::default());
+        // Under the visible top by less than the stack's margin: below.
+        assert_eq!(fan_for(card(600.0, 0.0), visible), Fan { below: true, right: false });
+        assert!(fan_for(card(600.0, STACK_MARGIN - 1.0), visible).below);
+        assert!(!fan_for(card(600.0, STACK_MARGIN), visible).below);
+        // Closer to the left edge than the deepest card and its chip: right.
+        assert_eq!(fan_for(card(0.0, 300.0), visible), Fan { below: false, right: true });
+        assert!(fan_for(card(LEFT_REACH - 1.0, 300.0), visible).right);
+        assert!(!fan_for(card(LEFT_REACH, 300.0), visible).right);
+        // The top-left corner: both.
+        assert_eq!(fan_for(card(0.0, 0.0), visible), Fan { below: true, right: true });
+        // On a second screen the same rule holds against its own frame.
+        let other = Area { x: 1440.0, ..visible };
+        let there = Area { x: 1440.0, ..card(0.0, 0.0) };
+        assert_eq!(fan_for(there, other), Fan { below: true, right: true });
+    }
+
+    #[test]
+    fn a_fanned_stack_is_the_default_one_mirrored_through_the_front_card() {
+        let card = (274.0, 233.0);
+        let layout = slots(&[false, false, true, true]);
+        let cards = back_cards(&layout);
+        let front = slot_frame(card, Slot::Front, cards);
+        let both = Fan { below: true, right: true };
+        for slot in &layout {
+            let normal = slot_frame(card, *slot, cards);
+            let flipped = fanned(normal, front, both);
+            assert_eq!((flipped.w, flipped.h), (normal.w, normal.h), "{slot:?} keeps its size");
+            assert_eq!(fanned(flipped, front, both), normal, "{slot:?}: mirrored twice is itself");
+        }
+        assert_eq!(fanned(front, front, both), front, "the front card stays put");
+        // A back card peeks below and right by its step.
+        let back = fanned(slot_frame(card, Slot::Card(1), cards), front, both);
+        assert_eq!(back.x + back.w, front.x + front.w + CARD_STEP);
+        assert_eq!(back.y, front.y - CARD_STEP);
+        // Chips sit right of the cards, hanging from the card's top down.
+        let chip = fanned(slot_frame(card, Slot::Chip(0), cards), front, both);
+        assert_eq!(chip.x, front.x + front.w + cards as f64 * CARD_STEP + CHIP_GAP);
+        assert_eq!(chip.y + chip.h, front.y + front.h);
+        // Only the axis that flips moves.
+        let normal = slot_frame(card, Slot::Card(1), cards);
+        assert_eq!(fanned(normal, front, Fan { below: false, right: true }).y, normal.y);
+        assert_eq!(fanned(normal, front, Fan { below: true, right: false }).x, normal.x);
+    }
+
+    #[test]
+    fn a_fanned_stack_stays_inside_the_screen_and_its_window_at_the_corners() {
+        // Screen 1440x900, visible frame below a 25 pt menu bar (AppKit,
+        // bottom-left origin); the card kept inside it at each spot.
+        let visible = Area { x: 0.0, y: 0.0, w: 1440.0, h: 875.0 };
+        let bounds = hold((320.0, 200.0));
+        let (ww, wh) = window_size(bounds);
+        for card in [(274.0, 233.0), (320.0, 145.0), (145.0, 320.0)] {
+            // Three chips (the tallest chip column), and two cards with a chip.
+            for finished in [[false, true, true, true], [false, false, false, true]] {
+                let layout = slots(&finished);
+                let cards = back_cards(&layout);
+                let front = shaped_frame(bounds, card, Slot::Front, cards);
+                let spots = [
+                    (0.0, visible.h - card.1),
+                    (visible.w - card.0, visible.h - card.1),
+                    ((visible.w - card.0) / 2.0, visible.h - card.1),
+                    (0.0, 300.0),
+                    (0.0, 0.0),
+                    (visible.w - card.0, 0.0),
+                ];
+                for (x, y) in spots {
+                    // The panel origin that puts the front card there.
+                    let origin = (x - front.x, y - front.y);
+                    let fan = fan_for(Area { x, y, w: card.0, h: card.1 }, visible);
+                    for slot in &layout {
+                        let item = fanned(shaped_frame(bounds, card, *slot, cards), front, fan);
+                        let screen = Area { x: item.x + origin.0, y: item.y + origin.1, ..item };
+                        let at = (x, y, card, slot, fan);
+                        assert!(
+                            screen.x >= visible.x - 0.5 && screen.x + screen.w <= visible.x + visible.w + 0.5,
+                            "{at:?}: {screen:?} leaves the screen sideways"
+                        );
+                        assert!(
+                            screen.y >= visible.y - 0.5 && screen.y + screen.h <= visible.y + visible.h + 0.5,
+                            "{at:?}: {screen:?} leaves the visible frame"
+                        );
+                        let w = to_window(item);
+                        assert!(w.x >= 0.0 && w.y >= 0.0 && w.x + w.w <= ww && w.y + w.h <= wh, "{at:?}: {w:?}");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
