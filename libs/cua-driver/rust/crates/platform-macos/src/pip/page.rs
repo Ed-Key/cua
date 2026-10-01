@@ -68,12 +68,12 @@ const PILL_NODES: u32 = 32;
 /// Room above the pill for its shadow (points).
 const PILL_GAP: f64 = 10.0;
 /// The extension centers the pill and puts its bottom 16 CSS px above the
-/// page's bottom: that, from half to four times the page's zoom, is what
+/// page's bottom: that, at any of Chrome's zooms (25% to 500%), is what
 /// tells the pill from page text quoting its label. The center is the
 /// page's less half a classic scrollbar (the page's area includes it, the
 /// pill's viewport does not).
 const PILL_CENTER_SLACK: f64 = 10.0;
-const PILL_BOTTOM: std::ops::RangeInclusive<f64> = 7.0..=65.0;
+const PILL_BOTTOM: std::ops::RangeInclusive<f64> = 3.0..=82.0;
 
 /// The page's area in its window's points (origin at the window's top-left
 /// corner), or why it is not known.
@@ -679,6 +679,11 @@ mod tests {
         // Twice the zoom: twice as far up and tall, still the pill.
         let zoomed = Area { x: 410.0, y: 819.0 - 32.0 - 60.0, w: 480.0, h: 60.0 };
         assert_eq!(pill_trim(page, zoomed), Some(32.0 + 60.0 + PILL_GAP));
+        // Chrome's zoom ends: 25% (4 pt up) and 500% (80 pt up).
+        let quarter = Area { x: 620.0, y: 819.0 - 4.0 - 7.5, w: 60.0, h: 7.5 };
+        assert_eq!(pill_trim(page, quarter), Some(4.0 + 7.5 + PILL_GAP));
+        let fivefold = Area { x: 50.0 + 100.0, y: 819.0 - 80.0 - 150.0, w: 1000.0, h: 150.0 };
+        assert_eq!(pill_trim(page, fivefold), Some(80.0 + 150.0 + PILL_GAP));
         // Outside the page.
         assert_eq!(pill_trim(page, at(1000.0, 773.0)), None);
         assert_eq!(pill_trim(page, at(530.0, 800.0)), None);
