@@ -1778,9 +1778,6 @@ fn end_session_unless_in_turn(session_id: &str, reason: SessionEndReason) -> boo
 }
 
 fn finish_session_end(session_id: &str, reason: SessionEndReason) {
-    // An ended session leaves its transport's turn: revived, it is held
-    // again on its next action.
-    crate::pip_turn::session_ended(session_id);
     let (first_fire, idle_revivable) = mark_session_ended(session_id, None, reason);
     let mut cursor_readers = CURSOR_OUTCOME_READERS
         .get()
@@ -1821,6 +1818,10 @@ fn finish_session_end(session_id: &str, reason: SessionEndReason) {
         }
     }
     let _ = retry_session_cleanup(session_id);
+    // Once its cleanup hooks ran (they read `pip_turn::ends_quietly`), the
+    // ended session leaves its transport's turn: revived, it is held again
+    // on its next action.
+    crate::pip_turn::session_ended(session_id);
     if first_fire {
         if let Some(observer) = SESSION_OBSERVER.get() {
             observer.on_session_ended(public_session_label(session_id), reason, cursor);

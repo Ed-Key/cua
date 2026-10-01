@@ -134,12 +134,26 @@ struct Effects {
 #[derive(Default)]
 struct Turns {
     map: HashMap<String, Turn>,
+    /// Transports whose connection closed on an open turn, with when and
+    /// their labels: calls still in flight may finish after the close (the
+    /// sessions' teardown waits for them), but they push no frame and their
+    /// sessions' panels still end quietly.
+    gone: HashMap<String, (Instant, BTreeSet<String>)>,
     next: u64,
 }
+
+/// How long a closed connection's quiet end is remembered: longer than any
+/// call in flight at the close runs.
+const GONE_MEMORY: Duration = Duration::from_secs(10 * 60);
 
 impl Turns {
     fn apply(&mut self, transport: &str, input: Input, now: Instant, lease: Duration) -> Effects {
         let mut effects = Effects::default();
+        self.gone
+            .retain(|_, (at, _)| now.saturating_duration_since(*at) < GONE_MEMORY);
+        if self.gone.contains_key(transport) {
+            return effects;
+        }
         if let Input::Hook(TurnEvent::Start) = input {
             self.next += 1;
             let epoch = self.next;
@@ -178,9 +192,12 @@ impl Turns {
                 if open || input != Input::Disconnect {
                     effects.notes = turn
                         .keys
-                        .into_iter()
-                        .map(|key| (key, PipHookTurn::End { finished: !open }))
+                        .iter()
+                        .map(|key| (key.clone(), PipHookTurn::End { finished: !open }))
                         .collect();
+                }
+                if open && input == Input::Disconnect {
+                    self.gone.insert(transport.to_owned(), (now, turn.keys));
                 }
             }
             return effects;
@@ -263,6 +280,15 @@ impl Turns {
             turn.acted.remove(key);
             turn.keys.remove(key);
         }
+        for (_, keys) in self.gone.values_mut() {
+            keys.remove(key);
+        }
+    }
+
+    /// Whether `key`'s session belongs to a connection that closed on an
+    /// open turn: its end is quiet, whenever its teardown runs.
+    fn ends_quietly(&self, key: &str) -> bool {
+        self.gone.values().any(|(_, keys)| keys.contains(key))
     }
 
     fn defers_eviction(&self, transport: &str, now: Instant, lease: Duration) -> bool {
@@ -284,14 +310,16 @@ pub fn set_pip_turn_fn(f: impl Fn(&str, PipHookTurn) + Send + Sync + 'static) {
 }
 
 /// Apply `input` to `transport`'s turn. Its notes go out under the lock, so
-/// a timer's note can never overtake an action's that came after it.
-fn apply(transport: &str, input: Input) {
+/// a timer's note can never overtake an action's that came after it. False
+/// when the transport's connection closed on an open turn (see `acted`).
+fn apply(transport: &str, input: Input) -> bool {
     if !crate::pip_hook::pip_enabled() || transport.is_empty() {
-        return;
+        return true;
     }
     let mut guard = TURNS.lock().unwrap_or_else(|e| e.into_inner());
     let turns = guard.get_or_insert_with(Turns::default);
     let effects = turns.apply(transport, input, Instant::now(), DEFAULT_LEASE);
+    let live = !turns.gone.contains_key(transport);
     if !effects.notes.is_empty() {
         tracing::info!(target: "pip", notes = ?effects.notes.iter().map(|(_, note)| note).collect::<Vec<_>>(), "PiP turn notes");
     }
@@ -317,6 +345,7 @@ fn apply(transport: &str, input: Input) {
             tracing::warn!(target: "pip", %error, "PiP turn timer did not start");
         }
     }
+    live
 }
 
 /// A `pip_turn` call on `transport` (the trusted runtime transport id):
@@ -336,9 +365,22 @@ pub fn action(transport: &str) {
 }
 
 /// The session `session_key` on `transport` acted: its frame or
-/// verification is about to be pushed.
-pub fn acted(transport: &str, session_key: &str) {
-    apply(transport, Input::Acted(session_key.to_owned()));
+/// verification is about to be pushed. Whether it may be: never for a call
+/// that finishes after its connection closed on an open turn (it would bring
+/// a panel back for an interrupted turn).
+pub fn acted(transport: &str, session_key: &str) -> bool {
+    apply(transport, Input::Acted(session_key.to_owned()))
+}
+
+/// Whether the session `session_key`, ending now, ends quietly: its
+/// connection closed while its turn was open, so even a teardown that waited
+/// for calls in flight plays no finished state.
+pub fn ends_quietly(session_key: &str) -> bool {
+    TURNS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .as_ref()
+        .is_some_and(|turns| turns.ends_quietly(session_key))
 }
 
 /// The transport's connection closed, before its sessions end: its turn
@@ -349,7 +391,8 @@ pub fn forget(transport: &str) {
     apply(transport, Input::Disconnect);
 }
 
-/// The session `session_key` ended (any reason): it leaves every turn.
+/// The session `session_key` ended (any reason) and its cleanup hooks ran:
+/// it leaves every turn.
 pub fn session_ended(session_key: &str) {
     if let Some(turns) = TURNS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
         turns.session_ended(session_key);
@@ -674,26 +717,53 @@ mod tests {
     #[test]
     fn a_connection_closing_on_an_open_turn_ends_it_quietly() {
         // Open (interrupted, or the client died): every label closes quietly,
-        // however fresh its last action.
+        // however fresh its last action. (Each case is its own connection: a
+        // closed one never comes back under the same id.)
         let mut run = Run::new();
-        run.at(0.0, T, START);
-        run.at(1.0, T, acted("a"));
-        let close = run.at(1.5, T, Input::Disconnect);
+        let open = "open";
+        run.at(0.0, open, START);
+        run.at(1.0, open, acted("a"));
+        let close = run.at(1.5, open, Input::Disconnect);
         assert_eq!(notes(&close), [("a", PipHookTurn::End { finished: false })]);
-        assert_eq!(run.phase(T), None);
+        assert_eq!(run.phase(open), None);
         // A Stop came (Stopping) or the turn is closed: nothing from the
         // turn, the connection-close rule decides.
-        run.at(2.0, T, START);
-        run.at(3.0, T, acted("a"));
-        run.at(4.0, T, STOP);
-        assert_eq!(run.at(4.1, T, Input::Disconnect), Effects::default());
+        let stopping = "stopping";
+        run.at(2.0, stopping, START);
+        run.at(3.0, stopping, acted("b"));
+        run.at(4.0, stopping, STOP);
+        assert_eq!(run.at(4.1, stopping, Input::Disconnect), Effects::default());
+        assert!(!run.turns.ends_quietly("b"));
         run.at(5.0, T, START);
-        run.at(6.0, T, acted("a"));
+        run.at(6.0, T, acted("c"));
         let stop = run.at(7.0, T, STOP);
         run.debounce(&stop, 8.5);
         assert_eq!(run.at(9.0, T, Input::Disconnect), Effects::default());
+        assert!(!run.turns.ends_quietly("c"));
         // Never hooked: nothing.
         assert_eq!(run.at(10.0, "never", Input::Disconnect), Effects::default());
+    }
+
+    #[test]
+    fn a_closed_connections_quiet_end_outlives_its_calls_in_flight_but_not_forever() {
+        let mut run = Run::new();
+        run.at(0.0, T, START);
+        run.at(1.0, T, acted("a"));
+        run.at(2.0, T, Input::Disconnect);
+        assert!(run.turns.ends_quietly("a"));
+        // A call that finishes after the close: no note, no turn.
+        assert_eq!(run.at(3.0, T, acted("a")), Effects::default());
+        assert_eq!(run.at(3.0, T, START), Effects::default());
+        assert_eq!(run.phase(T), None);
+        // Its teardown ran: forgotten. Or, at the latest, after GONE_MEMORY.
+        run.turns.session_ended("a");
+        assert!(!run.turns.ends_quietly("a"));
+        run.at(10.0, "other", START);
+        run.at(11.0, "other", acted("b"));
+        run.at(12.0, "other", Input::Disconnect);
+        assert!(run.turns.ends_quietly("b"));
+        run.at(12.0 + GONE_MEMORY.as_secs_f64(), "third", Input::Action);
+        assert!(!run.turns.ends_quietly("b"));
     }
 
     #[test]

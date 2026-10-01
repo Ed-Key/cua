@@ -1700,8 +1700,11 @@ impl ToolRegistry {
                 &runtime_prefix,
                 bound_window,
             );
-            if pip_hook::pip_frame_wanted(resolved_name, &frame) {
-                crate::pip_turn::acted(&transport, &frame.session_key);
+            // A call that finishes after its connection closed on an open
+            // turn brings no panel back.
+            if pip_hook::pip_frame_wanted(resolved_name, &frame)
+                && crate::pip_turn::acted(&transport, &frame.session_key)
+            {
                 pip_hook::push_pip_frame(frame);
             }
         }
@@ -1716,8 +1719,9 @@ impl ToolRegistry {
                 &public_args,
                 result.structured_content.as_ref(),
             ) {
-                crate::pip_turn::acted(&transport, &event.session_key);
-                pip_hook::push_pip_verification(event);
+                if crate::pip_turn::acted(&transport, &event.session_key) {
+                    pip_hook::push_pip_verification(event);
+                }
             }
         }
         drop(lifecycle_dispatch);

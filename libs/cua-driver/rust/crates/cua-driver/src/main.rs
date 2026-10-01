@@ -368,6 +368,14 @@ fn maybe_init_pip() {
                         pip_preview::PipSessionEnd::Expired
                     }
                     Some(SessionEndReason::Explicit) => pip_preview::PipSessionEnd::Finished,
+                    // Its connection closed while its hooked turn was open (an
+                    // interrupted or dead turn), even if its teardown waited
+                    // for calls in flight: quietly.
+                    Some(SessionEndReason::ProcessExit | SessionEndReason::Unknown)
+                        if cua_driver_core::pip_turn::ends_quietly(session_key) =>
+                    {
+                        pip_preview::PipSessionEnd::Expired
+                    }
                     Some(SessionEndReason::ProcessExit | SessionEndReason::Unknown) => {
                         pip_preview::PipSessionEnd::Disconnected
                     }
