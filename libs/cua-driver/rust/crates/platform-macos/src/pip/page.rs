@@ -19,10 +19,16 @@
 //! going or docked DevTools never leave a stale element behind. Anything
 //! unknown, ambiguous or late is an `Err` with its reason: the card then
 //! shows the whole window, never a guess.
+//!
+//! Cua's own "Cua is working in this tab" pill (extensions/chrome
+//! indicator.js, fixed at the page's bottom center) belongs to the tab, not
+//! the card: once a lookup has seen it in a window, that window's crop ends
+//! just above it, for as long as the driver runs, so the card does not change
+//! shape each time the pill hides (4 s after the last command) or comes back.
 
 use std::time::{Duration, Instant};
 
-use core_foundation::base::{CFRelease, CFTypeRef};
+use core_foundation::base::{CFRelease, CFRetain, CFTypeRef};
 
 use super::Area;
 use crate::ax::bindings::{
@@ -48,6 +54,17 @@ const MAX_NODES: u32 = 400;
 const MIN_SIDE: f64 = 40.0;
 /// AX and WindowServer round differently at the window's edges.
 const EDGE_SLACK: f64 = 1.0;
+/// The pill's label (indicator.js).
+const PILL_TEXT: &str = "Cua is working in this tab";
+/// The pill is appended last to the page's body, so it is searched for among
+/// the last `PILL_TAIL` children at each of `PILL_DEPTH` levels under the
+/// page (body, the indicator's host, the pill, its text), at most
+/// `PILL_NODES` elements, within the lookup's own budget.
+const PILL_TAIL: usize = 6;
+const PILL_DEPTH: u32 = 4;
+const PILL_NODES: u32 = 32;
+/// Room above the pill for its shadow (points).
+const PILL_GAP: f64 = 10.0;
 
 /// The page's area in its window's points (origin at the window's top-left
 /// corner), or why it is not known.
@@ -157,12 +174,63 @@ pub(super) fn capture_page(pid: Option<i32>, window_id: u32) -> Option<super::Sh
 /// of app `pid`. Capture worker and visibility poll only.
 pub(super) fn page_crop(pid: Option<i32>, window_id: u32, window: Area) -> Crop {
     let pid = pid.ok_or("the target has no app")?;
+    let kept = TRIMS.lock().unwrap_or_else(|e| e.into_inner()).get(&window_id).copied();
     let started = Instant::now();
-    let found = unsafe { page_area(pid, window_id, started + LOOKUP_BUDGET) };
+    let found = unsafe { page_area(pid, window_id, started + LOOKUP_BUDGET, kept.is_none()) };
     tracing::debug!(target: "pip", window = window_id, ?found, elapsed_ms = started.elapsed().as_millis() as u64, "PiP page lookup");
-    let crop = found.and_then(|page| crop_in_window(window, page));
+    let seen = found.ok().and_then(|(page, pill)| pill_trim(page, pill?));
+    // Read again: a lookup that started before another one kept the trim
+    // (the still's racing the poll) is trimmed all the same.
+    let trim = kept.or_else(|| {
+        let trim = keep_trim(&mut TRIMS.lock().unwrap_or_else(|e| e.into_inner()), window_id, seen)?;
+        tracing::info!(target: "pip", window = window_id, trim, "PiP page pill seen: the card ends above it from now on");
+        Some(trim)
+    });
+    let crop = found.and_then(|(page, _)| crop_in_window(window, page));
     let mut known = KNOWN.lock().unwrap_or_else(|e| e.into_inner());
-    remember(&mut known, window_id, (window.w, window.h), crop, started)
+    remember(&mut known, window_id, (window.w, window.h), crop, started).map(|crop| trimmed(crop, trim))
+}
+
+/// How much of `page`'s bottom (screen points) to leave out of the card for
+/// cua's pill at `pill` (screen points): from just above the pill (its
+/// shadow) to the page's bottom. `None` when the pill is not where the
+/// extension draws it (inside the page, in its lower half) or the rest of
+/// the page would be too small.
+fn pill_trim(page: Area, pill: Area) -> Option<f64> {
+    let inside = pill.x >= page.x - EDGE_SLACK
+        && pill.x + pill.w <= page.x + page.w + EDGE_SLACK
+        && pill.y + pill.h <= page.y + page.h + EDGE_SLACK
+        && pill.y >= page.y + page.h / 2.0;
+    let trim = page.y + page.h - (pill.y - PILL_GAP);
+    (inside && trim > 0.0 && page.h - trim >= MIN_SIDE).then_some(trim)
+}
+
+/// `crop` without its bottom `trim` points, unless that leaves too little.
+fn trimmed(crop: Area, trim: Option<f64>) -> Area {
+    match trim {
+        Some(trim) if crop.h - trim >= MIN_SIDE => Area { h: crop.h - trim, ..crop },
+        _ => crop,
+    }
+}
+
+/// The pill trim of each window that has shown the pill: never searched
+/// again and never dropped (see the module notes).
+static TRIMS: std::sync::LazyLock<std::sync::Mutex<std::collections::HashMap<u32, f64>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// `window_id`'s kept trim, or `seen` now kept as it (the first one wins
+/// when two workers saw the pill at once).
+fn keep_trim(trims: &mut std::collections::HashMap<u32, f64>, window_id: u32, seen: Option<f64>) -> Option<f64> {
+    if let Some(kept) = trims.get(&window_id) {
+        return Some(*kept);
+    }
+    let seen = seen?;
+    // ponytail: dropped wholesale past 64 windows, as `remember` does.
+    if trims.len() >= 64 {
+        trims.clear();
+    }
+    trims.insert(window_id, seen);
+    Some(seen)
 }
 
 /// The last answer each window's lookups gave: the window's size then, the
@@ -269,8 +337,15 @@ unsafe fn bound(element: AXUIElementRef, deadline: Instant) -> bool {
     }
 }
 
-/// The screen area of the one top-level `AXWebArea` in `window_id`.
-unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area, &'static str> {
+/// The screen area of the one top-level `AXWebArea` in `window_id`, and,
+/// when `find_pill`, cua's pill in it (searched only once the page's answer
+/// is settled, so the search never makes the page late).
+unsafe fn page_area(
+    pid: i32,
+    window_id: u32,
+    deadline: Instant,
+    find_pill: bool,
+) -> Result<(Area, Option<Area>), &'static str> {
     // A reference of our own: messaging timeouts stick to a reference.
     let app = AXUIElementCreateApplication(pid);
     if app.is_null() {
@@ -300,6 +375,7 @@ unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area,
         deadline,
         pages: Vec::new(),
         complete: true,
+        element: None,
     };
     if walk.bound(root) {
         walk.children(root, MAX_DEPTH);
@@ -315,7 +391,12 @@ unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area,
         Err("the lookup could not read all of the window's views")
     } else {
         match walk.pages[..] {
-            [page] => Ok(page),
+            [page] => Ok((
+                page,
+                walk.element
+                    .filter(|_| find_pill)
+                    .and_then(|element| find_pill_in(element, deadline)),
+            )),
             [] => {
                 Err(if ask_for_pages(pid) {
                     ASKED
@@ -326,8 +407,59 @@ unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area,
             _ => Err("the window shows more than one page"),
         }
     };
+    if let Some(element) = walk.element {
+        CFRelease(element as CFTypeRef);
+    }
     CFRelease(app as CFTypeRef);
     found
+}
+
+/// Cua's pill under `page`: the parent of the static text `PILL_TEXT`
+/// among the page's last children (see `PILL_TAIL`). Any failure, the
+/// deadline included, is `None`.
+unsafe fn find_pill_in(page: AXUIElementRef, deadline: Instant) -> Option<Area> {
+    let mut nodes = PILL_NODES;
+    pill_under(page, PILL_DEPTH, deadline, &mut nodes)
+}
+
+unsafe fn pill_under(parent: AXUIElementRef, depth: u32, deadline: Instant, nodes: &mut u32) -> Option<Area> {
+    if !bound(parent, deadline) {
+        return None;
+    }
+    let (children, _) = copy_children_reporting(parent);
+    let tail = children.len().saturating_sub(PILL_TAIL);
+    let mut found = None;
+    for (index, &child) in children.iter().enumerate().rev() {
+        if found.is_none() && index >= tail && *nodes > 0 {
+            *nodes -= 1;
+            let role = if bound(child, deadline) { copy_string_attr(child, "AXRole") } else { None };
+            found = if role.as_deref() == Some("AXStaticText") {
+                (bound(child, deadline) && copy_string_attr(child, "AXValue").as_deref() == Some(PILL_TEXT))
+                    .then(|| area_of(parent, deadline))
+                    .flatten()
+            } else if depth > 1 && role.is_some() {
+                pill_under(child, depth - 1, deadline, nodes)
+            } else {
+                None
+            };
+        }
+        CFRelease(child as CFTypeRef);
+    }
+    found
+}
+
+/// `element`'s screen area: its position and its size, each message
+/// bounded by the time left.
+unsafe fn area_of(element: AXUIElementRef, deadline: Instant) -> Option<Area> {
+    if !bound(element, deadline) {
+        return None;
+    }
+    let [x, y] = copy_geometry_attr_checked(element, "AXPosition", kAXValueCGPointType).ok()?;
+    if !bound(element, deadline) {
+        return None;
+    }
+    let [w, h] = copy_geometry_attr_checked(element, "AXSize", kAXValueCGSizeType).ok()?;
+    Some(Area { x, y, w, h })
 }
 
 struct Walk {
@@ -338,6 +470,8 @@ struct Walk {
     pages: Vec<Area>,
     /// Every element that was reached was read: `pages` is all of them.
     complete: bool,
+    /// The first page's element (retained), for the pill search.
+    element: Option<AXUIElementRef>,
 }
 
 impl Walk {
@@ -379,27 +513,19 @@ impl Walk {
             if copy_url_attr(element).is_some_and(|url| url.starts_with("devtools://")) {
                 return;
             }
-            match self.area(element) {
-                Some(area) => self.pages.push(area),
+            match area_of(element, self.deadline) {
+                Some(area) => {
+                    if self.element.is_none() {
+                        CFRetain(element as CFTypeRef);
+                        self.element = Some(element);
+                    }
+                    self.pages.push(area);
+                }
                 None => self.complete = false,
             }
         } else if depth > 0 && self.bound(element) {
             self.children(element, depth - 1);
         }
-    }
-
-    /// `element`'s screen area: its position and its size, each message
-    /// bounded by the time left.
-    unsafe fn area(&mut self, element: AXUIElementRef) -> Option<Area> {
-        if !self.bound(element) {
-            return None;
-        }
-        let [x, y] = copy_geometry_attr_checked(element, "AXPosition", kAXValueCGPointType).ok()?;
-        if !self.bound(element) {
-            return None;
-        }
-        let [w, h] = copy_geometry_attr_checked(element, "AXSize", kAXValueCGSizeType).ok()?;
-        Some(Area { x, y, w, h })
     }
 }
 
@@ -515,6 +641,69 @@ mod tests {
         assert_eq!(remember(&mut known, 7, size, Err(ASKED), at(1200)), Err(ASKED));
         assert_eq!(remember(&mut known, 7, size, Ok(new), at(1000)), Ok(new));
         assert_eq!(remember(&mut known, 7, size, Err(LATE), at(1500)), Err(LATE));
+    }
+
+    #[test]
+    fn the_crop_ends_just_above_cuas_pill() {
+        // VM A's steps page (screen points) and the pill as indicator.js
+        // draws it: 16 pt above the page's bottom, about 30 pt tall.
+        let page = Area { x: 100.0, y: 117.0, w: 1100.0, h: 702.0 };
+        let pill = Area { x: 530.0, y: 117.0 + 702.0 - 16.0 - 30.0, w: 240.0, h: 30.0 };
+        let trim = pill_trim(page, pill).unwrap();
+        assert_eq!(trim, 16.0 + 30.0 + PILL_GAP);
+        let crop = crop_in_window(WINDOW, page).unwrap();
+        let card = trimmed(crop, Some(trim));
+        assert_eq!(card, Area { h: 702.0 - 56.0, ..crop });
+        // The card's bottom, back in screen points, is the gap above the pill.
+        assert_eq!(WINDOW.y + card.y + card.h, pill.y - PILL_GAP);
+        // No trim, no change.
+        assert_eq!(trimmed(crop, None), crop);
+    }
+
+    #[test]
+    fn a_pill_not_where_the_extension_draws_it_trims_nothing() {
+        let page = Area { x: 100.0, y: 117.0, w: 1100.0, h: 702.0 };
+        let at = |x, y| Area { x, y, w: 240.0, h: 30.0 };
+        // In the page's upper half (a page quoting the label, say).
+        assert_eq!(pill_trim(page, at(530.0, 300.0)), None);
+        // Outside the page.
+        assert_eq!(pill_trim(page, at(1000.0, 773.0)), None);
+        assert_eq!(pill_trim(page, at(530.0, 800.0)), None);
+        // A page too short for a card once trimmed.
+        let short = Area { y: 117.0, h: 90.0, ..page };
+        assert_eq!(pill_trim(short, at(530.0, 161.0)), None);
+        // A trim kept from a taller page never leaves a sliver.
+        let crop = Area { x: 0.0, y: 87.0, w: 1100.0, h: 90.0 };
+        assert_eq!(trimmed(crop, Some(56.0)), crop);
+    }
+
+    #[test]
+    fn the_trim_is_kept_for_its_window_once_the_pill_was_seen() {
+        let mut trims = std::collections::HashMap::new();
+        // No pill seen yet: nothing to trim.
+        assert_eq!(keep_trim(&mut trims, 7, None), None);
+        // Seen: kept ...
+        assert_eq!(keep_trim(&mut trims, 7, Some(56.0)), Some(56.0));
+        // ... through lookups that no longer see it (the pill hid 4 s after
+        // the last command, Stop, a tab without it) ...
+        assert_eq!(keep_trim(&mut trims, 7, None), Some(56.0));
+        // ... and the first one stays (two workers, or a later sighting).
+        assert_eq!(keep_trim(&mut trims, 7, Some(60.0)), Some(56.0));
+        // Another window has its own.
+        assert_eq!(keep_trim(&mut trims, 8, None), None);
+    }
+
+    #[test]
+    fn a_late_lookup_keeps_the_trimmed_crop() {
+        // remember keeps the page's own crop; the trim goes on top, so the
+        // card a late lookup keeps is the trimmed one.
+        let mut known = std::collections::HashMap::new();
+        let t = Instant::now();
+        let page = Area { x: 0.0, y: 87.0, w: 1100.0, h: 702.0 };
+        let size = (1100.0, 789.0);
+        let _ = remember(&mut known, 7, size, Ok(page), t);
+        let late = remember(&mut known, 7, size, Err(LATE), t + Duration::from_millis(500));
+        assert_eq!(late.map(|crop| trimmed(crop, Some(56.0)).h), Ok(646.0));
     }
 
     #[test]
