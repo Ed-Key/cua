@@ -804,6 +804,10 @@ struct Scope {
     /// For a pick from a menu: the element that opened it (retained by the
     /// watch).
     opener: Option<usize>,
+    /// Whether the app's menu windows are watched. Not for invoke_menu: the
+    /// menu it walks fades out after the command, and reading that as "a
+    /// menu opened" would also end the wait before a sheet the command opens.
+    menus: bool,
 }
 
 /// One read of every fact; `keep` also returns the retained window for the
@@ -926,7 +930,7 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
     if let Some(opener) = scope.opener {
         facts.opener = read_element(&mut reader, opener as AXUIElementRef);
     }
-    facts.menus = crate::windows::menu_windows_of(scope.pid).map(|windows| {
+    facts.menus = scope.menus.then(|| crate::windows::menu_windows_of(scope.pid)).flatten().map(|windows| {
         let mut ids: Vec<u32> = windows.iter().map(|w| w.window_id).collect();
         ids.sort_unstable();
         ids
@@ -1258,6 +1262,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
     } else {
         (None, window_id)
     };
+    let watch_menus = tool != "invoke_menu";
     tokio::task::spawn_blocking(move || {
         let window_id = window_id.or_else(|| unsafe { focused_window_id(pid) })?;
         let opener = target
@@ -1269,6 +1274,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             target: target.as_ref().map(RetainedElement::as_ptr),
             collection: None,
             opener: opener.as_ref().map(RetainedElement::as_ptr),
+            menus: watch_menus,
         };
         let pass = unsafe { read_pass(&scope, false) };
         if pass.facts.window_present != Some(true) {
