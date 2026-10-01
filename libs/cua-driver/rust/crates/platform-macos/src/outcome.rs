@@ -671,7 +671,21 @@ unsafe fn list_items(
             .map(|items| items.into_iter().map(Owned).collect())
             .map_err(|_| None)
     };
-    let mut items = read(element, attribute)?;
+    // A context menu opened over a list is its child while it shows; it is
+    // not an item.
+    let not_menu = |reader: &mut Reader, items: Vec<Owned>| -> Result<Vec<Owned>, Option<usize>> {
+        let mut kept = Vec::with_capacity(items.len());
+        for item in items {
+            if !reader.admit(item.0) {
+                return Err(None);
+            }
+            if copy_string_attr(item.0, "AXRole").as_deref() != Some("AXMenu") {
+                kept.push(item);
+            }
+        }
+        Ok(kept)
+    };
+    let mut items = not_menu(reader, read(element, attribute)?)?;
     for _ in 0..2 {
         let [only] = items.as_slice() else { break };
         if !reader.admit(only.0) {
@@ -681,7 +695,7 @@ unsafe fn list_items(
         if !matches!(role.as_str(), "AXList" | "AXGroup") || own_label(only.0).is_some() {
             break;
         }
-        items = read(only.0, "AXChildren")?;
+        items = not_menu(reader, read(only.0, "AXChildren")?)?;
     }
     Ok(items)
 }
@@ -1195,7 +1209,6 @@ impl OutcomeWatch for Watch {
                     None => (pass.facts, DiskNotes::default(), false),
                 }
             };
-            tracing::debug!(?before, ?after, ?settle, complete, "outcome facts");
             describe(&before, &after, &disk, settle, complete_before && complete)
         })
         .await
