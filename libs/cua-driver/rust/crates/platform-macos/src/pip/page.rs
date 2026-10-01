@@ -199,12 +199,12 @@ pub(super) fn page_crop(pid: Option<i32>, window_id: u32, window: Area) -> Crop 
 /// How much of `page`'s bottom (screen points) to leave out of the card for
 /// cua's pill at `pill` (screen points): from just above the pill (its
 /// shadow) to the page's bottom. `None` when the pill is not where the
-/// extension draws it (centered, just above the page's bottom, in its lower
-/// half) or the rest of the page would be too small.
+/// extension draws it (centered, just above the page's bottom) or the rest
+/// of the page would be too small.
 fn pill_trim(page: Area, pill: Area) -> Option<f64> {
     let centered = ((pill.x + pill.w / 2.0) - (page.x + page.w / 2.0)).abs() <= PILL_CENTER_SLACK;
     let above_bottom = PILL_BOTTOM.contains(&(page.y + page.h - (pill.y + pill.h)));
-    let inside = centered && above_bottom && pill.y >= page.y + page.h / 2.0;
+    let inside = centered && above_bottom;
     let trim = page.y + page.h - (pill.y - PILL_GAP);
     (inside && trim > 0.0 && page.h - trim >= MIN_SIDE).then_some(trim)
 }
@@ -671,8 +671,8 @@ mod tests {
     fn a_pill_not_where_the_extension_draws_it_trims_nothing() {
         let page = Area { x: 100.0, y: 117.0, w: 1100.0, h: 702.0 };
         let at = |x, y| Area { x, y, w: 240.0, h: 30.0 };
-        // Page text quoting the label: in the upper half, off center, or
-        // centered but not just above the bottom.
+        // Page text quoting the label: off center, or centered but not just
+        // above the bottom.
         assert_eq!(pill_trim(page, at(530.0, 300.0)), None);
         assert_eq!(pill_trim(page, at(400.0, 773.0)), None);
         assert_eq!(pill_trim(page, at(530.0, 600.0)), None);
@@ -684,6 +684,10 @@ mod tests {
         assert_eq!(pill_trim(page, quarter), Some(4.0 + 7.5 + PILL_GAP));
         let fivefold = Area { x: 50.0 + 100.0, y: 819.0 - 80.0 - 150.0, w: 1000.0, h: 150.0 };
         assert_eq!(pill_trim(page, fivefold), Some(80.0 + 150.0 + PILL_GAP));
+        // ... also in a short page, where the pill reaches its upper half.
+        let low = Area { y: 117.0, h: 400.0, ..page };
+        let tall = Area { y: 517.0 - 80.0 - 170.0, h: 170.0, ..fivefold };
+        assert_eq!(pill_trim(low, tall), Some(80.0 + 170.0 + PILL_GAP));
         // Outside the page.
         assert_eq!(pill_trim(page, at(1000.0, 773.0)), None);
         assert_eq!(pill_trim(page, at(530.0, 800.0)), None);
