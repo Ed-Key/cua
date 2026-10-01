@@ -69,8 +69,10 @@ pub fn screen_recording_granted() -> bool {
 /// Shown wherever a prompt was skipped because the executable is bare.
 pub const BARE_EXECUTABLE_PROMPT_NOTE: &str =
     "This cua-driver executable is not inside an installed app bundle (for example a \
-     cargo build), so it does not raise macOS permission prompts. Prompts come only \
-     from the installed CuaDriver app: run `cua-driver permissions grant`.";
+     cargo build), so it does not raise macOS permission prompts and runs on the \
+     permissions of the app that launched it (your terminal or IDE). Grant \
+     Accessibility and Screen Recording to that app in System Settings, or run the \
+     installed CuaDriver app instead (`cua-driver permissions grant` sets it up).";
 
 /// True when this process runs from `<Name>.app/Contents/MacOS/<exe>` inside an
 /// app bundle that declares a bundle identifier (CuaDriver.app,
