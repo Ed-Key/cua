@@ -799,8 +799,7 @@ fn select_popup_option(
         Some(i) => {
             let err = unsafe { perform_action(options[i].element, "AXPress") };
             if err == kAXErrorSuccess {
-                // An option may carry its choice only in AXValue.
-                Ok(if options[i].title.is_empty() { options[i].value.clone() } else { options[i].title.clone() })
+                Ok((options[i].title.clone(), options[i].value.clone()))
             } else {
                 Err(format!("AXPress on option '{}' failed with AX error {err}", options[i].title))
             }
@@ -814,8 +813,8 @@ fn select_popup_option(
     for option in &options {
         unsafe { CFRelease(option.element as _) };
     }
-    let picked = match result {
-        Ok(title) => title,
+    let (picked_title, picked_value) = match result {
+        Ok(picked) => picked,
         Err(error) => {
             let closed = if opened { unsafe { close_popup_menu(element, pid) } } else { Some(true) };
             anyhow::bail!("{error}.{}", closed_note(closed));
@@ -830,9 +829,12 @@ fn select_popup_option(
     } else {
         Some(true)
     };
-    let shown = read_back_popup(element, &picked);
+    // The pop-up may show the chosen option's title or its own value.
+    let is_picked = |shown: &str| shows_option(shown, &picked_title, &picked_value);
+    let picked = if picked_title.is_empty() { picked_value.clone() } else { picked_title.clone() };
+    let shown = read_back_popup(element, is_picked);
     let (verified, how) = match &shown {
-        Some(now) if now.eq_ignore_ascii_case(&picked) => (Some(true), format!("it now shows '{now}'")),
+        Some(now) if is_picked(now) => (Some(true), format!("it now shows '{now}'")),
         Some(now) => (Some(false), format!("it still shows '{now}'; verify via screenshot")),
         None => (None, "its shown value is not readable through AX; could not confirm".to_owned()),
     };
@@ -878,6 +880,12 @@ unsafe fn popup_options(element: AXUIElementRef) -> Vec<PopupOption> {
         .collect()
 }
 
+/// Whether a pop-up's shown value names the option: its title, or its own
+/// non-empty value.
+fn shows_option(shown: &str, title: &str, value: &str) -> bool {
+    shown.eq_ignore_ascii_case(title) || (!value.is_empty() && shown.eq_ignore_ascii_case(value))
+}
+
 /// The option whose title, or else non-empty value, matches (case-insensitive).
 fn match_option(options: &[PopupOption], value: &str) -> Option<usize> {
     option_index(options.iter().map(|o| (o.title.as_str(), o.value.as_str())), value)
@@ -891,13 +899,13 @@ fn option_index<'a>(options: impl Iterator<Item = (&'a str, &'a str)>, value: &s
 }
 
 /// The pop-up's shown choice, polled for up to a second until it reads
-/// `picked` (AppKit updates it after the menu closes).
-fn read_back_popup(element: AXUIElementRef, picked: &str) -> Option<String> {
+/// the picked option (AppKit updates it after the menu closes).
+fn read_back_popup(element: AXUIElementRef, is_picked: impl Fn(&str) -> bool) -> Option<String> {
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     loop {
         // Only AXValue is the choice: a title can be a fixed label.
         let shown = unsafe { copy_string_attr(element, "AXValue") };
-        if shown.as_deref().is_some_and(|s| s.eq_ignore_ascii_case(picked))
+        if shown.as_deref().is_some_and(&is_picked)
             || std::time::Instant::now() >= deadline
         {
             return shown;
@@ -1146,6 +1154,10 @@ mod tests {
         assert_eq!(super::option_index(options.into_iter(), "daily"), Some(1));
         assert_eq!(super::option_index(options.into_iter(), "W"), Some(2));
         assert_eq!(super::option_index(options.into_iter(), "Monthly"), None);
+        assert!(super::shows_option("w", "Weekly", "w"), "a pop-up that reports the value");
+        assert!(super::shows_option("weekly", "Weekly", "w"));
+        assert!(!super::shows_option("", "Daily", ""), "an empty value proves nothing");
+        assert!(!super::shows_option("Daily", "Weekly", "w"));
     }
 
     #[test]
