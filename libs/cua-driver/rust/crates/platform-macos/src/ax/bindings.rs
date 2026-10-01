@@ -418,6 +418,22 @@ pub unsafe fn copy_stringish_attr(
     result
 }
 
+/// Whether the element lists `name` among its attribute names (it may still
+/// have no value for it right now, as an empty selection has none).
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn advertises_attribute(element: AXUIElementRef, name: &str) -> bool {
+    let mut names: CFArrayRef = std::ptr::null_mut();
+    if AXUIElementCopyAttributeNames(element, &mut names) != kAXErrorSuccess || names.is_null() {
+        return false;
+    }
+    let arr = CFArray::<CFStr>::wrap_under_create_rule(names);
+    let found = (0..arr.len()).any(|i| arr.get(i).is_some_and(|cf| cf.to_string() == name));
+    found
+}
+
 /// Get the action names for an AX element.
 ///
 /// # Safety

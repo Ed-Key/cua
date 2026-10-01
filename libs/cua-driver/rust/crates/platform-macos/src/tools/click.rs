@@ -1131,33 +1131,87 @@ impl Tool for ClickTool {
                 // element path: this route used to return with no focus
                 // protection at all (measured: every delayed self-activation
                 // of the pressed app kept focus).
-                let snapshot = WindowChangeDetector::snapshot(apps::frontmost_pid());
-                let ax_result = tokio::task::spawn_blocking(move || unsafe {
-                    let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
-                        return Ok::<bool, anyhow::Error>(false);
-                    };
-                    // The pid-scoped hit-test can resolve an element from a
-                    // same-process sibling overlapping the requested point.
-                    // Require proven ancestry in the requested window before
-                    // acting; otherwise fall through to the routed pixel path
-                    // (already gated for this exact window).
-                    if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid) {
-                        CFRelease(element as _);
-                        return Ok(false);
-                    }
-                    let delivered = if focus_only {
-                        crate::input::ax_actions::focus_element(element as usize).is_ok()
-                    } else {
-                        let press = core_foundation::string::CFString::new("AXPress");
-                        AXUIElementPerformAction(element, press.as_concrete_TypeRef())
-                            == kAXErrorSuccess
-                    };
-                    CFRelease(element as _);
-                    Ok(delivered)
-                })
+                let prior_front = apps::frontmost_pid();
+                let snapshot = WindowChangeDetector::snapshot(prior_front);
+                let pixel = SelectionPixelTarget {
+                    screen_x,
+                    screen_y,
+                    window_x: win_local_x,
+                    window_y: win_local_y,
+                };
+                // A click on a Catalyst list row is a row selection: the
+                // hit-test press is the first rung of the verified row ladder
+                // (and a pointer click at this point the next), so the result
+                // says selected only when the app reads the row selected.
+                let ax_result = focus_guard::with_focus_suppressed(
+                    Some(pid),
+                    prior_front,
+                    "click.pixel_ax",
+                    || async move {
+                        tokio::task::spawn_blocking(move || unsafe {
+                            let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
+                                return Ok::<PixelHit, anyhow::Error>(PixelHit::Missed);
+                            };
+                            // The pid-scoped hit-test can resolve an element
+                            // from a same-process sibling overlapping the
+                            // requested point. Require proven ancestry in the
+                            // requested window before acting; otherwise fall
+                            // through to the routed pixel path (already gated
+                            // for this exact window).
+                            if crate::ax::exact_target::element_window_id(element) != Some(hit_test_wid) {
+                                CFRelease(element as _);
+                                return Ok(PixelHit::Missed);
+                            }
+                            let row = (!focus_only)
+                                .then(|| crate::input::ax_actions::RowSelection::capture_for_hit(element as usize))
+                                .flatten()
+                                .filter(|row| row.kind == crate::input::ax_actions::RowKind::Catalyst);
+                            let outcome = if let Some(row) = row {
+                                let presses =
+                                    copy_action_names(element).iter().any(|action| action == "AXPress");
+                                PixelHit::Row(select_row(
+                                    &row,
+                                    element,
+                                    presses,
+                                    RowTarget {
+                                        idx: 0,
+                                        pid,
+                                        window_id: hit_test_wid,
+                                        label: format!(
+                                            "the {} row \"{}\" at the clicked point",
+                                            row.role,
+                                            row.name()
+                                        ),
+                                        snapshot_row: None,
+                                    },
+                                    Some(pixel),
+                                    false,
+                                ))
+                            } else if focus_only {
+                                if crate::input::ax_actions::focus_element(element as usize).is_ok() {
+                                    PixelHit::Delivered
+                                } else {
+                                    PixelHit::Missed
+                                }
+                            } else {
+                                let press = core_foundation::string::CFString::new("AXPress");
+                                if AXUIElementPerformAction(element, press.as_concrete_TypeRef())
+                                    == kAXErrorSuccess
+                                {
+                                    PixelHit::Delivered
+                                } else {
+                                    PixelHit::Missed
+                                }
+                            };
+                            CFRelease(element as _);
+                            Ok(outcome)
+                        })
+                        .await
+                    },
+                )
                 .await;
                 match ax_result {
-                    Ok(Ok(true)) => {
+                    Ok(Ok(PixelHit::Delivered)) => {
                         let changes = super::finish_window_observation(snapshot).await;
                         crate::cursor::overlay::send_command(
                             cursor_key.clone(),
@@ -1177,7 +1231,36 @@ impl Tool for ClickTool {
                             "effect": "unverifiable"
                         }));
                     }
-                    Ok(Ok(false)) if focus_only => {
+                    Ok(Ok(PixelHit::Row(outcome))) => {
+                        let changes = super::finish_window_observation(snapshot).await;
+                        crate::cursor::overlay::send_command(
+                            cursor_key.clone(),
+                            cursor_overlay::OverlayCommand::ClickPulse {
+                                x: screen_x,
+                                y: screen_y,
+                            },
+                        );
+                        return match outcome {
+                            Ok((mut msg, _, _, verified, via_pixel)) => {
+                                msg.push_str(&changes.result_suffix());
+                                let mut structured = serde_json::json!({
+                                    "path": if via_pixel { "cgevent" } else { "ax" },
+                                    "verified": verified,
+                                    "effect": if verified { "confirmed" } else { "unverifiable" },
+                                });
+                                if verified {
+                                    structured["evidence"] =
+                                        serde_json::json!([{ "kind": "accessibility_readback" }]);
+                                }
+                                ToolResult::text(msg).with_structured(structured)
+                            }
+                            Err(e) if super::pixel_route::is_pointer_refusal(&e) => {
+                                super::pixel_route::foreground_unavailable("click", hit_test_wid, &e)
+                            }
+                            Err(e) => ToolResult::error(format!("click: {e}")),
+                        };
+                    }
+                    Ok(Ok(PixelHit::Missed)) if focus_only => {
                         return ToolResult::error(
                             "Background PX focus is unavailable at the requested point.".to_owned(),
                         )
@@ -1593,7 +1676,13 @@ fn perform_ax_click(
                 &row,
                 element,
                 advertised.iter().any(|action| action == "AXPress"),
-                RowTarget { idx, pid, window_id, role: &role, title: &title, snapshot_row },
+                RowTarget {
+                    idx,
+                    pid,
+                    window_id,
+                    label: format!("[{idx}] {role} \"{title}\""),
+                    snapshot_row,
+                },
                 selection_pixel,
                 foreground,
             );
@@ -2049,13 +2138,24 @@ fn unknown_action_refusal(requested: &str, advertised: &[String]) -> ToolResult 
     }))
 }
 
+/// What the background pixel click's AX hit-test delivery did.
+enum PixelHit {
+    /// No element of the exact window at the point, or the press/focus
+    /// failed: fall through to routed pixel events.
+    Missed,
+    /// Pressed (or focused) the element at the point; not verified.
+    Delivered,
+    /// The point is on a Catalyst list row: the verified row ladder ran.
+    Row(anyhow::Result<(String, bool, bool, bool, bool)>),
+}
+
 /// The clicked element, for row-selection messages and pointer delivery.
 struct RowTarget<'a> {
     idx: usize,
     pid: i32,
     window_id: u32,
-    role: &'a str,
-    title: &'a str,
+    /// How results name the click: `[3] AXGroup "Message 312 from Lena"`.
+    label: String,
     snapshot_row: Option<&'a str>,
 }
 
@@ -2110,6 +2210,10 @@ enum RowRung {
     AxSelect,
     /// The element's own AXPress.
     Press,
+    /// AXPress on the content a click at the row's centre reaches (a
+    /// Catalyst row has no AXPress; its content does, and a press there
+    /// selects the row as a tap would).
+    PressAtCentre,
     /// A pointer click at the row.
     Pointer,
 }
@@ -2162,7 +2266,7 @@ trait RowIo {
 /// reports the selection).
 fn climb_row_ladder(io: &mut dyn RowIo) -> anyhow::Result<RowLadderEnd> {
     let mut last_sent = None;
-    for rung in [RowRung::AxSelect, RowRung::Press, RowRung::Pointer] {
+    for rung in [RowRung::AxSelect, RowRung::Press, RowRung::PressAtCentre, RowRung::Pointer] {
         if !io.applies(rung) {
             continue;
         }
@@ -2199,7 +2303,6 @@ struct LiveRowIo<'a> {
     row: &'a crate::input::ax_actions::RowSelection,
     element: AXUIElementRef,
     element_presses: bool,
-    idx: usize,
     pid: i32,
     window_id: u32,
     snapshot_row: Option<&'a str>,
@@ -2207,6 +2310,44 @@ struct LiveRowIo<'a> {
     foreground: bool,
     /// The pointer rung had a target where the row still is.
     pointer_possible: bool,
+    /// The content the centre-press rung presses (retained).
+    centre_target: Option<AXUIElementRef>,
+    /// Rungs that sent input, in order.
+    sent: Vec<RowRung>,
+}
+
+impl Drop for LiveRowIo<'_> {
+    fn drop(&mut self) {
+        if let Some(target) = self.centre_target.take() {
+            unsafe { CFRelease(target as CFTypeRef) };
+        }
+    }
+}
+
+/// AXPress on `element` as one rung's delivery: a stale handle fails before
+/// anything happens; a press that rebuilt the list or replaced the element
+/// (or the row) is reported as such, since the row's place may now hold
+/// something else.
+fn press_rung(
+    row: &crate::input::ax_actions::RowSelection,
+    element: AXUIElementRef,
+) -> anyhow::Result<RungSend> {
+    use crate::ax::bindings::{kAXErrorInvalidUIElement, kAXErrorSuccess};
+    let alive_before = unsafe { crate::ax::bindings::element_is_alive(element) };
+    let err = unsafe { crate::ax::bindings::perform_action(element, "AXPress") };
+    if err == kAXErrorInvalidUIElement {
+        anyhow::bail!("AXUIElementPerformAction(AXPress) returned {err}; take a fresh snapshot");
+    }
+    let replaced = if err == kAXErrorSuccess {
+        !row.readable() || !unsafe { crate::ax::bindings::element_is_alive(element) }
+    } else {
+        crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
+            crate::ax::bindings::element_gone_after_action(element)
+        })
+    };
+    // A press that returned an error may still have acted; the read-back
+    // decides.
+    Ok(if replaced { RungSend::Replaced } else { RungSend::Sent })
 }
 
 impl RowIo for LiveRowIo<'_> {
@@ -2214,13 +2355,26 @@ impl RowIo for LiveRowIo<'_> {
         match rung {
             RowRung::AxSelect => self.row.kind == crate::input::ax_actions::RowKind::Native,
             RowRung::Press => self.element_presses,
-            // The row must still be where the pixel target was taken.
-            RowRung::Pointer => {
-                self.pointer_possible = self.pixel.is_some_and(|point| {
-                    self.row.center().is_some_and(|(x, y)| {
-                        (x - point.screen_x).abs() <= 2.0 && (y - point.screen_y).abs() <= 2.0
-                    })
+            RowRung::PressAtCentre => {
+                if let Some(old) = self.centre_target.take() {
+                    unsafe { CFRelease(old as CFTypeRef) };
+                }
+                self.centre_target = self.row.press_target_at_centre(self.pid).and_then(|target| {
+                    // The clicked element itself already had its rung.
+                    if unsafe { core_foundation::base::CFEqual(target as CFTypeRef, self.element as CFTypeRef) } != 0 {
+                        unsafe { CFRelease(target as CFTypeRef) };
+                        None
+                    } else {
+                        Some(target)
+                    }
                 });
+                self.centre_target.is_some()
+            }
+            // The point must still lie on the row.
+            RowRung::Pointer => {
+                self.pointer_possible = self
+                    .pixel
+                    .is_some_and(|point| self.row.contains_point(point.screen_x, point.screen_y));
                 self.pointer_possible
             }
         }
@@ -2243,7 +2397,20 @@ impl RowIo for LiveRowIo<'_> {
     }
 
     fn send(&mut self, rung: RowRung) -> anyhow::Result<RungSend> {
-        use crate::ax::bindings::{kAXErrorInvalidUIElement, kAXErrorSuccess};
+        let sent = self.send_rung(rung)?;
+        if sent != RungSend::NotSent {
+            self.sent.push(rung);
+        }
+        Ok(sent)
+    }
+
+    fn read_back(&mut self) -> RowReadOutcome {
+        row_selection_outcome(self.row)
+    }
+}
+
+impl LiveRowIo<'_> {
+    fn send_rung(&mut self, rung: RowRung) -> anyhow::Result<RungSend> {
         Ok(match rung {
             RowRung::AxSelect => {
                 if crate::input::ax_actions::ax_write_rejected(self.row.select_via_ax()) {
@@ -2252,33 +2419,11 @@ impl RowIo for LiveRowIo<'_> {
                     RungSend::Sent
                 }
             }
-            RowRung::Press => {
-                let element = self.element;
-                let alive_before = unsafe { crate::ax::bindings::element_is_alive(element) };
-                let err = unsafe { crate::ax::bindings::perform_action(element, "AXPress") };
-                // A stale handle fails before anything happens: report that.
-                if err == kAXErrorInvalidUIElement {
-                    anyhow::bail!(
-                        "AXUIElementPerformAction(AXPress) returned {err}; take a fresh snapshot"
-                    );
-                }
-                // The press navigated or rebuilt the list: the row's
-                // coordinates may now hold something else.
-                let replaced = if err == kAXErrorSuccess {
-                    !self.row.readable() || !unsafe { crate::ax::bindings::element_is_alive(element) }
-                } else {
-                    crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
-                        crate::ax::bindings::element_gone_after_action(element)
-                    })
-                };
-                // A press that returned an error may still have acted; the
-                // read-back decides.
-                if replaced {
-                    RungSend::Replaced
-                } else {
-                    RungSend::Sent
-                }
-            }
+            RowRung::Press => press_rung(self.row, self.element)?,
+            RowRung::PressAtCentre => press_rung(
+                self.row,
+                self.centre_target.expect("the centre rung applies only with a target"),
+            )?,
             RowRung::Pointer => {
                 let point = self.pixel.expect("the pointer rung applies only with a target");
                 crate::input::mouse::click_at_xy_with_window_local(
@@ -2296,24 +2441,22 @@ impl RowIo for LiveRowIo<'_> {
             }
         })
     }
-
-    fn read_back(&mut self) -> RowReadOutcome {
-        row_selection_outcome(self.row)
-    }
 }
 
 fn rung_sent_text(rung: RowRung) -> &'static str {
     match rung {
         RowRung::AxSelect => "Requested the AX selection",
         RowRung::Press => "Sent AXPress",
+        RowRung::PressAtCentre => "Sent AXPress to the row's content at its centre",
         RowRung::Pointer => "Posted a pointer click at the row",
     }
 }
 
 /// Make `row` the exclusive selection and prove it: an AX selection write
-/// (AppKit rows), the element's own press, then a pointer click at the row.
-/// Success only when the app reports the row selected and no other; the
-/// rules for sending more input live on `climb_row_ladder`.
+/// (AppKit rows), the element's own press, a press on the row's content at
+/// its centre (Catalyst), then a pointer click at the row. Success only when
+/// the app reports the row selected and no other; the rules for sending more
+/// input live on `climb_row_ladder`.
 fn select_row(
     row: &crate::input::ax_actions::RowSelection,
     element: AXUIElementRef,
@@ -2322,31 +2465,33 @@ fn select_row(
     pixel: Option<SelectionPixelTarget>,
     foreground: bool,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
-    let RowTarget { idx, pid, window_id, role, title, snapshot_row } = target;
+    let RowTarget { idx, pid, window_id, label, snapshot_row } = target;
     let row_role = &row.role;
     let mut io = LiveRowIo {
         row,
         element,
         element_presses,
-        idx,
         pid,
         window_id,
         snapshot_row,
         pixel,
         foreground,
         pointer_possible: false,
+        centre_target: None,
+        sent: Vec::new(),
     };
     let unverifiable = |text: String, rung: RowRung| {
         Ok((text, false, false, false, rung == RowRung::Pointer))
     };
-    match climb_row_ladder(&mut io)? {
+    let end = climb_row_ladder(&mut io)?;
+    match end {
         RowLadderEnd::Confirmed(rung) => Ok((
             format!(
-                "✅ Selected {row_role} for [{idx}] {role} \"{title}\" {}; read back as the only \
-                 selected row.",
+                "✅ Selected {row_role} for {label} {}; read back as the only selected row.",
                 match rung {
                     RowRung::AxSelect => "through AX selection",
                     RowRung::Press => "with AXPress",
+                    RowRung::PressAtCentre => "with AXPress on its content at the row's centre",
                     RowRung::Pointer => "with a pointer click at the row",
                 }
             ),
@@ -2357,8 +2502,8 @@ fn select_row(
         )),
         RowLadderEnd::Unverifiable { after, replaced: true } => unverifiable(
             format!(
-                "✅ {} on [{idx}] {role} \"{title}\"; the element or its row was replaced, so \
-                 the selection cannot be read back. Take a fresh snapshot before acting again: \
+                "{} on {label}; the element or its row was replaced, so the selection cannot \
+                 be read back (effect unverifiable). Take a fresh snapshot before acting again: \
                  do not retry this click.",
                 rung_sent_text(after)
             ),
@@ -2366,9 +2511,9 @@ fn select_row(
         ),
         RowLadderEnd::Unverifiable { after, replaced: false } => unverifiable(
             format!(
-                "✅ {} on [{idx}] {role} \"{title}\"; the selection could not be read back \
-                 completely, so nothing further was sent. Take a fresh snapshot before acting \
-                 again: do not retry this click.",
+                "{} on {label}; the selection could not be read back completely (effect \
+                 unverifiable), so nothing further was sent. Take a fresh snapshot before \
+                 acting again: do not retry this click.",
                 rung_sent_text(after)
             ),
             after,
@@ -2377,20 +2522,20 @@ fn select_row(
             Err(ElementChanged { idx, now_reads }.into())
         }
         RowLadderEnd::Changed { now_reads: None, after: None } => anyhow::bail!(
-            "element [{idx}]'s name could not be read right before input, so it is not \
+            "the name of {label} could not be read right before input, so it is not \
              confirmed as the row the snapshot named. Nothing was sent; take a fresh snapshot."
         ),
         RowLadderEnd::Changed { now_reads, after: Some(after) } => unverifiable(
             format!(
-                "✅ {} on [{idx}] {role} \"{title}\"; {}, so nothing further was sent. Take a \
+                "{} on {label}; {}, so nothing further was sent (effect unverifiable). Take a \
                  fresh snapshot before acting again: do not retry this click.",
                 rung_sent_text(after),
                 match now_reads {
                     Some(now_reads) => format!(
-                        "element [{idx}] then read \"{now_reads}\" (element_changed: the app \
-                         reused it for other content)"
+                        "it then read \"{now_reads}\" (element_changed: the app reused it for \
+                         other content)"
                     ),
-                    None => format!("element [{idx}]'s name then could not be read"),
+                    None => "its name then could not be read".to_owned(),
                 }
             ),
             after,
@@ -2398,8 +2543,16 @@ fn select_row(
         RowLadderEnd::NotSelected => {
             let seen = row.observe();
             anyhow::bail!(
-                "row selection not confirmed for [{idx}] {role} \"{title}\": the app reports \
-                 {} (want the row selected and no other). Nothing claimed; take a fresh snapshot{}",
+                "row not selected: {label}. {} The app reports {} (want the row selected and \
+                 no other). Nothing claimed. {}",
+                if io.sent.is_empty() {
+                    "No route applied, so nothing was sent.".to_owned()
+                } else {
+                    format!(
+                        "Tried, each read back as not selected: {}.",
+                        io.sent.iter().map(|rung| rung_sent_text(*rung)).collect::<Vec<_>>().join("; ")
+                    )
+                },
                 match seen {
                     Some(seen) => format!(
                         "the row {}selected with {} other row(s) selected",
@@ -2408,10 +2561,11 @@ fn select_row(
                     ),
                     None => "no readable selection".to_owned(),
                 },
-                if foreground || !io.pointer_possible {
-                    "."
+                if foreground {
+                    "Take a fresh snapshot: the list may have changed under the click."
                 } else {
-                    ", or click the row by pixel with delivery_mode:\"foreground\"."
+                    "Next: click the row by x,y with delivery_mode:\"foreground\" (a real pointer \
+                     click), then read the selection back."
                 }
             )
         }
@@ -2460,7 +2614,7 @@ mod tests {
     #[test]
     fn row_ladder_sends_more_input_only_on_proof_of_a_miss() {
         use RowReadOutcome::{Missing, Selected, Unknown};
-        use RowRung::{AxSelect, Pointer, Press};
+        use RowRung::{AxSelect, Pointer, Press, PressAtCentre};
         use RungSend::{NotSent, Replaced, Sent};
         let ok = || Ok(());
         let changed = || Err(Some("The Home Depot".to_owned()));
@@ -2507,6 +2661,29 @@ mod tests {
              vec![Missing, Missing, Missing], RowLadderEnd::NotSelected,
              &["identity", "send AxSelect", "read Missing", "identity", "send Press",
                "read Missing", "identity", "send Pointer", "read Missing"]),
+            // Catalyst row (CatalystSearch, Messages): no AX selection write,
+            // no AXPress of its own; its content at the centre takes AXPress.
+            ("Catalyst row: centre press proven, no pointer", vec![PressAtCentre, Pointer],
+             vec![ok(), ok()], vec![Sent], vec![Selected], RowLadderEnd::Confirmed(PressAtCentre),
+             &["identity", "send PressAtCentre", "read Selected", "identity"]),
+            ("Catalyst row: centre press missing, pointer proven", vec![PressAtCentre, Pointer],
+             vec![ok(), ok(), ok()], vec![Sent, Sent], vec![Missing, Selected],
+             RowLadderEnd::Confirmed(Pointer),
+             &["identity", "send PressAtCentre", "read Missing", "identity", "send Pointer",
+               "read Selected", "identity"]),
+            ("Catalyst row: centre press unknown, no pointer", vec![PressAtCentre, Pointer],
+             vec![ok()], vec![Sent], vec![Unknown],
+             RowLadderEnd::Unverifiable { after: PressAtCentre, replaced: false },
+             &["identity", "send PressAtCentre", "read Unknown"]),
+            ("own press missing, then the centre press proven", vec![Press, PressAtCentre, Pointer],
+             vec![ok(), ok(), ok()], vec![Sent, Sent], vec![Missing, Selected],
+             RowLadderEnd::Confirmed(PressAtCentre),
+             &["identity", "send Press", "read Missing", "identity", "send PressAtCentre",
+               "read Selected", "identity"]),
+            ("Catalyst row: both missing, nothing claimed", vec![PressAtCentre, Pointer],
+             vec![ok(), ok()], vec![Sent, Sent], vec![Missing, Missing], RowLadderEnd::NotSelected,
+             &["identity", "send PressAtCentre", "read Missing", "identity", "send Pointer",
+               "read Missing"]),
             ("no rung applies", vec![], vec![], vec![], vec![], RowLadderEnd::NotSelected, &[]),
         ];
         for (name, applies, identity, sends, reads, want, want_log) in cases {

@@ -41,13 +41,18 @@ pub(crate) struct RowCandidate {
     pub selectable_peers: usize,
     /// One of those peers (or itself) is selected right now.
     pub peer_selected: bool,
+    /// Its parent advertises AXSelectedChildren: a list with a selection
+    /// model, even while nothing is selected (UIKit table and collection
+    /// views under Catalyst).
+    pub parent_lists_selection: bool,
 }
 
 /// Which step of the chain (clicked element first) is the row a plain click
 /// selects, if any. An AppKit row or list item wins, then a cell or icon;
-/// otherwise a Catalyst row: something selectable among 2+ selectable
-/// siblings, one of which is selected (Catalyst gives every element an
-/// AXSelected, so a selection model is only proven by a selected peer).
+/// otherwise a Catalyst row: something selectable whose parent lists a
+/// selection (AXSelectedChildren), or that sits among 2+ selectable siblings
+/// one of which is selected (Catalyst gives every element an AXSelected, so
+/// AXSelected alone proves no selection model).
 /// A click on a control inside a row is not a row click.
 pub(crate) fn choose_row(chain: &[RowCandidate]) -> Option<(usize, RowKind)> {
     let clicked = chain.first()?;
@@ -59,18 +64,20 @@ pub(crate) fn choose_row(chain: &[RowCandidate]) -> Option<(usize, RowKind)> {
         .or_else(|| find(&|c| is_selectable_container_role(&c.role)))
         .map(|at| (at, RowKind::Native))
         .or_else(|| {
-            find(&|c| c.selectable_peers >= 2 && c.peer_selected).map(|at| (at, RowKind::Catalyst))
+            find(&|c| c.parent_lists_selection || (c.selectable_peers >= 2 && c.peer_selected))
+                .map(|at| (at, RowKind::Catalyst))
         })
 }
 
-/// `choose_row`, reading a step's selectable peers (`scan_peers(at)`: count
-/// and whether one is selected) only when no AppKit row claims the click.
+/// `choose_row`, reading a step's selectable peers (`scan_peers(at)`: count,
+/// whether one is selected, and whether the parent lists a selection) only
+/// when no AppKit row claims the click.
 /// Peers are read bottom up and the climb stops at the first Catalyst row,
 /// since Catalyst answers each read slowly and a Finder list can hold
 /// thousands of rows. A click on a control scans nothing.
 pub(crate) fn find_row(
     chain: &mut [RowCandidate],
-    mut scan_peers: impl FnMut(usize) -> Option<(usize, bool)>,
+    mut scan_peers: impl FnMut(usize) -> Option<(usize, bool, bool)>,
 ) -> Option<(usize, RowKind)> {
     if chain.first().is_some_and(|clicked| is_control_role(&clicked.role)) {
         return None;
@@ -82,9 +89,10 @@ pub(crate) fn find_row(
         if !chain[at].selectable {
             continue;
         }
-        if let Some((peers, any)) = scan_peers(at) {
+        if let Some((peers, any, lists)) = scan_peers(at) {
             chain[at].selectable_peers = peers;
             chain[at].peer_selected = any;
+            chain[at].parent_lists_selection = lists;
             if let found @ Some(_) = choose_row(&chain[..=at]) {
                 return found;
             }
@@ -231,6 +239,7 @@ impl RowSelection {
                     selectable: copy_bool_attr(current, "AXSelected").is_some(),
                     selectable_peers: 0,
                     peer_selected: false,
+                    parent_lists_selection: false,
                 });
                 elements.push((current, parent));
                 let Some(parent) = parent else { break };
@@ -246,8 +255,11 @@ impl RowSelection {
             }
             let chosen = find_row(&mut chain, |at| {
                 elements[at].1.map(|parent| {
+                    if advertises_attribute(parent, "AXSelectedChildren") {
+                        return (0, false, true);
+                    }
                     let (peers, _, any, _) = scan_selection(parent, None);
-                    (peers, any)
+                    (peers, any, false)
                 })
             });
             let mut result = None;
@@ -271,6 +283,85 @@ impl RowSelection {
             }
             result
         }
+    }
+
+    /// The row around the element an AX hit test returned for a pointer
+    /// click. A read-only text area there (a message bubble) is the row's
+    /// content, so the walk starts at its parent; an editable one or any
+    /// other control is the click's target, never its row.
+    pub fn capture_for_hit(hit_ptr: usize) -> Option<Self> {
+        unsafe {
+            let hit = hit_ptr as AXUIElementRef;
+            if copy_string_attr(hit, "AXRole").as_deref() != Some("AXTextArea") {
+                return Self::capture(hit_ptr);
+            }
+            if attribute_settable(hit, "AXValue") == Some(true) {
+                return None;
+            }
+            let parent = copy_element_attr(hit, "AXParent")?;
+            let row = Self::capture(parent as usize);
+            CFRelease(parent as CFTypeRef);
+            row
+        }
+    }
+
+    /// Whether a screen point lies inside the row as it is now (2 points in
+    /// from its edges): a pointer click there still lands on this row.
+    pub fn contains_point(&self, x: f64, y: f64) -> bool {
+        unsafe { element_screen_rect(self.row) }.is_some_and(|[rx, ry, rw, rh]| {
+            x >= rx + 2.0 && x <= rx + rw - 2.0 && y >= ry + 2.0 && y <= ry + rh - 2.0
+        })
+    }
+
+    /// What a click at the row's centre reaches, when it is something inside
+    /// the row (not the row itself) that takes AXPress and is not a control:
+    /// a Catalyst row has no AXPress of its own, but its content does, and
+    /// pressing it selects the row as a tap there would. Retained; release
+    /// with CFRelease.
+    pub fn press_target_at_centre(&self, pid: i32) -> Option<AXUIElementRef> {
+        let (x, y) = self.center()?;
+        unsafe {
+            let hit = element_at_screen_position(pid, x, y)?;
+            let role = copy_string_attr(hit, "AXRole").unwrap_or_default();
+            let content = !is_control_role(&role)
+                || (role == "AXTextArea" && attribute_settable(hit, "AXValue") != Some(true));
+            let usable = content
+                && CFEqual(hit as CFTypeRef, self.row as CFTypeRef) == 0
+                && self.is_ancestor_of(hit)
+                && copy_action_names(hit).iter().any(|action| action == "AXPress");
+            if usable {
+                Some(hit)
+            } else {
+                CFRelease(hit as CFTypeRef);
+                None
+            }
+        }
+    }
+
+    unsafe fn is_ancestor_of(&self, element: AXUIElementRef) -> bool {
+        let mut current = copy_element_attr(element, "AXParent");
+        for _ in 0..MAX_SELECTION_ANCESTORS {
+            let Some(parent) = current else { return false };
+            let found = CFEqual(parent as CFTypeRef, self.row as CFTypeRef) != 0;
+            current = if found { None } else { copy_element_attr(parent, "AXParent") };
+            CFRelease(parent as CFTypeRef);
+            if found {
+                return true;
+            }
+        }
+        if let Some(parent) = current {
+            CFRelease(parent as CFTypeRef);
+        }
+        false
+    }
+
+    /// The row's name (Catalyst rows carry only a description).
+    pub fn name(&self) -> String {
+        ["AXTitle", "AXDescription"]
+            .into_iter()
+            .filter_map(|attribute| unsafe { copy_string_attr(self.row, attribute) })
+            .find(|name| !name.trim().is_empty())
+            .unwrap_or_default()
     }
 
     /// Whether the row still answers (it was not replaced).
@@ -537,7 +628,13 @@ mod tests {
             selectable,
             selectable_peers: peers,
             peer_selected,
+            parent_lists_selection: false,
         }
+    }
+
+    fn in_list(mut candidate: RowCandidate) -> RowCandidate {
+        candidate.parent_lists_selection = true;
+        candidate
     }
 
     #[test]
@@ -564,6 +661,18 @@ mod tests {
             step("AXGroup", true, 3, false),
         ];
         assert_eq!(choose_row(&stocks), Some((1, RowKind::Catalyst)));
+        // CatalystSearch / Messages (Catalyst UITableView): a row group whose
+        // list advertises AXSelectedChildren, with nothing selected yet and
+        // one row left after a search.
+        let message = [
+            in_list(step("AXGroup", true, 1, false)),
+            step("AXGroup", true, 1, false),
+            step("AXGroup", true, 2, false),
+        ];
+        assert_eq!(choose_row(&message), Some((0, RowKind::Catalyst)));
+        // A plain view inside the row (its list is the row's parent).
+        let inside = [step("AXGroup", true, 1, false), in_list(step("AXGroup", true, 1, false))];
+        assert_eq!(choose_row(&inside), Some((1, RowKind::Catalyst)));
     }
 
     #[test]
@@ -575,6 +684,11 @@ mod tests {
         // nothing proves a selection model (a toolbar group among groups).
         let toolbar = [step("AXGenericElement", true, 1, false), step("AXGroup", true, 3, false)];
         assert_eq!(choose_row(&toolbar), None);
+        // A list that lists its selection still never claims a control.
+        let button_in_list = [in_list(step("AXButton", true, 1, false))];
+        assert_eq!(choose_row(&button_in_list), None);
+        // Listing a selection needs a selectable child.
+        assert_eq!(choose_row(&[in_list(step("AXGroup", false, 0, false))]), None);
         assert_eq!(choose_row(&[]), None);
     }
 
@@ -600,7 +714,7 @@ mod tests {
             let mut scans = 0;
             let found = find_row(&mut chain, |_| {
                 scans += 1;
-                Some((11, true))
+                Some((11, true, true))
             });
             assert_eq!((found, scans), (None, 0), "{control}");
         }
@@ -612,10 +726,18 @@ mod tests {
         let mut scanned = vec![];
         let found = find_row(&mut stocks, |at| {
             scanned.push(at);
-            Some(if at == 0 { (1, false) } else { (11, true) })
+            Some(if at == 0 { (1, false, false) } else { (11, true, false) })
         });
         assert_eq!(found, Some((1, RowKind::Catalyst)));
         assert_eq!(scanned, [0, 1], "stops at the first Catalyst row");
+        // A row whose list lists its selection is found at once.
+        let mut message = vec![step("AXGroup", true, 0, false), step("AXGroup", true, 0, false)];
+        let mut scanned = vec![];
+        let found = find_row(&mut message, |at| {
+            scanned.push(at);
+            Some((0, false, at == 0))
+        });
+        assert_eq!((found, scanned), (Some((0, RowKind::Catalyst)), vec![0]));
     }
 
     #[test]
