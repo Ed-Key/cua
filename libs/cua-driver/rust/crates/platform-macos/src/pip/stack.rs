@@ -422,13 +422,23 @@ pub(super) struct Fan {
 /// deepest card that still leaves room for a chip, and that chip.
 pub(super) const LEFT_REACH: f64 = (MAX_CARDS - 2) as f64 * CARD_STEP + CHIP_GAP + CHIP_W;
 
+/// The tallest chip column: every back item a chip.
+pub(super) const CHIP_COLUMN: f64 = (MAX_CARDS - 1) as f64 * (CHIP_H + CHIP_ROW_GAP) - CHIP_ROW_GAP;
+
+/// How far the back items reach past a front card `card_h` tall on the
+/// side they fan to vertically: the deepest card's strip, or a full chip
+/// column taller than the card.
+pub(super) fn vertical_reach(card_h: f64) -> f64 {
+    STACK_MARGIN.max(CHIP_COLUMN - card_h)
+}
+
 /// The fan for a front card drawn at `card` (screen rect, AppKit
 /// bottom-left origin) on a screen whose visible frame is `visible`: below
-/// when the strips above would leave the frame's top, right when the cards
-/// and chips on the left would leave its left edge.
+/// when the strips (or chips) above would leave the frame's top, right when
+/// the cards and chips on the left would leave its left edge.
 pub(super) fn fan_for(card: Area, visible: Area) -> Fan {
     Fan {
-        below: visible.y + visible.h - (card.y + card.h) < STACK_MARGIN,
+        below: visible.y + visible.h - (card.y + card.h) < vertical_reach(card.h),
         right: card.x - visible.x < LEFT_REACH,
     }
 }
@@ -658,18 +668,19 @@ pub(super) struct Trail {
     max_lag: f64,
     /// When the last drag ended, until its settle is reported.
     released: Option<Instant>,
-    /// How far the back items reach past the deck on a mirrored side
-    /// (`fan_reach`): the lag gives up that much of `LAG_ROOM` there.
+    /// How far the back items reach past the deck where the window has
+    /// only `LAG_ROOM` (`fan_reach`): the lag gives up that much of it.
     reach: f64,
 }
 
-/// How far a stack fanned by `fan` reaches past the deck's right or bottom
-/// edge, where the window keeps only `LAG_ROOM` (its chip column and stack
-/// margin are on the left and top).
-pub(super) fn fan_reach(fan: Fan) -> f64 {
+/// How far a stack fanned by `fan` around a front card `card_h` tall
+/// reaches past the deck where the window keeps only `LAG_ROOM`: right or
+/// below it when mirrored, above the deck's stack margin when a chip column
+/// is taller than the card.
+pub(super) fn fan_reach(fan: Fan, card_h: f64) -> f64 {
     let right = if fan.right { LEFT_REACH } else { 0.0 };
-    let below = if fan.below { STACK_MARGIN } else { 0.0 };
-    right.max(below)
+    let vertical = vertical_reach(card_h) - if fan.below { 0.0 } else { STACK_MARGIN };
+    right.max(vertical)
 }
 
 fn spring_moving(spring: &Spring) -> bool {
@@ -690,10 +701,10 @@ impl Trail {
         spring_moving(&self.chips) || spring_moving(&self.cards)
     }
 
-    /// The stack now fans by `fan`: the lag is capped so mirrored items
-    /// never leave the window.
-    pub(super) fn fan(&mut self, fan: Fan) {
-        self.reach = fan_reach(fan);
+    /// The stack fans by `fan` around a front card `card_h` tall: the lag
+    /// is capped so its items never leave the window.
+    pub(super) fn fan(&mut self, fan: Fan, card_h: f64) {
+        self.reach = fan_reach(fan, card_h);
     }
 
     /// The panel was dragged by `delta`: the back items stay where they
@@ -1613,17 +1624,21 @@ mod tests {
             Fan { below: true, right: false },
             Fan { below: true, right: true },
         ] {
-            let mut trail = Trail::default();
-            trail.fan(fan);
-            for _ in 0..20 {
-                trail.panel_dragged((-60.0, 60.0));
+            for card_h in [233.0, 109.0] {
+                let mut trail = Trail::default();
+                trail.fan(fan, card_h);
+                for _ in 0..20 {
+                    trail.panel_dragged((-60.0, 60.0));
+                }
+                let (x, y) = trail.offset(Slot::Chip(0));
+                let reach = fan_reach(fan, card_h);
+                assert!((x.hypot(y) - (TRAIL_LAG_CAP - reach)).abs() < 1e-6, "{fan:?} {card_h}");
             }
-            let (x, y) = trail.offset(Slot::Chip(0));
-            assert!((x.hypot(y) - (TRAIL_LAG_CAP - fan_reach(fan))).abs() < 1e-6, "{fan:?}");
-            assert!(x.hypot(y) + fan_reach(fan) <= LAG_ROOM + 1e-6);
         }
+        // A 109 pt card's three-chip column hangs 59 pt below it.
+        assert_eq!(fan_reach(Fan { below: true, right: false }, 109.0), CHIP_COLUMN - 109.0);
         let mut trail = Trail::default();
-        trail.fan(Fan::default());
+        trail.fan(Fan::default(), 233.0);
         for _ in 0..20 {
             trail.panel_dragged((-60.0, 60.0));
         }
@@ -1973,7 +1988,7 @@ mod tests {
         let visible = Area { x: 0.0, y: 0.0, w: 1440.0, h: 875.0 };
         let bounds = hold((320.0, 200.0));
         let (ww, wh) = window_size(bounds);
-        for card in [(274.0, 233.0), (320.0, 145.0), (145.0, 320.0)] {
+        for card in [(274.0, 233.0), (320.0, 145.0), (240.0, 109.0), (145.0, 320.0)] {
             // Three chips (the tallest chip column), and two cards with a chip.
             for finished in [[false, true, true, true], [false, false, false, true]] {
                 let layout = slots(&finished);
@@ -2003,8 +2018,13 @@ mod tests {
                             screen.y >= visible.y - 0.5 && screen.y + screen.h <= visible.y + visible.h + 0.5,
                             "{at:?}: {screen:?} leaves the visible frame"
                         );
+                        // Inside the panel window even at the fullest lag.
                         let w = to_window(item);
-                        assert!(w.x >= 0.0 && w.y >= 0.0 && w.x + w.w <= ww && w.y + w.h <= wh, "{at:?}: {w:?}");
+                        let lag = TRAIL_LAG_CAP - fan_reach(fan, card.1);
+                        assert!(
+                            w.x - lag >= -0.5 && w.y - lag >= -0.5 && w.x + w.w + lag <= ww + 0.5 && w.y + w.h + lag <= wh + 0.5,
+                            "{at:?}: {w:?} with {lag} pt of lag"
+                        );
                     }
                 }
             }

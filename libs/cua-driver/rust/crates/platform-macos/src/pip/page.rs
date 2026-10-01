@@ -289,7 +289,7 @@ unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area,
     let Some(root) = root else {
         CFRelease(app as CFTypeRef);
         // Past the deadline the AXWindows read itself timed out.
-        return Err(if Instant::now() >= deadline {
+        return Err(if message_timeout(deadline, Instant::now()).is_none() {
             LATE
         } else {
             "the window is not in its app's accessibility tree"
@@ -308,7 +308,8 @@ unsafe fn page_area(pid: i32, window_id: u32, deadline: Instant) -> Result<Area,
     // A message that timed out reads as a missing value: past the deadline
     // nothing the walk saw can be trusted to be all of it. With time left,
     // an incomplete walk (node budget, a failed read) is not late.
-    let found = if Instant::now() >= deadline {
+    // Under a millisecond left counts as spent (`message_timeout`).
+    let found = if message_timeout(deadline, Instant::now()).is_none() {
         Err(LATE)
     } else if !walk.complete {
         Err("the lookup could not read all of the window's views")

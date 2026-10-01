@@ -1884,7 +1884,6 @@ unsafe fn sync_fan(panel: &mut Panel) {
     }
     let drawn = settle_frames(panel);
     panel.fan = fan;
-    panel.trail_motion.fan(fan);
     if panel.shown {
         for (index, slot) in panel.layout.clone().into_iter().enumerate() {
             let rest = resting(panel, slot, cards);
@@ -5143,6 +5142,8 @@ fn slot_views(panel: &Panel, slot: Slot) -> Vec<usize> {
 
 /// Put every item view (and its hit plate) where it is drawn now.
 unsafe fn apply_card_frames(panel: &mut Panel) {
+    // The lag the window has room for with this fan and card.
+    panel.trail_motion.fan(panel.fan, panel.front.1);
     let cards = back_cards(&panel.layout);
     for slot in panel.layout.clone() {
         let placed = to_window(view_frame(panel, slot, cards));
