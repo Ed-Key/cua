@@ -261,11 +261,15 @@ pub(crate) fn describe(
         _ => {}
     }
     if let (Some(a), Some(b)) = (&before.sheets, &after.sheets) {
-        for sheet in subtract(b, a) {
-            parts.push(format!("sheet opened: {sheet}"));
+        let said = |entry: &str, verb: &str| match entry.split_once(": ") {
+            Some((kind, name)) => format!("{kind} {verb}: {name}"),
+            None => format!("{entry} {verb}"),
+        };
+        for surface in subtract(b, a) {
+            parts.push(said(&surface, "opened"));
         }
-        for sheet in subtract(a, b) {
-            parts.push(format!("sheet closed: {sheet}"));
+        for surface in subtract(a, b) {
+            parts.push(said(&surface, "closed"));
         }
     }
     match (&before.collection, &after.collection) {
@@ -350,7 +354,7 @@ pub(crate) fn describe(
         let seconds = NO_CHANGE_WAIT.as_secs_f32();
         let mut line = if complete {
             format!(
-                "nothing it watches changed within {seconds:.1} s (focus, selection, list items, values, title, document, sheets)"
+                "nothing it watches changed within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers)"
             )
         } else {
             format!("no change seen within {seconds:.1} s, but the app did not answer every read")
@@ -452,6 +456,12 @@ fn file_stamp(path: &Path) -> Option<FileStamp> {
 /// A retained AX element that is released when dropped.
 struct Owned(AXUIElementRef);
 
+/// An element's children, each owned before any of them is looked at, so an
+/// early stop releases the rest.
+unsafe fn kids(element: AXUIElementRef) -> Vec<Owned> {
+    copy_children(element).into_iter().map(Owned).collect()
+}
+
 impl Drop for Owned {
     fn drop(&mut self) {
         unsafe { CFRelease(self.0 as CFTypeRef) };
@@ -507,14 +517,14 @@ unsafe fn item_name(reader: &mut Reader, element: AXUIElementRef) -> Option<Stri
     if let Some(label) = own_label(element) {
         return Some(label);
     }
-    for child in copy_children(element).into_iter().map(Owned).take(6) {
+    for child in kids(element).into_iter().take(6) {
         if !reader.admit(child.0) {
             return None;
         }
         if let Some(label) = own_label(child.0) {
             return Some(label);
         }
-        for grandchild in copy_children(child.0).into_iter().map(Owned).take(6) {
+        for grandchild in kids(child.0).into_iter().take(6) {
             if !reader.admit(grandchild.0) {
                 return None;
             }
@@ -662,7 +672,8 @@ unsafe fn read_collection(reader: &mut Reader, element: AXUIElementRef) -> Colle
     .then(|| match copy_element_array_attr_checked(element, selected_attr, MAX_SELECTED) {
         Ok(selected) => {
             let mut out = Vec::new();
-            for item in selected.into_iter().map(Owned) {
+            let selected: Vec<Owned> = selected.into_iter().map(Owned).collect();
+            for item in selected {
                 out.push(item_name(reader, item.0)?);
             }
             out.sort();
@@ -751,19 +762,23 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
         }
         if reader.admit(w.0) {
             let mut sheets = Vec::new();
-            for child in copy_children(w.0).into_iter().map(Owned) {
+            for child in kids(w.0) {
                 if !reader.admit(child.0) {
                     break;
                 }
-                if copy_string_attr(child.0, "AXRole").as_deref() == Some("AXSheet") {
-                    sheets.push(sheet_name(child.0));
+                let role = copy_string_attr(child.0, "AXRole");
+                if role.as_deref() == Some("AXPopover") {
+                    sheets.push(surface("popover", child.0));
+                }
+                if role.as_deref() == Some("AXSheet") {
+                    sheets.push(surface("sheet", child.0));
                     // A sheet on a sheet (Go to Folder over a Save panel).
-                    for inner in copy_children(child.0).into_iter().map(Owned) {
+                    for inner in kids(child.0) {
                         if !reader.admit(inner.0) {
                             break;
                         }
                         if copy_string_attr(inner.0, "AXRole").as_deref() == Some("AXSheet") {
-                            sheets.push(sheet_name(inner.0));
+                            sheets.push(surface("sheet", inner.0));
                         }
                     }
                 }
@@ -817,11 +832,15 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
     }
 }
 
-unsafe fn sheet_name(sheet: AXUIElementRef) -> String {
-    text_attr(sheet, "AXDescription")
-        .or_else(|| text_attr(sheet, "AXTitle"))
-        .or_else(|| text_attr(sheet, "AXIdentifier").filter(|id| !id.starts_with("_NS:")))
-        .unwrap_or_else(|| "sheet".into())
+/// A sheet or popover as the line names it: "sheet: save", "popover".
+unsafe fn surface(kind: &str, element: AXUIElementRef) -> String {
+    match text_attr(element, "AXDescription")
+        .or_else(|| text_attr(element, "AXTitle"))
+        .or_else(|| text_attr(element, "AXIdentifier").filter(|id| !id.starts_with("_NS:")))
+    {
+        Some(name) => format!("{kind}: {name}"),
+        None => kind.to_owned(),
+    }
 }
 
 unsafe fn retained(ptr: usize) -> AXUIElementRef {
@@ -869,14 +888,14 @@ unsafe fn disk_notes(before: &Facts, pass: &Pass) -> DiskNotes {
 
 /// The window's text area (two levels down at most), as TextEdit has it.
 unsafe fn window_text(window: AXUIElementRef) -> Option<String> {
-    let mut level: Vec<Owned> = copy_children(window).into_iter().map(Owned).collect();
+    let mut level = kids(window);
     for _ in 0..3 {
         let mut next = Vec::new();
         for element in level {
             if copy_string_attr(element.0, "AXRole").as_deref() == Some("AXTextArea") {
                 return copy_string_attr(element.0, "AXValue");
             }
-            next.extend(copy_children(element.0).into_iter().map(Owned).take(12));
+            next.extend(kids(element.0).into_iter().take(12));
         }
         level = next;
     }
@@ -1185,7 +1204,7 @@ mod tests {
         let mut before = window("note.txt");
         before.document = Some("/Users/lume/lab/work/note.txt".into());
         before.file = Some(FileStamp { modified: SystemTime::UNIX_EPOCH, len: 6 });
-        before.sheets = Some(vec!["save".into()]);
+        before.sheets = Some(vec!["sheet: save".into()]);
         let mut after = window("groceries.txt");
         after.document = Some("/Users/lume/lab/work/groceries.txt".into());
         after.file = Some(FileStamp { modified: SystemTime::UNIX_EPOCH, len: 52 });
@@ -1199,11 +1218,14 @@ mod tests {
     }
 
     #[test]
-    fn a_menu_that_opens_a_sheet_says_so() {
+    fn a_menu_that_opens_a_sheet_or_popover_says_so() {
         let before = window("note.txt");
         let mut after = before.clone();
-        after.sheets = Some(vec!["save".into()]);
-        assert_eq!(describe(&before, &after, &DiskNotes::default(), Settle::Settled, true), "sheet opened: save");
+        after.sheets = Some(vec!["sheet: save".into(), "popover".into()]);
+        assert_eq!(
+            describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
+            "sheet opened: save; popover opened"
+        );
     }
 
     #[test]
