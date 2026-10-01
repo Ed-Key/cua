@@ -412,6 +412,10 @@ impl SdkAdapter {
 
     pub fn end_transport_sessions(&self, transport_session: &str) -> usize {
         let owner = format!("{}{}", self.runtime_prefix, transport_session);
+        // Its turn goes first, even with no session left: one still open was
+        // interrupted (or its client died), so its panels close quietly
+        // before the sessions' end hooks apply the connection-close rule.
+        cua_driver_core::pip_turn::forget(&owner);
         cua_driver_core::session::end_sessions_for_owner(
             &owner,
             cua_driver_core::session::SessionEndReason::ProcessExit,

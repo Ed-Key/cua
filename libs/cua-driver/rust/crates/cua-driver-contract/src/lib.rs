@@ -48,9 +48,10 @@ pub use inputs::{
     EscalateSessionInput, EscalationReason, GetAgentCursorStateInput, GetCursorPositionInput,
     GetDesktopStateInput, GetScreenSizeInput, GetSessionInput, GetSessionStateInput, HotkeyInput,
     InputDeliveryMode, InvokeMenuInput, LegacyClickInput, ListSessionsInput, MoveCursorInput,
-    PressKeyInput, ScrollBy, ScrollDirection, ScrollInput, SetAgentCursorEnabledInput,
-    SetAgentCursorMotionInput, SetAgentCursorThemeInput, SetWindowFrameInput, StartSessionInput,
-    ToolInput, TypeTextInput, MULTI_CALL_SESSION_DESCRIPTION,
+    PipTurnInput, PressKeyInput, ScrollBy, ScrollDirection, ScrollInput,
+    SetAgentCursorEnabledInput, SetAgentCursorMotionInput, SetAgentCursorThemeInput,
+    SetWindowFrameInput, StartSessionInput, ToolInput, TypeTextInput,
+    MULTI_CALL_SESSION_DESCRIPTION,
 };
 pub use outputs::{
     advertised_output_schema, conforming_error_envelope, is_refusal_envelope,
@@ -479,8 +480,10 @@ mod tests {
     fn every_contract_has_success_schema_and_platforms() {
         for tool in manifest().tools {
             assert!(!tool.platforms.is_empty(), "{} has no platform", tool.name);
+            // pip_turn answers a client hook, which reads a tool's text as
+            // its own output: it returns nothing, by design.
             assert!(
-                tool.success_output_schema.is_some(),
+                tool.success_output_schema.is_some() || tool.name == "pip_turn",
                 "{} has no success output schema",
                 tool.name
             );

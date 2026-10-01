@@ -18,6 +18,13 @@
 //! while the work is fresh (see the table); otherwise the panel closes
 //! quietly.
 //!
+//! With a client that reports its turns (Claude Code's hooks call
+//! `pip_turn`; see `cua_driver_core::pip_turn`), a session acting in an
+//! open turn is not idle however long it is quiet, and the turn's end is
+//! its finish: the finale plays as at session end, once per turn, while the
+//! session lives on for the next turn. A session no client reports turns for
+//! behaves as described here without the turn rows.
+//!
 //! The finale plays on proof and at session end. Proof is a satisfied claim
 //! newer than the session's last action: its finale plays once the session
 //! has been quiet for 8 s since the later of that action and the proof's
@@ -42,11 +49,14 @@
 //! | Action note (on push; a frame that names a window its pid does not own is dropped before its note: no event at all) | records the action at its event ms (the session's last action is the newest of them), and the window it touched (identity and app, titled with the app name until a frame names it); ends a session finish older than it | none are dropped, but a claim older than the session's last action is no longer proof: it waits for a later finale | only if newer than the last applied action: cancels the finale (one playing, or a proof finale still waiting for its quiet period), restarts the idle deadline, lifts a user close | none |
 //! | Captured frame (a session's panel is created only by a frame whose capture succeeded; a frame with no picture for a session with no panel is dropped, and its action note waits for the panel a later frame creates) | resolves a pid-only action to its window at the action's event ms (replacing that action's app-only chip) and names the touched window (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card (and its shape, from the window's size), back items, window titles. While the user's pick is the front card (see `hands`) and the frame is of another window: that window joins or refreshes as the first back card with this still, title and shape on its own card, and the header, the live stream and the visibility answer stay the pick's |
 //! | Verification | latest by event ms per window (an older one never wins; a repeat with the same event time and status is not news) | latest by event ms per predicate (its identity on its window, not its display label, which may collide: two predicates with one label are two rows), kept across finales; an older one is ignored, and so is a repeat with the same event time and status | if it brought news: replays a playing finale. Proof (a satisfied claim newer than the session's last action) starts the proof timer; unsatisfied or unknown news starts nothing by itself. Before the session's first capture the panel does not exist yet: the evidence is kept for it, and its proof timer starts with the panel | chips and cards follow the verdicts; the front card shows its check badge while its window is finished; a shown panel stays up while proof waits for its finale, and fades as soon as news calls that proof off |
-//! | Idle timer (8 s after the last action) | none: idle is not done | none | none: no finale | the panel fades (a quiet hide), unless proof is waiting for its finale or the user holds it (see `hands`: it then fades when the hold is over) |
+//! | Idle timer (8 s after the last action) | none: idle is not done | none | none: no finale | the panel fades (a quiet hide), unless proof is waiting for its finale or the user holds it (see `hands`: it then fades when the hold is over); never while the session acts in an open turn |
 //! | Proof timer (8 s after the later of the session's last action and the proof's arrival, with no newer action) | none | the waiting proof is settled: it never comes due again by itself, played or not (its claims stay unshown until a finale displays them) | if a satisfied claim newer than the last action is still unshown and unsettled, the checklist plays (every unshown claim, latest status per predicate: a claim that flipped to unsatisfied shows as that): on the panel if it is up, and a quietly hidden panel is shown for it, unless the user closed the panel or the target window is fully visible (then nothing plays). The user's hold never moves this timer | the panel fades after |
 //! | `end_session` | the session finishes (now), always, whatever a finale is doing: each window it touched counts as finished unless its latest verification since its last action was not satisfied | none | a finale already playing keeps playing; otherwise one plays if anything is unshown (the checklist with claims, else the chips row) and the panel is up or may come up for it (not closed by the user, target window not fully visible); then the panel closes | back cards collapse to chips; the panel leaves the live set |
 //! | The session's control connection closing (or its host ending it) | only while the work is fresh, by event time: the session's last action is at most 8 s older than the close, or a finale is playing, or proof is waiting for its finale. Then as `end_session`. Otherwise none: not a finish | none | fresh: as `end_session`. Otherwise none: no finale plays and nothing is marked shown | fresh: as `end_session`. Otherwise the panel closes quietly and leaves the live set |
 //! | Idle-TTL eviction (the core reclaimed the session after 300 s idle; its connection may revive it) | none: not a finish | none | none: no finale plays, one playing is cut | the panel closes quietly and leaves the live set; a revived session starts a new panel on its next frame |
+//! | Turn open (the session acted in a turn the client's hooks opened) | none | none | the idle deadline does not apply until the turn ends; proof keeps its badge and evidence, but its finale waits for the turn's end (one finale per turn); the user's close as always | the panel stays up (unless the user closed it, the target window is fully visible, or neither applies and it waits for its first frame), and the visibility poll keeps answering for it |
+//! | Turn finished (the client's Stop, then 1.5 s with no action from its connection) | as `end_session` | none | as `end_session` (the playing finale keeps playing, else one plays if anything is unshown, the turn's proof as its checklist, and the panel may come up for it), but the session and its panel stay for the next turn; no proof plays its own finale after it | the panel fades after the finale (at once without one, unless the user holds it); a newer action brings it back, and finished marks give way to that action as after any finish |
+//! | Turn ended quietly (StopFailure, the turn's 5 min lease with no action, a new prompt after an interrupted turn) | none | none | no finale, now or for proof waiting then | the panel fades (unless the user holds it) |
 //! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim by predicate, and each touched window a chip or checklist stood for by its action: app and event time, so it holds when the window resolves meanwhile); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades, or, while the user holds it, stays with the finished state up and fades when the hold is over (an ended session's panel closes either way) |
 //! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not proof, not the user's hold) shows the panel or plays a finale | the panel hides (an ending one closes) |
 //! | The user's hands on the panel (pointer on it, press, release, click on a back card, scroll, Focus) | none | none | none: the agent's clock, the proof timer and every finale run as if the user were not there | see the table in `hands`: a held panel stays up and keeps its back cards, and a clicked card stays in front |
@@ -772,6 +782,21 @@ impl Lifecycle {
 pub(super) fn proof_quiet(last_action: Instant, proof: Option<Instant>, now: Instant) -> bool {
     let since = proof.map_or(last_action, |proof| proof.max(last_action));
     now.saturating_duration_since(since) >= IDLE_HIDE_AFTER
+}
+
+/// Whether the agent's side keeps a panel up (before the user's side and a
+/// finale; see `hands::shows`): an open hooked turn keeps it up however long
+/// the session is quiet (`idle_due`), a turn that ended lets it go at once,
+/// and with no turn reported the idle period decides.
+pub(super) fn agent_active(turn_open: bool, turn_done: bool, idle_due: bool) -> bool {
+    !turn_done && (turn_open || !idle_due)
+}
+
+/// Whether proof may play its own finale: not inside an open hooked turn
+/// (the turn's end plays it) and not after the turn ended (that end
+/// decided).
+pub(super) fn proof_may_play(turn_open: bool, turn_done: bool) -> bool {
+    !turn_open && !turn_done
 }
 
 /// Whether a due finale has a panel to play on: one that is up, or a hidden
@@ -1613,6 +1638,76 @@ mod tests {
     }
 
     // ── Row: finale timer ────────────────────────────────────────────────
+
+    // ── Rows: turns ──────────────────────────────────────────────────────
+
+    #[test]
+    fn row_turn_open_keeps_the_panel_up_and_holds_proof_for_the_turns_end() {
+        // Quiet for 20 s (S2's wait) or an hour inside an open turn: up.
+        assert!(agent_active(true, false, true));
+        assert!(agent_active(true, false, false));
+        // No turn reported: the idle period decides, as before turns.
+        assert!(agent_active(false, false, false));
+        assert!(!agent_active(false, false, true));
+        // Proof keeps its badge but plays no finale of its own in the turn.
+        let (mut verdicts, mut life) = proved();
+        assert!(verdicts.finished(10), "the badge, at once");
+        assert!(!proof_may_play(true, false));
+        let own = proof_may_play(true, false);
+        assert_eq!(proof_finale(&mut verdicts, &mut life, own, true), None);
+        assert!(
+            verdicts.proof_waiting(),
+            "kept, unsettled, for the turn's end"
+        );
+        // Unhooked: proof plays as before.
+        assert!(proof_may_play(false, false));
+    }
+
+    #[test]
+    fn row_turn_finished_plays_one_finale_and_keeps_the_session() {
+        // The turn's proof is the turn finish's checklist.
+        let (mut verdicts, mut life) = proved();
+        let Ending::Play(finale, generation) =
+            end_session(&mut verdicts, &mut life, FINISHED, 300, true)
+        else {
+            panic!("the checklist");
+        };
+        assert_eq!(finale.log_rows(), ["satisfied: saved"]);
+        assert!(life.end(generation));
+        verdicts.finale_shown(&finale);
+        // After it the panel goes (the turn is done), and nothing plays again:
+        // neither its proof nor a second end.
+        assert!(!agent_active(false, true, false));
+        assert!(!proof_may_play(false, true));
+        assert_eq!(
+            end_session(&mut verdicts, &mut life, FINISHED, 400, true),
+            Ending::Close
+        );
+        // The session lives on: its next action (a blocked Stop, or the next
+        // turn) is work again, and the finished mark gives way to it.
+        assert_eq!(life.resume(500), Some(false));
+        verdicts.note_action(A, 500, "Notes");
+        assert!(!verdicts.finished(10));
+        // A turn with no claims plays the chips row once.
+        let (mut verdicts, mut life) = (Verdicts::default(), Lifecycle::default());
+        life.resume(100);
+        verdicts.note_action(A, 100, "Notes");
+        let Ending::Play(chips, _) = end_session(&mut verdicts, &mut life, FINISHED, 200, true)
+        else {
+            panic!("the chips row");
+        };
+        assert_eq!(chips.log_rows(), ["finished: Notes"]);
+    }
+
+    #[test]
+    fn row_turn_ended_quietly_fades_and_plays_nothing() {
+        let (mut verdicts, mut life) = proved();
+        // Proof was waiting when the turn ended quietly: it never plays.
+        let own = proof_may_play(false, true);
+        assert!(!agent_active(false, true, false), "it fades at once");
+        assert_eq!(proof_finale(&mut verdicts, &mut life, own, true), None);
+        assert!(!life.playing());
+    }
 
     #[test]
     fn row_finale_timer_ends_only_its_own_finale_and_marks_what_it_showed() {

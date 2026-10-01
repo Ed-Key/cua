@@ -5642,6 +5642,52 @@ const FfiConverterTypeParseVisualRegionsOutput = (() => {
     return new FFIConverter();
 })();
 
+/**
+ * A client hook reporting that the agent's turn started or ended.
+ */
+export type PipTurnInput = {
+    /**
+     * The client's hook event name: UserPromptSubmit, Stop, StopFailure or
+     * SessionEnd. Any other value is ignored.
+     */
+    event: string
+}
+
+/**
+ * Generated factory for {@link PipTurnInput} record objects.
+ */
+export const PipTurnInput = (() => {
+    const defaults = () => ({
+    });
+    const create = (() => {
+        return uniffiCreateRecord<PipTurnInput, ReturnType<typeof defaults>>(defaults);
+    })();
+    return Object.freeze({
+        create,
+        new: create,
+        defaults: () => Object.freeze(defaults()) as Partial<PipTurnInput>,
+    });
+})();
+
+const FfiConverterTypePipTurnInput = (() => {
+    type TypeName = PipTurnInput;
+    class FFIConverter extends AbstractFfiConverterByteArray<TypeName> {
+        read(from: RustBuffer): TypeName {
+            return {
+                event: FfiConverterString.read(from)
+            };
+        }
+        write(value: TypeName, into: RustBuffer): void {
+            FfiConverterString.write(value.event, into);
+        }
+        allocationSize(value: TypeName): number {
+            return FfiConverterString.allocationSize(value.event);
+
+        }
+    };
+    return new FFIConverter();
+})();
+
 export enum VerificationStatus {
     Satisfied,
     Unsatisfied,
@@ -8240,6 +8286,7 @@ export default Object.freeze({
     FfiConverterTypeParseVisualRegionsInput,
     FfiConverterTypeParseVisualRegionsOptions,
     FfiConverterTypeParseVisualRegionsOutput,
+    FfiConverterTypePipTurnInput,
     FfiConverterTypePlatform,
     FfiConverterTypePredicateOutcome,
     FfiConverterTypePressKeyInput,

@@ -330,6 +330,30 @@ fn maybe_init_pip() {
                     }
                 }
             });
+            // The client's turn (its hooks call `pip_turn`). Its session end
+            // takes the panel down as `end_session` would (a Stop came), or
+            // quietly with no finished state (the turn was still open), the
+            // lifecycle session untouched.
+            cua_driver_core::pip_turn::set_pip_turn_fn(|session_key, turn| {
+                use cua_driver_core::pip_turn::PipHookTurn;
+                if let Some(slot) = BACKEND.get() {
+                    if let Some(b) = slot.lock().unwrap().as_ref() {
+                        match turn {
+                            PipHookTurn::Open => b.turn(session_key, pip_preview::PipTurn::Open),
+                            PipHookTurn::Finished => {
+                                b.turn(session_key, pip_preview::PipTurn::Finished)
+                            }
+                            PipHookTurn::Quiet => b.turn(session_key, pip_preview::PipTurn::Quiet),
+                            PipHookTurn::End { finished: true } => {
+                                b.end_session(session_key, pip_preview::PipSessionEnd::Finished)
+                            }
+                            PipHookTurn::End { finished: false } => {
+                                b.end_session(session_key, pip_preview::PipSessionEnd::Expired)
+                            }
+                        }
+                    }
+                }
+            });
             // Same private key the frames carry, so the ended session's
             // panel goes away with its cursor and recording. Only an
             // explicit end says the session is done. Its connection closing
@@ -344,6 +368,14 @@ fn maybe_init_pip() {
                         pip_preview::PipSessionEnd::Expired
                     }
                     Some(SessionEndReason::Explicit) => pip_preview::PipSessionEnd::Finished,
+                    // Its connection closed while its hooked turn was open (an
+                    // interrupted or dead turn), even if its teardown waited
+                    // for calls in flight: quietly.
+                    Some(SessionEndReason::ProcessExit | SessionEndReason::Unknown)
+                        if cua_driver_core::pip_turn::ends_quietly(session_key) =>
+                    {
+                        pip_preview::PipSessionEnd::Expired
+                    }
                     Some(SessionEndReason::ProcessExit | SessionEndReason::Unknown) => {
                         pip_preview::PipSessionEnd::Disconnected
                     }

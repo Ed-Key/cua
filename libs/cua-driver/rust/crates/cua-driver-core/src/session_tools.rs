@@ -509,6 +509,26 @@ impl Tool for EndSessionTool {
     }
 }
 
+// ── pip_turn ──────────────────────────────────────────────────────────────────
+
+/// A client hook's turn event. The registry handles it before any lifecycle
+/// admission, recording or PiP frame (see `pip_turn`); this body only answers
+/// a direct invocation. Either way: no content, never an error.
+pub struct PipTurnTool;
+
+static PIP_TURN_DEF: OnceLock<ToolDef> = OnceLock::new();
+
+#[async_trait]
+impl Tool for PipTurnTool {
+    fn def(&self) -> &ToolDef {
+        PIP_TURN_DEF.get_or_init(|| session_tool_def("pip_turn"))
+    }
+
+    async fn invoke(&self, _args: Value) -> ToolResult {
+        ToolResult::text("")
+    }
+}
+
 fn session_tool_def(name: &str) -> ToolDef {
     let contract = cua_driver_contract::tool_contract(name)
         .unwrap_or_else(|| panic!("canonical contract missing {name}"));

@@ -895,7 +895,7 @@ impl ToolRegistry {
     pub fn register_session_tools(&mut self) {
         use crate::session_tools::{
             EndSessionTool, EscalateSessionTool, GetSessionStateTool, GetSessionTool,
-            ListSessionsTool, StartSessionTool,
+            ListSessionsTool, PipTurnTool, StartSessionTool,
         };
         self.register(Box::new(StartSessionTool));
         self.register(Box::new(EscalateSessionTool));
@@ -903,6 +903,7 @@ impl ToolRegistry {
         self.register(Box::new(ListSessionsTool));
         self.register(Box::new(GetSessionStateTool));
         self.register(Box::new(EndSessionTool));
+        self.register(Box::new(PipTurnTool));
     }
 
     pub fn register_perception_tool(
@@ -1181,6 +1182,22 @@ impl ToolRegistry {
         // caller-chosen label alone. Translate it only after authorization so
         // policy and manifests continue to evaluate the public request.
         let runtime_prefix = namespace_runtime_args(&mut args, context, evidence);
+        // A client hook's turn event: before any lifecycle admission, so it
+        // never creates, revives or refreshes a session, and before
+        // recording, history and PiP frames. No content (a hook reads a
+        // tool's text as its own output), never an error.
+        let transport = args
+            .get("_transport_session_id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        if resolved_name == "pip_turn" {
+            if let Some(event) = args.get("event").and_then(Value::as_str) {
+                crate::pip_turn::hook(&transport, event);
+            }
+            return ToolResult::text("");
+        }
+        crate::pip_turn::action(&transport);
         if session_selecting_tool(resolved_name) {
             adopt_implicit_session(&mut args, &runtime_prefix);
         }
@@ -1683,7 +1700,11 @@ impl ToolRegistry {
                 &runtime_prefix,
                 bound_window,
             );
-            if pip_hook::pip_frame_wanted(resolved_name, &frame) {
+            // A call that finishes after its connection closed on an open
+            // turn brings no panel back.
+            if pip_hook::pip_frame_wanted(resolved_name, &frame)
+                && crate::pip_turn::acted(&transport, &frame.session_key)
+            {
                 pip_hook::push_pip_frame(frame);
             }
         }
@@ -1698,7 +1719,9 @@ impl ToolRegistry {
                 &public_args,
                 result.structured_content.as_ref(),
             ) {
-                pip_hook::push_pip_verification(event);
+                if crate::pip_turn::acted(&transport, &event.session_key) {
+                    pip_hook::push_pip_verification(event);
+                }
             }
         }
         drop(lifecycle_dispatch);

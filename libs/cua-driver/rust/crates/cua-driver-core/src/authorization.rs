@@ -885,7 +885,9 @@ pub fn advertised_risk_for(tool: &str) -> RiskAssessment {
         | "get_recording_state"
         | "check_for_update"
         | "health_report"
-        | "probe" => RiskClass::R0,
+        | "probe"
+        // A client hook's turn event: no content in or out, no OS effect.
+        | "pip_turn" => RiskClass::R0,
 
         // Local reversible control and lifecycle operations.
         "click"

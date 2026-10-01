@@ -3,15 +3,23 @@
 
 use crate::{
     CursorAction, CursorSemantics, EndSessionInput, EndSessionOutput, EscalateSessionInput,
-    GetSessionInput, GetSessionStateInput, ListSessionsInput, ListSessionsOutput, Platform,
-    SchemaMode, SessionOutput, SessionStateOutput, StartSessionInput, StartSessionOutput,
+    GetSessionInput, GetSessionStateInput, ListSessionsInput, ListSessionsOutput, PipTurnInput,
+    Platform, SchemaMode, SessionOutput, SessionStateOutput, StartSessionInput, StartSessionOutput,
     ToolAnnotations, ToolContract, ToolInput, ToolOutput,
 };
 
 const ALL_PLATFORMS: [Platform; 3] = [Platform::Macos, Platform::Windows, Platform::Linux];
 
 pub fn contracts() -> Vec<ToolContract> {
-    vec![start(), escalate(), get(), list(), get_state(), end()]
+    vec![
+        start(),
+        escalate(),
+        get(),
+        list(),
+        get_state(),
+        end(),
+        pip_turn(),
+    ]
 }
 
 fn contract<I: ToolInput, O: ToolOutput>(
@@ -119,6 +127,31 @@ fn end() -> ToolContract {
             open_world: false,
         },
     )
+}
+
+/// Called by client hooks (Claude Code's `mcp_tool` hooks) when the agent's
+/// turn starts and ends, so the preview panel lives for the whole turn. It
+/// returns no content at all: a hook reads a tool's text as its own output.
+fn pip_turn() -> ToolContract {
+    ToolContract {
+        name: PipTurnInput::TOOL_NAME.into(),
+        description: "For client hooks only, never call it: reports the agent's turn starting or ending to the preview panel. Returns nothing.".into(),
+        platforms: ALL_PLATFORMS.to_vec(),
+        aliases: Vec::new(),
+        capabilities: Vec::new(),
+        annotations: ToolAnnotations {
+            read_only: true,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        },
+        schema_mode: SchemaMode::CanonicalRuntime,
+        cursor_semantics: None,
+        input_schema: PipTurnInput::input_schema(),
+        success_output_schema: None,
+        error_output_schema: None,
+        output_validator: |_| Err("pip_turn returns no structured content".into()),
+    }
 }
 
 #[cfg(test)]

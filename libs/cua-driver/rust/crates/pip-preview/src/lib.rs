@@ -318,6 +318,22 @@ pub enum PipSessionEnd {
     Expired,
 }
 
+/// What a session's panel is told about the agent's turn (from the client's
+/// hooks; see `cua_driver_core::pip_turn`). A session never told anything
+/// behaves as before turns existed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PipTurn {
+    /// The session acts in an open turn: no idle hide, and a proof's
+    /// finale waits for the turn's end.
+    Open,
+    /// The turn ended: play the finished state as at session end, but keep
+    /// the session and its panel for the next turn; then fade.
+    Finished,
+    /// The turn ended without a finish (interrupted, failed): fade, no
+    /// finished state.
+    Quiet,
+}
+
 /// A live PiP window. Owned by `main.rs` for the lifetime of the
 /// process; `shutdown()` consumes it and closes the window.
 pub trait PipBackend: Send + Sync {
@@ -333,6 +349,9 @@ pub trait PipBackend: Send + Sync {
     /// The session with this private key is gone: drop its panel, as a
     /// finished session's or an expired one's (see `PipSessionEnd`).
     fn end_session(&self, _session_key: &str, _end: PipSessionEnd) {}
+
+    /// The session's turn changed. Non-blocking, like `push_frame`.
+    fn turn(&self, _session_key: &str, _turn: PipTurn) {}
 
     /// Close the window and release native resources. Called from
     /// `main.rs` on shutdown.
