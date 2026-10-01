@@ -240,7 +240,7 @@ fn keep_trim(
     };
     let changed = kept.is_none_or(|(trim, _)| (trim - seen).abs() > 0.5);
     // ponytail: dropped wholesale past 64 windows, as `remember` does.
-    if trims.len() >= 64 {
+    if kept.is_none() && trims.len() >= 64 {
         trims.clear();
     }
     trims.insert(window_id, (seen, started));
@@ -713,6 +713,16 @@ mod tests {
         assert_eq!(keep_trim(&mut trims, 7, Some(56.0), at(1800)), (Some(102.0), false));
         // Another window has its own.
         assert_eq!(keep_trim(&mut trims, 8, None, at(3000)), (None, false));
+        // A full cache drops only for a new window, never on an update.
+        for window in 100..162 {
+            keep_trim(&mut trims, window, Some(56.0), at(3000));
+        }
+        assert_eq!(trims.len(), 63);
+        keep_trim(&mut trims, 162, Some(56.0), at(3100));
+        keep_trim(&mut trims, 7, Some(56.0), at(3200));
+        assert_eq!(trims.len(), 64);
+        keep_trim(&mut trims, 163, Some(56.0), at(3300));
+        assert_eq!(trims.len(), 1);
     }
 
     #[test]
