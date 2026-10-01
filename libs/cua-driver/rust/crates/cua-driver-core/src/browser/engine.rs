@@ -335,7 +335,8 @@ fn viewport_point_to_screen(
 /// truncated name by its prefix), ignoring case.
 ///
 /// ponytail: visibility is the text's own element (visibility, opacity) plus
-/// a display:none ancestor (which accessibility drops), as the snapshot reads
+/// a display:none or content-visibility:hidden ancestor (which accessibility
+/// drops), as the snapshot reads
 /// it; text the snapshot drops for an
 /// inline-styled hidden ancestor still counts here, and closed shadow roots
 /// are not seen. Either reads as a changed row (a refusal, never a wrong
@@ -367,7 +368,8 @@ const ROW_STILL_READS: &str = "function(levels, name, truncated) { \
             (node.tagName === 'A' && node.hasAttribute('href')) || \
             roles.test(node.getAttribute('role') || '') || \
             node.getAttribute('aria-hidden') === 'true' || node.hidden || \
-            getComputedStyle(node).display === 'none')) continue; \
+            getComputedStyle(node).display === 'none' || \
+            getComputedStyle(node).contentVisibility === 'hidden')) continue; \
         const kids = Array.from(node.childNodes || []); \
         if (node.shadowRoot) kids.push(node.shadowRoot); \
         for (let k = kids.length - 1; k >= 0; k--) stack.push(kids[k]); \
