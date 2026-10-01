@@ -875,6 +875,14 @@ pub(crate) fn format_node_line(node: &AXNode) -> String {
         if !action_str.is_empty() {
             attrs.push(format!("actions=[{}]", action_str));
         }
+        // A checkbox or radio button's state is a number, which the quoted
+        // value above never shows: without it a Save panel's options read as
+        // unknown until a full element read.
+        if matches!(node.role.as_str(), "AXCheckBox" | "AXRadioButton") && node.value.is_none() {
+            if let Some(state) = &node.value_state {
+                attrs.push(format!("value={state}"));
+            }
+        }
         // The app's own selection (a list row, a tab): visible without a
         // screenshot, and a diff marks the row when it changes.
         if node.selected == Some(true) {
@@ -1035,6 +1043,20 @@ mod tests {
         assert_eq!(format_node_line(&node), "- [3] AXGroup (Message 312 from Lena) [actions=[cancel]]");
         node.selected = None;
         assert!(!format_node_line(&node).contains("selected"));
+    }
+
+    /// A checkbox shows its state; a text field's string value is unchanged.
+    #[test]
+    fn checkbox_rows_show_their_value() {
+        let mut node = row(Some(12), "AXCheckBox", "Keep changes in original document", 1, None);
+        node.actions = vec!["AXPress".into()];
+        node.value_state = Some("0".into());
+        assert_eq!(
+            format_node_line(&node),
+            "- [12] AXCheckBox \"Keep changes in original document\" [actions=[press] value=0]"
+        );
+        node.role = "AXButton".into();
+        assert!(!format_node_line(&node).contains("value="));
     }
 
     use super::*;

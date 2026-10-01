@@ -684,7 +684,7 @@ fn expand_tilde(path: &str) -> PathBuf {
     PathBuf::from(path)
 }
 
-fn percent_decode_path(path: &str) -> String {
+pub(crate) fn percent_decode_path(path: &str) -> String {
     let bytes = path.as_bytes();
     let mut decoded = Vec::with_capacity(bytes.len());
     let mut i = 0;

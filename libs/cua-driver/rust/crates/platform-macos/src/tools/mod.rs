@@ -10,7 +10,7 @@ pub(crate) mod get_window_state;
 mod hotkey;
 mod invoke_menu;
 mod kill_app;
-mod launch_app;
+pub(crate) mod launch_app;
 mod list_apps;
 mod list_windows;
 mod press_key;

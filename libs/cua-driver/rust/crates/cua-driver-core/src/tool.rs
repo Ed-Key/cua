@@ -574,6 +574,12 @@ pub trait Tool: Send + Sync {
     /// explains why, after authorization.
     async fn resolve_target(&self, _args: &mut Value) {}
 
+    /// Start watching what this action will change in the app, read before
+    /// it runs (see [`crate::outcome`]). Wrappers forward it. Default: none.
+    async fn begin_outcome(&self, _args: &Value) -> Option<Box<dyn crate::outcome::OutcomeWatch>> {
+        None
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult;
 }
 
@@ -1666,6 +1672,12 @@ impl ToolRegistry {
         // Desktop pixels read off a capped get_desktop_state image are mapped
         // back to the uncapped capture before any platform interprets them.
         crate::desktop_capture_scale::map_desktop_args(&mut args);
+        // The app's state before the action, for the outcome line below.
+        let outcome_watch = if crate::action_record::is_action_tool(resolved_name) {
+            tool.begin_outcome(&args).await
+        } else {
+            None
+        };
         // A bound browser tab's action leaves the macOS window it showed in
         // for the PiP frame below (see `pip_hook::with_bound_window`).
         let (mut result, bound_window) =
@@ -1777,6 +1789,16 @@ impl ToolRegistry {
         // recording/PiP screenshots would unnecessarily block an unrelated
         // runtime after the input side effect has already completed.
         drop(_desktop_action);
+        // Outside the input lock: waiting for the app to settle must not hold
+        // up another runtime's input. A refused or failed action sent nothing
+        // this watch can describe.
+        if let Some(watch) = outcome_watch {
+            if result.is_error != Some(true) {
+                if let Some(line) = watch.finish().await {
+                    crate::outcome::append(&mut result, &line);
+                }
+            }
+        }
         restore_public_runtime_result(&mut result, &runtime_prefix);
         // Preserve the producer's private summary for recording/replay before
         // the public ActionResult projection deliberately replaces legacy
