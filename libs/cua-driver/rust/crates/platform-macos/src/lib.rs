@@ -43,6 +43,8 @@ pub mod tools;
 #[cfg(target_os = "macos")]
 pub mod video_sckit;
 #[cfg(target_os = "macos")]
+mod outcome;
+#[cfg(target_os = "macos")]
 mod surface_observer;
 #[cfg(target_os = "macos")]
 pub mod window_change_detector;

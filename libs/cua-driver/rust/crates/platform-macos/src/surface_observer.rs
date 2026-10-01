@@ -613,6 +613,18 @@ impl Tool for SurfaceNoted {
         self.inner.resolve_target(args).await
     }
 
+    /// Every native action this wraps reports its outcome (see
+    /// [`crate::outcome`]); reads and activations do not.
+    async fn begin_outcome(
+        &self,
+        args: &Value,
+    ) -> Option<Box<dyn cua_driver_core::outcome::OutcomeWatch>> {
+        match self.role {
+            Role::Action => crate::outcome::begin(&self.inner.def().name, args).await,
+            _ => self.inner.begin_outcome(args).await,
+        }
+    }
+
     async fn invoke(&self, args: Value) -> ToolResult {
         if self.role != Role::Read {
             crate::window_change_detector::end_lingering_focus_guards();

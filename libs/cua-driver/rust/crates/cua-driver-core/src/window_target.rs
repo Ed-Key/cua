@@ -166,6 +166,10 @@ impl Tool for PidOnlyWindowTargetGuard {
         self.inner.resolve_target(args).await
     }
 
+    async fn begin_outcome(&self, args: &Value) -> Option<Box<dyn crate::outcome::OutcomeWatch>> {
+        self.inner.begin_outcome(args).await
+    }
+
     async fn invoke(&self, mut args: Value) -> ToolResult {
         // A windowless desktop-scope action needs no pid window. A desktop-
         // scope action that names a pid still resolves that pid's window (the

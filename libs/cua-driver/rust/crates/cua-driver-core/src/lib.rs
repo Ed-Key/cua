@@ -75,6 +75,7 @@ pub mod history;
 pub mod image_utils;
 pub mod launch_guard;
 pub mod mcp_result;
+pub mod outcome;
 pub mod page;
 pub mod perception_client;
 pub mod perception_tools;
