@@ -20,7 +20,7 @@ use cua_driver_core::outcome::OutcomeWatch;
 use serde_json::Value;
 
 use crate::ax::bindings::{
-    advertises_attribute, ax_get_window_id, copy_ax_windows_including, copy_bool_attr,
+    advertises_attribute, ax_get_window_id, copy_bool_attr,
     copy_children, copy_element_attr, copy_element_array_attr_checked, copy_string_attr,
     copy_stringish_attr, AXUIElementCreateApplication, AXUIElementRef,
     AXUIElementSetMessagingTimeout,
@@ -249,26 +249,29 @@ pub(crate) fn describe(
             None => parts.push(format!("document now {path}")),
         }
     }
-    if let (Some(a), Some(b), Some(path)) = (before.file, after.file, &after.document) {
-        if a != b || before.document != after.document {
+    let same_document = before.document.is_some() && before.document == after.document;
+    let holds = match &disk.file_text {
+        Some(FileText::Matches(chars)) => Some(format!("it holds the window's text ({chars} characters)")),
+        Some(FileText::Differs) => Some("its text differs from the window's".to_owned()),
+        None => None,
+    };
+    match (before.file, after.file, &after.document) {
+        // The same file's stamp moved: it was written during the action.
+        (Some(a), Some(b), Some(path)) if same_document && a != b => {
             let mut line = format!("file {path} modified during the action");
-            match &disk.file_text {
-                Some(FileText::Matches(chars)) => {
-                    line.push_str(&format!("; it holds the window's text ({chars} characters)"))
-                }
-                Some(FileText::Differs) => line.push_str("; its text differs from the window's"),
-                None => {}
+            if let Some(holds) = &holds {
+                line.push_str(&format!("; {holds}"));
             }
             parts.push(line);
         }
-    } else if before.file.is_none() && after.file.is_some() {
-        if let Some(path) = &after.document {
-            let mut line = format!("file {path} written");
-            if let Some(FileText::Matches(chars)) = &disk.file_text {
-                line.push_str(&format!("; it holds the window's text ({chars} characters)"));
+        // A new document (Save As, a first save): its file's text, never a
+        // claim about when it was written.
+        (_, Some(_), Some(_)) if !same_document => {
+            if let Some(holds) = &holds {
+                parts.push(format!("its file: {holds}"));
             }
-            parts.push(line);
         }
+        _ => {}
     }
     match (before.edited, after.edited) {
         (Some(true), Some(false)) => parts.push("no unsaved changes".into()),
@@ -754,11 +757,12 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
     }
     let app = Owned(app);
     let mut window = None;
-    if reader.admit(app.0) && copy_string_attr(app.0, "AXRole").is_some() {
-        let windows: Vec<Owned> = copy_ax_windows_including(app.0, scope.pid, scope.window_id)
-            .into_iter()
-            .map(Owned)
-            .collect();
+    let windows = if reader.admit(app.0) && copy_string_attr(app.0, "AXRole").is_some() {
+        app_windows(app.0, scope.pid, scope.window_id)
+    } else {
+        None
+    };
+    if let Some(windows) = windows {
         let mut others = Vec::new();
         for w in windows {
             match ax_get_window_id(w.0) {
@@ -830,7 +834,7 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
         }
     }
     let focus = if facts.window_present == Some(true) {
-        crate::ax::exact_target::focused_element_in_window(scope.pid, scope.window_id).map(Owned)
+        focused_in_window(&mut reader, app.0, scope.window_id)
     } else {
         None
     };
@@ -886,6 +890,50 @@ unsafe fn surface(kind: &str, element: AXUIElementRef) -> String {
     }
 }
 
+/// The app's windows, with the requested one even on another Space; `None`
+/// when the app did not answer (never read as "no windows").
+unsafe fn app_windows(app: AXUIElementRef, pid: i32, window_id: u32) -> Option<Vec<Owned>> {
+    let mut windows: Vec<Owned> = match copy_element_array_attr_checked(app, "AXWindows", 256) {
+        Ok(windows) => windows.into_iter().map(Owned).collect(),
+        Err(error) if error == crate::ax::bindings::kAXErrorNoValue => Vec::new(),
+        Err(_) => return None,
+    };
+    if !windows.iter().any(|w| ax_get_window_id(w.0) == Some(window_id)) {
+        windows.extend(crate::ax::bindings::copy_ax_window_by_remote_token(pid, window_id).map(Owned));
+    }
+    Some(windows)
+}
+
+/// The focused element when it is in `window_id` (or a child window of it),
+/// every message bounded by the read's budget.
+unsafe fn focused_in_window(reader: &mut Reader, app: AXUIElementRef, window_id: u32) -> Option<Owned> {
+    if !reader.admit(app) {
+        return None;
+    }
+    let focused = Owned(copy_element_attr(app, "AXFocusedUIElement")?);
+    if !reader.admit(focused.0) {
+        return None;
+    }
+    let in_window = crate::ax::exact_target::element_window_id(focused.0)
+        .is_some_and(|id| crate::ax::bindings::window_belongs_to(id, window_id));
+    in_window.then_some(focused)
+}
+
+/// The app's focused window, for an action that named none; bounded.
+unsafe fn focused_window_id(pid: i32) -> Option<u32> {
+    let app = AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        return None;
+    }
+    let app = Owned(app);
+    let mut reader = Reader::new();
+    if !reader.admit(app.0) {
+        return None;
+    }
+    let window = Owned(copy_element_attr(app.0, "AXFocusedWindow")?);
+    reader.admit(window.0).then(|| crate::ax::bindings::surface_window_id(window.0)).flatten()
+}
+
 unsafe fn retained(ptr: usize) -> AXUIElementRef {
     core_foundation::base::CFRetain(ptr as CFTypeRef);
     ptr as AXUIElementRef
@@ -922,7 +970,7 @@ unsafe fn disk_notes(before: &Facts, pass: &Pass) -> DiskNotes {
     let mut notes = DiskNotes::default();
     let after = &pass.facts;
     if let (Some(path), Some(window)) = (&after.document, &pass.window) {
-        if after.file.is_some() && after.file != before.file {
+        if after.file.is_some() && (after.file != before.file || after.document != before.document) {
             notes.file_text = file_text(Path::new(path), window.0);
         }
     }
@@ -1020,7 +1068,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
         None
     };
     tokio::task::spawn_blocking(move || {
-        let window_id = window_id.or_else(|| crate::ax::bindings::focused_window_id_of_pid(pid))?;
+        let window_id = window_id.or_else(|| unsafe { focused_window_id(pid) })?;
         let mut scope = Scope {
             pid,
             window_id,
@@ -1244,6 +1292,17 @@ mod tests {
     }
 
     #[test]
+    fn a_file_first_seen_after_the_action_is_not_called_written() {
+        let mut before = window("note.txt");
+        before.document = Some("/Users/lume/lab/work/note.txt".into());
+        let mut after = before.clone();
+        after.file = Some(FileStamp { modified: SystemTime::UNIX_EPOCH, len: 6 });
+        let disk = DiskNotes { file_text: Some(FileText::Matches(6)), ..DiskNotes::default() };
+        let line = describe(&before, &after, &disk, Settle::Settled, true);
+        assert!(!line.contains("modified") && !line.contains("written"), "{line}");
+    }
+
+    #[test]
     fn a_save_as_names_the_sheet_the_new_document_and_the_new_file() {
         let mut before = window("note.txt");
         before.document = Some("/Users/lume/lab/work/note.txt".into());
@@ -1256,8 +1315,8 @@ mod tests {
         assert_eq!(
             describe(&before, &after, &disk, Settle::Settled, true),
             "window title now \"groceries.txt\"; document now /Users/lume/lab/work/groceries.txt (was \
-             /Users/lume/lab/work/note.txt); file /Users/lume/lab/work/groceries.txt modified during the action; \
-             it holds the window's text (52 characters); sheet closed: save"
+             /Users/lume/lab/work/note.txt); its file: it holds the window's text (52 characters); \
+             sheet closed: save"
         );
     }
 
