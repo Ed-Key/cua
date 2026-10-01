@@ -58,14 +58,21 @@ impl Drop for ChildReaper {
             tree_kill(pid);
         }
         for c in &mut self.children {
-            #[cfg(unix)]
-            process_group_kill(c.id());
-            tree_kill(c.id());
-            let _ = c.kill();
-            let _ = c.wait();
+            kill_child_tree(c);
         }
         std::thread::sleep(Duration::from_millis(250));
     }
+}
+
+/// Kill `child` and everything in its process group, then reap it. Needed
+/// for a child spawned by [`spawn_in_job`]: a bare macOS `serve` re-spawns
+/// itself (responsibility disclaim) and only the group kill reaches that copy.
+pub fn kill_child_tree(child: &mut Child) {
+    #[cfg(unix)]
+    process_group_kill(child.id());
+    tree_kill(child.id());
+    let _ = child.kill();
+    let _ = child.wait();
 }
 
 /// Spawn a command, assigning it to the kill-on-close job on Windows so it can

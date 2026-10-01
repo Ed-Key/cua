@@ -16,7 +16,9 @@ use cua_driver_core::health_report::{
     NAME_SESSION_ACTIVE, NAME_TCC_ACCESSIBILITY, NAME_TCC_SCREEN_RECORDING,
 };
 
-use crate::permissions::status::{accessibility_granted, current_status, screen_recording_granted};
+use crate::permissions::status::{
+    accessibility_granted, bundle_identifier, current_status, screen_recording_granted,
+};
 
 /// macOS run order, in the order consumers see them reflected back in
 /// `report.checks[]`. Matches the Swift PR #1905 contract.
@@ -277,20 +279,6 @@ fn application_bundle_identifier_for_pid(pid: u32) -> Option<String> {
     let bundle_url = core_foundation::url::CFURL::from_path(bundle_path, true)?;
     let bundle = core_foundation::bundle::CFBundle::new(bundle_url)?;
     bundle_identifier(&bundle)
-}
-
-fn bundle_identifier(bundle: &core_foundation::bundle::CFBundle) -> Option<String> {
-    use core_foundation::base::TCFType;
-    use core_foundation::string::CFString;
-
-    unsafe {
-        let id_ref = core_foundation::bundle::CFBundleGetIdentifier(bundle.as_concrete_TypeRef());
-        if id_ref.is_null() {
-            return None;
-        }
-        let id = CFString::wrap_under_get_rule(id_ref).to_string();
-        (!id.is_empty()).then_some(id)
-    }
 }
 
 /// Read the running process's `CFBundleIdentifier` via CoreFoundation.

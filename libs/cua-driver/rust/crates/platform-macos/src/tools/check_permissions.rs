@@ -10,7 +10,7 @@ use super::ToolState;
 use crate::permission_observation::{DirectCaptureEvidenceStore, DirectCaptureVerification};
 use crate::permissions::status::{
     accessibility_granted, request_accessibility, request_screen_recording,
-    screen_recording_granted,
+    running_from_app_bundle, screen_recording_granted, BARE_EXECUTABLE_PROMPT_NOTE,
 };
 
 /// Private argv sentinel shared by the trusted CLI launcher and the public
@@ -450,6 +450,12 @@ impl Tool for CheckPermissionsTool {
                  staged or read-only check. Run `cua-driver permissions grant` to request \
                  and verify direct capture explicitly.",
             );
+        }
+        // request_* never prompt from a bare executable; say so instead of
+        // letting a missing grant look like a declined prompt.
+        if should_prompt && !running_from_app_bundle() && !(accessibility && screen_recording) {
+            summary.push_str("\nℹ️  ");
+            summary.push_str(BARE_EXECUTABLE_PROMPT_NOTE);
         }
         // Make the attribution explicit when answering for a host or caller
         // (not the daemon).
