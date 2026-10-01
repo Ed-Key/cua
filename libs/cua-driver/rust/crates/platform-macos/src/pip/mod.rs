@@ -1884,6 +1884,7 @@ unsafe fn sync_fan(panel: &mut Panel) {
     }
     let drawn = settle_frames(panel);
     panel.fan = fan;
+    panel.trail_motion.fan(fan);
     if panel.shown {
         for (index, slot) in panel.layout.clone().into_iter().enumerate() {
             let rest = resting(panel, slot, cards);

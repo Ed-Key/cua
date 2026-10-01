@@ -658,6 +658,18 @@ pub(super) struct Trail {
     max_lag: f64,
     /// When the last drag ended, until its settle is reported.
     released: Option<Instant>,
+    /// How far the back items reach past the deck on a mirrored side
+    /// (`fan_reach`): the lag gives up that much of `LAG_ROOM` there.
+    reach: f64,
+}
+
+/// How far a stack fanned by `fan` reaches past the deck's right or bottom
+/// edge, where the window keeps only `LAG_ROOM` (its chip column and stack
+/// margin are on the left and top).
+pub(super) fn fan_reach(fan: Fan) -> f64 {
+    let right = if fan.right { LEFT_REACH } else { 0.0 };
+    let below = if fan.below { STACK_MARGIN } else { 0.0 };
+    right.max(below)
 }
 
 fn spring_moving(spring: &Spring) -> bool {
@@ -678,9 +690,17 @@ impl Trail {
         spring_moving(&self.chips) || spring_moving(&self.cards)
     }
 
+    /// The stack now fans by `fan`: the lag is capped so mirrored items
+    /// never leave the window.
+    pub(super) fn fan(&mut self, fan: Fan) {
+        self.reach = fan_reach(fan);
+    }
+
     /// The panel was dragged by `delta`: the back items stay where they
-    /// are on screen (at most `TRAIL_LAG_CAP` behind), and spring after it.
+    /// are on screen (at most `TRAIL_LAG_CAP` behind, less a mirrored
+    /// stack's reach), and spring after it.
     pub(super) fn panel_dragged(&mut self, delta: (f64, f64)) {
+        let cap = TRAIL_LAG_CAP - self.reach;
         if !self.dragging {
             self.dragging = true;
             self.max_lag = 0.0;
@@ -689,8 +709,8 @@ impl Trail {
         for spring in [&mut self.chips, &mut self.cards] {
             let (x, y) = (spring.ox - delta.0, spring.oy - delta.1);
             let length = x.hypot(y);
-            let scale = if length > TRAIL_LAG_CAP {
-                TRAIL_LAG_CAP / length
+            let scale = if length > cap {
+                cap / length
             } else {
                 1.0
             };
@@ -1583,6 +1603,32 @@ mod tests {
         assert!(slow < 35.0, "{slow}");
         let (fling, _, _) = drag_and_release(4000.0);
         assert!((fling - TRAIL_LAG_CAP).abs() < 1e-6, "{fling}");
+    }
+
+    #[test]
+    fn a_mirrored_stack_lags_only_as_far_as_its_window_has_room() {
+        // A fling caps the lag at the room left past the mirrored items.
+        for fan in [
+            Fan { below: false, right: true },
+            Fan { below: true, right: false },
+            Fan { below: true, right: true },
+        ] {
+            let mut trail = Trail::default();
+            trail.fan(fan);
+            for _ in 0..20 {
+                trail.panel_dragged((-60.0, 60.0));
+            }
+            let (x, y) = trail.offset(Slot::Chip(0));
+            assert!((x.hypot(y) - (TRAIL_LAG_CAP - fan_reach(fan))).abs() < 1e-6, "{fan:?}");
+            assert!(x.hypot(y) + fan_reach(fan) <= LAG_ROOM + 1e-6);
+        }
+        let mut trail = Trail::default();
+        trail.fan(Fan::default());
+        for _ in 0..20 {
+            trail.panel_dragged((-60.0, 60.0));
+        }
+        let (x, y) = trail.offset(Slot::Chip(0));
+        assert!((x.hypot(y) - TRAIL_LAG_CAP).abs() < 1e-6, "the default fan keeps the full lag");
     }
 
     #[test]

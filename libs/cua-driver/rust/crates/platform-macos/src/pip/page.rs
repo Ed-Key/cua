@@ -165,12 +165,13 @@ pub(super) fn page_crop(pid: Option<i32>, window_id: u32, window: Area) -> Crop 
     remember(&mut known, window_id, (window.w, window.h), crop, started)
 }
 
-/// The last page crop each window was seen with: the window's size then,
-/// and when that lookup started.
+/// The last answer each window's lookups gave: the window's size then, the
+/// crop (`None`: the newest answer was not a page), and when that lookup
+/// started.
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Known {
     size: (f64, f64),
-    crop: Area,
+    crop: Option<Area>,
     started: Instant,
 }
 
@@ -193,26 +194,21 @@ fn remember(
 ) -> Crop {
     if crop == Err(LATE) {
         return match known.get(&window_id) {
-            Some(last) if last.size == size => Ok(last.crop),
+            Some(Known { size: was, crop: Some(last), .. }) if *was == size => Ok(*last),
             _ => crop,
         };
     }
     if known.get(&window_id).is_some_and(|last| last.started > started) {
         return crop;
     }
-    match crop {
-        Ok(area) => {
-            // ponytail: dropped wholesale past 64 windows; per-window
-            // removal on close if a long session ever needs it.
-            if known.len() >= 64 && !known.contains_key(&window_id) {
-                known.clear();
-            }
-            known.insert(window_id, Known { size, crop: area, started });
-        }
-        Err(_) => {
-            known.remove(&window_id);
-        }
+    // ponytail: dropped wholesale past 64 windows; per-window removal on
+    // close if a long session ever needs it.
+    if known.len() >= 64 && !known.contains_key(&window_id) {
+        known.clear();
     }
+    // A non-page answer stays as a marker, so an older lookup's page cannot
+    // come back after it.
+    known.insert(window_id, Known { size, crop: crop.ok(), started });
     crop
 }
 
@@ -513,6 +509,11 @@ mod tests {
         assert_eq!(remember(&mut known, 7, size, Ok(old), at(100)), Ok(old));
         assert_eq!(remember(&mut known, 7, size, Err(ASKED), at(100)), Err(ASKED));
         assert_eq!(remember(&mut known, 7, size, Err(LATE), at(900)), Ok(new));
+        // A newer "no page" is not undone by an older lookup's page: a late
+        // lookup after both shows the whole window.
+        assert_eq!(remember(&mut known, 7, size, Err(ASKED), at(1200)), Err(ASKED));
+        assert_eq!(remember(&mut known, 7, size, Ok(new), at(1000)), Ok(new));
+        assert_eq!(remember(&mut known, 7, size, Err(LATE), at(1500)), Err(LATE));
     }
 
     #[test]
