@@ -30,6 +30,7 @@ use cua_driver_core::server::{
 use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWrite, AsyncWriteExt, BufReader};
 use tracing::{debug, error, warn};
 
+use crate::mcp_surface::{Surface, ToolProfile};
 use crate::serve::{
     is_daemon_listening, send_request, DaemonRequest, DaemonResponse, ToolObservationOrigin,
 };
@@ -40,7 +41,10 @@ use crate::serve::{
 /// The runtime lives exactly as long as stdin: EOF ends every observed public
 /// session, drains admitted work through `shutdown`, and releases process
 /// ownership before returning.
-pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Result<()> {
+pub async fn run_direct(
+    driver: Arc<cua_driver_sdk::CuaDriver>,
+    profile: ToolProfile,
+) -> anyhow::Result<()> {
     // Direct stdio is an action endpoint just like `serve`; enforce the same
     // admin lock, bounded-manifest approval/expiry, and legacy-approval
     // consistency before the first request can be read.
@@ -48,6 +52,7 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
     validate_configured_policy()?;
     let sdk = crate::sdk_adapter::SdkAdapter::load(driver.clone()).await?;
     if crate::mcp_envelope::configured()? {
+        refuse_profile_with_envelopes(profile)?;
         let result = crate::mcp_envelope::run(
             sdk.clone(),
             BufReader::new(tokio::io::stdin()),
@@ -64,6 +69,7 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
     let mut line = String::new();
     let mut session_observed = false;
     let mut protocol_session = ProtocolSession::default();
+    let mut surface = Surface::new(profile);
     let transport_session = format!("mcp-{}", uuid::Uuid::new_v4());
     struct DirectTransportCleanup {
         sdk: Arc<crate::sdk_adapter::SdkAdapter>,
@@ -106,14 +112,27 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
                     }
                     Ok(era)
                 });
-                if let Err(response) = admission {
+                let era = match admission {
+                    Ok(era) => era,
+                    Err(response) => {
+                        writer
+                            .write_all(serde_json::to_string(&response)?.as_bytes())
+                            .await?;
+                        writer.write_all(b"\n").await?;
+                        writer.flush().await?;
+                        continue;
+                    }
+                };
+                surface.observe(&request);
+                if let Some(refusal) = surface.refusal(&request, era) {
                     writer
-                        .write_all(serde_json::to_string(&response)?.as_bytes())
+                        .write_all(serde_json::to_string(&refusal)?.as_bytes())
                         .await?;
                     writer.write_all(b"\n").await?;
                     writer.flush().await?;
                     continue;
                 }
+                let method = request.method.clone();
                 apply_direct_session_identity(&mut request, &transport_session);
                 let initialize_metadata = (!session_observed)
                     .then(|| request.initialize_metadata())
@@ -150,7 +169,7 @@ pub async fn run_direct(driver: Arc<cua_driver_sdk::CuaDriver>) -> anyhow::Resul
                     }
                     observe_proxy_tool_completed(outcome);
                 }
-                response
+                surface.render(&method, response)
             }
         };
         let serialized = serde_json::to_string(&response).unwrap_or_else(|error| {
@@ -200,7 +219,7 @@ pub(crate) fn apply_direct_session_identity(request: &mut Request, transport_ses
 /// clear startup error instead of a "successful" handshake that
 /// advertises zero tools and then errors on every call. Matches
 /// Swift `makeProxy`'s `fetchProxyToolList` pre-check.
-pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
+pub async fn run_proxy(socket_path: String, profile: ToolProfile) -> anyhow::Result<()> {
     validate_configured_policy()?;
     if !is_daemon_listening(&socket_path) {
         anyhow::bail!(
@@ -214,6 +233,7 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
     let compatibility_client = cua_driver_sdk::CuaDriver::connect(Some(socket_path.clone()))?;
     compatibility_client.metadata().await?;
     if crate::mcp_envelope::configured()? {
+        refuse_profile_with_envelopes(profile)?;
         return crate::mcp_envelope::proxy(&socket_path).await;
     }
 
@@ -267,13 +287,14 @@ pub async fn run_proxy(socket_path: String) -> anyhow::Result<()> {
     let stdout = tokio::io::stdout();
     supervise_control_connection(
         &mut control,
-        run_proxy_io(
+        run_proxy_io_with_profile(
             BufReader::new(stdin),
             tokio::io::BufWriter::new(stdout),
             &socket_path,
             &cached_tools_list,
             &session_id,
             daemon_observes_tool_calls,
+            profile,
         ),
     )
     .await
@@ -293,14 +314,21 @@ async fn supervise_control_connection<T>(
     }
 }
 
-/// Run the service-owned stdio loop over caller-provided I/O.
-///
-/// A clean reader EOF must return `Ok(())` promptly. The caller then drops the
-/// persistent control connection, allowing the daemon to reap the MCP session
-/// and its recording, preview, and overlay state (issue #2002).
+/// The opt-in typed envelope transport has its own loop; it does not apply a
+/// tool profile, so refuse the combination instead of serving the full set.
+fn refuse_profile_with_envelopes(profile: ToolProfile) -> anyhow::Result<()> {
+    if profile == ToolProfile::Core {
+        anyhow::bail!("--tools core is not supported with CUA_DRIVER_MCP_ENVELOPES=1");
+    }
+    Ok(())
+}
+
+/// Run the service-owned stdio loop over caller-provided I/O with the full
+/// tool profile.
+#[cfg(test)]
 async fn run_proxy_io<R, W>(
-    mut reader: R,
-    mut writer: W,
+    reader: R,
+    writer: W,
     socket_path: &str,
     cached_tools_list: &Arc<serde_json::Value>,
     session_id: &str,
@@ -310,9 +338,43 @@ where
     R: AsyncBufRead + Unpin,
     W: AsyncWrite + Unpin,
 {
+    run_proxy_io_with_profile(
+        reader,
+        writer,
+        socket_path,
+        cached_tools_list,
+        session_id,
+        daemon_observes_tool_calls,
+        ToolProfile::Full,
+    )
+    .await
+}
+
+/// Run the service-owned stdio loop over caller-provided I/O.
+///
+/// A clean reader EOF must return `Ok(())` promptly. The caller then drops the
+/// persistent control connection, allowing the daemon to reap the MCP session
+/// and its recording, preview, and overlay state (issue #2002).
+///
+/// The cached inventory stays the daemon's full list: it validates calls, and
+/// the profile narrows only what the client is shown and may call.
+async fn run_proxy_io_with_profile<R, W>(
+    mut reader: R,
+    mut writer: W,
+    socket_path: &str,
+    cached_tools_list: &Arc<serde_json::Value>,
+    session_id: &str,
+    daemon_observes_tool_calls: bool,
+    profile: ToolProfile,
+) -> anyhow::Result<()>
+where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin,
+{
     let mut line = String::new();
     let mut session_observed = false;
     let mut protocol_session = ProtocolSession::default();
+    let mut surface = Surface::new(profile);
 
     loop {
         line.clear();
@@ -345,14 +407,27 @@ where
                     )?;
                     Ok(era)
                 });
-                if let Err(response) = admission {
+                let era = match admission {
+                    Ok(era) => era,
+                    Err(response) => {
+                        writer
+                            .write_all(serde_json::to_string(&response)?.as_bytes())
+                            .await?;
+                        writer.write_all(b"\n").await?;
+                        writer.flush().await?;
+                        continue;
+                    }
+                };
+                surface.observe(&req);
+                if let Some(refusal) = surface.refusal(&req, era) {
                     writer
-                        .write_all(serde_json::to_string(&response)?.as_bytes())
+                        .write_all(serde_json::to_string(&refusal)?.as_bytes())
                         .await?;
                     writer.write_all(b"\n").await?;
                     writer.flush().await?;
                     continue;
                 }
+                let method = req.method.clone();
                 let initialize_metadata = (!session_observed)
                     .then(|| req.initialize_metadata())
                     .flatten();
@@ -403,7 +478,7 @@ where
                     }
                     observe_proxy_tool_completed(outcome);
                 }
-                response
+                surface.render(&method, response)
             }
         };
 
@@ -1123,6 +1198,97 @@ mod tests {
         }
         for reply in &replies[3..] {
             assert_eq!(reply["error"]["code"], -32602);
+        }
+    }
+
+    #[tokio::test]
+    async fn core_profile_lists_core_tools_and_refuses_the_rest_without_forwarding() {
+        use serde_json::json;
+        let mut input = Vec::new();
+        for request in [
+            json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{
+                "clientInfo":{"name":"codex-mcp-client","title":"Codex","version":"0.159.2"}}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/list"}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/call",
+                   "params":{"name":"start_recording","arguments":{"output_dir":"/tmp/x"}}}),
+        ] {
+            serde_json::to_writer(&mut input, &request).unwrap();
+            input.push(b'\n');
+        }
+        let inventory = Arc::new(json!({"tools":[
+            {"name":"get_window_state","_meta":{"anthropic/alwaysLoad":true}},
+            {"name":"start_recording"}
+        ]}));
+        let mut output = Vec::new();
+        // An unreachable endpoint: a forwarded call would come back as a
+        // -32603 transport error instead of the profile refusal.
+        run_proxy_io_with_profile(
+            BufReader::new(input.as_slice()),
+            &mut output,
+            "unreachable-test-endpoint",
+            &inventory,
+            "core-profile-test",
+            false,
+            ToolProfile::Core,
+        )
+        .await
+        .unwrap();
+        let replies: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(replies.len(), 3);
+        assert_eq!(
+            replies[1]["result"]["tools"],
+            json!([{"name":"get_window_state","_meta":{"anthropic/alwaysLoad":true}}])
+        );
+        let refusal = &replies[2]["result"];
+        assert_eq!(refusal["isError"], true, "{refusal}");
+        assert_eq!(refusal["structuredContent"]["code"], "tool_not_in_profile");
+        assert!(refusal["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("--tools full"));
+    }
+
+    #[test]
+    fn daemon_results_reach_codex_as_one_copy_and_others_unchanged() {
+        use cua_driver_core::protocol::Request;
+        let daemon_result = serde_json::json!({
+            "content": [{"type":"text","text":"Found 0 window(s)."}],
+            "structuredContent": {"windows": [], "current_space_id": 1},
+        });
+        let schema = cua_driver_contract::advertised_tool_output_schema("list_windows");
+        for (client, expected_text) in [
+            ("codex-mcp-client", crate::mcp_surface::CODEX_TEXT_POINTER),
+            ("claude-code", "Found 0 window(s)."),
+        ] {
+            let mut surface = Surface::new(ToolProfile::Core);
+            let init: Request = serde_json::from_value(serde_json::json!({
+                "jsonrpc":"2.0","id":1,"method":"initialize",
+                "params":{"clientInfo":{"name":client}}
+            }))
+            .unwrap();
+            surface.observe(&init);
+            let result = daemon_response_to_tool_result(
+                "list_windows",
+                DaemonResponse::ok(daemon_result.clone()),
+                schema.as_ref(),
+            )
+            .unwrap();
+            let rendered = serde_json::to_value(
+                surface.render("tools/call", Response::ok(serde_json::json!(4), result)),
+            )
+            .unwrap();
+            assert_eq!(
+                rendered["result"]["content"][0]["text"], expected_text,
+                "{client}"
+            );
+            assert_eq!(
+                rendered["result"]["structuredContent"], daemon_result["structuredContent"],
+                "{client}"
+            );
         }
     }
 

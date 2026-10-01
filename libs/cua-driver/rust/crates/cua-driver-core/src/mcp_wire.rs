@@ -8,6 +8,55 @@ pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 pub const PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 pub const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
 
+/// The tools `cua-driver mcp --tools core` advertises, in the order the
+/// server instructions name them. Usage across every lab run picked the first
+/// rows; the rest are tools a core tool's own guidance or refusal tells the
+/// caller to use (check_permissions, browser_type, browser_prepare, zoom for
+/// `from_zoom`, escalate_session for desktop-scope refusals, the history
+/// pair when the preview is admitted) and pip_turn, which client hooks call.
+/// Every MCP profile marks these `anthropic/alwaysLoad` for Claude Code.
+pub const CORE_TOOLS: &[&str] = &[
+    "get_window_state",
+    "act_and_read",
+    "click",
+    "double_click",
+    "right_click",
+    "type_text",
+    "press_key",
+    "hotkey",
+    "set_value",
+    "scroll",
+    "drag",
+    "zoom",
+    "invoke_menu",
+    "list_windows",
+    "list_apps",
+    "launch_app",
+    "bring_to_front",
+    "set_window_frame",
+    "clipboard_read",
+    "clipboard_write",
+    "verify_state",
+    "get_browser_state",
+    "browser_steps",
+    "browser_type",
+    "browser_prepare",
+    "get_desktop_state",
+    "check_permissions",
+    "escalate_session",
+    "start_session",
+    "end_session",
+    "history_status",
+    "history_query",
+    "pip_turn",
+];
+
+/// Whether `tool` belongs to the core profile. `type_text_chars` is the
+/// legacy alias of `type_text`.
+pub fn is_core_tool(tool: &str) -> bool {
+    CORE_TOOLS.contains(&tool) || tool == "type_text_chars"
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ProtocolEra {
     Legacy,

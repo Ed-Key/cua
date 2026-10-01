@@ -29,6 +29,7 @@ mod extension_manager;
 mod history_runtime;
 mod mcp_envelope;
 mod mcp_http;
+mod mcp_surface;
 mod perception_cli;
 mod private_worker;
 mod proxy;
@@ -463,7 +464,10 @@ fn test_runtime_lock() -> &'static tokio::sync::Mutex<()> {
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
 }
 
-fn run_mcp_direct(compatibility_mode: bool) -> anyhow::Result<()> {
+fn run_mcp_direct(
+    compatibility_mode: bool,
+    tools: mcp_surface::ToolProfile,
+) -> anyhow::Result<()> {
     // Validate immutable process policy before platform initialization. The
     // adapter repeats this check before reading stdin as defense in depth.
     cua_driver_core::authorization::validate_startup_authorization()?;
@@ -484,7 +488,7 @@ fn run_mcp_direct(compatibility_mode: bool) -> anyhow::Result<()> {
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()?;
-    runtime.block_on(proxy::run_direct(driver))
+    runtime.block_on(proxy::run_direct(driver, tools))
 }
 
 fn history_admission_requested(explicit: bool, persisted: bool) -> bool {
@@ -539,6 +543,65 @@ fn mcp_uses_direct_runtime_for(
         Ok(false)
     } else {
         Ok(socket.is_none() && !history_preview_admitted)
+    }
+}
+
+#[cfg(test)]
+mod tool_profile_registry_tests {
+    use crate::mcp_surface::{Surface, ToolProfile};
+    use cua_driver_core::mcp_wire::{is_core_tool, ProtocolEra, CORE_TOOLS};
+    use cua_driver_core::protocol::Request;
+
+    fn registry() -> Vec<serde_json::Value> {
+        super::inspect_tools_without_runtime()["tools"]
+            .as_array()
+            .expect("host tool inventory")
+            .clone()
+    }
+
+    fn call(name: &str) -> Request {
+        serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": "tools/call",
+            "params": {"name": name, "arguments": {}}
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn every_registered_tool_stays_callable_with_the_full_profile() {
+        let full = Surface::new(ToolProfile::Full);
+        let core = Surface::new(ToolProfile::Core);
+        let tools = registry();
+        assert!(tools.len() > CORE_TOOLS.len(), "{} tools", tools.len());
+        for tool in &tools {
+            let name = tool["name"].as_str().unwrap();
+            assert!(full.refusal(&call(name), ProtocolEra::Legacy).is_none(), "{name}");
+            assert_eq!(
+                core.refusal(&call(name), ProtocolEra::Legacy).is_none(),
+                is_core_tool(name),
+                "{name}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_core_tool_exists_and_is_preloaded_for_claude_code() {
+        let tools = registry();
+        for core in CORE_TOOLS {
+            // The history pair registers only when the preview is admitted.
+            if matches!(*core, "history_status" | "history_query") {
+                continue;
+            }
+            let tool = tools
+                .iter()
+                .find(|tool| tool["name"] == *core)
+                .unwrap_or_else(|| panic!("core tool {core} is not registered"));
+            assert_eq!(
+                tool["_meta"]["anthropic/alwaysLoad"] == serde_json::json!(true),
+                *core != "pip_turn",
+                "{core}"
+            );
+        }
     }
 }
 
@@ -977,6 +1040,7 @@ fn main() {
             direct,
             claude_code_compat,
             grants,
+            tools,
         } => {
             let startup_started = std::time::Instant::now();
             // Long-running MCP proxy — kick off the background update check
@@ -995,7 +1059,7 @@ fn main() {
                             true,
                             startup_started.elapsed(),
                         );
-                        run_mcp_direct(claude_code_compat)
+                        run_mcp_direct(claude_code_compat, tools)
                     }
                 }
                 Err(error) => Err(error),
@@ -1003,6 +1067,7 @@ fn main() {
                     socket,
                     claude_code_compat,
                     &grants,
+                    tools,
                     |daemon, success| {
                         telemetry::capture_mcp_startup_completed(
                             "daemon_proxy",
@@ -1284,6 +1349,7 @@ fn main() -> anyhow::Result<()> {
             direct,
             claude_code_compat,
             grants,
+            tools,
         } => {
             let startup_started = std::time::Instant::now();
             // Long-running MCP proxy — kick off the background update check
@@ -1298,13 +1364,14 @@ fn main() -> anyhow::Result<()> {
                         true,
                         startup_started.elapsed(),
                     );
-                    run_mcp_direct(claude_code_compat)
+                    run_mcp_direct(claude_code_compat, tools)
                 }
                 Err(error) => Err(error),
                 Ok(false) => cli::run_mcp_via_daemon_proxy(
                     socket,
                     claude_code_compat,
                     &grants,
+                    tools,
                     |daemon, success| {
                         telemetry::capture_mcp_startup_completed(
                             "daemon_proxy",
