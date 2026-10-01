@@ -43,6 +43,9 @@ const MAX_ITEMS: usize = 60;
 const MAX_SELECTED: usize = 30;
 /// Names shown in one list in the line.
 const MAX_SHOWN: usize = 12;
+/// Text controls longer than this are compared by length only (reading a
+/// long document's whole text every poll would be slow).
+const MAX_TEXT_CHARS: usize = 20_000;
 /// Files compared with the window's text up to this size.
 const MAX_FILE_BYTES: u64 = 256 * 1024;
 
@@ -62,8 +65,11 @@ extern "C" {
 pub(crate) struct Element {
     pub role: String,
     pub label: String,
-    /// AXValue as text (numbers as "0"/"1"); `None` when it has none.
+    /// AXValue as text (numbers as "0"/"1"); `None` when it has none, or
+    /// when a text control holds more than [`MAX_TEXT_CHARS`].
     pub value: Option<String>,
+    /// A long text control's length, its value left unread.
+    pub length: Option<usize>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -295,10 +301,13 @@ pub(crate) fn describe(
                 }
             }
         }
+        (Some(a), None) => parts.push(format!("{} is no longer readable (replaced or closed)", a.label)),
         _ => {}
     }
     if let (Some(a), Some(b)) = (&before.target, &after.target) {
-        if same_element(a, b) && a.value != b.value {
+        if same_element(a, b) && a.length != b.length {
+            parts.extend(length_line(a, b));
+        } else if same_element(a, b) && a.value != b.value {
             if let Some(value) = &b.value {
                 let was = a
                     .value
@@ -317,7 +326,9 @@ pub(crate) fn describe(
     let target_is_focus = matches!((&after.target, &after.focus), (Some(t), Some(f)) if same_element(t, f));
     match (&before.focus, &after.focus) {
         (Some(a), Some(b)) if same_element(a, b) => {
-            if a.value != b.value && !target_is_focus {
+            if a.length != b.length && !target_is_focus {
+                parts.extend(length_line(a, b));
+            } else if a.value != b.value && !target_is_focus {
                 if let Some(value) = &b.value {
                     parts.push(format!("{} now {}", element_name(b), shown_value(value)));
                 }
@@ -330,10 +341,10 @@ pub(crate) fn describe(
             }
             parts.push(line);
         }
-        (Some(a), None) if is_text_role(&a.role) && after.window_present == Some(true) => {
-            parts.push(format!("focus left {}", element_name(a)));
-        }
         _ => {}
+    }
+    if parts.is_empty() && before != after {
+        return "the window changed in a way this line does not describe; read it if it matters".into();
     }
     if parts.is_empty() {
         let seconds = NO_CHANGE_WAIT.as_secs_f32();
@@ -357,6 +368,16 @@ pub(crate) fn describe(
         ));
     }
     line
+}
+
+/// A long text control's change, by length.
+fn length_line(before: &Element, after: &Element) -> Option<String> {
+    let now = after.length.or_else(|| after.value.as_ref().map(|v| v.chars().count()))?;
+    let was = before.length.or_else(|| before.value.as_ref().map(|v| v.chars().count()));
+    Some(match was {
+        Some(was) => format!("{} now {now} characters, was {was}", element_name(after)),
+        None => format!("{} now {now} characters", element_name(after)),
+    })
 }
 
 /// A control value in the line (checkbox states and short text whole).
@@ -514,12 +535,24 @@ unsafe fn read_element(reader: &mut Reader, element: AXUIElementRef) -> Option<E
         .or_else(|| text_attr(element, "AXDescription"))
         .or_else(|| text_attr(element, "AXIdentifier").filter(|id| !id.starts_with("_NS:")))
         .unwrap_or_default();
-    let value = copy_stringish_attr(element, "AXValue").map(|value| value.state_value);
-    Some(Element { role, label, value })
+    let length = is_text_role(&role)
+        .then(|| crate::ax::bindings::copy_number_attr(element, "AXNumberOfCharacters"))
+        .flatten()
+        .map(|n| n as usize)
+        .filter(|&n| n > MAX_TEXT_CHARS);
+    let value = match length {
+        Some(_) => None,
+        None => copy_stringish_attr(element, "AXValue").map(|value| value.state_value),
+    };
+    Some(Element { role, label, value, length })
 }
 
 const COLLECTION_ROLES: &[&str] = &["AXList", "AXOutline", "AXTable", "AXGrid", "AXBrowser"];
-const STOP_ROLES: &[&str] = &["AXWindow", "AXSheet", "AXApplication", "AXSystemWide"];
+/// Walking up stops here. A menu is not a list the action changes: it
+/// closes when its item is chosen.
+const STOP_ROLES: &[&str] = &[
+    "AXWindow", "AXSheet", "AXApplication", "AXSystemWide", "AXMenu", "AXMenuBar", "AXMenuBarItem",
+];
 
 /// The list, outline or table holding `start` (itself or an ancestor up to
 /// six levels), retained: the nearest one that reports a selection, else the
@@ -723,11 +756,16 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
                     break;
                 }
                 if copy_string_attr(child.0, "AXRole").as_deref() == Some("AXSheet") {
-                    sheets.push(
-                        text_attr(child.0, "AXDescription")
-                            .or_else(|| text_attr(child.0, "AXTitle"))
-                            .unwrap_or_else(|| "sheet".into()),
-                    );
+                    sheets.push(sheet_name(child.0));
+                    // A sheet on a sheet (Go to Folder over a Save panel).
+                    for inner in copy_children(child.0).into_iter().map(Owned) {
+                        if !reader.admit(inner.0) {
+                            break;
+                        }
+                        if copy_string_attr(inner.0, "AXRole").as_deref() == Some("AXSheet") {
+                            sheets.push(sheet_name(inner.0));
+                        }
+                    }
                 }
             }
             facts.sheets = reader.complete.then_some(sheets);
@@ -777,6 +815,13 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
         window: if keep { window } else { None },
         holder: used,
     }
+}
+
+unsafe fn sheet_name(sheet: AXUIElementRef) -> String {
+    text_attr(sheet, "AXDescription")
+        .or_else(|| text_attr(sheet, "AXTitle"))
+        .or_else(|| text_attr(sheet, "AXIdentifier").filter(|id| !id.starts_with("_NS:")))
+        .unwrap_or_else(|| "sheet".into())
 }
 
 unsafe fn retained(ptr: usize) -> AXUIElementRef {
@@ -845,12 +890,19 @@ unsafe fn file_text(path: &Path, window: AXUIElementRef) -> Option<FileText> {
     }
     let on_disk = String::from_utf8(std::fs::read(path).ok()?).ok()?;
     let shown = window_text(window)?;
-    Some(if on_disk == shown {
-        FileText::Matches(shown.chars().count())
-    } else {
-        FileText::Differs
-    })
+    if on_disk == shown {
+        return Some(FileText::Matches(shown.chars().count()));
+    }
+    // A rich text, HTML or other formatted file never equals its shown
+    // text; only a plain text file's difference means something.
+    let plain = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .is_some_and(|e| PLAIN_TEXT.contains(&e.to_ascii_lowercase().as_str()));
+    plain.then_some(FileText::Differs)
 }
+
+const PLAIN_TEXT: &[&str] = &["txt", "text", "md", "markdown", "csv", "tsv", "log", "json", "yaml", "yml"];
 
 // ---------------------------------------------------------------------------
 // The watch
@@ -862,6 +914,16 @@ struct Watch {
     /// Keep the target and the list alive for the after-reads.
     _target: Option<RetainedElement>,
     _collection: Option<RetainedElement>,
+}
+
+/// The facts as settling compares them: focus that went nowhere (a menu
+/// open, the app activating) is a moment in the action, not its outcome,
+/// so it neither counts as a change nor ends the wait.
+fn settle_key(mut facts: Facts, before: &Facts) -> Facts {
+    if facts.focus.is_none() {
+        facts.focus = before.focus.clone();
+    }
+    facts
 }
 
 /// Start a watch for one native action, or `None` when the action has no
@@ -948,6 +1010,7 @@ impl OutcomeWatch for Watch {
             .ok()?;
             let elapsed = started.elapsed();
             if complete {
+                let now = settle_key(now, &watch.before);
                 if previous.as_ref() != Some(&now) {
                     last_change = Instant::now();
                 }
@@ -986,13 +1049,14 @@ impl OutcomeWatch for Watch {
             }
             let (after, disk, complete) = if pass.complete {
                 let disk = disk_notes(&before, &pass);
-                (pass.facts, disk, true)
+                (settle_key(pass.facts, &before), disk, true)
             } else {
                 match previous {
                     Some(facts) => (facts, DiskNotes::default(), true),
                     None => (pass.facts, DiskNotes::default(), false),
                 }
             };
+            tracing::debug!(?before, ?after, ?settle, complete, "outcome facts");
             describe(&before, &after, &disk, settle, complete_before && complete)
         })
         .await
@@ -1043,13 +1107,14 @@ mod tests {
     fn a_new_folder_with_selection_names_added_gone_and_the_rename_field() {
         let mut before = window("inbox");
         before.collection = Some(list(&FILES, &["receipt-feb.pdf", "receipt-jan.pdf", "receipt-mar.pdf"]));
-        before.focus = Some(Element { role: "AXList".into(), label: "icon view".into(), value: None });
+        before.focus = Some(Element { role: "AXList".into(), label: "icon view".into(), value: None, length: None });
         let mut after = before.clone();
         after.collection = Some(list(&["notes.txt", "photo.jpg", "New Folder With Items"], &["New Folder With Items"]));
         after.focus = Some(Element {
             role: "AXTextField".into(),
             label: String::new(),
             value: Some("New Folder With Items".into()),
+            length: None,
         });
         assert_eq!(
             describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
@@ -1063,10 +1128,10 @@ mod tests {
     fn a_rename_commit_names_the_committed_name() {
         let mut before = window("inbox");
         before.collection = Some(list(&["notes.txt", "photo.jpg", "New Folder With Items"], &["New Folder With Items"]));
-        before.focus = Some(Element { role: "AXTextField".into(), label: String::new(), value: Some("Receipts".into()) });
+        before.focus = Some(Element { role: "AXTextField".into(), label: String::new(), value: Some("Receipts".into()), length: None });
         let mut after = before.clone();
         after.collection = Some(list(&["notes.txt", "photo.jpg", "Receipts"], &["Receipts"]));
-        after.focus = Some(Element { role: "AXList".into(), label: "icon view".into(), value: None });
+        after.focus = Some(Element { role: "AXList".into(), label: "icon view".into(), value: None, length: None });
         assert_eq!(
             describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
             "icon view now: notes.txt, photo.jpg, Receipts (3); added Receipts; gone from the list: \
@@ -1148,6 +1213,7 @@ mod tests {
             role: "AXCheckBox".into(),
             label: "Check spelling as you type".into(),
             value: Some(value.into()),
+            length: None,
         };
         before.target = Some(checkbox("1"));
         before.focus = before.target.clone();
@@ -1163,13 +1229,36 @@ mod tests {
     #[test]
     fn a_set_value_echoes_the_text() {
         let mut before = window("note.txt");
-        let area = |value: &str| Element { role: "AXTextArea".into(), label: String::new(), value: Some(value.into()) };
+        let area = |value: &str| Element {
+            role: "AXTextArea".into(),
+            label: String::new(),
+            value: Some(value.into()),
+            length: None,
+        };
         before.target = Some(area("draft\n"));
         let mut after = before.clone();
         after.target = Some(area("shopping list\n- milk\n"));
         assert_eq!(
             describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
             "AXTextArea now \"shopping list\\n- milk\\n\", was \"draft\\n\""
+        );
+    }
+
+    #[test]
+    fn a_long_document_is_compared_by_length() {
+        let mut before = window("book.txt");
+        let area = |length: usize| Element {
+            role: "AXTextArea".into(),
+            label: String::new(),
+            value: None,
+            length: Some(length),
+        };
+        before.focus = Some(area(25_000));
+        let mut after = before.clone();
+        after.focus = Some(area(25_007));
+        assert_eq!(
+            describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
+            "AXTextArea now 25007 characters, was 25000"
         );
     }
 
