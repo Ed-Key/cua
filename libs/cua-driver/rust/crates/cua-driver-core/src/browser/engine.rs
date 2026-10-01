@@ -326,11 +326,15 @@ fn viewport_point_to_screen(
 }
 
 /// Walks `levels` up from the control (a shadow root's next level is its
-/// host, as the snapshot's DOM index counts it) and says whether that row's
-/// text, open shadow roots included, still holds `words` in order.
+/// host and a frame document's its frame element, as the snapshot's DOM
+/// index counts them) and says whether that row's text, open shadow roots
+/// included, still holds `words` in order.
 const ROW_STILL_READS: &str = "function(levels, words) { \
     let row = this; \
-    for (let i = 0; i < levels && row; i++) row = row.parentNode || row.host || null; \
+    for (let i = 0; i < levels && row; i++) { \
+        row = row.parentNode || row.host || \
+            (row.defaultView ? row.defaultView.frameElement : null) || null; \
+    } \
     if (!row) return false; \
     const parts = [], stack = [row]; \
     while (stack.length) { \
