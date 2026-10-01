@@ -1001,7 +1001,12 @@ impl CaptureWorker {
                     wait,
                 );
                 if png.is_some() && first {
-                    lock(&looping.captured).insert(key, epoch);
+                    // Under the epochs lock: a session that ended meanwhile
+                    // (`forget`) never gets its entry back.
+                    let epochs = lock(&looping.epochs);
+                    if epochs.current(&key) == Some(epoch) {
+                        lock(&looping.captured).insert(key, epoch);
+                    }
                 }
                 deliver(frame, epoch, png);
             })?;
@@ -6836,6 +6841,27 @@ mod tests {
         assert_eq!(recv(&delivered), ("fails".to_owned(), None));
         worker.push(frame("t", "slow"));
         assert!(recv(&delivered).1.is_some(), "still the first still's wait");
+    }
+
+    #[test]
+    fn a_session_that_ends_during_its_first_capture_leaves_no_marker() {
+        let (release, gate) = mpsc::channel::<()>();
+        let gate = Mutex::new(gate);
+        let (started_tx, started) = mpsc::channel::<()>();
+        let started_tx = Mutex::new(started_tx);
+        let capture: Arc<CaptureFn> = Arc::new(move |_, _| {
+            let _ = lock(&started_tx).send(());
+            let _ = lock(&gate).recv();
+            Some((7, vec![1], None))
+        });
+        let (worker, delivered) =
+            worker_with_first(capture, Duration::from_millis(100), Duration::from_secs(2));
+        worker.push(frame("s", "first"));
+        started.recv_timeout(Duration::from_secs(2)).unwrap();
+        worker.forget("s");
+        release.send(()).unwrap();
+        let _ = recv(&delivered);
+        assert!(lock(&worker.captured).is_empty(), "the ended session's epoch is not kept");
     }
 
     #[test]
