@@ -83,6 +83,18 @@ pub(crate) struct Collection {
     pub selected: Option<Vec<String>>,
 }
 
+#[derive(Clone, Debug, Eq)]
+pub(crate) struct OtherWindow {
+    pub id: u32,
+    pub title: String,
+}
+
+impl PartialEq for OtherWindow {
+    fn eq(&self, other: &Self) -> bool {
+        self.id == other.id
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct FileStamp {
     pub modified: SystemTime,
@@ -101,6 +113,9 @@ pub(crate) struct Facts {
     pub file: Option<FileStamp>,
     pub edited: Option<bool>,
     pub sheets: Option<Vec<String>>,
+    /// The app's other windows (an action can open one: Settings, a new
+    /// document). Compared by id; a title change elsewhere is not a change.
+    pub windows: Option<Vec<OtherWindow>>,
     pub focus: Option<Element>,
     pub target: Option<Element>,
     pub collection: Option<Collection>,
@@ -308,10 +323,23 @@ pub(crate) fn describe(
         (Some(a), None) => parts.push(format!("{} is no longer readable (replaced or closed)", a.label)),
         _ => {}
     }
+    if let (Some(a), Some(b)) = (&before.windows, &after.windows) {
+        for w in b.iter().filter(|w| !a.contains(w)) {
+            parts.push(format!("window opened: {} (window_id {})", quote(&w.title), w.id));
+        }
+        for w in a.iter().filter(|w| !b.contains(w)) {
+            parts.push(format!("window closed: {} (window_id {})", quote(&w.title), w.id));
+        }
+    }
+    // The target is the same retained element both times, so a new label
+    // (a disclosure triangle's "show more" becoming "show less") is still it.
     if let (Some(a), Some(b)) = (&before.target, &after.target) {
-        if same_element(a, b) && a.length != b.length {
+        let it = a.role == b.role;
+        if it && a.length != b.length {
             parts.extend(length_line(a, b));
-        } else if same_element(a, b) && a.value != b.value {
+        } else if it && a.value == b.value && a.label != b.label {
+            parts.push(format!("{} is now labelled {}", element_name(a), quote(&b.label)));
+        } else if it && a.value != b.value {
             if let Some(value) = &b.value {
                 let was = a
                     .value
@@ -354,7 +382,7 @@ pub(crate) fn describe(
         let seconds = NO_CHANGE_WAIT.as_secs_f32();
         let mut line = if complete {
             format!(
-                "nothing it watches changed within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers)"
+                "nothing it watches changed within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers, windows)"
             )
         } else {
             format!("no change seen within {seconds:.1} s, but the app did not answer every read")
@@ -558,10 +586,12 @@ unsafe fn read_element(reader: &mut Reader, element: AXUIElementRef) -> Option<E
 }
 
 const COLLECTION_ROLES: &[&str] = &["AXList", "AXOutline", "AXTable", "AXGrid", "AXBrowser"];
-/// Walking up stops here. A menu is not a list the action changes: it
-/// closes when its item is chosen.
+/// Walking up stops here. A menu is not a list the action changes (it
+/// closes when its item is chosen), nor is a toolbar (its buttons act on the
+/// window's content, which the focus finds).
 const STOP_ROLES: &[&str] = &[
     "AXWindow", "AXSheet", "AXApplication", "AXSystemWide", "AXMenu", "AXMenuBar", "AXMenuBarItem",
+    "AXToolbar",
 ];
 
 /// The list, outline or table holding `start` (itself or an ancestor up to
@@ -729,9 +759,22 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
             .into_iter()
             .map(Owned)
             .collect();
-        window = windows
-            .into_iter()
-            .find(|w| ax_get_window_id(w.0) == Some(scope.window_id));
+        let mut others = Vec::new();
+        for w in windows {
+            match ax_get_window_id(w.0) {
+                Some(id) if id == scope.window_id => window = Some(w),
+                Some(id) => {
+                    if !reader.admit(w.0) {
+                        break;
+                    }
+                    let title = copy_string_attr(w.0, "AXTitle").unwrap_or_default();
+                    others.push(OtherWindow { id, title });
+                }
+                None => {}
+            }
+        }
+        others.sort_by_key(|w| w.id);
+        facts.windows = reader.complete.then_some(others);
         facts.window_present = Some(window.is_some());
     } else {
         reader.complete = false;
@@ -1104,6 +1147,7 @@ mod tests {
             window_present: Some(true),
             title: Some(title.into()),
             sheets: Some(vec![]),
+            windows: Some(vec![]),
             ..Facts::default()
         }
     }
@@ -1245,6 +1289,39 @@ mod tests {
         assert_eq!(
             describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
             "AXCheckBox \"Check spelling as you type\" now 0 (off), was 1 (on)"
+        );
+    }
+
+    #[test]
+    fn a_menu_that_opens_another_window_names_it_with_its_id() {
+        let before = window("note.txt");
+        let mut after = before.clone();
+        after.windows = Some(vec![OtherWindow { id: 21016, title: "General".into() }]);
+        assert_eq!(
+            describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
+            "window opened: \"General\" (window_id 21016)"
+        );
+        // Another window's new title alone is not a change.
+        let mut retitled = after.clone();
+        retitled.windows = Some(vec![OtherWindow { id: 21016, title: "Open and Save".into() }]);
+        assert_eq!(after, retitled);
+    }
+
+    #[test]
+    fn a_relabelled_target_is_still_the_target() {
+        let mut before = window("note.txt");
+        let triangle = |label: &str, value: &str| Element {
+            role: "AXDisclosureTriangle".into(),
+            label: label.into(),
+            value: Some(value.into()),
+            length: None,
+        };
+        before.target = Some(triangle("show more options", "0"));
+        let mut after = before.clone();
+        after.target = Some(triangle("show less options", "1"));
+        assert_eq!(
+            describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
+            "AXDisclosureTriangle \"show less options\" now 1, was 0"
         );
     }
 
