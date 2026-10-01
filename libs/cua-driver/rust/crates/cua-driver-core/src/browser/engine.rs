@@ -356,7 +356,6 @@ const ROW_STILL_READS: &str = "function(levels, name, truncated) { \
         if (node.nodeType === 3) { \
             const host = node.parentElement; \
             if (host) { \
-                if (host.checkVisibility && !host.checkVisibility()) continue; \
                 const style = getComputedStyle(host); \
                 if (style.display === 'none' || style.visibility === 'hidden' || \
                     Number(style.opacity) <= 0) continue; \
@@ -367,7 +366,8 @@ const ROW_STILL_READS: &str = "function(levels, name, truncated) { \
         if (node.nodeType === 1 && node !== row && (skip.has(node.tagName) || \
             (node.tagName === 'A' && node.hasAttribute('href')) || \
             roles.test(node.getAttribute('role') || '') || \
-            node.getAttribute('aria-hidden') === 'true' || node.hidden)) continue; \
+            node.getAttribute('aria-hidden') === 'true' || node.hidden || \
+            getComputedStyle(node).display === 'none')) continue; \
         const kids = Array.from(node.childNodes || []); \
         if (node.shadowRoot) kids.push(node.shadowRoot); \
         for (let k = kids.length - 1; k >= 0; k--) stack.push(kids[k]); \
