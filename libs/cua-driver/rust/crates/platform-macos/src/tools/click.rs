@@ -815,6 +815,18 @@ impl Tool for ClickTool {
                 || async move {
                     tokio::task::spawn_blocking(move || {
                         let element_ptr = element_guard.as_ptr();
+                        // Menus on screen before the press, so a menu it opens
+                        // is tied to this window while the action holds the
+                        // input lock (a Catalyst pop-up's menu names no window).
+                        let menus_before = crate::outcome::menu_window_ids(pid);
+                        let note_menu = |result: anyhow::Result<_>| {
+                            if result.is_ok() {
+                                // SAFETY: the element guard keeps it retained.
+                                unsafe { crate::outcome::note_menu_opened(pid, wid, element_ptr, menus_before.clone()) };
+                            }
+                            result
+                        };
+                        note_menu((|| {
                         if foreground {
                             let mut outcome = None;
                             let has_modifiers = !selection_modifiers.is_empty();
@@ -882,6 +894,7 @@ impl Tool for ClickTool {
                             )
                             .map(|outcome| (outcome, false))
                         }
+                        })())
                     })
                     .await
                 },

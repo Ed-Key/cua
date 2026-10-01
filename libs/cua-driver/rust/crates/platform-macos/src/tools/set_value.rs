@@ -405,8 +405,17 @@ fn catalyst_read_back(
 ) -> Written {
     std::thread::sleep(std::time::Duration::from_millis(300));
     let now = read();
-    if now.as_deref() != Some(value) {
-        return Written::DidNotTake(now);
+    let Some(now) = now else {
+        // An unreadable value proves neither that it took nor that it did not.
+        outcome.verified = None;
+        outcome.detail.push_str(
+            " This is a Mac Catalyst field and its value could not be read back, so the write \
+             is unverified; whether the app reacted is unverified too.",
+        );
+        return Written::Outcome(outcome);
+    };
+    if now != value {
+        return Written::DidNotTake(Some(now));
     }
     outcome.verified = Some(true);
     outcome.detail.push_str(
@@ -1123,6 +1132,11 @@ mod tests {
         }
         let lost = super::catalyst_read_back(written().unwrap(), "Ada Lovelace", || Some("Ada".into()));
         assert!(matches!(lost, super::Written::DidNotTake(Some(ref now)) if now == "Ada"));
+        // Unreadable: unverified, not a failure.
+        match super::catalyst_read_back(written().unwrap(), "Ada Lovelace", || None) {
+            super::Written::Outcome(outcome) => assert_eq!(outcome.verified, None),
+            super::Written::DidNotTake(_) => panic!("an unreadable value is not a failed write"),
+        }
     }
 
     #[test]

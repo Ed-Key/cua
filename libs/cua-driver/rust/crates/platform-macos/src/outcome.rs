@@ -1033,16 +1033,54 @@ struct MenuOpener {
 /// ponytail: one record per window, 16 windows, oldest dropped.
 static MENU_OPENERS: std::sync::Mutex<Vec<MenuOpener>> = std::sync::Mutex::new(Vec::new());
 
-fn remember_menu_opener(pid: i32, window_id: u32, opener: usize, menus: Vec<u32>) {
-    let mut openers = MENU_OPENERS.lock().unwrap_or_else(|e| e.into_inner());
-    openers.retain(|o| (o.pid, o.window_id) != (pid, window_id));
-    if openers.len() >= 16 {
-        openers.remove(0);
+/// The app's on-screen menu window ids, for [`note_menu_opened`].
+pub(crate) fn menu_window_ids(pid: i32) -> Option<Vec<u32>> {
+    crate::windows::menu_windows_of(pid).map(|windows| windows.iter().map(|w| w.window_id).collect())
+}
+
+/// Called by a press on `element` in window `window_id` while the action
+/// still holds the input lock (so no other action can open a menu in
+/// between): when menu windows of the app appeared that `before` did not
+/// hold, remember `element` as their opener. A pop-up-like element (a
+/// pop-up or menu button, or a button that shows a menu) gets up to 250 ms
+/// for its menu to appear.
+///
+/// # Safety
+///
+/// `element` must be a valid AXUIElementRef for the duration of the call.
+pub(crate) unsafe fn note_menu_opened(pid: i32, window_id: u32, element: usize, before: Option<Vec<u32>>) {
+    let Some(before) = before else { return };
+    let role = copy_string_attr(element as AXUIElementRef, "AXRole").unwrap_or_default();
+    if role == "AXMenuItem" {
+        return;
     }
-    // SAFETY: `opener` is the watch's target, which the watch keeps retained
-    // while it finishes.
-    let opener = unsafe { RetainedElement::retain(opener) };
-    openers.push(MenuOpener { pid, window_id, opener, menus });
+    let shows_menu = matches!(role.as_str(), "AXPopUpButton" | "AXMenuButton")
+        || (role == "AXButton"
+            && crate::ax::bindings::copy_action_names(element as AXUIElementRef)
+                .iter()
+                .any(|action| action == "AXShowMenu"));
+    let deadline = Instant::now() + if shows_menu { Duration::from_millis(250) } else { Duration::ZERO };
+    loop {
+        let new: Vec<u32> = menu_window_ids(pid)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|id| !before.contains(id))
+            .collect();
+        if !new.is_empty() {
+            let mut openers = MENU_OPENERS.lock().unwrap_or_else(|e| e.into_inner());
+            openers.retain(|o| (o.pid, o.window_id) != (pid, window_id));
+            if openers.len() >= 16 {
+                openers.remove(0);
+            }
+            let opener = RetainedElement::retain(element);
+            openers.push(MenuOpener { pid, window_id, opener, menus: new });
+            return;
+        }
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
 }
 
 /// Whether `element` is an item of a menu with no AX parent (or the
@@ -1358,16 +1396,6 @@ impl OutcomeWatch for Watch {
             }
             if let Some(list) = &pass.holder {
                 remember_collection(scope.pid, scope.window_id, list);
-            }
-            // The action opened a menu: remember what opened it, so a pick
-            // from that menu is known to come from this window.
-            if let (Some(before_menus), Some(after_menus), Some(target)) =
-                (&before.menus, &pass.facts.menus, scope.target)
-            {
-                let new: Vec<u32> = after_menus.iter().filter(|id| !before_menus.contains(id)).copied().collect();
-                if !new.is_empty() {
-                    remember_menu_opener(scope.pid, scope.window_id, target, new);
-                }
             }
             let (after, disk, complete) = if pass.complete {
                 let disk = disk_notes(&before, &pass);
