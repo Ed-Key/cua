@@ -34,7 +34,7 @@ const NEAR_VIEWPORT_MARGIN: f64 = 1_000.0;
 /// notice to the user, not page content: snapshots leave it out, so it never
 /// shows up as a page change and its Stop button is never offered as a ref.
 const CUA_INDICATOR_HOST_ID: &str = "cua-driver-indicator";
-pub(crate) const MAX_SEMANTIC_TEXT_CHARS: usize = 1_000;
+const MAX_SEMANTIC_TEXT_CHARS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Rect {
@@ -842,6 +842,10 @@ fn relink_past_dropped_nodes(nodes: &mut [SemanticNode], ax_nodes: &[Value]) {
 
 /// Longest row name, in characters.
 const ROW_NAME_CHARS: usize = 80;
+/// How much of a row's text a ref keeps to re-prove the row by (well under
+/// the 1,000 characters one text node is read at, so both sides of the
+/// comparison see the same characters).
+pub(crate) const ROW_TEXT_CHARS: usize = 200;
 /// How far up the DOM a control's row is looked for.
 const ROW_LEVELS: usize = 5;
 /// How far up from a piece of text, or another control, its row may be.
@@ -927,6 +931,7 @@ fn name_controls_by_row(nodes: &mut [SemanticNode], dom: &DomIndex) {
                 let joined = found.iter().map(|(_, text)| *text).collect::<Vec<_>>().join(" ");
                 if let Some(text) = clean_semantic_text(joined) {
                     let mut name = text.clone();
+                    let text: String = text.chars().take(ROW_TEXT_CHARS).collect();
                     if name.chars().count() > ROW_NAME_CHARS {
                         name = name.chars().take(ROW_NAME_CHARS - 1).collect::<String>();
                         name.push('…');

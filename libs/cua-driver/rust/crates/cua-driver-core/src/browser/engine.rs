@@ -331,9 +331,11 @@ fn viewport_point_to_screen(
 /// ([`super::semantic`]'s `name_controls_by_row`): its visible text in
 /// order (children, then a shadow root, as the DOM index walks), open shadow
 /// roots included, without text inside buttons,
-/// links and fields, cleaned the same way, then compared with the row's whole
-/// text as the snapshot read it, ignoring case (a CSS text-transform changes
-/// case in accessibility, not in the DOM).
+/// links and fields, cleaned the same way, then compared with the row text the
+/// ref keeps (the start of a longer row), ignoring case: a CSS text-transform
+/// changes case in accessibility, not in the DOM. Accepted ceiling: a slot
+/// reused for an item that differs only in case, or only after the kept 200
+/// characters, still passes.
 ///
 /// ponytail: visibility is the text's own element (visibility, opacity) plus
 /// a display:none or content-visibility:hidden ancestor (which accessibility
@@ -413,11 +415,8 @@ async fn row_still_reads(
             "arguments": [
                 { "value": row.levels },
                 { "value": row.text },
-                // Snapshot text stops at this many characters.
-                {
-                    "value": row.text.chars().count()
-                        >= super::semantic::MAX_SEMANTIC_TEXT_CHARS
-                },
+                // The ref keeps this many characters of a longer row.
+                { "value": row.text.chars().count() >= super::semantic::ROW_TEXT_CHARS },
             ],
             "returnByValue": true,
         }),

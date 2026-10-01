@@ -196,8 +196,8 @@ pub struct RefEntry {
 pub struct RowName {
     pub name: String,
     pub levels: usize,
-    /// The row's whole text, which `name` shows at most 80 characters of:
-    /// what the ref is re-proven against and fingerprinted by.
+    /// The row's text (its first 200 characters), which `name` shows at most
+    /// 80 of: what the ref is re-proven against and fingerprinted by.
     pub text: String,
 }
 
