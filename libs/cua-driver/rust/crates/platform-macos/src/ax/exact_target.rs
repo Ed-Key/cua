@@ -200,6 +200,14 @@ pub fn gather_background_facts(
                 Some(id) if crate::ax::bindings::window_belongs_to(id, window_id) => {
                     ElementAncestry::ProvenDescendant
                 }
+                // An item of a menu that names no window (a Catalyst pop-up's
+                // menu) belongs to this window when a cua action on it
+                // opened that menu, which is still on screen around the item.
+                _ if crate::outcome::recorded_menu_opener(pid, window_id, ptr as AXUIElementRef)
+                    .is_some() =>
+                {
+                    ElementAncestry::ProvenDescendant
+                }
                 Some(_) => ElementAncestry::OutsideTargetWindow,
                 None => ElementAncestry::Unproven,
             });
