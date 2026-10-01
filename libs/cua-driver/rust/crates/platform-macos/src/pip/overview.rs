@@ -781,7 +781,7 @@ pub(super) unsafe fn screens() -> Vec<*mut AnyObject> {
 }
 
 /// Height of the primary screen (AppKit's coordinate origin).
-unsafe fn primary_screen_height() -> f64 {
+pub(super) unsafe fn primary_screen_height() -> f64 {
     let screens: *mut AnyObject = msg_send![class!(NSScreen), screens];
     let screen: *mut AnyObject = msg_send![screens, firstObject];
     if screen.is_null() {

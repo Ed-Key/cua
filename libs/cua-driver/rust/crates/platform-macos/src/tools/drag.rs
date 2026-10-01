@@ -322,11 +322,12 @@ impl Tool for DragTool {
                         if let Some(wid) = foreground_window_id {
                             // Keep the exact target window active for the
                             // complete HID gesture, then restore the prior
-                            // front process.
-                            return crate::input::skylight::with_foreground_pointer_activation(
+                            // front process. PiP panels anywhere on the
+                            // path stay out of its way for all of it.
+                            return crate::input::skylight::with_foreground_pointer_gesture(
                                 pid as libc::pid_t,
                                 wid,
-                                (from_sx, from_sy),
+                                &[(from_sx, from_sy), (to_sx, to_sy)],
                                 || {
                                     let observed_cursor = cursor_for_drag.clone();
                                     crate::input::mouse::drag_at_xy_observed(
@@ -437,7 +438,7 @@ impl Tool for DragTool {
             .with_structured(serde_json::json!({
                 "path": "cgevent_hid", "verified": false, "effect": "unverifiable"
             })),
-            Ok(Err(e)) if e.is::<crate::input::skylight::TargetOccluded>() => {
+            Ok(Err(e)) if super::pixel_route::is_pointer_refusal(&e) => {
                 super::pixel_route::foreground_unavailable("drag", window_id.unwrap_or_default(), &e)
             }
             Ok(Err(e)) => ToolResult::error(format!("drag failed: {e}")),

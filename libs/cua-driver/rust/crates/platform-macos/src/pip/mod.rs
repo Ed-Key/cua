@@ -60,6 +60,13 @@
 //!   user's; the agent's clock (the idle deadline above, the proof timer)
 //!   runs as ever, so a finale is never postponed by a resting pointer. A
 //!   panel that is not shown is not brought back by the pointer.
+//! - A panel never blocks an agent (see `yields`): a window-scoped
+//!   foreground click, double-click, right-click or drag that crosses a
+//!   panel orders it out at once for the gesture and back after it, unless
+//!   the user's hands are on it (then the gesture waits, at most 5 s, and is
+//!   refused `pip_held_by_user`). Background clicks, point scrolls and AX
+//!   actions never reach a panel; desktop-scope and interactive input are
+//!   not covered.
 //! - The header's close button hides the panel until the session's next
 //!   frame; the focus button brings the target window forward through the
 //!   same code path as the `bring_to_front` tool.
@@ -165,6 +172,7 @@ mod overview;
 mod page;
 mod stack;
 mod visibility;
+mod yields;
 
 use cursor::{cursor_in_well, shown_area, sprite_placement, sprite_window, Sprite};
 pub(crate) use cursor::sprite_box;
@@ -639,6 +647,10 @@ struct Panel {
     /// The window the session last acted in, from its latest captured
     /// frame: the front card, unless the user picked another.
     agent: Option<Tag>,
+    /// Agent gestures in flight that have this panel's window out of their
+    /// way (see `yields`): while non-zero the window stays ordered out,
+    /// whatever `shown` says.
+    aside: u32,
 }
 
 /// A back card's views.
@@ -3411,12 +3423,17 @@ unsafe fn show(panel: &mut Panel) {
     // not hold it, one that moves there before the first poll does.
     panel.hands.shown(mouse_location());
     let window = panel.window as *mut AnyObject;
-    let visible: bool = msg_send![window, isVisible];
-    if !visible {
-        let _: () = msg_send![window, setAlphaValue: 0.0_f64];
+    // A panel showing across an agent gesture in flight stays out of its
+    // way until the gesture ends (see `yields`).
+    join_asides(panel);
+    if panel.aside == 0 {
+        let visible: bool = msg_send![window, isVisible];
+        if !visible {
+            let _: () = msg_send![window, setAlphaValue: 0.0_f64];
+        }
+        // Never makeKey: the user's app keeps keyboard focus.
+        let _: () = msg_send![window, orderFrontRegardless];
     }
-    // Never makeKey: the user's app keeps keyboard focus.
-    let _: () = msg_send![window, orderFrontRegardless];
     animate_alpha(panel.window, 1.0);
     // The back items sit at rest behind the front card.
     panel.trail_motion.snap();
@@ -3463,16 +3480,20 @@ unsafe extern "C" fn hover_poll_cb(ctx: *mut c_void) {
         let worker = state.worker.clone();
         let mut cursor = state.cursor;
         let polled = panel_by_id(state, id).filter(|panel| panel.shown).map(|panel| {
-            let on = pointer_on(panel);
-            panel.hands.pointer(on, mouse_location(), now);
-            // The cursor of the press that is resizing, else of the band
-            // under the pointer; nothing while another panel is pressed.
-            let band = if on { pointer_edges(panel) } else { 0 };
-            if let Some(edges) = hands::poll_edges(gesture, id, band) {
-                sync_cursor(&mut cursor, id, edges);
-            }
-            if !panel.bar_shown && pointer_over(panel) {
-                show_bar(panel);
+            // Out of an agent gesture's way (see `yields`), the pointer the
+            // agent moves is not the user's and the panel is not under it.
+            if panel.aside == 0 {
+                let on = pointer_on(panel);
+                panel.hands.pointer(on, mouse_location(), now);
+                // The cursor of the press that is resizing, else of the band
+                // under the pointer; nothing while another panel is pressed.
+                let band = if on { pointer_edges(panel) } else { 0 };
+                if let Some(edges) = hands::poll_edges(gesture, id, band) {
+                    sync_cursor(&mut cursor, id, edges);
+                }
+                if !panel.bar_shown && pointer_over(panel) {
+                    show_bar(panel);
+                }
             }
             let held = pressed || panel.hands.holds(now);
             (panel.key.clone(), held, panel.hands.lapse(now))
@@ -3529,6 +3550,277 @@ unsafe fn animate_alpha_over(window: usize, alpha: f64, fade: Duration) {
     let animator: *mut AnyObject = msg_send![window as *mut AnyObject, animator];
     let _: () = msg_send![animator, setAlphaValue: alpha];
     let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+}
+
+// ── Stepping aside for the agent (see `yields`) ───────────────────────────
+
+/// An agent gesture in flight: its path and the panels it has out of its
+/// way. Main queue only.
+struct AsideRecord {
+    token: u64,
+    path: Vec<(f64, f64)>,
+    ids: Vec<i64>,
+}
+
+static ASIDES: Mutex<Vec<AsideRecord>> = Mutex::new(Vec::new());
+static NEXT_ASIDE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+/// How long a caller off the main queue waits for it to answer. A main
+/// queue that does not answer in time skips the step aside (the foreground
+/// admission check still refuses a covered point).
+const MAIN_WAIT: Duration = Duration::from_secs(1);
+
+/// An agent foreground pointer gesture was not sent: the user's hands are on
+/// a cua PiP panel it would cross, and they stayed there past
+/// `yields::USER_WAIT`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PipHeldByUser {
+    pub point: (f64, f64),
+    pub waited: Duration,
+}
+
+impl std::fmt::Display for PipHeldByUser {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let (x, y) = self.point;
+        write!(
+            f,
+            "the user is holding Cua Driver's preview panel over screen point ({x:.0},{y:.0}) \
+             (the pointer is on it, or it is pressed or dragged); waited {:.1} s and sent no \
+             input. Retry once the user lets go of the preview",
+            self.waited.as_secs_f64()
+        )
+    }
+}
+
+impl std::error::Error for PipHeldByUser {}
+
+/// cua's PiP panels out of one agent gesture's way until this drops (see
+/// `yields`). Dropping it gives them back, on every path: delivered,
+/// refused, failed, or unwound.
+#[must_use]
+pub struct Aside {
+    token: Option<u64>,
+}
+
+impl Drop for Aside {
+    fn drop(&mut self) {
+        if let Some(token) = self.token.take() {
+            give_back_aside(token);
+        }
+    }
+}
+
+/// Before a window-scoped foreground pointer gesture along `path` (screen
+/// points, CoreGraphics top-left origin: the click point, or a drag's start
+/// and end): order out every PiP panel it crosses, waiting (never on the
+/// main queue) while the user's hands are on one, at most
+/// `yields::USER_WAIT`. Call from a blocking thread, never the main one.
+pub fn step_aside(path: &[(f64, f64)]) -> Result<Aside, PipHeldByUser> {
+    let running = STATE.lock().unwrap_or_else(|e| e.into_inner()).is_some();
+    if !running || path.is_empty() {
+        return Ok(Aside { token: None });
+    }
+    let since = Instant::now();
+    let mut waited = false;
+    loop {
+        let owned = path.to_vec();
+        let answer = on_main(MAIN_WAIT, move || with_state(|state| unsafe { take_aside(state, owned) }));
+        match answer {
+            None => {
+                tracing::warn!(target: "pip", "PiP main queue did not answer; the agent gesture does not wait for the panels");
+                return Ok(Aside { token: None });
+            }
+            Some(None) => return Ok(Aside { token: None }),
+            Some(Some(Some(token))) => {
+                if waited {
+                    tracing::info!(target: "pip", waited_ms = since.elapsed().as_millis() as u64, "PiP released by the user: the agent gesture goes ahead");
+                }
+                return Ok(Aside { token: Some(token) });
+            }
+            Some(Some(None)) => {
+                let now = Instant::now();
+                if yields::give_up(since, now) {
+                    tracing::info!(target: "pip", "PiP held by the user past the wait: the agent gesture is refused");
+                    return Err(PipHeldByUser {
+                        point: path[0],
+                        waited: now - since,
+                    });
+                }
+                if !waited {
+                    waited = true;
+                    tracing::info!(target: "pip", "PiP held by the user: the agent gesture waits");
+                }
+                std::thread::sleep(yields::USER_POLL);
+            }
+        }
+    }
+}
+
+/// Main queue: the panels `path` crosses go out for a new gesture, whose
+/// token comes back; `None` while the user's hands are on one of them.
+unsafe fn take_aside(state: &mut State, path: Vec<(f64, f64)>) -> Option<u64> {
+    let pressed = state.gesture.as_ref().map(|gesture| gesture.id);
+    let primary_h = overview::primary_screen_height();
+    // The user's pointer as of now, not the last hover poll (see
+    // `yields::candidates`).
+    let pointer = mouse_location();
+    let mut looks = Vec::new();
+    for panel in state.panels.values_mut().chain(state.ending.iter_mut()) {
+        let visible: bool = msg_send![panel.window as *mut AnyObject, isVisible];
+        let on = visible && panel.aside == 0 && pointer_on(panel);
+        looks.push(yields::Look {
+            id: panel.id,
+            area: panel_screen_area(panel, primary_h),
+            shown: panel.shown,
+            visible,
+            aside: panel.aside,
+            pressed: pressed == Some(panel.id),
+            on,
+            hands: &mut panel.hands,
+        });
+    }
+    let candidates = yields::candidates(looks, pointer, Instant::now());
+    let ids = match yields::step(&candidates, &path) {
+        yields::Step::Wait => return None,
+        yields::Step::Aside(ids) => ids,
+    };
+    for &id in &ids {
+        if let Some(panel) = panel_by_id(state, id) {
+            let (count, order_out) = yields::take(panel.aside);
+            panel.aside = count;
+            if order_out {
+                // At once, not the fading `hide`: nothing about the panel
+                // changes but its window being out of the way.
+                let _: () = msg_send![
+                    panel.window as *mut AnyObject,
+                    orderOut: std::ptr::null_mut::<AnyObject>()
+                ];
+            }
+        }
+    }
+    let token = NEXT_ASIDE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    if !ids.is_empty() {
+        tracing::info!(target: "pip", token, ?ids, ?path, "PiP panels step aside for an agent gesture");
+    }
+    lock(&ASIDES).push(AsideRecord { token, path, ids });
+    Some(token)
+}
+
+/// Main queue: a panel being shown joins every gesture in flight it
+/// crosses, so it stays out of the way until they end.
+unsafe fn join_asides(panel: &mut Panel) {
+    let mut asides = lock(&ASIDES);
+    if asides.is_empty() {
+        return;
+    }
+    let area = panel_screen_area(panel, overview::primary_screen_height());
+    let before = panel.aside;
+    for record in asides.iter_mut() {
+        if !record.ids.contains(&panel.id) && yields::crosses(area, &record.path) {
+            record.ids.push(panel.id);
+            panel.aside = yields::take(panel.aside).0;
+            tracing::info!(target: "pip", token = record.token, id = panel.id, "PiP panel shown across an agent gesture stays aside");
+        }
+    }
+    let visible: bool = msg_send![panel.window as *mut AnyObject, isVisible];
+    if before == 0 && panel.aside > 0 && visible {
+        let _: () = msg_send![
+            panel.window as *mut AnyObject,
+            orderOut: std::ptr::null_mut::<AnyObject>()
+        ];
+    }
+}
+
+/// The gesture `token` is over: its panels come back if nothing else holds
+/// them out and they are still meant to show. Waits (bounded) for the main
+/// queue, so the panels are back when the tool answers; the give-back runs
+/// even if that wait runs out.
+fn give_back_aside(token: u64) {
+    if unsafe { libc::pthread_main_np() } != 0 {
+        with_state(|state| unsafe { give_back(state, token) });
+        return;
+    }
+    let (tx, rx) = mpsc::channel::<()>();
+    dispatch_to_main((token, tx), give_back_cb);
+    let _ = rx.recv_timeout(MAIN_WAIT);
+}
+
+unsafe extern "C" fn give_back_cb(ctx: *mut c_void) {
+    let (token, done) = *Box::from_raw(ctx as *mut (u64, mpsc::Sender<()>));
+    with_state(|state| give_back(state, token));
+    let _ = done.send(());
+}
+
+unsafe fn give_back(state: &mut State, token: u64) {
+    let record = {
+        let mut asides = lock(&ASIDES);
+        let Some(index) = asides.iter().position(|record| record.token == token) else {
+            return;
+        };
+        asides.remove(index)
+    };
+    for id in record.ids {
+        // An ended panel that closed meanwhile is gone: nothing to bring back.
+        let Some(panel) = panel_by_id(state, id) else {
+            continue;
+        };
+        let (count, back) = yields::give_back(panel.aside, panel.shown);
+        panel.aside = count;
+        if back {
+            let _: () = msg_send![panel.window as *mut AnyObject, orderFrontRegardless];
+            animate_alpha(panel.window, 1.0);
+            // The pointer the agent left under it is a resting pointer: it
+            // holds nothing until it moves (see `hands`).
+            panel.hands.shown(mouse_location());
+            tracing::info!(target: "pip", token, id, "PiP panel back after an agent gesture");
+        } else if count == 0 {
+            tracing::info!(target: "pip", token, id, "PiP panel stays hidden after an agent gesture (hidden meanwhile)");
+        }
+    }
+}
+
+/// The panel's window in CoreGraphics coordinates (top-left origin).
+unsafe fn panel_screen_area(panel: &Panel, primary_h: f64) -> Area {
+    let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
+    overview::screen_rect(area_of(frame), (0.0, 0.0), primary_h)
+}
+
+/// A job for the main queue, taken by whoever gets to it first: the main
+/// queue (it runs) or a caller that gave up waiting (it never runs).
+type MainJob = Arc<Mutex<Option<Box<dyn FnOnce() + Send>>>>;
+
+/// Run `f` on the main queue and wait up to `timeout` for its answer.
+/// `None` when it had not started by then: it then never runs.
+fn on_main<R: Send + 'static>(
+    timeout: Duration,
+    f: impl FnOnce() -> R + Send + 'static,
+) -> Option<R> {
+    if unsafe { libc::pthread_main_np() } != 0 {
+        return Some(f());
+    }
+    let (tx, rx) = mpsc::channel();
+    let job: MainJob = Arc::new(Mutex::new(Some(Box::new(move || {
+        let _ = tx.send(f());
+    }))));
+    dispatch_to_main(job.clone(), run_main_job_cb);
+    match rx.recv_timeout(timeout) {
+        Ok(answer) => Some(answer),
+        Err(_) => {
+            if lock(&job).take().is_some() {
+                return None;
+            }
+            // It is running right now: its answer is on the way.
+            rx.recv().ok()
+        }
+    }
+}
+
+unsafe extern "C" fn run_main_job_cb(ctx: *mut c_void) {
+    let job: MainJob = *Box::from_raw(ctx as *mut MainJob);
+    let run = lock(&job).take();
+    if let Some(run) = run {
+        run();
+    }
 }
 
 // ── Header buttons and ObjC classes ───────────────────────────────────────
@@ -4059,6 +4351,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         client: None,
         hands: Hands::default(),
         agent: None,
+        aside: 0,
     };
     apply_card_frames(&mut panel);
     render_backs(&mut panel);
