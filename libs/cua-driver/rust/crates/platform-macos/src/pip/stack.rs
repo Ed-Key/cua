@@ -711,7 +711,9 @@ impl Trail {
     /// are on screen (at most `TRAIL_LAG_CAP` behind, less a mirrored
     /// stack's reach), and spring after it.
     pub(super) fn panel_dragged(&mut self, delta: (f64, f64)) {
-        let cap = TRAIL_LAG_CAP - self.reach;
+        // Never negative (a tiny custom size box under a tall chip
+        // column): no lag at all then, and no division by a zero length.
+        let cap = (TRAIL_LAG_CAP - self.reach).max(0.0);
         if !self.dragging {
             self.dragging = true;
             self.max_lag = 0.0;
@@ -1635,6 +1637,12 @@ mod tests {
                 assert!((x.hypot(y) - (TRAIL_LAG_CAP - reach)).abs() < 1e-6, "{fan:?} {card_h}");
             }
         }
+        // A tiny card (a 60x40 custom box) under a tall chip column: no
+        // lag, never a reversed or NaN offset.
+        let mut trail = Trail::default();
+        trail.fan(Fan { below: true, right: false }, 27.0);
+        trail.panel_dragged((10.0, 0.0));
+        assert_eq!(trail.offset(Slot::Chip(0)), (0.0, 0.0));
         // A 109 pt card's three-chip column hangs 59 pt below it.
         assert_eq!(fan_reach(Fan { below: true, right: false }, 109.0), CHIP_COLUMN - 109.0);
         let mut trail = Trail::default();
