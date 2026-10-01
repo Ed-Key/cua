@@ -331,8 +331,9 @@ fn viewport_point_to_screen(
 /// ([`super::semantic`]'s `name_controls_by_row`): its visible text in
 /// order (children, then a shadow root, as the DOM index walks), open shadow
 /// roots included, without text inside buttons,
-/// links and fields, cleaned the same way, then compared with `name` (a
-/// truncated name by its prefix), ignoring case.
+/// links and fields, cleaned the same way, then compared with the row's whole
+/// text as the snapshot read it, ignoring case (a CSS text-transform changes
+/// case in accessibility, not in the DOM).
 ///
 /// ponytail: visibility is the text's own element (visibility, opacity) plus
 /// a display:none or content-visibility:hidden ancestor (which accessibility
@@ -341,7 +342,7 @@ fn viewport_point_to_screen(
 /// inline-styled hidden ancestor still counts here, and closed shadow roots
 /// are not seen. Either reads as a changed row (a refusal, never a wrong
 /// click). Move this check onto a fresh snapshot read if that bites.
-const ROW_STILL_READS: &str = "function(levels, name, truncated) { \
+const ROW_STILL_READS: &str = "function(levels, text, capped) { \
     let row = this; \
     for (let i = 0; i < levels && row; i++) { \
         row = row.parentNode || row.host || \
@@ -378,8 +379,7 @@ const ROW_STILL_READS: &str = "function(levels, name, truncated) { \
         .replace(/[\\uFEFF\\u200B\\u200C\\u200D\\u2060\\u00A0\\u2007\\u202F\\uE000-\\uF8FF]/g, ' ') \
         .split(/\\s+/).filter(Boolean).join(' ').toLowerCase(); \
     const now = clean(parts.join(' ')); \
-    const want = clean(truncated ? name.slice(0, -1) : name); \
-    return truncated ? now.startsWith(want) : now === want; \
+    return capped ? now.startsWith(clean(text)) : now === clean(text); \
 }";
 
 /// Whether the row a control was named after (see
@@ -412,8 +412,12 @@ async fn row_still_reads(
             "functionDeclaration": ROW_STILL_READS,
             "arguments": [
                 { "value": row.levels },
-                { "value": row.name },
-                { "value": row.truncated },
+                { "value": row.text },
+                // Snapshot text stops at this many characters.
+                {
+                    "value": row.text.chars().count()
+                        >= super::semantic::MAX_SEMANTIC_TEXT_CHARS
+                },
             ],
             "returnByValue": true,
         }),

@@ -196,8 +196,9 @@ pub struct RefEntry {
 pub struct RowName {
     pub name: String,
     pub levels: usize,
-    /// The row's text was longer: `name` is its first characters and "…".
-    pub truncated: bool,
+    /// The row's whole text, which `name` shows at most 80 characters of:
+    /// what the ref is re-proven against and fingerprinted by.
+    pub text: String,
 }
 
 /// One `dom_refs_v1` snapshot.

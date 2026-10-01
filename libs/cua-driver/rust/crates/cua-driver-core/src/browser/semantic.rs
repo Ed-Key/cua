@@ -34,7 +34,7 @@ const NEAR_VIEWPORT_MARGIN: f64 = 1_000.0;
 /// notice to the user, not page content: snapshots leave it out, so it never
 /// shows up as a page change and its Stop button is never offered as a ref.
 const CUA_INDICATOR_HOST_ID: &str = "cua-driver-indicator";
-const MAX_SEMANTIC_TEXT_CHARS: usize = 1_000;
+pub(crate) const MAX_SEMANTIC_TEXT_CHARS: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 struct Rect {
@@ -925,20 +925,13 @@ fn name_controls_by_row(nodes: &mut [SemanticNode], dom: &DomIndex) {
                 let mut found = found.clone();
                 found.sort_by_key(|(order, _)| *order);
                 let joined = found.iter().map(|(_, text)| *text).collect::<Vec<_>>().join(" ");
-                if let Some(mut name) = clean_semantic_text(joined) {
-                    let truncated = name.chars().count() > ROW_NAME_CHARS;
-                    if truncated {
+                if let Some(text) = clean_semantic_text(joined) {
+                    let mut name = text.clone();
+                    if name.chars().count() > ROW_NAME_CHARS {
                         name = name.chars().take(ROW_NAME_CHARS - 1).collect::<String>();
                         name.push('…');
                     }
-                    names.push((
-                        index,
-                        RowName {
-                            name,
-                            levels,
-                            truncated,
-                        },
-                    ));
+                    names.push((index, RowName { name, levels, text }));
                 }
                 break;
             }
@@ -2756,7 +2749,7 @@ mod tests {
             Some(RowName {
                 name: "Call the plumber".into(),
                 levels: 1,
-                truncated: false
+                text: "Call the plumber".into(),
             })
         );
         assert!(!entry.actions.contains(&BrowserActionKind::Type));

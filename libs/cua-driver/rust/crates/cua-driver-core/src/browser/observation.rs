@@ -114,7 +114,7 @@ pub(crate) struct Fingerprint {
 impl Fingerprint {
     pub(crate) fn of(entry: &RefEntry) -> Self {
         Self {
-            row: entry.row.as_ref().map(|row| row.name.clone()),
+            row: entry.row.as_ref().map(|row| row.text.clone()),
             ..Self::read(
                 entry.node_name.clone(),
                 entry.label.clone(),
@@ -893,7 +893,7 @@ mod tests {
             row: Some(crate::browser::store::RowName {
                 name: row.into(),
                 levels: 1,
-                truncated: false,
+                text: row.into(),
             }),
             ..node(10, "checkbox", "")
         };
