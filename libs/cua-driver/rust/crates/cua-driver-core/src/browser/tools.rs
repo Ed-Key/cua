@@ -3955,12 +3955,17 @@ impl Tool for BrowserTypeTool {
                                     describe_enter(after, &actual, before.password);
                                 summary.push_str(&said);
                                 structured["enter"] = described;
+                                // The evidence a batch step shows says what
+                                // Enter did, not only what came before it.
+                                structured["evidence"] = json!([{
+                                    "kind": "browser_readback",
+                                    "detail": format!("the field held {shown}{said}"),
+                                }]);
                                 if !confirmed {
                                     structured["effect"] = json!("unverifiable");
                                 }
                                 // What it holds now, where that is known.
                                 match after {
-                                    AfterEnter::NotSent(_) | AfterEnter::DialogBeforeEnter => {}
                                     AfterEnter::Field(state) => {
                                         structured["value"] = json!((!before.password)
                                             .then(|| truncate_value(&state.value)));
@@ -3968,14 +3973,6 @@ impl Tool for BrowserTypeTool {
                                     AfterEnter::ChangedBeforeEnter(value) => {
                                         structured["value"] = json!((!before.password)
                                             .then(|| truncate_value(value)));
-                                        structured["evidence"] = json!([{
-                                            "kind": "browser_readback",
-                                            "detail": format!(
-                                                "the field held {shown}, then changed to {} \
-                                                 before Enter",
-                                                shown_value(value, before.password)
-                                            ),
-                                        }]);
                                     }
                                     _ => structured["value"] = Value::Null,
                                 }

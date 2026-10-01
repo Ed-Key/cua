@@ -334,8 +334,9 @@ fn viewport_point_to_screen(
 /// links and fields, cleaned the same way, then compared with `name` (a
 /// truncated name by its prefix), ignoring case.
 ///
-/// ponytail: visibility is the text's own element (display, visibility,
-/// opacity), as the snapshot's layout reads it; text the snapshot drops for an
+/// ponytail: visibility is the text's own element (visibility, opacity) plus
+/// a display:none ancestor (which accessibility drops), as the snapshot reads
+/// it; text the snapshot drops for an
 /// inline-styled hidden ancestor still counts here, and closed shadow roots
 /// are not seen. Either reads as a changed row (a refusal, never a wrong
 /// click). Move this check onto a fresh snapshot read if that bites.
@@ -355,6 +356,7 @@ const ROW_STILL_READS: &str = "function(levels, name, truncated) { \
         if (node.nodeType === 3) { \
             const host = node.parentElement; \
             if (host) { \
+                if (host.checkVisibility && !host.checkVisibility()) continue; \
                 const style = getComputedStyle(host); \
                 if (style.display === 'none' || style.visibility === 'hidden' || \
                     Number(style.opacity) <= 0) continue; \

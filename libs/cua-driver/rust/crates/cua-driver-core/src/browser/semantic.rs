@@ -1679,7 +1679,7 @@ pub(crate) fn listed_ref(reference: &str, entry: &RefEntry, value: Option<&str>)
     let mut listed = serde_json::json!({
         "ref": reference,
         "role": entry.node_name,
-        "name": entry.label,
+        "name": entry.label.as_ref().or(entry.row.as_ref().map(|row| &row.name)),
         "value": value,
         "actions": entry.actions.iter().map(|action| action.as_str()).collect::<Vec<_>>(),
     });

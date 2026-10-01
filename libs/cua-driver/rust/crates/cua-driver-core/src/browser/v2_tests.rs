@@ -4617,6 +4617,8 @@ async fn keystrokes_use_char_events_for_text_delivery() {
     assert_eq!(s["effect"], "confirmed", "{s}");
     assert_eq!(s["enter"]["pressed"], true, "{s}");
     assert_eq!(s["enter"]["before_enter"], "a", "{s}");
+    let evidence = s["evidence"][0]["detail"].as_str().unwrap_or_default();
+    assert!(evidence.contains("then Enter was pressed"), "{evidence}");
     let readiness_checks = recorded_calls(&f, "Runtime.callFunctionOn");
     assert!(readiness_checks.iter().any(|(_, params)| {
         params["functionDeclaration"]
