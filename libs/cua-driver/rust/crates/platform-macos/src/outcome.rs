@@ -571,7 +571,11 @@ pub(crate) fn describe(
         let in_list = before.target_in_list != Some(false);
         if it && a.length != b.length {
             parts.extend(length_line(a, b));
-        } else if it && in_list && (vouched.contains(&a.label.as_str()) || vouched.contains(&b.label.as_str())) {
+        } else if it
+            && in_list
+            && row_like(&a.role)
+            && (vouched.contains(&a.label.as_str()) || vouched.contains(&b.label.as_str()))
+        {
             // An item's row: the list's content says what changed.
         } else if it && in_list && a.label != b.label {
             parts.push(shows_other_item(a, b));
@@ -595,7 +599,7 @@ pub(crate) fn describe(
     }
     if let (Some(a), Some(b)) = (&before.opener, &after.opener) {
         let in_list = before.opener_in_list != Some(false);
-        if in_list && (vouched.contains(&a.label.as_str()) || vouched.contains(&b.label.as_str())) {
+        if in_list && row_like(&a.role) && (vouched.contains(&a.label.as_str()) || vouched.contains(&b.label.as_str())) {
             // An item's row opened the menu: the list's content says what
             // the pick did.
         } else if in_list && a.label != b.label {
@@ -723,6 +727,13 @@ pub(crate) fn describe(
         ));
     }
     line
+}
+
+/// Whether an element of this role can be a list item's row or its text
+/// (a Catalyst cell's group, its static text), not a control with a value
+/// of its own (a checkbox or field inside the row keeps its own line).
+fn row_like(role: &str) -> bool {
+    matches!(role, "AXGroup" | "AXRow" | "AXCell" | "AXStaticText" | "AXImage" | "AXListItem")
 }
 
 /// An element in a list whose label changed: what it shows now, and that
@@ -2484,6 +2495,20 @@ mod tests {
         after.target = Some(field("3"));
         let text = line(&before, &after);
         assert!(text.contains("moved: Alpha (now 3 of 3)") && text.contains("AXTextField \"Priority\" now 3, was 1"), "{text}");
+    }
+
+    /// A checkbox inside a stateful row that shares the row's name is a
+    /// control, not the row: its own value line stays.
+    #[test]
+    fn a_control_named_like_its_row_keeps_its_line() {
+        let checkbox = |value: &str| Element { role: "AXCheckBox".into(), label: "Alpha".into(), value: Some(value.into()), length: None };
+        let mut before = window("Tasks");
+        before.collection = Some(rows(&[("Alpha", ""), ("Beta", "")]));
+        before.target = Some(checkbox("0"));
+        before.target_in_list = Some(true);
+        let mut after = before.clone();
+        after.target = Some(checkbox("1"));
+        assert_eq!(line(&before, &after), "AXCheckBox \"Alpha\" now 1 (on), was 0 (off)");
     }
 
     /// Duplicate names and unread values never produce a state claim; a swap
