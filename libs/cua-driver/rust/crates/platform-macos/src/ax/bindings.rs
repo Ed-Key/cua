@@ -734,7 +734,9 @@ fn focus_state(pid: i32, target: u32) -> FocusState {
             CFRelease(element as CFTypeRef);
             return FocusState::InMenu;
         }
-        let window = crate::ax::exact_target::element_window_id(element);
+        // The focused element's own window id: one bounded read (an inline
+        // editor is its own child window; no ancestor walk needed).
+        let window = ax_get_window_id(element);
         CFRelease(element as CFTypeRef);
         if is_inline_edit(role.as_deref(), window, target, window_belongs_to) {
             FocusState::InlineEdit

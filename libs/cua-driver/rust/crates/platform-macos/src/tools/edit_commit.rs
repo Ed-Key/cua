@@ -102,13 +102,18 @@ pub(crate) struct Ended {
 ///
 /// `field` must be a valid `AXUIElementRef` for the duration of the call.
 pub(crate) unsafe fn end_edit(field: AXUIElementRef) -> Option<Ended> {
+    // Bounded in time and per read, so a slow app cannot hold set_value:
+    // past the budget the result falls back to "not committed".
+    const READ_TIMEOUT_SECONDS: f32 = 0.2;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
     let window = copy_element_attr(field, "AXWindow")?;
     let mut queue = vec![window];
     let mut seen = 0usize;
     let mut ended = None;
     // Breadth first, bounded: Get Info's icon sits near the top.
-    while !queue.is_empty() && seen < 300 && ended.is_none() {
+    while !queue.is_empty() && seen < 300 && ended.is_none() && std::time::Instant::now() < deadline {
         let current = queue.remove(0);
+        crate::ax::bindings::AXUIElementSetMessagingTimeout(current, READ_TIMEOUT_SECONDS);
         seen += 1;
         let role = copy_string_attr(current, "AXRole").unwrap_or_default();
         if seen > 1
