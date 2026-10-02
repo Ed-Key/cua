@@ -718,7 +718,15 @@ impl BrowserPointerTool {
             target: validated.tab.cdp_target_id.as_str(),
             opened: None,
         };
-        let sent = dispatch_trusted(&mut delivery, conn.clone(), request, origin, destination).await;
+        let sent = dispatch_trusted(
+            &mut delivery,
+            conn.clone(),
+            &validated.cdp_session,
+            request,
+            origin,
+            destination,
+        )
+        .await;
         let opened = delivery.opened.take();
         // With a dialog up the page answers nothing, this included: the
         // emulation ends with the attachment session instead.
@@ -762,6 +770,7 @@ impl BrowserPointerTool {
 async fn dispatch_trusted(
     delivery: &mut Delivery<'_>,
     conn: Arc<CdpConnection>,
+    page: &str,
     request: &PointerRequest,
     origin: (f64, f64),
     destination: Option<(f64, f64)>,
@@ -815,6 +824,7 @@ async fn dispatch_trusted(
             drag(
                 delivery,
                 conn,
+                page,
                 origin,
                 destination.expect("drag destination validated"),
             )
@@ -834,14 +844,19 @@ async fn dispatch_trusted(
 /// a frame apart, so a library that tracks the pointer per animation frame
 /// sees each one. Whatever stops the drag part way, the button is released
 /// and interception is turned off again.
+///
+/// `page` is the tab's own session: Chrome intercepts a drag, and reports
+/// it, on the top-level page even when the element is in an out-of-process
+/// frame, whose own session (`delivery.cdp`) takes the mouse and drag events.
 async fn drag(
     delivery: &mut Delivery<'_>,
     owned: Arc<CdpConnection>,
+    page: &str,
     origin: (f64, f64),
     destination: (f64, f64),
 ) -> anyhow::Result<()> {
     let conn = delivery.conn;
-    let cdp = delivery.cdp;
+    let cdp = page;
     // Armed before interception is asked for: a call cancelled at any point
     // after it still turns interception off. It holds the event stream, so a
     // drag Chrome took over during a move that was cancelled is still found.
@@ -849,6 +864,7 @@ async fn drag(
         events: conn.subscribe(),
         conn: owned,
         cdp: cdp.to_owned(),
+        input_cdp: delivery.cdp.to_owned(),
         release_at: destination,
         pressed: false,
         intercepted: None,
@@ -945,7 +961,10 @@ async fn drag(
 struct DragCleanup {
     events: tokio::sync::mpsc::UnboundedReceiver<CdpEvent>,
     conn: Arc<CdpConnection>,
+    /// The page's session: interception and its events.
     cdp: String,
+    /// The element's frame session: the mouse and drag events.
+    input_cdp: String,
     release_at: (f64, f64),
     pressed: bool,
     /// The data of an HTML5 drag Chrome handed over and that was not
@@ -971,7 +990,14 @@ impl DragCleanup {
         // browser answers the interception call even with a dialog up.
         let cancel = self.undropped().map(|data| (self.release_at, data));
         self.pressed &= !dialog_open;
-        undo_drag(&self.conn, &self.cdp, self.pressed.then_some(self.release_at), cancel).await;
+        undo_drag(
+            &self.conn,
+            &self.cdp,
+            &self.input_cdp,
+            self.pressed.then_some(self.release_at),
+            cancel,
+        )
+        .await;
         // Disarmed only once undone: a call cancelled meanwhile undoes it
         // again from the drop (twice is harmless).
         self.armed = false;
@@ -983,11 +1009,11 @@ impl Drop for DragCleanup {
         if !self.armed {
             return;
         }
-        let (conn, cdp) = (self.conn.clone(), self.cdp.clone());
+        let (conn, cdp, input) = (self.conn.clone(), self.cdp.clone(), self.input_cdp.clone());
         let cancel = self.undropped().map(|data| (self.release_at, data));
         let release = self.pressed.then_some(self.release_at);
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move { undo_drag(&conn, &cdp, release, cancel).await });
+            runtime.spawn(async move { undo_drag(&conn, &cdp, &input, release, cancel).await });
         }
     }
 }
@@ -995,6 +1021,7 @@ impl Drop for DragCleanup {
 async fn undo_drag(
     conn: &CdpConnection,
     cdp: &str,
+    input: &str,
     release: Option<(f64, f64)>,
     cancel: Option<((f64, f64), Value)>,
 ) {
@@ -1002,7 +1029,7 @@ async fn undo_drag(
         let _ = tokio::time::timeout(
             CLEANUP_TIMEOUT,
             conn.call(
-                Some(cdp),
+                Some(input),
                 "Input.dispatchDragEvent",
                 json!({ "type": "dragCancel", "x": x, "y": y, "data": data }),
             ),
@@ -1013,7 +1040,7 @@ async fn undo_drag(
         let _ = tokio::time::timeout(
             CLEANUP_TIMEOUT,
             conn.call(
-                Some(cdp),
+                Some(input),
                 "Input.dispatchMouseEvent",
                 json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1 }),
             ),
