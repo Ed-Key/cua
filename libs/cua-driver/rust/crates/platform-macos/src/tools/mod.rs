@@ -17,6 +17,7 @@ mod press_key;
 mod right_click;
 mod scroll;
 mod set_value;
+pub(crate) mod edit_commit;
 mod set_window_frame;
 mod type_text;
 mod browser_route;

@@ -485,19 +485,58 @@ impl Tool for TypeTextTool {
                     && target_in_web_area(pid, element_ptr, window_id);
                 let is_electron = target_is_web_content
                     && crate::browser::electron_js::ElectronJs::is_electron(pid);
-                completed_typing_result(
+                let result = completed_typing_result(
                     outcome,
                     char_count,
                     target_is_web_content,
                     is_electron,
                     used_pixel_focus,
                     &changes.result_suffix(),
-                )
+                );
+                // A field its app saves only when editing ends (Finder's
+                // Get Info, its rename field): the text shows, nothing is
+                // saved yet.
+                match unsafe { typed_field_pending(pid, element_ptr) } {
+                    Some(field) => super::edit_commit::mark_typed_not_committed(
+                        result,
+                        field,
+                        &crate::apps::get_app_name_for_pid(pid).unwrap_or_else(|| "The app".into()),
+                    ),
+                    None => result,
+                }
             }
             Ok(Err(e)) => ToolResult::error(format!("type_text failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
     }
+}
+
+/// The pending-commit kind of the field the text went to: the addressed
+/// element, else the app's focused element.
+///
+/// # Safety
+///
+/// An addressed element must be retained for the duration of the call.
+unsafe fn typed_field_pending(
+    pid: i32,
+    element: Option<(usize, Option<usize>)>,
+) -> Option<super::edit_commit::Field> {
+    if !super::edit_commit::app_saves_on_end_editing(pid) {
+        return None;
+    }
+    if let Some((element, _)) = element {
+        return super::edit_commit::pending_field_of(pid, element as AXUIElementRef);
+    }
+    let app = crate::ax::bindings::AXUIElementCreateApplication(pid);
+    if app.is_null() {
+        return None;
+    }
+    let focused = crate::ax::bindings::copy_element_attr(app, "AXFocusedUIElement");
+    core_foundation::base::CFRelease(app as core_foundation::base::CFTypeRef);
+    let focused = focused?;
+    let field = super::edit_commit::pending_field_of(pid, focused);
+    core_foundation::base::CFRelease(focused as core_foundation::base::CFTypeRef);
+    field
 }
 
 // Response formatting is separate from dispatch so recovery guidance can be
