@@ -40,6 +40,14 @@ pub enum BrowserActionKind {
     Click,
     Type,
     Upload,
+    /// The page shows it answers a double-click here (an editable grid's
+    /// cell, a double-click handler): browser_pointer action double_click.
+    DoubleClick,
+    /// The page shows the element can be dragged (draggable, a grab or move
+    /// cursor, a dragstart handler): browser_pointer action drag.
+    Drag,
+    /// Hidden from outline lines: any listed element with a box can be
+    /// pointed at with browser_pointer.
     Pointer,
     Scroll,
 }
@@ -50,6 +58,8 @@ impl BrowserActionKind {
             Self::Click => "click",
             Self::Type => "type",
             Self::Upload => "upload",
+            Self::DoubleClick => "double_click",
+            Self::Drag => "drag",
             Self::Pointer => "pointer",
             Self::Scroll => "scroll",
         }
