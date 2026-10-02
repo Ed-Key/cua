@@ -756,6 +756,14 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             "Runtime.evaluate" if call.params["expression"] == "document.readyState" => {
                 MockReply::ok(json!({"result": {"type": "string", "value": "complete"}}))
             }
+            "Runtime.callFunctionOn"
+                if call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|function| function.contains("return this.nodeType === 1 ? this : this.parentElement")) =>
+            {
+                let of = call.params["objectId"].as_str().unwrap_or_default();
+                MockReply::ok(json!({"result": {"type": "object", "objectId": format!("element-of-{of}")}}))
+            }
             "Runtime.callFunctionOn" if call.params["objectId"] == "settle-counter" => {
                 let records = std::mem::take(&mut st.pending_mutations);
                 MockReply::ok(json!({"result": {"type": "number", "value": records}}))
@@ -5734,6 +5742,27 @@ async fn a_text_line_can_be_double_clicked_once_the_page_says_it_is_on_top() {
     );
     let said = text_of(&sent);
     assert!(said.starts_with(&format!("double-clicked {text} at (")), "{said}");
+}
+
+#[tokio::test]
+async fn synthetic_events_on_a_text_ref_go_to_the_element_holding_it() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    let text = named_ref(&snap, "Visible message");
+    let sent = BrowserPointerTool::new(f.engine.clone())
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION,
+            "ref": text, "action": "double_click", "input_route": "dom_event"}))
+        .await;
+    assert_eq!(structured(&sent)["status"], "ok", "{sent:?}");
+    let dispatched = recorded_calls(&f, "Runtime.callFunctionOn")
+        .into_iter()
+        .find(|(_, params)| params["functionDeclaration"].as_str().unwrap().contains("dblclick"))
+        .expect("the double-click was dispatched");
+    assert!(
+        dispatched.1["objectId"].as_str().unwrap().starts_with("element-of-"),
+        "{dispatched:?}"
+    );
 }
 
 #[tokio::test]

@@ -266,6 +266,31 @@ async fn resolve_object(
         .ok_or_else(|| stale("the ref's node has no live object in the page"))
 }
 
+/// The element synthetic events go to: the ref's node, or for a text ref
+/// (a card's or a cell's text) the element holding it.
+async fn element_of(
+    conn: &CdpConnection,
+    cdp_session: &str,
+    object_id: String,
+) -> Result<String, ToolResult> {
+    let reply = conn
+        .call(
+            Some(cdp_session),
+            "Runtime.callFunctionOn",
+            json!({
+                "objectId": object_id,
+                "functionDeclaration": "function() { return this.nodeType === 1 ? this : this.parentElement; }",
+            }),
+        )
+        .await
+        .map_err(|_| stale("the ref's node no longer resolves in the live page"))?;
+    reply
+        .pointer("/result/objectId")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .ok_or_else(|| stale("the ref's node is in no element of the live page"))
+}
+
 /// The centre of a ref's box, for the cursor drawn over a synthetic event.
 async fn point_for_ref(
     conn: &CdpConnection,
@@ -344,8 +369,7 @@ fn changes_summary(changes: Option<&Value>) -> String {
         },
         _ => match changes.get("reason").and_then(Value::as_str) {
             Some("javascript_dialog_open") => {
-                "a JavaScript dialog opened during the input, which stopped there (answer it \
-                 with browser_dialog)"
+                "a JavaScript dialog opened during the input (answer it with browser_dialog)"
                     .to_owned()
             }
             Some(reason) => format!("the page could not be read afterwards ({reason})"),
@@ -524,7 +548,12 @@ impl BrowserPointerTool {
         destination: Option<&ResolvedRef>,
     ) -> Result<Option<Settled>, ToolResult> {
         let conn = &validated.conn;
-        let object_id = resolve_object(conn, &origin.cdp_session, origin.backend_node_id).await?;
+        let object_id = element_of(
+            conn,
+            &origin.cdp_session,
+            resolve_object(conn, &origin.cdp_session, origin.backend_node_id).await?,
+        )
+        .await?;
 
         if let Some((x, y)) = point_for_ref(conn, &origin.cdp_session, origin.backend_node_id).await
         {
@@ -559,10 +588,11 @@ impl BrowserPointerTool {
             ),
             PointerAction::Drag => {
                 let destination_argument = if let Some(destination) = destination {
-                    let object_id = resolve_object(
+                    let object_id = element_of(
                         conn,
                         &destination.cdp_session,
-                        destination.backend_node_id,
+                        resolve_object(conn, &destination.cdp_session, destination.backend_node_id)
+                            .await?,
                     )
                     .await?;
                     json!([{ "objectId": object_id }, { "value": Value::Null }, { "value": Value::Null }])
@@ -820,6 +850,7 @@ async fn drag(
         cdp: cdp.to_owned(),
         release_at: destination,
         pressed: false,
+        intercepted: None,
         armed: true,
     };
     // Without interception an HTML5 drag would go to the operating system
@@ -827,7 +858,7 @@ async fn drag(
     conn.call(Some(cdp), "Input.setInterceptDrags", json!({ "enabled": true }))
         .await
         .map_err(|error| anyhow::anyhow!("Chrome would not intercept the drag ({error}), so none was started"))?;
-    let pressed = &mut cleanup.pressed;
+    let DragCleanup { pressed, intercepted, .. } = &mut cleanup;
     let result = async {
         delivery
             .send(
@@ -872,6 +903,7 @@ async fn drag(
             }
         }
         if let Some(data) = data {
+            *intercepted = Some(data.clone());
             for kind in ["dragEnter", "dragOver", "drop"] {
                 delivery
                     .send(
@@ -880,6 +912,8 @@ async fn drag(
                     )
                     .await?;
             }
+            // Dropped: nothing left to cancel.
+            *intercepted = None;
         } else {
             // The page's own drag: let it see the pointer rest over the drop.
             tokio::time::sleep(DRAG_FRAME * 3).await;
@@ -907,6 +941,9 @@ struct DragCleanup {
     cdp: String,
     release_at: (f64, f64),
     pressed: bool,
+    /// The data of an HTML5 drag Chrome handed over and that was not
+    /// dropped: until it is cancelled the tab takes no mouse input.
+    intercepted: Option<Value>,
     armed: bool,
 }
 
@@ -915,7 +952,13 @@ impl DragCleanup {
         // A page behind a dialog answers nothing, so no release then; the
         // browser answers the interception call even with a dialog up.
         self.pressed &= !dialog_open;
-        undo_drag(&self.conn, &self.cdp, self.pressed.then_some(self.release_at)).await;
+        undo_drag(
+            &self.conn,
+            &self.cdp,
+            self.pressed.then_some(self.release_at),
+            self.intercepted.as_ref().map(|data| (self.release_at, data.clone())),
+        )
+        .await;
         // Disarmed only once undone: a call cancelled meanwhile undoes it
         // again from the drop (twice is harmless).
         self.armed = false;
@@ -929,13 +972,30 @@ impl Drop for DragCleanup {
         }
         let (conn, cdp) = (self.conn.clone(), self.cdp.clone());
         let release = self.pressed.then_some(self.release_at);
+        let cancel = self.intercepted.take().map(|data| (self.release_at, data));
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
-            runtime.spawn(async move { undo_drag(&conn, &cdp, release).await });
+            runtime.spawn(async move { undo_drag(&conn, &cdp, release, cancel).await });
         }
     }
 }
 
-async fn undo_drag(conn: &CdpConnection, cdp: &str, release: Option<(f64, f64)>) {
+async fn undo_drag(
+    conn: &CdpConnection,
+    cdp: &str,
+    release: Option<(f64, f64)>,
+    cancel: Option<((f64, f64), Value)>,
+) {
+    if let Some(((x, y), data)) = cancel {
+        let _ = tokio::time::timeout(
+            CLEANUP_TIMEOUT,
+            conn.call(
+                Some(cdp),
+                "Input.dispatchDragEvent",
+                json!({ "type": "dragCancel", "x": x, "y": y, "data": data }),
+            ),
+        )
+        .await;
+    }
     if let Some((x, y)) = release {
         let _ = tokio::time::timeout(
             CLEANUP_TIMEOUT,
