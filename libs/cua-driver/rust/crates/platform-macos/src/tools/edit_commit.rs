@@ -106,6 +106,19 @@ pub(crate) unsafe fn end_edit(field: AXUIElementRef) -> Option<Ended> {
     // past the budget the result falls back to "not committed".
     const READ_TIMEOUT_SECONDS: f32 = 0.2;
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    // The field is the action's cached element: bound it here, and put the
+    // walk's usual timeout back after.
+    crate::ax::bindings::AXUIElementSetMessagingTimeout(field, READ_TIMEOUT_SECONDS);
+    let ended = end_edit_bounded(field, deadline, READ_TIMEOUT_SECONDS);
+    crate::ax::bindings::AXUIElementSetMessagingTimeout(field, crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS);
+    ended
+}
+
+unsafe fn end_edit_bounded(
+    field: AXUIElementRef,
+    deadline: std::time::Instant,
+    read_timeout: f32,
+) -> Option<Ended> {
     let window = copy_element_attr(field, "AXWindow")?;
     let mut queue = vec![window];
     let mut seen = 0usize;
@@ -113,7 +126,7 @@ pub(crate) unsafe fn end_edit(field: AXUIElementRef) -> Option<Ended> {
     // Breadth first, bounded: Get Info's icon sits near the top.
     while !queue.is_empty() && seen < 300 && ended.is_none() && std::time::Instant::now() < deadline {
         let current = queue.remove(0);
-        crate::ax::bindings::AXUIElementSetMessagingTimeout(current, READ_TIMEOUT_SECONDS);
+        crate::ax::bindings::AXUIElementSetMessagingTimeout(current, read_timeout);
         seen += 1;
         let role = copy_string_attr(current, "AXRole").unwrap_or_default();
         if seen > 1
