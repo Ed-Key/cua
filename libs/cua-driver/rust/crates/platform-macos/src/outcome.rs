@@ -37,6 +37,11 @@ const NO_CHANGE_WAIT: Duration = Duration::from_millis(600);
 const COMMAND_NO_CHANGE_WAIT: Duration = Duration::from_millis(1500);
 /// Once something changed: settled when reads agree for this long.
 const STABLE_FOR: Duration = Duration::from_millis(200);
+/// The same when a sheet, popover or menu closed: UIKit runs an alert
+/// button's or a menu item's handler after the close animation, so the
+/// list it changes moves later (a confirmed delete showed ~0.6 s after the
+/// alert closed).
+const STABLE_AFTER_CLOSE: Duration = Duration::from_millis(700);
 /// Never wait longer than this for the app to settle.
 const SETTLE_DEADLINE: Duration = Duration::from_secs(2);
 /// One read of every fact gives up after this (an app that does not answer).
@@ -76,15 +81,26 @@ pub(crate) struct Element {
     pub length: Option<usize>,
 }
 
+/// A list item as its content: its name and its own value (a Catalyst row's
+/// "Completed, Flagged"). `value: None` is unread or absent, never blank.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Item {
+    pub name: String,
+    pub value: Option<String>,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct Collection {
     pub role: String,
     pub label: String,
-    /// Item names, when the list has at most [`MAX_ITEMS`] and all were read.
-    pub items: Option<Vec<String>>,
+    /// The items, when the list has at most [`MAX_ITEMS`] and all were read.
+    pub items: Option<Vec<Item>>,
     pub count: Option<usize>,
     /// Selected names, when the list reports its selection.
     pub selected: Option<Vec<String>>,
+    /// A "Show More" / "See All" button in the list or next to it: the app
+    /// lists only some of its items (Messages' search shows the top hits).
+    pub more: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq)]
@@ -129,6 +145,16 @@ pub(crate) struct Facts {
     /// The element that opened the menu the action picks from (a pop-up
     /// button), read before and after the pick.
     pub opener: Option<Element>,
+    /// Whether the target (and the opener) is the watched list or sits in it:
+    /// `None` when its ancestry could not be read. A list row's element can
+    /// show another item after the list reloads (UIKit reuses cells), so
+    /// its own reads never say which item changed. Fixed for a watch.
+    pub target_in_list: Option<bool>,
+    pub opener_in_list: Option<bool>,
+    /// For a stepper's increment or decrement button (which has no value of
+    /// its own): the texts next to it, as (role, text), where the stepper
+    /// shows its number. `None` for any other target.
+    pub nearby: Option<Vec<(String, String)>>,
 }
 
 /// What the disk adds to a settled change (read once, after the facts).
@@ -238,13 +264,191 @@ fn selection_line(collection: &Collection) -> Option<String> {
     })
 }
 
+fn item_names(items: &[Item]) -> Vec<String> {
+    items.iter().map(|item| item.name.clone()).collect()
+}
+
 fn listing_line(collection: &Collection, verb: &str) -> Option<String> {
     let items = collection.items.as_ref()?;
     Some(if items.is_empty() {
         format!("{} {verb}: no items", collection.label)
     } else {
-        format!("{} {verb}: {} ({})", collection.label, names(items), items.len())
+        format!("{} {verb}: {} ({})", collection.label, names(&item_names(items)), items.len())
     })
+}
+
+/// The clause a listing ends with when the app shortened the list.
+fn more_clause(collection: &Collection) -> Option<String> {
+    let more = collection.more.as_ref()?;
+    Some(format!("the app shows only some items here: press the button {} to list the rest", quote(more)))
+}
+
+/// A button label that asks the app for the rest of a list it shortened:
+/// "Show More", "See All", "View all (12)", "More Results", "Load more…".
+/// Only a count or "results"/"items" may follow, so "Show All Tabs" or
+/// "Show More Options" is not one.
+pub(crate) fn is_more_button_label(label: &str) -> bool {
+    let text = label.trim().trim_end_matches(['…', '.']).trim().to_lowercase();
+    const STARTS: &[&str] = &["show more", "see more", "view more", "load more", "show all", "see all", "view all"];
+    let tail_ok = |rest: &str| {
+        let rest = rest.trim();
+        let count = rest.trim_start_matches('(').trim_end_matches(')');
+        rest.is_empty()
+            || (!count.is_empty() && count.chars().all(|c| c.is_ascii_digit()))
+            || matches!(rest, "results" | "items")
+    };
+    STARTS.iter().any(|start| {
+        text.strip_prefix(start)
+            .is_some_and(|rest| (rest.is_empty() || rest.starts_with(' ')) && tail_ok(rest))
+    }) || matches!(text.as_str(), "more results" | "all results")
+}
+
+/// Whether `element` is a button or link whose label asks for more items:
+/// the element itself, or with `deep` (a cell holding it) one of its first
+/// children.
+unsafe fn more_button(reader: &mut Reader, element: AXUIElementRef, deep: bool) -> Option<String> {
+    let is_button = |e: AXUIElementRef| {
+        matches!(copy_string_attr(e, "AXRole").as_deref(), Some("AXButton" | "AXLink"))
+    };
+    if !reader.admit(element) {
+        return None;
+    }
+    if is_button(element) {
+        return own_label(element).filter(|l| is_more_button_label(l));
+    }
+    if !deep {
+        return None;
+    }
+    for child in kids(element).into_iter().take(4) {
+        if !reader.admit(child.0) {
+            return None;
+        }
+        if is_button(child.0) {
+            if let Some(label) = own_label(child.0).filter(|l| is_more_button_label(l)) {
+                return Some(label);
+            }
+        }
+    }
+    None
+}
+
+/// How a list's content changed, by content only: an item is its name (and
+/// value), never its row element or position.
+#[derive(Debug, Default, PartialEq, Eq)]
+pub(crate) struct ListDiff {
+    pub added: Vec<String>,
+    pub gone: Vec<String>,
+    /// (name, was, now) for names that occur once in both lists and whose
+    /// value was read both times.
+    pub changed: Vec<(String, String, String)>,
+    /// The order of the items in both lists differs.
+    pub reordered: bool,
+    /// (name, position from 1, of) when exactly one item's move explains the
+    /// new order.
+    pub moved: Option<(String, usize, usize)>,
+}
+
+impl ListDiff {
+    fn is_empty(&self) -> bool {
+        self.added.is_empty() && self.gone.is_empty() && self.changed.is_empty() && !self.reordered
+    }
+}
+
+fn count_of(items: &[Item], name: &str) -> usize {
+    items.iter().filter(|item| item.name == name).count()
+}
+
+/// The names of `a` that occur exactly once in both lists, in `a`'s order.
+/// Duplicated names have no known correspondence, so they never count as
+/// moved or as making others move.
+fn common<'a>(a: &'a [Item], b: &[Item]) -> Vec<&'a str> {
+    a.iter()
+        .map(|item| item.name.as_str())
+        .filter(|name| count_of(a, name) == 1 && count_of(b, name) == 1)
+        .collect()
+}
+
+/// Items of `a` beyond what `b` holds of the same name (multiset difference).
+fn beyond(a: &[Item], b: &[Item]) -> Vec<String> {
+    let mut seen: Vec<&str> = Vec::new();
+    let mut out = Vec::new();
+    for item in a {
+        let name = item.name.as_str();
+        let taken = seen.iter().filter(|s| **s == name).count();
+        if taken >= count_of(b, name) {
+            out.push(item.name.clone());
+        }
+        seen.push(name);
+    }
+    out
+}
+
+pub(crate) fn list_diff(old: &[Item], new: &[Item]) -> ListDiff {
+    let mut diff = ListDiff { added: beyond(new, old), gone: beyond(old, new), ..ListDiff::default() };
+    let unique = |name: &str| count_of(old, name) == 1 && count_of(new, name) == 1;
+    for item in new.iter().filter(|item| unique(&item.name)) {
+        let before = old.iter().find(|o| o.name == item.name).and_then(|o| o.value.as_ref());
+        if let (Some(was), Some(now)) = (before, item.value.as_ref()) {
+            if was != now {
+                diff.changed.push((item.name.clone(), was.clone(), now.clone()));
+            }
+        }
+    }
+    let (a, b) = (common(old, new), common(new, old));
+    if a != b {
+        diff.reordered = true;
+        // The one item whose removal from both orders makes them equal; a
+        // swap of two has two such items, and then none is named.
+        fn without<'s>(list: &[&'s str], name: &str) -> Vec<&'s str> {
+            list.iter().copied().filter(|n| *n != name).collect()
+        }
+        let mut movers = b.iter().copied().filter(|n| unique(n) && without(&a, n) == without(&b, n));
+        if let (Some(name), None) = (movers.next(), movers.next()) {
+            let position = new.iter().position(|item| item.name == name).map_or(0, |i| i + 1);
+            diff.moved = Some((name.to_owned(), position, new.len()));
+        }
+    }
+    diff
+}
+
+fn shown_state(value: &str) -> String {
+    if value.is_empty() {
+        "blank".to_owned()
+    } else {
+        shown_value(value)
+    }
+}
+
+/// The parts a list's change adds to the line (none when it did not change).
+fn list_change_parts(list: &Collection, diff: &ListDiff) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !diff.added.is_empty() || !diff.gone.is_empty() || diff.reordered {
+        let mut line = listing_line(list, "now").unwrap_or_default();
+        if !diff.added.is_empty() {
+            line.push_str(&format!("; added {}", names(&diff.added)));
+        }
+        if !diff.gone.is_empty() {
+            line.push_str(&format!("; gone from the list: {}", names(&diff.gone)));
+        }
+        match &diff.moved {
+            Some((name, position, of)) => line.push_str(&format!("; moved: {name} (now {position} of {of})")),
+            None if diff.reordered => line.push_str("; order changed"),
+            None => {}
+        }
+        if let Some(more) = more_clause(list) {
+            line.push_str(&format!("; {more}"));
+        }
+        parts.push(line);
+    }
+    if !diff.changed.is_empty() {
+        let changes: Vec<String> = diff
+            .changed
+            .iter()
+            .map(|(name, was, now)| format!("{name} now {} (was {})", shown_state(now), shown_state(was)))
+            .collect();
+        parts.push(format!("changed in {}: {}", list.label, changes.join(", ")));
+    }
+    parts
 }
 
 /// The outcome line for `before` and `after`. `complete`: every fact was
@@ -311,20 +515,20 @@ pub(crate) fn describe(
             parts.push(said(&surface, "closed"));
         }
     }
+    // Labels of the list's items whose state the list read both times: an
+    // element in the list showing one of them is that item's row, and the
+    // list's own diff (by content) is the account of it; the element (which
+    // may now show another item) adds nothing. Other elements in a list (a
+    // table row's text field or pop-up) keep their own lines.
+    let mut vouched: Vec<&str> = Vec::new();
     match (&before.collection, &after.collection) {
         (Some(a), Some(b)) if same_collection(a, b) && !navigated => {
             if let (Some(old), Some(new)) = (&a.items, &b.items) {
-                let added = subtract(new, old);
-                let gone = subtract(old, new);
-                if !added.is_empty() || !gone.is_empty() {
-                    let mut line = listing_line(b, "now").unwrap_or_default();
-                    if !added.is_empty() {
-                        line.push_str(&format!("; added {}", names(&added)));
-                    }
-                    if !gone.is_empty() {
-                        line.push_str(&format!("; gone from the list: {}", names(&gone)));
-                    }
-                    parts.push(line);
+                let diff = list_diff(old, new);
+                parts.extend(list_change_parts(b, &diff));
+                let stateful = |items: &[Item]| items.iter().all(|item| item.value.is_some());
+                if stateful(old) && stateful(new) {
+                    vouched.extend(old.iter().chain(new).map(|item| item.name.as_str()));
                 }
             }
             if a.selected != b.selected {
@@ -338,7 +542,10 @@ pub(crate) fn describe(
             let shows_change = navigated
                 || before.collection.as_ref().is_none_or(|a| !same_collection(a, b));
             if shows_change {
-                parts.extend(listing);
+                parts.extend(listing.map(|line| match more_clause(b) {
+                    Some(more) => format!("{line}; {more}"),
+                    None => line,
+                }));
                 if b.selected.as_ref().is_some_and(|s| !s.is_empty()) {
                     parts.extend(selection_line(b));
                 }
@@ -355,12 +562,23 @@ pub(crate) fn describe(
             parts.push(format!("window closed: {} (window_id {})", quote(&w.title), w.id));
         }
     }
-    // The target is the same retained element both times, so a new label
-    // (a disclosure triangle's "show more" becoming "show less") is still it.
+    // The target is the same retained element both times, so outside a list
+    // a new label (a disclosure triangle's "show more" becoming "show less")
+    // is still it. Inside a list (or with its ancestry unread) the element
+    // may now show another item: its new label is no claim about any item.
     if let (Some(a), Some(b)) = (&before.target, &after.target) {
         let it = a.role == b.role;
+        let in_list = before.target_in_list != Some(false);
         if it && a.length != b.length {
             parts.extend(length_line(a, b));
+        } else if it
+            && in_list
+            && row_like(&a.role)
+            && (vouched.contains(&a.label.as_str()) || vouched.contains(&b.label.as_str()))
+        {
+            // An item's row: the list's content says what changed.
+        } else if it && in_list && a.label != b.label {
+            parts.push(shows_other_item(a, b));
         } else if it && a.value == b.value && a.label != b.label {
             parts.push(format!("{} is now labelled {}", element_name(a), quote(&b.label)));
         } else if it && a.value != b.value {
@@ -380,7 +598,13 @@ pub(crate) fn describe(
         }
     }
     if let (Some(a), Some(b)) = (&before.opener, &after.opener) {
-        if a.label != b.label {
+        let in_list = before.opener_in_list != Some(false);
+        if in_list && row_like(&a.role) && (vouched.contains(&a.label.as_str()) || vouched.contains(&b.label.as_str())) {
+            // An item's row opened the menu: the list's content says what
+            // the pick did.
+        } else if in_list && a.label != b.label {
+            parts.push(shows_other_item(a, b));
+        } else if a.label != b.label {
             parts.push(format!("{} is now labelled {}", element_name(a), quote(&b.label)));
         } else if a.value != b.value {
             if let Some(value) = &b.value {
@@ -394,6 +618,17 @@ pub(crate) fn describe(
                 "{} kept its label; whether the pick took is not readable",
                 element_name(b)
             ));
+        }
+    }
+    // A stepper's number, shown in a label next to it: compared place by
+    // place, only when the same kinds of elements sit there both times.
+    if let (Some(a), Some(b)) = (&before.nearby, &after.nearby) {
+        if a.len() == b.len() && a.iter().zip(b).all(|(x, y)| x.0 == y.0) {
+            for ((_, was), (_, now)) in a.iter().zip(b) {
+                if was != now {
+                    parts.push(format!("next to it: {} now {}", quote(was), quote(now)));
+                }
+            }
         }
     }
     if let (Some(a), Some(b)) = (&before.menus, &after.menus) {
@@ -469,6 +704,15 @@ pub(crate) fn describe(
         if after.document.is_some() && after.file.is_none() {
             line.push_str("; the document's file was not checked (protected folder or unreadable)");
         }
+        // A stepper keeps its number elsewhere: say what was read there.
+        if let Some(nearby) = &after.nearby {
+            let texts: Vec<String> = nearby.iter().map(|(_, text)| quote(text)).collect();
+            if texts.is_empty() {
+                line.push_str("; this stepper shows no readable value next to it: read the window before pressing again");
+            } else {
+                line.push_str(&format!("; text next to it unchanged: {}", names(&texts)));
+            }
+        }
         if let Some(still) = &still_open {
             line.push_str(&format!("; {still}"));
         }
@@ -483,6 +727,24 @@ pub(crate) fn describe(
         ));
     }
     line
+}
+
+/// Whether an element of this role can be a list item's row or its text
+/// (a Catalyst cell's group, its static text), not a control with a value
+/// of its own (a checkbox or field inside the row keeps its own line).
+fn row_like(role: &str) -> bool {
+    matches!(role, "AXGroup" | "AXRow" | "AXCell" | "AXStaticText" | "AXImage" | "AXListItem")
+}
+
+/// An element in a list whose label changed: what it shows now, and that
+/// this names no item (its row may have been reused for another item).
+fn shows_other_item(before: &Element, after: &Element) -> String {
+    let showed = if before.label.is_empty() { String::new() } else { format!(" (it showed {})", quote(&before.label)) };
+    format!(
+        "the {} acted on now shows {}{showed}; a list row's element can show another item after the list reloads, so this does not tell which item changed: read the list",
+        before.role,
+        quote(&after.label)
+    )
 }
 
 /// A long text control's change, by length.
@@ -622,12 +884,25 @@ unsafe fn own_label(element: AXUIElementRef) -> Option<String> {
 /// An item's name: its own title, description or text, else the first one
 /// a child or grandchild has (a Finder icon's image, a table row's cell).
 unsafe fn item_name(reader: &mut Reader, element: AXUIElementRef) -> Option<String> {
+    item_name_and_source(reader, element).map(|(name, _)| name)
+}
+
+/// [`item_name`], and whether the name is the item's own AXValue (then that
+/// value is not also its state).
+unsafe fn item_name_and_source(reader: &mut Reader, element: AXUIElementRef) -> Option<(String, bool)> {
     if !reader.admit(element) {
         return None;
     }
-    if let Some(label) = own_label(element) {
-        return Some(label);
+    if let Some(label) = text_attr(element, "AXTitle").or_else(|| text_attr(element, "AXDescription")) {
+        return Some((label, false));
     }
+    if let Some(value) = text_attr(element, "AXValue") {
+        return Some((value, true));
+    }
+    item_child_name(reader, element).map(|name| (name, false))
+}
+
+unsafe fn item_child_name(reader: &mut Reader, element: AXUIElementRef) -> Option<String> {
     for child in kids(element).into_iter().take(6) {
         if !reader.admit(child.0) {
             return None;
@@ -707,6 +982,121 @@ unsafe fn find_collection(reader: &mut Reader, start: AXUIElementRef) -> Option<
     fallback
 }
 
+fn same_ax(a: AXUIElementRef, b: AXUIElementRef) -> bool {
+    unsafe { core_foundation::base::CFEqual(a as CFTypeRef, b as CFTypeRef) != 0 }
+}
+
+/// Whether `element` is `list` or lies inside it (an ancestor up to eight
+/// levels; a Catalyst context menu's opener is the table itself):
+/// `Some(false)` when the walk reached a window, sheet, menu or the top
+/// without meeting it, `None` when a read failed or the budget ran out.
+unsafe fn inside(reader: &mut Reader, element: AXUIElementRef, list: AXUIElementRef) -> Option<bool> {
+    if same_ax(element, list) {
+        return Some(true);
+    }
+    core_foundation::base::CFRetain(element as CFTypeRef);
+    let mut current = Owned(element);
+    for _ in 0..8 {
+        if !reader.admit(current.0) {
+            return None;
+        }
+        let Some(parent) = copy_element_attr(current.0, "AXParent").map(Owned) else {
+            return Some(false);
+        };
+        if same_ax(parent.0, list) {
+            return Some(true);
+        }
+        if !reader.admit(parent.0) {
+            return None;
+        }
+        let role = copy_string_attr(parent.0, "AXRole")?;
+        if STOP_ROLES.contains(&role.as_str()) {
+            return Some(false);
+        }
+        current = parent;
+    }
+    Some(false)
+}
+
+/// A stepper's increment or decrement button: UIKit names them by
+/// identifier, AppKit by subrole, or the button sits in an AXIncrementor.
+/// Every message is bounded by `reader`'s budget (an unanswered read means
+/// no); the caller restores the element's action timeout.
+unsafe fn is_stepper_part(reader: &mut Reader, element: AXUIElementRef) -> bool {
+    if !reader.admit(element) || copy_string_attr(element, "AXRole").as_deref() != Some("AXButton") {
+        return false;
+    }
+    let id = copy_string_attr(element, "AXIdentifier");
+    if matches!(id.as_deref(), Some("Increment" | "Decrement")) {
+        return true;
+    }
+    if !reader.admit(element) {
+        return false;
+    }
+    let subrole = copy_string_attr(element, "AXSubrole");
+    if matches!(subrole.as_deref(), Some("AXIncrementArrow" | "AXDecrementArrow")) {
+        return true;
+    }
+    if !reader.admit(element) {
+        return false;
+    }
+    let Some(parent) = copy_element_attr(element, "AXParent").map(Owned) else {
+        return false;
+    };
+    reader.admit(parent.0) && copy_string_attr(parent.0, "AXRole").as_deref() == Some("AXIncrementor")
+}
+
+/// The texts next to a stepper button, as (role, text): an AXIncrementor
+/// parent's own value, then the static texts and text fields among the
+/// children of the group holding the stepper (up to 16 children). `None`
+/// when a read failed.
+unsafe fn nearby_texts(reader: &mut Reader, target: AXUIElementRef) -> Option<Vec<(String, String)>> {
+    if !reader.admit(target) {
+        return None;
+    }
+    let parent = Owned(copy_element_attr(target, "AXParent")?);
+    if !reader.admit(parent.0) {
+        return None;
+    }
+    let mut out = Vec::new();
+    let mut stepper = None;
+    let group = if copy_string_attr(parent.0, "AXRole").as_deref() == Some("AXIncrementor") {
+        if let Some(value) = copy_stringish_attr(parent.0, "AXValue") {
+            out.push(("AXIncrementor".to_owned(), value.state_value));
+        }
+        let group = Owned(copy_element_attr(parent.0, "AXParent")?);
+        stepper = Some(parent);
+        group
+    } else {
+        parent
+    };
+    if !reader.admit(group.0) {
+        return None;
+    }
+    let role = copy_string_attr(group.0, "AXRole").unwrap_or_default();
+    if STOP_ROLES.contains(&role.as_str()) || COLLECTION_ROLES.contains(&role.as_str()) {
+        return Some(out);
+    }
+    for child in kids(group.0).into_iter().take(16) {
+        if same_ax(child.0, target) || stepper.as_ref().is_some_and(|s| same_ax(child.0, s.0)) {
+            continue;
+        }
+        if !reader.admit(child.0) {
+            return None;
+        }
+        let role = copy_string_attr(child.0, "AXRole").unwrap_or_default();
+        if role == "AXStaticText" || is_text_role(&role) {
+            let text = text_attr(child.0, "AXValue")
+                .or_else(|| text_attr(child.0, "AXDescription"))
+                .or_else(|| text_attr(child.0, "AXTitle"));
+            if let Some(text) = text {
+                out.push((role, text));
+            }
+        }
+    }
+    Some(out)
+}
+
 unsafe fn attribute_count(element: AXUIElementRef, name: &str) -> Option<usize> {
     let attr = CFString::new(name);
     let mut count: isize = 0;
@@ -777,14 +1167,34 @@ unsafe fn read_collection(reader: &mut Reader, element: AXUIElementRef) -> Colle
     } else {
         ("AXChildren", "AXSelectedChildren")
     };
+    let mut more = None;
     let (items, count) = match list_items(reader, element, items_attr) {
         Ok(items) => {
             let mut names = Vec::with_capacity(items.len());
             for item in items {
                 // An unnamed item is a spacer; a read cut by the budget makes
                 // the whole list unknown.
-                match item_name(reader, item.0) {
-                    Some(name) => names.push(name),
+                match item_name_and_source(reader, item.0) {
+                    // The list's own "Show More" row is not one of its items.
+                    Some((name, _)) if is_more_button_label(&name) && more.is_none() => {
+                        match more_button(reader, item.0, true) {
+                            Some(label) => more = Some(label),
+                            None if !reader.complete => break,
+                            None => names.push(Item { name, value: None }),
+                        }
+                    }
+                    Some((name, named_by_value)) => {
+                        // Its own value (a row's state), unless that is
+                        // where its name came from.
+                        let value = if named_by_value {
+                            None
+                        } else if reader.admit(item.0) {
+                            copy_stringish_attr(item.0, "AXValue").map(|value| value.state_value.trim().to_owned())
+                        } else {
+                            break;
+                        };
+                        names.push(Item { name, value });
+                    }
                     None if reader.complete => {}
                     None => break,
                 }
@@ -811,12 +1221,29 @@ unsafe fn read_collection(reader: &mut Reader, element: AXUIElementRef) -> Colle
         Err(_) => None,
     })
     .flatten();
+    // A "Show More" next to the list (a section header's button).
+    if more.is_none() && reader.admit(element) {
+        if let Some(parent) = copy_element_attr(element, "AXParent").map(Owned) {
+            if reader.admit(parent.0) {
+                for sibling in kids(parent.0).into_iter().take(16) {
+                    if same_ax(sibling.0, element) {
+                        continue;
+                    }
+                    if let Some(label) = more_button(reader, sibling.0, false) {
+                        more = Some(label);
+                        break;
+                    }
+                }
+            }
+        }
+    }
     Collection {
         role,
         label,
         items,
         count,
         selected,
+        more,
     }
 }
 
@@ -839,6 +1266,11 @@ struct Scope {
     menus: bool,
     /// A menu command or key shortcut: waits [`COMMAND_NO_CHANGE_WAIT`].
     command: bool,
+    /// Set once the watch found its list (see [`Facts::target_in_list`]).
+    target_in_list: Option<bool>,
+    opener_in_list: Option<bool>,
+    /// The target is a stepper's increment or decrement button.
+    stepper: bool,
 }
 
 /// One read of every fact; `keep` also returns the retained window for the
@@ -961,6 +1393,11 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
     if let Some(opener) = scope.opener {
         facts.opener = read_element(&mut reader, opener as AXUIElementRef);
     }
+    if let (true, Some(target)) = (scope.stepper, scope.target) {
+        facts.nearby = nearby_texts(&mut reader, target as AXUIElementRef);
+    }
+    facts.target_in_list = scope.target_in_list;
+    facts.opener_in_list = scope.opener_in_list;
     facts.menus = scope.menus.then(|| crate::windows::menu_windows_of(scope.pid)).flatten().map(|windows| {
         let mut ids: Vec<u32> = windows.iter().map(|w| w.window_id).collect();
         ids.sort_unstable();
@@ -972,6 +1409,8 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
         .filter(|&ptr| alive(ptr))
         .map(|ptr| Owned(retained(ptr)))
         .or_else(|| scope.target.and_then(|t| find_collection(&mut reader, t as AXUIElementRef)))
+        // A context menu's pick: the list holding the row it opened on.
+        .or_else(|| scope.opener.and_then(|o| find_collection(&mut reader, o as AXUIElementRef)))
         .or_else(|| focus.as_ref().and_then(|f| find_collection(&mut reader, f.0)))
         .or_else(|| remembered_collection(scope.pid, scope.window_id).map(Owned));
     let mut used = None;
@@ -980,10 +1419,11 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
         used = Some(RetainedElement::retain(list.0 as usize));
     }
     // The target is the element cache's own object, which the action is
-    // about to use: give it back the action timeout the reads shortened.
-    if let Some(target) = scope.target {
+    // about to use (and an opener is an earlier action's): give them back
+    // the action timeout the reads shortened.
+    for element in [scope.target, scope.opener].into_iter().flatten() {
         AXUIElementSetMessagingTimeout(
-            target as AXUIElementRef,
+            element as AXUIElementRef,
             crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS,
         );
     }
@@ -1162,8 +1602,10 @@ pub(crate) unsafe fn recorded_menu_opener(pid: i32, window_id: u32, element: AXU
 }
 
 /// What opened the menu `element` is in, for the pick's outcome: an AppKit
-/// menu's parent (the pop-up button), or the recorded opener of a detached
-/// menu. `None` when `element` is not in a menu.
+/// menu's parent when that is a control that shows a choice (a pop-up
+/// button), or the recorded opener of a detached menu. A context menu's
+/// parent is a container (a Catalyst window's root group, a list), whose
+/// label says nothing about the pick. `None` when `element` is not in a menu.
 unsafe fn menu_opener_of(pid: i32, window_id: u32, element: AXUIElementRef) -> Option<RetainedElement> {
     if copy_string_attr(element, "AXRole").as_deref() != Some("AXMenuItem") {
         return None;
@@ -1172,7 +1614,7 @@ unsafe fn menu_opener_of(pid: i32, window_id: u32, element: AXUIElementRef) -> O
         if copy_string_attr(menu.0, "AXRole").as_deref() == Some("AXMenu") {
             if let Some(parent) = copy_element_attr(menu.0, "AXParent").map(Owned) {
                 let role = copy_string_attr(parent.0, "AXRole").unwrap_or_default();
-                if !matches!(role.as_str(), "AXApplication" | "AXMenuBarItem" | "AXMenuItem" | "") {
+                if matches!(role.as_str(), "AXPopUpButton" | "AXMenuButton" | "AXButton" | "AXComboBox") {
                     return Some(RetainedElement::retain(parent.0 as usize));
                 }
             }
@@ -1295,6 +1737,13 @@ fn settle_key(mut facts: Facts, before: &Facts) -> Facts {
     facts
 }
 
+/// Whether a sheet, popover or menu open before is gone in `now`.
+fn surface_closed(before: &Facts, now: &Facts) -> bool {
+    let sheets = matches!((&before.sheets, &now.sheets), (Some(a), Some(b)) if a.iter().any(|s| !b.contains(s)));
+    let menus = matches!((&before.menus, &now.menus), (Some(a), Some(b)) if a.iter().any(|m| !b.contains(m)));
+    sheets || menus
+}
+
 /// Start a watch for one native action, or `None` when the action has no
 /// window to watch (desktop scope, scroll, an unknown window).
 pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWatch>> {
@@ -1349,8 +1798,25 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             opener: opener.as_ref().map(RetainedElement::as_ptr),
             menus: watch_menus,
             command,
+            target_in_list: None,
+            opener_in_list: None,
+            stepper: target.as_ref().is_some_and(|t| unsafe {
+                let element = t.as_ptr() as AXUIElementRef;
+                let yes = is_stepper_part(&mut Reader::new(), element);
+                AXUIElementSetMessagingTimeout(element, crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS);
+                yes
+            }),
         };
-        let pass = unsafe { read_pass(&scope, false) };
+        // A read cut by the budget leaves nothing to compare with; a busy
+        // app (a Catalyst list mid-reload) often answers the next one.
+        let mut pass = unsafe { read_pass(&scope, false) };
+        for _ in 0..2 {
+            if pass.complete {
+                break;
+            }
+            std::thread::sleep(POLL);
+            pass = unsafe { read_pass(&scope, false) };
+        }
         if pass.facts.window_present != Some(true) {
             return None;
         }
@@ -1358,6 +1824,29 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             remember_collection(pid, window_id, list);
         }
         scope.collection = pass.holder.as_ref().map(RetainedElement::as_ptr);
+        // Where the target and the opener sit, once: every later read and the
+        // line use the same answer.
+        let place = |element: Option<usize>| -> Option<bool> {
+            let element = element? as AXUIElementRef;
+            match &pass.holder {
+                Some(list) => unsafe { inside(&mut Reader::new(), element, list.as_ptr() as AXUIElementRef) },
+                None => pass.complete.then_some(false),
+            }
+        };
+        scope.target_in_list = place(scope.target);
+        scope.opener_in_list = place(scope.opener);
+        // The walk shortened their message timeouts; the action (and later
+        // actions on the cache's elements) need the normal one back.
+        for element in [scope.target, scope.opener].into_iter().flatten() {
+            unsafe {
+                AXUIElementSetMessagingTimeout(
+                    element as AXUIElementRef,
+                    crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS,
+                )
+            };
+        }
+        pass.facts.target_in_list = scope.target_in_list;
+        pass.facts.opener_in_list = scope.opener_in_list;
         Some(Box::new(Watch {
             scope,
             before: pass.facts,
@@ -1402,8 +1891,9 @@ impl OutcomeWatch for Watch {
                     last_change = Instant::now();
                 }
                 let changed = now != watch.before;
+                let stable_for = if surface_closed(&watch.before, &now) { STABLE_AFTER_CLOSE } else { STABLE_FOR };
                 previous = Some(now);
-                if changed && last_change.elapsed() >= STABLE_FOR {
+                if changed && last_change.elapsed() >= stable_for {
                     break Settle::Settled;
                 }
                 if !changed && !watch.scope.command && elapsed >= NO_CHANGE_WAIT {
@@ -1489,9 +1979,10 @@ mod tests {
         Collection {
             role: "AXList".into(),
             label: "icon view".into(),
-            items: Some(items.iter().map(|s| s.to_string()).collect()),
+            items: Some(items.iter().map(|s| Item { name: s.to_string(), value: None }).collect()),
             count: Some(items.len()),
             selected: Some(selected.iter().map(|s| s.to_string()).collect()),
+            more: None,
         }
     }
 
@@ -1501,6 +1992,8 @@ mod tests {
             title: Some(title.into()),
             sheets: Some(vec![]),
             windows: Some(vec![]),
+            target_in_list: Some(false),
+            opener_in_list: Some(false),
             ..Facts::default()
         }
     }
@@ -1849,6 +2342,288 @@ mod tests {
         assert!(names(&many).ends_with("f11, and 8 more"));
         let long = "x".repeat(200);
         assert_eq!(shown_value(&long), format!("200 characters ending \"…{}\"", "x".repeat(40)));
+    }
+
+    const PACKING: [&str; 8] = [
+        "Passport", "Phone charger", "Sunscreen", "Swimsuit", "Hiking boots", "Rain jacket", "Toothbrush",
+        "Paperback novel",
+    ];
+
+    /// A Catalyst table: unnamed AXGroup rows that carry their state as value.
+    fn rows(items: &[(&str, &str)]) -> Collection {
+        Collection {
+            role: "AXGroup".into(),
+            label: "AXGroup".into(),
+            items: Some(items.iter().map(|(n, v)| Item { name: n.to_string(), value: Some(v.to_string()) }).collect()),
+            count: Some(items.len()),
+            selected: Some(vec![]),
+            more: None,
+        }
+    }
+
+    fn plain<'a>(names: &[&'a str]) -> Vec<(&'a str, &'static str)> {
+        names.iter().map(|n| (*n, "")).collect()
+    }
+
+    fn row(label: &str, value: &str) -> Element {
+        Element { role: "AXGroup".into(), label: label.into(), value: Some(value.into()), length: None }
+    }
+
+    /// The list window: the target is a row of it.
+    fn packing(items: &[(&str, &str)], target: Element) -> Facts {
+        let mut facts = window("CatalystPacking");
+        facts.collection = Some(rows(items));
+        facts.target = Some(target);
+        facts.target_in_list = Some(true);
+        facts
+    }
+
+    fn line(before: &Facts, after: &Facts) -> String {
+        describe(before, after, &DiskNotes::default(), Settle::Settled, true)
+    }
+
+    /// K1: the row element shows the next item after the reload; the line
+    /// names the item whose state changed, by content.
+    #[test]
+    fn a_row_action_in_place_names_the_item_not_the_reused_row() {
+        let before = packing(&plain(&PACKING), row("Sunscreen", ""));
+        let mut items = plain(&PACKING);
+        items[2].1 = "Starred";
+        let after = packing(&items, row("Swimsuit", ""));
+        assert_eq!(line(&before, &after), "changed in AXGroup: Sunscreen now \"Starred\" (was blank)");
+    }
+
+    /// K2: a row read as another item before and after (its reads lag) must
+    /// not lend its value change to the line; the list says what moved.
+    #[test]
+    fn a_row_that_moved_is_named_with_its_new_place_and_state() {
+        let before = packing(&plain(&PACKING), row("Sunscreen", ""));
+        let mut items: Vec<(&str, &str)> = plain(&PACKING[1..]);
+        items.push(("Passport", "Packed"));
+        let after = packing(&items, row("Sunscreen", "Starred"));
+        assert_eq!(
+            line(&before, &after),
+            "AXGroup now: Phone charger, Sunscreen, Swimsuit, Hiking boots, Rain jacket, Toothbrush, Paperback novel, \
+             Passport (8); moved: Passport (now 8 of 8); changed in AXGroup: Passport now \"Packed\" (was blank)"
+        );
+    }
+
+    /// K3: a context menu pick (its menu's parent is a container, so it has
+    /// no opener): the menu closing and the move are the line.
+    #[test]
+    fn a_context_menu_pick_on_a_row_names_the_moved_item() {
+        let mut before = window("CatalystPacking");
+        before.collection = Some(rows(&plain(&PACKING)));
+        before.menus = Some(vec![41]);
+        let mut after = before.clone();
+        let mut order = vec!["Toothbrush"];
+        order.extend(PACKING.iter().filter(|n| **n != "Toothbrush"));
+        after.collection = Some(rows(&plain(&order)));
+        after.menus = Some(vec![]);
+        let text = line(&before, &after);
+        assert!(text.starts_with("AXGroup now: Toothbrush, Passport"), "{text}");
+        assert!(text.ends_with("; moved: Toothbrush (now 1 of 8); menu closed"), "{text}");
+        assert!(!text.contains("kept its label") && !text.contains("labelled"), "{text}");
+    }
+
+    /// K5: a removed row; the reused row element's value is not reported.
+    #[test]
+    fn a_removed_row_is_gone_and_no_row_element_claim_is_added() {
+        let before = packing(&plain(&PACKING), row("Passport", ""));
+        let rest: Vec<&str> = PACKING.iter().copied().filter(|n| *n != "Rain jacket").collect();
+        let after = packing(&plain(&rest), row("Passport", "Packed"));
+        let text = line(&before, &after);
+        assert!(text.ends_with("(7); gone from the list: Rain jacket"), "{text}");
+        assert!(!text.contains("Passport\" now"), "{text}");
+    }
+
+    /// With the list unreadable, a row whose label changed says only what it
+    /// shows now and that this names no item.
+    #[test]
+    fn a_relabelled_row_with_the_list_unread_says_it_cannot_tell() {
+        let mut before = packing(&plain(&PACKING), row("Sunscreen", ""));
+        before.collection = None;
+        let mut after = before.clone();
+        after.target = Some(row("Swimsuit", ""));
+        let text = line(&before, &after);
+        assert!(text.starts_with("the AXGroup acted on now shows \"Swimsuit\" (it showed \"Sunscreen\")"), "{text}");
+        assert!(text.ends_with("does not tell which item changed: read the list"), "{text}");
+        // Ancestry unread: the same, never "is now labelled".
+        before.target_in_list = None;
+        after.target_in_list = None;
+        assert!(!line(&before, &after).contains("labelled"));
+    }
+
+    /// An AppKit table's checkbox: the row has no value, so the list says
+    /// nothing and the checkbox's own line stays.
+    #[test]
+    fn a_checkbox_in_a_list_keeps_its_line_when_the_list_says_nothing() {
+        let checkbox = |value: &str| Element {
+            role: "AXCheckBox".into(),
+            label: "Enabled".into(),
+            value: Some(value.into()),
+            length: None,
+        };
+        let mut before = window("Rules");
+        before.collection = Some(list(&["Rule A", "Rule B"], &[]));
+        before.target = Some(checkbox("0"));
+        before.target_in_list = Some(true);
+        let mut after = before.clone();
+        after.target = Some(checkbox("1"));
+        assert_eq!(line(&before, &after), "AXCheckBox \"Enabled\" now 1 (on), was 0 (off)");
+    }
+
+    /// A pop-up inside an AppKit table row: rows without values say
+    /// nothing, so the pop-up's new choice is still named.
+    #[test]
+    fn a_popup_in_a_list_keeps_its_choice_when_the_list_says_nothing() {
+        let popup = |value: &str| Element {
+            role: "AXPopUpButton".into(),
+            label: "Access".into(),
+            value: Some(value.into()),
+            length: None,
+        };
+        let mut before = window("Rules");
+        before.collection = Some(list(&["Camera", "Microphone"], &[]));
+        before.menus = Some(vec![5]);
+        before.opener = Some(popup("Allow"));
+        before.opener_in_list = Some(true);
+        let mut after = before.clone();
+        after.menus = Some(vec![]);
+        after.opener = Some(popup("Block"));
+        assert_eq!(line(&before, &after), "AXPopUpButton \"Access\" now shows \"Block\"; menu closed");
+    }
+
+    /// An AppKit table re-sorted by a row's field edit: the rows carry no
+    /// state, so the field's own value line stays beside the move.
+    #[test]
+    fn a_field_edit_that_resorts_a_table_keeps_the_fields_line() {
+        let field = |value: &str| Element {
+            role: "AXTextField".into(),
+            label: "Priority".into(),
+            value: Some(value.into()),
+            length: None,
+        };
+        let mut before = window("Tasks");
+        before.collection = Some(list(&["Alpha", "Beta", "Gamma"], &[]));
+        before.target = Some(field("1"));
+        before.target_in_list = Some(true);
+        let mut after = before.clone();
+        after.collection = Some(list(&["Beta", "Gamma", "Alpha"], &[]));
+        after.target = Some(field("3"));
+        let text = line(&before, &after);
+        assert!(text.contains("moved: Alpha (now 3 of 3)") && text.contains("AXTextField \"Priority\" now 3, was 1"), "{text}");
+    }
+
+    /// A checkbox inside a stateful row that shares the row's name is a
+    /// control, not the row: its own value line stays.
+    #[test]
+    fn a_control_named_like_its_row_keeps_its_line() {
+        let checkbox = |value: &str| Element { role: "AXCheckBox".into(), label: "Alpha".into(), value: Some(value.into()), length: None };
+        let mut before = window("Tasks");
+        before.collection = Some(rows(&[("Alpha", ""), ("Beta", "")]));
+        before.target = Some(checkbox("0"));
+        before.target_in_list = Some(true);
+        let mut after = before.clone();
+        after.target = Some(checkbox("1"));
+        assert_eq!(line(&before, &after), "AXCheckBox \"Alpha\" now 1 (on), was 0 (off)");
+    }
+
+    /// Duplicate names and unread values never produce a state claim; a swap
+    /// of two names no mover.
+    #[test]
+    fn ambiguous_list_changes_claim_no_item() {
+        let old = rows(&[("Snacks", ""), ("Snacks", "Packed"), ("Map", "")]).items.unwrap();
+        let new = rows(&[("Snacks", "Packed"), ("Snacks", ""), ("Map", "")]).items.unwrap();
+        assert_eq!(list_diff(&old, &new), ListDiff::default());
+        let unread = vec![Item { name: "Map".into(), value: None }];
+        let read = vec![Item { name: "Map".into(), value: Some("Packed".into()) }];
+        assert!(list_diff(&unread, &read).changed.is_empty());
+        let swapped = list_diff(
+            &rows(&plain(&["A", "B", "C"])).items.unwrap(),
+            &rows(&plain(&["B", "A", "C"])).items.unwrap(),
+        );
+        assert!(swapped.reordered && swapped.moved.is_none(), "{swapped:?}");
+        let parts = list_change_parts(&rows(&plain(&["B", "A", "C"])), &swapped);
+        assert_eq!(parts, vec!["AXGroup now: B, A, C (3); order changed".to_owned()]);
+        // A removed duplicate is gone once.
+        let gone = list_diff(
+            &rows(&plain(&["Snacks", "Snacks", "Map"])).items.unwrap(),
+            &rows(&plain(&["Snacks", "Map"])).items.unwrap(),
+        );
+        assert_eq!(gone.gone, vec!["Snacks".to_owned()]);
+        assert!(!gone.reordered);
+        // Removing or adding one of two duplicates moves nothing else.
+        let first_gone = list_diff(
+            &rows(&plain(&["Snacks", "Map", "Snacks"])).items.unwrap(),
+            &rows(&plain(&["Map", "Snacks"])).items.unwrap(),
+        );
+        assert!(!first_gone.reordered && first_gone.moved.is_none(), "{first_gone:?}");
+        let added = list_diff(
+            &rows(&plain(&["Map", "Snacks"])).items.unwrap(),
+            &rows(&plain(&["Snacks", "Map", "Snacks"])).items.unwrap(),
+        );
+        assert!(!added.reordered && added.moved.is_none() && added.added == vec!["Snacks".to_owned()], "{added:?}");
+    }
+
+    /// S1/S2: a stepper's number is read from the label next to it.
+    #[test]
+    fn a_stepper_press_names_the_number_next_to_it() {
+        let mut before = window("CatalystPacking");
+        before.target = Some(Element { role: "AXButton".into(), label: "Days, Increment".into(), value: None, length: None });
+        let texts = |days: &str| Some(vec![("AXStaticText".to_owned(), "Trip length".to_owned()), ("AXStaticText".to_owned(), days.to_owned())]);
+        before.nearby = texts("5 days");
+        let mut after = before.clone();
+        after.nearby = texts("6 days");
+        assert_eq!(line(&before, &after), "next to it: \"5 days\" now \"6 days\"");
+        let same = describe(&before, &before, &DiskNotes::default(), Settle::Unchanged, true);
+        assert!(same.ends_with("; text next to it unchanged: \"Trip length\", \"5 days\""), "{same}");
+        let mut bare = before.clone();
+        bare.nearby = Some(vec![]);
+        let none = describe(&bare, &bare, &DiskNotes::default(), Settle::Unchanged, true);
+        assert!(none.ends_with("this stepper shows no readable value next to it: read the window before pressing again"), "{none}");
+        // Different kinds of elements next to it: no place-by-place claim.
+        let mut reshaped = after.clone();
+        reshaped.nearby = Some(vec![("AXTextField".to_owned(), "6".to_owned())]);
+        assert!(!line(&before, &reshaped).contains("now \""));
+    }
+
+    /// K6: a sheet closing keeps the watch waiting for the list.
+    #[test]
+    fn a_closing_sheet_or_menu_is_seen() {
+        let mut before = window("CatalystPacking");
+        before.sheets = Some(vec!["sheet: alert".into()]);
+        before.menus = Some(vec![]);
+        let mut now = before.clone();
+        assert!(!surface_closed(&before, &now));
+        now.sheets = Some(vec![]);
+        assert!(surface_closed(&before, &now));
+        let mut menu = window("CatalystPacking");
+        menu.menus = Some(vec![7]);
+        let mut gone = menu.clone();
+        gone.menus = Some(vec![]);
+        assert!(surface_closed(&menu, &gone) && !surface_closed(&gone, &menu));
+    }
+
+    #[test]
+    fn more_buttons_are_recognised_by_label() {
+        for yes in ["Show More", "See All", "see all (12)", "View all 40", "Load more…", "More Results", "Show More...", "Show more results"] {
+            assert!(is_more_button_label(yes), "{yes}");
+        }
+        for no in ["More", "Showcase", "See Allison", "Show", "Load", "Moreover", "Show All Tabs", "Show More Options"] {
+            assert!(!is_more_button_label(no), "{no}");
+        }
+        let mut list = rows(&plain(&["Hiking boots", "Toothbrush", "Passport"]));
+        list.more = Some("Show More".into());
+        let mut before = window("CatalystPacking");
+        before.collection = Some(rows(&plain(&["Hiking boots", "Toothbrush", "Passport", "Sunscreen"])));
+        let mut after = before.clone();
+        after.collection = Some(list);
+        assert_eq!(
+            line(&before, &after),
+            "AXGroup now: Hiking boots, Toothbrush, Passport (3); gone from the list: Sunscreen; the app shows only \
+             some items here: press the button \"Show More\" to list the rest"
+        );
     }
 
     #[test]
