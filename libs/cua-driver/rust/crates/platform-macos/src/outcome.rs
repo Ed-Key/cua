@@ -358,20 +358,14 @@ fn count_of(items: &[Item], name: &str) -> usize {
     items.iter().filter(|item| item.name == name).count()
 }
 
-/// The items of `a` that `b` holds too, as many of each name as both have,
-/// in `a`'s order.
+/// The names of `a` that occur exactly once in both lists, in `a`'s order.
+/// Duplicated names have no known correspondence, so they never count as
+/// moved or as making others move.
 fn common<'a>(a: &'a [Item], b: &[Item]) -> Vec<&'a str> {
-    let mut seen: Vec<&str> = Vec::new();
-    let mut out = Vec::new();
-    for item in a {
-        let name = item.name.as_str();
-        let taken = seen.iter().filter(|s| **s == name).count();
-        if taken < count_of(b, name) {
-            out.push(name);
-        }
-        seen.push(name);
-    }
-    out
+    a.iter()
+        .map(|item| item.name.as_str())
+        .filter(|name| count_of(a, name) == 1 && count_of(b, name) == 1)
+        .collect()
 }
 
 /// Items of `a` beyond what `b` holds of the same name (multiset difference).
@@ -2493,6 +2487,17 @@ mod tests {
         );
         assert_eq!(gone.gone, vec!["Snacks".to_owned()]);
         assert!(!gone.reordered);
+        // Removing or adding one of two duplicates moves nothing else.
+        let first_gone = list_diff(
+            &rows(&plain(&["Snacks", "Map", "Snacks"])).items.unwrap(),
+            &rows(&plain(&["Map", "Snacks"])).items.unwrap(),
+        );
+        assert!(!first_gone.reordered && first_gone.moved.is_none(), "{first_gone:?}");
+        let added = list_diff(
+            &rows(&plain(&["Map", "Snacks"])).items.unwrap(),
+            &rows(&plain(&["Snacks", "Map", "Snacks"])).items.unwrap(),
+        );
+        assert!(!added.reordered && added.moved.is_none() && added.added == vec!["Snacks".to_owned()], "{added:?}");
     }
 
     /// S1/S2: a stepper's number is read from the label next to it.
