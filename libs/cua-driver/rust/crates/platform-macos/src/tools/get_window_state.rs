@@ -646,6 +646,17 @@ impl Tool for GetWindowStateTool {
             r.tree_markdown.push_str(line);
         }
 
+        // A same-pid window no AXWindow claims that WindowServer records as a
+        // child of another window of the app (a popover, an inline editor):
+        // its controls live in the parent's tree, so say where to read.
+        let child_parent = matches!(window_scope, Some(crate::ax::WindowScope::AxUnresolved { .. }))
+            .then(|| child_window_parent(pid, window_id))
+            .flatten();
+        if let (Some(parent), Some(r)) = (child_parent, tree_result.as_mut()) {
+            r.tree_markdown.push_str(&child_window_line(window_id, parent));
+            r.tree_markdown.push('\n');
+        }
+
         // Build response.
         let mut content: Vec<Content> = Vec::new();
 
@@ -852,6 +863,17 @@ impl Tool for GetWindowStateTool {
                     "recommended": "px",
                     "reason": "non-AX surface — act by pixel (x,y) off the screenshot \
                                in this response (an element px action)."
+                });
+            }
+            Degradation::AxWindowUnresolved { .. } if child_parent.is_some() => {
+                let parent = child_parent.expect("checked");
+                structured["degraded"] = serde_json::json!(true);
+                structured["degraded_reason"] = serde_json::json!(child_window_line(window_id, parent));
+                structured["escalation"] = serde_json::json!({
+                    "recommended": "parent_window",
+                    "parent_window_id": parent,
+                    "reason": format!("read window_id {parent} (it usually holds this child \
+                                       window's controls) and act on its elements with window_id {parent}")
                 });
             }
             Degradation::AxWindowUnresolved { ax_window_count } => {
@@ -1332,6 +1354,29 @@ fn window_scope_refusal(
     }
 }
 
+/// The nearest same-pid WindowServer parent of `window_id` (a few levels).
+fn child_window_parent(pid: i32, window_id: u32) -> Option<u32> {
+    let mut current = window_id;
+    for _ in 0..4 {
+        let parent = crate::input::skylight::window_parent_id(current)?;
+        if crate::windows::resolve_window_owner(pid, parent) == crate::windows::WindowOwner::SamePid {
+            return Some(parent);
+        }
+        current = parent;
+    }
+    None
+}
+
+/// What a read of a child window says instead of an empty tree.
+fn child_window_line(window_id: u32, parent: u32) -> String {
+    format!(
+        "child_window: window_id {window_id} is a child window (a popover or an inline editor) \
+         of window {parent} of this app, and no AXWindow claims it, so this read has no \
+         elements. Its controls are usually in window {parent}'s tree: call get_window_state \
+         with window_id {parent} and act on those elements with window_id {parent}."
+    )
+}
+
 /// Which degradation rung a snapshot lands on.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Degradation {
@@ -1649,6 +1694,12 @@ mod window_scope_contract_tests {
             !text.contains("AXMenuBar"),
             "the refusal must never carry menu-bar content"
         );
+    }
+
+    #[test]
+    fn a_child_window_read_names_its_parent() {
+        let line = super::child_window_line(71197, 71190);
+        assert!(line.contains("child window") && line.contains("get_window_state with window_id 71190"), "{line}");
     }
 
     #[test]

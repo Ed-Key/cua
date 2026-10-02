@@ -694,6 +694,119 @@ pub fn raise_exact_window(pid: i32, window_id: u32) -> bool {
     }
 }
 
+/// Whether `pid`'s keyboard focus is a text control in a WindowServer child
+/// window of `target`: an inline editor (Finder's rename field) or a
+/// popover's field (a tag editor). Such an edit lives only while its app is
+/// active: Finder cancels an inline rename when it loses the front.
+pub fn inline_edit_open(pid: i32, target: u32) -> bool {
+    focus_state(pid, target) == FocusState::InlineEdit
+}
+
+/// Where `pid`'s keyboard focus is, as a menu command's wait reads it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FocusState {
+    /// A text control in a child window of the target: an inline edit.
+    InlineEdit,
+    /// The application itself, or nothing: a menu is tracking or closing.
+    InMenu,
+    /// Any other element.
+    Elsewhere,
+}
+
+fn focus_state(pid: i32, target: u32) -> FocusState {
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return FocusState::Elsewhere;
+        }
+        let element = copy_element_attr(app, "AXFocusedUIElement");
+        CFRelease(app as CFTypeRef);
+        let Some(element) = element else {
+            return FocusState::InMenu;
+        };
+        let role = copy_string_attr(element, "AXRole");
+        if matches!(role.as_deref(), Some("AXApplication" | "AXMenu" | "AXMenuItem" | "AXMenuBarItem")) {
+            CFRelease(element as CFTypeRef);
+            return FocusState::InMenu;
+        }
+        let window = crate::ax::exact_target::element_window_id(element);
+        CFRelease(element as CFTypeRef);
+        if is_inline_edit(role.as_deref(), window, target, window_belongs_to) {
+            FocusState::InlineEdit
+        } else {
+            FocusState::Elsewhere
+        }
+    }
+}
+
+/// After a menu command: whether it opened an inline edit of `target`
+/// (File > Rename, New Folder). The editor shows only after the menu has
+/// closed (Finder: about 0.4 s after the press, the app reporting itself as
+/// focused until then), so wait while the focus is in the menu, and stop
+/// once it has settled on anything else for a moment, or at `max`.
+pub fn await_inline_edit_after_menu(pid: i32, target: u32, max: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + max;
+    let mut elsewhere_since: Option<std::time::Instant> = None;
+    loop {
+        match focus_state(pid, target) {
+            FocusState::InlineEdit => return true,
+            FocusState::InMenu => elsewhere_since = None,
+            FocusState::Elsewhere => {
+                let since = *elsewhere_since.get_or_insert_with(std::time::Instant::now);
+                if since.elapsed() >= std::time::Duration::from_millis(150) {
+                    return false;
+                }
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+/// [`inline_edit_open`]'s decision, with an injectable parent lookup.
+fn is_inline_edit(
+    role: Option<&str>,
+    window: Option<u32>,
+    target: u32,
+    belongs: impl Fn(u32, u32) -> bool,
+) -> bool {
+    matches!(role, Some("AXTextField" | "AXTextArea" | "AXComboBox"))
+        && window.is_some_and(|window| window != target && belongs(window, target))
+}
+
+/// [`inline_edit_open`], polled for up to `budget`: an editor opened by a
+/// key or menu command appears a moment after the command.
+pub fn await_inline_edit(pid: i32, target: u32, budget: std::time::Duration) -> bool {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if inline_edit_open(pid, target) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod inline_edit_tests {
+    #[test]
+    fn only_a_focused_text_control_in_a_child_window_is_an_inline_edit() {
+        let child_of_7 = |window: u32, target: u32| window == 70 && target == 7;
+        assert!(super::is_inline_edit(Some("AXTextField"), Some(70), 7, child_of_7));
+        assert!(super::is_inline_edit(Some("AXTextArea"), Some(70), 7, child_of_7));
+        // A field in the window itself, a button in the child, another
+        // window's field, or an unknown window: not an inline edit.
+        assert!(!super::is_inline_edit(Some("AXTextField"), Some(7), 7, |_, _| true));
+        assert!(!super::is_inline_edit(Some("AXButton"), Some(70), 7, child_of_7));
+        assert!(!super::is_inline_edit(Some("AXTextField"), Some(80), 7, child_of_7));
+        assert!(!super::is_inline_edit(Some("AXTextField"), None, 7, child_of_7));
+    }
+}
+
 /// A focused window reading, reported as `target` when it is part of it.
 pub fn focused_as_target(focused: Option<u32>, target: u32) -> Option<u32> {
     focused.map(|window| if window_belongs_to(window, target) { target } else { window })

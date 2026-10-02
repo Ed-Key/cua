@@ -963,12 +963,52 @@ pub fn with_foreground_assist(
 
     let result = body();
 
-    if prev_ok {
+    if prev_ok && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid) {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
     result?;
     Ok(true)
+}
+
+/// How long a foreground action waits for an inline editor it may have
+/// opened (Finder's rename field shows a moment after Return).
+const INLINE_EDIT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// When the target was left in front because an inline edit was open, per
+/// pid: the action's outcome line says so.
+static KEPT_FRONT: std::sync::Mutex<Vec<(i32, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
+
+/// Whether a foreground action that succeeded must leave its target in
+/// front: its app has an inline edit open (a text field in a child window of
+/// the target), which the app cancels when it loses the front (Finder's
+/// rename). Handing the front back would undo what the action opened, so the
+/// target stays in front and the outcome line says why.
+pub(crate) fn keeps_front_for_inline_edit(succeeded: bool, pid: libc::pid_t, window_id: u32) -> bool {
+    // Measured for Finder only (its inline rename); other apps keep the
+    // brief activation.
+    if !succeeded
+        || !crate::tools::edit_commit::app_saves_on_end_editing(pid)
+        || !crate::ax::bindings::await_inline_edit(pid, window_id, INLINE_EDIT_WAIT)
+    {
+        return false;
+    }
+    note_kept_front(pid);
+    true
+}
+
+pub(crate) fn note_kept_front(pid: i32) {
+    if let Ok(mut kept) = KEPT_FRONT.lock() {
+        kept.retain(|(_, at)| at.elapsed() < std::time::Duration::from_secs(60));
+        kept.push((pid, std::time::Instant::now()));
+    }
+}
+
+/// Whether `pid` was left in front for an inline edit at or after `since`.
+pub(crate) fn kept_front_since(pid: i32, since: std::time::Instant) -> bool {
+    KEPT_FRONT
+        .lock()
+        .is_ok_and(|kept| kept.iter().any(|(kept_pid, at)| *kept_pid == pid && *at >= since))
 }
 
 /// Upper bound on how long [`with_foreground_assist`] waits for a requested
@@ -1020,6 +1060,12 @@ fn await_window_focused(pid: libc::pid_t, window_id: u32) -> bool {
 /// focused. The exact AX window raise that `bring_to_front` uses completes
 /// that case, so it runs when the records alone did not land.
 fn focus_exact_window(pid: libc::pid_t, window_id: u32) -> bool {
+    // An inline editor of the window (Finder's rename field) has the focus:
+    // making the window itself key would end that edit. Its focus already
+    // counts as the window's.
+    if crate::ax::bindings::inline_edit_open(pid, window_id) && await_window_focused(pid, window_id) {
+        return true;
+    }
     focus_with_ax_fallback(
         || {
             make_exact_window_key(pid, window_id);
@@ -1117,7 +1163,7 @@ pub fn with_foreground_hid_activation(
     let result = action();
     std::thread::sleep(std::time::Duration::from_millis(40));
 
-    if prev_ok {
+    if prev_ok && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid) {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 

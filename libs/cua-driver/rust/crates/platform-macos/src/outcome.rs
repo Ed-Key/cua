@@ -153,6 +153,11 @@ pub(crate) enum Settle {
     /// A command: nothing changed within [`COMMAND_NO_CHANGE_WAIT`], which
     /// does not show it did nothing (it can finish later).
     CommandUnchanged,
+    /// [`Settle::CommandUnchanged`] for a menu command (invoke_menu): its
+    /// line says no effect was seen, first, since a menu item that did
+    /// nothing visible must not read as done. A key shortcut keeps the
+    /// plainer line: its usual effects (a text selection) are not watched.
+    MenuCommandUnchanged,
     /// Something changed and settled, then the last read matched the start
     /// again: the wait ended early, so neither "changed" nor "unchanged".
     Reverted,
@@ -441,10 +446,15 @@ pub(crate) fn describe(
         return line;
     }
     if parts.is_empty() {
-        let command = settle == Settle::CommandUnchanged;
+        let command = matches!(settle, Settle::CommandUnchanged | Settle::MenuCommandUnchanged);
         let seconds = if command { COMMAND_NO_CHANGE_WAIT } else { NO_CHANGE_WAIT }.as_secs_f32();
         let mut line = if complete && settle == Settle::Reverted {
             "a change came and went (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: read the window before repeating the action".to_owned()
+        } else if complete && command && settle == Settle::MenuCommandUnchanged {
+            format!(
+                "{} within {seconds:.1} s (no window opened or closed, and focus, selection, list items, values, title, document, sheets and popovers are as before); not settled: a command can finish later or act on a window already open, so read the window before repeating it",
+                cua_driver_core::outcome::NO_EFFECT
+            )
         } else if complete && command {
             format!(
                 "no change seen within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: a command can finish later, so read the window before repeating it"
@@ -1266,6 +1276,9 @@ struct Watch {
     scope: Scope,
     before: Facts,
     before_complete: bool,
+    /// When the watch began: a foreground action that then left the app in
+    /// front for an inline edit is named in the line.
+    started: Instant,
     /// Keep the target, the list and a menu's opener alive for the after-reads.
     _target: Option<RetainedElement>,
     _collection: Option<RetainedElement>,
@@ -1349,6 +1362,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             scope,
             before: pass.facts,
             before_complete: pass.complete,
+            started: Instant::now(),
             _target: target,
             _collection: pass.holder,
             _opener: opener,
@@ -1435,13 +1449,36 @@ impl OutcomeWatch for Watch {
             };
             // A change that went back by the last read is not settled.
             let settle = if settle == Settle::Settled && after == before { Settle::Reverted } else { settle };
+            // invoke_menu is the command that does not watch menus.
+            let settle = if settle == Settle::CommandUnchanged && !scope.menus {
+                Settle::MenuCommandUnchanged
+            } else {
+                settle
+            };
             describe(&before, &after, &disk, settle, complete_before && complete)
         })
         .await
         .ok()?;
+        let line = with_kept_front(
+            line,
+            crate::input::skylight::kept_front_since(watch.scope.pid, watch.started),
+        );
         drop(watch);
         Some(line)
     }
+}
+
+/// The line, plus why the previous front app was not brought back when a
+/// foreground action left this app in front for an inline edit.
+fn with_kept_front(line: String, kept: bool) -> String {
+    if !kept {
+        return line;
+    }
+    format!(
+        "{line}; this app stays in front: it has an inline edit open (a rename or a popover's \
+         field), which it cancels when it loses the front, so the previous front app was not \
+         brought back"
+    )
 }
 
 #[cfg(test)]
@@ -1507,6 +1544,13 @@ mod tests {
             .ends_with("; still open: a menu"));
     }
 
+    #[test]
+    fn a_kept_front_is_named_after_the_line() {
+        assert_eq!(super::with_kept_front("x".into(), false), "x");
+        let line = super::with_kept_front("window opened: \"\" (window_id 9)".into(), true);
+        assert!(line.starts_with("window opened") && line.contains("stays in front") && line.contains("cancels"), "{line}");
+    }
+
     /// A command (invoke_menu, hotkey) with nothing seen is not called
     /// "nothing changed": Finder's Move to Trash once showed after 0.6 s.
     #[test]
@@ -1514,6 +1558,8 @@ mod tests {
         let before = window("cleanup");
         let line = describe(&before, &before.clone(), &DiskNotes::default(), Settle::CommandUnchanged, true);
         assert!(line.starts_with("no change seen within 1.5 s"), "{line}");
+        let menu = describe(&before, &before.clone(), &DiskNotes::default(), Settle::MenuCommandUnchanged, true);
+        assert!(menu.starts_with(cua_driver_core::outcome::NO_EFFECT) && menu.contains("no window opened"), "{menu}");
         assert!(line.contains("not settled") && !line.contains("nothing it watches changed"), "{line}");
         let line = describe(&before, &before.clone(), &DiskNotes::default(), Settle::Unchanged, true);
         assert!(line.starts_with("nothing it watches changed within 0.6 s"), "{line}");

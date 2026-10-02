@@ -28,8 +28,21 @@ use crate::ax::bindings::{
 
 pub struct InvokeMenuTool;
 
+/// Where the front app ended up after a menu command run from behind.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FrontAfter {
+    Restored,
+    NotConfirmed,
+    /// The command opened an inline editor; handing the front back would
+    /// cancel it.
+    KeptForInlineEdit,
+}
+
 const AX_MESSAGING_TIMEOUT_SECONDS: f32 = 2.0;
 const MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long a menu command gets to open an inline editor (File > Rename)
+/// before the previous front app is brought back.
+const INLINE_EDIT_WAIT: Duration = Duration::from_millis(1200);
 
 unsafe fn set_messaging_timeout(element: AXUIElementRef) {
     let _ = AXUIElementSetMessagingTimeout(element, AX_MESSAGING_TIMEOUT_SECONDS);
@@ -498,7 +511,18 @@ impl Tool for InvokeMenuTool {
             // call returns (TextEdit writes a saved document asynchronously),
             // and re-keying a sibling document dropped the save.
             let mut front_restored = None;
-            if let Some(prior_pid) = prior_frontmost.filter(|prior_pid| *prior_pid != pid) {
+            // A command that opened an inline editor (File > Rename) keeps
+            // the app in front: the app cancels that edit when it loses the
+            // front, so handing it back would undo the command.
+            let other_front = prior_frontmost.filter(|prior_pid| *prior_pid != pid);
+            let kept = other_front.is_some()
+                && result.is_ok()
+                && crate::tools::edit_commit::app_saves_on_end_editing(pid)
+                && crate::ax::bindings::await_inline_edit_after_menu(pid, window_id, INLINE_EDIT_WAIT);
+            if kept {
+                front_restored = Some(FrontAfter::KeptForInlineEdit);
+            }
+            if let Some(prior_pid) = other_front.filter(|_| !kept) {
                 let restored_exact = prior_frontmost_window.is_some_and(|prior_window_id| {
                     focus_exact_window(prior_pid, prior_window_id).is_ok()
                 });
@@ -513,7 +537,7 @@ impl Tool for InvokeMenuTool {
                     std::thread::sleep(Duration::from_millis(20));
                     restored = crate::apps::frontmost_pid() == Some(prior_pid);
                 }
-                front_restored = Some(restored);
+                front_restored = Some(if restored { FrontAfter::Restored } else { FrontAfter::NotConfirmed });
             }
             result.map(|()| front_restored)
         })
@@ -521,10 +545,11 @@ impl Tool for InvokeMenuTool {
 
         match outcome {
             Ok(Ok(front_restored)) => ToolResult::text(format!(
-                "Resolved the live native menu path and dispatched its final accessibility action; verify the command's semantic effect from fresh state.{}",
+                "Pressed the menu item (every step of the path resolved uniquely); what the command did is in the Outcome line.{}",
                 match front_restored {
-                    Some(true) => " The target app was active only for the menu action; the previous front app is front again.",
-                    Some(false) => " The target app was activated for the menu action; the previous front app was not confirmed back in front.",
+                    Some(FrontAfter::Restored) => " The target app was active only for the menu action; the previous front app is front again.",
+                    Some(FrontAfter::NotConfirmed) => " The target app was activated for the menu action; the previous front app was not confirmed back in front.",
+                    Some(FrontAfter::KeptForInlineEdit) => " The target app stays in front: the command opened an inline editor, which the app cancels when it loses the front, so the previous front app was not brought back.",
                     None => "",
                 }
             ))

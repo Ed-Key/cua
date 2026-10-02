@@ -260,7 +260,9 @@ impl Tool for SetValueTool {
                                     copy_string_attr(element, "AXValue")
                                 }));
                             }
-                            Ok(Written::Outcome(outcome))
+                            Ok(Written::Outcome(unsafe {
+                                settle_end_of_editing(outcome, element, element_index, pid, &value)
+                            }))
                         },
                     )
                 })
@@ -272,7 +274,7 @@ impl Tool for SetValueTool {
         let changes = snapshot.detect_async().await;
 
         match result {
-            Ok(Ok(SetValueAttempt::Refused)) => nonsettable_text_refusal(),
+            Ok(Ok(SetValueAttempt::Refused)) => nonsettable_text_refusal(super::edit_commit::read_only_note(pid)),
             Ok(Ok(SetValueAttempt::FileNameNeedsRename)) => file_name_needs_rename(pid, window_id),
             Ok(Ok(SetValueAttempt::CatalystNeedsTyping)) => catalyst_text_needs_typing(pid, window_id),
             Ok(Ok(SetValueAttempt::CatalystDidNotTake(now))) => catalyst_text_did_not_take(pid, window_id, now),
@@ -523,11 +525,11 @@ fn text_value_not_settable(role: &str, read_settable: impl FnOnce() -> Option<bo
     matches!(role, "AXTextField" | "AXTextArea") && read_settable() == Some(false)
 }
 
-fn nonsettable_text_refusal() -> ToolResult {
-    ToolResult::error(
+fn nonsettable_text_refusal(note: &str) -> ToolResult {
+    ToolResult::error(format!(
         "Cannot set AXValue: the text control currently reports that its value is not settable. \
-         No value write was attempted. This describes AXValue writability, not keyboard editability.",
-    )
+         No value write was attempted. This describes AXValue writability, not keyboard editability.{note}",
+    ))
     .with_structured(serde_json::json!({
         "code": "AX_VALUE_NOT_SETTABLE",
         "effect": "refused",
@@ -570,6 +572,72 @@ fn apply_verification_label(outcome: &mut SetValueOutcome) {
         if let Some(rest) = outcome.detail.strip_prefix("✅ Set") {
             outcome.detail = format!("📨 Sent (unverified){rest}");
         }
+    }
+}
+
+/// A text field whose app saves it only when its editing ends (Finder's Get
+/// Info, its rename field): a matching read-back proves only what the field
+/// shows. A multi-line field is ended here the way Tab ends it (Return would
+/// be a new line); a one-line field is left for the agent's Return. Either
+/// way the result is never "confirmed": what the app saved is not readable.
+///
+/// # Safety
+///
+/// `element` must be a valid `AXUIElementRef` for the duration of the call.
+unsafe fn settle_end_of_editing(
+    outcome: SetValueOutcome,
+    element: AXUIElementRef,
+    element_index: usize,
+    pid: i32,
+    value: &str,
+) -> SetValueOutcome {
+    use super::edit_commit::{end_edit, not_committed, pending_field_of, Field};
+    // A read-back that did not match keeps its own words.
+    if outcome.verified != Some(true) {
+        return outcome;
+    }
+    let Some(field) = pending_field_of(pid, element) else {
+        return outcome;
+    };
+    let role = copy_string_attr(element, "AXRole").unwrap_or_default();
+    let app = crate::apps::get_app_name_for_pid(pid).unwrap_or_else(|| "The app".into());
+    let shown = serde_json::json!(value);
+    let focused = crate::ax::bindings::copy_bool_attr(element, "AXFocused") == Some(true);
+    if field == Field::MultiLine && focused {
+        if let Some(ended) = end_edit(element) {
+            let now = copy_string_attr(element, "AXValue");
+            let (detail, verified) = if now.as_deref() == Some(value) {
+                (
+                    format!(
+                        "📨 Set and ended the edit: [{element_index}] {role} holds {shown} and the \
+                         focus moved to {}, which ends its editing, when {app} saves this field. \
+                         What {app} saved is not readable through accessibility, so the save is \
+                         unverified.",
+                        ended.focus
+                    ),
+                    None,
+                )
+            } else {
+                (
+                    format!(
+                        "⚠️ Not kept: [{element_index}] {role} showed {shown}, but after its edit \
+                         ended (focus moved to {}) it reads {}: {app} did not keep the value.",
+                        ended.focus,
+                        serde_json::json!(now)
+                    ),
+                    Some(false),
+                )
+            };
+            return SetValueOutcome { detail, verified, changed: None };
+        }
+    }
+    SetValueOutcome {
+        detail: format!(
+            "⚠️ Set, not committed: [{element_index}] {role} shows {shown}. {}",
+            not_committed(field, &app)
+        ),
+        verified: None,
+        changed: None,
     }
 }
 
