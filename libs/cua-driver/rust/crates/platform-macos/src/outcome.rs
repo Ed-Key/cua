@@ -284,14 +284,23 @@ fn more_clause(collection: &Collection) -> Option<String> {
 }
 
 /// A button label that asks the app for the rest of a list it shortened:
-/// "Show More", "See All", "View all 12", "More Results", "Load more…".
+/// "Show More", "See All", "View all (12)", "More Results", "Load more…".
+/// Only a count or "results"/"items" may follow, so "Show All Tabs" or
+/// "Show More Options" is not one.
 pub(crate) fn is_more_button_label(label: &str) -> bool {
     let text = label.trim().trim_end_matches(['…', '.']).trim().to_lowercase();
     const STARTS: &[&str] = &["show more", "see more", "view more", "load more", "show all", "see all", "view all"];
+    let tail_ok = |rest: &str| {
+        let rest = rest.trim();
+        let count = rest.trim_start_matches('(').trim_end_matches(')');
+        rest.is_empty()
+            || (!count.is_empty() && count.chars().all(|c| c.is_ascii_digit()))
+            || matches!(rest, "results" | "items")
+    };
     STARTS.iter().any(|start| {
         text.strip_prefix(start)
-            .is_some_and(|rest| rest.is_empty() || rest.starts_with(' ') || rest.starts_with('('))
-    }) || matches!(text.as_str(), "more results" | "all results" | "show more results" | "see all results")
+            .is_some_and(|rest| (rest.is_empty() || rest.starts_with(' ')) && tail_ok(rest))
+    }) || matches!(text.as_str(), "more results" | "all results")
 }
 
 /// Whether `element` is a button or link whose label asks for more items:
@@ -587,12 +596,12 @@ pub(crate) fn describe(
         }
     }
     if let (Some(a), Some(b)) = (&before.opener, &after.opener) {
-        if before.opener_in_list != Some(false) {
-            // A context menu's row: the list's content (or nothing) says
-            // what the pick did; the row element's reads do not.
-            if a.label != b.label && !list_told {
-                parts.push(shows_other_item(a, b));
-            }
+        let in_list = before.opener_in_list != Some(false);
+        if in_list && list_told {
+            // A pop-up in a list row: the list's content says what the pick
+            // did; the opener element may now sit in another item's row.
+        } else if in_list && a.label != b.label {
+            parts.push(shows_other_item(a, b));
         } else if a.label != b.label {
             parts.push(format!("{} is now labelled {}", element_name(a), quote(&b.label)));
         } else if a.value != b.value {
@@ -866,12 +875,25 @@ unsafe fn own_label(element: AXUIElementRef) -> Option<String> {
 /// An item's name: its own title, description or text, else the first one
 /// a child or grandchild has (a Finder icon's image, a table row's cell).
 unsafe fn item_name(reader: &mut Reader, element: AXUIElementRef) -> Option<String> {
+    item_name_and_source(reader, element).map(|(name, _)| name)
+}
+
+/// [`item_name`], and whether the name is the item's own AXValue (then that
+/// value is not also its state).
+unsafe fn item_name_and_source(reader: &mut Reader, element: AXUIElementRef) -> Option<(String, bool)> {
     if !reader.admit(element) {
         return None;
     }
-    if let Some(label) = own_label(element) {
-        return Some(label);
+    if let Some(label) = text_attr(element, "AXTitle").or_else(|| text_attr(element, "AXDescription")) {
+        return Some((label, false));
     }
+    if let Some(value) = text_attr(element, "AXValue") {
+        return Some((value, true));
+    }
+    item_child_name(reader, element).map(|name| (name, false))
+}
+
+unsafe fn item_child_name(reader: &mut Reader, element: AXUIElementRef) -> Option<String> {
     for child in kids(element).into_iter().take(6) {
         if !reader.admit(child.0) {
             return None;
@@ -1130,22 +1152,22 @@ unsafe fn read_collection(reader: &mut Reader, element: AXUIElementRef) -> Colle
             for item in items {
                 // An unnamed item is a spacer; a read cut by the budget makes
                 // the whole list unknown.
-                match item_name(reader, item.0) {
+                match item_name_and_source(reader, item.0) {
                     // The list's own "Show More" row is not one of its items.
-                    Some(name) if is_more_button_label(&name) && more.is_none() => {
+                    Some((name, _)) if is_more_button_label(&name) && more.is_none() => {
                         match more_button(reader, item.0, true) {
                             Some(label) => more = Some(label),
                             None if !reader.complete => break,
                             None => names.push(Item { name, value: None }),
                         }
                     }
-                    Some(name) => {
+                    Some((name, named_by_value)) => {
                         // Its own value (a row's state), unless that is
                         // where its name came from.
-                        let value = if reader.admit(item.0) {
-                            copy_stringish_attr(item.0, "AXValue")
-                                .map(|value| value.state_value.trim().to_owned())
-                                .filter(|value| *value != name)
+                        let value = if named_by_value {
+                            None
+                        } else if reader.admit(item.0) {
+                            copy_stringish_attr(item.0, "AXValue").map(|value| value.state_value.trim().to_owned())
                         } else {
                             break;
                         };
@@ -2426,6 +2448,27 @@ mod tests {
         assert_eq!(line(&before, &after), "AXCheckBox \"Enabled\" now 1 (on), was 0 (off)");
     }
 
+    /// A pop-up inside an AppKit table row: rows without values say
+    /// nothing, so the pop-up's new choice is still named.
+    #[test]
+    fn a_popup_in_a_list_keeps_its_choice_when_the_list_says_nothing() {
+        let popup = |value: &str| Element {
+            role: "AXPopUpButton".into(),
+            label: "Access".into(),
+            value: Some(value.into()),
+            length: None,
+        };
+        let mut before = window("Rules");
+        before.collection = Some(list(&["Camera", "Microphone"], &[]));
+        before.menus = Some(vec![5]);
+        before.opener = Some(popup("Allow"));
+        before.opener_in_list = Some(true);
+        let mut after = before.clone();
+        after.menus = Some(vec![]);
+        after.opener = Some(popup("Block"));
+        assert_eq!(line(&before, &after), "AXPopUpButton \"Access\" now shows \"Block\"; menu closed");
+    }
+
     /// Duplicate names and unread values never produce a state claim; a swap
     /// of two names no mover.
     #[test]
@@ -2493,10 +2536,10 @@ mod tests {
 
     #[test]
     fn more_buttons_are_recognised_by_label() {
-        for yes in ["Show More", "See All", "see all (12)", "View all 40", "Load more…", "More Results", "Show More..."] {
+        for yes in ["Show More", "See All", "see all (12)", "View all 40", "Load more…", "More Results", "Show More...", "Show more results"] {
             assert!(is_more_button_label(yes), "{yes}");
         }
-        for no in ["More", "Showcase", "See Allison", "Show", "Load", "Moreover"] {
+        for no in ["More", "Showcase", "See Allison", "Show", "Load", "Moreover", "Show All Tabs", "Show More Options"] {
             assert!(!is_more_button_label(no), "{no}");
         }
         let mut list = rows(&plain(&["Hiking boots", "Toothbrush", "Passport"]));
