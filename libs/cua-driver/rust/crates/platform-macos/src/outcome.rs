@@ -153,6 +153,9 @@ pub(crate) enum Settle {
     /// A command: nothing changed within [`COMMAND_NO_CHANGE_WAIT`], which
     /// does not show it did nothing (it can finish later).
     CommandUnchanged,
+    /// Something changed and settled, then the last read matched the start
+    /// again: the wait ended early, so neither "changed" nor "unchanged".
+    Reverted,
     /// Changed, then reads agreed for [`STABLE_FOR`].
     Settled,
     /// Still changing at [`SETTLE_DEADLINE`].
@@ -440,7 +443,9 @@ pub(crate) fn describe(
     if parts.is_empty() {
         let command = settle == Settle::CommandUnchanged;
         let seconds = if command { COMMAND_NO_CHANGE_WAIT } else { NO_CHANGE_WAIT }.as_secs_f32();
-        let mut line = if complete && command {
+        let mut line = if complete && settle == Settle::Reverted {
+            "a change came and went (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: read the window before repeating the action".to_owned()
+        } else if complete && command {
             format!(
                 "no change seen within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: a command can finish later, so read the window before repeating it"
             )
@@ -1428,12 +1433,8 @@ impl OutcomeWatch for Watch {
                     None => (pass.facts, DiskNotes::default(), false),
                 }
             };
-            // A command whose change went back (or never came) is not settled.
-            let settle = if scope.command && settle != Settle::StillChanging && after == before {
-                Settle::CommandUnchanged
-            } else {
-                settle
-            };
+            // A change that went back by the last read is not settled.
+            let settle = if settle == Settle::Settled && after == before { Settle::Reverted } else { settle };
             describe(&before, &after, &disk, settle, complete_before && complete)
         })
         .await
@@ -1516,6 +1517,9 @@ mod tests {
         assert!(line.contains("not settled") && !line.contains("nothing it watches changed"), "{line}");
         let line = describe(&before, &before.clone(), &DiskNotes::default(), Settle::Unchanged, true);
         assert!(line.starts_with("nothing it watches changed within 0.6 s"), "{line}");
+        // A change that settled, then read back as the start, claims no wait.
+        let line = describe(&before, &before.clone(), &DiskNotes::default(), Settle::Reverted, true);
+        assert!(line.starts_with("a change came and went") && line.contains("not settled"), "{line}");
     }
 
     #[test]
