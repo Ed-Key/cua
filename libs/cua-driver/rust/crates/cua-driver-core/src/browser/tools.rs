@@ -239,6 +239,8 @@ pub(crate) struct Delivery<'a> {
     pub(crate) target: &'a str,
     /// The dialog the page opened while handling what was sent.
     pub(crate) opened: Option<CdpDialogState>,
+    /// How many calls reached the page.
+    pub(crate) sent: usize,
 }
 
 impl Delivery<'_> {
@@ -272,12 +274,14 @@ impl Delivery<'_> {
             .await
         {
             Ok(value) => {
+                self.sent += 1;
                 self.blocked();
                 Ok(Some(value))
             }
             // The call that opened the dialog was delivered; its reply only
             // comes once the dialog is resolved.
             Err(CallStopped::Dialog(dialog)) => {
+                self.sent += 1;
                 self.opened = Some(dialog);
                 Ok(Some(json!({})))
             }
@@ -3568,6 +3572,7 @@ impl Tool for BrowserTypeTool {
             cdp,
             target: cdp_target,
             opened: None,
+            sent: 0,
         };
         let (typed, delivered_chars) = if mode == "set_value" {
             match delivery

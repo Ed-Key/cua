@@ -621,6 +621,7 @@ impl BrowserPointerTool {
             cdp: &origin.cdp_session,
             target: validated.tab.cdp_target_id.as_str(),
             opened: None,
+            sent: 0,
         };
         match delivery
             .send(
@@ -717,6 +718,7 @@ impl BrowserPointerTool {
             cdp: cdp_session,
             target: validated.tab.cdp_target_id.as_str(),
             opened: None,
+            sent: 0,
         };
         let sent = dispatch_trusted(
             &mut delivery,
@@ -728,6 +730,7 @@ impl BrowserPointerTool {
         )
         .await;
         let opened = delivery.opened.take();
+        let nothing_sent = delivery.sent == 0;
         // With a dialog up the page answers nothing, this included: the
         // emulation ends with the attachment session instead.
         let cleanup = if opened.is_some() {
@@ -740,6 +743,11 @@ impl BrowserPointerTool {
             )
             .await
         };
+        // A dialog that opened before any of the input went out: nothing
+        // was done, and the result must not say it was.
+        if let (Some(dialog), true) = (&opened, nothing_sent) {
+            return Err(dialog_open_refusal(dialog).to_tool_result());
+        }
         if let Err(error) = sent {
             return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserInputTrustUnavailable,
