@@ -1020,17 +1020,30 @@ unsafe fn inside(reader: &mut Reader, element: AXUIElementRef, list: AXUIElement
 
 /// A stepper's increment or decrement button: UIKit names them by
 /// identifier, AppKit by subrole, or the button sits in an AXIncrementor.
-unsafe fn is_stepper_part(element: AXUIElementRef) -> bool {
-    if copy_string_attr(element, "AXRole").as_deref() != Some("AXButton") {
+/// Every message is bounded by `reader`'s budget (an unanswered read means
+/// no); the caller restores the element's action timeout.
+unsafe fn is_stepper_part(reader: &mut Reader, element: AXUIElementRef) -> bool {
+    if !reader.admit(element) || copy_string_attr(element, "AXRole").as_deref() != Some("AXButton") {
         return false;
     }
     let id = copy_string_attr(element, "AXIdentifier");
+    if matches!(id.as_deref(), Some("Increment" | "Decrement")) {
+        return true;
+    }
+    if !reader.admit(element) {
+        return false;
+    }
     let subrole = copy_string_attr(element, "AXSubrole");
-    matches!(id.as_deref(), Some("Increment" | "Decrement"))
-        || matches!(subrole.as_deref(), Some("AXIncrementArrow" | "AXDecrementArrow"))
-        || copy_element_attr(element, "AXParent")
-            .map(Owned)
-            .is_some_and(|p| copy_string_attr(p.0, "AXRole").as_deref() == Some("AXIncrementor"))
+    if matches!(subrole.as_deref(), Some("AXIncrementArrow" | "AXDecrementArrow")) {
+        return true;
+    }
+    if !reader.admit(element) {
+        return false;
+    }
+    let Some(parent) = copy_element_attr(element, "AXParent").map(Owned) else {
+        return false;
+    };
+    reader.admit(parent.0) && copy_string_attr(parent.0, "AXRole").as_deref() == Some("AXIncrementor")
 }
 
 /// The texts next to a stepper button, as (role, text): an AXIncrementor
@@ -1787,7 +1800,12 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             command,
             target_in_list: None,
             opener_in_list: None,
-            stepper: target.as_ref().is_some_and(|t| unsafe { is_stepper_part(t.as_ptr() as AXUIElementRef) }),
+            stepper: target.as_ref().is_some_and(|t| unsafe {
+                let element = t.as_ptr() as AXUIElementRef;
+                let yes = is_stepper_part(&mut Reader::new(), element);
+                AXUIElementSetMessagingTimeout(element, crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS);
+                yes
+            }),
         };
         // A read cut by the budget leaves nothing to compare with; a busy
         // app (a Catalyst list mid-reload) often answers the next one.
