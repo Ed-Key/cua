@@ -606,7 +606,18 @@ unsafe fn settle_end_of_editing(
     if field == Field::MultiLine && focused {
         if let Some(ended) = end_edit(element) {
             let now = copy_string_attr(element, "AXValue");
-            let (detail, verified) = if now.as_deref() == Some(value) {
+            let (detail, verified) = if now.is_none() {
+                (
+                    format!(
+                        "📨 Set and ended the edit: [{element_index}] {role} was set to {shown} and \
+                         the focus moved to {}, which ends its editing, when {app} saves this \
+                         field; its value could not be read again, so neither what it holds nor \
+                         what {app} saved is verified.",
+                        ended.focus
+                    ),
+                    None,
+                )
+            } else if now.as_deref() == Some(value) {
                 (
                     format!(
                         "📨 Set and ended the edit: [{element_index}] {role} holds {shown} and the \

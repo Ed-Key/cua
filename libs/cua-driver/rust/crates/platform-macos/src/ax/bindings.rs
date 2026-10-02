@@ -714,16 +714,21 @@ enum FocusState {
 }
 
 fn focus_state(pid: i32, target: u32) -> FocusState {
+    // Each read is bounded, so a busy app cannot stretch a wait that holds
+    // the previous front app away from the user.
+    const READ_TIMEOUT_SECONDS: f32 = 0.2;
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
             return FocusState::Elsewhere;
         }
+        AXUIElementSetMessagingTimeout(app, READ_TIMEOUT_SECONDS);
         let element = copy_element_attr(app, "AXFocusedUIElement");
         CFRelease(app as CFTypeRef);
         let Some(element) = element else {
             return FocusState::InMenu;
         };
+        AXUIElementSetMessagingTimeout(element, READ_TIMEOUT_SECONDS);
         let role = copy_string_attr(element, "AXRole");
         if matches!(role.as_deref(), Some("AXApplication" | "AXMenu" | "AXMenuItem" | "AXMenuBarItem")) {
             CFRelease(element as CFTypeRef);

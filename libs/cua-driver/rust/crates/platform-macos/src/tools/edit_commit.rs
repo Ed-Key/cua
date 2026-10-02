@@ -117,7 +117,8 @@ pub(crate) unsafe fn end_edit(field: AXUIElementRef) -> Option<Ended> {
             && set_bool_attr_true(current, "AXFocused") == 0
         {
             std::thread::sleep(std::time::Duration::from_millis(150));
-            if crate::ax::bindings::copy_bool_attr(field, "AXFocused") != Some(true) {
+            // Only a read that says the field lost the focus counts.
+            if crate::ax::bindings::copy_bool_attr(field, "AXFocused") == Some(false) {
                 let label = ["AXTitle", "AXDescription", "AXIdentifier"]
                     .iter()
                     .find_map(|name| copy_string_attr(current, name).filter(|t| !t.is_empty()))
