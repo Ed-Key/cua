@@ -47,6 +47,10 @@ pub enum ElementAncestry {
     /// Ancestry could not be resolved (dead element, SPI failure). An address
     /// the shell cannot re-prove is not an exact target.
     Unproven,
+    /// An item of a menu that names no window (a Catalyst pop-up's menu),
+    /// which no cua action on the requested window opened: nothing ties it
+    /// to that window.
+    DetachedMenuNotOpenedByCua,
 }
 
 /// Fresh facts about one exact target, gathered by the platform shell.
@@ -222,6 +226,22 @@ pub fn decide_background_input(
                     target.window_id
                 ),
                 Some("get_window_state"),
+            );
+        }
+        ElementAncestry::DetachedMenuNotOpenedByCua => {
+            return refuse(
+                refusal_codes::ELEMENT_OUTSIDE_TARGET_WINDOW,
+                format!(
+                    "the addressed element is an item of a menu that names no window, and no \
+                     cua action on window {} opened that menu (it was opened outside cua, or \
+                     it closed since). Close it (press_key escape), then open it through cua: \
+                     click its pop-up button in window {} with click, read the window again \
+                     and click the item; or pick the choice with the keyboard (focus the \
+                     pop-up, then arrow keys and return). Menu bar commands go through \
+                     invoke_menu",
+                    target.window_id, target.window_id
+                ),
+                Some("click"),
             );
         }
     }
@@ -668,6 +688,7 @@ mod tests {
         for element in [
             ElementAncestry::OutsideTargetWindow,
             ElementAncestry::Unproven,
+            ElementAncestry::DetachedMenuNotOpenedByCua,
         ] {
             let facts = BackgroundTargetFacts {
                 element,
@@ -680,6 +701,24 @@ mod tests {
                     "{action:?} with {element:?}"
                 );
             }
+        }
+    }
+
+    /// A detached menu nobody opened through cua: the refusal names the way
+    /// in (open it with a cua click, the keyboard, or invoke_menu).
+    #[test]
+    fn detached_menu_refusal_says_how_to_reach_the_item() {
+        let facts = BackgroundTargetFacts {
+            element: ElementAncestry::DetachedMenuNotOpenedByCua,
+            ..matched_facts()
+        };
+        match decide_background_input(TARGET, &facts, BackgroundAction::AxSemantic) {
+            BackgroundInputDecision::Refuse(refusal) => {
+                assert!(refusal.reason.contains("click its pop-up button"), "{}", refusal.reason);
+                assert!(refusal.reason.contains("invoke_menu"), "{}", refusal.reason);
+                assert_eq!(refusal.advice, Some("click"));
+            }
+            other => panic!("expected a refusal, got {other:?}"),
         }
     }
 
