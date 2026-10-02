@@ -81,7 +81,24 @@ fn is_modifier(k: &str) -> bool {
 const HOTKEY_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
 const HOTKEY_FOCUS_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(10);
 
+/// A Mac Catalyst field ignores focus writes: without focus already, keys
+/// would go to whatever has it, and waiting for a write to take never helps.
+const CATALYST_HOTKEY_NOT_FOCUSED: &str = "cua could not confirm that this Mac Catalyst field has \
+    keyboard focus, and Catalyst ignores focus requests, so nothing was sent. Next: click the field \
+    (its element_token; a background click is enough), or, if the field already shows its cursor, \
+    send the hotkey with window_id and no element_token: keys go to the focused field.";
+
 fn focus_hotkey_element(pid: i32, element_ptr: usize) -> anyhow::Result<()> {
+    if crate::input::ax_actions::is_element_focused(pid, element_ptr) {
+        return Ok(());
+    }
+    // SAFETY: the caller's element guard keeps `element_ptr` retained.
+    let catalyst = unsafe {
+        super::type_text::catalyst_text_control_of(element_ptr as crate::ax::bindings::AXUIElementRef)
+    };
+    if catalyst == super::type_text::CatalystText::Yes {
+        anyhow::bail!("{CATALYST_HOTKEY_NOT_FOCUSED}");
+    }
     let deadline = std::time::Instant::now() + HOTKEY_FOCUS_TIMEOUT;
     loop {
         crate::input::ax_actions::focus_element(element_ptr)?;

@@ -817,6 +817,9 @@ impl Tool for GetWindowStateTool {
                     structured["web_content"] = unexposed;
                 }
             }
+            if let Some(note) = partial_list_note(&r.nodes) {
+                structured["partial_list"] = serde_json::json!(note);
+            }
         }
         if let Some(d) = outline_diff.as_ref() {
             structured["diff"] = serde_json::json!({
@@ -1642,6 +1645,33 @@ fn tree_query(text: Option<&str>, context: bool) -> Option<crate::ax::tree::Quer
     text.map(|text| crate::ax::tree::Query { text, context })
 }
 
+/// A list the app shortened: the window holds a "Show More" / "See All"
+/// button (Messages' search lists its top hits above one). The button is in
+/// the outline already, but agents read the rows and miss it; say so once.
+fn partial_list_note(nodes: &[crate::ax::tree::AXNode]) -> Option<String> {
+    let buttons: Vec<String> = nodes
+        .iter()
+        .filter(|n| matches!(n.role.as_str(), "AXButton" | "AXLink"))
+        .filter_map(|n| {
+            let index = n.element_index?;
+            let label = n
+                .title
+                .as_deref()
+                .filter(|t| !t.trim().is_empty())
+                .or(n.description.as_deref())?;
+            crate::outcome::is_more_button_label(label)
+                .then(|| format!("[{index}] {} {}", n.role, serde_json::json!(label.trim())))
+        })
+        .take(4)
+        .collect();
+    (!buttons.is_empty()).then(|| {
+        format!(
+            "The app shows only some items here: press {} to list the rest before deciding an item is missing.",
+            buttons.join(" or ")
+        )
+    })
+}
+
 #[cfg(test)]
 mod window_scope_contract_tests {
     use super::*;
@@ -2307,6 +2337,29 @@ mod tests {
             selected: None,
             in_web_content: false,
         }
+    }
+
+    /// A shortened list's "Show More" is named once, with its index; other
+    /// buttons and unindexed rows are not.
+    #[test]
+    fn a_show_more_button_is_named_as_a_partial_list() {
+        let mut described = node(Some(9), "AXButton", None, 1, None, None, vec![]);
+        described.description = Some("See All".into());
+        let nodes = vec![
+            node(Some(3), "AXGroup", Some("Hiking boots"), 1, None, None, vec![]),
+            node(Some(4), "AXButton", Some("Show More"), 1, None, None, vec![]),
+            node(None, "AXButton", Some("Show More"), 1, None, None, vec![]),
+            node(Some(5), "AXButton", Some("Showcase"), 1, None, None, vec![]),
+            described,
+        ];
+        assert_eq!(
+            partial_list_note(&nodes).as_deref(),
+            Some(
+                "The app shows only some items here: press [4] AXButton \"Show More\" or [9] AXButton \
+                 \"See All\" to list the rest before deciding an item is missing."
+            )
+        );
+        assert_eq!(partial_list_note(&nodes[..1]), None);
     }
 
     #[test]

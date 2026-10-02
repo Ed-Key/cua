@@ -463,6 +463,14 @@ impl Tool for TypeTextTool {
         };
 
         match result {
+            Ok(Ok(outcome))
+                if outcome.delivered_chars == Some(0)
+                    && char_count > 0
+                    && !delivery_mode.is_foreground()
+                    && catalyst_typing_target(pid, element_ptr.map(|(ptr, _)| ptr), window_id) =>
+            {
+                catalyst_background_keys_not_landed(pid, window_id, char_count, outcome.path)
+            }
             Ok(Ok(outcome)) if outcome.delivered_chars.is_some_and(|n| n < char_count) => {
                 let delivered_chars = outcome.delivered_chars.unwrap_or_default();
                 ToolResult::error(format!(
@@ -976,6 +984,53 @@ fn catalyst_text_needs_focus_result(pid: i32, window_id: Option<u32>) -> ToolRes
         "window_id": window_id,
         "reason": reason,
     }))
+}
+
+const CATALYST_BACKGROUND_KEYS_NOT_LANDED: &str = "catalyst_background_keys_not_landed";
+
+/// Whether typing went to a Mac Catalyst text view: the addressed element,
+/// else the focused element of the window.
+fn catalyst_typing_target(pid: i32, element: Option<usize>, window_id: Option<u32>) -> bool {
+    unsafe {
+        match element {
+            Some(ptr) => catalyst_text_control_of(ptr as AXUIElementRef) == CatalystText::Yes,
+            None => {
+                let Some(focused) = window_id
+                    .and_then(|wid| crate::ax::exact_target::focused_element_in_window(pid, wid))
+                else {
+                    return false;
+                };
+                let yes = catalyst_text_control_of(focused) == CatalystText::Yes;
+                CFRelease(focused as CFTypeRef);
+                yes
+            }
+        }
+    }
+}
+
+/// Background keys reached no character of a Catalyst field (its text read
+/// back unchanged). Some Catalyst fields (Messages' search) take only keys
+/// typed while their window is in front; "retry the remaining suffix" would
+/// send the same keys the same way again.
+fn catalyst_background_keys_not_landed(pid: i32, window_id: Option<u32>, requested: usize, path: &str) -> ToolResult {
+    let reason = format!(
+        "0 of {requested} character(s) landed: background keys did not reach this Mac Catalyst \
+         field (its text read back unchanged), so nothing needs undoing. Next: type_text again \
+         with delivery_mode \"foreground\" (it fronts the window briefly, then restores the \
+         previous app). If that also lands nothing, the field does not take typed text."
+    );
+    ToolResult::error(format!("type_text failed ({CATALYST_BACKGROUND_KEYS_NOT_LANDED}): {reason}"))
+        .with_structured(serde_json::json!({
+            "code": CATALYST_BACKGROUND_KEYS_NOT_LANDED,
+            "effect": "failed",
+            "path": path,
+            "pid": pid,
+            "window_id": window_id,
+            "requested_chars": requested,
+            "delivered_chars": 0,
+            "retryable": true,
+            "escalation": { "recommended": "foreground", "reason": reason },
+        }))
 }
 
 /// Whether `element` is an addressed Mac Catalyst text view that does not
@@ -2282,6 +2337,21 @@ mod tests {
                 assert!(data.get("escalation").is_none(), "{data}");
             }
         }
+    }
+
+    /// Background keys that missed a Catalyst field: nothing landed, and the
+    /// next route is named exactly (not "retry the remaining suffix").
+    #[test]
+    fn catalyst_keys_that_missed_name_the_foreground_route() {
+        let result = catalyst_background_keys_not_landed(7, Some(42), 7, PATH_KEY_EVENTS);
+        let data = result.structured_content.as_ref().unwrap();
+        assert_eq!(data["code"], "catalyst_background_keys_not_landed");
+        assert_eq!((data["delivered_chars"].as_u64(), data["escalation"]["recommended"].as_str()), (Some(0), Some("foreground")));
+        let reason = data["escalation"]["reason"].as_str().unwrap();
+        for needed in ["0 of 7", "nothing needs undoing", "delivery_mode \"foreground\""] {
+            assert!(reason.contains(needed), "missing {needed:?}: {reason}");
+        }
+        assert!(!reason.contains("suffix"), "{reason}");
     }
 
     #[test]

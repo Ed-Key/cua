@@ -458,7 +458,8 @@ fn catalyst_text_did_not_take(pid: i32, window_id: u32, now: Option<String>) -> 
     };
     let reason = format!(
         "This Mac Catalyst field did not keep the value written ({holds}). Click the field, \
-         select all (hotkey cmd+a) if replacing, then type_text."
+         select all (hotkey cmd+a) if replacing, then type_text; if type_text reports that 0 \
+         characters landed, type again with delivery_mode \"foreground\"."
     );
     ToolResult::error(format!("set_value failed ({CATALYST_TEXT_DID_NOT_TAKE}): {reason}"))
         .with_structured(serde_json::json!({
@@ -478,10 +479,10 @@ fn catalyst_text_needs_typing(pid: i32, window_id: u32) -> ToolResult {
     let reason = "This is a Mac Catalyst search field. Catalyst apps take an accessibility \
                   value write without reacting to it (a search does not run), and the value \
                   read-back cannot tell the difference, so nothing was written. \
-                  Next: click the field and confirm it is focused (type_text refuses with \
-                  catalyst_text_needs_focus when it is not), select all (hotkey cmd+a) if \
-                  replacing, then type_text on it. Then check the app's own result (for a \
-                  search field, that its results changed).";
+                  Next: click the field (a background click is enough), select all (hotkey \
+                  cmd+a) if replacing, then type_text on it. If type_text reports that 0 \
+                  characters landed, type again with delivery_mode \"foreground\". Then check \
+                  the app's own result (for a search field, that its results changed).";
     ToolResult::error(format!("set_value refused ({CATALYST_TEXT_NEEDS_TYPING}): {reason}"))
         .with_structured(serde_json::json!({
             "code": CATALYST_TEXT_NEEDS_TYPING,
@@ -1276,7 +1277,7 @@ mod tests {
         assert_eq!(data["effect"], "refused");
         assert_eq!((data["pid"].as_i64(), data["window_id"].as_u64()), (Some(7), Some(42)));
         let reason = data["reason"].as_str().unwrap();
-        for needed in ["search field", "nothing was written", "click the field", "focused", "select all", "type_text", "results changed"] {
+        for needed in ["search field", "nothing was written", "click the field", "select all", "type_text", "delivery_mode \"foreground\"", "results changed"] {
             assert!(reason.contains(needed), "missing {needed:?}: {reason}");
         }
     }
