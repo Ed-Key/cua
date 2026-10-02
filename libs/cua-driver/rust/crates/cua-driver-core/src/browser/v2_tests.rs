@@ -116,6 +116,8 @@ struct FixtureState {
     /// reports as the main frame starting to load and then navigating within
     /// its document, and the new view drawn.
     click_pushes_state: bool,
+    /// A mouseover handler calls alert(): the first mouse move opens it.
+    move_opens_dialog: bool,
     /// What the page answers the next this-many hit-tests at a ref's click
     /// point (the facts), and the node that is on top there.
     hit: Option<(usize, Value, i64)>,
@@ -198,6 +200,7 @@ impl Default for FixtureState {
             click_opens_dialog: false,
             click_navigates: None,
             click_pushes_state: false,
+            move_opens_dialog: false,
             hit: None,
             drag_starts: false,
             intercepting_drags: false,
@@ -721,6 +724,19 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     }])
                     .unanswered();
             }
+        }
+        if call.method == "Input.dispatchMouseEvent"
+            && call.params["type"] == "mouseMoved"
+            && std::mem::take(&mut st.move_opens_dialog)
+        {
+            st.dialog_open = true;
+            return MockReply::ok(json!({}))
+                .with_events(vec![MockEvent {
+                    method: "Page.javascriptDialogOpening".into(),
+                    session_id: st.page_session.clone(),
+                    params: json!({"type": "alert", "message": "hovered"}),
+                }])
+                .unanswered();
         }
         // A page behind a dialog answers only what the browser process does.
         if st.dialog_open
@@ -5763,6 +5779,31 @@ async fn synthetic_events_on_a_text_ref_go_to_the_element_holding_it() {
         dispatched.1["objectId"].as_str().unwrap().starts_with("element-of-"),
         "{dispatched:?}"
     );
+}
+
+#[tokio::test]
+async fn a_dialog_opened_by_the_move_to_the_element_is_refused_not_reported_as_done() {
+    for action in ["double_click", "drag"] {
+        let f = fixture_with(|st| st.semantic_large_page = true).await;
+        let (target, tab) = bind(&f).await;
+        let snap = semantic_snapshot(&f, &target, &tab).await;
+        let text = named_ref(&snap, "Visible message");
+        let mut call = json!({"target_id": target, "tab_id": tab, "session": SESSION,
+            "ref": text, "action": action});
+        if action == "drag" {
+            call["to_x"] = json!(400.0);
+            call["to_y"] = json!(300.0);
+        }
+        f.state.lock().unwrap().move_opens_dialog = true;
+        let refused = BrowserPointerTool::new(f.engine.clone()).invoke(call).await;
+        let refused = structured(&refused);
+        assert_eq!(refused["refusal"]["code"], "browser_dialog_open", "{action}: {refused}");
+        let presses = mouse_events(&f)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "mousePressed")
+            .count();
+        assert_eq!(presses, 0, "{action}: the press never went out");
+    }
 }
 
 #[tokio::test]

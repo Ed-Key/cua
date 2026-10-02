@@ -730,7 +730,12 @@ impl BrowserPointerTool {
         )
         .await;
         let opened = delivery.opened.take();
-        let nothing_sent = delivery.sent == 0;
+        // Nothing of the action itself went out (at most the move that
+        // brings the pointer to the element).
+        let nothing_sent = match &sent {
+            Ok(preparing) => delivery.sent <= *preparing,
+            Err(_) => delivery.sent == 0,
+        };
         // With a dialog up the page answers nothing, this included: the
         // emulation ends with the attachment session instead.
         let cleanup = if opened.is_some() {
@@ -743,8 +748,9 @@ impl BrowserPointerTool {
             )
             .await
         };
-        // A dialog that opened before any of the input went out: nothing
-        // was done, and the result must not say it was.
+        // A dialog that opened before the action itself went out (before
+        // the press, or during the move to the element): nothing was done,
+        // and the result must not say it was.
         if let (Some(dialog), true) = (&opened, nothing_sent) {
             return Err(dialog_open_refusal(dialog).to_tool_result());
         }
@@ -782,8 +788,12 @@ async fn dispatch_trusted(
     request: &PointerRequest,
     origin: (f64, f64),
     destination: Option<(f64, f64)>,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
+    // Calls that only bring the pointer to the element; what comes after
+    // them is the requested action itself.
+    let mut preparing = delivery.sent;
     match request.action {
+        // The move is the hover itself.
         PointerAction::Hover => {
             delivery
                 .send(
@@ -809,6 +819,7 @@ async fn dispatch_trusted(
                     json!({ "type": "mouseMoved", "x": origin.0, "y": origin.1, "button": "none" }),
                 )
                 .await?;
+            preparing = delivery.sent;
             for click_count in [1, 2] {
                 for kind in ["mousePressed", "mouseReleased"] {
                     delivery
@@ -829,7 +840,7 @@ async fn dispatch_trusted(
                 .await?;
         }
         PointerAction::Drag => {
-            drag(
+            preparing = drag(
                 delivery,
                 conn,
                 page,
@@ -839,7 +850,7 @@ async fn dispatch_trusted(
             .await?;
         }
     }
-    Ok(())
+    Ok(preparing)
 }
 
 /// Press at `origin`, move in steps, release at `destination`. Drags are
@@ -862,7 +873,7 @@ async fn drag(
     page: &str,
     origin: (f64, f64),
     destination: (f64, f64),
-) -> anyhow::Result<()> {
+) -> anyhow::Result<usize> {
     let conn = delivery.conn;
     let cdp = page;
     // Armed before interception is asked for: a call cancelled at any point
@@ -884,6 +895,7 @@ async fn drag(
         .await
         .map_err(|error| anyhow::anyhow!("Chrome would not intercept the drag ({error}), so none was started"))?;
     let DragCleanup { pressed, intercepted, events, .. } = &mut cleanup;
+    let mut preparing = delivery.sent;
     let result = async {
         delivery
             .send(
@@ -891,6 +903,7 @@ async fn drag(
                 json!({ "type": "mouseMoved", "x": origin.0, "y": origin.1, "button": "none" }),
             )
             .await?;
+        preparing = delivery.sent;
         *pressed = delivery
             .send(
                 "Input.dispatchMouseEvent",
@@ -959,7 +972,7 @@ async fn drag(
     }
     .await;
     cleanup.finish(delivery.opened.is_some()).await;
-    result
+    result.map(|()| preparing)
 }
 
 /// What a drag leaves to undo: the pressed button and drag interception.
