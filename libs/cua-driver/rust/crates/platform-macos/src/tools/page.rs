@@ -28,9 +28,7 @@ impl MacOsPageBackend {
     /// Resolve `bundle_id` for `pid` via the running-apps list.
     async fn bundle_id_for(pid: i32) -> String {
         tokio::task::spawn_blocking(move || {
-            crate::apps::list_running_apps()
-                .into_iter()
-                .find(|a| a.pid == pid)
+            crate::apps::running_app(pid)
                 .and_then(|a| a.bundle_id)
                 .unwrap_or_default()
         })

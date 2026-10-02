@@ -2,8 +2,7 @@
 
 /// Returns true if the process at `pid` is a WKWebView-based app (but not Electron).
 pub fn is_wk_web_view_app(pid: i32) -> bool {
-    let apps = crate::apps::list_running_apps();
-    let app = apps.iter().find(|a| a.pid == pid);
+    let app = crate::apps::running_app(pid);
 
     let bundle_path: Option<String> = app.and_then(|a| find_bundle_path_for_app_name(&a.name));
 

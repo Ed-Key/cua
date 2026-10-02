@@ -208,6 +208,10 @@ pub fn gather_background_facts(
                 {
                     ElementAncestry::ProvenDescendant
                 }
+                // Such a menu with no record: say how to open it through cua.
+                _ if crate::outcome::in_detached_menu(ptr as AXUIElementRef) => {
+                    ElementAncestry::DetachedMenuNotOpenedByCua
+                }
                 Some(_) => ElementAncestry::OutsideTargetWindow,
                 None => ElementAncestry::Unproven,
             });

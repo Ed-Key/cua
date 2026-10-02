@@ -11,8 +11,7 @@ impl ElectronJs {
     /// Returns true if the process at `pid` is an Electron app.
     pub fn is_electron(pid: i32) -> bool {
         // Look up the bundle path from list_running_apps.
-        let apps = crate::apps::list_running_apps();
-        let app = apps.iter().find(|a| a.pid == pid);
+        let app = crate::apps::running_app(pid);
 
         if let Some(app) = app {
             // Try to infer bundle path from app name.

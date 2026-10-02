@@ -31,6 +31,10 @@ use crate::ax::cache::{CachedSnapshot, RetainedElement};
 const POLL: Duration = Duration::from_millis(50);
 /// With nothing changed by then, stop and say so.
 const NO_CHANGE_WAIT: Duration = Duration::from_millis(600);
+/// The same for a command (a menu item, a key shortcut): the app runs it
+/// after the menu closes, and its work (a Finder file operation) can show
+/// later than a click's. A Move to Trash once showed after 0.6 s.
+const COMMAND_NO_CHANGE_WAIT: Duration = Duration::from_millis(1500);
 /// Once something changed: settled when reads agree for this long.
 const STABLE_FOR: Duration = Duration::from_millis(200);
 /// Never wait longer than this for the app to settle.
@@ -146,6 +150,12 @@ pub(crate) enum FileText {
 pub(crate) enum Settle {
     /// Nothing changed within [`NO_CHANGE_WAIT`].
     Unchanged,
+    /// A command: nothing changed within [`COMMAND_NO_CHANGE_WAIT`], which
+    /// does not show it did nothing (it can finish later).
+    CommandUnchanged,
+    /// Something changed and settled, then the last read matched the start
+    /// again: the wait ended early, so neither "changed" nor "unchanged".
+    Reverted,
     /// Changed, then reads agreed for [`STABLE_FOR`].
     Settled,
     /// Still changing at [`SETTLE_DEADLINE`].
@@ -431,8 +441,15 @@ pub(crate) fn describe(
         return line;
     }
     if parts.is_empty() {
-        let seconds = NO_CHANGE_WAIT.as_secs_f32();
-        let mut line = if complete {
+        let command = settle == Settle::CommandUnchanged;
+        let seconds = if command { COMMAND_NO_CHANGE_WAIT } else { NO_CHANGE_WAIT }.as_secs_f32();
+        let mut line = if complete && settle == Settle::Reverted {
+            "a change came and went (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: read the window before repeating the action".to_owned()
+        } else if complete && command {
+            format!(
+                "no change seen within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: a command can finish later, so read the window before repeating it"
+            )
+        } else if complete {
             format!(
                 "nothing it watches changed within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers, menus, windows)"
             )
@@ -810,6 +827,8 @@ struct Scope {
     /// menu it walks fades out after the command, and reading that as "a
     /// menu opened" would also end the wait before a sheet the command opens.
     menus: bool,
+    /// A menu command or key shortcut: waits [`COMMAND_NO_CHANGE_WAIT`].
+    command: bool,
 }
 
 /// One read of every fact; `keep` also returns the retained window for the
@@ -1087,7 +1106,7 @@ pub(crate) unsafe fn note_menu_opened(pid: i32, window_id: u32, element: usize, 
 
 /// Whether `element` is an item of a menu with no AX parent (or the
 /// application as parent): a menu that names no window.
-unsafe fn in_detached_menu(element: AXUIElementRef) -> bool {
+pub(crate) unsafe fn in_detached_menu(element: AXUIElementRef) -> bool {
     core_foundation::base::CFRetain(element as CFTypeRef);
     let mut current = Owned(element);
     for _ in 0..6 {
@@ -1303,6 +1322,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
         (None, window_id)
     };
     let watch_menus = tool != "invoke_menu";
+    let command = tool == "invoke_menu" || tool == "hotkey";
     tokio::task::spawn_blocking(move || {
         let window_id = window_id.or_else(|| unsafe { focused_window_id(pid) })?;
         let opener = target
@@ -1315,6 +1335,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             collection: None,
             opener: opener.as_ref().map(RetainedElement::as_ptr),
             menus: watch_menus,
+            command,
         };
         let pass = unsafe { read_pass(&scope, false) };
         if pass.facts.window_present != Some(true) {
@@ -1371,13 +1392,17 @@ impl OutcomeWatch for Watch {
                 if changed && last_change.elapsed() >= STABLE_FOR {
                     break Settle::Settled;
                 }
-                if !changed && elapsed >= NO_CHANGE_WAIT {
+                if !changed && !watch.scope.command && elapsed >= NO_CHANGE_WAIT {
                     break Settle::Unchanged;
+                }
+                if !changed && elapsed >= COMMAND_NO_CHANGE_WAIT {
+                    break Settle::CommandUnchanged;
                 }
             }
             if elapsed >= SETTLE_DEADLINE {
                 break match &previous {
                     Some(facts) if *facts != watch.before => Settle::StillChanging,
+                    _ if watch.scope.command => Settle::CommandUnchanged,
                     _ => Settle::Unchanged,
                 };
             }
@@ -1408,6 +1433,8 @@ impl OutcomeWatch for Watch {
                     None => (pass.facts, DiskNotes::default(), false),
                 }
             };
+            // A change that went back by the last read is not settled.
+            let settle = if settle == Settle::Settled && after == before { Settle::Reverted } else { settle };
             describe(&before, &after, &disk, settle, complete_before && complete)
         })
         .await
@@ -1478,6 +1505,21 @@ mod tests {
         let after = before.clone();
         assert!(describe(&before, &after, &DiskNotes::default(), Settle::Unchanged, true)
             .ends_with("; still open: a menu"));
+    }
+
+    /// A command (invoke_menu, hotkey) with nothing seen is not called
+    /// "nothing changed": Finder's Move to Trash once showed after 0.6 s.
+    #[test]
+    fn a_command_with_no_change_seen_is_not_settled() {
+        let before = window("cleanup");
+        let line = describe(&before, &before.clone(), &DiskNotes::default(), Settle::CommandUnchanged, true);
+        assert!(line.starts_with("no change seen within 1.5 s"), "{line}");
+        assert!(line.contains("not settled") && !line.contains("nothing it watches changed"), "{line}");
+        let line = describe(&before, &before.clone(), &DiskNotes::default(), Settle::Unchanged, true);
+        assert!(line.starts_with("nothing it watches changed within 0.6 s"), "{line}");
+        // A change that settled, then read back as the start, claims no wait.
+        let line = describe(&before, &before.clone(), &DiskNotes::default(), Settle::Reverted, true);
+        assert!(line.starts_with("a change came and went") && line.contains("not settled"), "{line}");
     }
 
     #[test]
