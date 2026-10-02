@@ -465,6 +465,7 @@ impl Tool for TypeTextTool {
         match result {
             Ok(Ok(outcome))
                 if outcome.delivered_chars == Some(0)
+                    && outcome.unconfirmed == Some(Unconfirmed::Unchanged)
                     && char_count > 0
                     && !delivery_mode.is_foreground()
                     && catalyst_typing_target(pid, element_ptr.map(|(ptr, _)| ptr), window_id) =>
@@ -1476,9 +1477,14 @@ fn cgevent_type_verified(
         }),
         text,
     );
-    let unconfirmed = delivered_chars
-        .is_none()
-        .then(|| Unconfirmed::from_readback(before.as_deref(), readback.read().as_deref()));
+    // "0 delivered" covers both an untouched field and one whose selection
+    // was deleted with nothing typed in its place: say which, so only the
+    // untouched case is reported as nothing to undo.
+    let unconfirmed = match delivered_chars {
+        None => Some(Unconfirmed::from_readback(before.as_deref(), readback.read().as_deref())),
+        Some(0) if !text.is_empty() => Some(Unconfirmed::from_readback(before.as_deref(), readback.read().as_deref())),
+        Some(_) => None,
+    };
     Ok((verified, delivered_chars, unconfirmed))
 }
 
