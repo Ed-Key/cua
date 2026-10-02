@@ -2345,7 +2345,7 @@ const READ_EDIT_STATE: &str = "function() { \
     let start = null, end = null; \
     if (field) { try { start = this.selectionStart; end = this.selectionEnd; } catch (e) {} } \
     return { value: field ? String(this.value) : String(this.innerText || ''), start: start, \
-        end: end, field: field, connected: this.isConnected, \
+        end: end, field: field, connected: this.isConnected, single_line: this.tagName === 'INPUT', \
         password: this.tagName === 'INPUT' && (this.type || '').toLowerCase() === 'password' }; \
 }";
 
@@ -2373,6 +2373,8 @@ struct EditState {
     end: Option<usize>,
     /// An input or textarea, as opposed to a contenteditable element.
     field: bool,
+    /// An input: it cannot hold a newline.
+    single_line: bool,
     password: bool,
     /// Still in the live document. A page that replaced the element keeps
     /// the old node's value, which then proves nothing about the page.
@@ -2398,6 +2400,7 @@ async fn read_edit_state(conn: &CdpConnection, cdp: &str, object_id: &str) -> Op
         start: state["start"].as_u64().map(|n| n as usize),
         end: state["end"].as_u64().map(|n| n as usize),
         field: state["field"].as_bool().unwrap_or(false),
+        single_line: state["single_line"].as_bool().unwrap_or(false),
         password: state["password"].as_bool().unwrap_or(false),
         connected: state["connected"].as_bool().unwrap_or(false),
     })
@@ -2668,6 +2671,329 @@ async fn await_edit_readback(
     (!delivery.blocked()).then_some(judged)
 }
 
+/// What browser_type does with newlines in its text.
+#[derive(Debug, PartialEq, Eq)]
+enum Newline {
+    /// Type the text as it is.
+    AsText,
+    /// Type this text, read it back, then press Enter.
+    EnterAfter(String),
+    /// A single-line field cannot hold a newline before the end.
+    Refused,
+}
+
+/// One trailing newline ("\n" or "\r\n") is Enter, pressed after the text
+/// is read back: always for a single-line input (it cannot hold a newline,
+/// so typing one could only drop it or submit before the read-back), and in
+/// keystrokes mode for any field (where it was always the Enter key). A
+/// textarea or contenteditable in the other modes keeps it as text.
+fn plan_newline(text: &str, single_line: bool, keystrokes: bool) -> Newline {
+    let body = text
+        .strip_suffix("\r\n")
+        .or_else(|| text.strip_suffix('\n'));
+    if single_line && body.unwrap_or(text).contains(['\n', '\r']) {
+        return Newline::Refused;
+    }
+    match body {
+        Some(body) if single_line || keystrokes => Newline::EnterAfter(body.to_owned()),
+        _ => Newline::AsText,
+    }
+}
+
+/// How sending Enter went.
+#[derive(Debug, PartialEq, Eq)]
+enum EnterSend {
+    /// keyDown, char and keyUp all reached the page.
+    Sent,
+    /// Nothing was sent, and why.
+    NotSent(String),
+    /// Nothing was sent: the field no longer holds the confirmed text; what
+    /// it holds now.
+    Changed(String),
+    /// A JavaScript dialog opened; `keys` says whether any Enter event had
+    /// reached the page first.
+    Dialog { keys: bool },
+    /// Some Enter events reached the page, then sending failed: the page
+    /// may have acted on them.
+    Partial(String),
+}
+
+/// Press Enter in the exact field whose text was just confirmed: focus it
+/// under focus emulation (the tab may be in the background), check it is
+/// the active element and still holds `confirmed` right before the first
+/// key, then send the key events of a real Enter (keyCode 13 too, for
+/// handlers that read it). Every call goes through `delivery`, so a dialog
+/// the page opens on the way ends the wait at once.
+async fn press_enter(
+    delivery: &mut Delivery<'_>,
+    backend: i64,
+    object_id: &str,
+    confirmed: &str,
+) -> EnterSend {
+    let blocked = |keys: bool| EnterSend::Dialog { keys };
+    match delivery
+        .send(
+            "Emulation.setFocusEmulationEnabled",
+            json!({ "enabled": true }),
+        )
+        .await
+    {
+        Ok(Some(_)) => {}
+        Ok(None) => return blocked(false),
+        Err(error) => {
+            return EnterSend::NotSent(format!("the tab could not enter focus emulation: {error}"))
+        }
+    }
+    let sent = async {
+        let mut ready = false;
+        for _ in 0..20 {
+            match delivery
+                .send("DOM.focus", json!({ "backendNodeId": backend }))
+                .await
+            {
+                Ok(Some(_)) => {}
+                Ok(None) => return blocked(false),
+                Err(error) => {
+                    return EnterSend::NotSent(format!("the field could not be focused: {error}"))
+                }
+            }
+            match delivery
+                .send(
+                    "Runtime.callFunctionOn",
+                    json!({
+                        "objectId": object_id,
+                        "functionDeclaration": FOCUS_EMULATION_READY_CHECK,
+                        "returnByValue": true,
+                    }),
+                )
+                .await
+            {
+                Ok(Some(value)) if value["result"]["value"].as_bool() == Some(true) => {
+                    ready = true;
+                    break;
+                }
+                Ok(None) => return blocked(false),
+                _ => {}
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        if !ready {
+            return EnterSend::NotSent("the field did not become the focused element".to_owned());
+        }
+        // As for keystrokes: the trusted-input path can lag the focus ack.
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        // What Enter would submit is what the field holds now.
+        match delivery
+            .send(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": READ_EDIT_STATE,
+                    "returnByValue": true,
+                }),
+            )
+            .await
+        {
+            Ok(Some(read)) => {
+                let state = &read["result"]["value"];
+                if state["connected"].as_bool() != Some(true) {
+                    return EnterSend::NotSent("the page took the field out before Enter".to_owned());
+                }
+                if state["value"].as_str() != Some(confirmed) {
+                    return EnterSend::Changed(state["value"].as_str().unwrap_or("").to_owned());
+                }
+            }
+            Ok(None) => return blocked(false),
+            Err(error) => {
+                return EnterSend::NotSent(format!("the field could not be read before Enter: {error}"))
+            }
+        }
+        // And it is still the element the keys go to (a timer may have
+        // focused another one during the wait).
+        match delivery
+            .send(
+                "Runtime.callFunctionOn",
+                json!({
+                    "objectId": object_id,
+                    "functionDeclaration": FOCUS_EMULATION_READY_CHECK,
+                    "returnByValue": true,
+                }),
+            )
+            .await
+        {
+            Ok(Some(value)) if value["result"]["value"].as_bool() == Some(true) => {}
+            Ok(None) => return blocked(false),
+            _ => {
+                return EnterSend::NotSent(
+                    "another element took the focus before Enter".to_owned(),
+                )
+            }
+        }
+        let key = |kind: &str| {
+            json!({ "type": kind, "key": "Enter", "code": "Enter",
+                    "windowsVirtualKeyCode": 13, "nativeVirtualKeyCode": 13 })
+        };
+        let events = [
+            key("keyDown"),
+            json!({ "type": "char", "key": "Enter", "text": "\r", "unmodifiedText": "\r" }),
+            key("keyUp"),
+        ];
+        for (index, event) in events.into_iter().enumerate() {
+            let keys = index > 0;
+            match delivery.send("Input.dispatchKeyEvent", event).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return blocked(keys),
+                Err(error) if keys => {
+                    return EnterSend::Partial(format!("sending Enter stopped partway: {error}"))
+                }
+                Err(error) => {
+                    return EnterSend::NotSent(format!("the Enter key could not be sent: {error}"))
+                }
+            }
+        }
+        if delivery.blocked() {
+            return blocked(true);
+        }
+        EnterSend::Sent
+    }
+    .await;
+    if !delivery.blocked() {
+        let _ = delivery
+            .conn
+            .call(
+                Some(delivery.cdp),
+                "Emulation.setFocusEmulationEnabled",
+                json!({ "enabled": false }),
+            )
+            .await;
+    }
+    sent
+}
+
+/// The field after Enter.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AfterEnter {
+    /// Enter was not pressed, and why.
+    NotSent(String),
+    /// Enter was not pressed: the field changed to this before it.
+    ChangedBeforeEnter(String),
+    /// The page opened a JavaScript dialog while it handled Enter.
+    Dialog,
+    /// The page opened a JavaScript dialog before any Enter event was sent.
+    DialogBeforeEnter,
+    /// Enter was sent in part, then sending failed (why).
+    Partial(String),
+    /// What the field holds: the first read that differs from the text
+    /// before Enter, or that text after half a second.
+    Field(EditState),
+    /// The page took the field out of the document.
+    Detached,
+    /// The field could not be read (the page may have navigated).
+    Unreadable,
+}
+
+async fn field_after_enter(
+    delivery: &mut Delivery<'_>,
+    object_id: &str,
+    before_enter: &str,
+) -> AfterEnter {
+    let (conn, cdp) = (delivery.conn, delivery.cdp);
+    let mut last = None;
+    for attempt in 0..10 {
+        if attempt > 0 {
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let state = tokio::select! {
+            biased;
+            _ = delivery.opens() => return AfterEnter::Dialog,
+            state = read_edit_state(conn, cdp, object_id) => state,
+        };
+        match state {
+            None => return AfterEnter::Unreadable,
+            Some(state) if !state.connected => return AfterEnter::Detached,
+            Some(state) if state.value != before_enter => return AfterEnter::Field(state),
+            Some(state) => last = Some(state),
+        }
+    }
+    last.map_or(AfterEnter::Unreadable, AfterEnter::Field)
+}
+
+/// How a result tells what Enter did: the sentence to add, the `enter`
+/// object, and whether the request as a whole is still confirmed.
+fn describe_enter(after: &AfterEnter, before_enter: &str, password: bool) -> (String, Value, bool) {
+    let pressed = |field: &str| {
+        json!({ "pressed": true, "field": field,
+                "before_enter": (!password).then(|| truncate_value(before_enter)) })
+    };
+    match after {
+        AfterEnter::NotSent(reason) => (
+            format!(". Enter was NOT pressed: {reason}"),
+            json!({ "pressed": false, "reason": reason }),
+            false,
+        ),
+        AfterEnter::Dialog => (
+            ", then Enter was pressed and the page opened a JavaScript dialog".to_owned(),
+            pressed("dialog"),
+            true,
+        ),
+        AfterEnter::ChangedBeforeEnter(value) => (
+            format!(
+                ". Enter was NOT pressed: the field changed to {} before it",
+                shown_value(value, password)
+            ),
+            json!({ "pressed": false, "reason": "field_changed" }),
+            false,
+        ),
+        AfterEnter::DialogBeforeEnter => (
+            ". Enter was NOT pressed: the page opened a JavaScript dialog first".to_owned(),
+            json!({ "pressed": false, "reason": "javascript_dialog_open" }),
+            false,
+        ),
+        AfterEnter::Partial(reason) => (
+            format!(
+                ". Enter was sent only in part ({reason}); the page may have acted on it: read \
+                 the page before pressing it again"
+            ),
+            json!({ "pressed": "partial", "reason": reason }),
+            false,
+        ),
+        AfterEnter::Field(state) if state.value.is_empty() && !before_enter.is_empty() => (
+            ", then Enter was pressed and the field is now empty".to_owned(),
+            pressed("cleared"),
+            true,
+        ),
+        AfterEnter::Field(state) if state.value == before_enter => (
+            format!(
+                ", then Enter was pressed; the field still holds {}",
+                shown_value(&state.value, password)
+            ),
+            pressed("unchanged"),
+            true,
+        ),
+        AfterEnter::Field(state) => (
+            format!(
+                ", then Enter was pressed and the field now holds {}",
+                shown_value(&state.value, password)
+            ),
+            pressed("changed"),
+            true,
+        ),
+        AfterEnter::Detached => (
+            ", then Enter was pressed and the page took the field out (it replaced it or moved on)"
+                .to_owned(),
+            pressed("replaced"),
+            true,
+        ),
+        AfterEnter::Unreadable => (
+            ", then Enter was pressed; the field could not be read after it (the page may have \
+             navigated)"
+                .to_owned(),
+            pressed("unreadable"),
+            true,
+        ),
+    }
+}
+
 const SHOWN_VALUE_CHARS: usize = 200;
 
 fn truncate_value(value: &str) -> String {
@@ -2852,7 +3178,9 @@ impl BrowserTypeTool {
             description: "Type text into an editable page ref of a bound tab. Appends at the \
                 caret unless replace:true, which replaces the content (empty text clears it). \
                 Reads the field back: confirmed, or an error with the value it holds; changes \
-                has what else the page changed. Refused for heuristic bindings."
+                has what else the page changed. End the text with \\n to press Enter once the \
+                field is read back holding it (submit, send, add); the result says what the \
+                field holds after Enter. Refused for heuristic bindings."
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -2860,7 +3188,7 @@ impl BrowserTypeTool {
                     "target_id": schema_target_id(),
                     "tab_id": schema_tab_id(),
                     "session": schema_session(),
-                    "text": { "type": "string", "description": "Text to type." },
+                    "text": { "type": "string", "description": "Text to type. A trailing \\n presses Enter after it (in a textarea or contenteditable it is a newline unless mode is keystrokes)." },
                     "ref": schema_ref(),
                     "mode": {
                         "type": "string",
@@ -2921,7 +3249,7 @@ impl Tool for BrowserTypeTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        let (target_id, tab_id, text) = match (
+        let (target_id, tab_id, mut text) = match (
             args.require_str("target_id"),
             args.require_str("tab_id"),
             args.require_str("text"),
@@ -3097,11 +3425,30 @@ impl Tool for BrowserTypeTool {
             }
         }
 
-        let requested_chars = text.chars().count();
         let mut replaced_chars = 0usize;
         // What the field held before any input, for the read-back below.
         // Keystrokes re-read it after their focus preparation (see there).
         let mut before = read_edit_state(conn, cdp, &object_id).await;
+        let enter = match plan_newline(
+            &text,
+            before.as_ref().is_some_and(|state| state.single_line),
+            mode == "keystrokes",
+        ) {
+            Newline::AsText => false,
+            Newline::EnterAfter(body) => {
+                text = body;
+                true
+            }
+            Newline::Refused => {
+                return BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserActionUnavailable,
+                    "this is a single-line field: it cannot hold a newline, so text for it may \
+                     only end with one (which presses Enter once the text is in); nothing was typed",
+                )
+                .to_tool_result()
+            }
+        };
+        let requested_chars = text.chars().count();
         let replaces = replace || mode == "set_value";
         let edit_mode = if mode == "set_value" {
             EditMode::SetValue
@@ -3508,6 +3855,28 @@ impl Tool for BrowserTypeTool {
                 changes,
             );
         }
+        // Enter, only once the text is confirmed: wrong text is never
+        // submitted (see plan_newline).
+        let after_enter = match &readback {
+            Some(Readback::Confirmed(actual)) if enter => Some(
+                match press_enter(&mut delivery, entry.backend_node_id, &object_id, actual).await {
+                    EnterSend::NotSent(reason) => AfterEnter::NotSent(reason),
+                    EnterSend::Changed(value) => AfterEnter::ChangedBeforeEnter(value),
+                    EnterSend::Partial(reason) => AfterEnter::Partial(reason),
+                    EnterSend::Dialog { keys: false } => AfterEnter::DialogBeforeEnter,
+                    EnterSend::Dialog { keys: true } => AfterEnter::Dialog,
+                    EnterSend::Sent => field_after_enter(&mut delivery, &object_id, actual).await,
+                },
+            ),
+            _ => None,
+        };
+        let settled = delivery.opened.take().map(Settled::Dialog);
+        // Said by every result that typed but did not get as far as Enter.
+        let no_enter = if enter && after_enter.is_none() {
+            " Enter was not pressed."
+        } else {
+            ""
+        };
 
         // Input was sent: from here every outcome also says what the page
         // changed, read once the page has settled.
@@ -3520,7 +3889,7 @@ impl Tool for BrowserTypeTool {
                             break 'outcome ToolResult::error(format!(
                                 "typed {requested_chars} char(s) into {tab_id}, but the field now \
                                  holds {shown}{}: the page changed or rejected the input. Read the \
-                                 page before typing again.",
+                                 page before typing again.{no_enter}",
                                 expected
                                     .as_deref()
                                     .map(|expected| format!(
@@ -3546,18 +3915,23 @@ impl Tool for BrowserTypeTool {
                         }
                         Readback::Confirmed(actual) => {
                             let shown = shown_value(&actual, before.password);
-                            let summary = if replaces {
+                            let holds = if after_enter.is_some() {
+                                "held"
+                            } else {
+                                "now holds"
+                            };
+                            let mut summary = if replaces {
                                 format!(
                                     "typed {requested_chars} char(s) into {tab_id}, replacing \
-                                     {replaced_chars} char(s); the field now holds {shown}"
+                                     {replaced_chars} char(s); the field {holds} {shown}"
                                 )
                             } else {
                                 format!(
-                                    "typed {requested_chars} char(s) into {tab_id}; the field now \
-                                     holds {shown}"
+                                    "typed {requested_chars} char(s) into {tab_id}; the field \
+                                     {holds} {shown}"
                                 )
                             };
-                            break 'outcome ToolResult::text(summary).with_structured(json!({
+                            let mut structured = json!({
                                 "status": "ok",
                                 "effect": "confirmed",
                                 "evidence": [{
@@ -3575,13 +3949,42 @@ impl Tool for BrowserTypeTool {
                                 "replace": replaces,
                                 "replaced_chars": replaced_chars,
                                 "value": (!before.password).then(|| truncate_value(&actual)),
-                            }));
+                            });
+                            if let Some(after) = &after_enter {
+                                let (said, described, confirmed) =
+                                    describe_enter(after, &actual, before.password);
+                                summary.push_str(&said);
+                                structured["enter"] = described;
+                                // The evidence a batch step shows says what
+                                // Enter did, not only what came before it.
+                                structured["evidence"] = json!([{
+                                    "kind": "browser_readback",
+                                    "detail": format!("the field held {shown}{said}"),
+                                }]);
+                                if !confirmed {
+                                    structured["effect"] = json!("unverifiable");
+                                }
+                                // What it holds now, where that is known.
+                                match after {
+                                    AfterEnter::Field(state) => {
+                                        structured["value"] = json!((!before.password)
+                                            .then(|| truncate_value(&state.value)));
+                                    }
+                                    AfterEnter::ChangedBeforeEnter(value) => {
+                                        structured["value"] = json!((!before.password)
+                                            .then(|| truncate_value(value)));
+                                    }
+                                    _ => structured["value"] = Value::Null,
+                                }
+                            }
+                            break 'outcome ToolResult::text(summary).with_structured(structured);
                         }
                         Readback::Detached => {
                             break 'outcome ToolResult::text(format!(
                                 "typed {requested_chars} char(s) into {tab_id}, but the page \
                                  replaced the field while it handled the input, so what it holds \
-                                 now is unknown. Snapshot the tab again and read the new field."
+                                 now is unknown. Snapshot the tab again and read the new \
+                                 field.{no_enter}"
                             ))
                             .with_structured(json!({
                                 "status": "ok",
@@ -3601,7 +4004,7 @@ impl Tool for BrowserTypeTool {
                                 "typed {requested_chars} char(s) into {tab_id}; the field now holds \
                                  {shown}, which the input could have produced (for example by \
                                  replacing a selection the driver could not see), but that cannot \
-                                 be confirmed. Check the value before typing again."
+                                 be confirmed. Check the value before typing again.{no_enter}"
                             ))
                             .with_structured(json!({
                                 "status": "ok",
@@ -3620,14 +4023,19 @@ impl Tool for BrowserTypeTool {
                     }
                 }
             }
+            let no_enter = if no_enter.is_empty() {
+                String::new()
+            } else {
+                format!(".{no_enter}")
+            };
             match typed {
                 Ok(()) => ToolResult::text(if replaces {
                     format!(
                         "typed {requested_chars} char(s) into {tab_id}, replacing \
-                         {replaced_chars} char(s)"
+                         {replaced_chars} char(s){no_enter}"
                     )
                 } else {
-                    format!("typed {requested_chars} char(s) into {tab_id}")
+                    format!("typed {requested_chars} char(s) into {tab_id}{no_enter}")
                 })
                 .with_structured(json!({
                     "status": "ok",
@@ -3659,6 +4067,7 @@ impl Tool for BrowserTypeTool {
                 .to_tool_result(),
             }
         };
+        let watch = if settled.is_some() { None } else { watch };
         let changes = page_changes_after(
             &self.engine,
             &self.registry,
@@ -3667,7 +4076,7 @@ impl Tool for BrowserTypeTool {
             &tab_id,
             &validated,
             held,
-            None,
+            settled,
             watch,
         )
         .await;
@@ -4104,6 +4513,7 @@ pub(crate) mod tests {
             start: selection.map(|(start, _)| start),
             end: selection.map(|(_, end)| end),
             field: true,
+            single_line: false,
             password: false,
             connected: true,
         };
@@ -4203,6 +4613,7 @@ pub(crate) mod tests {
                                     start: selection.map(|(start, _)| start),
                                     end: selection.map(|(_, end)| end),
                                     field,
+                                    single_line: false,
                                     password: false,
                                     connected: true,
                                 };
@@ -4240,6 +4651,71 @@ pub(crate) mod tests {
         );
         assert_eq!(shown_value("a\"b", false), "\"a\\\"b\"");
         assert_eq!(truncate_value(&"x".repeat(250)).chars().count(), 201);
+    }
+
+    #[test]
+    fn a_trailing_newline_is_enter_where_a_newline_cannot_be_text() {
+        use Newline::{AsText, EnterAfter, Refused};
+        let enter = |body: &str| EnterAfter(body.to_owned());
+        // (text, single-line input, keystrokes mode, plan)
+        let cases = [
+            ("Buy milk\n", true, false, enter("Buy milk")),
+            ("Buy milk\r\n", true, false, enter("Buy milk")),
+            ("Buy milk\n", true, true, enter("Buy milk")),
+            ("\n", true, false, enter("")),
+            ("Buy milk", true, false, AsText),
+            // An input cannot hold a newline before the end: nothing is typed.
+            ("first\nsecond\n", true, true, Refused),
+            ("first\nsecond", true, false, Refused),
+            ("a\r", true, false, Refused),
+            // A textarea or contenteditable keeps it as text, except in
+            // keystrokes mode, where it was always the Enter key.
+            ("a\nb\n", false, false, AsText),
+            ("a\nb\n", false, true, enter("a\nb")),
+            ("hello", false, true, AsText),
+        ];
+        for (text, single_line, keystrokes, plan) in cases {
+            assert_eq!(plan_newline(text, single_line, keystrokes), plan, "{text:?}");
+        }
+    }
+
+    #[test]
+    fn enter_results_say_what_the_field_holds_and_hide_passwords() {
+        let field = |value: &str| EditState {
+            value: value.to_owned(),
+            start: None,
+            end: None,
+            field: true,
+            single_line: true,
+            password: false,
+            connected: true,
+        };
+        let (said, described, confirmed) =
+            describe_enter(&AfterEnter::Field(field("")), "Buy milk", false);
+        assert!(said.contains("the field is now empty"), "{said}");
+        assert_eq!(described["field"], "cleared");
+        assert_eq!(described["before_enter"], "Buy milk");
+        assert!(confirmed);
+        let (said, described, _) =
+            describe_enter(&AfterEnter::Field(field("cats")), "cats", false);
+        assert!(said.contains("still holds \"cats\""), "{said}");
+        assert_eq!(described["field"], "unchanged");
+        let (said, described, _) =
+            describe_enter(&AfterEnter::Field(field("hunter2")), "hunter2", true);
+        assert!(!said.contains("hunter2") && !described.to_string().contains("hunter2"));
+        let (said, described, confirmed) =
+            describe_enter(&AfterEnter::NotSent("no focus".into()), "x", false);
+        assert!(said.contains("NOT pressed: no focus"), "{said}");
+        assert_eq!(described["pressed"], false);
+        assert!(!confirmed, "typing without the Enter asked for is not confirmed");
+        let (said, described, confirmed) =
+            describe_enter(&AfterEnter::ChangedBeforeEnter("milk!".into()), "milk", false);
+        assert!(said.contains("changed to \"milk!\" before it"), "{said}");
+        assert_eq!(described["reason"], "field_changed");
+        assert!(!confirmed);
+        let (said, _, _) =
+            describe_enter(&AfterEnter::ChangedBeforeEnter("hunter3".into()), "hunter2", true);
+        assert!(!said.contains("hunter"), "{said}");
     }
 
     use super::*;

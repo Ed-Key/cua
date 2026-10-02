@@ -183,6 +183,22 @@ pub struct RefEntry {
     /// this is, among those its node has had.
     #[serde(skip_serializing)]
     pub minted: Option<(u64, u32)>,
+    /// The row text an unnamed checkbox, radio or switch was shown with, and
+    /// how many DOM levels up that row is. Re-proven before the ref is used
+    /// (the page may have reused the element for another item); not part of
+    /// the fingerprint, which keeps the accessible name.
+    #[serde(skip_serializing)]
+    pub row: Option<RowName>,
+}
+
+/// See [`RefEntry::row`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RowName {
+    pub name: String,
+    pub levels: usize,
+    /// The row's text (its first 200 characters), which `name` shows at most
+    /// 80 of: what the ref is re-proven against and fingerprinted by.
+    pub text: String,
 }
 
 /// One `dom_refs_v1` snapshot.
@@ -630,6 +646,7 @@ mod tests {
                     destination: None,
                     attachment: None,
                     minted: None,
+                    row: None,
                 },
             );
             rec.tabs.insert(tab_id.clone(), {
@@ -781,6 +798,7 @@ mod tests {
                 destination: None,
                 attachment: None,
                 minted: None,
+                row: None,
             };
             let recorded = tab.stable.record(
                 &mut || store.mint_snapshot_id(),

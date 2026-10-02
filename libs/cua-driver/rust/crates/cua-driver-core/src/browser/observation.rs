@@ -104,15 +104,23 @@ pub(crate) struct Fingerprint {
     pub(crate) role: String,
     pub(crate) name: Option<String>,
     pub(crate) destination: Option<String>,
+    /// The row name an unnamed control was shown with: a control reused for
+    /// another row is another entity between snapshots too. The live
+    /// re-proof reads accessibility only and checks the row separately, so
+    /// it compares [`Self::accessible`].
+    pub(crate) row: Option<String>,
 }
 
 impl Fingerprint {
     pub(crate) fn of(entry: &RefEntry) -> Self {
-        Self::read(
-            entry.node_name.clone(),
-            entry.label.clone(),
-            entry.destination.clone(),
-        )
+        Self {
+            row: entry.row.as_ref().map(|row| row.text.clone()),
+            ..Self::read(
+                entry.node_name.clone(),
+                entry.label.clone(),
+                entry.destination.clone(),
+            )
+        }
     }
 
     /// The fingerprint of what a node reads as now, by the same rule.
@@ -122,7 +130,13 @@ impl Fingerprint {
             name: name.filter(|_| !text),
             role,
             destination,
+            row: None,
         }
+    }
+
+    /// Without the row name: what accessibility alone can re-prove.
+    pub(crate) fn accessible(self) -> Self {
+        Self { row: None, ..self }
     }
 }
 
@@ -611,6 +625,7 @@ mod tests {
             destination: None,
             attachment: None,
             minted: None,
+            row: None,
         }
     }
 
@@ -842,6 +857,7 @@ mod tests {
             role: "link".into(),
             name: Some("Bob".into()),
             destination: Some("https://x.test/u/bob".into()),
+            row: None,
         };
         assert_ne!(issued, live, "the use is refused as stale");
         assert_eq!(
@@ -866,6 +882,30 @@ mod tests {
                 key: held,
                 gone: true
             }
+        );
+    }
+
+    #[test]
+    fn an_unnamed_checkbox_reused_for_another_row_gets_a_new_ref() {
+        let mut session = Session::new(0);
+        let in_row = |row: &str| RefEntry {
+            label: None,
+            row: Some(crate::browser::store::RowName {
+                name: row.into(),
+                levels: 1,
+                text: row.into(),
+            }),
+            ..node(10, "checkbox", "")
+        };
+        let first = session.observe(identity("L1", 1), &[in_row("Buy milk")], None);
+        let held = keys(&first)[0].clone();
+        let second = session.observe(identity("L1", 1), &[in_row("Call plumber")], first.revision);
+        assert!(!session.resolves(&held), "the old ref never names the new row");
+        assert_ne!(keys(&second)[0], held);
+        // The live re-proof reads accessibility only: the row is checked apart.
+        assert_eq!(
+            Fingerprint::of(&in_row("Buy milk")).accessible(),
+            Fingerprint::read("checkbox".into(), None, None)
         );
     }
 

@@ -92,6 +92,8 @@ struct FixtureState {
     /// A focus handler that moves the caret to the end of the field. In an
     /// inactive tab it runs only once focus is emulated.
     field_focus_moves_caret_to_end: bool,
+    /// The field is an `<input>` (it cannot hold a newline).
+    field_single_line: bool,
     focus_emulated: bool,
     /// Accessible names the page changed since the fixture was built, by
     /// backend node id (a node reused for another entity).
@@ -176,6 +178,7 @@ impl Default for FixtureState {
             field_detached_after_input: false,
             field_caret: None,
             field_focus_moves_caret_to_end: false,
+            field_single_line: false,
             focus_emulated: false,
             renamed: Default::default(),
             removed: Default::default(),
@@ -1151,11 +1154,13 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     .any(|(_, method, _)| method == "Input.insertText");
                 let connected = !(st.field_detached_after_input && typed);
                 let caret = st.field_caret;
+                let single_line = st.field_single_line;
                 match st.field_value.as_mut() {
                     Some(value) if function.contains("selectionStart") => MockReply::ok(json!({
                         "result": { "value": {
                             "value": value.clone(), "start": caret, "end": caret,
                             "field": true, "password": false, "connected": connected,
+                            "single_line": single_line,
                         } }
                     })),
                     Some(value) if function.contains("getOwnPropertyDescriptor") => {
@@ -1548,6 +1553,19 @@ fn structured(result: &ToolResult) -> &Value {
         .structured_content
         .as_ref()
         .expect("structured content")
+}
+
+/// The result's text, all parts joined.
+fn text_of(result: &ToolResult) -> String {
+    result
+        .content
+        .iter()
+        .filter_map(|content| match content {
+            crate::protocol::Content::Text { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 const SESSION: &str = "run-v2";
@@ -4378,6 +4396,74 @@ async fn a_field_that_rejects_input_is_reported_as_a_mismatch() {
 }
 
 #[tokio::test]
+async fn a_trailing_newline_in_an_input_is_enter_after_the_text_is_confirmed() {
+    let f = fixture_with(|state| {
+        state.field_value = Some(String::new());
+        state.field_single_line = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "Buy milk\n", "session": SESSION
+        }))
+        .await;
+    let s = structured(&typed);
+    assert_ne!(typed.is_error, Some(true), "{s}");
+    assert_eq!(s["effect"], "confirmed", "{s}");
+    // The text went in without the newline, then one Enter.
+    let inserted = recorded_calls(&f, "Input.insertText");
+    assert_eq!(inserted.len(), 1);
+    assert_eq!(inserted[0].1["text"], "Buy milk");
+    let keys: Vec<String> = recorded_calls(&f, "Input.dispatchKeyEvent")
+        .iter()
+        .map(|(_, p)| format!("{} {}", p["type"].as_str().unwrap(), p["key"].as_str().unwrap()))
+        .collect();
+    assert_eq!(keys, ["keyDown Enter", "char Enter", "keyUp Enter"]);
+    // This fixture field ignores Enter: the result says it still holds the text.
+    assert_eq!(s["enter"]["field"], "unchanged", "{s}");
+    assert!(text_of(&typed).contains("still holds \"Buy milk\""), "{}", text_of(&typed));
+}
+
+#[tokio::test]
+async fn enter_is_not_pressed_after_text_the_field_rejected() {
+    let f = fixture_with(|state| {
+        state.field_value = Some(String::new());
+        state.field_digits_only = true;
+        state.field_single_line = true;
+    })
+    .await;
+    let (target, tab) = bind(&f).await;
+    let snap = snapshot(&f, &target, &tab).await;
+    let input = ref_of(&snap, "main", "Shadow Input");
+    let typed = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "ab12\n", "session": SESSION
+        }))
+        .await;
+    assert_eq!(typed.is_error, Some(true));
+    assert_eq!(structured(&typed)["code"], "browser_type_mismatch");
+    assert!(text_of(&typed).contains("Enter was not pressed"), "{}", text_of(&typed));
+    assert!(recorded_calls(&f, "Input.dispatchKeyEvent").is_empty());
+
+    // A newline inside the text cannot go into an input: nothing is typed.
+    let refused = BrowserTypeTool::new(f.engine.clone())
+        .invoke(json!({
+            "target_id": target, "tab_id": tab, "ref": input,
+            "text": "first\nsecond\n", "mode": "keystrokes", "session": SESSION
+        }))
+        .await;
+    assert_eq!(structured(&refused)["status"], "refused");
+    assert!(text_of(&refused).contains("single-line field"), "{}", text_of(&refused));
+    assert!(recorded_calls(&f, "Input.dispatchKeyEvent").is_empty());
+    assert_eq!(recorded_calls(&f, "Input.insertText").len(), 1);
+}
+
+#[tokio::test]
 async fn a_field_the_page_replaced_is_unverifiable_not_confirmed() {
     let f = fixture_with(|state| {
         state.field_value = Some(String::new());
@@ -4482,7 +4568,13 @@ async fn partial_keystrokes_report_exact_delivered_prefix() {
 
 #[tokio::test]
 async fn keystrokes_use_char_events_for_text_delivery() {
-    let f = fixture().await;
+    // A multi-line field the keys land in: the trailing newline is Enter,
+    // pressed once "a" is read back.
+    let f = fixture_with(|state| {
+        state.field_value = Some(String::new());
+        state.field_caret = Some(0);
+    })
+    .await;
     let (target, tab) = bind(&f).await;
     let snap = snapshot(&f, &target, &tab).await;
     let shadow_ref = ref_of(&snap, "main", "Shadow Input");
@@ -4511,15 +4603,22 @@ async fn keystrokes_use_char_events_for_text_delivery() {
     assert!(params[2].get("text").is_none());
     assert_eq!(params[3]["type"], "keyDown");
     assert_eq!(params[3]["key"], "Enter");
+    assert_eq!(params[3]["windowsVirtualKeyCode"], 13);
     assert_eq!(params[4]["type"], "char");
     assert_eq!(params[4]["key"], "Enter");
     assert_eq!(params[4]["text"], "\r");
     assert_eq!(params[4]["unmodifiedText"], "\r");
     assert_eq!(params[5]["type"], "keyUp");
+    // Typing, then Enter: each under its own focus emulation.
     let focus_emulation = recorded_calls(&f, "Emulation.setFocusEmulationEnabled");
-    assert_eq!(focus_emulation.len(), 2);
-    assert_eq!(focus_emulation[0].1["enabled"], true);
-    assert_eq!(focus_emulation[1].1["enabled"], false);
+    let enabled: Vec<&Value> = focus_emulation.iter().map(|(_, p)| &p["enabled"]).collect();
+    assert_eq!(enabled, [true, false, true, false]);
+    let s = structured(&result);
+    assert_eq!(s["effect"], "confirmed", "{s}");
+    assert_eq!(s["enter"]["pressed"], true, "{s}");
+    assert_eq!(s["enter"]["before_enter"], "a", "{s}");
+    let evidence = s["evidence"][0]["detail"].as_str().unwrap_or_default();
+    assert!(evidence.contains("then Enter was pressed"), "{evidence}");
     let readiness_checks = recorded_calls(&f, "Runtime.callFunctionOn");
     assert!(readiness_checks.iter().any(|(_, params)| {
         params["functionDeclaration"]

@@ -404,6 +404,11 @@ element, indented under the element that contains it:
 - Unnamed wrappers, the page root, list bullets, the text inside a field that
   only repeats its value, and the extension's own "Cua is working in this tab"
   pill are left out.
+- A checkbox, radio or switch with no label of its own is named after the
+  text of its row (a list item, table row or similar), without the row's
+  buttons and links, so `{"action":"click","name":"Buy milk"}` reaches it. A
+  transparent native control laid over a drawn one is listed: it takes the
+  clicks. Before such a ref is used, its row must still read as that name.
 
 Programs that want the refs as data pass `include_refs:true` and also get
 `refs` (lines that declare an action) and `content_refs`, each entry
@@ -588,7 +593,15 @@ unverifiable (`readback: "element_replaced"`): snapshot again. A value the
 input could have produced but the driver cannot confirm (for example it
 replaced a selection the page does not expose) is unverifiable with
 `readback: "ambiguous"` and the value it holds. Read the page
-before typing again. Inspect the live schema when in doubt:
+before typing again.
+
+To submit (add a to-do, send a message, run a search), end the text with
+`\n`: the field is read back holding the text first, then Enter is pressed,
+and the result says what the field holds after it (`enter.field`: `cleared`,
+`unchanged`, `changed`, `replaced`). Enter is never pressed after text that
+was not confirmed. A single-line input refuses a newline anywhere else; in a
+textarea or contenteditable the newline is text unless `mode` is `keystrokes`.
+Inspect the live schema when in doubt:
 
 ```bash
 cua-driver describe browser_type
