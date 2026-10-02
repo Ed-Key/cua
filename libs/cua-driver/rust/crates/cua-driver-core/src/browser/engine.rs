@@ -4004,18 +4004,27 @@ const SETTLE_DEADLINE: std::time::Duration = std::time::Duration::from_millis(1_
 const SETTLE_CALL_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(750);
 const NAVIGATION_DEADLINE: std::time::Duration = std::time::Duration::from_secs(8);
 /// A mutation counter for the main document: `n` counts records the
-/// observer's callback has seen, `o` is the observer.
+/// observer's callback has seen, `o` is the observer, `c` counts the page's
+/// own records. What Cua's extension does to the page is not the page
+/// changing: its "working in this tab" indicator and the favicon badge
+/// (extensions/chrome/indicator.js) come and go on their own timer, and once
+/// counted as the change an action made.
 // ponytail: the main document only (open shadow roots and frames are not
 // observed), and the counter's handle is not released: Runtime.releaseObject
 // is outside the existing-profile allowlist, and the handle is a few bytes
 // that die with the document. Observe frames, and release the handle, if a
 // long-lived single-page app ever shows either as a problem.
 const SETTLE_COUNTER: &str = "(() => { const s = { n: 0 }; \
-    s.o = new MutationObserver((records) => { s.n += records.length; }); \
+    const cua = (node) => !!node && node.nodeType === 1 && (node.id === 'cua-driver-indicator' \
+        || node.id === 'cua-driver-favicon' || (node.tagName === 'LINK' && /icon/i.test(node.rel))); \
+    s.c = (records) => records.filter((r) => !(cua(r.target) || (r.type === 'childList' \
+        && r.addedNodes.length + r.removedNodes.length > 0 \
+        && [...r.addedNodes, ...r.removedNodes].every(cua)))).length; \
+    s.o = new MutationObserver((records) => { s.n += s.c(records); }); \
     s.o.observe(document, { subtree: true, childList: true, attributes: true, characterData: true }); \
     return s; })()";
 const SETTLE_TAKE: &str =
-    "function() { const n = this.n + this.o.takeRecords().length; this.n = 0; return n; }";
+    "function() { const n = this.n + this.c(this.o.takeRecords()); this.n = 0; return n; }";
 const SETTLE_STOP: &str = "function() { this.o.disconnect(); }";
 
 /// Attribute names that make an element interactive-enough to ref.
