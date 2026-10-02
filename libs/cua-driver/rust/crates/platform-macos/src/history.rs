@@ -180,9 +180,7 @@ pub struct MacosApplicationIdentityProvider;
 impl ApplicationIdentityProvider for MacosApplicationIdentityProvider {
     fn resolve(&self, pid: i64, _window_id: Option<u64>) -> Option<ApplicationIdentity> {
         let pid = i32::try_from(pid).ok()?;
-        crate::apps::list_running_apps()
-            .into_iter()
-            .find(|app| app.pid == pid)
+        crate::apps::running_app(pid)
             .map(|app| ApplicationIdentity {
                 bundle_id: app.bundle_id,
                 display_name: Some(app.name),

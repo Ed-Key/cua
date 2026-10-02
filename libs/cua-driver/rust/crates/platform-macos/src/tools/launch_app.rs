@@ -246,8 +246,7 @@ impl Tool for LaunchAppTool {
             let windows = resolve_windows_for_pid(pid);
 
             let app_info: Option<crate::apps::AppInfo> = {
-                let apps = crate::apps::list_running_apps();
-                apps.into_iter().find(|a| a.pid == pid)
+                crate::apps::running_app(pid)
             };
 
             Ok::<_, anyhow::Error>((pid, app_info, windows))

@@ -1044,9 +1044,7 @@ impl BrowserPlatform for MacOsBrowserPlatform {
         // Before any probe an action could base its visibility on.
         self.follow_tab_switches();
         let (app, fallback_name, fallback_bundle_id) = tokio::task::spawn_blocking(move || {
-            let app = crate::apps::list_running_apps()
-                .into_iter()
-                .find(|app| i64::from(app.pid) == pid);
+            let app = i32::try_from(pid).ok().and_then(crate::apps::running_app);
             let fallback_name = crate::apps::get_app_name_for_pid(pid as i32);
             let fallback_bundle_id = crate::apps::bundle_id_for_pid(pid as i32);
             (app, fallback_name, fallback_bundle_id)

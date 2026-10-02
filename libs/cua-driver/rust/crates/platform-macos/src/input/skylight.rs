@@ -223,6 +223,32 @@ fn get_process_for_pid_fn() -> Option<GetProcessForPIDFn> {
     *SYM.get_or_init(|| find_sym(b"GetProcessForPID\0").map(|p| unsafe { as_fn(p) }))
 }
 
+/// `OSStatus GetProcessPID(const void *psn, pid_t *pid)`: deprecated, still
+/// resolves (macOS 26).
+type GetProcessPidFn = unsafe extern "C" fn(*const c_void, *mut libc::pid_t) -> i32;
+
+fn get_process_pid_fn() -> Option<GetProcessPidFn> {
+    static SYM: OnceLock<Option<GetProcessPidFn>> = OnceLock::new();
+    *SYM.get_or_init(|| find_sym(b"GetProcessPID\0").map(|p| unsafe { as_fn(p) }))
+}
+
+/// The WindowServer's front process as a pid, read at call time (a few
+/// microseconds; NSWorkspace's frontmost app is a copy that can be stale).
+/// `None` when the symbols are missing or the query fails.
+pub fn front_pid() -> Option<libc::pid_t> {
+    let get_front = get_front_process_fn()?;
+    let get_pid = get_process_pid_fn()?;
+    let mut front_psn = [0u8; 8];
+    if unsafe { get_front(front_psn.as_mut_ptr().cast()) } != 0 {
+        return None;
+    }
+    let mut pid: libc::pid_t = 0;
+    if unsafe { get_pid(front_psn.as_ptr().cast(), &mut pid) } != 0 || pid <= 0 {
+        return None;
+    }
+    Some(pid)
+}
+
 /// `true` when `SLEventPostToPid` resolved.
 pub fn is_available() -> bool {
     post_to_pid_fn().is_some()

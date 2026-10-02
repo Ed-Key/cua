@@ -82,7 +82,8 @@ fn live_pids() -> Option<Vec<i32>> {
 /// pid and the frontmost app never changed. `NSRunningApplication` looked up
 /// by pid answers from LaunchServices at call time (under 1 ms for 600
 /// processes). Falls back to the workspace copy when the process table cannot
-/// be read.
+/// be read. Call inside an autorelease pool, with every property read: the
+/// lookups autorelease temporaries that a long-lived thread never drains.
 fn running_applications() -> Vec<objc2::rc::Retained<objc2_app_kit::NSRunningApplication>> {
     use objc2_app_kit::{NSRunningApplication, NSWorkspace};
     let apps: Vec<_> = match live_pids() {
@@ -99,36 +100,46 @@ fn running_applications() -> Vec<objc2::rc::Retained<objc2_app_kit::NSRunningApp
 }
 
 fn list_running_apps_native() -> Vec<AppInfo> {
-    use objc2_app_kit::NSApplicationActivationPolicy;
+    objc2::rc::autoreleasepool(|_| list_running_apps_in_pool())
+}
 
-    let mut apps = Vec::new();
+fn list_running_apps_in_pool() -> Vec<AppInfo> {
+    running_applications().iter().filter_map(|app| app_info(app)).collect()
+}
+
+/// The running regular app with `pid` (one fresh lookup, not a scan), or
+/// `None` when no such app runs.
+pub fn running_app(pid: i32) -> Option<AppInfo> {
+    use objc2_app_kit::NSRunningApplication;
+    objc2::rc::autoreleasepool(|_| {
+        let app = unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) }?;
+        app_info(&app)
+    })
+}
+
+/// A regular, live app as [`AppInfo`]; `None` for anything else.
+fn app_info(app: &objc2_app_kit::NSRunningApplication) -> Option<AppInfo> {
+    use objc2_app_kit::NSApplicationActivationPolicy;
     unsafe {
-        for app in running_applications() {
-            if app.isTerminated()
-                || app.activationPolicy() != NSApplicationActivationPolicy::Regular
-            {
-                continue;
-            }
-            let Some(name) = app.localizedName().map(|value| value.to_string()) else {
-                continue;
-            };
-            let pid = app.processIdentifier();
-            if name.is_empty() || pid <= 0 {
-                continue;
-            }
-            apps.push(AppInfo {
-                name,
-                pid,
-                bundle_id: app.bundleIdentifier().map(|value| value.to_string()),
-                running: true,
-                active: app.isActive(),
-                launch_path: None,
-                kind: Some("desktop".to_owned()),
-                last_used: None,
-            });
+        if app.isTerminated() || app.activationPolicy() != NSApplicationActivationPolicy::Regular {
+            return None;
         }
+        let name = app.localizedName().map(|value| value.to_string())?;
+        let pid = app.processIdentifier();
+        if name.is_empty() || pid <= 0 {
+            return None;
+        }
+        Some(AppInfo {
+            name,
+            pid,
+            bundle_id: app.bundleIdentifier().map(|value| value.to_string()),
+            running: true,
+            active: app.isActive(),
+            launch_path: None,
+            kind: Some("desktop".to_owned()),
+            last_used: None,
+        })
     }
-    apps
 }
 
 /// Launch an app by bundle ID via NSWorkspace, background only (no focus
@@ -646,18 +657,19 @@ fn read_app_plist(plist_path: &std::path::Path) -> Option<AppInfo> {
     })
 }
 
-/// The pid of the active (frontmost) application, read fresh: the running
-/// application that says it is active. `NSWorkspace.frontmostApplication`
-/// went stale in the daemon like its app list (see [`running_applications`]).
-/// `None` if there isn't one (rare, e.g. screensaver).
+/// The pid of the frontmost application, read fresh from the WindowServer.
+/// `NSWorkspace.frontmostApplication` went stale in the daemon like its app
+/// list (see [`running_applications`]). Without the WindowServer symbols:
+/// the running application that says it is active. `None` if there isn't
+/// one (rare, e.g. screensaver).
 pub fn frontmost_pid() -> Option<i32> {
-    // An app switch during the scan can leave no app saying it is active;
-    // the second scan sees the switch finished.
-    (0..2).find_map(|_| {
-        running_applications()
-            .into_iter()
-            .find(|app| unsafe { app.isActive() })
-            .map(|app| unsafe { app.processIdentifier() })
+    crate::input::skylight::front_pid().or_else(|| {
+        objc2::rc::autoreleasepool(|_| {
+            running_applications()
+                .into_iter()
+                .find(|app| unsafe { app.isActive() })
+                .map(|app| unsafe { app.processIdentifier() })
+        })
     })
 }
 
