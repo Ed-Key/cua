@@ -325,6 +325,37 @@ fn viewport_point_to_screen(
     ))
 }
 
+/// How long a read waits for the page's event listeners before it goes on
+/// without them (they only add hints to the outline).
+const LISTENERS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// Every event listener in the document a read collected (its whole tree,
+/// shadow roots and same-process frames included), each with its node's
+/// backend id: the evidence that a card or a cell takes a drag or a
+/// double-click. `None` when the browser would not say in time.
+async fn page_listeners(conn: &CdpConnection, cdp_session: &str, root: &Value) -> Option<Value> {
+    let backend = root.get("backendNodeId")?.as_i64()?;
+    let ask = async {
+        let resolved = conn
+            .call(
+                Some(cdp_session),
+                "DOM.resolveNode",
+                json!({ "backendNodeId": backend }),
+            )
+            .await
+            .ok()?;
+        let object_id = resolved.pointer("/object/objectId")?.as_str()?.to_owned();
+        conn.call(
+            Some(cdp_session),
+            "DOMDebugger.getEventListeners",
+            json!({ "objectId": object_id, "depth": -1, "pierce": true }),
+        )
+        .await
+        .ok()
+    };
+    tokio::time::timeout(LISTENERS_TIMEOUT, ask).await.ok().flatten()
+}
+
 /// Walks `levels` up from the control (a shadow root's next level is its
 /// host and a frame document's its frame element, as the snapshot's DOM
 /// index counts them) and names the row by the snapshot's rule
@@ -2849,20 +2880,29 @@ impl BrowserEngine {
             .iter()
             .map(|value| Value::String((*value).to_owned()))
             .collect::<Vec<_>>();
-        let (layout, metrics) = tokio::try_join!(
-            conn.call(
-                Some(cdp_session),
-                "DOMSnapshot.captureSnapshot",
-                json!({
-                    "computedStyles": styles,
-                    "includePaintOrder": true,
-                    "includeDOMRects": true
-                }),
-            ),
-            conn.call(Some(cdp_session), "Page.getLayoutMetrics", json!({})),
-        )
-        .map_err(|error| route_err("semantic layout collection failed", error))?;
-        let dom = build_dom_index(&root);
+        let (layout, listeners) = tokio::join!(
+            async {
+                tokio::try_join!(
+                    conn.call(
+                        Some(cdp_session),
+                        "DOMSnapshot.captureSnapshot",
+                        json!({
+                            "computedStyles": styles,
+                            "includePaintOrder": true,
+                            "includeDOMRects": true
+                        }),
+                    ),
+                    conn.call(Some(cdp_session), "Page.getLayoutMetrics", json!({})),
+                )
+            },
+            page_listeners(conn, cdp_session, &root),
+        );
+        let (layout, metrics) =
+            layout.map_err(|error| route_err("semantic layout collection failed", error))?;
+        let mut dom = build_dom_index(&root);
+        if let Some(listeners) = &listeners {
+            dom.add_listeners(listeners);
+        }
         let title = snapshot_document_title(&layout, &root);
         let layout = build_layout_index(&layout);
         let viewport = parse_viewport(&metrics);
@@ -3509,7 +3549,41 @@ impl BrowserEngine {
             events,
             main: tree.main_identity(),
             navigating: false,
+            within: false,
+            counter: None,
         })
+    }
+
+    /// Start the page's mutation counter for `settle` now, right before the
+    /// input is sent, so what the input changes at once is counted too: a
+    /// router that draws its new view in the same task as its pushState has
+    /// drawn it before the input's reply. Only for an action whose changes
+    /// will be read, once nothing can refuse it any more.
+    pub(crate) async fn count_from_here(
+        &self,
+        validated: &ValidatedTab,
+        watch: &mut Option<PageWatch>,
+    ) {
+        let Some(watch) = watch.as_mut() else {
+            return;
+        };
+        watch.counter = tokio::time::timeout(
+            SETTLE_CALL_TIMEOUT,
+            validated.conn.call(
+                Some(&validated.cdp_session),
+                "Runtime.evaluate",
+                json!({ "expression": SETTLE_COUNTER, "objectGroup": "cua-settle" }),
+            ),
+        )
+        .await
+        .ok()
+        .and_then(Result::ok)
+        .and_then(|value| value.pointer("/result/objectId")?.as_str().map(str::to_owned))
+        .map(|object_id| SettleCounter {
+            conn: validated.conn.clone(),
+            cdp_session: validated.cdp_session.clone(),
+            object_id: Some(object_id),
+        });
     }
 
     /// Wait, within bounds, until the page has stopped changing after an
@@ -3532,14 +3606,31 @@ impl BrowserEngine {
             return open;
         }
         let main = watch.as_ref().map(|watch| watch.main.clone());
-        let mut navigating = move || watch.as_mut().is_some_and(PageWatch::navigating);
+        let mut navigating = || watch.as_mut().is_some_and(PageWatch::navigating);
+        // A navigation that stays in the document (a router's pushState, a
+        // fragment) ends as soon as the browser says so; the page is then
+        // waited for like any other change.
         if navigating() {
-            return self.await_document(validated, main.as_ref(), started).await;
+            if let Some(settled) = self
+                .await_document(validated, main.as_ref(), started, &mut navigating)
+                .await
+            {
+                return settled;
+            }
         }
         let bounded = |method: &'static str, params: Value| async move {
             tokio::time::timeout(SETTLE_CALL_TIMEOUT, conn.call(Some(cdp), method, params)).await
         };
-        let counter = match bounded(
+        let replaced = |document: Option<Settled>| document.unwrap_or(Settled::Deadline);
+        // Started before the input: it has counted everything the input did.
+        let from_input = watch
+            .as_mut()
+            .and_then(|watch| watch.counter.as_mut())
+            .and_then(SettleCounter::take);
+        let counted_from_input = from_input.is_some();
+        let counter = match from_input {
+            Some(counter) => Some(counter),
+            None => match bounded(
             "Runtime.evaluate",
             json!({ "expression": SETTLE_COUNTER, "objectGroup": "cua-settle" }),
         )
@@ -3551,19 +3642,31 @@ impl BrowserEngine {
                 .map(str::to_owned),
             // The document is being replaced under the call.
             Ok(Err(error)) if is_context_gone(&error) => {
-                return self.await_document(validated, main.as_ref(), started).await
+                return replaced(
+                    self.await_document(validated, main.as_ref(), started, || true)
+                        .await,
+                )
             }
             // The page cannot run the counter: nothing says it settled.
             Ok(Err(_)) => return Settled::Deadline,
             // No answer: a dialog, or a document still being replaced.
             Err(_) => None,
+            },
         };
         let Some(counter) = counter else {
             return match dialog() {
                 Some(open) => open,
-                None => self.await_document(validated, main.as_ref(), started).await,
+                None => replaced(
+                    self.await_document(validated, main.as_ref(), started, || true)
+                        .await,
+                ),
             };
         };
+        // After a same-document navigation the router draws the new view,
+        // maybe once its data has loaded: quiet counts only after the page
+        // has changed at all since the input (a counter started after the
+        // input cannot tell, and does not hold out).
+        let mut changed = 0;
         let mut quiet = 0;
         while started.elapsed() < SETTLE_DEADLINE {
             tokio::time::sleep(SETTLE_POLL).await;
@@ -3571,9 +3674,19 @@ impl BrowserEngine {
                 return open;
             }
             // A page at rest that is about to be replaced has not settled.
-            if navigating() {
-                return self.await_document(validated, main.as_ref(), started).await;
+            if watch.as_mut().is_some_and(PageWatch::navigating) {
+                let mut navigating = || watch.as_mut().is_some_and(PageWatch::navigating);
+                if let Some(settled) = self
+                    .await_document(validated, main.as_ref(), started, &mut navigating)
+                    .await
+                {
+                    return settled;
+                }
+                quiet = 0;
             }
+            let drawn = !(counted_from_input
+                && changed == 0
+                && watch.as_ref().is_some_and(PageWatch::within_document));
             match bounded(
                 "Runtime.callFunctionOn",
                 json!({
@@ -3585,7 +3698,7 @@ impl BrowserEngine {
             .await
             {
                 Ok(Ok(value)) => match value.pointer("/result/value").and_then(Value::as_u64) {
-                    Some(0) => {
+                    Some(0) if drawn => {
                         quiet += 1;
                         if quiet == SETTLE_QUIET_POLLS {
                             let _ = bounded(
@@ -3596,12 +3709,26 @@ impl BrowserEngine {
                             return Settled::Quiet;
                         }
                     }
-                    Some(_) => quiet = 0,
+                    Some(0) => {}
+                    Some(count) => {
+                        quiet = 0;
+                        changed += count;
+                    }
                     // The counter is gone with its document.
-                    None => return self.await_document(validated, main.as_ref(), started).await,
+                    None => {
+                        return replaced(
+                            self.await_document(validated, main.as_ref(), started, || true)
+                                .await,
+                        )
+                    }
                 },
                 // The counter's document was replaced.
-                Ok(Err(_)) => return self.await_document(validated, main.as_ref(), started).await,
+                Ok(Err(_)) => {
+                    return replaced(
+                        self.await_document(validated, main.as_ref(), started, || true)
+                            .await,
+                    )
+                }
                 // No answer in time: a dialog shows up at the next poll.
                 Err(_) => {}
             }
@@ -3611,6 +3738,11 @@ impl BrowserEngine {
             json!({ "objectId": counter, "functionDeclaration": SETTLE_STOP }),
         )
         .await;
+        // Held only for a view that never came: the page did not change at
+        // all, so it is at rest, not still changing.
+        if counted_from_input && changed == 0 && watch.as_ref().is_some_and(PageWatch::within_document) {
+            return Settled::Quiet;
+        }
         Settled::Deadline
     }
 
@@ -3618,18 +3750,24 @@ impl BrowserEngine {
     /// replaced `old` (the main frame's document before the action, when
     /// known) and has loaded. When `old` is still there at the deadline the
     /// navigation did not happen, and the page is simply not settled.
+    ///
+    /// `still_navigating` is asked while the old document is still there:
+    /// `false` (the browser said the navigation stayed in the document)
+    /// ends the wait with `None`, and the caller waits for the page to
+    /// settle instead.
     pub(crate) async fn await_document(
         &self,
         validated: &ValidatedTab,
         old: Option<&FrameIdentity>,
         started: tokio::time::Instant,
-    ) -> Settled {
+        mut still_navigating: impl FnMut() -> bool,
+    ) -> Option<Settled> {
         let conn = &validated.conn;
         let target = validated.tab.cdp_target_id.as_str();
         let mut replaced = old.is_none();
         while started.elapsed() < NAVIGATION_DEADLINE {
             if let Some(dialog) = conn.dialog_state(target) {
-                return Settled::Dialog(dialog);
+                return Some(Settled::Dialog(dialog));
             }
             if !replaced {
                 let tree = tokio::time::timeout(
@@ -3641,6 +3779,9 @@ impl BrowserEngine {
                     (&tree, old),
                     (Ok(Ok(tree)), Some(old)) if tree.main_identity() != *old
                 );
+                if !replaced && !still_navigating() {
+                    return None;
+                }
             }
             if replaced {
                 let ready = tokio::time::timeout(
@@ -3659,7 +3800,7 @@ impl BrowserEngine {
                     {
                         // One beat for scripts that render on load.
                         tokio::time::sleep(SETTLE_POLL * 2).await;
-                        return Settled::NewDocument { loaded: true };
+                        return Some(Settled::NewDocument { loaded: true });
                     }
                     // Still loading, between documents, or slow: ask again.
                     Ok(Ok(_)) | Err(_) => {}
@@ -3670,11 +3811,11 @@ impl BrowserEngine {
             }
             tokio::time::sleep(SETTLE_POLL).await;
         }
-        if replaced {
+        Some(if replaced {
             Settled::NewDocument { loaded: false }
         } else {
             Settled::Deadline
-        }
+        })
     }
 
     /// The ref space (`p7`) the session holds for this tab, if any.
@@ -3723,15 +3864,59 @@ pub(crate) struct PageWatch {
     events: tokio::sync::mpsc::UnboundedReceiver<super::cdp_ws::CdpEvent>,
     main: FrameIdentity,
     navigating: bool,
+    /// The main frame navigated within its document (history.pushState, a
+    /// fragment) since the watch began.
+    within: bool,
+    /// The page's mutation counter, started before the input.
+    counter: Option<SettleCounter>,
+}
+
+/// A mutation counter in the page (see [`SETTLE_COUNTER`]). Whoever holds it
+/// last stops it: a watch whose action was refused before it was sent never
+/// reaches `settle`, and its observer must not keep counting in the page.
+struct SettleCounter {
+    conn: Arc<CdpConnection>,
+    cdp_session: String,
+    object_id: Option<String>,
+}
+
+impl SettleCounter {
+    fn take(&mut self) -> Option<String> {
+        self.object_id.take()
+    }
+}
+
+impl Drop for SettleCounter {
+    fn drop(&mut self) {
+        let Some(object_id) = self.object_id.take() else {
+            return;
+        };
+        let (conn, cdp) = (self.conn.clone(), self.cdp_session.clone());
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move {
+                let _ = tokio::time::timeout(
+                    SETTLE_CALL_TIMEOUT,
+                    conn.call(
+                        Some(&cdp),
+                        "Runtime.callFunctionOn",
+                        json!({ "objectId": object_id, "functionDeclaration": SETTLE_STOP }),
+                    ),
+                )
+                .await;
+            });
+        }
+    }
 }
 
 impl PageWatch {
     /// Whether the main frame has started to load another document since
-    /// the watch began. Child frames, new tabs and same-document history
-    /// changes do not count.
+    /// the watch began. Child frames and new tabs do not count. Chrome
+    /// reports a same-document navigation (a router's history.pushState, a
+    /// fragment link) as started loading too; once it says the navigation
+    /// stayed in the document, the main frame is no longer navigating.
     fn navigating(&mut self) -> bool {
         while let Ok(event) = self.events.try_recv() {
-            let frame = match event.method.as_str() {
+            let (frame, starts) = match event.method.as_str() {
                 "Page.frameRequestedNavigation"
                     if event
                         .params
@@ -3739,19 +3924,26 @@ impl PageWatch {
                         .and_then(Value::as_str)
                         .is_none_or(|disposition| disposition == "currentTab") =>
                 {
-                    event.params.get("frameId")
+                    (event.params.get("frameId"), true)
                 }
                 "Page.frameScheduledNavigation" | "Page.frameStartedLoading" => {
-                    event.params.get("frameId")
+                    (event.params.get("frameId"), true)
                 }
-                "Page.frameNavigated" => event.params.pointer("/frame/id"),
-                _ => None,
+                "Page.frameNavigated" => (event.params.pointer("/frame/id"), true),
+                "Page.navigatedWithinDocument" => (event.params.get("frameId"), false),
+                _ => (None, false),
             };
             if frame.and_then(Value::as_str) == Some(self.main.frame_id.as_str()) {
-                self.navigating = true;
+                self.navigating = starts;
+                self.within |= !starts;
             }
         }
         self.navigating
+    }
+
+    /// Whether the main frame navigated within its document so far.
+    fn within_document(&self) -> bool {
+        self.within
     }
 }
 

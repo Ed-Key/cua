@@ -5,6 +5,12 @@
 //! tab, then revalidates the native window, endpoint, tab, and (for refs) frame
 //! identity before dispatch. It never activates a target or brings a page to
 //! the foreground.
+//!
+//! Any listed element can be pointed at, whatever its line offers: a card or
+//! a grid cell is plain text to accessibility but takes a drag or a
+//! double-click. What keeps trusted input on the element is the live
+//! hit-test browser_click uses (`browser_target_covered` when something else
+//! is on top at its centre), not the actions the line declares.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -13,16 +19,31 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use crate::protocol::ToolResult;
+use crate::recording_tools::ReplayRegistrySlot;
 use crate::tool::{ProtectedResourceOwnership, Tool, ToolDef};
 use crate::tool_args::ArgsExt;
 
-use super::cdp_ws::CdpConnection;
-use super::engine::{BrowserEngine, ValidatedTab};
+use super::cdp_ws::{CdpConnection, CdpEvent};
+use super::engine::{dialog_open_refusal, BrowserEngine, Settled, ValidatedTab};
 use super::platform::BrowserVisualActionKind;
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
-use super::required_session_schema;
-use super::store::{BrowserActionKind, FrameKind, FrameRef};
-use super::tools::{browser_protected_resource_scope, browser_resource_ownership};
+use super::session_schema;
+use super::store::{FrameKind, FrameRef};
+use super::tools::{
+    browser_protected_resource_scope, browser_resource_ownership, changes_will_be_read, live_point,
+    no_registry, page_changes_after, quad_center, require_session, with_changes, Delivery, HeldRef,
+    LiveInput,
+};
+
+/// Pointer moves between a drag's press and its release.
+const DRAG_STEPS: u32 = 8;
+/// How long a drag waits, after its last move, for Chrome to say it took the
+/// drag over as an HTML5 drag-and-drop (`Input.dragIntercepted`).
+const DRAG_INTERCEPT_WAIT: Duration = Duration::from_millis(150);
+/// One animation frame between a drag's moves.
+const DRAG_FRAME: Duration = Duration::from_millis(16);
+/// How long cleanup after a stopped drag waits for each answer.
+const CLEANUP_TIMEOUT: Duration = Duration::from_millis(750);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PointerAction {
@@ -56,6 +77,28 @@ impl PointerAction {
             Self::Drag => "drag",
         }
     }
+
+    /// What a hit-test refusal calls this input.
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Hover => "hover",
+            Self::RightClick => "right-click",
+            Self::DoubleClick => "double-click",
+            Self::Scroll => "scroll",
+            Self::Drag => "drag",
+        }
+    }
+
+    /// What the result says was done.
+    fn past(self) -> &'static str {
+        match self {
+            Self::Hover => "hovered over",
+            Self::RightClick => "right-clicked",
+            Self::DoubleClick => "double-clicked",
+            Self::Scroll => "scrolled at",
+            Self::Drag => "dragged",
+        }
+    }
 }
 
 fn visual_kind(action: PointerAction) -> BrowserVisualActionKind {
@@ -65,15 +108,6 @@ fn visual_kind(action: PointerAction) -> BrowserVisualActionKind {
         PointerAction::DoubleClick => BrowserVisualActionKind::DoubleClick,
         PointerAction::Scroll => BrowserVisualActionKind::Scroll,
         PointerAction::Drag => BrowserVisualActionKind::Drag,
-    }
-}
-
-fn ref_declares_pointer_action(actions: &[BrowserActionKind], action: PointerAction) -> bool {
-    match action {
-        PointerAction::Scroll => actions
-            .iter()
-            .any(|kind| matches!(kind, BrowserActionKind::Scroll | BrowserActionKind::Pointer)),
-        _ => actions.contains(&BrowserActionKind::Pointer),
     }
 }
 
@@ -116,19 +150,6 @@ struct PointerRequest {
     destination: Option<Location>,
     delta_x: f64,
     delta_y: f64,
-}
-
-fn explicit_session(args: &Value) -> Result<String, ToolResult> {
-    let session = args
-        .opt_str("session")
-        .or_else(|| args.opt_str("_session_id"))
-        .unwrap_or_else(|| "default".into());
-    if session.is_empty() || session == "default" {
-        return Err(ToolResult::error(
-            "Browser targets and page refs are session-scoped capabilities - declare an explicit session (start_session) and pass its id on this call.",
-        ));
-    }
-    Ok(session)
 }
 
 fn finite_pair(args: &Value, x_name: &str, y_name: &str) -> Result<Option<(f64, f64)>, String> {
@@ -245,11 +266,12 @@ async fn resolve_object(
         .ok_or_else(|| stale("the ref's node has no live object in the page"))
 }
 
+/// The centre of a ref's box, for the cursor drawn over a synthetic event.
 async fn point_for_ref(
     conn: &CdpConnection,
     cdp_session: &str,
     backend_node_id: i64,
-) -> Result<(f64, f64), ToolResult> {
+) -> Option<(f64, f64)> {
     let _ = conn
         .call(
             Some(cdp_session),
@@ -264,55 +286,124 @@ async fn point_for_ref(
             json!({ "backendNodeId": backend_node_id }),
         )
         .await
-        .map_err(|_| stale("the ref's node has no live layout box"))?;
-    quad_center(&model).ok_or_else(|| stale("the ref's node returned an unusable layout box"))
+        .ok()?;
+    quad_center(&model)
 }
 
-fn quad_center(box_model: &Value) -> Option<(f64, f64)> {
-    let quad = box_model.get("model")?.get("content")?.as_array()?;
-    if quad.len() < 8 {
-        return None;
-    }
-    let values = quad
-        .iter()
-        .take(8)
-        .map(Value::as_f64)
-        .collect::<Option<Vec<_>>>()?;
-    Some((
-        (values[0] + values[2] + values[4] + values[6]) / 4.0,
-        (values[1] + values[3] + values[5] + values[7]) / 4.0,
-    ))
+/// One clause on what the page did, from the `changes` the action read: what
+/// a caller learns without opening them. Never a bare "ok".
+fn changes_summary(changes: Option<&Value>) -> String {
+    let Some(changes) = changes else {
+        return "the page was not read afterwards (this session holds a dom_refs_v1 \
+                snapshot; read it again to see the effect)"
+            .to_owned();
+    };
+    let still = if changes.get("settled") == Some(&Value::Bool(false)) {
+        "; the page had not settled when it was read"
+    } else {
+        ""
+    };
+    let said = match changes.get("kind").and_then(Value::as_str) {
+        Some("diff") => {
+            let ops = changes
+                .get("ops")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if ops.is_empty() {
+                "nothing in the page's outline changed".to_owned()
+            } else {
+                let count = |kind: &str| {
+                    ops.iter()
+                        .filter(|op| op.get("op").and_then(Value::as_str) == Some(kind))
+                        .count()
+                };
+                let parts = [
+                    ("added", count("add")),
+                    ("changed", count("change")),
+                    ("moved", count("move")),
+                    ("gone", count("leave")),
+                ]
+                .into_iter()
+                .filter(|(_, n)| *n > 0)
+                .map(|(word, n)| format!("{n} {word}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+                format!("the page changed: {parts} line(s), listed in changes")
+            }
+        }
+        Some("snapshot") => match changes.get("reason").and_then(Value::as_str) {
+            Some("document_changed") => {
+                "a new document replaced the page; its outline is in changes".to_owned()
+            }
+            Some("diff_larger_than_snapshot") => {
+                "the page changed; its outline is in changes".to_owned()
+            }
+            // No baseline to compare with: a read, not a proven change.
+            _ => "the page was read again; its outline is in changes".to_owned(),
+        },
+        _ => match changes.get("reason").and_then(Value::as_str) {
+            Some("javascript_dialog_open") => {
+                "a JavaScript dialog opened during the input, which stopped there (answer it \
+                 with browser_dialog)"
+                    .to_owned()
+            }
+            Some(reason) => format!("the page could not be read afterwards ({reason})"),
+            None => "the page could not be read afterwards".to_owned(),
+        },
+    };
+    format!("{said}{still}")
+}
+
+/// A drag Chrome took over as HTML5 drag and drop: the data it would carry.
+fn intercepted_drag(event: &CdpEvent, cdp_session: &str) -> Option<Value> {
+    (event.method == "Input.dragIntercepted" && event.session_id.as_deref() == Some(cdp_session))
+    .then(|| event.params.get("data").cloned())
+    .flatten()
 }
 
 pub struct BrowserPointerTool {
     def: ToolDef,
     engine: Arc<BrowserEngine>,
+    /// What the read after the input is dispatched through.
+    registry: ReplayRegistrySlot,
 }
 
 impl BrowserPointerTool {
     pub fn new(engine: Arc<BrowserEngine>) -> Self {
+        Self::with_registry(engine, no_registry())
+    }
+
+    pub fn with_registry(engine: Arc<BrowserEngine>, registry: ReplayRegistrySlot) -> Self {
         Self {
             def: ToolDef {
                 name: "browser_pointer".into(),
-                description: "Hover, right-click, double-click, scroll, or drag in a bound tab by ref or viewport x,y, without activating the tab. Refs need the pointer capability (scroll also accepts scroll). dom_event requires a ref.".into(),
+                description: "Hover, right-click, double-click, scroll, or drag in a bound tab, \
+                    without activating it. Any ref from the outline can be pointed at (cards, \
+                    cells and text too, not only lines offering an action); trusted input goes \
+                    to the ref's live centre, refused as browser_target_covered when something \
+                    else is on top there. Drag from a ref or x,y to destination_ref or to_x,to_y \
+                    (HTML5 drag and drop included). Returns what the page changed in changes. \
+                    dom_event requires a ref."
+                    .into(),
                 input_schema: json!({
                     "type": "object",
                     "properties": {
                         "target_id": { "type": "string", "description": "Target id from get_browser_state." },
                         "tab_id": { "type": "string", "description": "Tab id from get_browser_state." },
-                        "session": required_session_schema(),
+                        "session": session_schema(),
                         "action": { "type": "string", "enum": ["hover", "right_click", "double_click", "scroll", "drag"] },
                         "input_route": { "type": "string", "enum": ["trusted", "dom_event"], "default": "trusted" },
                         "ref": { "type": "string", "description": "Origin page ref, instead of x,y." },
                         "x": { "type": "number", "description": "Origin viewport x in CSS pixels." },
                         "y": { "type": "number", "description": "Origin viewport y in CSS pixels." },
-                        "destination_ref": { "type": "string", "description": "Drag destination ref in the same frame." },
+                        "destination_ref": { "type": "string", "description": "Drag destination ref (a list, a cell) in the same frame; dropped at its centre." },
                         "to_x": { "type": "number", "description": "Drag destination x in CSS pixels." },
                         "to_y": { "type": "number", "description": "Drag destination y in CSS pixels." },
                         "delta_x": { "type": "number", "description": "Horizontal scroll in CSS pixels." },
                         "delta_y": { "type": "number", "description": "Vertical scroll in CSS pixels." }
                     },
-                    "required": ["target_id", "tab_id", "session", "action"],
+                    "required": ["target_id", "tab_id", "action"],
                     "additionalProperties": true
                 }),
                 read_only: false,
@@ -321,6 +412,7 @@ impl BrowserPointerTool {
                 open_world: true,
             },
             engine,
+            registry,
         }
     }
 
@@ -331,26 +423,12 @@ impl BrowserPointerTool {
         tab_id: &str,
         validated: &ValidatedTab,
         external: &str,
-        action: PointerAction,
     ) -> Result<ResolvedRef, ToolResult> {
         let entry = self
             .engine
             .store
             .resolve_ref(session, target_id, tab_id, external)
             .map_err(|refusal| refusal.to_tool_result())?;
-        let declared = ref_declares_pointer_action(&entry.actions, action);
-        if entry.semantic && !declared {
-            let required = if action == PointerAction::Scroll {
-                "scroll or pointer"
-            } else {
-                "pointer"
-            };
-            return Err(BrowserRefusal::new(
-                BrowserRefusalCode::BrowserActionUnavailable,
-                format!("semantic ref {external} does not declare the {required} action"),
-            )
-            .to_tool_result());
-        }
         let cdp_session = self
             .engine
             .frame_session_for_mutation(session, target_id, tab_id, validated, &entry)
@@ -362,6 +440,43 @@ impl BrowserPointerTool {
             frame: entry.frame,
             cdp_session,
         })
+    }
+
+    /// Where trusted input goes for one location: the point given, or the
+    /// ref's live centre once the page says its element is on top there.
+    async fn live(
+        &self,
+        validated: &ValidatedTab,
+        (session, target_id, tab_id): (&str, &str, &str),
+        location: &Location,
+        reference: Option<&ResolvedRef>,
+        noun: &'static str,
+        scroll: bool,
+    ) -> Result<(f64, f64), ToolResult> {
+        match (location, reference) {
+            (Location::Coordinates(x, y), None) => Ok((*x, *y)),
+            (Location::Ref(_), Some(reference)) => {
+                let held = HeldRef {
+                    session,
+                    target_id,
+                    tab_id,
+                    frame: &reference.frame,
+                    named: &reference.external,
+                };
+                live_point(
+                    &self.engine,
+                    &validated.conn,
+                    &reference.cdp_session,
+                    reference.backend_node_id,
+                    &held,
+                    LiveInput::Pointer(noun),
+                    scroll,
+                )
+                .await
+                .map_err(|refusal| refusal.to_tool_result())
+            }
+            _ => unreachable!("resolution matches the request"),
+        }
     }
 
     fn trusted_background_refusal(&self, validated: &ValidatedTab) -> Option<ToolResult> {
@@ -398,6 +513,8 @@ impl BrowserPointerTool {
         None
     }
 
+    /// Synthetic DOM events on the ref's element. `Ok` carries a dialog the
+    /// page opened while it handled them.
     async fn dom_event(
         &self,
         session: &str,
@@ -405,15 +522,12 @@ impl BrowserPointerTool {
         validated: &ValidatedTab,
         origin: &ResolvedRef,
         destination: Option<&ResolvedRef>,
-    ) -> ToolResult {
+    ) -> Result<Option<Settled>, ToolResult> {
         let conn = &validated.conn;
-        let object_id =
-            match resolve_object(conn, &origin.cdp_session, origin.backend_node_id).await {
-                Ok(id) => id,
-                Err(result) => return result,
-            };
+        let object_id = resolve_object(conn, &origin.cdp_session, origin.backend_node_id).await?;
 
-        if let Ok((x, y)) = point_for_ref(conn, &origin.cdp_session, origin.backend_node_id).await {
+        if let Some((x, y)) = point_for_ref(conn, &origin.cdp_session, origin.backend_node_id).await
+        {
             self.engine
                 .visualize_browser_action(
                     session,
@@ -445,24 +559,20 @@ impl BrowserPointerTool {
             ),
             PointerAction::Drag => {
                 let destination_argument = if let Some(destination) = destination {
-                    let object_id = match resolve_object(
+                    let object_id = resolve_object(
                         conn,
                         &destination.cdp_session,
                         destination.backend_node_id,
                     )
-                    .await
-                    {
-                        Ok(id) => id,
-                        Err(result) => return result,
-                    };
+                    .await?;
                     json!([{ "objectId": object_id }, { "value": Value::Null }, { "value": Value::Null }])
                 } else if let Some(Location::Coordinates(x, y)) = &request.destination {
                     if origin.frame.kind != FrameKind::Main {
-                        return BrowserRefusal::new(
+                        return Err(BrowserRefusal::new(
                             BrowserRefusalCode::BrowserWrongTargetRefused,
                             "coordinate drag destinations are only provably in the same frame for a main-frame origin; use destination_ref for iframe or OOPIF drag",
                         )
-                        .to_tool_result();
+                        .to_tool_result());
                     }
                     json!([{ "value": Value::Null }, { "value": x }, { "value": y }])
                 } else {
@@ -475,9 +585,15 @@ impl BrowserPointerTool {
             }
         };
 
-        match conn
-            .call(
-                Some(&origin.cdp_session),
+        let mut delivery = Delivery {
+            engine: &self.engine,
+            conn,
+            cdp: &origin.cdp_session,
+            target: validated.tab.cdp_target_id.as_str(),
+            opened: None,
+        };
+        match delivery
+            .send(
                 "Runtime.callFunctionOn",
                 json!({
                     "objectId": object_id,
@@ -488,113 +604,56 @@ impl BrowserPointerTool {
             )
             .await
         {
-            Ok(value)
+            Ok(None) => {
+                Err(dialog_open_refusal(delivery.opened.as_ref().expect("blocked by a dialog"))
+                    .to_tool_result())
+            }
+            Ok(Some(_)) if delivery.opened.is_some() => Ok(delivery.opened.map(Settled::Dialog)),
+            Ok(Some(value))
                 if value.get("exceptionDetails").is_none()
                     && (!matches!(request.action, PointerAction::Scroll | PointerAction::Drag)
                         || value.pointer("/result/value").and_then(Value::as_bool)
                             != Some(false)) =>
             {
-                ToolResult::text(format!(
-                    "dispatched synthetic {} in {}",
-                    request.action.as_str(),
-                    validated.tab.tab_id
-                ))
-                .with_structured(self.success_json(
-                    request,
-                    validated,
-                    origin,
-                    destination,
-                    None,
-                    None,
-                ))
+                Ok(None)
             }
-            Ok(value) if value.get("exceptionDetails").is_some() => BrowserRefusal::new(
+            Ok(Some(value)) if value.get("exceptionDetails").is_some() => Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserActionUnavailable,
                 format!(
                     "synthetic {} raised a page-side exception and delivery was not proven",
                     request.action.as_str()
                 ),
             )
-            .to_tool_result(),
-            Ok(_) if request.action == PointerAction::Drag => BrowserRefusal::new(
+            .to_tool_result()),
+            Ok(Some(_)) if request.action == PointerAction::Drag => Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserWrongTargetRefused,
                 "the drag destination did not resolve in the origin ref's exact document",
             )
-            .to_tool_result(),
-            Ok(_) => BrowserRefusal::new(
+            .to_tool_result()),
+            Ok(Some(_)) => Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserActionUnavailable,
                 "the synthetic scroll target did not move, so delivery was not proven",
             )
-            .to_tool_result(),
-            Err(error) => ToolResult::error(format!(
+            .to_tool_result()),
+            Err(error) => Err(ToolResult::error(format!(
                 "synthetic {} failed: {error}",
                 request.action.as_str()
-            )),
+            ))),
         }
     }
 
-    fn success_json(
-        &self,
-        request: &PointerRequest,
-        validated: &ValidatedTab,
-        origin: &ResolvedRef,
-        destination: Option<&ResolvedRef>,
-        origin_point: Option<(f64, f64)>,
-        destination_point: Option<(f64, f64)>,
-    ) -> Value {
-        let external_ref = (!origin.external.is_empty()).then_some(origin.external.as_str());
-        json!({
-            "status": "ok",
-            "action": request.action.as_str(),
-            "route": request.route.as_str(),
-            "target_id": validated.record.target_id,
-            "tab_id": validated.tab.tab_id,
-            "ref": external_ref,
-            "frame": origin.frame.kind.as_str(),
-            "destination_ref": destination.map(|value| value.external.as_str()),
-            "x": origin_point.map(|point| point.0),
-            "y": origin_point.map(|point| point.1),
-            "to_x": destination_point.map(|point| point.0),
-            "to_y": destination_point.map(|point| point.1),
-            "delta_x": (request.action == PointerAction::Scroll).then_some(request.delta_x),
-            "delta_y": (request.action == PointerAction::Scroll).then_some(request.delta_y),
-        })
-    }
-
+    /// Trusted CDP mouse input at `origin` (and `destination` for a drag).
+    /// `Ok` carries a dialog the page opened while it handled the input.
     async fn trusted(
         &self,
         session: &str,
         request: &PointerRequest,
         validated: &ValidatedTab,
-        origin_ref: Option<&ResolvedRef>,
-        destination_ref: Option<&ResolvedRef>,
-    ) -> ToolResult {
+        cdp_session: &str,
+        origin: (f64, f64),
+        destination: Option<(f64, f64)>,
+    ) -> Result<Option<Settled>, ToolResult> {
         let conn = &validated.conn;
-        let cdp_session = origin_ref
-            .map(|reference| reference.cdp_session.as_str())
-            .unwrap_or(validated.cdp_session.as_str());
-        let origin = match (&request.origin, origin_ref) {
-            (Location::Coordinates(x, y), None) => (*x, *y),
-            (Location::Ref(_), Some(reference)) => {
-                match point_for_ref(conn, &reference.cdp_session, reference.backend_node_id).await {
-                    Ok(point) => point,
-                    Err(result) => return result,
-                }
-            }
-            _ => unreachable!("origin resolution matches request"),
-        };
-        let destination = match (&request.destination, destination_ref) {
-            (Some(Location::Coordinates(x, y)), None) => Some((*x, *y)),
-            (Some(Location::Ref(_)), Some(reference)) => {
-                match point_for_ref(conn, &reference.cdp_session, reference.backend_node_id).await {
-                    Ok(point) => Some(point),
-                    Err(result) => return result,
-                }
-            }
-            (None, None) => None,
-            _ => unreachable!("destination resolution matches request"),
-        };
-
         self.engine
             .visualize_browser_action(
                 session,
@@ -614,36 +673,47 @@ impl BrowserPointerTool {
             )
             .await
         {
-            return BrowserRefusal::new(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserInputTrustUnavailable,
                 format!("the target tab could not enter CDP focus emulation: {error}"),
             )
-            .to_tool_result();
+            .to_tool_result());
         }
         tokio::time::sleep(Duration::from_millis(25)).await;
 
-        let delivery = self
-            .dispatch_trusted(conn, cdp_session, request, origin, destination)
-            .await;
-        let cleanup = conn
-            .call(
+        let mut delivery = Delivery {
+            engine: &self.engine,
+            conn,
+            cdp: cdp_session,
+            target: validated.tab.cdp_target_id.as_str(),
+            opened: None,
+        };
+        let sent = dispatch_trusted(&mut delivery, request, origin, destination).await;
+        let opened = delivery.opened.take();
+        // With a dialog up the page answers nothing, this included: the
+        // emulation ends with the attachment session instead.
+        let cleanup = if opened.is_some() {
+            Ok(json!({}))
+        } else {
+            conn.call(
                 Some(cdp_session),
                 "Emulation.setFocusEmulationEnabled",
                 json!({ "enabled": false }),
             )
-            .await;
-        if let Err(error) = delivery {
-            return BrowserRefusal::new(
+            .await
+        };
+        if let Err(error) = sent {
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserInputTrustUnavailable,
                 format!(
                     "trusted {} failed ({error}); no synthetic fallback was attempted",
                     request.action.as_str()
                 ),
             )
-            .to_tool_result();
+            .to_tool_result());
         }
         if let Err(error) = cleanup {
-            return BrowserRefusal::new(
+            return Err(BrowserRefusal::new(
                 BrowserRefusalCode::BrowserInputTrustUnavailable,
                 format!(
                     "trusted {} was acknowledged but focus emulation could not be restored ({error}); delivery is unknown and must not be retried automatically",
@@ -651,84 +721,188 @@ impl BrowserPointerTool {
                 ),
             )
             .with_detail(json!({ "delivery": "unknown", "retryable": false }))
-            .to_tool_result();
+            .to_tool_result());
         }
-
-        let synthetic_origin = ResolvedRef {
-            external: match &request.origin {
-                Location::Ref(reference) => reference.clone(),
-                Location::Coordinates(_, _) => String::new(),
-            },
-            backend_node_id: origin_ref.map_or(0, |reference| reference.backend_node_id),
-            frame: origin_ref
-                .map(|reference| reference.frame.clone())
-                .unwrap_or_else(FrameRef::main_unproven),
-            cdp_session: cdp_session.to_owned(),
-        };
-        ToolResult::text(format!(
-            "dispatched trusted {} in {}",
-            request.action.as_str(),
-            validated.tab.tab_id
-        ))
-        .with_structured(self.success_json(
-            request,
-            validated,
-            &synthetic_origin,
-            destination_ref,
-            Some(origin),
-            destination,
-        ))
+        Ok(opened.map(Settled::Dialog))
     }
+}
 
-    async fn dispatch_trusted(
-        &self,
-        conn: &CdpConnection,
-        cdp_session: &str,
-        request: &PointerRequest,
-        origin: (f64, f64),
-        destination: Option<(f64, f64)>,
-    ) -> anyhow::Result<()> {
-        let call = |params: Value| conn.call(Some(cdp_session), "Input.dispatchMouseEvent", params);
-        match request.action {
-            PointerAction::Hover => {
-                call(
+/// Send the mouse events. A dialog the page opens stops the sending; the
+/// caller finds it in `delivery.opened`.
+async fn dispatch_trusted(
+    delivery: &mut Delivery<'_>,
+    request: &PointerRequest,
+    origin: (f64, f64),
+    destination: Option<(f64, f64)>,
+) -> anyhow::Result<()> {
+    match request.action {
+        PointerAction::Hover => {
+            delivery
+                .send(
+                    "Input.dispatchMouseEvent",
                     json!({ "type": "mouseMoved", "x": origin.0, "y": origin.1, "button": "none" }),
                 )
                 .await?;
+        }
+        PointerAction::RightClick => {
+            for kind in ["mousePressed", "mouseReleased"] {
+                delivery
+                    .send(
+                        "Input.dispatchMouseEvent",
+                        json!({ "type": kind, "x": origin.0, "y": origin.1, "button": "right", "clickCount": 1 }),
+                    )
+                    .await?;
             }
-            PointerAction::RightClick => {
+        }
+        PointerAction::DoubleClick => {
+            delivery
+                .send(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": origin.0, "y": origin.1, "button": "none" }),
+                )
+                .await?;
+            for click_count in [1, 2] {
                 for kind in ["mousePressed", "mouseReleased"] {
-                    call(json!({ "type": kind, "x": origin.0, "y": origin.1, "button": "right", "clickCount": 1 })).await?;
+                    delivery
+                        .send(
+                            "Input.dispatchMouseEvent",
+                            json!({ "type": kind, "x": origin.0, "y": origin.1, "button": "left", "clickCount": click_count }),
+                        )
+                        .await?;
                 }
-            }
-            PointerAction::DoubleClick => {
-                for click_count in [1, 2] {
-                    for kind in ["mousePressed", "mouseReleased"] {
-                        call(json!({ "type": kind, "x": origin.0, "y": origin.1, "button": "left", "clickCount": click_count })).await?;
-                    }
-                }
-            }
-            PointerAction::Scroll => {
-                call(json!({ "type": "mouseWheel", "x": origin.0, "y": origin.1, "deltaX": request.delta_x, "deltaY": request.delta_y })).await?;
-            }
-            PointerAction::Drag => {
-                let destination = destination.expect("drag destination validated");
-                call(
-                    json!({ "type": "mouseMoved", "x": origin.0, "y": origin.1, "button": "none" }),
-                )
-                .await?;
-                call(json!({ "type": "mousePressed", "x": origin.0, "y": origin.1, "button": "left", "buttons": 1, "clickCount": 1 })).await?;
-                for step in 1..=8 {
-                    let progress = f64::from(step) / 8.0;
-                    let x = origin.0 + (destination.0 - origin.0) * progress;
-                    let y = origin.1 + (destination.1 - origin.1) * progress;
-                    call(json!({ "type": "mouseMoved", "x": x, "y": y, "button": "left", "buttons": 1 })).await?;
-                }
-                call(json!({ "type": "mouseReleased", "x": destination.0, "y": destination.1, "button": "left", "buttons": 0, "clickCount": 1 })).await?;
             }
         }
-        Ok(())
+        PointerAction::Scroll => {
+            delivery
+                .send(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseWheel", "x": origin.0, "y": origin.1, "deltaX": request.delta_x, "deltaY": request.delta_y }),
+                )
+                .await?;
+        }
+        PointerAction::Drag => {
+            drag(
+                delivery,
+                origin,
+                destination.expect("drag destination validated"),
+            )
+            .await?;
+        }
     }
+    Ok(())
+}
+
+/// Press at `origin`, move in steps, release at `destination`. Drags are
+/// intercepted first: an element that starts an HTML5 drag-and-drop would
+/// otherwise hand the drag to the operating system, which follows the real
+/// mouse, not these events. Chrome then reports the drag's data instead
+/// (`Input.dragIntercepted`), and the drop is carried to the destination as
+/// drag events. A drag that page script draws from pointer events (dragula,
+/// SortableJS's fallback) is never intercepted and is the moves themselves,
+/// a frame apart, so a library that tracks the pointer per animation frame
+/// sees each one. Whatever stops the drag part way, the button is released
+/// and interception is turned off again.
+async fn drag(
+    delivery: &mut Delivery<'_>,
+    origin: (f64, f64),
+    destination: (f64, f64),
+) -> anyhow::Result<()> {
+    let conn = delivery.conn;
+    let cdp = delivery.cdp;
+    let mut events = conn.subscribe();
+    // Without interception an HTML5 drag would go to the operating system
+    // and never end: send nothing.
+    conn.call(Some(cdp), "Input.setInterceptDrags", json!({ "enabled": true }))
+        .await
+        .map_err(|error| anyhow::anyhow!("Chrome would not intercept the drag ({error}), so none was started"))?;
+    let mut pressed = false;
+    let result = async {
+        delivery
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({ "type": "mouseMoved", "x": origin.0, "y": origin.1, "button": "none" }),
+            )
+            .await?;
+        pressed = delivery
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({ "type": "mousePressed", "x": origin.0, "y": origin.1, "button": "left", "buttons": 1, "clickCount": 1 }),
+            )
+            .await?
+            .is_some();
+        let take = |events: &mut tokio::sync::mpsc::UnboundedReceiver<CdpEvent>| {
+            std::iter::from_fn(|| events.try_recv().ok()).find_map(|event| intercepted_drag(&event, cdp))
+        };
+        let mut data = None;
+        for step in 1..=DRAG_STEPS {
+            tokio::time::sleep(DRAG_FRAME).await;
+            let progress = f64::from(step) / f64::from(DRAG_STEPS);
+            let x = origin.0 + (destination.0 - origin.0) * progress;
+            let y = origin.1 + (destination.1 - origin.1) * progress;
+            delivery
+                .send(
+                    "Input.dispatchMouseEvent",
+                    json!({ "type": "mouseMoved", "x": x, "y": y, "button": "left", "buttons": 1 }),
+                )
+                .await?;
+            data = take(&mut events);
+            if data.is_some() {
+                break;
+            }
+        }
+        if data.is_none() && delivery.opened.is_none() {
+            let deadline = tokio::time::Instant::now() + DRAG_INTERCEPT_WAIT;
+            while data.is_none() {
+                match tokio::time::timeout_at(deadline, events.recv()).await {
+                    Ok(Some(event)) => data = intercepted_drag(&event, cdp),
+                    _ => break,
+                }
+            }
+        }
+        if let Some(data) = data {
+            for kind in ["dragEnter", "dragOver", "drop"] {
+                delivery
+                    .send(
+                        "Input.dispatchDragEvent",
+                        json!({ "type": kind, "x": destination.0, "y": destination.1, "data": data }),
+                    )
+                    .await?;
+            }
+        } else {
+            // The page's own drag: let it see the pointer rest over the drop.
+            tokio::time::sleep(DRAG_FRAME * 3).await;
+        }
+        delivery
+            .send(
+                "Input.dispatchMouseEvent",
+                json!({ "type": "mouseReleased", "x": destination.0, "y": destination.1, "button": "left", "buttons": 0, "clickCount": 1 }),
+            )
+            .await?;
+        pressed = false;
+        anyhow::Ok(())
+    }
+    .await;
+    // A drag stopped after the press still lets the button go (a page behind
+    // a dialog answers nothing, so not then).
+    if pressed && delivery.opened.is_none() {
+        let _ = tokio::time::timeout(
+            CLEANUP_TIMEOUT,
+            conn.call(
+                Some(cdp),
+                "Input.dispatchMouseEvent",
+                json!({ "type": "mouseReleased", "x": destination.0, "y": destination.1, "button": "left", "buttons": 0, "clickCount": 1 }),
+            ),
+        )
+        .await;
+    }
+    // The browser answers this one even with a dialog up: interception left
+    // on would swallow the user's own drags in this tab.
+    let _ = tokio::time::timeout(
+        CLEANUP_TIMEOUT,
+        conn.call(Some(cdp), "Input.setInterceptDrags", json!({ "enabled": false })),
+    )
+    .await;
+    result
 }
 
 #[async_trait]
@@ -770,7 +944,7 @@ impl Tool for BrowserPointerTool {
             Ok(value) => value,
             Err(error) => return error,
         };
-        let session = match explicit_session(&args) {
+        let session = match require_session(&args) {
             Ok(value) => value,
             Err(error) => return error,
         };
@@ -802,16 +976,21 @@ impl Tool for BrowserPointerTool {
             }
         }
 
+        // What the session holds now is what the changes are made against.
+        let held = self.engine.held_view(&session, &target_id, &tab_id);
+        // A double-click can open a JavaScript dialog, and a page behind one
+        // answers nothing: hear about it, and send nothing into one already up.
+        let cdp_target = validated.tab.cdp_target_id.as_str();
+        self.engine
+            .watch_dialogs(&validated.conn, &validated.cdp_session, cdp_target)
+            .await;
+        if let Some(dialog) = validated.conn.dialog_state(cdp_target) {
+            return dialog_open_refusal(&dialog).to_tool_result();
+        }
+
         let origin_ref = match &request.origin {
             Location::Ref(external) => match self
-                .resolve_ref(
-                    &session,
-                    &target_id,
-                    &tab_id,
-                    &validated,
-                    external,
-                    request.action,
-                )
+                .resolve_ref(&session, &target_id, &tab_id, &validated, external)
                 .await
             {
                 Ok(reference) => Some(reference),
@@ -821,14 +1000,7 @@ impl Tool for BrowserPointerTool {
         };
         let destination_ref = match &request.destination {
             Some(Location::Ref(external)) => match self
-                .resolve_ref(
-                    &session,
-                    &target_id,
-                    &tab_id,
-                    &validated,
-                    external,
-                    request.action,
-                )
+                .resolve_ref(&session, &target_id, &tab_id, &validated, external)
                 .await
             {
                 Ok(reference) => Some(reference),
@@ -871,9 +1043,16 @@ impl Tool for BrowserPointerTool {
             .to_tool_result();
         }
 
-        match request.route {
-            InputRoute::DomEvent => {
-                self.dom_event(
+        // From before the input: a navigation it sets off is seen starting.
+        let mut watch = self.engine.page_watch(&validated).await;
+        let reads = changes_will_be_read(&self.registry, held);
+        let (sent, points) = match request.route {
+            InputRoute::DomEvent => (
+                {
+                    if reads {
+                        self.engine.count_from_here(&validated, &mut watch).await;
+                    }
+                    self.dom_event(
                     &session,
                     &request,
                     &validated,
@@ -881,18 +1060,145 @@ impl Tool for BrowserPointerTool {
                     destination_ref.as_ref(),
                 )
                 .await
-            }
+                },
+                None,
+            ),
             InputRoute::Trusted => {
-                self.trusted(
-                    &session,
-                    &request,
-                    &validated,
-                    origin_ref.as_ref(),
-                    destination_ref.as_ref(),
+                let cdp_session = origin_ref
+                    .as_ref()
+                    .map(|reference| reference.cdp_session.clone())
+                    .unwrap_or_else(|| validated.cdp_session.clone());
+                let ids = (session.as_str(), target_id.as_str(), tab_id.as_str());
+                let origin = match self
+                    .live(&validated, ids, &request.origin, origin_ref.as_ref(), request.action.noun(), true)
+                    .await
+                {
+                    Ok(point) => point,
+                    Err(result) => return result,
+                };
+                let destination = match &request.destination {
+                    Some(location) => match self
+                        .live(&validated, ids, location, destination_ref.as_ref(), "drop", true)
+                        .await
+                    {
+                        Ok(point) => Some(point),
+                        Err(result) => return result,
+                    },
+                    None => None,
+                };
+                // Scrolling to the drop point may have moved the origin: look
+                // at it again where it is now, without scrolling.
+                let origin = match (&destination_ref, &origin_ref) {
+                    (Some(_), Some(reference)) => match self
+                        .live(&validated, ids, &request.origin, Some(reference), "drag", false)
+                        .await
+                    {
+                        Ok(point) => point,
+                        Err(_) => {
+                            return BrowserRefusal::new(
+                                BrowserRefusalCode::BrowserTargetCovered,
+                                format!(
+                                    "{} and {} are not both reachable at once: once the drop \
+                                     point was scrolled into view, the centre of {} was out of \
+                                     view or covered, so no drag was sent. Scroll so both are \
+                                     visible, or drag in shorter moves",
+                                    reference.external,
+                                    destination_ref.as_ref().map_or("", |r| r.external.as_str()),
+                                    reference.external
+                                ),
+                            )
+                            .with_detail(json!({ "input_sent": false }))
+                            .to_tool_result()
+                        }
+                    },
+                    _ => origin,
+                };
+                if reads {
+                    self.engine.count_from_here(&validated, &mut watch).await;
+                }
+                (
+                    self.trusted(
+                        &session,
+                        &request,
+                        &validated,
+                        &cdp_session,
+                        origin,
+                        destination,
+                    )
+                    .await,
+                    Some((origin, destination)),
                 )
-                .await
             }
+        };
+        let opened = match sent {
+            Ok(opened) => opened,
+            Err(refused) => return refused,
+        };
+        let changes = page_changes_after(
+            &self.engine,
+            &self.registry,
+            &args,
+            &target_id,
+            &tab_id,
+            &validated,
+            held,
+            opened,
+            watch,
+        )
+        .await;
+
+        let at = |point: Option<(f64, f64)>| {
+            point.map_or(String::new(), |(x, y)| format!(" at ({x:.0}, {y:.0})"))
+        };
+        let origin_named = match &request.origin {
+            Location::Ref(reference) => reference.clone(),
+            Location::Coordinates(_, _) => "the point".to_owned(),
+        };
+        let mut said = format!(
+            "{} {origin_named}{}",
+            request.action.past(),
+            at(points.map(|(origin, _)| origin))
+        );
+        if let Some(destination) = &request.destination {
+            let named = match destination {
+                Location::Ref(reference) => reference.clone(),
+                Location::Coordinates(_, _) => "the point".to_owned(),
+            };
+            said.push_str(&format!(
+                " to {named}{}",
+                at(points.and_then(|(_, destination)| destination))
+            ));
         }
+        if request.action == PointerAction::Scroll {
+            said.push_str(&format!(" by ({}, {})", request.delta_x, request.delta_y));
+        }
+        let route = match request.route {
+            InputRoute::Trusted => "",
+            InputRoute::DomEvent => " with synthetic DOM events (trust-gated handlers may ignore them)",
+        };
+        said.push_str(&format!(
+            "{route} in {tab_id}; {}",
+            changes_summary(changes.as_ref())
+        ));
+
+        let external = |reference: Option<&ResolvedRef>| reference.map(|r| r.external.clone());
+        let structured = json!({
+            "status": "ok",
+            "action": request.action.as_str(),
+            "route": request.route.as_str(),
+            "target_id": target_id,
+            "tab_id": tab_id,
+            "ref": external(origin_ref.as_ref()),
+            "frame": origin_ref.as_ref().map(|r| r.frame.kind.as_str()),
+            "destination_ref": external(destination_ref.as_ref()),
+            "x": points.map(|(origin, _)| origin.0),
+            "y": points.map(|(origin, _)| origin.1),
+            "to_x": points.and_then(|(_, destination)| destination).map(|point| point.0),
+            "to_y": points.and_then(|(_, destination)| destination).map(|point| point.1),
+            "delta_x": (request.action == PointerAction::Scroll).then_some(request.delta_x),
+            "delta_y": (request.action == PointerAction::Scroll).then_some(request.delta_y),
+        });
+        with_changes(ToolResult::text(said).with_structured(structured), changes)
     }
 }
 
@@ -957,42 +1263,6 @@ mod tests {
     }
 
     #[test]
-    fn scroll_capability_does_not_authorize_other_pointer_actions() {
-        let scroll_only = [BrowserActionKind::Scroll];
-        assert!(ref_declares_pointer_action(
-            &scroll_only,
-            PointerAction::Scroll
-        ));
-        for action in [
-            PointerAction::Hover,
-            PointerAction::RightClick,
-            PointerAction::DoubleClick,
-            PointerAction::Drag,
-        ] {
-            assert!(!ref_declares_pointer_action(&scroll_only, action));
-        }
-
-        let pointer = [BrowserActionKind::Pointer];
-        assert!(ref_declares_pointer_action(&pointer, PointerAction::Scroll));
-        assert!(ref_declares_pointer_action(
-            &pointer,
-            PointerAction::RightClick
-        ));
-    }
-
-    #[test]
-    fn quad_center_rejects_malformed_models() {
-        assert_eq!(
-            quad_center(&json!({ "model": { "content": [0, 0, 10, 0, 10, 20, 0, 20] } })),
-            Some((5.0, 10.0))
-        );
-        assert_eq!(
-            quad_center(&json!({ "model": { "content": [0, 0] } })),
-            None
-        );
-    }
-
-    #[test]
     fn exact_frame_comparison_includes_document_identity() {
         let first = FrameRef::main_unproven();
         let second = FrameRef::main_unproven();
@@ -1007,5 +1277,51 @@ mod tests {
             }),
         };
         assert!(!same_exact_frame(&first, &navigated));
+    }
+
+    #[test]
+    fn a_result_says_what_the_page_did_never_a_bare_ok() {
+        let table = [
+            (None, "the page was not read afterwards"),
+            (
+                Some(json!({"kind": "diff", "ops": []})),
+                "nothing in the page's outline changed",
+            ),
+            (
+                Some(json!({"kind": "diff", "ops": [
+                    {"op": "move", "ref": "p1:3"}, {"op": "change", "ref": "p1:4"},
+                    {"op": "move", "ref": "p1:5"}]})),
+                "the page changed: 1 changed, 2 moved line(s), listed in changes",
+            ),
+            (
+                Some(json!({"kind": "snapshot", "reason": "document_changed", "outline": "-"})),
+                "a new document replaced the page",
+            ),
+            (
+                Some(json!({"kind": "unavailable", "reason": "javascript_dialog_open"})),
+                "a JavaScript dialog opened",
+            ),
+            (
+                Some(json!({"kind": "diff", "ops": [{"op": "add", "ref": "p1:9"}], "settled": false})),
+                "1 added line(s), listed in changes; the page had not settled",
+            ),
+        ];
+        for (changes, says) in table {
+            let said = changes_summary(changes.as_ref());
+            assert!(said.contains(says), "{said:?} should say {says:?}");
+        }
+    }
+
+    #[test]
+    fn only_this_tabs_intercepted_drag_carries_data() {
+        let event = |session: Option<&str>, method: &str| CdpEvent {
+            method: method.into(),
+            session_id: session.map(str::to_owned),
+            params: json!({"data": {"items": [], "dragOperationsMask": 1}}),
+        };
+        assert!(intercepted_drag(&event(Some("s1"), "Input.dragIntercepted"), "s1").is_some());
+        assert!(intercepted_drag(&event(None, "Input.dragIntercepted"), "s1").is_none());
+        assert!(intercepted_drag(&event(Some("s2"), "Input.dragIntercepted"), "s1").is_none());
+        assert!(intercepted_drag(&event(Some("s1"), "Page.frameNavigated"), "s1").is_none());
     }
 }

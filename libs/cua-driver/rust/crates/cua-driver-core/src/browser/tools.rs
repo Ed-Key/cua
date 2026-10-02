@@ -58,12 +58,15 @@ pub fn register_browser_tools(engine: &Arc<BrowserEngine>, registry: &mut ToolRe
     )));
     registry.register(Box::new(super::steps::BrowserStepsTool::new(
         engine.clone(),
-        slot,
+        slot.clone(),
     )));
     registry.register(Box::new(BrowserDialogTool::new(engine.clone())));
     registry.register(Box::new(BrowserSetInputFilesTool::new(engine.clone())));
     registry.register(Box::new(BrowserDownloadTool::new(engine.clone())));
-    registry.register(Box::new(BrowserPointerTool::new(engine.clone())));
+    registry.register(Box::new(BrowserPointerTool::with_registry(
+        engine.clone(),
+        slot,
+    )));
     registry.register(Box::new(super::tabs_tool::BrowserTabsTool::new(
         super::extension_bridge::global().clone(),
     )));
@@ -82,7 +85,7 @@ pub(crate) fn session_of(args: &Value) -> String {
 /// Targets and refs are minted into a session with a real owner, whose end
 /// cleans them up: a label the caller chose, or its transport's implicit
 /// session. Only a call with neither (no transport, no label) is refused.
-fn require_session(args: &Value) -> Result<String, ToolResult> {
+pub(crate) fn require_session(args: &Value) -> Result<String, ToolResult> {
     let sid = session_of(args);
     if sid.is_empty() || sid == "default" {
         return Err(ToolResult::error(
@@ -229,13 +232,13 @@ pub(crate) async fn browser_protected_resource_scope(
 /// Sends the calls that put input into a page, and stops when a JavaScript
 /// dialog opens: a page behind one answers nothing, the call that opened it
 /// included.
-struct Delivery<'a> {
-    engine: &'a BrowserEngine,
-    conn: &'a CdpConnection,
-    cdp: &'a str,
-    target: &'a str,
+pub(crate) struct Delivery<'a> {
+    pub(crate) engine: &'a BrowserEngine,
+    pub(crate) conn: &'a CdpConnection,
+    pub(crate) cdp: &'a str,
+    pub(crate) target: &'a str,
     /// The dialog the page opened while handling what was sent.
-    opened: Option<CdpDialogState>,
+    pub(crate) opened: Option<CdpDialogState>,
 }
 
 impl Delivery<'_> {
@@ -259,7 +262,7 @@ impl Delivery<'_> {
     /// Send one call; `Ok(None)` when it was not sent because a dialog is
     /// open. A call the page answered is `Ok(Some(..))` even when the dialog
     /// opened while it ran: what it carried did reach the page.
-    async fn send(&mut self, method: &str, params: Value) -> anyhow::Result<Option<Value>> {
+    pub(crate) async fn send(&mut self, method: &str, params: Value) -> anyhow::Result<Option<Value>> {
         if self.blocked() {
             return Ok(None);
         }
@@ -300,7 +303,7 @@ pub(crate) fn public_session(args: &Value) -> Option<String> {
         })
 }
 
-fn no_registry() -> ReplayRegistrySlot {
+pub(crate) fn no_registry() -> ReplayRegistrySlot {
     Arc::new(Mutex::new(Weak::new()))
 }
 
@@ -430,7 +433,7 @@ fn changes_value(changes: &PageChanges) -> Value {
 // One action's tab, what its session held, and how the wait for the page
 // is to be made or has already ended.
 #[allow(clippy::too_many_arguments)]
-async fn page_changes_after(
+pub(crate) async fn page_changes_after(
     engine: &BrowserEngine,
     registry: &ReplayRegistrySlot,
     args: &Value,
@@ -508,8 +511,15 @@ async fn page_changes_after(
     Some(changes)
 }
 
+/// Whether [`page_changes_after`] will wait for the page and read it: what
+/// starting a mutation counter before the input is worth doing for.
+pub(crate) fn changes_will_be_read(registry: &ReplayRegistrySlot, held: HeldView) -> bool {
+    super::steps::in_steps_batch()
+        || (held != HeldView::DomRefs && registry.lock().unwrap().upgrade().is_some())
+}
+
 /// Put `changes` on a result that has structured content.
-fn with_changes(mut result: ToolResult, changes: Option<Value>) -> ToolResult {
+pub(crate) fn with_changes(mut result: ToolResult, changes: Option<Value>) -> ToolResult {
     if let (Some(changes), Some(structured)) = (changes, result.structured_content.as_mut()) {
         structured["changes"] = changes;
     }
@@ -656,7 +666,8 @@ impl GetBrowserStateTool {
             description: "Read-only browser inspection. Start with app (macOS: the app's only \
                 window) or pid + window_id: it binds the window and returns target_id, the \
                 tabs, and the active tab's tab_id and outline, one line per element with its \
-                ref and actions inline. Later reads pass target_id + tab_id. Consent and \
+                ref and actions inline (drag and double_click are browser_pointer actions). \
+                Later reads pass target_id + tab_id. Consent and \
                 setup refusals give the browser_prepare call to make. \
                 Details: skill://cua-driver/BROWSER.md"
                 .into(),
@@ -1486,8 +1497,9 @@ impl Tool for BrowserNavigateTool {
                     // replaced the old one.
                     let loaded = self
                         .engine
-                        .await_document(&validated, None, tokio::time::Instant::now())
-                        .await;
+                        .await_document(&validated, None, tokio::time::Instant::now(), || true)
+                        .await
+                        .unwrap_or(Settled::Deadline);
                     page_changes_after(
                         &self.engine,
                         &self.registry,
@@ -1803,6 +1815,10 @@ impl Tool for BrowserClickTool {
                         .await;
                 }
             }
+            let mut watch = watch;
+            if changes_will_be_read(&self.registry, held) {
+                self.engine.count_from_here(&validated, &mut watch).await;
+            }
             let opened = match self
                 .engine
                 .call_until_dialog(
@@ -1861,130 +1877,26 @@ impl Tool for BrowserClickTool {
         }
 
         // Trusted route: resolve a click point, then Input.dispatchMouseEvent.
-        let (x, y) =
-            match (backend_node_id, coords) {
-                (Some(backend), _) => {
-                    // The point is the centre of the element's box, and the click
-                    // goes to whatever is on top there. Ask the page what that
-                    // is before sending it: once more after a scroll and a beat
-                    // (a popover may still be moving), then refuse.
-                    let mut attempt = 0;
-                    loop {
-                        // Best effort scroll-into-view; ignore failure (older Chromium).
-                        let _ = conn
-                            .call(
-                                Some(cdp),
-                                "DOM.scrollIntoViewIfNeeded",
-                                json!({ "backendNodeId": backend }),
-                            )
-                            .await;
-                        let box_model = match conn
-                            .call(
-                                Some(cdp),
-                                "DOM.getBoxModel",
-                                json!({ "backendNodeId": backend }),
-                            )
-                            .await
-                        {
-                            Ok(v) => v,
-                            Err(_) => return BrowserRefusal::new(
-                                BrowserRefusalCode::BrowserRefStale,
-                                "the ref's node has no layout box — it left the DOM or is hidden",
-                            )
-                            .to_tool_result(),
-                        };
-                        let Some(point) = quad_center(&box_model) else {
-                            return BrowserRefusal::new(
-                                BrowserRefusalCode::BrowserRefStale,
-                                "the ref's node returned an unusable layout box",
-                            )
-                            .to_tool_result();
-                        };
-                        let (hit, probe) = hit_test(conn, cdp, backend, point, &box_model).await;
-                        let named = ext_ref.as_deref().unwrap_or("the ref");
-                        let blocked = match hit {
-                            Hit::Receives => break point,
-                            Hit::Gone => {
-                                return BrowserRefusal::new(
-                                    BrowserRefusalCode::BrowserRefStale,
-                                    "the ref's node left the page before the click",
-                                )
-                                .to_tool_result()
-                            }
-                            blocked => blocked,
-                        };
-                        if attempt == 0 {
-                            attempt += 1;
-                            tokio::time::sleep(HIT_TEST_RETRY).await;
-                            continue;
-                        }
-                        // Name what is on top by the ref the session holds for
-                        // it: a ref is something the caller already has. What the
-                        // element says is page content, which only a read tells.
-                        let on_top = match (&blocked, &probe, &ref_frame) {
-                            (Hit::Covered { .. } | Hit::Container, Some(probe), Some(frame)) => {
-                                match probe.element_on_top(conn, cdp).await {
-                                    Some(covering) => self.engine.store.ref_of_node(
-                                        &session, &target_id, &tab_id, frame, covering,
-                                    ),
-                                    None => None,
-                                }
-                            }
-                            _ => None,
-                        };
-                        let by = match (&blocked, &on_top) {
-                            (
-                                Hit::Covered {
-                                    own_indicator: true,
-                                },
-                                _,
-                            ) => "Cua's own \"working in this tab\" pill".to_owned(),
-                            (_, Some(reference)) => reference.clone(),
-                            _ => "an element that has no ref in the outline you hold (read the \
-                              page again to see it)"
-                                .to_owned(),
-                        };
-                        let refusal = match blocked {
-                            Hit::Covered { .. } => BrowserRefusal::new(
-                                BrowserRefusalCode::BrowserTargetCovered,
-                                format!(
-                                "{named} is covered at its centre by {by}: a click there would \
-                                 go to that element, so none was sent. Deal with what covers it \
-                                 (close it or scroll it away), or act on it by its own ref"
-                            ),
-                            ),
-                            Hit::Container => BrowserRefusal::new(
-                                BrowserRefusalCode::BrowserTargetCovered,
-                                format!(
-                                    "{named} takes no click at its centre: the element around it, \
-                                 {by}, would receive it (the ref's element takes no pointer \
-                                 input there, or is drawn elsewhere), so none was sent"
-                                ),
-                            ),
-                            Hit::Outside => BrowserRefusal::new(
-                                BrowserRefusalCode::BrowserTargetCovered,
-                                format!(
-                                    "the centre of {named} is outside the visible page even after \
-                                 scrolling to it, so no click was sent"
-                                ),
-                            ),
-                            _ => BrowserRefusal::new(
-                                BrowserRefusalCode::BrowserActionUnavailable,
-                                format!(
-                                    "the page did not say which element a click at the centre of \
-                                 {named} would reach, so none was sent; input_route \
-                                 \"dom_event\" clicks the element itself"
-                                ),
-                            ),
-                        };
-                        return refusal
-                            .with_detail(json!({ "covered_by_ref": on_top, "click_sent": false }))
-                            .to_tool_result();
-                    }
+        let (x, y) = match (backend_node_id, coords) {
+            (Some(backend), _) => {
+                let frame = ref_frame.as_ref().expect("a ref has a frame");
+                let held = HeldRef {
+                    session: &session,
+                    target_id: &target_id,
+                    tab_id: &tab_id,
+                    frame,
+                    named: ext_ref.as_deref().unwrap_or("the ref"),
+                };
+                match live_point(&self.engine, conn, cdp, backend, &held, LiveInput::Click, true)
+                    .await
+                {
+                    Ok(point) => point,
+                    Err(refusal) => return refusal.to_tool_result(),
                 }
-                (None, Some(pt)) => pt,
-                (None, None) => unreachable!("validated above"),
-            };
+            }
+            (None, Some(pt)) => pt,
+            (None, None) => unreachable!("validated above"),
+        };
 
         self.engine
             .visualize_browser_action(
@@ -2012,6 +1924,10 @@ impl Tool for BrowserClickTool {
                 ),
             )
             .to_tool_result();
+        }
+        let mut watch = watch;
+        if changes_will_be_read(&self.registry, held) {
+            self.engine.count_from_here(&validated, &mut watch).await;
         }
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
@@ -2115,6 +2031,185 @@ impl Tool for BrowserClickTool {
 
 /// How long a covered target is given before it is looked at once more.
 const HIT_TEST_RETRY: std::time::Duration = std::time::Duration::from_millis(150);
+
+/// The pointer input a hit-test holds back when the ref's element would not
+/// receive it, as its refusal names it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum LiveInput {
+    Click,
+    /// browser_pointer's input: the noun its refusals use ("double-click",
+    /// "drag", "hover", "right-click", "scroll", "drop").
+    Pointer(&'static str),
+}
+
+impl LiveInput {
+    fn noun(self) -> &'static str {
+        match self {
+            Self::Click => "click",
+            Self::Pointer(noun) => noun,
+        }
+    }
+
+    fn sent_key(self) -> &'static str {
+        match self {
+            Self::Click => "click_sent",
+            Self::Pointer(_) => "input_sent",
+        }
+    }
+
+    fn dom_event_hint(self) -> &'static str {
+        match self {
+            Self::Click => "input_route \"dom_event\" clicks the element itself",
+            Self::Pointer(_) => "input_route \"dom_event\" sends the events to the element itself",
+        }
+    }
+}
+
+/// A ref the session holds, for naming it (and what covers it) in a refusal.
+pub(crate) struct HeldRef<'a> {
+    pub(crate) session: &'a str,
+    pub(crate) target_id: &'a str,
+    pub(crate) tab_id: &'a str,
+    pub(crate) frame: &'a super::store::FrameRef,
+    /// How the refusal names the ref (`p3:7`).
+    pub(crate) named: &'a str,
+}
+
+/// The viewport point where trusted pointer input reaches a ref's element:
+/// the centre of its box, once the page says the element (something inside
+/// it, or its label) is on top there. Pointer input goes to whatever is on
+/// top, so this is asked before any is sent: once more after a scroll and a
+/// beat (a popover may still be moving), then refused, naming what is on top
+/// by a ref the session holds.
+///
+/// `scroll: false` looks where the element is now without scrolling to it
+/// (a drag's origin, looked at again once its drop point was scrolled to).
+pub(crate) async fn live_point(
+    engine: &BrowserEngine,
+    conn: &CdpConnection,
+    cdp: &str,
+    backend: i64,
+    held: &HeldRef<'_>,
+    input: LiveInput,
+    scroll: bool,
+) -> Result<(f64, f64), BrowserRefusal> {
+    let noun = input.noun();
+    let named = held.named;
+    let mut attempt = 0;
+    loop {
+        // Best effort scroll-into-view; ignore failure (older Chromium).
+        if scroll {
+            let _ = conn
+                .call(
+                    Some(cdp),
+                    "DOM.scrollIntoViewIfNeeded",
+                    json!({ "backendNodeId": backend }),
+                )
+                .await;
+        }
+        let box_model = conn
+            .call(
+                Some(cdp),
+                "DOM.getBoxModel",
+                json!({ "backendNodeId": backend }),
+            )
+            .await
+            .map_err(|_| {
+                BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRefStale,
+                    "the ref's node has no layout box — it left the DOM or is hidden",
+                )
+            })?;
+        let point = quad_center(&box_model).ok_or_else(|| {
+            BrowserRefusal::new(
+                BrowserRefusalCode::BrowserRefStale,
+                "the ref's node returned an unusable layout box",
+            )
+        })?;
+        let (hit, probe) = hit_test(conn, cdp, backend, point, &box_model).await;
+        let blocked = match hit {
+            Hit::Receives => return Ok(point),
+            Hit::Gone => {
+                return Err(BrowserRefusal::new(
+                    BrowserRefusalCode::BrowserRefStale,
+                    format!("the ref's node left the page before the {noun}"),
+                ))
+            }
+            blocked => blocked,
+        };
+        if attempt == 0 {
+            attempt += 1;
+            tokio::time::sleep(HIT_TEST_RETRY).await;
+            continue;
+        }
+        // Name what is on top by the ref the session holds for it: a ref is
+        // something the caller already has. What the element says is page
+        // content, which only a read tells.
+        let on_top = match (&blocked, &probe) {
+            (Hit::Covered { .. } | Hit::Container, Some(probe)) => {
+                match probe.element_on_top(conn, cdp).await {
+                    Some(covering) => engine.store.ref_of_node(
+                        held.session,
+                        held.target_id,
+                        held.tab_id,
+                        held.frame,
+                        covering,
+                    ),
+                    None => None,
+                }
+            }
+            _ => None,
+        };
+        let by = match (&blocked, &on_top) {
+            (
+                Hit::Covered {
+                    own_indicator: true,
+                },
+                _,
+            ) => "Cua's own \"working in this tab\" pill".to_owned(),
+            (_, Some(reference)) => reference.clone(),
+            _ => "an element that has no ref in the outline you hold (read the page again to \
+                  see it)"
+                .to_owned(),
+        };
+        let refusal = match blocked {
+            Hit::Covered { .. } => BrowserRefusal::new(
+                BrowserRefusalCode::BrowserTargetCovered,
+                format!(
+                    "{named} is covered at its centre by {by}: a {noun} there would go to that \
+                     element, so none was sent. Deal with what covers it (close it or scroll it \
+                     away), or act on it by its own ref"
+                ),
+            ),
+            Hit::Container => BrowserRefusal::new(
+                BrowserRefusalCode::BrowserTargetCovered,
+                format!(
+                    "{named} takes no {noun} at its centre: the element around it, {by}, would \
+                     receive it (the ref's element takes no pointer input there, or is drawn \
+                     elsewhere), so none was sent"
+                ),
+            ),
+            Hit::Outside => BrowserRefusal::new(
+                BrowserRefusalCode::BrowserTargetCovered,
+                format!(
+                    "the centre of {named} is outside the visible page even after scrolling to \
+                     it, so no {noun} was sent"
+                ),
+            ),
+            _ => BrowserRefusal::new(
+                BrowserRefusalCode::BrowserActionUnavailable,
+                format!(
+                    "the page did not say which element a {noun} at the centre of {named} would \
+                     reach, so none was sent; {}",
+                    input.dom_event_hint()
+                ),
+            ),
+        };
+        let mut detail = json!({ "covered_by_ref": on_top });
+        detail[input.sent_key()] = json!(false);
+        return Err(refusal.with_detail(detail));
+    }
+}
 
 /// What is on top at a ref's click point, as the page reports it. Run on the
 /// ref's node; `x`, `y` are the click point and `bx`, `by` the top-left of
@@ -2300,7 +2395,7 @@ async fn hit_test(
 }
 
 /// Center of the content quad from a `DOM.getBoxModel` result.
-fn quad_center(box_model: &Value) -> Option<(f64, f64)> {
+pub(crate) fn quad_center(box_model: &Value) -> Option<(f64, f64)> {
     let quad = box_model.get("model")?.get("content")?.as_array()?;
     if quad.len() < 8 {
         return None;

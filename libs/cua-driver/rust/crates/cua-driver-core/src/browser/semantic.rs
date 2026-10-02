@@ -94,7 +94,76 @@ struct DomMeta {
     own_indicator: bool,
     parent_backend_node_id: Option<i64>,
     frame_id: Option<String>,
+    /// What the element's own event listeners handle (see
+    /// [`DomIndex::add_listeners`]).
+    listened: Listened,
+    /// It listens to so many kinds of event that it is an event system's
+    /// root (React puts every kind on its root), not a sign about itself.
+    delegates_everything: bool,
+    /// A control, a draggable or a listening element sits inside it: its own
+    /// listeners are delegation for those, not a sign about itself.
+    interactive_inside: bool,
+    /// A block of its own (a div, a list, a table, a paragraph) sits inside
+    /// it: it is a container, and its listeners serve what it contains.
+    block_inside: bool,
 }
+
+impl DomMeta {
+    /// An element that lays out a block of its own.
+    fn block(&self) -> bool {
+        matches!(
+            self.tag.as_str(),
+            "div" | "p" | "ul" | "ol" | "li" | "dl" | "table" | "thead" | "tbody" | "tfoot" | "tr"
+                | "td" | "th" | "section" | "article" | "aside" | "header" | "footer" | "nav"
+                | "main" | "form" | "fieldset" | "figure" | "blockquote" | "pre" | "details"
+                | "h1" | "h2" | "h3" | "h4" | "h5" | "h6"
+        )
+    }
+
+    /// A control, a draggable, or an element that listens for pointer input
+    /// itself: what makes the elements around it mere delegates.
+    fn interactive(&self) -> bool {
+        let attr = |name: &str| self.attrs.get(name);
+        (!self.delegates_everything
+            && (self.listened.press || self.listened.double || self.listened.drag))
+            || matches!(self.tag.as_str(), "button" | "select" | "textarea" | "summary")
+            || (self.tag == "a" && attr("href").is_some())
+            || (self.tag == "input"
+                && !attr("type").is_some_and(|kind| kind.eq_ignore_ascii_case("hidden")))
+            || attr("draggable").is_some_and(|value| value.eq_ignore_ascii_case("true"))
+            || attr("onclick").is_some()
+            || attr("contenteditable").is_some_and(|value| !value.eq_ignore_ascii_case("false"))
+            || attr("tabindex").is_some_and(|value| value != "-1")
+            || attr("role").is_some_and(|role| {
+                matches!(
+                    role.to_ascii_lowercase().as_str(),
+                    "button" | "link" | "checkbox" | "radio" | "switch" | "tab" | "menuitem"
+                        | "option" | "textbox" | "combobox" | "slider" | "gridcell" | "treeitem"
+                )
+            })
+    }
+}
+
+/// What pointer input beyond a click an element's own listeners (or its
+/// other signs) say it takes. Hints: a page can listen and do nothing.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Listened {
+    /// Presses (click, mousedown, mouseup, pointerdown, pointerup): only
+    /// marks the element as interactive for the elements around it.
+    pub(crate) press: bool,
+    /// dblclick.
+    pub(crate) double: bool,
+    /// dragstart.
+    pub(crate) drag: bool,
+}
+
+/// Event kinds that mean "pressing here does something".
+const PRESS_EVENTS: &[&str] = &["click", "mousedown", "mouseup", "pointerdown", "pointerup"];
+/// An element listening to at least this many kinds of event is an event
+/// system's root (React 17+ listens to every kind on its root container).
+const DELEGATION_ROOT_KINDS: usize = 20;
+/// Cursors a page shows over something it lets you drag.
+const DRAG_CURSORS: &[&str] = &["grab", "grabbing", "move", "-webkit-grab", "-webkit-grabbing", "all-scroll"];
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct DomIndex {
@@ -418,6 +487,114 @@ impl SemanticDocument {
 }
 
 impl DomIndex {
+    /// Record the page's event listeners, as `DOMDebugger.getEventListeners`
+    /// on the document (whole subtree, pierced) reported them. Without this
+    /// call an index knows no listeners, and only the other signs count.
+    pub(crate) fn add_listeners(&mut self, reply: &Value) {
+        let mut kinds: HashMap<i64, HashSet<&str>> = HashMap::new();
+        for listener in reply
+            .get("listeners")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+        {
+            if let (Some(backend), Some(kind)) = (
+                listener.get("backendNodeId").and_then(Value::as_i64),
+                listener.get("type").and_then(Value::as_str),
+            ) {
+                kinds.entry(backend).or_default().insert(kind);
+            }
+        }
+        for (backend, kinds) in &kinds {
+            if let Some(meta) = self.nodes.get_mut(backend) {
+                meta.delegates_everything = kinds.len() >= DELEGATION_ROOT_KINDS;
+                meta.listened = Listened {
+                    press: PRESS_EVENTS.iter().any(|kind| kinds.contains(kind)),
+                    double: kinds.contains("dblclick"),
+                    drag: kinds.contains("dragstart"),
+                };
+            }
+        }
+        // Mark everything above an interactive element, and above a block.
+        // A walk stops at the first ancestor already marked: everything
+        // above it is too.
+        let marks = |index: &mut Self, is: fn(&DomMeta) -> bool, mark: fn(&mut DomMeta) -> &mut bool| {
+            let from: Vec<i64> = index
+                .nodes
+                .iter()
+                .filter(|(_, meta)| is(meta))
+                .map(|(backend, _)| *backend)
+                .collect();
+            for backend in from {
+                let mut above = index.nodes.get(&backend).and_then(|meta| meta.parent_backend_node_id);
+                while let Some(parent) = above {
+                    let Some(meta) = index.nodes.get_mut(&parent) else { break };
+                    if *mark(meta) {
+                        break;
+                    }
+                    *mark(meta) = true;
+                    above = meta.parent_backend_node_id;
+                }
+            }
+        };
+        marks(self, DomMeta::interactive, |meta| &mut meta.interactive_inside);
+        marks(self, DomMeta::block, |meta| &mut meta.block_inside);
+    }
+
+    /// What pointer input the page says `backend` takes, beyond its role:
+    /// its own listeners (unless it is an event system's root, the document
+    /// or body, or has controls inside it whose events it only delegates),
+    /// a draggable attribute or a drag cursor that starts on it, and, for a
+    /// table or grid cell, a double-click listener on anything above it (a
+    /// grid widget listens on its container or the document).
+    fn evidence(&self, backend: i64, role: &str, layout: &LayoutIndex) -> Listened {
+        let Some(meta) = self.nodes.get(&backend) else {
+            return Listened::default();
+        };
+        let own = if meta.delegates_everything
+            || meta.interactive_inside
+            || meta.block_inside
+            || matches!(meta.tag.as_str(), "html" | "body" | "#document")
+        {
+            Listened::default()
+        } else {
+            meta.listened
+        };
+        let cursor = |id: i64| {
+            layout
+                .nodes
+                .get(&id)
+                .and_then(|layout| layout.styles.get("cursor"))
+                .map(|cursor| cursor.to_ascii_lowercase())
+        };
+        // Cursors are inherited: the sign is on the element that sets it.
+        let grab_cursor = meta.tag.starts_with('#').then_some(false).unwrap_or_else(|| {
+            cursor(backend).is_some_and(|own| {
+                DRAG_CURSORS.contains(&own.as_str())
+                    && meta.parent_backend_node_id.and_then(cursor) != Some(own)
+            })
+        });
+        let draggable = meta
+            .attrs
+            .get("draggable")
+            .is_some_and(|value| value.eq_ignore_ascii_case("true"));
+        let double_above = matches!(role, "cell" | "gridcell")
+            && std::iter::successors(meta.parent_backend_node_id, |id| {
+                self.nodes.get(id)?.parent_backend_node_id
+            })
+            .take(64)
+            .any(|id| {
+                self.nodes
+                    .get(&id)
+                    .is_some_and(|above| above.listened.double && !above.delegates_everything)
+            });
+        Listened {
+            press: false,
+            double: own.double || double_above,
+            drag: own.drag || draggable || grab_cursor,
+        }
+    }
+
     fn is_ancestor_of(&self, ancestor: i64, mut descendant: i64) -> bool {
         let mut visited = HashSet::new();
         while visited.insert(descendant) {
@@ -494,6 +671,7 @@ pub(crate) fn build_dom_index(root: &Value) -> DomIndex {
                     own_indicator,
                     parent_backend_node_id,
                     frame_id: frame_id.map(str::to_owned),
+                    ..Default::default()
                 },
             );
             *order += 1;
@@ -746,7 +924,10 @@ pub(crate) fn compose_accessibility_tree(
         let layout_meta = backend_node_id.and_then(|backend| layout.nodes.get(&backend));
         let states = ax_states(ax);
         let visibility = classify_visibility(dom_meta, layout_meta, viewport);
-        let actions = action_kinds(&role, dom_meta, &states, layout_meta);
+        let evidence = backend_node_id
+            .map(|backend| dom.evidence(backend, &role, layout))
+            .unwrap_or_default();
+        let actions = action_kinds(&role, dom_meta, &states, layout_meta, evidence);
         let root_title = matches!(role.as_str(), "rootwebarea" | "webarea")
             .then(|| ax_value_string(ax.get("name")))
             .flatten();
@@ -789,6 +970,7 @@ pub(crate) fn compose_accessibility_tree(
     apply_page_occlusion(&mut nodes, dom, layout);
     // Before redundant text goes: a named cell's text is part of its row.
     name_controls_by_row(&mut nodes, dom);
+    adopt_dom_descendants(&mut nodes, dom);
     remove_redundant_static_text(&mut nodes);
     SemanticDocument {
         title: None,
@@ -860,9 +1042,21 @@ const ROW_TEXT_LEVELS: usize = ROW_LEVELS + 6;
 /// neither can be told apart in an outline or aimed at by name.
 fn name_controls_by_row(nodes: &mut [SemanticNode], dom: &DomIndex) {
     let toggle = |role: &str| matches!(role, "checkbox" | "radio" | "switch");
+    // A wrapper the page makes take pointer input (a draggable card) is
+    // named after its own text: that text is what the card is.
+    let own_text = |node: &SemanticNode| {
+        node.name.is_none()
+            && matches!(
+                node.role.as_str(),
+                "generic" | "group" | "none" | "presentation" | "listitem"
+            )
+            && node.actions.iter().any(|action| {
+                matches!(action, BrowserActionKind::Drag | BrowserActionKind::DoubleClick)
+            })
+    };
     if !nodes
         .iter()
-        .any(|node| toggle(&node.role) && node.name.is_none())
+        .any(|node| (toggle(&node.role) && node.name.is_none()) || own_text(node))
     {
         return;
     }
@@ -911,14 +1105,35 @@ fn name_controls_by_row(nodes: &mut [SemanticNode], dom: &DomIndex) {
             }
         }
     }
+    // The row named by the text found `levels` up from the node.
+    let row_name = |found: &Vec<(usize, &str)>, levels: usize| {
+        let mut found = found.clone();
+        found.sort_by_key(|(order, _)| *order);
+        let joined = found.iter().map(|(_, text)| *text).collect::<Vec<_>>().join(" ");
+        clean_semantic_text(joined).map(|text| {
+            let mut name = text.clone();
+            let text: String = text.chars().take(ROW_TEXT_CHARS).collect();
+            if name.chars().count() > ROW_NAME_CHARS {
+                name = name.chars().take(ROW_NAME_CHARS - 1).collect::<String>();
+                name.push('…');
+            }
+            RowName { name, levels, text }
+        })
+    };
     let mut names = Vec::new();
     for (index, node) in nodes.iter().enumerate() {
-        if !toggle(&node.role) || node.name.is_some() {
-            continue;
-        }
         let Some(backend) = node.backend_node_id else {
             continue;
         };
+        if own_text(node) {
+            if let Some(row) = texts.get(&backend).and_then(|found| row_name(found, 0)) {
+                names.push((index, row));
+            }
+            continue;
+        }
+        if !toggle(&node.role) || node.name.is_some() {
+            continue;
+        }
         let mut above = parent(backend);
         for levels in 1..=ROW_LEVELS {
             let Some(ancestor) = above else { break };
@@ -926,17 +1141,8 @@ fn name_controls_by_row(nodes: &mut [SemanticNode], dom: &DomIndex) {
                 break;
             }
             if let Some(found) = texts.get(&ancestor) {
-                let mut found = found.clone();
-                found.sort_by_key(|(order, _)| *order);
-                let joined = found.iter().map(|(_, text)| *text).collect::<Vec<_>>().join(" ");
-                if let Some(text) = clean_semantic_text(joined) {
-                    let mut name = text.clone();
-                    let text: String = text.chars().take(ROW_TEXT_CHARS).collect();
-                    if name.chars().count() > ROW_NAME_CHARS {
-                        name = name.chars().take(ROW_NAME_CHARS - 1).collect::<String>();
-                        name.push('…');
-                    }
-                    names.push((index, RowName { name, levels, text }));
+                if let Some(row) = row_name(found, levels) {
+                    names.push((index, row));
                 }
                 break;
             }
@@ -1031,11 +1237,17 @@ fn supplement_dom_actions(
         if meta.attrs.contains_key("disabled") {
             states.insert("disabled".to_owned(), Value::Bool(true));
         }
-        let actions = action_kinds(&role, Some(meta), &states, layout_meta);
+        let evidence = dom.evidence(backend_node_id, &role, layout);
+        let actions = action_kinds(&role, Some(meta), &states, layout_meta, evidence);
         if actions.is_empty() {
             continue;
         }
-        let name = dom_name(&meta.attrs);
+        // A card's text names it better than its id (see name_controls_by_row).
+        let pointer_only = actions
+            .iter()
+            .any(|action| matches!(action, BrowserActionKind::Drag | BrowserActionKind::DoubleClick));
+        let name = dom_name(&meta.attrs)
+            .filter(|name| !(pointer_only && meta.attrs.get("id") == Some(name)));
         nodes.push(SemanticNode {
             ax_id: format!("dom-{backend_node_id}"),
             // The nearest DOM ancestor the outline has (its parent may be a
@@ -1063,6 +1275,53 @@ fn supplement_dom_actions(
             actions,
             document_order: meta.order,
         });
+    }
+}
+
+/// A card the DOM supplement added (accessibility ignores it, the page lets
+/// you drag it) and named by its own text holds, in the DOM, the text and
+/// controls that accessibility hung under the nearest node it kept. Each of
+/// those hangs under the card instead, so the card's line holds its own text.
+fn adopt_dom_descendants(nodes: &mut [SemanticNode], dom: &DomIndex) {
+    let added: HashMap<i64, String> = nodes
+        .iter()
+        .filter(|node| {
+            node.ax_id.starts_with("dom-")
+                && node.row_name.as_ref().is_some_and(|row| row.levels == 0)
+        })
+        .filter_map(|node| Some((node.backend_node_id?, node.ax_id.clone())))
+        .collect();
+    if added.is_empty() {
+        return;
+    }
+    let listed: HashSet<i64> = nodes.iter().filter_map(|node| node.backend_node_id).collect();
+    let mut moves = Vec::new();
+    for (index, node) in nodes.iter().enumerate() {
+        let Some(backend) = node.backend_node_id else {
+            continue;
+        };
+        // The nearest listed DOM ancestor; an added one is a new parent.
+        let start = dom.nodes.get(&backend).and_then(|meta| meta.parent_backend_node_id);
+        let nearest = std::iter::successors(start, |id| dom.nodes.get(id)?.parent_backend_node_id)
+        .take(dom.nodes.len())
+        .find(|id| listed.contains(id));
+        if let Some(parent) = nearest.and_then(|id| added.get(&id)) {
+            if node.parent_ax_id.as_ref() != Some(parent) {
+                moves.push((index, parent.clone()));
+            }
+        }
+    }
+    for (index, parent) in moves {
+        let child = nodes[index].ax_id.clone();
+        let old = nodes[index].parent_ax_id.replace(parent.clone());
+        for node in nodes.iter_mut() {
+            if Some(&node.ax_id) == old.as_ref() {
+                node.child_ax_ids.retain(|id| id != &child);
+            }
+            if node.ax_id == parent {
+                node.child_ax_ids.push(child.clone());
+            }
+        }
     }
 }
 
@@ -1279,6 +1538,7 @@ fn action_kinds(
     dom: Option<&DomMeta>,
     states: &BTreeMap<String, Value>,
     layout: Option<&LayoutMeta>,
+    evidence: Listened,
 ) -> Vec<BrowserActionKind> {
     if states.get("disabled").and_then(Value::as_bool) == Some(true) {
         return Vec::new();
@@ -1297,6 +1557,7 @@ fn action_kinds(
             | "menuitemradio"
             | "option"
             | "treeitem"
+            | "gridcell"
             | "slider"
             | "spinbutton"
             | "combobox"
@@ -1366,6 +1627,15 @@ fn action_kinds(
         && layout.is_some_and(|meta| meta.bounds.is_some_and(Rect::has_area))
     {
         actions.push(BrowserActionKind::Click);
+    }
+    // What the page says beyond a click: a double-click handler or an
+    // editable grid's cell, and something it lets you drag.
+    let boxed = layout.is_some_and(|meta| meta.bounds.is_some_and(Rect::has_area));
+    if boxed && (evidence.double || role == "gridcell") {
+        actions.push(BrowserActionKind::DoubleClick);
+    }
+    if boxed && evidence.drag {
+        actions.push(BrowserActionKind::Drag);
     }
     if let Some(layout) = layout.filter(|meta| {
         meta.bounds.is_some_and(Rect::has_area)
@@ -1470,7 +1740,7 @@ fn clean_semantic_text(value: String) -> Option<String> {
 fn remove_redundant_static_text(nodes: &mut Vec<SemanticNode>) {
     let names: HashMap<String, String> = nodes
         .iter()
-        .filter_map(|node| node.name.clone().map(|name| (node.ax_id.clone(), name)))
+        .filter_map(|node| Some((node.ax_id.clone(), node.shown_name()?.to_owned())))
         .collect();
     nodes.retain(|node| {
         if node.role != "statictext" && node.role != "text" {
@@ -2348,9 +2618,10 @@ mod tests {
             own_indicator: false,
             parent_backend_node_id: None,
             frame_id: None,
+            ..Default::default()
         };
         assert_eq!(
-            action_kinds("textbox", Some(&dom), &BTreeMap::new(), None),
+            action_kinds("textbox", Some(&dom), &BTreeMap::new(), None, Listened::default()),
             vec![BrowserActionKind::Upload]
         );
     }
@@ -2878,6 +3149,148 @@ mod tests {
         assert_eq!(visibility(3), Some(BrowserVisibility::InViewport));
         assert_eq!(visibility(4), Some(BrowserVisibility::InViewport));
         assert_eq!(visibility(5), Some(BrowserVisibility::CssHidden));
+    }
+
+    /// A board and two grids, as Chrome reports them (see lab/web/board and
+    /// lab/web/grid): a draggable card accessibility keeps as an unnamed
+    /// group; a card it ignores, with a grab cursor its span inherits; a
+    /// grid under a React-style root that listens to everything; a grid
+    /// whose container listens for double-clicks; a span with its own click
+    /// listener.
+    fn pointer_page(listeners: bool) -> SemanticDocument {
+        let text = |id: i64, value: &str| json!({"nodeType": 3, "nodeName": "#text", "backendNodeId": id, "nodeValue": value});
+        let element = |id: i64, tag: &str, attributes: Value, children: Vec<Value>| {
+            json!({"nodeType": 1, "nodeName": tag, "backendNodeId": id, "attributes": attributes, "children": children})
+        };
+        let cell = |id: i64, value: &str| {
+            element(id - 2, "TABLE", json!([]), vec![element(id - 1, "TR", json!([]), vec![
+                element(id, "TD", json!([]), vec![text(id + 1, value)])])])
+        };
+        let mut dom = build_dom_index(&json!({"nodeType": 9, "backendNodeId": 100, "children": [
+            element(1, "BODY", json!([]), vec![
+                element(2, "DIV", json!(["id", "native"]), vec![element(3, "DIV", json!([]), vec![
+                    element(4, "DIV", json!(["draggable", "true"]), vec![text(5, "Write report")])])]),
+                element(10, "DIV", json!(["id", "pointer"]), vec![element(11, "DIV", json!([]), vec![
+                    element(12, "DIV", json!([]), vec![text(13, "Draft invoice"),
+                        element(14, "SPAN", json!([]), vec![text(15, "urgent")])])])]),
+                element(20, "DIV", json!(["id", "root"]), vec![cell(23, "Coffee")]),
+                element(30, "DIV", json!(["id", "grid"]), vec![cell(33, "2")]),
+                element(40, "SPAN", json!([]), vec![text(41, "Chip")]),
+            ])]}));
+        if listeners {
+            let mut all: Vec<Value> = [
+                (2, "dragstart"), (10, "pointerdown"), (30, "dblclick"), (30, "click"), (40, "click"),
+                (100, "keydown"),
+            ]
+            .into_iter()
+            .map(|(id, kind)| json!({"type": kind, "backendNodeId": id}))
+            .collect();
+            // React 17+ listens to every kind of event on its root.
+            for kind in ["click", "dblclick", "mousedown", "mouseup", "pointerdown", "pointerup",
+                         "keydown", "keyup", "input", "change", "focusin", "focusout", "dragstart",
+                         "drop", "scroll", "wheel", "touchstart", "touchend", "contextmenu",
+                         "copy", "paste", "select"] {
+                all.push(json!({"type": kind, "backendNodeId": 20}));
+            }
+            dom.add_listeners(&json!({ "listeners": all }));
+        }
+        // Every element has a box; the second card sets a grab cursor and
+        // its span inherits it.
+        let backends: Vec<i64> = vec![1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 40, 41];
+        let layout = build_layout_index(&json!({
+            "strings": ["block", "visible", "1", "auto", "default", "grab"],
+            "documents": [{
+                "nodes": {"backendNodeId": backends},
+                "layout": {
+                    "nodeIndex": (0..backends.len()).collect::<Vec<_>>(),
+                    "bounds": backends.iter().map(|id| json!([0, id * 10, 300, 8])).collect::<Vec<_>>(),
+                    "styles": backends.iter().map(|id| if (12..=15).contains(id) {
+                        json!([0, 1, 2, 3, 5])
+                    } else {
+                        json!([0, 1, 2, 3, 4])
+                    }).collect::<Vec<_>>(),
+                    "paintOrders": (0..backends.len()).collect::<Vec<_>>()
+                }
+            }]
+        }));
+        let viewport = parse_viewport(&json!({
+            "cssVisualViewport": {"pageX": 0.0, "pageY": 0.0, "clientWidth": 800.0, "clientHeight": 900.0}
+        }));
+        let ax = |id: &str, parent: &str, backend: i64, role: &str, name: Option<&str>, ignored: bool| {
+            let mut node = json!({"nodeId": id, "parentId": parent, "ignored": ignored,
+                                  "backendDOMNodeId": backend, "role": {"value": role}});
+            if let Some(name) = name {
+                node["name"] = json!({"value": name});
+            }
+            node
+        };
+        let nodes = json!({"nodes": [
+            {"nodeId": "root", "ignored": false, "role": {"value": "RootWebArea"}, "backendDOMNodeId": 100},
+            ax("card1", "root", 4, "group", None, false),
+            ax("t5", "card1", 5, "StaticText", Some("Write report"), false),
+            ax("card2", "root", 12, "generic", None, true),
+            ax("t13", "card2", 13, "StaticText", Some("Draft invoice"), false),
+            ax("t15", "card2", 15, "StaticText", Some("urgent"), false),
+            ax("c23", "root", 23, "cell", Some("Coffee"), false),
+            ax("t24", "c23", 24, "StaticText", Some("Coffee"), false),
+            ax("c33", "root", 33, "cell", Some("2"), false),
+            ax("t34", "c33", 34, "StaticText", Some("2"), false),
+            ax("t41", "root", 41, "StaticText", Some("Chip"), false),
+        ]});
+        compose_accessibility_tree(&nodes, &dom, &layout, &viewport, frame())
+    }
+
+    #[test]
+    fn cards_and_cells_offer_drag_and_double_click_on_the_pages_own_signs() {
+        let document = pointer_page(true);
+        let outline = document.page(0, 300, usize::MAX, None, None).outline_with("r");
+        for line in [
+            "- group \"Write report\" [r drag]",
+            "- generic \"Draft invoice urgent\" [r drag]",
+            "  - statictext \"urgent\" [r]",
+            "- cell \"Coffee\" [r]",
+            "- cell \"2\" [r double_click]",
+            "- statictext \"Chip\" [r]",
+        ] {
+            assert!(outline.lines().any(|held| held == line), "no {line:?} in:\n{outline}");
+        }
+        // The text a card is named by is not listed again; the span that only
+        // inherits the grab cursor, the containers whose listeners serve their
+        // cards and cells, and React's root offer nothing.
+        assert!(!outline.contains("statictext \"Write report\""), "{outline}");
+        // Text that is only part of the name stays, under the card.
+        assert!(outline.contains("  - statictext \"Draft invoice\" [r]"), "{outline}");
+        assert_eq!(outline.matches(" drag]").count(), 2, "{outline}");
+        assert_eq!(outline.matches("double_click").count(), 1, "{outline}");
+        // A press listener alone offers no action (it only marks what is
+        // around it as a delegate).
+        assert_eq!(outline.matches("click]").count(), 1, "{outline}");
+        // A card's name is re-proven against its own text before use.
+        let card = document
+            .nodes
+            .iter()
+            .find(|node| node.backend_node_id == Some(12))
+            .and_then(SemanticNode::to_ref_entry)
+            .unwrap();
+        assert_eq!(card.label, None);
+        assert_eq!(card.row.as_ref().map(|row| row.levels), Some(0));
+        assert_eq!(
+            card.row.as_ref().map(|row| row.name.as_str()),
+            Some("Draft invoice urgent")
+        );
+        let line = parse_outline_line("    - cell \"2\" [p1:9 double_click]").unwrap();
+        assert_eq!(line.actions, ["double_click"]);
+    }
+
+    #[test]
+    fn without_listeners_only_the_other_signs_count() {
+        let outline = pointer_page(false)
+            .page(0, 300, usize::MAX, None, None)
+            .outline_with("r");
+        assert!(outline.contains("- group \"Write report\" [r drag]"), "{outline}");
+        assert!(outline.contains("- generic \"Draft invoice urgent\" [r drag]"), "{outline}");
+        assert!(outline.contains("- cell \"2\" [r]"), "{outline}");
+        assert!(!outline.contains("Chip\" [r click]"), "{outline}");
     }
 
     #[test]
