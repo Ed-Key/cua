@@ -2218,12 +2218,19 @@ pub(crate) async fn live_point(
 /// so the point is found there whatever frame the node is in. The walk goes
 /// down through open shadow roots and through the (open or closed) roots the
 /// node itself lives in, and up through shadow hosts when it asks whether
-/// one element contains another. With `element` it returns the element on
-/// top itself instead of the facts about it.
+/// one element contains another. A text node's corner is its own (a range
+/// over it), not its parent element's: the box the point came from. With
+/// `element` it returns the element on top itself instead of the facts
+/// about it.
 const HIT_TEST: &str = "function(x, y, bx, by, element) { \
     const target = this.nodeType === 1 ? this : this.parentElement; \
     if (!target || !target.isConnected) return element ? null : { connected: false }; \
-    const rect = target.getBoundingClientRect(); \
+    let rect = target.getBoundingClientRect(); \
+    if (this.nodeType === 3) { \
+        const range = this.ownerDocument.createRange(); \
+        range.selectNodeContents(this); \
+        rect = range.getBoundingClientRect(); \
+    } \
     const px = x - bx + rect.left, py = y - by + rect.top; \
     const own = new Map(); \
     for (let root = target.getRootNode(); root && root.host; root = root.host.getRootNode()) \

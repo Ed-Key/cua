@@ -688,7 +688,7 @@ impl BrowserPointerTool {
             target: validated.tab.cdp_target_id.as_str(),
             opened: None,
         };
-        let sent = dispatch_trusted(&mut delivery, request, origin, destination).await;
+        let sent = dispatch_trusted(&mut delivery, conn.clone(), request, origin, destination).await;
         let opened = delivery.opened.take();
         // With a dialog up the page answers nothing, this included: the
         // emulation ends with the attachment session instead.
@@ -731,6 +731,7 @@ impl BrowserPointerTool {
 /// caller finds it in `delivery.opened`.
 async fn dispatch_trusted(
     delivery: &mut Delivery<'_>,
+    conn: Arc<CdpConnection>,
     request: &PointerRequest,
     origin: (f64, f64),
     destination: Option<(f64, f64)>,
@@ -783,6 +784,7 @@ async fn dispatch_trusted(
         PointerAction::Drag => {
             drag(
                 delivery,
+                conn,
                 origin,
                 destination.expect("drag destination validated"),
             )
@@ -804,18 +806,28 @@ async fn dispatch_trusted(
 /// and interception is turned off again.
 async fn drag(
     delivery: &mut Delivery<'_>,
+    owned: Arc<CdpConnection>,
     origin: (f64, f64),
     destination: (f64, f64),
 ) -> anyhow::Result<()> {
     let conn = delivery.conn;
     let cdp = delivery.cdp;
     let mut events = conn.subscribe();
+    // Armed before interception is asked for: a call cancelled at any point
+    // after it still turns interception off.
+    let mut cleanup = DragCleanup {
+        conn: owned,
+        cdp: cdp.to_owned(),
+        release_at: destination,
+        pressed: false,
+        armed: true,
+    };
     // Without interception an HTML5 drag would go to the operating system
     // and never end: send nothing.
     conn.call(Some(cdp), "Input.setInterceptDrags", json!({ "enabled": true }))
         .await
         .map_err(|error| anyhow::anyhow!("Chrome would not intercept the drag ({error}), so none was started"))?;
-    let mut pressed = false;
+    let pressed = &mut cleanup.pressed;
     let result = async {
         delivery
             .send(
@@ -823,7 +835,7 @@ async fn drag(
                 json!({ "type": "mouseMoved", "x": origin.0, "y": origin.1, "button": "none" }),
             )
             .await?;
-        pressed = delivery
+        *pressed = delivery
             .send(
                 "Input.dispatchMouseEvent",
                 json!({ "type": "mousePressed", "x": origin.0, "y": origin.1, "button": "left", "buttons": 1, "clickCount": 1 }),
@@ -878,32 +890,68 @@ async fn drag(
                 json!({ "type": "mouseReleased", "x": destination.0, "y": destination.1, "button": "left", "buttons": 0, "clickCount": 1 }),
             )
             .await?;
-        pressed = false;
+        *pressed = false;
         anyhow::Ok(())
     }
     .await;
-    // A drag stopped after the press still lets the button go (a page behind
-    // a dialog answers nothing, so not then).
-    if pressed && delivery.opened.is_none() {
+    cleanup.finish(delivery.opened.is_some()).await;
+    result
+}
+
+/// What a drag leaves to undo: the pressed button and drag interception.
+/// `finish` undoes it on every way out of the drag; if the call is cancelled
+/// instead (its future dropped), the drop undoes it in the background.
+/// Interception left on would swallow the user's own drags in this tab.
+struct DragCleanup {
+    conn: Arc<CdpConnection>,
+    cdp: String,
+    release_at: (f64, f64),
+    pressed: bool,
+    armed: bool,
+}
+
+impl DragCleanup {
+    async fn finish(mut self, dialog_open: bool) {
+        self.armed = false;
+        // A page behind a dialog answers nothing, so no release then; the
+        // browser answers the interception call even with a dialog up.
+        let pressed = self.pressed && !dialog_open;
+        undo_drag(&self.conn, &self.cdp, pressed.then_some(self.release_at)).await;
+    }
+}
+
+impl Drop for DragCleanup {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let (conn, cdp) = (self.conn.clone(), self.cdp.clone());
+        let release = self.pressed.then_some(self.release_at);
+        if let Ok(runtime) = tokio::runtime::Handle::try_current() {
+            runtime.spawn(async move { undo_drag(&conn, &cdp, release).await });
+        }
+    }
+}
+
+async fn undo_drag(conn: &CdpConnection, cdp: &str, release: Option<(f64, f64)>) {
+    if let Some((x, y)) = release {
         let _ = tokio::time::timeout(
             CLEANUP_TIMEOUT,
             conn.call(
                 Some(cdp),
                 "Input.dispatchMouseEvent",
-                json!({ "type": "mouseReleased", "x": destination.0, "y": destination.1, "button": "left", "buttons": 0, "clickCount": 1 }),
+                json!({ "type": "mouseReleased", "x": x, "y": y, "button": "left", "buttons": 0, "clickCount": 1 }),
             ),
         )
         .await;
     }
-    // The browser answers this one even with a dialog up: interception left
-    // on would swallow the user's own drags in this tab.
     let _ = tokio::time::timeout(
         CLEANUP_TIMEOUT,
         conn.call(Some(cdp), "Input.setInterceptDrags", json!({ "enabled": false })),
     )
     .await;
-    result
 }
+
 
 #[async_trait]
 impl Tool for BrowserPointerTool {

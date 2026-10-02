@@ -218,8 +218,12 @@ pub(crate) struct SemanticNode {
 impl SemanticNode {
     /// The name an outline shows: the accessible name, else the row's.
     fn shown_name(&self) -> Option<&str> {
-        self.name
-            .as_deref()
+        // A card named by its own text shows that text, even when its DOM id
+        // is what its fingerprint keeps as its name.
+        let own_text = self.row_name.as_ref().filter(|row| row.levels == 0);
+        own_text
+            .map(|row| row.name.as_str())
+            .or(self.name.as_deref())
             .or(self.row_name.as_ref().map(|row| row.name.as_str()))
     }
 
@@ -1044,8 +1048,13 @@ fn name_controls_by_row(nodes: &mut [SemanticNode], dom: &DomIndex) {
     let toggle = |role: &str| matches!(role, "checkbox" | "radio" | "switch");
     // A wrapper the page makes take pointer input (a draggable card) is
     // named after its own text: that text is what the card is.
+    // Its DOM id names it no better than nothing: the id stays its name for
+    // the fingerprint, the text is what is shown.
     let own_text = |node: &SemanticNode| {
-        node.name.is_none()
+        (node.name.is_none()
+            || node.backend_node_id.and_then(|backend| dom.nodes.get(&backend)).is_some_and(
+                |meta| meta.attrs.get("id").map(|id| clean_semantic_text(id.clone())) == Some(node.name.clone()),
+            ))
             && matches!(
                 node.role.as_str(),
                 "generic" | "group" | "none" | "presentation" | "listitem"
@@ -1242,12 +1251,7 @@ fn supplement_dom_actions(
         if actions.is_empty() {
             continue;
         }
-        // A card's text names it better than its id (see name_controls_by_row).
-        let pointer_only = actions
-            .iter()
-            .any(|action| matches!(action, BrowserActionKind::Drag | BrowserActionKind::DoubleClick));
-        let name = dom_name(&meta.attrs)
-            .filter(|name| !(pointer_only && meta.attrs.get("id") == Some(name)));
+        let name = dom_name(&meta.attrs);
         nodes.push(SemanticNode {
             ax_id: format!("dom-{backend_node_id}"),
             // The nearest DOM ancestor the outline has (its parent may be a
@@ -1947,7 +1951,13 @@ pub(crate) fn listed_ref(reference: &str, entry: &RefEntry, value: Option<&str>)
     let mut listed = serde_json::json!({
         "ref": reference,
         "role": entry.node_name,
-        "name": entry.label.as_ref().or(entry.row.as_ref().map(|row| &row.name)),
+        "name": entry
+            .row
+            .as_ref()
+            .filter(|row| row.levels == 0)
+            .map(|row| &row.name)
+            .or(entry.label.as_ref())
+            .or(entry.row.as_ref().map(|row| &row.name)),
         "value": value,
         "actions": entry.actions.iter().map(|action| action.as_str()).collect::<Vec<_>>(),
     });
@@ -3172,7 +3182,8 @@ mod tests {
                     element(4, "DIV", json!(["draggable", "true"]), vec![text(5, "Write report")])])]),
                 element(10, "DIV", json!(["id", "pointer"]), vec![element(11, "DIV", json!([]), vec![
                     element(12, "DIV", json!([]), vec![text(13, "Draft invoice"),
-                        element(14, "SPAN", json!([]), vec![text(15, "urgent")])])])]),
+                        element(14, "SPAN", json!([]), vec![text(15, "urgent")])]),
+                    element(16, "DIV", json!(["id", "card-9", "draggable", "true"]), vec![text(17, "Pay rent")])])]),
                 element(20, "DIV", json!(["id", "root"]), vec![cell(23, "Coffee")]),
                 element(30, "DIV", json!(["id", "grid"]), vec![cell(33, "2")]),
                 element(40, "SPAN", json!([]), vec![text(41, "Chip")]),
@@ -3196,7 +3207,7 @@ mod tests {
         }
         // Every element has a box; the second card sets a grab cursor and
         // its span inherits it.
-        let backends: Vec<i64> = vec![1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 40, 41];
+        let backends: Vec<i64> = vec![1, 2, 3, 4, 5, 10, 11, 12, 13, 14, 15, 16, 17, 20, 21, 22, 23, 24, 30, 31, 32, 33, 34, 40, 41];
         let layout = build_layout_index(&json!({
             "strings": ["block", "visible", "1", "auto", "default", "grab"],
             "documents": [{
@@ -3231,6 +3242,8 @@ mod tests {
             ax("card2", "root", 12, "generic", None, true),
             ax("t13", "card2", 13, "StaticText", Some("Draft invoice"), false),
             ax("t15", "card2", 15, "StaticText", Some("urgent"), false),
+            ax("card3", "root", 16, "generic", None, true),
+            ax("t17", "card3", 17, "StaticText", Some("Pay rent"), false),
             ax("c23", "root", 23, "cell", Some("Coffee"), false),
             ax("t24", "c23", 24, "StaticText", Some("Coffee"), false),
             ax("c33", "root", 33, "cell", Some("2"), false),
@@ -3248,6 +3261,7 @@ mod tests {
             "- group \"Write report\" [r drag]",
             "- generic \"Draft invoice urgent\" [r drag]",
             "  - statictext \"urgent\" [r]",
+            "- generic \"Pay rent\" [r drag]",
             "- cell \"Coffee\" [r]",
             "- cell \"2\" [r double_click]",
             "- statictext \"Chip\" [r]",
@@ -3260,7 +3274,7 @@ mod tests {
         assert!(!outline.contains("statictext \"Write report\""), "{outline}");
         // Text that is only part of the name stays, under the card.
         assert!(outline.contains("  - statictext \"Draft invoice\" [r]"), "{outline}");
-        assert_eq!(outline.matches(" drag]").count(), 2, "{outline}");
+        assert_eq!(outline.matches(" drag]").count(), 3, "{outline}");
         assert_eq!(outline.matches("double_click").count(), 1, "{outline}");
         // A press listener alone offers no action (it only marks what is
         // around it as a delegate).
@@ -3278,6 +3292,17 @@ mod tests {
             card.row.as_ref().map(|row| row.name.as_str()),
             Some("Draft invoice urgent")
         );
+        // A card with an id keeps the id as its fingerprint's name (the
+        // live re-proof reads it so), and shows its text.
+        let with_id = document
+            .nodes
+            .iter()
+            .find(|node| node.backend_node_id == Some(16))
+            .and_then(SemanticNode::to_ref_entry)
+            .unwrap();
+        assert_eq!(with_id.label.as_deref(), Some("card-9"));
+        assert_eq!(with_id.row.as_ref().map(|row| row.name.as_str()), Some("Pay rent"));
+        assert!(!outline.contains("card-9"), "{outline}");
         let line = parse_outline_line("    - cell \"2\" [p1:9 double_click]").unwrap();
         assert_eq!(line.actions, ["double_click"]);
     }
