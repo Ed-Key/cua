@@ -112,9 +112,21 @@ struct FixtureState {
     /// The click handler sets location.href: the main frame starts loading
     /// the document with this loader id.
     click_navigates: Option<String>,
+    /// The click handler is a router's: history.pushState, which Chrome
+    /// reports as the main frame starting to load and then navigating within
+    /// its document, and the new view drawn.
+    click_pushes_state: bool,
+    /// A mouseover handler calls alert(): the first mouse move opens it.
+    move_opens_dialog: bool,
     /// What the page answers the next this-many hit-tests at a ref's click
     /// point (the facts), and the node that is on top there.
     hit: Option<(usize, Value, i64)>,
+    /// The pressed element starts an HTML5 drag: with interception on, the
+    /// first pressed move is answered with `Input.dragIntercepted`.
+    drag_starts: bool,
+    intercepting_drags: bool,
+    /// Hit-tests answered "on top" before the scripted `hit` answers start.
+    hit_skip: usize,
     /// The input handler calls alert() when text arrives.
     type_opens_dialog: bool,
     /// The input handler defers its alert: the insert is answered, and the
@@ -187,7 +199,12 @@ impl Default for FixtureState {
             click_removes: Vec::new(),
             click_opens_dialog: false,
             click_navigates: None,
+            click_pushes_state: false,
+            move_opens_dialog: false,
             hit: None,
+            drag_starts: false,
+            intercepting_drags: false,
+            hit_skip: 0,
             type_opens_dialog: false,
             type_opens_dialog_late: false,
             readback_opens_dialog: None,
@@ -682,6 +699,21 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     params: json!({"frameId": "F_MAIN"}),
                 }]);
             }
+            if std::mem::take(&mut st.click_pushes_state) {
+                st.pending_mutations += 3;
+                return MockReply::ok(json!({})).with_events(vec![
+                    MockEvent {
+                        method: "Page.frameStartedLoading".into(),
+                        session_id: st.page_session.clone(),
+                        params: json!({"frameId": "F_MAIN"}),
+                    },
+                    MockEvent {
+                        method: "Page.navigatedWithinDocument".into(),
+                        session_id: st.page_session.clone(),
+                        params: json!({"frameId": "F_MAIN", "url": "https://fixture.test/#/users"}),
+                    },
+                ]);
+            }
             if std::mem::take(&mut st.click_opens_dialog) {
                 st.dialog_open = true;
                 return MockReply::ok(json!({}))
@@ -692,6 +724,19 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                     }])
                     .unanswered();
             }
+        }
+        if call.method == "Input.dispatchMouseEvent"
+            && call.params["type"] == "mouseMoved"
+            && std::mem::take(&mut st.move_opens_dialog)
+        {
+            st.dialog_open = true;
+            return MockReply::ok(json!({}))
+                .with_events(vec![MockEvent {
+                    method: "Page.javascriptDialogOpening".into(),
+                    session_id: st.page_session.clone(),
+                    params: json!({"type": "alert", "message": "hovered"}),
+                }])
+                .unanswered();
         }
         // A page behind a dialog answers only what the browser process does.
         if st.dialog_open
@@ -726,6 +771,14 @@ fn fixture_handler(state: SharedState) -> MockHandler {
             }
             "Runtime.evaluate" if call.params["expression"] == "document.readyState" => {
                 MockReply::ok(json!({"result": {"type": "string", "value": "complete"}}))
+            }
+            "Runtime.callFunctionOn"
+                if call.params["functionDeclaration"]
+                    .as_str()
+                    .is_some_and(|function| function.contains("return this.nodeType === 1 ? this : this.parentElement")) =>
+            {
+                let of = call.params["objectId"].as_str().unwrap_or_default();
+                MockReply::ok(json!({"result": {"type": "object", "objectId": format!("element-of-{of}")}}))
             }
             "Runtime.callFunctionOn" if call.params["objectId"] == "settle-counter" => {
                 let records = std::mem::take(&mut st.pending_mutations);
@@ -983,10 +1036,12 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 let known = if is_oopif {
                     backend == 100
                 } else {
-                    [10, 20, 21, 30].contains(&backend)
+                    // The large page's heading and Reply button too.
+                    [10, 20, 21, 30, 2_000, 2_011].contains(&backend)
                 };
                 if known {
-                    let (x, y) = ((backend * 10) as f64, (backend * 10) as f64);
+                    let at = ((backend % 1_000) * 10) as f64;
+                    let (x, y) = (at, at);
                     MockReply::ok(json!({
                         "model": {
                             "content": [x, y, x + 20.0, y, x + 20.0, y + 10.0, x, y + 10.0],
@@ -1068,6 +1123,25 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                 }
                 MockReply::ok(json!({}))
             }
+            "Input.setInterceptDrags" => {
+                st.intercepting_drags = call.params["enabled"].as_bool().unwrap_or(false);
+                MockReply::ok(json!({}))
+            }
+            "Input.dispatchDragEvent" => MockReply::ok(json!({})),
+            "Input.dispatchMouseEvent"
+                if st.drag_starts
+                    && st.intercepting_drags
+                    && call.params["type"] == "mouseMoved"
+                    && call.params["buttons"] == 1 =>
+            {
+                st.drag_starts = false;
+                MockReply::ok(json!({})).with_events(vec![MockEvent {
+                    method: "Input.dragIntercepted".into(),
+                    session_id: call.session_id.clone(),
+                    params: json!({"data": {"items": [{"mimeType": "text/plain", "data": "Write report"}],
+                        "dragOperationsMask": 16}}),
+                }])
+            }
             "DOM.focus" | "Emulation.setFocusEmulationEnabled" | "Input.dispatchMouseEvent" => {
                 if call.method == "Emulation.setFocusEmulationEnabled" {
                     st.focus_emulated = call.params["enabled"].as_bool().unwrap_or(false);
@@ -1097,8 +1171,10 @@ fn fixture_handler(state: SharedState) -> MockHandler {
                         json!({"result": {"type": "object", "objectId": "obj-on-top"}}),
                     );
                 }
+                let skipped = st.hit_skip > 0;
+                st.hit_skip = st.hit_skip.saturating_sub(1);
                 let scripted = match st.hit.as_mut() {
-                    Some((remaining, facts, _)) if *remaining > 0 => {
+                    Some((remaining, facts, _)) if *remaining > 0 && !skipped => {
                         *remaining -= 1;
                         Some(facts.clone())
                     }
@@ -3626,21 +3702,6 @@ async fn semantic_refs_enforce_declared_action_kinds_before_delivery() {
         "browser_action_unavailable"
     );
 
-    let pointer = BrowserPointerTool::new(f.engine.clone())
-        .invoke(json!({
-            "target_id": target,
-            "tab_id": tab,
-            "session": SESSION,
-            "ref": content_ref,
-            "action": "hover",
-            "input_route": "dom_event"
-        }))
-        .await;
-    assert_eq!(
-        structured(&pointer)["refusal"]["code"],
-        "browser_action_unavailable"
-    );
-
     let button_ref = snap["refs"]
         .as_array()
         .unwrap()
@@ -5461,6 +5522,23 @@ async fn a_single_click_that_navigates_returns_the_new_page_not_a_diff_of_the_ol
     assert_eq!(clicked["changes"]["reason"], "document_changed");
 }
 
+#[tokio::test]
+async fn a_click_that_changes_the_route_in_the_document_is_not_waited_out_as_a_navigation() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "changes-click-pushes-state").await;
+    let first = agent.snapshot().await;
+    f.state.lock().unwrap().click_pushes_state = true;
+    let started = std::time::Instant::now();
+    let clicked = agent
+        .call("browser_click", json!({ "ref": named_ref(&first, "Reply") }))
+        .await;
+    let took = started.elapsed();
+    // Before: the wait for a new document ran out at 8 s.
+    assert!(took < std::time::Duration::from_secs(3), "{took:?}");
+    assert_ne!(clicked["changes"]["reason"], "document_changed", "{clicked}");
+    assert!(clicked["changes"].get("settled").is_none(), "settled quietly: {clicked}");
+}
+
 // ── Hit-test before a trusted click ─────────────────────────────────────────
 
 fn covered() -> Value {
@@ -5625,6 +5703,204 @@ async fn a_coordinate_click_and_a_dom_event_click_are_not_hit_tested() {
             .as_str()
             .unwrap()
             .contains("elementFromPoint")));
+}
+
+// ── Pointer input on any listed element ─────────────────────────────────────
+
+/// The mouse events browser_pointer sent, as (type, x, y).
+fn mouse_events(f: &Fixture) -> Vec<(String, f64, f64)> {
+    recorded_calls(f, "Input.dispatchMouseEvent")
+        .into_iter()
+        .map(|(_, params)| {
+            (
+                params["type"].as_str().unwrap().to_owned(),
+                params["x"].as_f64().unwrap(),
+                params["y"].as_f64().unwrap(),
+            )
+        })
+        .collect()
+}
+
+#[tokio::test]
+async fn a_text_line_can_be_double_clicked_once_the_page_says_it_is_on_top() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    // A content line: no action in its bracket, and still pointed at.
+    let text = named_ref(&snap, "Visible message");
+    let pointer = BrowserPointerTool::new(f.engine.clone());
+    let call = json!({"target_id": target, "tab_id": tab, "session": SESSION,
+        "ref": text, "action": "double_click"});
+
+    f.state.lock().unwrap().hit = Some((2, covered(), 0));
+    let refused = structured(&pointer.invoke(call.clone()).await).clone();
+    assert_eq!(refused["refusal"]["code"], "browser_target_covered", "{refused}");
+    assert_eq!(refused["refusal"]["detail"]["input_sent"], false);
+    assert!(refused["refusal"]["message"]
+        .as_str()
+        .unwrap()
+        .contains("a double-click there would go to that element"));
+    assert!(mouse_events(&f).is_empty(), "nothing goes to what covers it");
+
+    f.state.lock().unwrap().hit = None;
+    let sent = pointer.invoke(call).await;
+    assert_eq!(structured(&sent)["status"], "ok", "{sent:?}");
+    let kinds: Vec<String> = mouse_events(&f).into_iter().map(|(kind, _, _)| kind).collect();
+    assert_eq!(
+        kinds,
+        [
+            "mouseMoved",
+            "mousePressed",
+            "mouseReleased",
+            "mousePressed",
+            "mouseReleased"
+        ]
+    );
+    let said = text_of(&sent);
+    assert!(said.starts_with(&format!("double-clicked {text} at (")), "{said}");
+}
+
+#[tokio::test]
+async fn synthetic_events_on_a_text_ref_go_to_the_element_holding_it() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    let text = named_ref(&snap, "Visible message");
+    let sent = BrowserPointerTool::new(f.engine.clone())
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION,
+            "ref": text, "action": "double_click", "input_route": "dom_event"}))
+        .await;
+    assert_eq!(structured(&sent)["status"], "ok", "{sent:?}");
+    let dispatched = recorded_calls(&f, "Runtime.callFunctionOn")
+        .into_iter()
+        .find(|(_, params)| params["functionDeclaration"].as_str().unwrap().contains("dblclick"))
+        .expect("the double-click was dispatched");
+    assert!(
+        dispatched.1["objectId"].as_str().unwrap().starts_with("element-of-"),
+        "{dispatched:?}"
+    );
+}
+
+#[tokio::test]
+async fn a_dialog_opened_by_the_move_to_the_element_is_refused_not_reported_as_done() {
+    for action in ["double_click", "drag"] {
+        let f = fixture_with(|st| st.semantic_large_page = true).await;
+        let (target, tab) = bind(&f).await;
+        let snap = semantic_snapshot(&f, &target, &tab).await;
+        let text = named_ref(&snap, "Visible message");
+        let mut call = json!({"target_id": target, "tab_id": tab, "session": SESSION,
+            "ref": text, "action": action});
+        if action == "drag" {
+            call["to_x"] = json!(400.0);
+            call["to_y"] = json!(300.0);
+        }
+        f.state.lock().unwrap().move_opens_dialog = true;
+        let refused = BrowserPointerTool::new(f.engine.clone()).invoke(call).await;
+        let refused = structured(&refused);
+        assert_eq!(refused["refusal"]["code"], "browser_dialog_open", "{action}: {refused}");
+        let presses = mouse_events(&f)
+            .into_iter()
+            .filter(|(kind, _, _)| kind == "mousePressed")
+            .count();
+        assert_eq!(presses, 0, "{action}: the press never went out");
+    }
+}
+
+#[tokio::test]
+async fn a_drop_point_that_is_covered_stops_the_drag_before_the_press() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let (target, tab) = bind(&f).await;
+    let snap = semantic_snapshot(&f, &target, &tab).await;
+    let card = named_ref(&snap, "Visible message");
+    let list = named_ref(&snap, "Reply");
+    // The origin's look finds it on top; both looks at the destination
+    // find it covered.
+    {
+        let mut st = f.state.lock().unwrap();
+        st.hit_skip = 1;
+        st.hit = Some((2, covered(), 0));
+    }
+    let pointer = BrowserPointerTool::new(f.engine.clone());
+    let refused = pointer
+        .invoke(json!({"target_id": target, "tab_id": tab, "session": SESSION,
+            "ref": card, "destination_ref": list, "action": "drag"}))
+        .await;
+    let refused = structured(&refused);
+    assert_eq!(refused["refusal"]["code"], "browser_target_covered", "{refused}");
+    let message = refused["refusal"]["message"].as_str().unwrap();
+    assert!(message.starts_with(&format!("{list} is covered")), "{message}");
+    assert!(message.contains("a drop there"), "{message}");
+    assert!(mouse_events(&f).is_empty());
+}
+
+#[tokio::test]
+async fn an_html5_drag_is_intercepted_and_dropped_as_drag_events() {
+    let f = fixture_with(|st| {
+        st.semantic_large_page = true;
+        st.drag_starts = true;
+    })
+    .await;
+    let agent = Agent::bound(&f, "pointer-html5-drag").await;
+    let snap = agent.snapshot().await;
+    let card = named_ref(&snap, "Visible message");
+    let list = named_ref(&snap, "Reply");
+    let dragged = agent
+        .call(
+            "browser_pointer",
+            json!({"ref": card, "destination_ref": list, "action": "drag"}),
+        )
+        .await;
+    assert_eq!(dragged["changes"]["kind"], "diff", "{dragged}");
+
+    let drags: Vec<(String, Value)> = recorded_calls(&f, "Input.dispatchDragEvent")
+        .into_iter()
+        .map(|(_, params)| (params["type"].as_str().unwrap().to_owned(), params["data"].clone()))
+        .collect();
+    assert_eq!(
+        drags.iter().map(|(kind, _)| kind.as_str()).collect::<Vec<_>>(),
+        ["dragEnter", "dragOver", "drop"]
+    );
+    assert!(drags
+        .iter()
+        .all(|(_, data)| data["items"][0]["data"] == "Write report"));
+    // Pressed once, moved until Chrome took the drag over, released at the drop.
+    let moves = mouse_events(&f);
+    assert_eq!(moves.iter().filter(|(kind, _, _)| kind == "mousePressed").count(), 1);
+    assert_eq!(
+        moves.iter().filter(|(kind, _, _)| kind == "mouseMoved").count(),
+        2,
+        "{moves:?}"
+    );
+    let (released, _, _) = moves.last().unwrap();
+    assert_eq!(released, "mouseReleased");
+    let intercepts: Vec<bool> = recorded_calls(&f, "Input.setInterceptDrags")
+        .into_iter()
+        .map(|(_, params)| params["enabled"].as_bool().unwrap())
+        .collect();
+    assert_eq!(intercepts, [true, false]);
+}
+
+#[tokio::test]
+async fn a_drag_the_page_draws_itself_is_the_moves_alone() {
+    let f = fixture_with(|st| st.semantic_large_page = true).await;
+    let agent = Agent::bound(&f, "pointer-script-drag").await;
+    let snap = agent.snapshot().await;
+    let card = named_ref(&snap, "Visible message");
+    let dragged = agent
+        .call(
+            "browser_pointer",
+            json!({"ref": card, "to_x": 400.0, "to_y": 300.0, "action": "drag"}),
+        )
+        .await;
+    assert!(dragged.get("changes").is_some(), "{dragged}");
+    assert!(recorded_calls(&f, "Input.dispatchDragEvent").is_empty());
+    let moves = mouse_events(&f);
+    assert_eq!(
+        moves.iter().filter(|(kind, _, _)| kind == "mouseMoved").count(),
+        1 + 8,
+        "{moves:?}"
+    );
+    assert_eq!(moves.last().unwrap(), &("mouseReleased".to_owned(), 400.0, 300.0));
 }
 
 // ── Found by review ─────────────────────────────────────────────────────────

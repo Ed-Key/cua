@@ -54,11 +54,16 @@ const EXISTING_PROFILE_METHODS: &[&str] = &[
     "DOM.resolveNode",
     "DOM.scrollIntoViewIfNeeded",
     "DOM.setFileInputFiles",
+    // A read's hints that a card or cell takes a drag or a double-click.
+    "DOMDebugger.getEventListeners",
     "DOMSnapshot.captureSnapshot",
     "Emulation.setFocusEmulationEnabled",
+    "Input.dispatchDragEvent",
     "Input.dispatchKeyEvent",
     "Input.dispatchMouseEvent",
     "Input.insertText",
+    // Drags: an HTML5 drag-and-drop is carried as drag events (browser_pointer).
+    "Input.setInterceptDrags",
     "Page.bringToFront",
     "Page.captureScreenshot",
     "Page.enable",

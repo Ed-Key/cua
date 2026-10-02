@@ -394,9 +394,14 @@ element, indented under the element that contains it:
 ```
 
 - The bracket holds the ref and the actions it declares: `click`, `type`,
-  `upload`, `scroll`. A ref with none is a content ref: use it as `scope_ref`
-  for a later read, never as an action target. `browser_pointer` works on a
-  ref that declares `click`, `type` or `upload` and has a layout box.
+  `upload`, `scroll`, and the pointer actions the page shows it takes:
+  `drag` (a draggable element, a grab or move cursor, a dragstart handler)
+  and `double_click` (an editable grid's cell, a double-click handler). A ref
+  with none is a content ref: use it as `scope_ref` for a later read; it is
+  never clicked or typed into, but `browser_pointer` can still point at it.
+- A card or wrapper that offers `drag`, `double_click` or `click` but has no
+  name of its own is named by its own text (`group "Write report" [p1:3
+  drag]`); the name is re-proven before the ref is used.
 - States are words such as `disabled`, `checked`, `unchecked`, `expanded`,
   `collapsed`, `selected`, `focused`, `required`, the frame kind when it is
   not the main frame (`iframe`, `oopif`), and where the element is when it is
@@ -649,19 +654,30 @@ what else the page changed (a button that became enabled, a suggestion list).
 
 Use `browser_pointer` for `hover`, `right_click`, `double_click`, `scroll`, and
 `drag`. It uses the same `trusted` versus explicit `dom_event` distinction as
-`browser_click`. Hover, right-click, double-click, and drag require a ref that
-declares `pointer`. Scroll accepts either `scroll` or `pointer`; a plain
-overflow container can therefore be scrollable without gaining click, hover,
-or drag authority. The synthetic route requires a current ref; drag also
-requires `destination_ref` in the same proven frame. Coordinate origins and
-destinations are available only where the trusted route can preserve the
-requested posture.
+`browser_click`. Any ref in the outline can be pointed at, content refs
+included: a kanban card or a grid cell is text to accessibility but takes a
+drag or a double-click. Trusted input goes to the ref's live centre once the
+page says the ref's element is on top there, exactly as `browser_click`
+checks; otherwise it is refused `browser_target_covered` (`input_sent:
+false`) and names what covers it by its ref. A drag goes from `ref` (or `x`,
+`y`) to `destination_ref` (dropped at its centre, hit-tested the same way)
+or `to_x`, `to_y`; HTML5 drag and drop is carried as Chrome's own drag events,
+and a drag the page draws from pointer events is the mouse moves themselves.
+The synthetic route requires a current ref; drag also requires
+`destination_ref` in the same proven frame.
+
+The result says what was done, where, and what the page changed, and carries
+the `changes` an action returns:
 
 ```text
-browser_pointer
-  '{"target_id":"<target>","tab_id":"<tab>","ref":"p5:2",
-    "action":"scroll","input_route":"dom_event","delta_y":240,
-    "session":"browser-run-1"}'
+browser_pointer {"target_id":"<target>","tab_id":"<tab>","ref":"p1:3",
+                 "action":"drag","destination_ref":"p1:8"}
+-> dragged p1:3 at (123, 96) to p1:8 at (559, 126) in <tab>; the page
+   changed: 1 moved line(s), listed in changes
+browser_pointer {"target_id":"<target>","tab_id":"<tab>","ref":"p14:9",
+                 "action":"double_click"}
+-> double-clicked p14:9 at (215, 116) in <tab>; the page changed: 1 added
+   line(s), listed in changes        (the cell's editor: textbox p14:19)
 ```
 
 ### JavaScript dialogs
