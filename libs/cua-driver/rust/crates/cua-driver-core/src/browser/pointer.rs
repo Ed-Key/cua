@@ -912,11 +912,13 @@ struct DragCleanup {
 
 impl DragCleanup {
     async fn finish(mut self, dialog_open: bool) {
-        self.armed = false;
         // A page behind a dialog answers nothing, so no release then; the
         // browser answers the interception call even with a dialog up.
-        let pressed = self.pressed && !dialog_open;
-        undo_drag(&self.conn, &self.cdp, pressed.then_some(self.release_at)).await;
+        self.pressed &= !dialog_open;
+        undo_drag(&self.conn, &self.cdp, self.pressed.then_some(self.release_at)).await;
+        // Disarmed only once undone: a call cancelled meanwhile undoes it
+        // again from the drop (twice is harmless).
+        self.armed = false;
     }
 }
 
