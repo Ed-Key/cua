@@ -515,15 +515,21 @@ pub(crate) fn describe(
             parts.push(said(&surface, "closed"));
         }
     }
-    // Whether the list's own content said what changed: then an element in
-    // the list (which may now show another item) adds nothing.
-    let mut list_told = false;
+    // Labels of the list's items whose state the list read both times: an
+    // element in the list showing one of them is that item's row, and the
+    // list's own diff (by content) is the account of it; the element (which
+    // may now show another item) adds nothing. Other elements in a list (a
+    // table row's text field or pop-up) keep their own lines.
+    let mut vouched: Vec<&str> = Vec::new();
     match (&before.collection, &after.collection) {
         (Some(a), Some(b)) if same_collection(a, b) && !navigated => {
             if let (Some(old), Some(new)) = (&a.items, &b.items) {
                 let diff = list_diff(old, new);
-                list_told = !diff.is_empty();
                 parts.extend(list_change_parts(b, &diff));
+                let stateful = |items: &[Item]| items.iter().all(|item| item.value.is_some());
+                if stateful(old) && stateful(new) {
+                    vouched.extend(old.iter().chain(new).map(|item| item.name.as_str()));
+                }
             }
             if a.selected != b.selected {
                 parts.extend(selection_line(b));
@@ -565,14 +571,12 @@ pub(crate) fn describe(
         let in_list = before.target_in_list != Some(false);
         if it && a.length != b.length {
             parts.extend(length_line(a, b));
+        } else if it && in_list && (vouched.contains(&a.label.as_str()) || vouched.contains(&b.label.as_str())) {
+            // An item's row: the list's content says what changed.
         } else if it && in_list && a.label != b.label {
-            if !list_told {
-                parts.push(shows_other_item(a, b));
-            }
+            parts.push(shows_other_item(a, b));
         } else if it && a.value == b.value && a.label != b.label {
             parts.push(format!("{} is now labelled {}", element_name(a), quote(&b.label)));
-        } else if it && in_list && list_told {
-            // The list's content says which item changed.
         } else if it && a.value != b.value {
             if let Some(value) = &b.value {
                 let was = a
@@ -591,9 +595,9 @@ pub(crate) fn describe(
     }
     if let (Some(a), Some(b)) = (&before.opener, &after.opener) {
         let in_list = before.opener_in_list != Some(false);
-        if in_list && list_told {
-            // A pop-up in a list row: the list's content says what the pick
-            // did; the opener element may now sit in another item's row.
+        if in_list && (vouched.contains(&a.label.as_str()) || vouched.contains(&b.label.as_str())) {
+            // An item's row opened the menu: the list's content says what
+            // the pick did.
         } else if in_list && a.label != b.label {
             parts.push(shows_other_item(a, b));
         } else if a.label != b.label {
@@ -2375,15 +2379,13 @@ mod tests {
         );
     }
 
-    /// K3: a context menu pick: the row that opened the menu is no source of
-    /// truth either; the menu closing and the move are.
+    /// K3: a context menu pick (its menu's parent is a container, so it has
+    /// no opener): the menu closing and the move are the line.
     #[test]
-    fn a_context_menu_pick_on_a_row_names_the_moved_item_not_the_opener() {
+    fn a_context_menu_pick_on_a_row_names_the_moved_item() {
         let mut before = window("CatalystPacking");
         before.collection = Some(rows(&plain(&PACKING)));
         before.menus = Some(vec![41]);
-        before.opener = Some(Element { role: "AXGroup".into(), label: String::new(), value: Some(String::new()), length: None });
-        before.opener_in_list = Some(true);
         let mut after = before.clone();
         let mut order = vec!["Toothbrush"];
         order.extend(PACKING.iter().filter(|n| **n != "Toothbrush"));
@@ -2461,6 +2463,27 @@ mod tests {
         after.menus = Some(vec![]);
         after.opener = Some(popup("Block"));
         assert_eq!(line(&before, &after), "AXPopUpButton \"Access\" now shows \"Block\"; menu closed");
+    }
+
+    /// An AppKit table re-sorted by a row's field edit: the rows carry no
+    /// state, so the field's own value line stays beside the move.
+    #[test]
+    fn a_field_edit_that_resorts_a_table_keeps_the_fields_line() {
+        let field = |value: &str| Element {
+            role: "AXTextField".into(),
+            label: "Priority".into(),
+            value: Some(value.into()),
+            length: None,
+        };
+        let mut before = window("Tasks");
+        before.collection = Some(list(&["Alpha", "Beta", "Gamma"], &[]));
+        before.target = Some(field("1"));
+        before.target_in_list = Some(true);
+        let mut after = before.clone();
+        after.collection = Some(list(&["Beta", "Gamma", "Alpha"], &[]));
+        after.target = Some(field("3"));
+        let text = line(&before, &after);
+        assert!(text.contains("moved: Alpha (now 3 of 3)") && text.contains("AXTextField \"Priority\" now 3, was 1"), "{text}");
     }
 
     /// Duplicate names and unread values never produce a state claim; a swap
