@@ -3668,6 +3668,8 @@ impl BrowserEngine {
         // input cannot tell, and does not hold out).
         let mut changed = 0;
         let mut quiet = 0;
+        // Polls the page answered with no change at all.
+        let mut answered_quiet = 0;
         while started.elapsed() < SETTLE_DEADLINE {
             tokio::time::sleep(SETTLE_POLL).await;
             if let Some(open) = dialog() {
@@ -3699,6 +3701,7 @@ impl BrowserEngine {
             {
                 Ok(Ok(value)) => match value.pointer("/result/value").and_then(Value::as_u64) {
                     Some(0) if drawn => {
+                        answered_quiet += 1;
                         quiet += 1;
                         if quiet == SETTLE_QUIET_POLLS {
                             let _ = bounded(
@@ -3709,7 +3712,7 @@ impl BrowserEngine {
                             return Settled::Quiet;
                         }
                     }
-                    Some(0) => {}
+                    Some(0) => answered_quiet += 1,
                     Some(count) => {
                         quiet = 0;
                         changed += count;
@@ -3738,9 +3741,14 @@ impl BrowserEngine {
             json!({ "objectId": counter, "functionDeclaration": SETTLE_STOP }),
         )
         .await;
-        // Held only for a view that never came: the page did not change at
-        // all, so it is at rest, not still changing.
-        if counted_from_input && changed == 0 && watch.as_ref().is_some_and(PageWatch::within_document) {
+        // Held only for a view that never came: the page answered, and did
+        // not change at all, so it is at rest, not still changing. Polls it
+        // never answered prove nothing.
+        if counted_from_input
+            && changed == 0
+            && answered_quiet >= SETTLE_QUIET_POLLS
+            && watch.as_ref().is_some_and(PageWatch::within_document)
+        {
             return Settled::Quiet;
         }
         Settled::Deadline

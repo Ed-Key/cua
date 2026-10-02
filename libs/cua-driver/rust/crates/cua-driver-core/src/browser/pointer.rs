@@ -842,10 +842,11 @@ async fn drag(
 ) -> anyhow::Result<()> {
     let conn = delivery.conn;
     let cdp = delivery.cdp;
-    let mut events = conn.subscribe();
     // Armed before interception is asked for: a call cancelled at any point
-    // after it still turns interception off.
+    // after it still turns interception off. It holds the event stream, so a
+    // drag Chrome took over during a move that was cancelled is still found.
     let mut cleanup = DragCleanup {
+        events: conn.subscribe(),
         conn: owned,
         cdp: cdp.to_owned(),
         release_at: destination,
@@ -858,7 +859,7 @@ async fn drag(
     conn.call(Some(cdp), "Input.setInterceptDrags", json!({ "enabled": true }))
         .await
         .map_err(|error| anyhow::anyhow!("Chrome would not intercept the drag ({error}), so none was started"))?;
-    let DragCleanup { pressed, intercepted, .. } = &mut cleanup;
+    let DragCleanup { pressed, intercepted, events, .. } = &mut cleanup;
     let result = async {
         delivery
             .send(
@@ -888,7 +889,7 @@ async fn drag(
                     json!({ "type": "mouseMoved", "x": x, "y": y, "button": "left", "buttons": 1 }),
                 )
                 .await?;
-            data = take(&mut events);
+            data = take(events);
             if data.is_some() {
                 break;
             }
@@ -904,16 +905,21 @@ async fn drag(
         }
         if let Some(data) = data {
             *intercepted = Some(data.clone());
+            let mut dropped = false;
             for kind in ["dragEnter", "dragOver", "drop"] {
-                delivery
+                dropped = delivery
                     .send(
                         "Input.dispatchDragEvent",
                         json!({ "type": kind, "x": destination.0, "y": destination.1, "data": data }),
                     )
-                    .await?;
+                    .await?
+                    .is_some();
             }
-            // Dropped: nothing left to cancel.
-            *intercepted = None;
+            // Dropped: nothing left to cancel. A dialog that stopped the drop
+            // leaves the drag to be cancelled.
+            if dropped && delivery.opened.is_none() {
+                *intercepted = None;
+            }
         } else {
             // The page's own drag: let it see the pointer rest over the drop.
             tokio::time::sleep(DRAG_FRAME * 3).await;
@@ -937,6 +943,7 @@ async fn drag(
 /// instead (its future dropped), the drop undoes it in the background.
 /// Interception left on would swallow the user's own drags in this tab.
 struct DragCleanup {
+    events: tokio::sync::mpsc::UnboundedReceiver<CdpEvent>,
     conn: Arc<CdpConnection>,
     cdp: String,
     release_at: (f64, f64),
@@ -948,17 +955,23 @@ struct DragCleanup {
 }
 
 impl DragCleanup {
+    /// The drag Chrome took over, when no drop has ended it: what was seen,
+    /// else an interception still waiting in the event stream.
+    fn undropped(&mut self) -> Option<Value> {
+        if self.intercepted.is_none() && self.pressed {
+            let cdp = self.cdp.clone();
+            self.intercepted = std::iter::from_fn(|| self.events.try_recv().ok())
+                .find_map(|event| intercepted_drag(&event, &cdp));
+        }
+        self.intercepted.clone()
+    }
+
     async fn finish(mut self, dialog_open: bool) {
         // A page behind a dialog answers nothing, so no release then; the
         // browser answers the interception call even with a dialog up.
+        let cancel = self.undropped().map(|data| (self.release_at, data));
         self.pressed &= !dialog_open;
-        undo_drag(
-            &self.conn,
-            &self.cdp,
-            self.pressed.then_some(self.release_at),
-            self.intercepted.as_ref().map(|data| (self.release_at, data.clone())),
-        )
-        .await;
+        undo_drag(&self.conn, &self.cdp, self.pressed.then_some(self.release_at), cancel).await;
         // Disarmed only once undone: a call cancelled meanwhile undoes it
         // again from the drop (twice is harmless).
         self.armed = false;
@@ -971,8 +984,8 @@ impl Drop for DragCleanup {
             return;
         }
         let (conn, cdp) = (self.conn.clone(), self.cdp.clone());
+        let cancel = self.undropped().map(|data| (self.release_at, data));
         let release = self.pressed.then_some(self.release_at);
-        let cancel = self.intercepted.take().map(|data| (self.release_at, data));
         if let Ok(runtime) = tokio::runtime::Handle::try_current() {
             runtime.spawn(async move { undo_drag(&conn, &cdp, release, cancel).await });
         }
