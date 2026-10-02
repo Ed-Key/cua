@@ -44,42 +44,58 @@ pub fn list_running_apps() -> Vec<AppInfo> {
     list_running_apps_native()
 }
 
-/// Every live pid, from the kernel's process table.
-fn live_pids() -> Vec<i32> {
+/// Every live pid, from the kernel's process table; `None` when it could
+/// not be read.
+fn live_pids() -> Option<Vec<i32>> {
     // SAFETY: a null buffer asks for the count; the second call writes at
     // most `buffer.len()` pids and returns how many it wrote.
     unsafe {
-        let count = libc::proc_listallpids(std::ptr::null_mut(), 0);
-        if count <= 0 {
-            return Vec::new();
+        let mut room = libc::proc_listallpids(std::ptr::null_mut(), 0);
+        for _ in 0..3 {
+            if room <= 0 {
+                return None;
+            }
+            let mut buffer = vec![0i32; room as usize + 64];
+            let bytes = (buffer.len() * std::mem::size_of::<i32>()) as libc::c_int;
+            let written = libc::proc_listallpids(buffer.as_mut_ptr().cast(), bytes);
+            if written <= 0 {
+                return None;
+            }
+            // A full buffer may have cut processes started since the count.
+            if (written as usize) < buffer.len() {
+                buffer.truncate(written as usize);
+                buffer.retain(|&pid| pid > 0);
+                buffer.sort_unstable();
+                return Some(buffer);
+            }
+            room = written * 2;
         }
-        let mut buffer = vec![0i32; count as usize + 64];
-        let bytes = (buffer.len() * std::mem::size_of::<i32>()) as libc::c_int;
-        let written = libc::proc_listallpids(buffer.as_mut_ptr().cast(), bytes);
-        buffer.truncate(written.max(0) as usize);
-        buffer.retain(|&pid| pid > 0);
-        buffer.sort_unstable();
-        buffer
+        None
     }
 }
 
 /// The running applications, read fresh on every call.
 ///
 /// `NSWorkspace.runningApplications` and `frontmostApplication` are copies
-/// that only an NSApplication run loop refreshes. The `--no-overlay` daemon's
-/// main thread runs a bare CFRunLoop, where they kept the first read: a
-/// relaunched app kept its dead pid, an app launched later never showed, and
-/// the frontmost app never changed. Under an NSApplication loop they lagged
-/// 1-2 s, and the frontmost app once missed a switch for 4 s (lab VM,
-/// 2026-10-01). `NSRunningApplication` looked up by pid answers from
-/// LaunchServices at call time, about 3 ms for 600 processes.
+/// that only an NSApplication run loop refreshes, late (1-2 s) or never: in
+/// the `--no-overlay` daemon (a bare CFRunLoop) a relaunched app kept its dead
+/// pid and the frontmost app never changed. `NSRunningApplication` looked up
+/// by pid answers from LaunchServices at call time (under 1 ms for 600
+/// processes). Falls back to the workspace copy when the process table cannot
+/// be read.
 fn running_applications() -> Vec<objc2::rc::Retained<objc2_app_kit::NSRunningApplication>> {
-    use objc2_app_kit::NSRunningApplication;
-    live_pids()
-        .into_iter()
-        .filter_map(|pid| unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
-        .filter(|app| unsafe { !app.isTerminated() })
-        .collect()
+    use objc2_app_kit::{NSRunningApplication, NSWorkspace};
+    let apps: Vec<_> = match live_pids() {
+        Some(pids) => pids
+            .into_iter()
+            .filter_map(|pid| unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) })
+            .collect(),
+        None => unsafe {
+            let running = NSWorkspace::sharedWorkspace().runningApplications();
+            (0..running.count()).map(|index| running.objectAtIndex(index)).collect()
+        },
+    };
+    apps.into_iter().filter(|app| unsafe { !app.isTerminated() }).collect()
 }
 
 fn list_running_apps_native() -> Vec<AppInfo> {
@@ -635,10 +651,14 @@ fn read_app_plist(plist_path: &std::path::Path) -> Option<AppInfo> {
 /// went stale in the daemon like its app list (see [`running_applications`]).
 /// `None` if there isn't one (rare, e.g. screensaver).
 pub fn frontmost_pid() -> Option<i32> {
-    running_applications()
-        .into_iter()
-        .find(|app| unsafe { app.isActive() })
-        .map(|app| unsafe { app.processIdentifier() })
+    // An app switch during the scan can leave no app saying it is active;
+    // the second scan sees the switch finished.
+    (0..2).find_map(|_| {
+        running_applications()
+            .into_iter()
+            .find(|app| unsafe { app.isActive() })
+            .map(|app| unsafe { app.processIdentifier() })
+    })
 }
 
 /// Re-activate the app with `pid` via

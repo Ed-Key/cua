@@ -1428,6 +1428,12 @@ impl OutcomeWatch for Watch {
                     None => (pass.facts, DiskNotes::default(), false),
                 }
             };
+            // A command whose change went back (or never came) is not settled.
+            let settle = if scope.command && settle != Settle::StillChanging && after == before {
+                Settle::CommandUnchanged
+            } else {
+                settle
+            };
             describe(&before, &after, &disk, settle, complete_before && complete)
         })
         .await
