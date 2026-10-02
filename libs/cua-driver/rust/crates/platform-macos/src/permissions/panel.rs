@@ -121,7 +121,7 @@ pub fn panel_enabled() -> bool {
     if MainThreadMarker::new().is_none() {
         return false;
     }
-    if !running_inside_app_bundle() {
+    if !crate::permissions::status::running_from_app_bundle() {
         return false;
     }
     true
@@ -198,19 +198,6 @@ fn env_on(key: &str) -> bool {
             matches!(lower.as_str(), "1" | "true" | "yes" | "on")
         })
         .unwrap_or(false)
-}
-
-/// Detect whether the current executable lives under a `.app` bundle.
-fn running_inside_app_bundle() -> bool {
-    let Ok(exe) = std::env::current_exe() else {
-        return false;
-    };
-    exe.components().any(|c| {
-        c.as_os_str()
-            .to_str()
-            .map(|s| s.ends_with(".app"))
-            .unwrap_or(false)
-    })
 }
 
 // ── Layout constants ────────────────────────────────────────────────────

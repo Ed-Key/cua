@@ -8,7 +8,7 @@
 
 #![cfg(any(unix, target_os = "windows"))]
 
-use cua_driver_testkit::spawn_in_job;
+use cua_driver_testkit::{kill_child_tree, serve_command, spawn_in_job};
 use serde_json::{json, Value};
 use std::io::{BufRead, Write};
 use std::process::{Child, ChildStdin, Command, Stdio};
@@ -116,17 +116,36 @@ async fn relay(
 
 struct Process(Child, #[allow(dead_code)] tempfile::TempDir);
 
+fn default_session_ttl() -> u64 {
+    // This isolates transport lifetime from intentional session expiry.
+    (recovery_idle_seconds() + 60).max(300)
+}
+
+/// The daemon command every test here uses. `serve_command` turns the
+/// permissions gate off, so a bare cargo build never raises a TCC prompt.
+fn daemon_command(endpoint: &str) -> Command {
+    let mut command = serve_command(
+        std::path::Path::new(env!("CARGO_BIN_EXE_cua-driver")),
+        endpoint,
+    );
+    command.args(["--no-overlay", "--dangerously-bypass-approvals"]);
+    command
+}
+
 impl Process {
     fn spawn(args: &[&str]) -> Self {
-        // This isolates transport lifetime from intentional session expiry.
-        Self::spawn_with_session_ttl(args, (recovery_idle_seconds() + 60).max(300))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cua-driver"));
+        command.args(args);
+        Self::start(command, default_session_ttl())
     }
 
-    fn spawn_with_session_ttl(args: &[&str], session_ttl_seconds: u64) -> Self {
+    fn daemon(endpoint: &str, session_ttl_seconds: u64) -> Self {
+        Self::start(daemon_command(endpoint), session_ttl_seconds)
+    }
+
+    fn start(mut command: Command, session_ttl_seconds: u64) -> Self {
         let driver_home = tempfile::tempdir().expect("isolated driver state");
-        let mut command = Command::new(env!("CARGO_BIN_EXE_cua-driver"));
         command
-            .args(args)
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::inherit())
@@ -180,9 +199,18 @@ fn recovery_idle_seconds() -> u64 {
 
 impl Drop for Process {
     fn drop(&mut self) {
-        let _ = self.0.kill();
-        let _ = self.0.wait();
+        // Runs on panic too. A plain kill would orphan the responsibility-
+        // disclaimed copy a bare macOS `serve` spawns of itself.
+        kill_child_tree(&mut self.0);
     }
+}
+
+#[test]
+fn daemon_command_disables_the_permissions_gate() {
+    let command = daemon_command("/tmp/d.sock");
+    let args: Vec<_> = command.get_args().collect();
+    assert_eq!(args[0], "serve");
+    assert!(args.iter().any(|arg| *arg == "--no-permissions-gate"));
 }
 
 struct Client {
@@ -350,14 +378,7 @@ async fn real_proxies_recover_from_control_loss_without_waiting_for_stdin() {
         format!(r"\\.\pipe\cua-recovery-{}-daemon", std::process::id()),
         format!(r"\\.\pipe\cua-recovery-{}-proxy", std::process::id()),
     );
-    let mut daemon = Process::spawn(&[
-        "serve",
-        "--socket",
-        &daemon_endpoint,
-        "--no-overlay",
-        "--no-permissions-gate",
-        "--dangerously-bypass-approvals",
-    ]);
+    let mut daemon = Process::daemon(&daemon_endpoint, default_session_ttl());
     let deadline = Instant::now() + BOUND;
     loop {
         assert!(
@@ -446,17 +467,7 @@ async fn idle_reclaimed_sessions_are_recreated_through_the_daemon() {
     let endpoint = directory.path().join("d.sock").display().to_string();
     #[cfg(target_os = "windows")]
     let endpoint = format!(r"\\.\pipe\cua-idle-{}-daemon", std::process::id());
-    let mut daemon = Process::spawn_with_session_ttl(
-        &[
-            "serve",
-            "--socket",
-            &endpoint,
-            "--no-overlay",
-            "--no-permissions-gate",
-            "--dangerously-bypass-approvals",
-        ],
-        1,
-    );
+    let mut daemon = Process::daemon(&endpoint, 1);
     let deadline = Instant::now() + BOUND;
     while connect(&endpoint).await.is_err() {
         assert!(

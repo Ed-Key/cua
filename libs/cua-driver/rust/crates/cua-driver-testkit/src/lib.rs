@@ -56,6 +56,7 @@ mod windows_setup;
 
 pub use browser_fixture::BrowserFixtureServer;
 pub use cli::CliDriver;
+pub use daemon::serve_command;
 pub use driver::{BehaviorRecording, Driver};
 pub use host_state::{IsolatedStateRoot, SHARE_HOST_STATE};
 pub use journal::FixtureJournal;
@@ -65,7 +66,7 @@ pub use paths::{
     REQUIRE_DRIVER_BIN_ENV,
 };
 pub use raw::RawDriver;
-pub use reaper::{spawn_in_job, ChildReaper};
+pub use reaper::{kill_child_tree, spawn_in_job, ChildReaper};
 pub use response::ToolResponse;
 
 use std::time::Duration;

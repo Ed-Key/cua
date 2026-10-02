@@ -90,13 +90,11 @@ impl TestDaemon {
         } else {
             Stdio::null()
         };
-        let mut command = Command::new(binary);
+        let mut command = serve_command(binary, &socket);
         command
-            .args(["serve", "--socket", &socket, "--no-permissions-gate"])
             .stdin(Stdio::null())
             .stdout(Stdio::null())
-            .stderr(stderr)
-            .env("CUA_DRIVER_RS_TELEMETRY_ENABLED", "false");
+            .stderr(stderr);
         if !overlay_enabled {
             command.arg("--no-overlay");
         }
@@ -162,6 +160,18 @@ impl TestDaemon {
         reaper.push(child);
         None
     }
+}
+
+/// `serve` command for a test-owned daemon. The permissions gate is always
+/// off (flag and env): a test daemon must never raise macOS permission prompts
+/// or block startup waiting for grants.
+pub fn serve_command(binary: &Path, socket: &str) -> Command {
+    let mut command = Command::new(binary);
+    command
+        .args(["serve", "--socket", socket, "--no-permissions-gate"])
+        .env("CUA_DRIVER_RS_PERMISSIONS_GATE", "0")
+        .env("CUA_DRIVER_RS_TELEMETRY_ENABLED", "false");
+    command
 }
 
 /// Total time the daemon has to answer a readiness probe.
@@ -313,6 +323,15 @@ fn daemon_is_listening(binary: &Path, socket: &str) -> ProbeOutcome {
 #[cfg(test)]
 mod readiness_probe_tests {
     use super::*;
+
+    #[test]
+    fn serve_command_always_disables_the_permissions_gate() {
+        let command = serve_command(Path::new("cua-driver"), "/tmp/d.sock");
+        assert!(command.get_args().any(|arg| arg == "--no-permissions-gate"));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "CUA_DRIVER_RS_PERMISSIONS_GATE" && value == Some("0".as_ref())
+        }));
+    }
 
     /// The furthest-progress ordering is what makes the expiry message useful,
     /// so pin it rather than leaving it to derive order by accident.

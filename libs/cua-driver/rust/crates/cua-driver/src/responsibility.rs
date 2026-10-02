@@ -21,9 +21,20 @@ pub fn already_disclaimed() -> bool {
 /// testable without spawning. Embedded mode must skip the disclaim:
 /// disclaiming would make the driver its own responsible process and
 /// break TCC inheritance from the host.
+///
+/// A bare executable outside any app bundle (a cargo build) must skip it too.
+/// Its ad-hoc code identity changes on every build, so owning its TCC identity
+/// means every build is an unknown identity: each AX or capture check raises a
+/// prompt and adds another Settings row that can never stay granted. Staying
+/// in the launcher's chain keeps it on the terminal's or IDE's existing grants.
 #[cfg(target_os = "macos")]
-fn should_skip_disclaim(embedded: bool, already_disclaimed: bool, inside_bundle: bool) -> bool {
-    embedded || already_disclaimed || inside_bundle
+fn should_skip_disclaim(
+    embedded: bool,
+    already_disclaimed: bool,
+    inside_cuadriver_app: bool,
+    inside_app_bundle: bool,
+) -> bool {
+    embedded || already_disclaimed || inside_cuadriver_app || !inside_app_bundle
 }
 
 #[cfg(target_os = "macos")]
@@ -32,6 +43,7 @@ pub fn reexec_disclaimed_if_needed() {
         cua_driver_core::embedded_mode(),
         already_disclaimed(),
         crate::bundle::is_executable_inside_cuadriver_app(),
+        platform_macos::permissions::status::running_from_app_bundle(),
     ) {
         return;
     }
@@ -175,12 +187,14 @@ mod tests {
     use super::*;
 
     #[test]
-    fn embedded_mode_skips_disclaim_reexec() {
-        assert!(should_skip_disclaim(true, false, false));
-        // A bare standalone binary must still disclaim.
-        assert!(!should_skip_disclaim(false, false, false));
-        assert!(should_skip_disclaim(false, true, false));
-        assert!(should_skip_disclaim(false, false, true));
+    fn disclaim_only_for_a_non_cuadriver_app_bundle() {
+        assert!(should_skip_disclaim(true, false, false, true));
+        // Only an executable in some other app bundle owns its identity.
+        assert!(!should_skip_disclaim(false, false, false, true));
+        assert!(should_skip_disclaim(false, true, false, true));
+        assert!(should_skip_disclaim(false, false, true, true));
+        // A bare cargo build stays in its launcher's TCC chain.
+        assert!(should_skip_disclaim(false, false, false, false));
     }
 
     #[test]

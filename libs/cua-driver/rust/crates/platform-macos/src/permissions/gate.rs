@@ -38,7 +38,8 @@ use std::time::{Duration, Instant};
 use anyhow::Result;
 
 use crate::permissions::status::{
-    current_status, request_accessibility, request_screen_recording, PermissionsStatus,
+    current_status, request_accessibility, request_screen_recording, running_from_app_bundle,
+    PermissionsStatus, BARE_EXECUTABLE_PROMPT_NOTE,
 };
 
 const PERMISSION_PROBE_ARG: &str = "--cua-internal-permission-probe";
@@ -400,6 +401,9 @@ where
     }
 
     let missing = missing_from_status(initial);
+    // A bare executable never prompts (see `running_from_app_bundle`), and
+    // System Settings would not list it either, so skip both and say why.
+    let bundled = running_from_app_bundle();
 
     // Raise the TCC system prompts BEFORE showing our panel. The
     // `AXIsProcessTrustedWithOptions` / `CGRequestScreenCaptureAccess`
@@ -420,7 +424,7 @@ where
     //
     // These calls are no-ops when the grant is already active so the
     // happy-path (both green) sees no UI from this block.
-    if opts.also_raise_prompts {
+    if opts.also_raise_prompts && bundled {
         if let Err(error) = fresh_status_with_request(true) {
             tracing::warn!("permission request probe failed: {error}");
         }
@@ -452,8 +456,8 @@ where
     let skip_wait_loop;
     match presentation {
         PanelPresentation::NotShown => {
-            print_banner(&missing, opts.open_settings);
-            should_auto_open_settings = opts.open_settings;
+            should_auto_open_settings = opts.open_settings && bundled;
+            print_banner(&missing, should_auto_open_settings, bundled);
             skip_wait_loop = false;
         }
         PanelPresentation::ShownOpenSettings => {
@@ -598,7 +602,7 @@ pub fn wait_for_grants(opts: &GateOpts) -> Result<()> {
     }
 }
 
-fn print_banner(missing: &[MissingPermission], open_settings: bool) {
+fn print_banner(missing: &[MissingPermission], open_settings: bool, bundled: bool) {
     println!();
     println!("──────────────────────────────────────────────────────────────");
     println!(" cua-driver needs your permission before desktop tools can run");
@@ -610,6 +614,10 @@ fn print_banner(missing: &[MissingPermission], open_settings: bool) {
         println!("       {}", m.rationale());
     }
     println!();
+    if !bundled {
+        println!(" {BARE_EXECUTABLE_PROMPT_NOTE}");
+        println!();
+    }
     if open_settings {
         println!(" Opening System Settings → Privacy & Security now.");
     } else {

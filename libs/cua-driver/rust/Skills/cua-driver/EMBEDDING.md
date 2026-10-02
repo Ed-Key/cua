@@ -32,7 +32,10 @@ own responsible process. Second, a process can explicitly _disclaim_
 responsibility for a child (`responsibility_spawnattrs_setdisclaim`), making
 the child its own responsible process — standalone cua-driver does this on
 purpose so its permissions attach to a stable `com.trycua.driver` identity
-instead of whatever terminal launched it. Embedded mode turns that off.
+instead of whatever terminal launched it. Embedded mode turns that off. A bare
+build outside any app bundle (for example `cargo build` output) never
+disclaims either: its code identity changes on every build, so it stays in its
+launcher's chain and never raises prompts of its own.
 
 Note this is TCC **responsibility** inheritance — it is unrelated to App
 Sandbox inheritance (`com.apple.security.inherit`). This guide assumes a

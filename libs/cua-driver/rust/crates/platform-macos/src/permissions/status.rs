@@ -66,9 +66,69 @@ pub fn screen_recording_granted() -> bool {
     unsafe { CGPreflightScreenCaptureAccess() }
 }
 
+/// Shown wherever a prompt was skipped because the executable is bare.
+pub const BARE_EXECUTABLE_PROMPT_NOTE: &str =
+    "This cua-driver executable is not inside an installed app bundle (for example a \
+     cargo build), so it does not raise macOS permission prompts and runs on the \
+     permissions of the app that launched it (your terminal or IDE). Grant \
+     Accessibility and Screen Recording to that app in System Settings, or run the \
+     installed CuaDriver app instead (`cua-driver permissions grant` sets it up).";
+
+/// True when this process runs from `<Name>.app/Contents/MacOS/<exe>` inside an
+/// app bundle that declares a bundle identifier (CuaDriver.app,
+/// CuaDriverLocal.app, or an embedding host app).
+///
+/// Only such a process may raise TCC prompts. A bare executable (a cargo
+/// build) gets a new ad-hoc code identity on every build, so each prompt adds
+/// another System Settings row that can never stay granted. The executable is
+/// canonicalized first so a CLI symlink into the installed app still counts.
+pub fn running_from_app_bundle() -> bool {
+    static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *CACHED.get_or_init(|| {
+        std::env::current_exe()
+            .and_then(std::fs::canonicalize)
+            .is_ok_and(|exe| bundle_identifier_for_executable(&exe).is_some())
+    })
+}
+
+/// Bundle identifier of the `.app` that directly contains `executable` as
+/// `Contents/MacOS/<exe>`, or `None` for any other layout.
+fn bundle_identifier_for_executable(executable: &std::path::Path) -> Option<String> {
+    let macos = executable.parent()?;
+    let contents = macos.parent()?;
+    let app = contents.parent()?;
+    if macos.file_name()? != "MacOS"
+        || contents.file_name()? != "Contents"
+        || app.extension()? != "app"
+    {
+        return None;
+    }
+    let url = core_foundation::url::CFURL::from_path(app, true)?;
+    bundle_identifier(&core_foundation::bundle::CFBundle::new(url)?)
+}
+
+/// Non-empty `CFBundleIdentifier` of `bundle`.
+pub(crate) fn bundle_identifier(bundle: &core_foundation::bundle::CFBundle) -> Option<String> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::CFString;
+
+    unsafe {
+        let id_ref = core_foundation::bundle::CFBundleGetIdentifier(bundle.as_concrete_TypeRef());
+        if id_ref.is_null() {
+            return None;
+        }
+        let id = CFString::wrap_under_get_rule(id_ref).to_string();
+        (!id.is_empty()).then_some(id)
+    }
+}
+
 /// Raise the Accessibility TCC prompt if not yet granted.  No-op when
-/// already active.  Mirrors Swift `Permissions.requestAccessibility()`.
+/// already active, and never prompts outside an app bundle
+/// ([`running_from_app_bundle`]).  Mirrors Swift `Permissions.requestAccessibility()`.
 pub fn request_accessibility() -> bool {
+    if !running_from_app_bundle() {
+        return accessibility_granted();
+    }
     use core_foundation::base::TCFType;
     use core_foundation::boolean::CFBoolean;
     use core_foundation::dictionary::CFDictionary;
@@ -80,12 +140,72 @@ pub fn request_accessibility() -> bool {
     unsafe { crate::ax::bindings::AXIsProcessTrustedWithOptions(options.as_concrete_TypeRef()) }
 }
 
-/// Raise the Screen Recording TCC prompt if not yet granted.
+/// Raise the Screen Recording TCC prompt if not yet granted.  Never prompts
+/// outside an app bundle ([`running_from_app_bundle`]).
 /// Mirrors Swift `Permissions.requestScreenRecording()`.
 pub fn request_screen_recording() -> bool {
+    if !running_from_app_bundle() {
+        return screen_recording_granted();
+    }
     #[link(name = "CoreGraphics", kind = "framework")]
     extern "C" {
         fn CGRequestScreenCaptureAccess() -> bool;
     }
     unsafe { CGRequestScreenCaptureAccess() }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fake_app(root: &std::path::Path, info_plist: Option<&str>) -> std::path::PathBuf {
+        let macos = root.join("Fake.app/Contents/MacOS");
+        std::fs::create_dir_all(&macos).unwrap();
+        let exe = macos.join("cua-driver");
+        std::fs::write(&exe, b"").unwrap();
+        if let Some(plist) = info_plist {
+            std::fs::write(root.join("Fake.app/Contents/Info.plist"), plist).unwrap();
+        }
+        exe
+    }
+
+    #[test]
+    fn bundle_check_requires_app_layout_with_a_bundle_identifier() {
+        let with_id = tempfile::tempdir().unwrap();
+        let exe = fake_app(
+            with_id.path(),
+            Some(
+                r#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0"><dict>
+<key>CFBundleIdentifier</key><string>com.example.fake</string>
+<key>CFBundleExecutable</key><string>cua-driver</string>
+</dict></plist>"#,
+            ),
+        );
+        assert_eq!(
+            bundle_identifier_for_executable(&exe).as_deref(),
+            Some("com.example.fake")
+        );
+
+        let without_plist = tempfile::tempdir().unwrap();
+        let exe = fake_app(without_plist.path(), None);
+        assert_eq!(bundle_identifier_for_executable(&exe), None);
+
+        let bare = tempfile::tempdir().unwrap();
+        let exe = bare.path().join("debug/cua-driver");
+        assert_eq!(bundle_identifier_for_executable(&exe), None);
+        // Inside an .app but not at Contents/MacOS/<exe>.
+        let nested = with_id
+            .path()
+            .join("Fake.app/Contents/Resources/cua-driver");
+        assert_eq!(bundle_identifier_for_executable(&nested), None);
+    }
+
+    #[test]
+    fn bare_test_binary_is_not_a_bundle() {
+        // `cargo test` runs this from target/debug/deps, outside any bundle, so
+        // request_* take the non-prompting branch. (Calling them here would
+        // raise a real prompt if that branch ever regressed.)
+        assert!(!running_from_app_bundle());
+    }
 }
