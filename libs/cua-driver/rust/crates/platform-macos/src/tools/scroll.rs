@@ -32,6 +32,9 @@ struct WheelTarget {
     screen_y: f64,
     win_local: Option<(f64, f64)>,
     wid: Option<u32>,
+    /// Element screen rect `[x, y, w, h]` for the cursor glide; `None` for
+    /// pixel targets.
+    rect: Option<[f64; 4]>,
 }
 
 pub struct ScrollTool {
@@ -46,13 +49,29 @@ impl ScrollTool {
 
 static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 
+/// Wheel notches or keystroke repetitions accepted in one call. The input
+/// schema advertises this range and both delivery paths enforce it.
+const AMOUNT_MIN: u64 = 1;
+const AMOUNT_MAX: u64 = 50;
+
+fn clamp_amount(requested: u64) -> usize {
+    requested.clamp(AMOUNT_MIN, AMOUNT_MAX) as usize
+}
+
+const ELECTRON_BACKGROUND_SCROLL_UNAVAILABLE: &str = "Untargeted background scroll is \
+     unavailable for Electron/Chromium windows on macOS: they drop background keystrokes, so \
+     nothing was sent. Pass an element_token, or window_id with window-local screenshot x,y, \
+     for a guarded background wheel scroll; or retry with delivery_mode:\"foreground\", which \
+     briefly fronts the window, scrolls, and restores the prior frontmost app.";
+
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "scroll".into(),
         description: "Scroll with a real wheel event at an element (element_token preferred) or \
             at x,y screenshot pixels; only this reaches nested scroll regions. With no target it \
-            sends Page or arrow keys to the focused scroller. Delivery does not prove content \
-            moved; verify. Details: skill://cua-driver/MACOS.md".into(),
+            sends Page or arrow keys to the focused scroller. Untargeted background scroll of \
+            Electron/Chromium is refused: pass a target or delivery_mode \"foreground\". \
+            Delivery does not prove content moved; verify. Details: skill://cua-driver/MACOS.md".into(),
         input_schema: serde_json::json!({
             "type": "object",
             // `pid` conditionally required (validated in code), not pinned in the
@@ -60,7 +79,7 @@ fn def() -> &'static ToolDef {
             "required": ["direction"],
             "properties": {
                 "session": cua_driver_core::tool_schema::session_schema(),
-                "pid": { "type": "integer", "description": "Target process ID." },
+                "pid": { "type": "integer", "description": "Target process ID. Optional with element_token or scope \"desktop\"." },
                 "direction": {
                     "type": "string",
                     "enum": ["up", "down", "left", "right"],
@@ -74,15 +93,13 @@ fn def() -> &'static ToolDef {
                 },
                 "amount": {
                     "type": "integer",
-                    "minimum": 1,
-                    "maximum": 50,
+                    "minimum": AMOUNT_MIN,
+                    "maximum": AMOUNT_MAX,
                     "default": 3,
                     "description": "Wheel notches, or keystroke repeats with no target."
                 },
                 "window_id": { "type": "integer", "description": "Target window ID; required with x,y." },
-                "element_index": cua_driver_core::tool_schema::element_index_schema(),
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
-                "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
                 "x": { "type": "number", "description": "X in get_window_state screenshot pixels, for surfaces missing from the tree." },
                 "y": { "type": "number", "description": "Y in the same screenshot pixels." },
                 "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "Legacy frame; prefer target. \"desktop\" with x,y and no pid/window_id uses get_desktop_state pixels." },
@@ -116,7 +133,7 @@ impl Tool for ScrollTool {
             let (x, y) = (input.x, input.y);
             let direction = input.direction.as_str();
             let by = input.by.unwrap_or(ScrollBy::Line).as_str();
-            let amount = input.amount.unwrap_or(3).clamp(1, 50) as usize;
+            let amount = clamp_amount(input.amount.unwrap_or(3));
             let step = if input.by == Some(ScrollBy::Page) {
                 WHEEL_STEP_PAGE_PX
             } else {
@@ -146,7 +163,7 @@ impl Tool for ScrollTool {
                 Err(error) => ToolResult::error(format!("desktop scroll task failed: {error}")),
             };
         }
-        let pid = match args.require_i32("pid") {
+        let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -163,35 +180,23 @@ impl Tool for ScrollTool {
         let explicit_pixel_target = args.opt_u64("window_id").is_some()
             && args.opt_f64("x").is_some()
             && args.opt_f64("y").is_some();
-        let explicit_element_target =
-            args.opt_u64("element_index").is_some() || args.opt_str("element_token").is_some();
+        let explicit_element_target = args.opt_str("element_token").is_some();
         if background_electron && !explicit_pixel_target && !explicit_element_target {
-            return ToolResult::error(
-                "Background Electron scroll requires a fresh element target with a usable \
-                 rectangle inside its window, or window_id and window-local screenshot x,y. \
-                 Untargeted keyboard scrolling remains unavailable."
-                    .to_owned(),
-            )
-            .with_structured(serde_json::json!({ "code": "background_unavailable" }));
+            return cua_driver_core::delivery::background_unavailable_result(
+                ELECTRON_BACKGROUND_SCROLL_UNAVAILABLE,
+                "background_unavailable",
+                "Electron/Chromium windows drop background keystroke scrolling on macOS",
+                serde_json::json!({ "effect": "refused" }),
+            );
         }
         let direction = match args.require_str("direction") {
             Ok(v) => v,
             Err(e) => return e,
         };
         let by = args.str_or("by", "line");
-        let amount = args.u64_or("amount", 3) as usize;
-        // Surface 6: element_token / element_index precedence.
-        let element_token_arg = args.opt_str("element_token");
+        let amount = clamp_amount(args.u64_or("amount", 3));
         let window_id_arg = args.opt_u64("window_id");
-        let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
-        let resolved = match self.state.element_cache.resolve_element_args(
-            pid,
-            element_index_arg,
-            element_token_arg.as_deref(),
-            args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
-            "scroll",
-        ) {
+        let resolved = match self.state.snapshots.resolve(pid, &args) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -357,6 +362,7 @@ impl Tool for ScrollTool {
                     screen_y,
                     win_local: Some((lx, ly)),
                     wid: Some(wid),
+                    rect: Some(rect),
                 })
             })
             .await;
@@ -429,6 +435,9 @@ impl Tool for ScrollTool {
                 }
                 std::thread::sleep(std::time::Duration::from_millis(40));
                 let center = unsafe { element_screen_center(element_ptr as AXUIElementRef) };
+                let rect = unsafe {
+                    crate::ax::bindings::element_screen_rect(element_ptr as AXUIElementRef)
+                };
                 Ok(center.map(|(cx, cy)| {
                     let win_local = wid
                         .and_then(crate::windows::window_bounds_by_id)
@@ -438,6 +447,7 @@ impl Tool for ScrollTool {
                         screen_y: cy,
                         win_local,
                         wid,
+                        rect,
                     }
                 }))
             });
@@ -480,6 +490,7 @@ impl Tool for ScrollTool {
                         screen_y: sy,
                         win_local: Some((lx, ly)),
                         wid: Some(wid),
+                        rect: None,
                     })
                 }
                 Err(refusal) => return refusal,
@@ -541,11 +552,12 @@ impl Tool for ScrollTool {
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
             }
-            crate::cursor::overlay::animate_cursor_to(
+            crate::cursor::overlay::animate_cursor_to_target(
                 cursor_key.clone(),
                 target.screen_x,
                 target.screen_y,
                 target.wid.map(|wid| wid as u64),
+                target.rect,
             )
             .await;
             self.state.cursor_registry.update_position(
@@ -562,6 +574,7 @@ impl Tool for ScrollTool {
                 screen_y,
                 win_local,
                 wid,
+                ..
             } = target;
             let amount_ticks = amount;
             let fg = delivery_mode.is_foreground() && wid.is_some();
@@ -778,5 +791,20 @@ unsafe fn collect_ax_buttons(
             collect_ax_buttons(child, depth + 1, buttons);
             CFRelease(child as CFTypeRef);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn amount_is_clamped_to_the_advertised_range() {
+        let amount = &def().input_schema["properties"]["amount"];
+        assert_eq!(amount["minimum"], serde_json::json!(AMOUNT_MIN));
+        assert_eq!(amount["maximum"], serde_json::json!(AMOUNT_MAX));
+        assert_eq!(clamp_amount(1100), AMOUNT_MAX as usize);
+        assert_eq!(clamp_amount(0), AMOUNT_MIN as usize);
+        assert_eq!(clamp_amount(3), 3);
     }
 }

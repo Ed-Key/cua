@@ -25,7 +25,7 @@ use crate::ax::bindings::{
     copy_stringish_attr, AXUIElementCreateApplication, AXUIElementRef,
     AXUIElementSetMessagingTimeout,
 };
-use crate::ax::cache::{CachedSnapshot, RetainedElement};
+use crate::ax::snapshot::{AxSnapshot, RetainedElement};
 
 /// Read the app this often after the action.
 const POLL: Duration = Duration::from_millis(50);
@@ -1757,20 +1757,9 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
         .and_then(|id| u32::try_from(id).ok());
     // The action's own element, resolved the way the action resolves it (in
     // this dispatch, so the session's snapshots are the ones consulted).
-    let (target, window_id) = if args.get("element_token").is_some() || args.get("element_index").is_some() {
-        let resolved = cua_driver_core::element_cache::current_runtime_cache::<CachedSnapshot>()
-            .and_then(|cache| {
-                cache
-                    .resolve_element_args(
-                        pid,
-                        args.get("element_index").and_then(Value::as_u64).map(|i| i as usize),
-                        args.get("element_token").and_then(Value::as_str),
-                        args.get("snapshot_id").and_then(Value::as_str),
-                        window_id.map(u64::from),
-                        "outcome",
-                    )
-                    .ok()
-            })
+    let (target, window_id) = if args.get("element_token").is_some() {
+        let resolved = cua_driver_core::snapshot_store::current_runtime_store::<AxSnapshot>()
+            .and_then(|store| store.resolve(pid, args).ok())
             .map(|resolved| resolved.into_parts(window_id.map(u64::from)));
         match resolved {
             // A token carries its window: watch that one, not the focused one.

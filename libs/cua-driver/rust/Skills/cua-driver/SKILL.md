@@ -1,7 +1,7 @@
 ---
 name: cua-driver
 description: Drive a native GUI app (macOS, Windows, Linux) via the cua-driver CLI (default) or MCP server; snapshot its accessibility tree, act through snapshot-bound element tokens, native menu paths, exact window geometry, or pixel coordinates, and verify from fresh state. Use when the user asks you to operate, drive, automate, or perform a GUI task in a real application on the host, or to continue, resume, or recall recent Cua activity.
-version: 0.30.2 # x-release-please-version
+version: 0.34.0 # x-release-please-version
 metadata:
   openclaw:
     requires:
@@ -31,7 +31,16 @@ metadata:
 
 # cua-driver
 
-Operate one exact target, observe its state, act once, and verify the user's postcondition.
+Operate one exact target, observe it narrowly, act by element, and verify the user's postcondition at checkpoints.
+
+## Efficient loop
+
+The MCP server instructions carry the same rules, so they apply even when this file is not opened.
+
+1. Read the window: `get_window_state({app})` for a single-window app on macOS, else `({pid, window_id})`. Add `query:"Save"` when you know the target, and pass `include_screenshot:false` when the tree is enough. On macOS later reads of the same window return only changed rows.
+2. Act by `element_token`. A narrowed read keeps the full snapshot actionable, so you can act on a match without re-reading. Use pixels only for surfaces missing from the tree.
+3. Verify at checkpoints (after a meaningful state change, before finishing), not after every action. One `verify_state` or one targeted `get_window_state` is usually enough.
+4. Batch known steps: on macOS, `act_and_read` with `steps` (one window, background, one read at the end); `run_actions` (full tool profile) for steps across windows, foreground delivery, or drag. Both stop at the first failure; see [Workflow](WORKFLOW.md#batch-known-actions).
 
 ## Act
 
@@ -41,6 +50,7 @@ Operate one exact target, observe its state, act once, and verify the user's pos
 | Find or open the requested app            | `list_apps`, `list_windows`, `launch_app`                                                             | Current platform guide below                          |
 | Observe one window                        | `get_window_state({pid, window_id})`, or `{app}` for a single-window app on macOS                     | [Workflow](WORKFLOW.md)                               |
 | Act on a control                          | `click` / `type_text` with a fresh `element_token` and exact window target                            | [Workflow](WORKFLOW.md)                               |
+| Run several decided actions in one call   | `act_and_read({pid, window_id, steps})` on macOS; else `run_actions({steps:[{tool,args},...]})`       | [Workflow](WORKFLOW.md#batch-known-actions)           |
 | Use pixels when semantics cannot reach it | Fresh target screenshot, then `x,y` on the same target                                                | [Workflow](WORKFLOW.md)                               |
 | Verify the outcome                        | `verify_state({pid, window_id, expect})` or a fresh snapshot read by the agent                        | [Workflow](WORKFLOW.md)                               |
 | Operate the authorized desktop            | `get_desktop_state` → input with `target:{kind:"desktop",display_id:"primary"}` → `get_desktop_state` | [Workflow](WORKFLOW.md), [Linux](LINUX.md) on Wayland |
@@ -58,7 +68,7 @@ Check the installed version and advertised schema before using unfamiliar parame
 
 1. Select the exact target on each action. A session is lifecycle metadata, not capture scope or permission authority.
 2. Observe before input and verify after it. `effect:"unverifiable"` and a successful exit are not task success; never replay a partial, canceled, or unknown action blindly. Never resend a move, toggle, typing, or submit (`idempotent:false`) without a fresh read showing its effect missing.
-3. Use tokens from the latest snapshot (`<snapshot_id>:<index>` for a row in its tree), never invented indices. A fresh snapshot replaces prior element handles; prefer `element_token` over `element_index` plus `snapshot_id`.
+3. Use tokens from the latest snapshot (`<snapshot_id>:<index>` for a row in its tree), never invented indices. A fresh snapshot replaces prior element handles and lists them in `invalidated_snapshot_ids`.
 4. Keep background window actions non-interfering. Foreground delivery and desktop input require authorization for visible control; an unavailable route is not permission to escalate.
 5. Never infer pixels from a missing image, a different window, or an unaccounted-for resized preview. Capture failure and an empty accessibility tree are different failures.
 6. Keep one controller for a shared desktop. Distinct sessions/cursors do not isolate focus, keyboard input, application state, or snapshot caches.
@@ -70,7 +80,7 @@ Check the installed version and advertised schema before using unfamiliar parame
 | --------------------------------------------------------- | ------------------------------------------------------------------------------------- |
 | Missing binary, mismatched daemon, unknown tool/field     | [Runtime preflight](RUNTIME.md#preflight-and-transport)                               |
 | Stale token or ambiguous window                           | Refresh `list_windows` / `get_window_state`; choose the intended live target          |
-| Large or sparse tree                                      | [Bounded observation](WORKFLOW.md#observe)                                            |
+| Large, truncated, or sparse tree; repeated reads          | [Bounded observation and diff reads](WORKFLOW.md#observe)                             |
 | `surface_identity_unproven` or screenshot permission wait | [Wayland capture recovery](LINUX.md#capture-recovery)                                 |
 | `background_unavailable`                                  | Verify current state; ask before foreground/desktop control if not already authorized |
 | Text did not visibly change                               | Reobserve before retrying; [text and value semantics](WORKFLOW.md#act-once)           |

@@ -200,10 +200,10 @@ pub fn diff_outline(prior: &Rows, nodes: &[AXNode], window_title: &str) -> Outli
         && display_added == 0
         && display_removed == 0;
     let mut markdown = if none {
-        format!("No changes since your last look at \"{window_title}\". Rows keep their numbers; pair element_index with this response's snapshot_id.\n")
+        format!("No changes since your last look at \"{window_title}\". Rows keep their numbers; act on row [N] with element_token <snapshot_id>:N from this response.\n")
     } else {
         format!(
-            "Changes since your last look at \"{window_title}\" (+ added, ~ changed, x vanished text; unchanged rows keep their numbers, pair element_index with this response's snapshot_id):\n"
+            "Changes since your last look at \"{window_title}\" (+ added, ~ changed, x vanished text; unchanged rows keep their numbers, act on row [N] with element_token <snapshot_id>:N from this response):\n"
         )
     };
     if !removed.is_empty() {

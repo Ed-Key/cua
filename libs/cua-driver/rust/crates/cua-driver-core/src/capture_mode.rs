@@ -8,7 +8,7 @@
 //!
 //! The modality choice is no longer made at *capture* time. It is expressed at
 //! *action* time by how you address the target: an **element ax action**
-//! (`element_index` / `element_token` → the accessibility rung) or an **element
+//! (`element_token` → the accessibility rung) or an **element
 //! px action** (`x` / `y` → the pixel rung).
 //!
 //! `capture_mode` is still *accepted* on `get_window_state` so older MCP/CLI

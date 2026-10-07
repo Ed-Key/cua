@@ -28,39 +28,13 @@ pub const DISPLAY_SIZE: f32 = 21.0;
 pub const ARROW_HEIGHT: f32 = DISPLAY_SIZE * (26.0 / 42.0);
 const FLOAT_DURATION_SECS: f32 = 4.0;
 
-/// Where the artwork's anchor (the canvas centre, `RenderStateCore::pos`)
-/// must sit so that the theme's `hotspot` (canvas units) lands on `tip`
-/// when the arrow points along `heading` (radians, y down). The painter
-/// rotates the canvas by `heading - π/4` about the anchor and scales it by
-/// `DISPLAY_SIZE / CANVAS_SIZE`, so the hotspot's offset from the centre
-/// is rotated and scaled the same way, then subtracted.
-pub fn anchor_for_tip(tip: (f64, f64), heading: f64, hotspot: [u16; 2]) -> (f64, f64) {
-    let scale = f64::from(DISPLAY_SIZE / CANVAS_SIZE);
-    let half = f64::from(CANVAS_SIZE / 2.0);
-    let (dx, dy) = (
-        (f64::from(hotspot[0]) - half) * scale,
-        (f64::from(hotspot[1]) - half) * scale,
-    );
-    let (sin, cos) = (heading - std::f64::consts::FRAC_PI_4).sin_cos();
-    (tip.0 - (dx * cos - dy * sin), tip.1 - (dx * sin + dy * cos))
-}
-
-/// `anchor_for_tip` with the embedded default theme's hotspot, for callers
-/// that have no theme in hand (drag tracking, examples).
-pub fn default_anchor_for_tip(tip: (f64, f64), heading: f64) -> (f64, f64) {
-    anchor_for_tip(
-        tip,
-        heading,
-        crate::theme_artifact::embedded_default_theme().hotspot,
-    )
-}
-
 /// Points from the tip to the farthest point a theme with this `hotspot`
 /// can paint, at any heading: the canvas corner farthest from the hotspot
-/// (rotation about the canvas centre keeps that distance), plus the default
-/// theme's float drift (`shared_float_motion`: at most 11 canvas units of
-/// translation, and a 2.5 degree sway about the centre that moves a point
-/// at most 4 units). Content outside the 128-unit canvas is not covered.
+/// (the painter rotates and scales about the hotspot, which keeps that
+/// distance), plus a bound on the default theme's float drift
+/// (`shared_float_motion`: at most 12 canvas units of translation; its sway
+/// also pivots on the hotspot). Content outside the 128-unit canvas is not
+/// covered.
 pub fn tip_reach(hotspot: [u16; 2]) -> f64 {
     const FLOAT_DRIFT: f64 = 15.0;
     let canvas = f64::from(CANVAS_SIZE);
@@ -187,9 +161,8 @@ pub(crate) fn shared_float_motion(visual: &CursorVisualState) -> (f32, f32, f32)
 
 /// Paint one frame of the embedded actions-v2 theme.
 ///
-/// `anchor_x/y` is the existing overlay's cursor centre. The Lottie canvas is
-/// centred there so the established click offset and path physics remain
-/// unchanged. `heading` rotates the artwork around the canvas centre.
+/// `anchor_x/y` is where the theme hotspot is drawn. `heading` and the
+/// display scale pivot around that hotspot.
 pub fn paint_default_theme(
     pm: &mut tiny_skia::Pixmap,
     visual: &CursorVisualState,
@@ -261,7 +234,7 @@ mod tests {
         result
     }
 
-    /// Paint the still default cursor at `heading` with its anchor at
+    /// Paint the still default cursor at `heading` with its hotspot at
     /// `anchor`, `scale` pixels per point.
     fn paint_still(anchor: (f32, f32), heading: f32, scale: f32) -> tiny_skia::Pixmap {
         let mut pixmap = tiny_skia::Pixmap::new(512, 512).unwrap();
@@ -301,9 +274,9 @@ mod tests {
         let scale = 4.0f64;
         let target = (64.0, 64.0);
         for heading in [PI / 4.0, 0.0, PI / 2.0, 3.0 * PI / 4.0, PI, -PI / 4.0, -2.0] {
-            let anchor = default_anchor_for_tip(target, heading);
+            // The painter draws the hotspot at the point it is given.
             let pixmap = paint_still(
-                ((anchor.0 * scale) as f32, (anchor.1 * scale) as f32),
+                ((target.0 * scale) as f32, (target.1 * scale) as f32),
                 heading as f32,
                 scale as f32,
             );
@@ -317,7 +290,7 @@ mod tests {
                 if pixel[3] >= 250 {
                     let x = f64::from(index as u32 % pixmap.width()) / scale;
                     let y = f64::from(index as u32 / pixmap.width()) / scale;
-                    ink.push(((x - anchor.0) * dx + (y - anchor.1) * dy, x, y));
+                    ink.push(((x - target.0) * dx + (y - target.1) * dy, x, y));
                 }
             }
             let farthest = ink.iter().map(|p| p.0).fold(f64::MIN, f64::max);
@@ -329,21 +302,6 @@ mod tests {
             let gap = ((tip.0 - target.0).powi(2) + (tip.1 - target.1).powi(2)).sqrt();
             assert!(gap <= 1.0, "heading {heading}: tip is {gap:.2} pt from the target");
         }
-    }
-
-    #[test]
-    fn anchor_offset_scales_with_the_display_size_and_rotates_with_the_heading() {
-        // The neutral heading is π/4: no rotation, so the offset is the
-        // hotspot's canvas offset scaled to points.
-        let hotspot = [46, 30];
-        let s = f64::from(DISPLAY_SIZE / CANVAS_SIZE);
-        let (x, y) = anchor_for_tip((100.0, 100.0), std::f64::consts::FRAC_PI_4, hotspot);
-        assert!((x - (100.0 + 18.0 * s)).abs() < 1e-9 && (y - (100.0 + 34.0 * s)).abs() < 1e-9);
-        // A quarter turn swaps the axes.
-        let (x, y) = anchor_for_tip((100.0, 100.0), 3.0 * std::f64::consts::FRAC_PI_4, hotspot);
-        assert!((x - (100.0 - 34.0 * s)).abs() < 1e-9 && (y - (100.0 + 18.0 * s)).abs() < 1e-9);
-        // The canvas centre is its own hotspot.
-        assert_eq!(anchor_for_tip((7.0, 9.0), 1.3, [64, 64]), (7.0, 9.0));
     }
 
     #[test]

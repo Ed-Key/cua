@@ -33,9 +33,10 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_window_state".into(),
         description: "Read one window (pid, window_id, or app for its only window): \
-            accessibility rows with element_token and element_index, plus a screenshot whose pixels are the x,y space for pixel \
-            actions. On macOS later looks return only changed rows (diff); pair element_index \
-            with the latest snapshot_id. Details: skill://cua-driver/WORKFLOW.md".into(),
+            accessibility rows tagged [index], plus a screenshot whose pixels are the x,y space for \
+            pixel actions. Act on row [N] with element_token <snapshot_id>:N from the latest read. \
+            On macOS later looks return only changed rows (diff). Details: \
+            skill://cua-driver/WORKFLOW.md".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -47,6 +48,14 @@ fn def() -> &'static ToolDef {
                 "query_context": { "type": "boolean", "default": false, "description": "With query, also keep every row under each match." },
                 "diff": { "type": "boolean", "default": true, "description": "Return only rows changed since this session's last look; false forces the full outline. macOS only." },
                 "element_fields": cua_driver_core::tool_schema::element_fields_schema(),
+                "tree_format": {
+                    "type": "string",
+                    "enum": ["markdown", "elements", "both"],
+                    "description": "Alias of element_fields: markdown is none, elements or both is full. Not with element_fields."
+                },
+                "since": { "type": "string", "description": "Alias of diff: a snapshot_id from this session's previous look gets the diff; any other gets a full read." },
+                "verbose": { "type": "boolean", "description": "Send background_input on every read." },
+                "full_output": { "type": "boolean", "description": "Defaults element_fields to full and diff to false." },
                 "capture_mode": cua_driver_core::capture_mode::capture_mode_schema(),
                 "include_accessibility_tree": {
                     "type": "boolean",
@@ -188,6 +197,12 @@ impl Tool for GetWindowStateTool {
             }
         }
 
+        // Upstream's shape arguments are aliases of the fork's on macOS; the
+        // shared window_state_view shaping is not applied here (TOOLS.md).
+        let aliases = match ShapeAliases::from_args(&args) {
+            Ok(aliases) => aliases,
+            Err(refusal) => return refusal,
+        };
         let query = args.opt_str("query");
         let query_context = match args.get("query_context") {
             None | Some(serde_json::Value::Bool(false)) => false,
@@ -219,7 +234,7 @@ impl Tool for GetWindowStateTool {
         // returns BOTH the tree and a screenshot now, so the agent grounds on
         // both and cross-checks (the AX tree lies often enough that a grounding
         // screenshot should always be present). The modality is chosen at action
-        // time: an element ax action (element_index) or element px action (x,y).
+        // time: an element ax action (element_token) or element px action (x,y).
         // We don't even read the arg; it stays in the schema only so old callers
         // don't trip additionalProperties:false.
         //
@@ -282,27 +297,35 @@ impl Tool for GetWindowStateTool {
         // A query always renders the full filtered outline: its rows are few
         // and a filter is a fresh question, not a follow-up look. verify_state's
         // internal observation evaluates the full outline.
-        let want_diff = match args.get("diff") {
-            None | Some(serde_json::Value::Bool(true)) => query.is_none() && !observation_only,
-            Some(serde_json::Value::Bool(false)) => false,
+        // Explicit `diff` wins; `since` asks for a diff; `full_output` only
+        // changes the default.
+        let diff_setting = match args.get("diff") {
+            None | Some(serde_json::Value::Null) => {
+                aliases.since.is_some() || !aliases.full_output
+            }
+            Some(serde_json::Value::Bool(on)) => *on,
             Some(_) => return ToolResult::error("diff must be a boolean"),
         };
-        let element_fields = match args.get("element_fields").map(|v| v.as_str()) {
-            None | Some(Some("none")) => ElementFields::None,
-            Some(Some("compact")) => ElementFields::Compact,
-            Some(Some("full")) => ElementFields::Full,
-            Some(_) => {
-                return ToolResult::error(
-                    "element_fields must be \"none\", \"compact\" or \"full\"",
-                )
-            }
+        let want_diff = diff_setting && query.is_none() && !observation_only;
+        let element_fields = match args.get("element_fields") {
+            None | Some(Value::Null) => aliases.element_fields(),
+            Some(value) => match value.as_str() {
+                Some("none") => ElementFields::None,
+                Some("compact") => ElementFields::Compact,
+                Some("full") => ElementFields::Full,
+                _ => {
+                    return ToolResult::error(
+                        "element_fields must be \"none\", \"compact\" or \"full\"",
+                    )
+                }
+            },
         };
 
         // The walk leaves one retain on every actionable element. The owner
         // built inside the blocking task takes them over immediately, so a walk
         // abandoned by the backstop timeout still releases them when the task
         // drops its result.
-        let mut walk_owner: Option<crate::ax::cache::CachedSnapshot> = None;
+        let mut walk_owner: Option<crate::ax::snapshot::AxSnapshot> = None;
         let mut first_walk: Option<cua_driver_core::walk_budget::WalkOutcome> = None;
         let mut tree_result = if want_tree {
             let q = query.clone();
@@ -337,16 +360,19 @@ impl Tool for GetWindowStateTool {
                 let (tree, first_walk) = match retry {
                     Some(budget_ms) => {
                         // Release the abandoned walk's element retains.
-                        drop(crate::ax::cache::CachedSnapshot::from_nodes(&first.nodes));
+                        drop(crate::ax::snapshot::AxSnapshot::from_nodes(&first.nodes));
                         (walk(budget_ms), Some(first.walk))
                     }
                     None => (first, None),
                 };
-                let owner = crate::ax::cache::CachedSnapshot::from_nodes(&tree.nodes);
+                let owner = crate::ax::snapshot::AxSnapshot::from_nodes(&tree.nodes);
                 (tree, owner, first_walk)
             });
             let retry_ms = cua_driver_core::walk_budget::RETRY_CAP_MS.min(timeout_ms.saturating_mul(4));
-            let backstop = std::time::Duration::from_millis(timeout_ms + retry_ms)
+            // A launching app is waited on for up to `timeout_ms` before each
+            // walk's own budget starts (see `ax::launch`), so the first walk and
+            // its retry can each take twice their budget.
+            let backstop = std::time::Duration::from_millis(timeout_ms + retry_ms) * 2
                 + AX_WALK_BACKSTOP_GRACE;
             match tokio::time::timeout(backstop, walk_future).await {
                 Ok(Ok((tree, owner, first))) => {
@@ -382,9 +408,9 @@ impl Tool for GetWindowStateTool {
         // this tool never does — so treat that as resolved.
         let scope_matched = window_scope.as_ref().is_none_or(|s| s.is_matched());
 
-        if !scope_matched && !observation_only {
-            self.state.element_cache.remove(pid, u64::from(window_id));
-        }
+        let removed = (!scope_matched && !observation_only)
+            .then(|| self.state.snapshots.remove(pid, u64::from(window_id)))
+            .flatten();
 
         // Capture the screenshot and deliver it alongside the tree — the
         // grounding frame the agent cross-checks the (sometimes-lying) tree
@@ -525,22 +551,29 @@ impl Tool for GetWindowStateTool {
         // overlapping looks must not both hand `next_id` to different new rows.
         let look_lock = self.state.look_lock(pid, u64::from(window_id));
         let _look_guard = look_lock.lock().await;
+        // `since` (an alias) names the look a diff is relative to: only this
+        // window's latest snapshot qualifies; any other id gets a full read.
+        let since_is_latest = aliases.since.as_deref().is_none_or(|since| {
+            cua_driver_core::element_token::parse_snapshot_handle(since).is_some_and(|sid| {
+                self.state.snapshots.window_for_snapshot(pid, sid) == Some(u64::from(window_id))
+            })
+        });
         let prior = self
             .state
-            .element_cache
+            .snapshots
             .with_latest_payload(pid, u64::from(window_id), |p| p.prior_look());
         let mut outline_diff: Option<crate::ax::diff::OutlineDiff> = None;
         let prepared_snapshot = tree_result.as_mut().map(|r| {
             let screenshot_transform = match (screenshot_frame.as_ref(), screenshot_dims) {
                 (Some((bounds, _)), Some((width, _))) if bounds.width > 0.0 => {
-                    Some(crate::ax::cache::ScreenshotTransform::new(
+                    Some(crate::ax::snapshot::ScreenshotTransform::new(
                         (bounds.x, bounds.y),
                         f64::from(width) / bounds.width,
                     ))
                 }
                 _ => None,
             };
-            let bounds = crate::ax::cache::LookBounds {
+            let bounds = crate::ax::snapshot::LookBounds {
                 max_elements,
                 max_depth,
                 screenshot: screenshot_transform,
@@ -567,7 +600,7 @@ impl Tool for GetWindowStateTool {
             // caller sees whole. Keep a separate history map if agents start
             // juggling more windows per app than that.
             let comparable = diff_baseline(prior.as_ref(), &bounds, &session_id);
-            if let (true, Some(p)) = (want_diff, comparable) {
+            if let (true, Some(p)) = (want_diff && since_is_latest, comparable) {
                 let title = r
                     .nodes
                     .iter()
@@ -597,30 +630,22 @@ impl Tool for GetWindowStateTool {
         let snapshot_payload = prepared_snapshot.or_else(|| {
             screenshot_resize_scale.is_some().then(|| match prior {
                 Some(p) => p.into_history_payload(),
-                None => crate::ax::cache::CachedSnapshot::from_nodes(&[]),
+                None => crate::ax::snapshot::AxSnapshot::from_nodes(&[]),
             })
         });
-        let snapshot_id = snapshot_payload
+        let (snapshot_id, replaced) = snapshot_payload
             .filter(|_| scope_matched && !observation_only)
             .and_then(|payload| {
-                self.state.element_cache.publish_for_session(
+                self.state.snapshots.publish_for_session(
                     pid,
                     u64::from(window_id),
                     payload,
                     session_id.as_deref(),
                     screenshot_resize_scale,
                 )
-            });
-        if let Some(snapshot_id) = snapshot_id {
-            self.state
-                .zoom_registry
-                .retire_replaced(pid, u64::from(window_id), snapshot_id);
-        }
-        let snapshot_handle = snapshot_id.map(|sid| {
-            cua_driver_core::element_token::token_for(sid, 0)
-                .trim_end_matches(":0")
-                .to_string()
-        });
+            })
+            .unzip();
+        let snapshot_handle = snapshot_id.map(cua_driver_core::element_token::format_snapshot_id);
         // Without element records the tree is the only index, so it says how
         // to form a token from any row.
         if let (ElementFields::None, Some(handle), Some(r)) = (
@@ -828,9 +853,8 @@ impl Tool for GetWindowStateTool {
                 "removed": d.removed,
                 "note": "tree_markdown and elements list only rows added or changed since this \
                     session's previous get_window_state of this window. Unchanged rows keep \
-                    their element_index; act on one by passing this response's snapshot_id \
-                    together with its element_index (or element_token \
-                    \"<snapshot_id>:<element_index>\"). Pass diff:false for the full outline."
+                    their numbers; act on row [N] with element_token \"<snapshot_id>:N\" built \
+                    from this response's snapshot_id. Pass diff:false for the full outline."
             });
         }
         // Surface 6: an opaque snapshot identifier consumers can log
@@ -841,16 +865,36 @@ impl Tool for GetWindowStateTool {
         if let Some(handle) = snapshot_handle {
             structured["snapshot_id"] = serde_json::json!(handle);
         }
+        let invalidated: Vec<String> = removed
+            .into_iter()
+            .chain(replaced.into_iter().flatten())
+            .map(cua_driver_core::element_token::format_snapshot_id)
+            .collect();
+        if !invalidated.is_empty() {
+            content.push(Content::text(format!(
+                "Invalidated snapshots {}: their element_tokens are stale.",
+                invalidated.join(", ")
+            )));
+            structured["invalidated_snapshot_ids"] = serde_json::json!(invalidated);
+        }
         if let Some(capture_id) = capture_id {
             structured["capture_id"] = serde_json::json!(capture_id);
         }
         // Best-effort-background ladder, rung (2). Both rungs point the agent at
-        // the same next move: an empty AX tree means element_index has nothing
+        // the same next move: an empty AX tree means element_token has nothing
         // to bind to, so the deliberate action is an element px action — read
         // the screenshot already in this response and click by pixel (x,y).
         // macOS can pixel-target in the background, so the recommendation is
         // `px`, not `foreground`.
-        match degradation_for(tree_result.is_some(), element_count, window_scope.as_ref()) {
+        let app_lookup_timed_out = tree_result
+            .as_ref()
+            .is_some_and(|r| r.walk.reason() == Some("app_lookup_timeout"));
+        match degradation_for(
+            tree_result.is_some(),
+            element_count,
+            window_scope.as_ref(),
+            app_lookup_timed_out,
+        ) {
             Degradation::None => {}
             Degradation::AxTreeEmpty => {
                 structured["degraded"] = serde_json::json!(true);
@@ -877,6 +921,24 @@ impl Tool for GetWindowStateTool {
                     "parent_window_id": parent,
                     "reason": format!("read window_id {parent} (it usually holds this child \
                                        window's controls) and act on its elements with window_id {parent}")
+                });
+            }
+            Degradation::AxAppLaunching => {
+                structured["degraded"] = serde_json::json!(true);
+                structured["degraded_reason"] = serde_json::json!(format!(
+                    "ax_app_launching: window_id {window_id} exists and is owned by pid \
+                     {pid}, but that app has not finished launching and did not answer \
+                     accessibility within the {timeout_ms} ms timeout_ms budget. The tree is \
+                     returned EMPTY because the window's accessibility surface is not \
+                     available yet."
+                ));
+                structured["escalation"] = serde_json::json!({
+                    "recommended": "foreground",
+                    "reason": "observation-only until the app finishes launching: re-snapshot \
+                               in a moment or with a larger timeout_ms. Background input \
+                               (including px) is refused while the window's AX surface is \
+                               unresolved; act with delivery_mode:\"foreground\" only if \
+                               you cannot wait."
                 });
             }
             Degradation::AxWindowUnresolved { ax_window_count } => {
@@ -917,11 +979,12 @@ impl Tool for GetWindowStateTool {
             })
             .await;
             // Sent once per (session, window) while unchanged: every copy is
-            // re-read by the model on every later turn. diff:false is a full
-            // look and repeats it; verify_state's internal look neither shows
-            // it to the model nor counts as sent.
+            // re-read by the model on every later turn. A full look (diff off,
+            // including full_output's default) or verbose repeats it;
+            // verify_state's internal look neither shows it to the model nor
+            // counts as sent.
             if let Ok(report) = report {
-                let full_look = args.get("diff") == Some(&Value::Bool(false));
+                let full_look = !diff_setting || aliases.verbose;
                 let key = (session_id.clone(), pid, window_id);
                 if observation_only
                     || background_input_is_news(
@@ -1293,15 +1356,79 @@ fn background_input_is_news(
     true
 }
 
+/// Upstream's `get_window_state` shape arguments, read as aliases of the
+/// fork's own: `full_output` defaults element_fields to full and diff to
+/// false, `tree_format` names an element_fields projection, `since` asks for a
+/// diff, and `verbose` repeats background_input. Explicit `element_fields` and
+/// `diff` always win (the typed SDK sends `full_output` by default).
+#[derive(Debug, Default, PartialEq)]
+struct ShapeAliases {
+    full_output: bool,
+    verbose: bool,
+    tree_format: Option<ElementFields>,
+    since: Option<String>,
+}
+
+impl ShapeAliases {
+    fn from_args(args: &Value) -> Result<Self, ToolResult> {
+        let flag = |name: &str| match args.get(name) {
+            None | Some(Value::Null) => Ok(false),
+            Some(Value::Bool(on)) => Ok(*on),
+            Some(_) => Err(ToolResult::error(format!("{name} must be a boolean"))),
+        };
+        let tree_format = match args.get("tree_format") {
+            None | Some(Value::Null) => None,
+            Some(value) => Some(match value.as_str() {
+                Some("markdown") => ElementFields::None,
+                Some("elements" | "both") => ElementFields::Full,
+                _ => {
+                    return Err(ToolResult::error(
+                        "tree_format must be \"markdown\", \"elements\" or \"both\"",
+                    ))
+                }
+            }),
+        };
+        if tree_format.is_some() && args.get("element_fields").is_some_and(|v| !v.is_null()) {
+            return Err(ToolResult::error(
+                "pass tree_format or element_fields, not both",
+            ));
+        }
+        let since = match args.get("since") {
+            None | Some(Value::Null) => None,
+            Some(Value::String(id)) if !id.trim().is_empty() => Some(id.trim().to_owned()),
+            Some(_) => {
+                return Err(ToolResult::error(
+                    "since must be a snapshot_id string from an earlier get_window_state",
+                ))
+            }
+        };
+        Ok(Self {
+            full_output: flag("full_output")?,
+            verbose: flag("verbose")?,
+            tree_format,
+            since,
+        })
+    }
+
+    /// The projection when the caller passed no `element_fields`.
+    fn element_fields(&self) -> ElementFields {
+        match (self.tree_format, self.full_output) {
+            (Some(fields), _) => fields,
+            (None, true) => ElementFields::Full,
+            (None, false) => ElementFields::None,
+        }
+    }
+}
+
 /// Turn an unresolvable window scope into a structured refusal, or `None` when
 /// the scope is one the caller can still be served (issue #2237).
 ///
 /// Refusing is the point: the pre-fix behaviour returned the app's menu bar
 /// under the requested `window_id`, which reads as a healthy snapshot and gets
-/// clicked by `element_index`. Both refusals name the exact retry, matching the
+/// clicked by `element_token`. Both refusals name the exact retry, matching the
 /// remedy-in-the-refusal shape the rest of the driver uses.
 ///
-/// The owner pid is REPORTED, not followed: `element_cache`, the element-token
+/// The owner pid is REPORTED, not followed: `snapshots`, the element-token
 /// registry and snapshot-owned screenshot transform are keyed on the caller-supplied pid, so
 /// walking under `owner_pid` while echoing the requested pid would hand back
 /// indices the caller replays against the wrong key. One retry with the named
@@ -1390,6 +1517,9 @@ enum Degradation {
     /// The requested window is live and owned by this pid, but no AXWindow
     /// claims its CGWindowID, so the walk deliberately covered nothing.
     AxWindowUnresolved { ax_window_count: usize },
+    /// The window scope is unresolved because the app is still launching and
+    /// did not answer accessibility within the caller's budget.
+    AxAppLaunching,
 }
 
 /// Decide the degradation rung. Pure: `walk_attempted` is false in the
@@ -1400,11 +1530,15 @@ fn degradation_for(
     walk_attempted: bool,
     element_count: usize,
     scope: Option<&crate::ax::WindowScope>,
+    app_lookup_timed_out: bool,
 ) -> Degradation {
     if !walk_attempted {
         return Degradation::None;
     }
     if let Some(crate::ax::WindowScope::AxUnresolved { ax_window_count }) = scope {
+        if app_lookup_timed_out {
+            return Degradation::AxAppLaunching;
+        }
         return Degradation::AxWindowUnresolved {
             ax_window_count: *ax_window_count,
         };
@@ -1417,23 +1551,37 @@ fn degradation_for(
 
 /// Render the actionable nodes from the AX walk into the
 /// `structuredContent.elements` array shape described on the tool: one entry
-/// per node with an `element_index`, carrying role, label (built from
-/// title/description/value/identifier), frame, parent_index, depth, and —
-/// Surface 6 — an opaque `element_token` for the same row.
+/// per node with an `element_index`, carrying role, label, value, state,
+/// frame, parent_index, depth, and an opaque `element_token` for the row.
 ///
 /// Order matches the markdown rendering exactly (DFS, same indices). Only
-/// nodes that received an `element_index` (i.e. are addressable via
-/// click(element_index=N)) appear — non-actionable display-only rows are
-/// omitted to match the contract on the tool description.
+/// nodes that received an `element_index` (addressable through their
+/// element_token) appear; display-only rows are omitted.
 pub(crate) fn build_elements_array_with_token(
     nodes: &[crate::ax::tree::AXNode],
     snapshot_id: Option<u32>,
 ) -> Vec<serde_json::Value> {
-    build_elements_array(nodes, snapshot_id, false)
+    nodes
+        .iter()
+        .filter(|node| node.element_index.is_some())
+        .map(|node| element_entry(node, snapshot_id))
+        .collect()
 }
 
-/// Verification observes display-only state without creating action tokens or
-/// changing the public actionable projection and its existing snapshot cache.
+/// Observation-only `elements` for `verify_state`: every actionable row as
+/// [`build_elements_array_with_token`] emits it, plus the display-only rows
+/// (static text, labels, read-only values) the public array omits, in DFS
+/// order. Display-only rows carry `"display_only": true` and no
+/// `element_index`/`element_token`, because they are not addressable. They let
+/// a postcondition read text that only a display node holds, such as a
+/// label-less AXStaticText whose content lives in AXValue (#4526). No action
+/// tokens are created and the public projection is unchanged.
+pub(crate) fn build_observation_elements_array(
+    nodes: &[crate::ax::tree::AXNode],
+) -> Vec<serde_json::Value> {
+    nodes.iter().map(|node| element_entry(node, None)).collect()
+}
+
 /// A row's human-readable name: title, then description, then a non-blank
 /// value, then the placeholder hint, then the identifier, trimmed.
 fn derive_label(node: &crate::ax::tree::AXNode) -> Option<String> {
@@ -1450,129 +1598,115 @@ fn derive_label(node: &crate::ax::tree::AXNode) -> Option<String> {
         .or_else(|| nonblank(&node.identifier))
 }
 
-fn build_observation_elements_array(nodes: &[crate::ax::tree::AXNode]) -> Vec<serde_json::Value> {
-    build_elements_array(nodes, None, true)
-}
-
-fn build_elements_array(
-    nodes: &[crate::ax::tree::AXNode],
-    snapshot_id: Option<u32>,
-    include_display_only: bool,
-) -> Vec<serde_json::Value> {
-    nodes
-        .iter()
-        .filter_map(|node| {
-            if node.element_index.is_none() && !include_display_only {
-                return None;
-            }
-            // `label` is a best-effort human-readable string: title first,
-            // then description, then value, then identifier. Mirrors what
-            // a human reading the markdown row would call this element.
-            let label = derive_label(node);
-            let frame = node
-                .frame
-                .map(|[x, y, w, h]| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
-            let mut entry = serde_json::json!({
-                "role": node.role,
-                "depth": node.depth,
-            });
-            // Surface 6: opaque token paired to the integer index.
-            // Tools accept either; the token has explicit validity
-            // (invalidated when the next snapshot supersedes this
-            // one in the per-pid LRU). See cua-driver-core's
-            // `element_token` module.
-            if let Some(idx) = node.element_index {
-                entry["element_index"] = serde_json::json!(idx);
-                if let Some(sid) = snapshot_id {
-                    entry["element_token"] =
-                        serde_json::json!(cua_driver_core::element_token::token_for(sid, idx));
-                }
-            }
-            if let Some(url) = &node.url {
-                entry["url"] = serde_json::json!(url);
-            }
-            if let Some(label) = label {
-                entry["label"] = serde_json::Value::String(label);
-            }
-            // Surface the element's AXValue separately from `label`. `label`
-            // collapses title→description→value→identifier into one display
-            // string, so on a control that has BOTH a title/description AND a
-            // value (e.g. a "Compose message" text field holding typed text),
-            // the value is shadowed and invisible to a caller reading the
-            // structured side — it only showed up in `tree_markdown`, forcing a
-            // markdown grep to verify what landed. Emit it explicitly so the
-            // verify-then-escalate loop can read the typed text structurally.
-            // `value_state` widens the string-only AXValue read to all CF
-            // types (CFNumber sliders → "8", CFBoolean checkboxes/radios →
-            // "1"/"0") — controls whose state was previously invisible here.
-            // Falls back to `value` so the field never regresses for
-            // string-valued elements.
-            // value_state may be "" for an empty text field; keep it. Text
-            // fields never fall back to `value`, which can hold the
-            // placeholder hint rather than content.
-            let fallback = (!crate::ax::tree::is_text_entry_role(&node.role))
-                .then(|| node.value.clone().filter(|v| !v.is_empty()))
-                .flatten();
-            if let Some(value) = node.value_state.clone().or(fallback) {
-                entry["value"] = serde_json::Value::String(value);
-            }
-            if let Some(placeholder) = &node.placeholder {
-                entry["placeholder"] = serde_json::Value::String(placeholder.clone());
-            }
-            if let Some(settable) = node.value_settable {
-                entry["value_settable"] = serde_json::Value::Bool(settable);
-            }
-            if let Some(focused) = node.focused {
-                entry["focused"] = serde_json::json!(focused);
-            }
-            if let Some(selection) = &node.text_selection {
-                entry["text_selection"] = serde_json::json!(selection);
-            }
-            if let Some(desc) = node.value_description.clone() {
-                entry["value_description"] = serde_json::Value::String(desc);
-            }
-            // Only surface a real range: WebKit reports AXMinValue/AXMaxValue
-            // as 0.0/0.0 on non-range controls (checkboxes, radios), which
-            // would be pure noise on every two-state element.
-            if let (Some(min), Some(max)) = (node.min_value, node.max_value) {
-                if max > min {
-                    entry["min"] = serde_json::json!(min);
-                    entry["max"] = serde_json::json!(max);
-                }
-            }
-            if let Some(enabled) = node.enabled {
-                entry["enabled"] = serde_json::Value::Bool(enabled);
-            }
-            let selected = node.selected.or_else(|| {
-                let role = node.role.to_ascii_lowercase();
-                if role.contains("checkbox") || role.contains("radiobutton") {
-                    node.value_state.as_deref().and_then(|value| match value {
-                        "1" | "true" | "on" => Some(true),
-                        "0" | "false" | "off" => Some(false),
-                        _ => None,
-                    })
-                } else {
-                    None
-                }
-            });
-            if let Some(selected) = selected {
-                entry["selected"] = serde_json::Value::Bool(selected);
-            }
-            if !node.actions.is_empty() {
-                entry["actions"] = serde_json::json!(node.actions);
-            }
-            if node.in_web_content {
-                entry["in_web_content"] = serde_json::Value::Bool(true);
-            }
-            if let Some(frame) = frame {
-                entry["frame"] = frame;
-            }
-            if let Some(parent) = node.parent_element_index {
-                entry["parent_index"] = serde_json::json!(parent);
-            }
-            Some(entry)
-        })
-        .collect()
+/// One `elements` record. An empty value stays real (T014): an empty text
+/// field reports `value:""`, never its placeholder.
+fn element_entry(node: &crate::ax::tree::AXNode, snapshot_id: Option<u32>) -> serde_json::Value {
+    // `label` is a best-effort human-readable string: title first,
+    // then description, then value, then identifier. Mirrors what
+    // a human reading the markdown row would call this element.
+    let label = derive_label(node);
+    let frame = node
+        .frame
+        .map(|[x, y, w, h]| serde_json::json!({ "x": x, "y": y, "w": w, "h": h }));
+    let mut entry = serde_json::json!({
+        "role": node.role,
+        "depth": node.depth,
+    });
+    // Surface 6: the opaque token for the row's index; it is
+    // invalidated when the next snapshot of the window supersedes
+    // this one. See cua-driver-core's `element_token` module.
+    if let Some(idx) = node.element_index {
+        entry["element_index"] = serde_json::json!(idx);
+        if let Some(sid) = snapshot_id {
+            entry["element_token"] =
+                serde_json::json!(cua_driver_core::element_token::token_for(sid, idx));
+        }
+    } else {
+        entry["display_only"] = serde_json::Value::Bool(true);
+    }
+    if let Some(url) = &node.url {
+        entry["url"] = serde_json::json!(url);
+    }
+    if let Some(label) = label {
+        entry["label"] = serde_json::Value::String(label);
+    }
+    // Surface the element's AXValue separately from `label`. `label`
+    // collapses title→description→value→identifier into one display
+    // string, so on a control that has BOTH a title/description AND a
+    // value (e.g. a "Compose message" text field holding typed text),
+    // the value is shadowed and invisible to a caller reading the
+    // structured side — it only showed up in `tree_markdown`, forcing a
+    // markdown grep to verify what landed. Emit it explicitly so the
+    // verify-then-escalate loop can read the typed text structurally.
+    // `value_state` widens the string-only AXValue read to all CF
+    // types (CFNumber sliders → "8", CFBoolean checkboxes/radios →
+    // "1"/"0") — controls whose state was previously invisible here.
+    // Falls back to `value` so the field never regresses for
+    // string-valued elements.
+    // value_state may be "" for an empty text field; keep it. Text
+    // fields never fall back to `value`, which can hold the
+    // placeholder hint rather than content.
+    let fallback = (!crate::ax::tree::is_text_entry_role(&node.role))
+        .then(|| node.value.clone().filter(|v| !v.is_empty()))
+        .flatten();
+    if let Some(value) = node.value_state.clone().or(fallback) {
+        entry["value"] = serde_json::Value::String(value);
+    }
+    if let Some(placeholder) = &node.placeholder {
+        entry["placeholder"] = serde_json::Value::String(placeholder.clone());
+    }
+    if let Some(settable) = node.value_settable {
+        entry["value_settable"] = serde_json::Value::Bool(settable);
+    }
+    if let Some(focused) = node.focused {
+        entry["focused"] = serde_json::json!(focused);
+    }
+    if let Some(selection) = &node.text_selection {
+        entry["text_selection"] = serde_json::json!(selection);
+    }
+    if let Some(desc) = node.value_description.clone() {
+        entry["value_description"] = serde_json::Value::String(desc);
+    }
+    // Only surface a real range: WebKit reports AXMinValue/AXMaxValue
+    // as 0.0/0.0 on non-range controls (checkboxes, radios), which
+    // would be pure noise on every two-state element.
+    if let (Some(min), Some(max)) = (node.min_value, node.max_value) {
+        if max > min {
+            entry["min"] = serde_json::json!(min);
+            entry["max"] = serde_json::json!(max);
+        }
+    }
+    if let Some(enabled) = node.enabled {
+        entry["enabled"] = serde_json::Value::Bool(enabled);
+    }
+    let selected = node.selected.or_else(|| {
+        let role = node.role.to_ascii_lowercase();
+        if role.contains("checkbox") || role.contains("radiobutton") {
+            node.value_state.as_deref().and_then(|value| match value {
+                "1" | "true" | "on" => Some(true),
+                "0" | "false" | "off" => Some(false),
+                _ => None,
+            })
+        } else {
+            None
+        }
+    });
+    if let Some(selected) = selected {
+        entry["selected"] = serde_json::Value::Bool(selected);
+    }
+    if !node.actions.is_empty() {
+        entry["actions"] = serde_json::json!(node.actions);
+    }
+    if node.in_web_content {
+        entry["in_web_content"] = serde_json::Value::Bool(true);
+    }
+    if let Some(frame) = frame {
+        entry["frame"] = frame;
+    }
+    if let Some(parent) = node.parent_element_index {
+        entry["parent_index"] = serde_json::json!(parent);
+    }
+    entry
 }
 
 /// The previous look a diff may be relative to: one this session actually
@@ -1583,10 +1717,10 @@ fn build_elements_array(
 /// rows with frames for another image; a different `element_fields`
 /// projection would leave unchanged rows with fields the caller never got.
 fn diff_baseline<'a>(
-    prior: Option<&'a crate::ax::cache::PriorLook>,
-    bounds: &crate::ax::cache::LookBounds,
+    prior: Option<&'a crate::ax::snapshot::PriorLook>,
+    bounds: &crate::ax::snapshot::LookBounds,
     session: &Option<String>,
-) -> Option<&'a crate::ax::cache::PriorLook> {
+) -> Option<&'a crate::ax::snapshot::PriorLook> {
     prior.filter(|p| {
         p.full_delivered
             && p.bounds == *bounds
@@ -1751,9 +1885,30 @@ mod window_scope_contract_tests {
             degradation_for(
                 true,
                 0,
-                Some(&WindowScope::AxUnresolved { ax_window_count: 3 })
+                Some(&WindowScope::AxUnresolved { ax_window_count: 3 }),
+                false
             ),
             Degradation::AxWindowUnresolved { ax_window_count: 3 }
+        );
+    }
+
+    /// A window that exists before its app answers accessibility is not an
+    /// unscoped window: the degradation names the launch instead.
+    #[test]
+    fn a_launch_that_outlasts_the_budget_degrades_as_app_launching() {
+        assert_eq!(
+            degradation_for(
+                true,
+                0,
+                Some(&WindowScope::AxUnresolved { ax_window_count: 0 }),
+                true
+            ),
+            Degradation::AxAppLaunching
+        );
+        // A walk cut short for another reason after resolving keeps its rung.
+        assert_eq!(
+            degradation_for(true, 0, Some(&WindowScope::Matched), true),
+            Degradation::AxTreeEmpty
         );
     }
 
@@ -1761,7 +1916,7 @@ mod window_scope_contract_tests {
     fn empty_tree_still_degrades_as_ax_tree_empty() {
         // Back-compat with the pre-existing rung.
         assert_eq!(
-            degradation_for(true, 0, Some(&WindowScope::Matched)),
+            degradation_for(true, 0, Some(&WindowScope::Matched), false),
             Degradation::AxTreeEmpty
         );
     }
@@ -1769,14 +1924,14 @@ mod window_scope_contract_tests {
     #[test]
     fn resolved_window_with_elements_is_not_degraded() {
         assert_eq!(
-            degradation_for(true, 42, Some(&WindowScope::Matched)),
+            degradation_for(true, 42, Some(&WindowScope::Matched), false),
             Degradation::None
         );
     }
 
     #[test]
     fn screenshot_only_path_does_not_degrade() {
-        assert_eq!(degradation_for(false, 0, None), Degradation::None);
+        assert_eq!(degradation_for(false, 0, None, false), Degradation::None);
     }
 
     #[test]
@@ -1788,6 +1943,8 @@ mod window_scope_contract_tests {
             "window_id_not_found",
             "window_owner_pid_mismatch",
             "ax_window_unresolved",
+            "ax_app_launching",
+            "app_lookup_timeout",
         ] {
             assert!(tools_md.contains(code), "TOOLS.md must document {code}");
         }
@@ -1824,6 +1981,63 @@ mod window_scope_contract_tests {
                 .contains("include_screenshot:false"),
             "include_accessibility_tree must document the both-false error"
         );
+    }
+
+    #[test]
+    fn schema_advertises_single_tree_and_diff_controls() {
+        let d = def();
+        let props = &d.input_schema["properties"];
+        assert_eq!(
+            props["tree_format"]["enum"],
+            serde_json::json!(["markdown", "elements", "both"])
+        );
+        for name in ["since", "verbose", "full_output"] {
+            assert!(props.get(name).is_some(), "schema must advertise {name}");
+        }
+        assert_eq!(d.input_schema["additionalProperties"], false);
+        // macOS keeps the fork's short description; the upstream arguments
+        // are aliases, documented on each property and in TOOLS.md.
+        for needle in ["element_token <snapshot_id>:N", "only changed rows (diff)"] {
+            assert!(
+                d.description.contains(needle),
+                "description must mention {needle}"
+            );
+        }
+        for name in ["tree_format", "since", "verbose", "full_output"] {
+            assert!(
+                props[name]["description"].as_str().is_some_and(|t| !t.is_empty()),
+                "{name} needs a description"
+            );
+        }
+    }
+
+    #[test]
+    fn upstream_shape_arguments_are_aliases_and_explicit_arguments_win() {
+        let parse = |args: Value| ShapeAliases::from_args(&args).map_err(|_| ());
+        let none = parse(serde_json::json!({})).unwrap();
+        assert_eq!(none, ShapeAliases::default());
+        assert_eq!(none.element_fields(), ElementFields::None);
+        let full = parse(serde_json::json!({"full_output": true})).unwrap();
+        assert_eq!(full.element_fields(), ElementFields::Full);
+        for (format, fields) in [
+            ("markdown", ElementFields::None),
+            ("elements", ElementFields::Full),
+            ("both", ElementFields::Full),
+        ] {
+            let aliases = parse(serde_json::json!({"tree_format": format, "full_output": true}))
+                .unwrap();
+            assert_eq!(aliases.element_fields(), fields, "{format}");
+        }
+        assert!(parse(serde_json::json!({"tree_format": "markdown", "element_fields": "full"}))
+            .is_err());
+        assert!(parse(serde_json::json!({"tree_format": "xml"})).is_err());
+        assert!(parse(serde_json::json!({"since": 3})).is_err());
+        assert!(parse(serde_json::json!({"verbose": "yes"})).is_err());
+        assert_eq!(
+            parse(serde_json::json!({"since": " s0000002a "})).unwrap().since.as_deref(),
+            Some("s0000002a")
+        );
+        assert!(parse(serde_json::json!({"verbose": true})).unwrap().verbose);
     }
 }
 
@@ -2446,6 +2660,36 @@ mod tests {
     }
 
     #[test]
+    fn observation_elements_include_display_only_rows_in_dfs_order() {
+        // #4526: verify_state must be able to read a label-less static text
+        // whose content lives in AXValue. The public array omits it; the
+        // observation-only array keeps it, marked display-only and without
+        // an element_index.
+        let mut text = node(None, "AXStaticText", None, 1, Some(0), None, vec![]);
+        text.value = Some("Saved".into());
+        let nodes = vec![
+            node(Some(0), "AXGroup", Some("Form"), 0, None, None, vec![]),
+            text,
+            node(Some(1), "AXButton", Some("OK"), 1, Some(0), None, vec![]),
+        ];
+
+        assert_eq!(build_elements_array_with_token(&nodes, None).len(), 2);
+        let observed = build_observation_elements_array(&nodes);
+        assert_eq!(observed.len(), 3);
+        assert_eq!(observed[0]["element_index"], 0);
+        let display = &observed[1];
+        assert_eq!(display["role"], "AXStaticText");
+        assert_eq!(display["label"], "Saved");
+        assert_eq!(display["value"], "Saved");
+        assert_eq!(display["display_only"], true);
+        assert_eq!(display["parent_index"], 0);
+        assert!(display.get("element_index").is_none());
+        assert!(display.get("element_token").is_none());
+        assert_eq!(observed[2]["element_index"], 1);
+        assert!(observed[2].get("display_only").is_none());
+    }
+
+    #[test]
     fn elements_shape_carries_role_label_frame_parent_depth() {
         let nodes = vec![node(
             Some(7),
@@ -2816,14 +3060,14 @@ mod tests {
 
     #[test]
     fn build_elements_array_with_token_emits_element_token_per_row() {
-        let cache = crate::ax::cache::ElementCache::new();
+        let cache = crate::ax::snapshot::Snapshots::new();
         let pid = 0x6abc_0001_i32;
         let nodes = vec![
             node(Some(0), "AXButton", Some("A"), 1, None, None, vec![]),
             node(Some(1), "AXButton", Some("B"), 1, None, None, vec![]),
             node(Some(2), "AXButton", Some("C"), 1, None, None, vec![]),
         ];
-        let sid = cache.publish(pid, 9, crate::ax::cache::CachedSnapshot::from_nodes(&nodes));
+        let sid = cache.publish(pid, 9, crate::ax::snapshot::AxSnapshot::from_nodes(&nodes));
         let entries = build_elements_array_with_token(&nodes, Some(sid));
         assert_eq!(entries.len(), 3);
         // Every entry must have BOTH fields (additive contract).
@@ -2843,7 +3087,7 @@ mod tests {
             let idx = e["element_index"].as_u64().unwrap() as usize;
             let tok = e["element_token"].as_str().unwrap();
             let (resolved_idx, wid, _) = cache
-                .resolve_element_args(pid, None, Some(tok), None, None, "click")
+                .resolve(pid, &serde_json::json!({ "element_token": tok }))
                 .expect("token must resolve")
                 .into_parts(None);
             assert_eq!(wid, Some(9));
@@ -3007,13 +3251,13 @@ mod tests {
         let session = Some("s".to_owned());
         let all = [ElementFields::None, ElementFields::Compact, ElementFields::Full];
         for before in all {
-            let prior_bounds = crate::ax::cache::LookBounds {
+            let prior_bounds = crate::ax::snapshot::LookBounds {
                 max_elements: 10,
                 max_depth: 5,
                 element_fields: before,
                 ..Default::default()
             };
-            let prior = crate::ax::cache::PriorLook {
+            let prior = crate::ax::snapshot::PriorLook {
                 elements: Vec::new(),
                 rows: crate::ax::diff::rows_of(&nodes),
                 next_id: 1,
@@ -3022,7 +3266,7 @@ mod tests {
                 full_delivered: true,
             };
             for after in all {
-                let bounds = crate::ax::cache::LookBounds {
+                let bounds = crate::ax::snapshot::LookBounds {
                     element_fields: after,
                     ..prior_bounds
                 };

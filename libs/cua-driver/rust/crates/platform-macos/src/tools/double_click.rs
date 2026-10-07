@@ -38,9 +38,9 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "double_click".into(),
         description:
-            "Double-click an element or point. An element (element_token, or element_index + \
-             snapshot_id) gets AXOpen when it offers one, else a double-click at its center; \
-             x,y are get_window_state screenshot pixels of window_id. Background by default."
+            "Double-click an element or point. An element_token gets AXOpen when the element \
+             offers it, else a double-click at its center; x,y are get_window_state screenshot \
+             pixels of window_id. Background by default."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -50,10 +50,8 @@ fn def() -> &'static ToolDef {
                 "pid":           { "type": "integer", "description": "Target process ID." },
                 "x":             { "type": "number",  "description": "X in screenshot pixels (pixel path)." },
                 "y":             { "type": "number",  "description": "Y in screenshot pixels (pixel path)." },
-                "window_id":     { "type": "integer", "description": "Target window ID; required with element_index or x,y, carried by element_token." },
-                "element_index": cua_driver_core::tool_schema::element_index_schema(),
+                "window_id":     { "type": "integer", "description": "Target window ID; required with x,y, carried by element_token." },
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
-                "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
                 "delivery_mode": cua_driver_core::tool_schema::delivery_mode_schema()
             },
             "additionalProperties": false
@@ -73,7 +71,7 @@ impl Tool for DoubleClickTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        let pid = match args.require_i32("pid") {
+        let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -82,19 +80,8 @@ impl Tool for DoubleClickTool {
         // background CGEvents), via the same skylight assist click uses.
         let delivery_mode = super::DeliveryMode::parse(args.opt_str("delivery_mode").as_deref());
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-        // Surface 6: token / index precedence — see click.rs for the
-        // canonical comment.
-        let element_token_arg = args.opt_str("element_token");
         let window_id_arg = args.opt_u64("window_id");
-        let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
-        let resolved = match self.state.element_cache.resolve_element_args(
-            pid,
-            element_index_arg,
-            element_token_arg.as_deref(),
-            args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
-            "double_click",
-        ) {
+        let resolved = match self.state.snapshots.resolve(pid, &args) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -160,11 +147,7 @@ impl Tool for DoubleClickTool {
         // ── Pixel path ───────────────────────────────────────────────────────
         let mut cx = match args.get("x").and_then(|v| v.as_f64()) {
             Some(v) => v,
-            None => {
-                return ToolResult::error(
-                    "Either element_index + window_id or x + y must be provided.",
-                )
-            }
+            None => return ToolResult::error("Either element_token or x + y must be provided."),
         };
         let mut cy = match args.get("y").and_then(|v| v.as_f64()) {
             Some(v) => v,

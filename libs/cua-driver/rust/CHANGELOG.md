@@ -1,10 +1,188 @@
 # Changelog
 
-## Unreleased
+## [0.34.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.33.4...cua-driver-rs-v0.34.0) (2026-10-05)
+
+
+### Features
+
+* **cua-driver:** choose the cursor motion in start_session and a saved default ([#4670](https://github.com/trycua/cua/issues/4670)) ([75ac680](https://github.com/trycua/cua/commit/75ac6800d12d6de94320219a4d713436464efcb2))
+* **cua-driver:** six agent cursor motion styles ([#4659](https://github.com/trycua/cua/issues/4659)) ([5e5370f](https://github.com/trycua/cua/commit/5e5370f7c9a57e9540eadc17c19b5bfeca0d9d91))
+
 
 ### Bug Fixes
 
-* **cua-driver:** deliver X11 key-down before the tap delay and finish background keyboard delivery before closing the input connection.
+* **cua-driver:** draw the comet trail from the arrow's body, not its tip ([#4673](https://github.com/trycua/cua/issues/4673)) ([9abf27b](https://github.com/trycua/cua/commit/9abf27b622e1cf544c95da4adc8b614ddf716313))
+* **cua-driver:** prefer the owned macOS browser profile endpoint ([#4384](https://github.com/trycua/cua/issues/4384)) ([9966c8b](https://github.com/trycua/cua/commit/9966c8bd805465f1897540b289df6e09f1506217))
+* **cua-driver:** scope macOS health permission guidance ([#4674](https://github.com/trycua/cua/issues/4674)) ([4addd86](https://github.com/trycua/cua/commit/4addd869b6a14b9f4d416de6e725adc7082c8eb7))
+* **images:** keep Chromium tabs alive under gVisor on arm64 ([#4658](https://github.com/trycua/cua/issues/4658)) ([f68b806](https://github.com/trycua/cua/commit/f68b806024170205c63f4c65501a11e61042fa38))
+
+## [0.33.4](https://github.com/trycua/cua/compare/cua-driver-rs-v0.33.3...cua-driver-rs-v0.33.4) (2026-10-05)
+
+
+### Bug Fixes
+
+* **cua-driver:** recognize captured Chinese browser consent ([#4590](https://github.com/trycua/cua/issues/4590)) ([9ccafc9](https://github.com/trycua/cua/commit/9ccafc981412b02c096fc5a4008d08b16cada8e7))
+* **cua-driver:** support multi-monitor Hyprland desktops ([#4305](https://github.com/trycua/cua/issues/4305)) ([8674a68](https://github.com/trycua/cua/commit/8674a6832086a38c40ea59886b977a82a97645ad))
+
+## [0.33.3](https://github.com/trycua/cua/compare/cua-driver-rs-v0.33.2...cua-driver-rs-v0.33.3) (2026-10-04)
+
+
+### Bug Fixes
+
+* **cua-driver:** drain committed consent work through timeout ([26560e5](https://github.com/trycua/cua/commit/26560e5ccc6bb7c06864377794790094a4c3171a))
+* **cua-driver:** refuse set_value on Finder's Get Info Name field ([#4614](https://github.com/trycua/cua/issues/4614)) ([f8c292a](https://github.com/trycua/cua/commit/f8c292a95135d7c87d1f426bad3afa271a598f80)), closes [#4577](https://github.com/trycua/cua/issues/4577)
+* **cua-driver:** settle started browser consent before claim completion ([d2d8d26](https://github.com/trycua/cua/commit/d2d8d263a924f425e835a1eeb5a7c0c6d9183d95))
+
+## [0.33.2](https://github.com/trycua/cua/compare/cua-driver-rs-v0.33.1...cua-driver-rs-v0.33.2) (2026-10-04)
+
+
+### Bug Fixes
+
+* **cua-driver:** match "..." to the ellipsis in macOS menu paths ([#4578](https://github.com/trycua/cua/issues/4578)) ([a207d40](https://github.com/trycua/cua/commit/a207d402d0c645db5e71bde91c99ee10b8c9c8dc))
+* **cua-driver:** repair native Hyprland foreground regressions ([#4396](https://github.com/trycua/cua/issues/4396)) ([51003ab](https://github.com/trycua/cua/commit/51003ab368f35c429dd9301975fb59e1ef80d72e))
+
+## [0.33.1](https://github.com/trycua/cua/compare/cua-driver-rs-v0.33.0...cua-driver-rs-v0.33.1) (2026-10-03)
+
+
+### Bug Fixes
+
+* **cua-driver:** close remaining Claude cleanup safety gaps ([eb13682](https://github.com/trycua/cua/commit/eb136826b46adb68209ef72881bb469fad23c660))
+* **cua-driver:** drain Windows foreground input before restoring focus ([#4500](https://github.com/trycua/cua/issues/4500)) ([c8edda0](https://github.com/trycua/cua/commit/c8edda06be53e13a759c69de125ce37189023954)), closes [#4477](https://github.com/trycua/cua/issues/4477)
+* **cua-driver:** fail safely when Claude ownership cannot be inspected ([f7ff44a](https://github.com/trycua/cua/commit/f7ff44aba1e8807e82860cd90825f4c77fa3e6c1))
+* **cua-driver:** keep idle X11 cursor overlays unmapped ([#4529](https://github.com/trycua/cua/issues/4529)) ([5e13eb7](https://github.com/trycua/cua/commit/5e13eb7777172587fa32ce2af1d78d7572b77f1a))
+* **cua-driver:** keep the CLI fallback inside the ownership check ([762c223](https://github.com/trycua/cua/commit/762c223918d8bbfa11cce77320810e0c7ddb670d))
+* **cua-driver:** keep the uninstaller parseable by bash 3.2 ([25c6cb1](https://github.com/trycua/cua/commit/25c6cb16eb9a2a4e35c25199bc358247185d3d6d))
+* **cua-driver:** let verify_state read label-less display text on macOS ([#4531](https://github.com/trycua/cua/issues/4531)) ([15c6c24](https://github.com/trycua/cua/commit/15c6c24e23184f8e0388440ec52f3e4ee2fb58f3)), closes [#4526](https://github.com/trycua/cua/issues/4526)
+* **cua-driver:** make Claude MCP cleanup path-owned ([cf31fc1](https://github.com/trycua/cua/commit/cf31fc1e0a616b8237337f4f363d591208fd8515))
+* **cua-driver:** make the macOS background drag refusal explicit ([#4533](https://github.com/trycua/cua/issues/4533)) ([61ec8ac](https://github.com/trycua/cua/commit/61ec8ac1d80df191bccd7fc9e9275123a809b2f7)), closes [#4524](https://github.com/trycua/cua/issues/4524)
+* **cua-driver:** make Windows MCP removal guidance ownership-safe ([4b2589c](https://github.com/trycua/cua/commit/4b2589cd87c3f139e55ef9b8e86a00654a6b3ba2))
+* **cua-driver:** omit AX-less AppKit helper windows from macOS list_windows ([#4534](https://github.com/trycua/cua/issues/4534)) ([4635c06](https://github.com/trycua/cua/commit/4635c066808ba662c1d82a394592f707b4ad09ae)), closes [#4525](https://github.com/trycua/cua/issues/4525)
+* **cua-driver:** preserve foreign dangling launcher ([c1800a0](https://github.com/trycua/cua/commit/c1800a06618a338eca0d2e1d136b67e40d258f8e))
+* **cua-driver:** reject relative MCP commands as ownership evidence ([abc786c](https://github.com/trycua/cua/commit/abc786ca428222ef1e429f3a9e255a9953cb841c))
+* **cua-driver:** remove UTF-8 BOM from Windows uninstaller ([e309dc1](https://github.com/trycua/cua/commit/e309dc15e8c92a4e7adbfce0aaa2aee5f1582540))
+* **cua-driver:** scrub the Claude MCP registration the CLI actually creates ([558ddf0](https://github.com/trycua/cua/commit/558ddf0141c952337e0f4d3c2455474ce28e3adb))
+* **cua-driver:** tie Claude MCP cleanup to actual release removal ([ff770f5](https://github.com/trycua/cua/commit/ff770f5d5211a5a5898a5a569cb84e4736000777))
+
+## [0.33.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.32.0...cua-driver-rs-v0.33.0) (2026-10-03)
+
+
+### Features
+
+* **cua-driver:** auto-link skills for Pi ([#4049](https://github.com/trycua/cua/issues/4049)) ([402c6bd](https://github.com/trycua/cua/commit/402c6bd53bc2edee0555c5cd006d672a853c3d8e))
+* **cua-driver:** let embedding hosts set the macOS key gap ([#3489](https://github.com/trycua/cua/issues/3489)) ([310cdfd](https://github.com/trycua/cua/commit/310cdfd589631bba98444d1e4e77ed03269e0d80))
+
+
+### Bug Fixes
+
+* **cua-driver:** accept verbatim and junctioned Windows browser installs ([#4467](https://github.com/trycua/cua/issues/4467)) ([07f2bfc](https://github.com/trycua/cua/commit/07f2bfce90396b85fc49711a82266a981b8fc317)), closes [#4345](https://github.com/trycua/cua/issues/4345)
+* **cua-driver:** close the menu a failed macOS invoke_menu path opened ([#4484](https://github.com/trycua/cua/issues/4484)) ([154ca56](https://github.com/trycua/cua/commit/154ca5690350217f0824e004d04c031e5c411883))
+* **cua-driver:** constrain element_token tool schemas ([#4318](https://github.com/trycua/cua/issues/4318)) ([db55739](https://github.com/trycua/cua/commit/db55739146476d2a5f6b34c8ccde4da6eab1dc3a))
+* **cua-driver:** count an erroring macOS toggle press when its value moved ([#4485](https://github.com/trycua/cua/issues/4485)) ([ca59dc0](https://github.com/trycua/cua/commit/ca59dc0f15ace9c7c643042163bfd9086c88d9e8)), closes [#3835](https://github.com/trycua/cua/issues/3835)
+* **cua-driver:** deduplicate macOS browser setup identities ([#4466](https://github.com/trycua/cua/issues/4466)) ([51b9255](https://github.com/trycua/cua/commit/51b925522e2e811edb2d13a51a92780a5a0e12ac))
+* **cua-driver:** extend first Linux snapshot budget ([#4375](https://github.com/trycua/cua/issues/4375)) ([920a42f](https://github.com/trycua/cua/commit/920a42f1043a04400924f797d5430543a0ff99ad))
+* **cua-driver:** map Windows browser window rect into Chromium DIP layout ([#4506](https://github.com/trycua/cua/issues/4506)) ([1974811](https://github.com/trycua/cua/commit/197481193955970de22857caaaaa87c146a0373c)), closes [#4428](https://github.com/trycua/cua/issues/4428)
+* **cua-driver:** point the macOS CDP-port error at browser_prepare, not launch_app flags ([#2931](https://github.com/trycua/cua/issues/2931)) ([f0447fa](https://github.com/trycua/cua/commit/f0447fad70e1b151bcc8226f3889236cf1135cae))
+* **cua-driver:** rank titled macOS launch windows first ([#4048](https://github.com/trycua/cua/issues/4048)) ([b02ed97](https://github.com/trycua/cua/commit/b02ed97a76774faa2be269663877a6816f25c3b6))
+* **cua-driver:** re-resolve visible windows on a stale Space view ([#4509](https://github.com/trycua/cua/issues/4509)) ([f105145](https://github.com/trycua/cua/commit/f105145fab23968262e4ec82934a15de814317b8)), closes [#4437](https://github.com/trycua/cua/issues/4437)
+* **cua-driver:** refuse ambiguous macOS browser AppleScript ([#4051](https://github.com/trycua/cua/issues/4051)) ([fb33104](https://github.com/trycua/cua/commit/fb33104d2e7468a9210425479d9c942565fbbbe8))
+* **cua-driver:** refuse set_value on Finder file name cells instead of confirming a rename that never happened ([#4483](https://github.com/trycua/cua/issues/4483)) ([323af7c](https://github.com/trycua/cua/commit/323af7c39876a4464ad6c4ce2acf1cf17b049921)), closes [#4469](https://github.com/trycua/cua/issues/4469)
+* **cua-driver:** report recoverable UIA timeouts as warnings ([#3959](https://github.com/trycua/cua/issues/3959)) ([59c1f4b](https://github.com/trycua/cua/commit/59c1f4ba2fa6b6c868a1331f8e7df6d7ee94790c))
+* **cua-driver:** resolve sheet elements to their parent window ([#4507](https://github.com/trycua/cua/issues/4507)) ([030d5a0](https://github.com/trycua/cua/commit/030d5a0c05e0ce0684a051452c7b1ff618de66cd)), closes [#4392](https://github.com/trycua/cua/issues/4392)
+* **cua-driver:** support rotated Hyprland outputs ([#3969](https://github.com/trycua/cua/issues/3969)) ([69cf20a](https://github.com/trycua/cua/commit/69cf20a32d3a660bad9a3f7e3e99ab13fbca86f7))
+* **cua-driver:** validate get_window_state window via exact Win32 lookup ([#4505](https://github.com/trycua/cua/issues/4505)) ([fc6b4be](https://github.com/trycua/cua/commit/fc6b4beaa5345dc318f4f17e9a6be4b9188b5bb2)), closes [#4416](https://github.com/trycua/cua/issues/4416)
+* **cua-driver:** validate Windows capture handles ([#4333](https://github.com/trycua/cua/issues/4333)) ([0293791](https://github.com/trycua/cua/commit/029379139cf976de40f325ee4db94972bc2f74a0))
+
+## [0.32.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.31.0...cua-driver-rs-v0.32.0) (2026-10-01)
+
+
+### Features
+
+* merge updated sdk from cua-staging ([#4397](https://github.com/trycua/cua/issues/4397)) ([9166817](https://github.com/trycua/cua/commit/9166817485ae53f3966935c13878a8196d79a399))
+
+
+### Bug Fixes
+
+* **cua-driver:** list #4418 and #4421 in the 0.32.0 changelog ([#4425](https://github.com/trycua/cua/issues/4425))
+* **cua-driver:** list every windowed instance of a bundle in macOS list_apps ([#4421](https://github.com/trycua/cua/issues/4421)) ([29c5465](https://github.com/trycua/cua/commit/29c54656ccf6bf8490461768a0fac3096eb91e5c))
+* **installers:** hash downloads with .NET and load Windows PowerShell's own modules, so update --apply works from pwsh 7 ([#4418](https://github.com/trycua/cua/issues/4418)) ([a22426a](https://github.com/trycua/cua/commit/a22426adac1980dae7a44dde2f6446a8da39b99c))
+* **cua-driver:** keep Windows update --apply from killing its own installer ([#4398](https://github.com/trycua/cua/issues/4398)) ([93d0f7a](https://github.com/trycua/cua/commit/93d0f7af24b1561f98f6a85cd20ca2b35f37db35))
+* **cua-driver:** run the cursor event loop when PiP is enabled ([#4304](https://github.com/trycua/cua/issues/4304)) ([5933507](https://github.com/trycua/cua/commit/5933507e73be299f0d7d7e4d7a600950da7b09e3))
+
+## [0.31.0](https://github.com/trycua/cua/compare/cua-driver-rs-v0.30.4...cua-driver-rs-v0.31.0) (2026-09-29)
+
+
+### ⚠ BREAKING CHANGES
+
+* **cua-driver:** resolve element tokens against a snapshot store invalidated on read ([#3873](https://github.com/trycua/cua/issues/3873))
+
+### Bug Fixes
+
+* **cua-driver:** accept every Enter-key spelling in the Linux terminal gate ([#3658](https://github.com/trycua/cua/issues/3658)) ([f1d8388](https://github.com/trycua/cua/commit/f1d8388714bb300da9f01775154a7d064ccead3e))
+* **cua-driver:** allow Hyprland foreground typing with Num Lock and keymap options ([#3970](https://github.com/trycua/cua/issues/3970)) ([7954a1c](https://github.com/trycua/cua/commit/7954a1c089b386e15aa22d30cf004c7b175ccae1))
+* **cua-driver:** honor modifiers during X11 drags ([#3618](https://github.com/trycua/cua/issues/3618)) ([8157888](https://github.com/trycua/cua/commit/815788869898c2df14d102802899f0cf51b04631))
+* **cua-driver:** keep the Windows autostart task when an isolated install or failed registration would remove it ([#4284](https://github.com/trycua/cua/issues/4284)) ([f7469d3](https://github.com/trycua/cua/commit/f7469d3fd6bd18c572d599f8f79bcf0b6c0060a4))
+* **cua-driver:** report live running state for accessory apps ([#3456](https://github.com/trycua/cua/issues/3456)) ([0d61146](https://github.com/trycua/cua/commit/0d61146a4c6be5ed3c4b2f47e5628fbe96560eca))
+* **cua-driver:** report native Wayland modified-drag refusals with a stable code ([#4360](https://github.com/trycua/cua/issues/4360)) ([62cdfbc](https://github.com/trycua/cua/commit/62cdfbcd9356cf2e1b47ab09fee94eddd1d881cc))
+* **cua-driver:** resolve element tokens against a snapshot store invalidated on read ([#3873](https://github.com/trycua/cua/issues/3873)) ([61f1c0a](https://github.com/trycua/cua/commit/61f1c0ab255a1a39e675d93341cd50c0ceb2027e))
+* **cua-driver:** reveal the agent cursor for keyboard-first actions ([#4287](https://github.com/trycua/cua/issues/4287)) ([2d0431f](https://github.com/trycua/cua/commit/2d0431fb00962c50349ca1a25247e8b502db679b))
+* **cua-driver:** send a real key repeat rate on Hyprland agent keyboards ([#4358](https://github.com/trycua/cua/issues/4358)) ([065a660](https://github.com/trycua/cua/commit/065a660f21fdd315928cd7afedfbb9d778f6eb65)), closes [#4257](https://github.com/trycua/cua/issues/4257)
+* **cua-driver:** ship the Hyprland plugin keyboard sources in release kits and test them in CI ([#4310](https://github.com/trycua/cua/issues/4310)) ([0e7ad50](https://github.com/trycua/cua/commit/0e7ad50a5796846a10d9b1c53ce2d29591027d8b))
+* **cua-driver:** wait for a launching macOS app before its first snapshot ([#4309](https://github.com/trycua/cua/issues/4309)) ([1cb7b6f](https://github.com/trycua/cua/commit/1cb7b6fb2415b6d12978d2dfa3ecda0b07075c72))
+
+## [0.30.4](https://github.com/trycua/cua/compare/cua-driver-rs-v0.30.3...cua-driver-rs-v0.30.4) (2026-09-28)
+
+
+### Bug Fixes
+
+* **cua-driver:** anchor theme transforms at hotspot ([#4246](https://github.com/trycua/cua/issues/4246)) ([b0ebd91](https://github.com/trycua/cua/commit/b0ebd915daf85beeb8e3301a2ae83df8d4499752))
+* **cua-driver:** capture X11 DirectColor window colors ([#3758](https://github.com/trycua/cua/issues/3758)) ([0dd44d6](https://github.com/trycua/cua/commit/0dd44d62226fe09dd2ee1a5bf0952d4572077b83))
+* **cua-driver:** drop schemars uint/float formats from contract schema ([#3462](https://github.com/trycua/cua/issues/3462)) ([efd75df](https://github.com/trycua/cua/commit/efd75df76f2ccdc2f9c63ca8fb65e0356a46a1b4))
+* **cua-driver:** keep a foreground key chord's modifiers on its base key ([#3855](https://github.com/trycua/cua/issues/3855)) ([f71044a](https://github.com/trycua/cua/commit/f71044a940b8eb5c604e461157bd9e64adefcf5a)), closes [#3849](https://github.com/trycua/cua/issues/3849)
+* **cua-driver:** preserve delivered X11 mouse click timing ([#3762](https://github.com/trycua/cua/issues/3762)) ([1db9aca](https://github.com/trycua/cua/commit/1db9aca009b79f9462e28949ef68e07487d9a118))
+* **cua-driver:** render browser cursor on Linux ([#3778](https://github.com/trycua/cua/issues/3778)) ([b75b0b0](https://github.com/trycua/cua/commit/b75b0b08c947e7d9b2a400e33694566771f9910d))
+* **cua-driver:** scope trajectory recording to the session that started it ([#3632](https://github.com/trycua/cua/issues/3632)) ([758488e](https://github.com/trycua/cua/commit/758488e582b7e48a396b44416135b45d2769fdfc))
+* **cua-driver:** support fractionally scaled Hyprland desktops ([#4244](https://github.com/trycua/cua/issues/4244)) ([3034435](https://github.com/trycua/cua/commit/3034435724d4621679f9e99f4dc0d348d6a684ef))
+* **cua-driver:** verify a raised window on its display, not global order ([#3785](https://github.com/trycua/cua/issues/3785)) ([0a91a11](https://github.com/trycua/cua/commit/0a91a118675bf8d7c36f43e096275952c2225770))
+
+## [0.30.3](https://github.com/trycua/cua/compare/cua-driver-rs-v0.30.2...cua-driver-rs-v0.30.3) (2026-09-28)
+
+
+### Bug Fixes
+
+* **cua-driver:** confirm X11 foreground actions that close a window when focus parks on the WM ([#4248](https://github.com/trycua/cua/issues/4248)) ([55c7f27](https://github.com/trycua/cua/commit/55c7f27b19e8c688cb45911425edee798f77fb28))
+* **cua-driver:** diagnose file-descriptor exhaustion during macOS browser inspection ([#3889](https://github.com/trycua/cua/issues/3889)) ([da9af53](https://github.com/trycua/cua/commit/da9af5392ead4f04c2743cf6119c638cb81194f6))
+* **cua-driver:** diagnose Windows SSH pipe access ([#3318](https://github.com/trycua/cua/issues/3318)) ([92db289](https://github.com/trycua/cua/commit/92db2899a9dfe2ef44fe5fdfb38cf3ac67cd4deb))
+* **cua-driver:** drop the boolean enum from verify_state for Gemini clients ([#4229](https://github.com/trycua/cua/issues/4229)) ([919f1d5](https://github.com/trycua/cua/commit/919f1d517b504115af79e81b1a0c892cca4132c8))
+* **cua-driver:** fail autostart enable when the UAC prompt is declined ([#3180](https://github.com/trycua/cua/issues/3180)) ([cb74f56](https://github.com/trycua/cua/commit/cb74f56d76b8371d41aeccb0d764ab570237459a))
+* **cua-driver:** handle consent for fresh browser claims ([#3288](https://github.com/trycua/cua/issues/3288)) ([a00aec2](https://github.com/trycua/cua/commit/a00aec22cf96a86c27599ed829e5ac2a7022f491))
+* **cua-driver:** ignore daemon windows in change detection ([#1784](https://github.com/trycua/cua/issues/1784)) ([dee3d52](https://github.com/trycua/cua/commit/dee3d5225cf85ba94f67f4190d7d381dcf31abb7))
+* **cua-driver:** invoke a menu on a window that is not already in front ([#3781](https://github.com/trycua/cua/issues/3781)) ([8ec1de4](https://github.com/trycua/cua/commit/8ec1de4761690c164a598a990625ac3711493820))
+* **cua-driver:** keep schema properties named title or description ([#3827](https://github.com/trycua/cua/issues/3827)) ([1052ad8](https://github.com/trycua/cua/commit/1052ad8fe9497d817ff8ee947cdec636382559af)), closes [#3802](https://github.com/trycua/cua/issues/3802)
+* **cua-driver:** keep the Windows daemon accepting after a failed pipe instance ([#4279](https://github.com/trycua/cua/issues/4279)) ([49b7fb3](https://github.com/trycua/cua/commit/49b7fb324bd1b811d7c1b2b235977d6a6d52d0ae))
+* **cua-driver:** launch apps with a standard-user token from an elevated Windows Driver ([#4282](https://github.com/trycua/cua/issues/4282)) ([002b936](https://github.com/trycua/cua/commit/002b9365557667c5e999c77a438e329e5accfcb2)), closes [#3607](https://github.com/trycua/cua/issues/3607)
+* **cua-driver:** lazily initialize macos clipboard ([#3025](https://github.com/trycua/cua/issues/3025)) ([c3687bd](https://github.com/trycua/cua/commit/c3687bd8dffb90bcdd1670470e50eeb11db5d106))
+* **cua-driver:** let SDK hosts bound the post-action window poll ([#3946](https://github.com/trycua/cua/issues/3946)) ([990a2d1](https://github.com/trycua/cua/commit/990a2d1f17b27129bb05e9cebc68e4f5ebc0305b))
+* **cua-driver:** make Windows listener discovery locale independent ([#3275](https://github.com/trycua/cua/issues/3275)) ([ed00ede](https://github.com/trycua/cua/commit/ed00ede10ec65fd605812959347399ae7cee3c6a))
+* **cua-driver:** map standalone Wayland modifier keys ([#3659](https://github.com/trycua/cua/issues/3659)) ([b1bd49c](https://github.com/trycua/cua/commit/b1bd49ce1dccb6fa5cdff1306f3e63e4b3163cbf))
+* **cua-driver:** mark the left Windows key as extended ([#4046](https://github.com/trycua/cua/issues/4046)) ([e955fb1](https://github.com/trycua/cua/commit/e955fb1b52dcfb924043eb4a38c656b24cc10840))
+* **cua-driver:** move fixed-size macOS windows with set_window_frame ([#4133](https://github.com/trycua/cua/issues/4133)) ([770bf22](https://github.com/trycua/cua/commit/770bf22db4cce624a512357eaa992ea23dfea32b)), closes [#4114](https://github.com/trycua/cua/issues/4114)
+* **cua-driver:** parse Windows signer names that contain commas ([#4273](https://github.com/trycua/cua/issues/4273)) ([160ae91](https://github.com/trycua/cua/commit/160ae91fc1f1d25583c79d7c0f51d2c4638b53a7)), closes [#4272](https://github.com/trycua/cua/issues/4272)
+* **cua-driver:** recreate an idle-reclaimed unnamed session on its next call ([#4283](https://github.com/trycua/cua/issues/4283)) ([b0842f5](https://github.com/trycua/cua/commit/b0842f52665516db8f364af3c3bc51b4172e6afc))
+* **cua-driver:** reject malformed tool arguments found by fuzzing ([#3777](https://github.com/trycua/cua/issues/3777)) ([38f56e4](https://github.com/trycua/cua/commit/38f56e4ae5c08e91a8d46f855f972e4ab5638a8e))
+* **cua-driver:** report Linux kill_app success only after the process exits ([#4281](https://github.com/trycua/cua/issues/4281)) ([3470e23](https://github.com/trycua/cua/commit/3470e230a1f17ba3cf4d55721ad8a32a0e68faf0))
+* **cua-driver:** report named Linux text fields' content as value ([#4292](https://github.com/trycua/cua/issues/4292)) ([7224b85](https://github.com/trycua/cua/commit/7224b85f62badb32a923e6ba655453072771ae87))
+* **cua-driver:** report screenshot_frame_valid on successful Linux window captures ([#3814](https://github.com/trycua/cua/issues/3814)) ([9fe9520](https://github.com/trycua/cua/commit/9fe9520ef35775b1d056d7a2cc2be302ee5ac75c))
+* **cua-driver:** resolve Windows shortcut environment targets ([#3975](https://github.com/trycua/cua/issues/3975)) ([1b58f46](https://github.com/trycua/cua/commit/1b58f4688e1b550ddf6950924c2e1ce70276ebe4))
+* **cua-driver:** scope codesign --strict to symlinks in isolated-launch check ([#4059](https://github.com/trycua/cua/issues/4059)) ([d4585e8](https://github.com/trycua/cua/commit/d4585e86524192ffb5a69fd8f2e23bda98bd6dff))
+* **cua-driver:** self-elevate the Windows local uninstaller ([#3178](https://github.com/trycua/cua/issues/3178)) ([09ffe7b](https://github.com/trycua/cua/commit/09ffe7b0df2316ed52da9b16e5990204f09ab245))
+* **cua-driver:** skip Chromium targets without browser windows ([#3541](https://github.com/trycua/cua/issues/3541)) ([8381a05](https://github.com/trycua/cua/commit/8381a051072834a6a960571455ccfcc33bc143ae))
+* **cua-driver:** skip unrepresentable Hyprland clients ([#4250](https://github.com/trycua/cua/issues/4250)) ([fbbb2d7](https://github.com/trycua/cua/commit/fbbb2d706bed5421f0761c61db8876e290fa5d86))
+* **cua-driver:** wait for a cold Chromium tree before the first snapshot ([#3783](https://github.com/trycua/cua/issues/3783)) ([1e93424](https://github.com/trycua/cua/commit/1e93424e55fb28252f2112e2c683bdbb35cbda11))
+
+
+### Performance Improvements
+
+* **cua-driver:** skip verifier AX walk for screenshot evidence ([#4164](https://github.com/trycua/cua/issues/4164)) ([78c42a3](https://github.com/trycua/cua/commit/78c42a38ab27e61ca74d5ea53362f23eac8ef921))
 
 ## [0.30.2](https://github.com/trycua/cua/compare/cua-driver-rs-v0.30.1...cua-driver-rs-v0.30.2) (2026-09-27)
 

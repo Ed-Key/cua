@@ -3,12 +3,13 @@
 //! This is the explicit persistent-foreground escape hatch for focus-proxy
 //! applications.  A successful native request is only a request receipt: when
 //! an exact `window_id` is supplied, the tool independently verifies the
-//! process, semantic key window, and WindowServer layer-0 order before it says
-//! `activated: true`.
+//! process, semantic key window, and per-display front position before it
+//! says `activated: true`.
 
 use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
+use core_graphics::display::CGDisplay;
 use cua_driver_core::{
     protocol::ToolResult,
     tool::{Tool, ToolDef},
@@ -16,6 +17,7 @@ use cua_driver_core::{
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
 use serde_json::{json, Value};
 
+use crate::windows::{WindowBounds, WindowInfo};
 
 pub struct BringToFrontTool;
 
@@ -28,9 +30,10 @@ const VERIFY_STABLE: Duration = Duration::from_millis(100);
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "bring_to_front".into(),
-        description: "Activate an app and leave it frontmost; this steals foreground and most input does \
-             not need it. With window_id, success means that window was verified focused and \
-             frontmost; an accepted request alone is partial."
+        description: "Activate an app and leave it frontmost; this steals foreground, does not \
+             restore the prior app, and most input does not need it. With window_id, success \
+             means that window was verified focused and the front window of its process on its \
+             display; an accepted request alone is partial."
             .into(),
         input_schema: json!({
             "type": "object",
@@ -54,6 +57,7 @@ struct ExactWindowObservation {
     front_process_matches_target: Option<bool>,
     focused_window_id: Option<u32>,
     frontmost_ordinary_window_id: Option<u32>,
+    process_front_window_on_display: Option<u32>,
     target_visible_ordinary: bool,
 }
 
@@ -74,6 +78,10 @@ impl ExactWindowObservation {
         self.focused_window_id == Some(window_id)
     }
 
+    fn exact_window_front_in_process_on_display(self, window_id: u32) -> bool {
+        self.target_visible_ordinary && self.process_front_window_on_display == Some(window_id)
+    }
+
     fn exact_window_frontmost_ordinary(self, window_id: u32) -> bool {
         self.target_visible_ordinary && self.frontmost_ordinary_window_id == Some(window_id)
     }
@@ -81,7 +89,7 @@ impl ExactWindowObservation {
     fn exact_postcondition(self, pid: i32, window_id: u32) -> bool {
         self.process_activated(pid)
             && self.exact_window_focused(window_id)
-            && self.exact_window_frontmost_ordinary(window_id)
+            && self.exact_window_front_in_process_on_display(window_id)
     }
 }
 
@@ -103,11 +111,75 @@ fn classify_exact_outcome(
     } else if request_accepted
         || observation.process_activated(pid)
         || observation.exact_window_focused(window_id)
-        || observation.exact_window_frontmost_ordinary(window_id)
+        || observation.exact_window_front_in_process_on_display(window_id)
     {
         ExactOutcome::Partial
     } else {
         ExactOutcome::Failed
+    }
+}
+
+fn active_display_bounds() -> Vec<WindowBounds> {
+    let Ok(displays) = CGDisplay::active_displays() else {
+        return Vec::new();
+    };
+    displays
+        .into_iter()
+        .map(|display| {
+            let bounds = CGDisplay::new(display).bounds();
+            WindowBounds {
+                x: bounds.origin.x,
+                y: bounds.origin.y,
+                width: bounds.size.width,
+                height: bounds.size.height,
+            }
+        })
+        .collect()
+}
+
+fn overlap_area(left: &WindowBounds, right: &WindowBounds) -> f64 {
+    let width = (left.x + left.width).min(right.x + right.width) - left.x.max(right.x);
+    let height = (left.y + left.height).min(right.y + right.height) - left.y.max(right.y);
+    if width > 0.0 && height > 0.0 {
+        width * height
+    } else {
+        0.0
+    }
+}
+
+fn display_holding(bounds: &WindowBounds, displays: &[WindowBounds]) -> Option<usize> {
+    displays
+        .iter()
+        .enumerate()
+        .map(|(index, display)| (index, overlap_area(bounds, display)))
+        .filter(|(_, area)| *area > 0.0)
+        .max_by(|(_, left), (_, right)| left.total_cmp(right))
+        .map(|(index, _)| index)
+}
+
+fn front_window_of_process_on_target_display(
+    windows: &[WindowInfo],
+    displays: &[WindowBounds],
+    pid: i32,
+    window_id: u32,
+) -> Option<u32> {
+    let target = windows.iter().find(|w| w.window_id == window_id)?;
+    let target_display = display_holding(&target.bounds, displays);
+    windows
+        .iter()
+        .filter(|window| {
+            window.pid == pid && display_holding(&window.bounds, displays) == target_display
+        })
+        .max_by_key(|window| window.z_index)
+        .map(|window| window.window_id)
+}
+
+/// `id`, or the target's own id when `id` is the sheet attached to it.
+fn sheet_as_target(id: Option<u32>, sheet: Option<u32>, window_id: u32) -> Option<u32> {
+    if id.is_some() && id == sheet {
+        Some(window_id)
+    } else {
+        id
     }
 }
 
@@ -117,17 +189,27 @@ fn observe_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
     let target_visible_ordinary = windows
         .iter()
         .any(|window| window.pid == pid && window.window_id == window_id && window.layer == 0);
-    let mut frontmost_ordinary_window_id = windows
-        .iter()
-        .max_by_key(|window| window.z_index)
-        .map(|window| window.window_id);
     // A sheet attached to the target (an Open panel) sits above it and has
     // its own id, but it is part of the target window.
-    if let Some(sheet) = crate::ax::bindings::attached_sheet_of_window(pid, window_id) {
-        if frontmost_ordinary_window_id == Some(sheet) {
-            frontmost_ordinary_window_id = Some(window_id);
-        }
-    }
+    let sheet = crate::ax::bindings::attached_sheet_of_window(pid, window_id);
+    let frontmost_ordinary_window_id = sheet_as_target(
+        windows
+            .iter()
+            .max_by_key(|window| window.z_index)
+            .map(|window| window.window_id),
+        sheet,
+        window_id,
+    );
+    let process_front_window_on_display = sheet_as_target(
+        front_window_of_process_on_target_display(
+            &windows,
+            &active_display_bounds(),
+            pid,
+            window_id,
+        ),
+        sheet,
+        window_id,
+    );
     ExactWindowObservation {
         workspace_frontmost_pid: crate::apps::frontmost_pid(),
         front_process_matches_target: crate::input::skylight::front_process_matches(pid, window_id),
@@ -136,6 +218,7 @@ fn observe_exact_window(pid: i32, window_id: u32) -> ExactWindowObservation {
             window_id,
         ),
         frontmost_ordinary_window_id,
+        process_front_window_on_display,
         target_visible_ordinary,
     }
 }
@@ -174,6 +257,8 @@ fn exact_result(
     let process_activated = observation.process_activated(pid);
     let frontmost_pid = observation.frontmost_pid(pid);
     let exact_window_focused = observation.exact_window_focused(window_id);
+    let exact_window_front_on_display =
+        observation.exact_window_front_in_process_on_display(window_id);
     let exact_window_frontmost_ordinary = observation.exact_window_frontmost_ordinary(window_id);
     let status = match outcome {
         ExactOutcome::Activated => "activated",
@@ -192,6 +277,7 @@ fn exact_result(
         "exact_window_effect": {
             "verified": activated,
             "focused": exact_window_focused,
+            "front_in_process_on_display": exact_window_front_on_display,
             "frontmost_ordinary": exact_window_frontmost_ordinary,
             "target_visible_ordinary": observation.target_visible_ordinary,
         },
@@ -201,6 +287,7 @@ fn exact_result(
             "front_process_matches_target": observation.front_process_matches_target,
             "focused_window_id": observation.focused_window_id,
             "frontmost_ordinary_window_id": observation.frontmost_ordinary_window_id,
+            "process_front_window_on_display": observation.process_front_window_on_display,
         }
     });
     if activated {
@@ -211,9 +298,10 @@ fn exact_result(
     } else {
         ToolResult::error(format!(
             "bring_to_front: exact window {window_id} for pid {pid} was not verified \
-             as frontmost and focused (request_accepted={request_accepted}, \
+             as the frontmost process's focused window and the front window of that process \
+             on its display (request_accepted={request_accepted}, \
              process_activated={process_activated}, focused={exact_window_focused}, \
-             frontmost_ordinary={exact_window_frontmost_ordinary})."
+             front_in_process_on_display={exact_window_front_on_display})."
         ))
         .with_structured(structured)
     }
@@ -413,12 +501,138 @@ mod tests {
             front_process_matches_target,
             focused_window_id,
             frontmost_ordinary_window_id,
+            process_front_window_on_display: frontmost_ordinary_window_id,
             target_visible_ordinary,
         }
     }
 
+    fn contested_observation(
+        focused_window_id: Option<u32>,
+        global_front_window_id: Option<u32>,
+        process_front_window_on_display: Option<u32>,
+    ) -> ExactWindowObservation {
+        ExactWindowObservation {
+            workspace_frontmost_pid: Some(42),
+            front_process_matches_target: Some(true),
+            focused_window_id,
+            frontmost_ordinary_window_id: global_front_window_id,
+            process_front_window_on_display,
+            target_visible_ordinary: true,
+        }
+    }
+
+    fn side_by_side_displays() -> Vec<WindowBounds> {
+        vec![
+            WindowBounds {
+                x: 0.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+            WindowBounds {
+                x: 1920.0,
+                y: 0.0,
+                width: 1920.0,
+                height: 1080.0,
+            },
+        ]
+    }
+
+    fn window(window_id: u32, pid: i32, z_index: usize, x: f64) -> WindowInfo {
+        WindowInfo {
+            window_id,
+            pid,
+            app_name: "Target".into(),
+            title: format!("window {window_id}"),
+            bounds: WindowBounds {
+                x,
+                y: 100.0,
+                width: 800.0,
+                height: 600.0,
+            },
+            layer: 0,
+            z_index,
+            is_on_screen: true,
+            current_space_id: None,
+            on_current_space: Some(true),
+            space_ids: None,
+        }
+    }
+
     #[test]
-    fn exact_success_requires_process_focus_and_layer_zero_order() {
+    fn another_applications_window_on_top_does_not_unverify_the_reveal() {
+        let contested = contested_observation(Some(7), Some(900), Some(7));
+        assert_eq!(
+            classify_exact_outcome(true, 42, 7, contested),
+            ExactOutcome::Activated
+        );
+        let structured = exact_result(42, 7, "skylight_process_exact_cocoa_ax", true, contested)
+            .structured_content
+            .expect("structured result");
+        assert_eq!(structured["activated"], true);
+        assert_eq!(
+            structured["exact_window_effect"]["front_in_process_on_display"],
+            true
+        );
+        assert_eq!(
+            structured["exact_window_effect"]["frontmost_ordinary"],
+            false
+        );
+        assert_eq!(structured["observed"]["process_front_window_on_display"], 7);
+        assert_eq!(structured["observed"]["frontmost_ordinary_window_id"], 900);
+    }
+
+    #[test]
+    fn a_sibling_window_of_the_same_application_in_front_is_only_partial() {
+        assert_eq!(
+            classify_exact_outcome(
+                true,
+                42,
+                7,
+                contested_observation(Some(7), Some(8), Some(8))
+            ),
+            ExactOutcome::Partial
+        );
+    }
+
+    #[test]
+    fn a_sibling_in_front_on_another_display_leaves_the_target_front_where_it_sits() {
+        let windows = vec![window(7, 42, 10, 100.0), window(8, 42, 30, 2000.0)];
+        let displays = side_by_side_displays();
+        assert_eq!(
+            front_window_of_process_on_target_display(&windows, &displays, 42, 7),
+            Some(7)
+        );
+        assert_eq!(
+            front_window_of_process_on_target_display(&windows, &displays, 42, 8),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn a_sibling_in_front_on_the_same_display_takes_the_front_position() {
+        let windows = vec![
+            window(7, 42, 10, 100.0),
+            window(8, 42, 30, 500.0),
+            window(9, 99, 40, 200.0),
+        ];
+        assert_eq!(
+            front_window_of_process_on_target_display(&windows, &side_by_side_displays(), 42, 7),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn without_display_bounds_every_window_of_the_process_competes() {
+        let windows = vec![window(7, 42, 10, 100.0), window(8, 42, 30, 2000.0)];
+        assert_eq!(
+            front_window_of_process_on_target_display(&windows, &[], 42, 7),
+            Some(8)
+        );
+    }
+
+    #[test]
+    fn exact_success_requires_process_focus_and_front_position_on_its_display() {
         assert_eq!(
             classify_exact_outcome(
                 true,
@@ -567,5 +781,13 @@ mod tests {
         assert_eq!(structured["status"], "activated");
         assert_eq!(structured["activated"], true);
         assert_eq!(structured["exact_window_effect"]["verified"], true);
+    }
+
+    #[test]
+    fn a_sheet_attached_to_the_target_counts_as_the_target() {
+        assert_eq!(sheet_as_target(Some(9), Some(9), 7), Some(7));
+        assert_eq!(sheet_as_target(Some(8), Some(9), 7), Some(8));
+        assert_eq!(sheet_as_target(Some(8), None, 7), Some(8));
+        assert_eq!(sheet_as_target(None, Some(9), 7), None);
     }
 }

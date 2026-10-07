@@ -97,8 +97,8 @@ returned by `get_browser_state`.
 
 ### Copy page content to the system clipboard
 
-If the requested outcome is exact page content on the system clipboard—not a
-literal text-selection gesture—read the content from a fresh semantic browser
+If the requested outcome is exact page content on the system clipboard (not a
+literal text-selection gesture), read the content from a fresh semantic browser
 snapshot, call `clipboard_write` with the exact observed value, and verify it
 with `clipboard_read`. This path is background-safe and does not require a
 clickable ref: passive headings and text nodes are evidence sources, not

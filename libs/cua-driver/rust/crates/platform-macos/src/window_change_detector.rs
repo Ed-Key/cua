@@ -340,6 +340,7 @@ mod tests {
         // panicking (no frontmost to restore to).
         let snap_none = WindowChangeDetector::snapshot(None);
         assert_eq!(snap_none.front_pid(), None);
+        assert!(snap_none._lease.is_none(), "no frontmost pid means no lease");
     }
 
     struct DropFlag(std::sync::Arc<std::sync::atomic::AtomicBool>);

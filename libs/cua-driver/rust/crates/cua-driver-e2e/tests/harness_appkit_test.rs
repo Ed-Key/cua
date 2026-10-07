@@ -26,7 +26,7 @@
 
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use cua_driver_testkit::ax::{element_index_by_id, element_index_containing, has_id, looks_empty};
 use cua_driver_testkit::e2e::{
@@ -77,12 +77,62 @@ impl Harness {
     }
 
     fn launch_with_oracles(command_oracle: Option<&Path>, pointer_oracle: Option<&Path>) -> Self {
-        Self::launch_with(command_oracle, pointer_oracle, &[])
+        Self::launch_with_options(command_oracle, pointer_oracle, false)
+    }
+
+    fn launch_with_options(
+        command_oracle: Option<&Path>,
+        pointer_oracle: Option<&Path>,
+        keep_ordered_front: bool,
+    ) -> Self {
+        Self::spawn(
+            command_oracle,
+            pointer_oracle,
+            keep_ordered_front,
+            None,
+            &[],
+        )
+        .presented()
     }
 
     fn launch_with(
         command_oracle: Option<&Path>,
         pointer_oracle: Option<&Path>,
+        env: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn(command_oracle, pointer_oracle, false, None, env).presented()
+    }
+
+    /// Launch with the opt-in erroring toggles (`erroring_toggles` scenario).
+    fn launch_with_erroring_toggles() -> Self {
+        Self::spawn(
+            None,
+            None,
+            false,
+            None,
+            &[("CUA_APPKIT_ERRORING_TOGGLES", "1")],
+        )
+        .presented()
+    }
+
+    fn presented(self) -> Self {
+        // Settle for window creation + activation.
+        std::thread::sleep(Duration::from_millis(800));
+        self.await_presented();
+        self
+    }
+
+    /// Launch a harness that holds off entering its run loop for `delay`
+    /// after registering its window, without waiting for its launch posture.
+    fn launch_slowly(delay: Duration) -> Self {
+        Self::spawn(None, None, false, Some(delay), &[])
+    }
+
+    fn spawn(
+        command_oracle: Option<&Path>,
+        pointer_oracle: Option<&Path>,
+        keep_ordered_front: bool,
+        launch_delay: Option<Duration>,
         env: &[(&str, &str)],
     ) -> Self {
         let exe = harness_exe();
@@ -101,18 +151,42 @@ impl Harness {
         if let Some(path) = pointer_oracle {
             command.env("CUA_APPKIT_POINTER_ORACLE", path);
         }
-        for (name, value) in env {
-            command.env(name, value);
+        if keep_ordered_front {
+            command.env("CUA_APPKIT_KEEP_ORDERED_FRONT", "1");
         }
+        if let Some(delay) = launch_delay {
+            command.env("CUA_APPKIT_LAUNCH_DELAY_MS", delay.as_millis().to_string());
+        }
+        command.envs(env.iter().copied());
         let app = command
             .spawn()
             .unwrap_or_else(|error| panic!("launch AppKit harness {exe:?}: {error}"));
         let pid = app.id();
-        // Settle for window creation + activation.
-        std::thread::sleep(Duration::from_millis(800));
         Self { _app: app, pid }
     }
+
+    /// Wait until the harness has finished launching and shows its window.
+    ///
+    /// Its window is registered with WindowServer before the app enters its
+    /// run loop, so `find_window` can succeed while every accessibility
+    /// request still fails. On a cold hosted runner the first launch spends
+    /// seconds in that state; a case must not start there.
+    fn await_presented(&self) {
+        let deadline = Instant::now() + HARNESS_LAUNCH_TIMEOUT;
+        while !cua_driver_testkit::observer::macos::application_presented(self.pid) {
+            assert!(
+                Instant::now() < deadline,
+                "AppKit harness pid {} did not finish launching and show its window within {:?}",
+                self.pid,
+                HARNESS_LAUNCH_TIMEOUT
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
 }
+
+/// Upper bound for a harness launch, cold first launches included.
+const HARNESS_LAUNCH_TIMEOUT: Duration = Duration::from_secs(20);
 
 impl Drop for Harness {
     fn drop(&mut self) {
@@ -138,6 +212,58 @@ fn snapshot_elements(driver: &mut McpDriver, pid: u32, window_id: u64) -> ToolRe
             "element_fields": "full"
         }),
     )
+}
+
+struct FrontWindow {
+    window_id: u64,
+    z_index: i64,
+    app_name: String,
+    title: String,
+}
+
+impl std::fmt::Display for FrontWindow {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "window {} (z_index {}, {} {:?})",
+            self.window_id, self.z_index, self.app_name, self.title
+        )
+    }
+}
+
+/// The window WindowServer ranks first in the global layer-0 order, read from
+/// `list_windows` (`z_index`: higher values are closer to the front) so the
+/// observation does not depend on the tool under test.
+fn front_layer_zero_window(driver: &mut McpDriver) -> Option<FrontWindow> {
+    let response = driver.call("list_windows", serde_json::json!({"on_screen_only": true}));
+    response.structured()["windows"]
+        .as_array()?
+        .iter()
+        .filter(|window| window["layer"].as_i64() == Some(0))
+        .filter_map(|window| {
+            Some(FrontWindow {
+                window_id: window["window_id"].as_u64()?,
+                z_index: window["z_index"].as_i64()?,
+                app_name: window["app_name"].as_str().unwrap_or_default().to_owned(),
+                title: window["title"].as_str().unwrap_or_default().to_owned(),
+            })
+        })
+        .max_by_key(|window| window.z_index)
+}
+
+/// Poll the global layer-0 order until `window_id` leads it, up to 3s, and
+/// return the last observation so a caller can name whatever leads instead.
+fn await_front_layer_zero_window(driver: &mut McpDriver, window_id: u64) -> Option<FrontWindow> {
+    let deadline = Instant::now() + Duration::from_secs(3);
+    loop {
+        let front = front_layer_zero_window(driver);
+        if front.as_ref().map(|window| window.window_id) == Some(window_id)
+            || Instant::now() >= deadline
+        {
+            return front;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 fn element_token_by_id(snapshot: &ToolResponse, identifier: &str) -> String {
@@ -564,20 +690,20 @@ fn harness_appkit_exact_activation_with_agent_cursor() {
 
 #[test]
 #[ignore]
-fn harness_appkit_exact_activation_refuses_competing_window() {
+fn harness_appkit_exact_activation_ignores_competing_application_window() {
     let mut case = native_foreground_case(
         "appkit",
         "exact_activation_competing_window",
         Targeting::NotApplicable,
         DriverRoute::WindowState,
-    )
-    .expecting_refusal(vec![RefusalCode::BringToFrontExactWindowUnverified]);
+    );
     case.oracles.push(OracleKind::Cursor);
     run_case(case, |pid, wid, driver| {
         let competitor = Harness::launch_with(None, None, &[("CUA_APPKIT_KEEP_ORDERED_FRONT", "1")]);
         let (competing_wid, _) = driver
             .find_window(competitor.pid as i64, "CuaTestHarness AppKit")
             .expect("find competing ordinary window");
+        assert_ne!(competing_wid, wid);
         let snapshot = snapshot_elements(driver, pid, wid);
         assert!(!snapshot.is_error(), "target snapshot: {}", snapshot.text());
         let observer = NativeObserver::new();
@@ -586,38 +712,47 @@ fn harness_appkit_exact_activation_refuses_competing_window() {
             native_id: wid,
         };
         let before = observer.snapshot(target).expect("observe competing window");
+        let front = await_front_layer_zero_window(driver, competing_wid);
+        let leader = front
+            .as_ref()
+            .map(FrontWindow::to_string)
+            .unwrap_or_else(|| "no on-screen layer-0 window".to_owned());
+        assert_eq!(
+            front.map(|window| window.window_id),
+            Some(competing_wid),
+            "competing window {competing_wid} must lead the global layer-0 order before \
+             bring_to_front; list_windows ranks {leader} first"
+        );
         let response = driver.call(
             "bring_to_front",
             serde_json::json!({"pid": pid, "window_id": wid}),
         );
         assert!(
-            response.is_error(),
-            "competing window must prevent verification"
+            !response.is_error(),
+            "another application ordering its window front must not unverify activation: {}",
+            response.raw
         );
         assert_eq!(
             response.structured()["code"],
-            "bring_to_front_exact_window_unverified"
+            "bring_to_front_exact_window_verified"
         );
-        assert_eq!(response.structured()["activated"], false);
+        assert_eq!(response.structured()["activated"], true);
         assert_eq!(response.structured()["process_activated"], true);
         assert_eq!(
             response.structured()["exact_window_effect"]["focused"],
             true
         );
         assert_eq!(
-            response.structured()["observed"]["frontmost_ordinary_window_id"].as_u64(),
-            Some(competing_wid)
+            response.structured()["exact_window_effect"]["front_in_process_on_display"],
+            true
         );
-        let after = observer
-            .snapshot(target)
-            .expect("observe refused activation");
+        assert_eq!(
+            response.structured()["observed"]["focused_window_id"].as_u64(),
+            Some(wid)
+        );
+        let after = observer.snapshot(target).expect("observe activated target");
         assert_eq!(after.cursor_pos, before.cursor_pos, "real pointer moved");
-        Observation::refused(
-            RefusalCode::BringToFrontExactWindowUnverified,
-            vec![OracleKind::FixtureState, OracleKind::Cursor],
-            response.text(),
-            Evidence::default(),
-        )
+        Observation::delivered_with_fixture_state(vec![OracleKind::Cursor])
     });
 }
 
@@ -788,6 +923,95 @@ fn harness_appkit_smoke() {
     );
 }
 
+/// AppKit registers a window with WindowServer when the app constructs it, but
+/// the app answers accessibility only once it enters its run loop; a cold
+/// launch can sit between the two for seconds. The first snapshot waits for
+/// the launch within `timeout_ms`, and a launch that outlasts the budget is
+/// reported as such instead of as an unexplained empty tree.
+#[test]
+#[ignore]
+fn harness_appkit_first_snapshot_waits_for_a_launching_app() {
+    let case = native_readonly_case(
+        "appkit",
+        "launching_app_snapshot",
+        Targeting::Ax,
+        DriverRoute::AxRead,
+        vec![OracleKind::AxState],
+    );
+    execute_case(case, |evidence| {
+        let mut driver = McpDriver::spawn_macos_daemon_proxy_named("appkit-launching-app-snapshot")
+            .expect("start installed macOS daemon proxy");
+        *evidence = recording_evidence(driver.recording_dir());
+        driver.start_behavior_recording();
+        let snapshot = |driver: &mut McpDriver, pid: u32, wid: u64, timeout_ms: u64| {
+            driver.call(
+                "get_window_state",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "timeout_ms": timeout_ms,
+                    "include_screenshot": false
+                }),
+            )
+        };
+        let launching_window = |driver: &mut McpDriver, harness: &Harness| {
+            let (wid, _) = driver
+                .find_window(harness.pid as i64, "CuaTestHarness AppKit")
+                .expect("a launching AppKit window is listed before it can answer AX");
+            assert!(
+                !cua_driver_testkit::observer::macos::application_presented(harness.pid),
+                "the harness must still be launching when the snapshot starts"
+            );
+            wid
+        };
+
+        let stalled = Harness::launch_slowly(Duration::from_secs(4));
+        let wid = launching_window(&mut driver, &stalled);
+        let early = snapshot(&mut driver, stalled.pid, wid, 300);
+        let state = early.structured();
+        assert!(
+            !early.is_error(),
+            "a launching app degrades; it does not error: {}",
+            early.text()
+        );
+        assert_eq!(state["truncated"], true, "{state}");
+        assert_eq!(state["truncation_reason"], "app_lookup_timeout", "{state}");
+        assert_eq!(state["degraded"], true, "{state}");
+        assert!(
+            state["degraded_reason"]
+                .as_str()
+                .is_some_and(|reason| reason.starts_with("ax_app_launching")),
+            "{state}"
+        );
+        assert_eq!(state["elements"], serde_json::json!([]), "{state}");
+        assert!(
+            state.get("snapshot_id").is_none(),
+            "an unresolved launch must not publish element tokens: {state}"
+        );
+        drop(stalled);
+
+        let slow = Harness::launch_slowly(Duration::from_millis(2500));
+        let wid = launching_window(&mut driver, &slow);
+        let started = Instant::now();
+        let first = snapshot(&mut driver, slow.pid, wid, 10_000);
+        let waited = started.elapsed();
+        let state = first.structured();
+        assert!(!first.is_error(), "first snapshot: {}", first.text());
+        assert!(state.get("degraded").is_none(), "{state}");
+        assert_eq!(state["truncated"], false, "{state}");
+        for aid in ["wnd-main", "btn-increment", "btn-clicktarget", "txt-input"] {
+            assert!(
+                has_id(first.tree_text(), aid),
+                "first snapshot of a launching app is missing {aid}: {}",
+                first.tree_text()
+            );
+        }
+        assert!(first.tree_text().contains("slider_value=0"));
+        println!("first snapshot of a launching app returned the whole window after {waited:?}");
+        Observation::delivered(vec![OracleKind::AxState], Evidence::default())
+    });
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_query_projects_structured_elements() {
@@ -877,8 +1101,7 @@ fn harness_appkit_stale_element_token_fails_closed() {
                 serde_json::json!({
                     "pid": pid as i64,
                     "window_id": wid,
-                    "snapshot_id": first.snapshot_id(),
-                    "element_index": index
+                    "element_token": first.element_token(index)
                 }),
             );
             assert!(
@@ -992,6 +1215,74 @@ fn harness_appkit_invoke_menu_live_path() {
     );
 }
 
+/// A path that fails after opening a menu closes it again: the next command
+/// through the same menu, with no other activation in between, still runs.
+#[test]
+#[ignore]
+fn harness_appkit_invoke_menu_failed_path_leaves_no_menu_open() {
+    run_case(
+        native_foreground_case(
+            "appkit",
+            "invoke_menu_failed_path",
+            Targeting::Ax,
+            DriverRoute::MacosAxAction,
+        ),
+        |pid, wid, driver| {
+            let refused = driver.call(
+                "invoke_menu",
+                serde_json::json!({
+                    "pid": pid,
+                    "window_id": wid,
+                    "path": ["Window", "Arrange", "Missing"]
+                }),
+            );
+            assert!(refused.is_error(), "missing menu path was accepted");
+            assert_eq!(
+                refused.structured()["refusal"]["code"],
+                "menu_path_unavailable",
+                "{}",
+                refused.raw
+            );
+
+            let invoked = driver.call(
+                "invoke_menu",
+                serde_json::json!({
+                    "pid": pid,
+                    "window_id": wid,
+                    "path": ["Window", "Arrange", "Left"]
+                }),
+            );
+            assert!(
+                !invoked.is_error(),
+                "invoke_menu failed: {}",
+                invoked.text()
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(3);
+            while !snapshot_elements(driver, pid, wid)
+                .tree_text()
+                .contains("menu_action=window_arrange_left")
+            {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "menu command after a failed path did not reach fixture; refusal: {}; command: {}",
+                    refused.raw,
+                    invoked.raw
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(
+                refused.structured()["refusal"]["message"]
+                    .as_str()
+                    .is_some_and(|message| message.contains("path segment 2 was not found")
+                        && message.contains("No menu window this call opened is still on screen")),
+                "{}",
+                refused.raw
+            );
+            Observation::delivered(vec![OracleKind::FixtureState], Evidence::default())
+        },
+    );
+}
+
 /// text_input: type_text into the NSTextField, verify the mirror label
 /// shows the typed string. Exercises the AX type_text path
 /// (AXSetAttribute on AXValue, or CGEvent fallback).
@@ -1017,8 +1308,7 @@ fn harness_appkit_text_input() {
                 serde_json::json!({
                     "pid": pid as i64,
                     "window_id": wid,
-                    "element_index": idx,
-                    "snapshot_id": snap_pre.snapshot_id(),
+                    "element_token": snap_pre.element_token(idx),
                     "value": "hello-cua"
                 }),
             );
@@ -1323,6 +1613,58 @@ fn assert_honest_return_effect(result: &ToolResponse) {
     }
 }
 
+/// The fixture's accelerator fires only when control and shift are set on the
+/// `k` keyDown itself, so a foreground chord that loses them leaves it at 0.
+#[test]
+#[ignore]
+fn harness_appkit_foreground_press_key_chord_carries_its_modifiers() {
+    run_case(
+        native_foreground_case(
+            "appkit",
+            "press_key_chord",
+            Targeting::Ax,
+            DriverRoute::MacosCgEventHid,
+        ),
+        |pid, wid, driver| {
+            let before = snapshot_elements(driver, pid, wid);
+            assert!(
+                before.tree_text().contains("accel_fired=0"),
+                "fixture did not start with an unfired accelerator:\n{}",
+                before.tree_text()
+            );
+            let chord = driver.call(
+                "press_key",
+                serde_json::json!({
+                    "pid": pid as i64,
+                    "window_id": wid,
+                    "key": "k",
+                    "modifiers": ["ctrl", "shift"],
+                    "delivery_mode": "foreground"
+                }),
+            );
+            assert!(
+                !chord.is_error(),
+                "foreground press_key chord failed: {}",
+                chord.text()
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(2);
+            loop {
+                let after = snapshot_elements(driver, pid, wid);
+                if after.tree_text().contains("accel_fired=1") {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "ctrl+shift+k arrived without its modifiers:\n{}",
+                    after.tree_text()
+                );
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            Observation::delivered_with_fixture_state(Vec::new())
+        },
+    );
+}
+
 #[test]
 #[ignore]
 fn harness_appkit_px_background_press_key_reports_honest_delivery_truth() {
@@ -1562,8 +1904,7 @@ fn harness_appkit_type_text_background() {
             let resp = driver.call(
                 "type_text",
                 serde_json::json!({
-                    "pid": pid as i64, "window_id": wid, "element_index": idx,
-                    "snapshot_id": snap_pre.snapshot_id(),
+                    "pid": pid as i64, "window_id": wid, "element_token": snap_pre.element_token(idx),
                     "text": "kbd-cua", "delivery_mode": "background"
                 }),
             );
@@ -1623,13 +1964,12 @@ fn harness_appkit_type_text_does_not_replay_an_unreadable_ax_write() {
                 focused.text()
             );
             let pre = snapshot_elements(driver, pid, wid);
-            let index = element_index_by_id(pre.tree_text(), "txt-input").unwrap();
             let text = "one-insertion-cua";
             let response = driver.call(
                 "type_text",
                 serde_json::json!({
                     "pid": pid as i64, "window_id": wid,
-                    "element_index": index, "snapshot_id": pre.snapshot_id(),
+                    "element_token": element_token_by_id(&pre, "txt-input"),
                     "text": text, "delivery_mode": "background"
                 }),
             );
@@ -1695,8 +2035,7 @@ fn harness_appkit_scroll_foreground() {
                 serde_json::json!({
                     "pid": pid as i64,
                     "window_id": wid,
-                    "element_index": index,
-                    "snapshot_id": pre.snapshot_id(),
+                    "element_token": pre.element_token(index),
                     "direction": "down",
                     "amount": 5,
                     "delivery_mode": "foreground"
@@ -1735,8 +2074,7 @@ fn harness_appkit_scroll_background() {
             serde_json::json!({
                 "pid": pid as i64,
                 "window_id": wid,
-                "element_index": index,
-                "snapshot_id": pre.snapshot_id(),
+                "element_token": pre.element_token(index),
                 "direction": "down",
                 "amount": 5,
                 "delivery_mode": "background"
@@ -1878,8 +2216,7 @@ fn harness_appkit_counter() {
                 serde_json::json!({
                     "pid": pid as i64,
                     "window_id": wid,
-                    "element_index": idx,
-                    "snapshot_id": snap_pre.snapshot_id(),
+                    "element_token": snap_pre.element_token(idx),
                     "action": "press",
                     "delivery_mode": "background"
                 }),
@@ -1902,6 +2239,99 @@ fn harness_appkit_counter() {
             );
         },
     );
+}
+
+/// AppKit answers an accessibility press whose handler raises with an AX
+/// error, as Finder's toolbar view switcher does after switching (#3835). A
+/// checkbox that toggled before raising is reported as performed and
+/// confirmed; one that changed nothing keeps the error.
+#[test]
+#[ignore]
+fn harness_appkit_erroring_toggle_press_counts_only_when_its_value_moved() {
+    let case = native_background_case(
+        "appkit",
+        "toggle_press_error",
+        Targeting::Ax,
+        DriverRoute::MacosAxAction,
+    );
+    let cell_id = case.cell_id.clone();
+    execute_case(case, |evidence| {
+        let mut driver = McpDriver::spawn_macos_daemon_proxy_named(&cell_id)
+            .expect("start installed macOS daemon proxy");
+        *evidence = recording_evidence(driver.recording_dir());
+        let harness = Harness::launch_with_erroring_toggles();
+        let pid = harness.pid;
+        let (wid, _) = driver
+            .find_window(pid as i64, "CuaTestHarness AppKit")
+            .expect("AppKit main window not found");
+
+        let (_, passed) = run_with_background_oracles(
+            &mut driver,
+            TargetWindow {
+                pid,
+                native_id: wid,
+            },
+            |driver| {
+                let press = |driver: &mut McpDriver, identifier: &str| {
+                    let snapshot = snapshot_elements(driver, pid, wid);
+                    driver.call(
+                        "click",
+                        serde_json::json!({
+                            "pid": pid as i64,
+                            "window_id": wid,
+                            "element_token": element_token_by_id(&snapshot, identifier),
+                            "action": "press",
+                            "delivery_mode": "background"
+                        }),
+                    )
+                };
+                let state = |driver: &mut McpDriver| {
+                    snapshot_elements(driver, pid, wid).tree_text().to_owned()
+                };
+                assert!(
+                    state(driver).contains("acts_then_errors=false errors_only=false"),
+                    "erroring toggles did not start off"
+                );
+
+                let acted = press(driver, "chk-acts-then-errors");
+                assert!(
+                    !acted.is_error(),
+                    "a press whose value moved was reported as failed: {}",
+                    acted.raw
+                );
+                assert_eq!(acted.action_effect(), Some("confirmed"), "{}", acted.raw);
+                assert!(
+                    acted.text().contains("although the app returned AX error"),
+                    "result does not name the AX error: {}",
+                    acted.raw
+                );
+
+                let refused = press(driver, "chk-errors-only");
+                assert!(
+                    refused.is_error(),
+                    "a press that changed nothing was reported as performed: {}",
+                    refused.raw
+                );
+                assert!(
+                    refused
+                        .text()
+                        .contains("AXUIElementPerformAction(AXPress) returned"),
+                    "{}",
+                    refused.raw
+                );
+
+                std::thread::sleep(Duration::from_millis(200));
+                let after = state(driver);
+                assert!(
+                    after.contains("acts_then_errors=true errors_only=false"),
+                    "fixture state after the presses:\n{after}"
+                );
+            },
+        )
+        .unwrap_or_else(|error| panic!("background desktop contract failed: {error}"));
+
+        Observation::delivered_with_fixture_state(passed)
+    });
 }
 
 /// Resolve the native AppKit button from a screenshot-space PX target, then
@@ -3917,14 +4347,12 @@ fn harness_appkit_type_text_waits_for_a_lagging_value_readback() {
                 focused.text()
             );
             let snap_pre = snapshot_elements(driver, pid, wid);
-            let idx = element_index_by_id(snap_pre.tree_text(), "txt-input")
-                .expect("txt-input element_index not found");
             let text = "lagging-readback-cua";
             let resp = driver.call(
                 "type_text",
                 serde_json::json!({
-                    "pid": pid as i64, "window_id": wid, "element_index": idx,
-                    "snapshot_id": snap_pre.snapshot_id(),
+                    "pid": pid as i64, "window_id": wid,
+                    "element_token": element_token_by_id(&snap_pre, "txt-input"),
                     "text": text, "delivery_mode": "background"
                 }),
             );

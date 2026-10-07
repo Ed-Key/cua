@@ -53,7 +53,8 @@ fn isolated_driver_host(
             })
             .collect(),
         inherit_stderr: true,
-        no_overlay: false,
+        // No overlay window on the developer's display.
+        no_overlay: true,
     })
     .expect("construct host");
     (host, state)
@@ -190,6 +191,7 @@ async fn embedded_host_serves_sdk_and_mcp_with_one_contract() {
             session: Some("embedded-sdk-window".into()),
             capture_scope: Some(CaptureScope::Window),
             cursor_theme: None,
+            cursor_motion: None,
         })
         .await
         .expect("start SDK-owned session");

@@ -383,7 +383,7 @@ fn workflow_steps() -> (&'static str, &'static str) {
     let act_step = if cfg!(target_os = "macos") {
         "Apps: act and read in one `act_and_read` (`steps`). Chrome pages: `get_browser_state(app)`, then `browser_steps`."
     } else {
-        "Act with the fresh index. Chrome pages: `get_browser_state(pid, window_id)`, then `browser_steps`."
+        "Act with a fresh `element_token`. Chrome pages: `get_browser_state(pid, window_id)`, then `browser_steps`."
     };
     (read_step, act_step)
 }
@@ -432,7 +432,7 @@ For non-GUI outcomes, prefer a client-provided app API/SDK, headless/background 
 
 On continuation/recent-work, when available, call `history_status`; if ready, make one bounded initial `history_query` before broad discovery; otherwise continue.
 
-For app/window outcomes, use the narrowest semantic Cua route first: `set_window_frame` plus `list_windows` readback for geometry, typed browser tools for supported page content, clipboard tools for clipboard state. Then climb: background `element_index` ({tree_kind}), background pixels, foreground delivery, desktop fallback. Never advance on transport success alone.
+For app/window outcomes, use the narrowest semantic Cua route first: `set_window_frame` plus `list_windows` readback for geometry, typed browser tools for supported page content, clipboard tools for clipboard state. Then climb: background `element_token` ({tree_kind}), background pixels, foreground delivery, desktop fallback. Never advance on transport success alone.
 
 0. `start_session` is optional. For multi-call work, prefer a short `session` label and repeat it on every call that accepts it. Unnamed calls use the transport's implicit session. Idle names resume; `start_session` revives others; `end_session` cleans up.
 1. {read_step}
@@ -552,11 +552,17 @@ mod agent_instruction_tests {
         assert!(instructions.contains("`set_window_frame` plus `list_windows` readback"));
         assert!(instructions.contains("typed browser tools for supported page content"));
         assert!(instructions.contains("has no shell"));
+        // The workflow is front-loaded: read, act by token, then verify.
+        let (read_step, act_step) = super::workflow_steps();
+        let read = instructions.find(read_step).expect("read step");
+        let act = instructions.find(act_step).expect("act step");
+        let verify = instructions.find("3. `verify_state(").expect("verify step");
         assert!(
-            instructions.find("client-provided app API/SDK")
-                < instructions.find("background `element_index`"),
-            "semantic/headless operations must precede native UI dispatch"
+            read < act && act < verify,
+            "read, act, verify must come in order"
         );
+        assert!(instructions.contains("`element_token`"));
+        assert!(!instructions.contains("element_index"));
         assert_within_budget(&instructions);
     }
 

@@ -31,6 +31,7 @@ pub const kAXErrorFailure: AXError = -25200;
 pub const kAXErrorInvalidUIElement: AXError = -25202;
 pub const kAXErrorCannotComplete: AXError = -25204;
 pub const kAXErrorAttributeUnsupported: AXError = -25205;
+pub const kAXErrorActionUnsupported: AXError = -25206;
 pub const kAXErrorNotImplemented: AXError = -25208;
 pub const kAXErrorNoValue: AXError = -25212;
 pub const kAXErrorAPIDisabled: AXError = -25211;
@@ -95,7 +96,7 @@ extern "C" {
     ) -> bool;
 
     /// Private SPI: maps an AX window element to its CGWindowID.
-    /// Stable since macOS 10.9; used by yabai, Hammerspoon, Accessibility Inspector.
+    /// Stable since macOS 10.9.
     pub fn _AXUIElementGetWindow(element: AXUIElementRef, window_id: *mut u32) -> AXError;
 
     /// Private SPI: materializes an AX element from its 20-byte remote token
@@ -332,6 +333,12 @@ pub(crate) unsafe fn coerce_binary_value(value: CFTypeRef) -> Option<bool> {
     None
 }
 
+/// Read a boolean-valued AX attribute (CFBoolean, or a 0/1 CFNumber).
+///
+/// # Safety
+///
+/// `element` must be a valid, retained `AXUIElementRef` for the duration of
+/// the call.
 pub unsafe fn copy_binary_attr(element: AXUIElementRef, attr_name: &str) -> Option<bool> {
     let attr = CFStr::new(attr_name);
     let mut value: CFTypeRef = std::ptr::null();
@@ -607,36 +614,17 @@ pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
     Some(value as AXUIElementRef)
 }
 
-/// Return the CGWindowID of the application's focused AX window.
-///
-/// This is a narrow read-only proof used before global keyboard delivery: an
-/// already focused exact window must not be re-activated, because doing so can
-/// make a focus-proxy renderer drop its current key target.
 /// The window an AX surface belongs to for reads, actions and focus checks.
 /// An `AXSheet` (an Open panel, a save prompt) has its own WindowServer id,
 /// but it lives inside its parent window's accessibility tree and is read
-/// and addressed through that window, so it folds into the parent's id.
+/// and addressed through that window, so it folds into the parent's id
+/// (see [`super::exact_target::owning_window_id`]).
 ///
 /// # Safety
 ///
 /// `element` must be a valid `AXUIElementRef` for the duration of the call.
 pub unsafe fn surface_window_id(element: AXUIElementRef) -> Option<u32> {
-    surface_window_id_within(element, 4)
-}
-
-/// A sheet can sit on another sheet (Go to Folder on an Open panel), so fold
-/// upward until a real window, a few levels at most.
-unsafe fn surface_window_id_within(element: AXUIElementRef, levels: u8) -> Option<u32> {
-    if levels > 0 && copy_string_attr(element, "AXRole").as_deref() == Some("AXSheet") {
-        if let Some(parent) = copy_element_attr(element, "AXParent") {
-            let parent_id = surface_window_id_within(parent, levels - 1);
-            CFRelease(parent as CFTypeRef);
-            if parent_id.is_some() {
-                return parent_id;
-            }
-        }
-    }
-    ax_get_window_id(element)
+    super::exact_target::owning_window_id(element)
 }
 
 /// Whether `window_id` is `target`, or a WindowServer child window of it.
@@ -847,6 +835,11 @@ pub fn attached_sheet_of_window(pid: i32, window_id: u32) -> Option<u32> {
     }
 }
 
+/// Return the CGWindowID of the application's focused AX window.
+///
+/// This is a narrow read-only proof used before global keyboard delivery: an
+/// already focused exact window must not be re-activated, because doing so can
+/// make a focus-proxy renderer drop its current key target.
 pub fn focused_window_id_of_pid(pid: i32) -> Option<u32> {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
@@ -1333,6 +1326,51 @@ unsafe fn checked_element_array(
         .collect())
 }
 
+/// CGWindowIDs of `pid`'s `AXWindows`, or `None` when that list cannot be
+/// read: the process is not trusted for Accessibility, the app does not
+/// answer within a short timeout, or AX reports an error. `None` means
+/// "unknown", never "no windows", so callers must not treat it as proof that a
+/// window lacks an AX counterpart.
+pub fn ax_window_ids_of_pid(pid: i32) -> Option<std::collections::HashSet<u32>> {
+    unsafe {
+        if !AXIsProcessTrusted() {
+            return None;
+        }
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, AX_WINDOW_IDS_TIMEOUT_SECONDS);
+        let attr = CFStr::new("AXWindows");
+        let mut value: CFTypeRef = std::ptr::null();
+        let err = AXUIElementCopyAttributeValue(app, attr.as_concrete_TypeRef(), &mut value);
+        CFRelease(app as CFTypeRef);
+        if err != kAXErrorSuccess || value.is_null() {
+            return None;
+        }
+        if core_foundation::base::CFGetTypeID(value) != CFArray::<CFTypeRef>::type_id() {
+            CFRelease(value);
+            return None;
+        }
+        let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
+        let ax_type_id = AXUIElementGetTypeID();
+        Some(
+            (0..arr.len())
+                .filter_map(|i| {
+                    let item = *arr.get(i)?;
+                    (core_foundation::base::CFGetTypeID(item) == ax_type_id)
+                        .then(|| ax_get_window_id(item as AXUIElementRef))
+                        .flatten()
+                })
+                .collect(),
+        )
+    }
+}
+
+/// AX messaging timeout for [`ax_window_ids_of_pid`], in seconds. Window
+/// enumeration calls it once per app, so a hung app must not stall it.
+const AX_WINDOW_IDS_TIMEOUT_SECONDS: f32 = 0.25;
+
 /// Highest AX element id probed when looking for an off-Space window.
 /// Window elements are allocated early in an app's lifetime (Calculator's
 /// main window is id 42); alt-tab-macos probes the same order of magnitude.
@@ -1393,15 +1431,30 @@ pub unsafe fn copy_ax_window_by_remote_token(pid: i32, window_id: u32) -> Option
 }
 
 /// Whether to run the remote-token probe for a window `AXWindows` omitted.
-/// Only windows WindowServer reports on another Space qualify; a current-Space
-/// or unknown window that AX cannot map fails fast instead of paying the
-/// probe's deadline on every call (issue #4083). `on_current_space` is only
-/// queried for unlisted windows, so listed windows skip the WindowServer read.
+///
+/// Windows WindowServer reports on another Space qualify. So does a window it
+/// places on the current Space but reports off screen: that combination is a
+/// stale or mid-transition Space view (issue #4437), in which AX drops the
+/// window from `AXWindows` exactly as it does for an off-Space one. An
+/// on-screen current-Space or unknown window that AX cannot map fails fast
+/// instead of paying the probe's deadline on every call (issue #4083). The
+/// WindowServer view is only queried for unlisted windows, so listed windows
+/// skip that read.
 fn should_probe_off_space_window(
     listed_in_ax_windows: bool,
-    on_current_space: impl FnOnce() -> Option<bool>,
+    space_view: impl FnOnce() -> Option<crate::windows::WindowSpaceView>,
 ) -> bool {
-    !listed_in_ax_windows && on_current_space() == Some(false)
+    if listed_in_ax_windows {
+        return false;
+    }
+    match space_view() {
+        Some(view) => match view.on_current_space {
+            Some(false) => true,
+            Some(true) => !view.is_on_screen,
+            None => false,
+        },
+        None => false,
+    }
 }
 
 /// `AXWindows` of `pid`'s application element, plus the requested window when
@@ -1422,7 +1475,7 @@ pub unsafe fn copy_ax_windows_including(
         .iter()
         .any(|&window| ax_get_window_id(window) == Some(window_id));
     if should_probe_off_space_window(listed, || {
-        crate::windows::window_on_current_space_by_id(window_id)
+        crate::windows::window_space_view_by_id(window_id)
     }) {
         windows.extend(copy_ax_window_by_remote_token(pid, window_id));
     }
@@ -1462,6 +1515,7 @@ mod tests {
     }
 
     use super::*;
+    use crate::windows::WindowSpaceView;
     use core_foundation::{boolean::CFBoolean, number::CFNumber};
 
     #[test]
@@ -1473,14 +1527,42 @@ mod tests {
         assert_eq!(&token[12..20], &42u64.to_ne_bytes());
     }
 
+    fn space_view(on_current_space: Option<bool>, is_on_screen: bool) -> WindowSpaceView {
+        WindowSpaceView {
+            on_current_space,
+            is_on_screen,
+        }
+    }
+
     #[test]
     fn off_space_probe_runs_only_for_unlisted_off_space_windows() {
-        assert!(should_probe_off_space_window(false, || Some(false)));
-        assert!(!should_probe_off_space_window(false, || Some(true)));
+        assert!(should_probe_off_space_window(false, || Some(space_view(
+            Some(false),
+            false
+        ))));
+        assert!(!should_probe_off_space_window(false, || Some(space_view(
+            Some(true),
+            true
+        ))));
         assert!(!should_probe_off_space_window(false, || None));
+        assert!(!should_probe_off_space_window(false, || Some(space_view(
+            None, false
+        ))));
         assert!(!should_probe_off_space_window(true, || {
             panic!("listed windows must not query Space membership")
         }));
+    }
+
+    /// Issue #4437: WindowServer placed a visible window on the reported
+    /// current Space yet marked it off screen, and AX omitted it. That stale
+    /// Space view must re-resolve through the exact-id probe rather than
+    /// refuse the window as `ax_unresolved`.
+    #[test]
+    fn off_space_probe_runs_for_a_current_space_window_reported_off_screen() {
+        assert!(should_probe_off_space_window(false, || Some(space_view(
+            Some(true),
+            false
+        ))));
     }
 
     #[test]

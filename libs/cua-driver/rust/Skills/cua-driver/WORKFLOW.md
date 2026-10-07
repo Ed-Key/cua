@@ -37,9 +37,9 @@ These objects are argument fragments for tools advertising `target`, not standal
 
 ## Observe
 
-`get_window_state({pid, window_id})` requests the accessibility tree and a grounding screenshot by default. Check what actually came back: permission, backing-store, or surface-identity failures can leave usable tree data without an image. `screenshot_error` and `screenshot_frame_valid:false` are not empty-tree signals.
+`get_window_state({pid, window_id})` requests the accessibility tree and a grounding screenshot by default. Verify at checkpoints rather than after every action. Check what actually came back: permission, backing-store, or surface-identity failures can leave usable tree data without an image. `screenshot_error` and `screenshot_frame_valid:false` are not empty-tree signals.
 
-On macOS a row keeps its `element_index` across looks at the same window, and a vanished row's number is not reused while the session keeps that window's numbering. After that history is evicted, a full look restarts at 0; do not carry old indices across it. After the first look, a session's next `get_window_state` of that window can return only rows added, changed, or removed, when that change list is shorter than the full outline (`diff` in the response lists their numbers and is absent when the full outline came back; `tree_markdown` marks `+` added, `~` changed, `x` vanished text). Unchanged rows are omitted but still actionable: pair their `element_index` with the new response's `snapshot_id`. Pass `diff:false` when you need the full outline again, for example after a context reset. A `query`, a changed `max_elements`/`max_depth` or screenshot scale, or a look by another session always returns the full outline.
+On macOS a row keeps its number (`[N]`, its `element_index`) across looks at the same window, and a vanished row's number is not reused while the session keeps that window's numbering. After that history is evicted, a full look restarts at 0; do not carry old indices across it. After the first look, a session's next `get_window_state` of that window can return only rows added, changed, or removed, when that change list is shorter than the full outline (`diff` in the response lists their numbers and is absent when the full outline came back; `tree_markdown` marks `+` added, `~` changed, `x` vanished text). Unchanged rows are omitted but still actionable: use `element_token` `<snapshot_id>:N` with the new response's `snapshot_id`. Pass `diff:false` when you need the full outline again, for example after a context reset. A `query`, a changed `max_elements`/`max_depth`, `element_fields` or screenshot scale, or a look by another session always returns the full outline.
 
 Actions return without waiting to see whether a window opens. On macOS, the first `get_window_state` of that app after an action reports windows, sheets, or dialogs the app opened since, as `window_change` (once). When exactly one appeared and the window you acted on no longer holds focus, `window_change.rebind` gives its `pid` and `window_id`: read and act there next. System indicator windows (screen-sharing badges, tiny overlays) are left out and only counted in `ignored_windows`. Its `pid` can differ from the app's (file panels run in a separate process). With several candidates, pick from `new_windows` yourself.
 
@@ -53,7 +53,8 @@ On macOS a row can also carry:
 - `url`: a link's destination, kept apart from its label.
 
 - Use `query` to project matching rows plus their real ancestors without renumbering their indices. On macOS, add `query_context:true` to also keep everything under each match (a message heading with its body and links), without sibling branches. Display-only rows (message text) appear in `tree_markdown`; structured `elements` hold only actionable rows. A query locates; it does not prove absence.
-- Use `max_elements` / `max_depth` to bound the walk, and compare returned/total counts. Truncation does not prove absence.
+- Use `max_elements` (default 2000 on macOS) / `max_depth` to bound the walk, and compare returned/total counts. Truncation does not prove absence.
+- On macOS, upstream's shape arguments are aliases: `full_output:true` defaults to `element_fields:"full"` and `diff:false`; `tree_format` `markdown` is `element_fields:"none"` and `elements`/`both` is `"full"` (the tree text stays); `since:<snapshot_id>` asks for the diff above, and a `since` that is not this session's previous look returns the full outline; `verbose:true` repeats `background_input` on every read. Explicit `element_fields` and `diff` win. See [TOOLS.md](TOOLS.md#get_window_state).
 - Use `include_screenshot:false` only when tree-only observation is enough; it cannot ground a pixel action.
 - Where advertised, `include_accessibility_tree:false` requests capture without a tree walk. Check the installed schema first.
 - `capture_mode` is deprecated and ignored. Do not change configuration to repair a sparse tree.
@@ -70,7 +71,7 @@ The accessibility model may lag or disagree with rendered state: Electron text s
 
 ## Act once
 
-Use an `element_token` from the latest snapshot of the intended window: `<snapshot_id>:<index>` for a row of its tree. If using an integer, pair `element_index` with that response's `snapshot_id`. Never build a token from an older snapshot's id. A later snapshot can invalidate a pending action, including when another agent observes the same window.
+Use an `element_token` from the latest snapshot of the intended window: `<snapshot_id>:<index>` for a row of its tree. Never build a token from an older snapshot's id. A later snapshot can invalidate a pending action, including when another agent observes the same window.
 
 Example CLI window action, with IDs and token replaced from the preceding response:
 
@@ -95,6 +96,28 @@ Text insertion and value replacement are different intents. Setting a field does
 If a text action returns `unverifiable`, take a fresh snapshot before retrying. A deferred provider can publish after the call unwinds, so retrying immediately may duplicate text. If renderer focus is missing, the advertised `type_text` pixel form focuses then types in one call. For minimized windows, prefer an exposed semantic commit control; do not assume Return or a value write commits, and do not silently restore the window.
 
 Keep `delivery_mode:"background"` as the default for window input. The route may use accessibility hit-testing even when addressed by pixels: pixel coordinates do not promise physical pointer delivery. Read the returned `route` instead of inferring it from the tool name.
+
+## Batch known actions
+
+On macOS, for steps on one window in the background, use `act_and_read` with `steps` (above): it keeps each step's full result and its outcome lines and reads once at the end. `run_actions` is listed only in the full tool profile; use it for steps across windows, with foreground delivery, double or right clicks, drag, or more than 8 steps.
+
+When the next several actions are already decided and nothing between them needs a look, send them as one `run_actions` call instead of one call per action. The batch runs the same tools in order, stops at the first failure, and returns per-step status plus at most one bounded observation. Typical fit: fill several fields, then press a button, then read the result. Do not batch across a point where the answer decides the next step, or when a step reshuffles the window and invalidates element tokens used by later steps (use pixel targets after it, or split the batch there).
+
+```bash
+cua-driver run_actions '{"session":"run-1","steps":[
+  {"tool":"set_value","args":{"pid":844,"element_token":"s0000002a:14","value":"Ada"}},
+  {"tool":"set_value","args":{"pid":844,"element_token":"s0000002a:15","value":"Lovelace"}},
+  {"tool":"click","args":{"target":{"kind":"window","pid":844,"window_id":10725},"element_token":"s0000002a:21"}},
+  {"tool":"press_key","args":{"pid":844,"key":"return"}}
+ ],"delay_ms":100,"observe":{"max_elements":120}}'
+```
+
+- `tool` is one of `click`, `double_click`, `right_click`, `set_value`, `type_text`, `press_key`, `hotkey`, `scroll`, `drag`; `args` are exactly that tool's arguments. Run `describe run_actions` and `describe <tool>` for schemas. Up to 32 steps.
+- Every step is validated before the first runs, so a malformed step changes nothing. Each step then passes the same session, permission, capability-manifest and approval checks as a direct call; a batch grants nothing a single call lacks, and a refused step ends the batch like any other failure.
+- A batch has one session. Set `session` on `run_actions`; a step may repeat it but not name another.
+- `observe` is optional and reads once, after the last executed step (also after a failure): `get_window_state` arguments, `pid`/`window_id` taken from the last step that names both, `include_screenshot:false` and `max_elements:200` unless you override. Omit `observe` to read nothing.
+- Each step reports only the first line of its result (`steps[].message`), so outcome lines after it are not shown; read the window to see what happened.
+- Read `steps[].ok` and `failed_step`. Steps before a failure did run and are not rolled back; steps after it did not. Observe before repairing, as for a single `unverifiable` action.
 
 ## Pixel coordinates
 
@@ -130,7 +153,7 @@ cua-driver verify_state '{"pid":844,"window_id":10725,"expect":[{"element":{"sel
 
 To check a caret or selection on the focused native text control, use an element predicate with `text_selection` (`location`, `length`, optional exact `text`, UTF-16 units). A selection inside web content (including an Electron app's web views) stays `unknown`; native controls are checked.
 
-This example proves a matching trusted element exists, not that every application has a meaningful “Saved” indicator. Choose predicates that establish this task. Use fresh `get_window_state` for outcomes the predicate language cannot express, and fresh `get_desktop_state` for desktop proof. `verify_state` remains an exact-window tool; a previous desktop action does not disable it.
+This example proves a matching trusted element exists, not that every application has a meaningful “Saved” indicator. `label_contains` matches an element's accessible name, which for label-less text is its value. On macOS a selector also reaches display-only text (static text, read-only values) when no addressable control matches it. Text inside web content stays `unknown` with `untrusted_source`; read it from a fresh snapshot instead. Choose predicates that establish this task. Use fresh `get_window_state` for outcomes the predicate language cannot express, and fresh `get_desktop_state` for desktop proof. `verify_state` remains an exact-window tool; a previous desktop action does not disable it.
 
 ### Verified sequences on one window
 

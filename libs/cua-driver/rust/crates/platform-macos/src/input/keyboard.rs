@@ -14,6 +14,21 @@ use foreign_types::ForeignType;
 const SCREEN_SHARING_BUNDLE_ID: &str = "com.apple.ScreenSharing";
 const SHIFT_KEY_CODE: u16 = 56;
 
+/// Default key down→up gap and inter-key pacing.
+const DEFAULT_KEY_GAP: std::time::Duration = std::time::Duration::from_millis(8);
+
+/// Key down→up gap and inter-key pacing: `DEFAULT_KEY_GAP`, or the
+/// host's `CUA_DRIVER_KEY_GAP_MS` clamped by `cua_driver_core::key_pacing`.
+/// Read once: pacing is a launch-time knob, not a per-call one.
+fn key_gap() -> std::time::Duration {
+    static GAP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
+    *GAP.get_or_init(|| cua_driver_core::key_pacing::key_gap_from_env(DEFAULT_KEY_GAP))
+}
+
+fn key_gap_sleep() {
+    std::thread::sleep(key_gap());
+}
+
 fn is_screen_sharing_bundle_id(bundle_id: &str) -> bool {
     bundle_id == SCREEN_SHARING_BUNDLE_ID
 }
@@ -38,7 +53,7 @@ pub fn press_key(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> 
     let flags = modifier_flags(&modifiers);
 
     post_key(pid, key_code, true, flags)?;
-    std::thread::sleep(std::time::Duration::from_millis(8));
+    key_gap_sleep();
     post_key(pid, key_code, false, key_up_flags(flags))?;
     Ok(())
 }
@@ -71,20 +86,20 @@ pub fn type_text(pid: i32, text: &str) -> anyhow::Result<()> {
         // and the modifier leaks into the next character (Swift fix: event.flags = []).
         down.set_flags(CGEventFlags::CGEventFlagNull);
         post_keyboard_event(pid, &down);
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
 
         let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
         up.set_string(&ch_str);
         up.set_flags(CGEventFlags::CGEventFlagNull);
         post_keyboard_event(pid, &up);
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
     }
     Ok(())
 }
 
 /// Type a string character-by-character with an extra `inter_char_delay_ms`
-/// pause after each character (on top of the internal 8 ms down/up gap).
+/// pause after each character (on top of the internal down/up key gap).
 pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
@@ -96,7 +111,7 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
         down.set_string(&ch_str);
         down.set_flags(CGEventFlags::CGEventFlagNull);
         post_keyboard_event(pid, &down);
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
 
         let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
@@ -104,11 +119,11 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
         up.set_flags(CGEventFlags::CGEventFlagNull);
         post_keyboard_event(pid, &up);
 
-        // Additional inter-character delay on top of the 8 ms internal gap.
+        // Additional inter-character delay on top of the internal key gap.
         if inter_char_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms));
         } else {
-            std::thread::sleep(std::time::Duration::from_millis(8));
+            key_gap_sleep();
         }
     }
     Ok(())
@@ -117,6 +132,18 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
 /// Send a key combination (hotkey) to `pid`.
 pub fn hotkey(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
     press_key(pid, key, modifiers)
+}
+
+/// Press and release a single key to `pid` WITHOUT the auth-message envelope,
+/// so it goes through IOHIDPostEvent where an open NSMenu's tracking loop sees
+/// it (set_value sends Escape this way to a pop-up menu that ignored AXCancel).
+pub fn press_key_no_auth(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
+    let key_code = key_name_to_code(key)?;
+    let flags = modifier_flags(modifiers);
+    post_key_no_auth(pid, key_code, true, flags)?;
+    key_gap_sleep();
+    post_key_no_auth(pid, key_code, false, key_up_flags(flags))?;
+    Ok(())
 }
 
 /// Press and release one key on the global HID queue.
@@ -167,7 +194,7 @@ pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
             return Err(error);
         }
         pressed_modifiers.push((modifier_code, modifier_flag));
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
     }
 
     let result = (|| {
@@ -178,7 +205,7 @@ pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
             active_flags,
             CGEventTapLocation::HID,
         )?;
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
         post_global_key(
             &source,
             key_code,
@@ -236,7 +263,7 @@ pub(super) fn with_global_modifier_keys<T>(
             return Err(error);
         }
         pressed.push((key_code, flag));
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
     }
 
     let result = gesture(active_flags);
@@ -270,13 +297,15 @@ fn release_global_modifiers(
             event.set_flags(active_flags);
             event.post(tap);
         }
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
     }
 }
 
 fn modifier_key_code_and_flag(modifier: &str) -> Option<(u16, CGEventFlags)> {
     match modifier.to_lowercase().as_str() {
-        "cmd" | "command" => Some((55, CGEventFlags::CGEventFlagCommand)),
+        "cmd" | "command" | "super" | "meta" | "win" => {
+            Some((55, CGEventFlags::CGEventFlagCommand))
+        }
         "shift" => Some((56, CGEventFlags::CGEventFlagShift)),
         "option" | "alt" => Some((58, CGEventFlags::CGEventFlagAlternate)),
         "ctrl" | "control" => Some((59, CGEventFlags::CGEventFlagControl)),
@@ -316,7 +345,7 @@ pub(super) fn with_pid_modifier_keys<T>(
             return Err(error);
         }
         pressed.push((key_code, flag));
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
     }
 
     let result = gesture();
@@ -332,7 +361,7 @@ fn release_pid_modifiers(
     for &(key_code, flag) in pressed.iter().rev() {
         active_flags.remove(flag);
         let _ = post_key(pid, key_code, false, active_flags);
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
     }
 }
 
@@ -351,13 +380,13 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
         down.set_string(&value);
         down.set_flags(CGEventFlags::CGEventFlagNull);
         down.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
         let up = CGEvent::new_keyboard_event(source.clone(), 0, false)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard up failed"))?;
         up.set_string(&value);
         up.set_flags(CGEventFlags::CGEventFlagNull);
         up.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms.max(8)));
+        std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()));
     }
     Ok(())
 }
@@ -386,10 +415,11 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
             .collect::<anyhow::Result<Vec<_>>>()?;
         for cg_event in native_events {
             cg_event.post(CGEventTapLocation::HID);
-            std::thread::sleep(std::time::Duration::from_millis(8));
+            key_gap_sleep();
         }
-        if inter_char_delay_ms > 8 {
-            std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms - 8));
+        let extra = std::time::Duration::from_millis(inter_char_delay_ms).saturating_sub(key_gap());
+        if !extra.is_zero() {
+            std::thread::sleep(extra);
         }
     }
     Ok(())
@@ -432,7 +462,7 @@ pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()
         .collect::<anyhow::Result<Vec<_>>>()?;
     for event in events {
         event.post(CGEventTapLocation::HID);
-        std::thread::sleep(std::time::Duration::from_millis(8));
+        key_gap_sleep();
     }
     Ok(())
 }
@@ -693,11 +723,33 @@ fn post_key(pid: i32, key_code: u16, key_down: bool, flags: CGEventFlags) -> any
     Ok(())
 }
 
+/// [`post_key`] without the auth-message envelope: SLEventPostToPid then
+/// takes the IOHIDPostEvent path, which NSMenu tracking observes.
+fn post_key_no_auth(
+    pid: i32,
+    key_code: u16,
+    key_down: bool,
+    flags: CGEventFlags,
+) -> anyhow::Result<()> {
+    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+        .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
+    let event = CGEvent::new_keyboard_event(source, key_code, key_down)
+        .map_err(|_| anyhow::anyhow!("CGEvent::new_keyboard_event failed"))?;
+    event.set_flags(flags);
+    let event_ptr = event.as_ptr() as *mut std::ffi::c_void;
+    if !crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false) {
+        event.post_to_pid(pid as libc::pid_t);
+    }
+    Ok(())
+}
+
 fn modifier_flags(modifiers: &[&str]) -> CGEventFlags {
     let mut flags = CGEventFlags::CGEventFlagNull;
     for m in modifiers {
         match m.to_lowercase().as_str() {
-            "cmd" | "command" => flags |= CGEventFlags::CGEventFlagCommand,
+            "cmd" | "command" | "super" | "meta" | "win" => {
+                flags |= CGEventFlags::CGEventFlagCommand
+            }
             "shift" => flags |= CGEventFlags::CGEventFlagShift,
             "option" | "alt" => flags |= CGEventFlags::CGEventFlagAlternate,
             "ctrl" | "control" => flags |= CGEventFlags::CGEventFlagControl,
@@ -715,7 +767,7 @@ pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
         "space" => 49,
         "delete" | "backspace" => 51,
         "escape" | "esc" => 53,
-        "command" | "cmd" => 55,
+        "command" | "cmd" | "super" | "meta" | "win" => 55,
         "shift" => 56,
         "capslock" => 57,
         "option" | "alt" => 58,
@@ -789,9 +841,36 @@ pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
         "m" => 46,
         "." => 47,
         "`" => 50,
-        _ => anyhow::bail!("Unknown key name: {key}"),
+        _ => anyhow::bail!("{}", unknown_key_message(key)),
     };
     Ok(code)
+}
+
+/// The error for a name `key_name_to_code` does not know, saying what to send
+/// instead: a combination such as "shift+Right" is a key plus modifiers, and
+/// a printable symbol is text.
+fn unknown_key_message(key: &str) -> String {
+    if key.chars().count() > 1 && key.contains('+') && !key.ends_with('+') {
+        let parts: Vec<&str> = key.split('+').collect();
+        let (modifiers, name) = parts.split_at(parts.len() - 1);
+        return format!(
+            "Unknown key name: {key}. A key name is one key, not a combination. Send the last \
+             part as the key and the rest as modifiers, e.g. key:\"{}\" with modifiers:{:?}, \
+             or use the hotkey tool with keys:{:?}.",
+            name[0],
+            modifiers
+                .iter()
+                .map(|m| m.to_lowercase())
+                .collect::<Vec<_>>(),
+            parts
+        );
+    }
+    format!(
+        "Unknown key name: {key}. Use a key name such as return, tab, escape, space, delete, \
+         left, right, up, down, pageup, pagedown, home, end, f1..f12, a single letter, digit \
+         or punctuation character, or a punctuation name such as period, comma or at; to \
+         enter text use type_text."
+    )
 }
 
 #[cfg(test)]
@@ -863,6 +942,36 @@ mod tests {
         );
         let no_command = modifier_flags(&["ctrl", "shift"]);
         assert_eq!(key_up_flags(no_command), no_command);
+    }
+
+    #[test]
+    fn unknown_key_errors_say_what_to_send_instead() {
+        let combo = key_name_to_code("shift+Right").unwrap_err().to_string();
+        assert!(combo.contains("modifiers"), "{combo}");
+        assert!(combo.contains("hotkey"), "{combo}");
+        assert!(combo.contains("key:\"Right\""), "{combo}");
+        let symbol = key_name_to_code("asterisk").unwrap_err().to_string();
+        assert!(symbol.contains("type_text"), "{symbol}");
+        assert!(key_name_to_code("shift").is_ok());
+    }
+
+    /// cua-spacesd names the Meta key `super` (the cross-platform name), and
+    /// the macOS driver dropped it: `cua do hotkey cmd+w` pressed a bare `w`.
+    #[test]
+    fn super_meta_and_win_are_command() {
+        for name in ["cmd", "command", "super", "meta", "win", "Super"] {
+            assert_eq!(
+                modifier_key_code_and_flag(name),
+                Some((55, CGEventFlags::CGEventFlagCommand)),
+                "{name}"
+            );
+            assert_eq!(
+                modifier_flags(&[name]),
+                CGEventFlags::CGEventFlagCommand,
+                "{name}"
+            );
+            assert_eq!(key_name_to_code(name).unwrap(), 55, "{name}");
+        }
     }
 
     #[test]
@@ -1007,6 +1116,13 @@ mod tests {
             bare_chord_transitions(57, None, &[]),
             vec![(57, true, None), (57, false, None)]
         );
+    }
+
+    /// The default source derives a modifier's own flag from its keycode but
+    /// has nothing to derive from for the base key, which is what turned
+    /// `cmd+a` into a literal `a` on the foreground rung.
+    #[test]
+    fn bare_base_key_carries_the_chord_flags_the_default_source_cannot_derive() {
         let command_down = create_bare_keyboard_event(55, true).unwrap();
         assert_eq!(
             command_down.get_type() as u32,
@@ -1017,6 +1133,25 @@ mod tests {
                 .get_flags()
                 .contains(CGEventFlags::CGEventFlagCommand),
             "bare Command down must derive the active Command flag"
+        );
+
+        let bare_base = create_bare_keyboard_event(0, true).unwrap();
+        assert!(
+            !bare_base
+                .get_flags()
+                .contains(CGEventFlags::CGEventFlagCommand),
+            "the default source cannot derive Command for a non-modifier keycode"
+        );
+
+        let (code, down, flags) =
+            bare_chord_transitions(0, None, &[(55, CGEventFlags::CGEventFlagCommand)])[1];
+        let carried = create_bare_keyboard_event(code, down).unwrap();
+        carried.set_flags(flags.expect("a non-Caps-Lock base key carries explicit flags"));
+        assert!(
+            carried
+                .get_flags()
+                .contains(CGEventFlags::CGEventFlagCommand),
+            "the chord's base key must carry Command"
         );
     }
 

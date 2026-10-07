@@ -73,11 +73,11 @@ fn def() -> &'static ToolDef {
             "required": ["x", "y"],
             "properties": {
                 "session": cua_driver_core::tool_schema::session_schema(),
-                "x": { "type": "number" },
-                "y": { "type": "number" },
+                "x": { "type": "number", "description": "Destination X: with pid and window_id, that window's screenshot pixels; otherwise screen points (window scope) or get_desktop_state pixels (desktop scope)." },
+                "y": { "type": "number", "description": "Destination Y, in the same space as x." },
                 "pid": { "type": "integer", "description": "With window_id, x,y are that window's screenshot pixels." },
                 "window_id": { "type": "integer", "description": "Window whose screenshot x,y refer to." },
-                "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window" },
+                "scope": { "type": "string", "enum": ["window", "desktop"], "default": "window", "description": "\"window\" moves only the agent cursor; \"desktop\" moves the real pointer." },
                 "cursor_id": { "type": "string", "default": "default", "description": "Cursor instance to move." }
             },
             "additionalProperties": false

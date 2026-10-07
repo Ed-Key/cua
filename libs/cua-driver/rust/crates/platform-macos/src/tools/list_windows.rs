@@ -64,6 +64,7 @@ impl Tool for ListWindowsTool {
         if let Some(pid) = pid_filter {
             windows.retain(|w| w.pid == pid);
         }
+        crate::windows::retain_ax_reachable(&mut windows, current_space_id);
 
         let windows_json: Vec<Value> = windows.iter().map(window_record_json).collect();
         let omitted = (explicit.is_none() && on_screen_only).then(|| {
@@ -71,6 +72,7 @@ impl Tool for ListWindowsTool {
             if let Some(pid) = pid_filter {
                 all.retain(|w| w.pid == pid);
             }
+            crate::windows::retain_ax_reachable(&mut all, current_space_id);
             all.len().saturating_sub(windows_json.len())
         });
 

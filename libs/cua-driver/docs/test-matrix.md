@@ -102,23 +102,36 @@ cells is always an error.
 
 ## Harness E2E: Optional Perception Loop
 
-`perception_capture_loop_test.rs` runs the documented capture-bound loop
-against the shared web harness in Electron in the capture lane of the macOS,
-Windows, and Linux X11 runners:
+`perception_capture_loop_test.rs` runs the documented capture-bound loop in
+the capture lane of the macOS, Windows, and Linux X11 runners:
 
 | Cell | Coverage |
 | --- | --- |
 | `<os>-electron-parse-visual-regions-not-installed-not-applicable-not-applicable` | A retained window capture parses to the typed `not_installed` refusal when no extension is installed |
 | `<os>-electron-perception-capture-click-px-foreground` | `get_window_state` capture, `parse_visual_regions` on that capture, one foreground `click` with the same `capture_id` at the parsed region center, fixture-journal delivery oracle, `capture_not_found` refusal for the consumed capture, then a fresh capture and reparse |
+| `<os>-tk-perception-published-capture-click-px-foreground` | The published `cua-perception` extension, installed from its signed release catalog as `publisher-verified`, parses a capture of the visual-only Tk canvas. One foreground capture-bound `click` on the OCR region that reads "Cancel" selects that card in the fixture journal. The consumed capture is refused with `capture_not_found`, a fresh capture reparses, and an unused capture older than 60 seconds is refused with `capture_expired`. Neither refusal changes the fixture |
 
-The installed extension is a developer-only unsigned worker compiled from
+The Electron rows use a developer-only unsigned worker compiled from
 `tests/support/perception_swatch_worker.rs`. It speaks the real worker
 protocol inside Driver's containment, echoes the retained PNG digest, and finds
 the harness's solid `#drag-source` and `#drop-target` swatches in the captured
-pixels, so the row needs no published artifact or model. macOS runs a second
-instance of the installed app with an isolated extension home and socket.
-Wayland lanes record a coverage limitation instead of running the row. Model
-quality belongs to the `cua-perception` crate and its artifact-gated lanes.
+pixels, so those rows need no published artifact or model.
+
+The published-catalog row pins the `cua-perception-v0.2.1` catalog and archive
+SHA-256 for each target and downloads them (about 425 MB) unless
+`CUA_E2E_PERCEPTION_CACHE_DIR` already holds verified copies. The Driver also
+checks the catalog signature. The canvas fixture needs a Python with Tk:
+`python3` on macOS and Linux, and `py -3` or `python` on Windows.
+`CUA_E2E_TK_PYTHON` overrides the search. The hosted macOS capture lane adds
+the matching Homebrew `python-tk` formula, and the Linux capture lane installs
+`python3-tk` and `x11-utils`. The row fails rather than skips when Tk is
+missing.
+
+macOS runs a second instance of the installed app with an isolated extension
+home and socket, so the shared daemon never gains either extension. Wayland
+lanes record a coverage limitation instead of running these rows. Broader
+model quality belongs to the `cua-perception` crate and its artifact-gated
+lanes.
 
 ## Harness E2E: Model-Backed Perception Decision Loop
 
@@ -155,14 +168,22 @@ Windows native harnesses are repo-local applications built from source:
 
 | Harness | Source test | Coverage |
 | --- | --- | --- |
-| WPF | `harness_wpf_test.rs` | UIA controls, text, keys, pointer actions, scroll, drag, popups, menus, modal windows |
-| WinUI3 | `harness_winui3_test.rs` | XAML controls, text, checkbox/radio, slider, combo, popup |
+| WPF | `harness_wpf_test.rs` | UIA controls, text, keys, pointer actions, scroll, drag, popups, menus, modal windows; foreground single-line and multiline text integrity |
+| WinUI3 | `harness_winui3_test.rs` | XAML controls, text, checkbox/radio, slider, combo, popup; foreground single-line and multiline text integrity |
 | WebView2 | `harness_web_test.rs` | Window discovery, CDP page access, JavaScript, DOM click path |
 | Desktop target | `desktop_scope_windows_test.rs` | Per-call window/desktop modality, full-display capture, screen-absolute click/scroll, and strict rejection |
 | Desktop invariants | Testkit `DesktopObserver` plus typed launch/capture/cursor owners | Cross-cutting focus, z-order, minimized-launch, screenshot, cursor, and desktop checks |
 
-Native controls use AX/UIA state as their oracle. Pointer actions also use PX
-where the tool contract requires coordinates. Current `set_value` rows declare
+Native controls use AX/UIA state as their oracle. The foreground typing rows
+also compare each fixture's real `TextBox.Text` values from an isolated,
+atomically replaced state file, including the target and leakage sentinels.
+The single-line row covers CJK, digits, and emoji; the multiline sample covers
+LF, CR, CRLF, repeated empty lines, and leading/trailing breaks. The oracle
+normalizes line endings only and preserves all other characters and blank
+lines. Foreground delivery keeps the target in front until its thread has
+read every inserted event (a sentinel-key drain), so text after line breaks is
+not handed to the previously active window. Pointer actions also use PX where
+the tool contract requires coordinates. Current `set_value` rows declare
 background delivery and attach desktop-side-effect oracles.
 
 ## Harness E2E: macOS

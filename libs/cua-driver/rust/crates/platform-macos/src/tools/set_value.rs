@@ -2,11 +2,13 @@
 //!
 //! Two modes, determined by the element's AXRole:
 //!
-//! * **AXPopUpButton**: Find the option whose AXTitle or AXValue matches
-//!   `value` (case-insensitive) and AXPress it: directly when the popup lists
-//!   its options, else after opening its menu (closed again on any outcome),
-//!   then read the popup's shown value back.  Safari `<select>` elements that
-//!   expose no AX children use `osascript do JavaScript` instead.
+//! * **AXPopUpButton**: Find the option (a child, or an `AXMenuItem` under the
+//!   popup's `AXMenu`) whose AXTitle or AXValue matches `value`
+//!   (case-insensitive) and AXPress it.  AppKit and Chromium popups publish
+//!   their items only while the menu is open, so the menu is opened for the
+//!   selection and closed again.  Safari `<select>` elements are set through
+//!   `osascript do JavaScript` instead.  The pop-up's shown value is read
+//!   back to confirm the pick.
 //!
 //! * **Everything else**: Write `AXValue` directly (sliders, steppers, native
 //!   text fields that expose a settable AXValue).
@@ -21,8 +23,8 @@ use std::sync::Arc;
 
 use crate::apps;
 use crate::ax::bindings::{
-    copy_children, copy_number_attr, copy_string_attr, kAXErrorSuccess, perform_action,
-    set_number_attr, set_string_attr, AXUIElementRef,
+    copy_bool_attr, copy_children, copy_number_attr, copy_string_attr, copy_url_attr,
+    kAXErrorSuccess, perform_action, set_number_attr, set_string_attr, AXUIElementRef,
 };
 use crate::focus_guard;
 use crate::window_change_detector::WindowChangeDetector;
@@ -46,7 +48,7 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "set_value".into(),
         description:
-            "Set an element's value (element_token, or element_index + snapshot_id). A popup or \
+            "Set an element's value by element_token. A popup or \
              select gets the matching option picked (its menu is opened and closed again when \
              the options are not listed) and read back; other elements get AXValue written \
              (sliders, steppers, date pickers, settable text fields). Web pages ignore value \
@@ -60,11 +62,9 @@ fn def() -> &'static ToolDef {
                 "pid": { "type": "integer", "description": "Target process ID." },
                 "window_id": {
                     "type": "integer",
-                    "description": "Target window ID; required with element_index, carried by element_token."
+                    "description": "Target window ID; omit with element_token, which carries it."
                 },
-                "element_index": cua_driver_core::tool_schema::element_index_schema(),
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
-                "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
                 "value": {
                     "type": "string",
                     "description": "New value, coerced to the element type; for a popup, the option title or value (case-insensitive)."
@@ -87,7 +87,7 @@ impl Tool for SetValueTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
-        let pid = match args.require_i32("pid") {
+        let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -96,48 +96,23 @@ impl Tool for SetValueTool {
             Err(e) => return e,
         };
 
-        // Surface 6: element_token / element_index precedence. Neither
-        // is now schema-required so the resolver can centralize the
-        // "missing addressing" error message.
-        let element_token_arg = args.opt_str("element_token");
-        let window_id_arg = args.opt_u64("window_id");
-        let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
-        let resolved = match self.state.element_cache.resolve_element_args(
-            pid,
-            element_index_arg,
-            element_token_arg.as_deref(),
-            args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
-            "set_value",
-        ) {
-            Ok(r) => r,
-            Err(e) => return e,
-        };
-        let (element_index, window_id, element_guard) = match resolved {
-            cua_driver_core::element_token::ResolvedElement::None => {
-                return ToolResult::error(
-                    "set_value requires element_index (+ window_id) or element_token to \
-                     address the target element.",
-                )
-            }
-            cua_driver_core::element_token::ResolvedElement::Element {
-                window_id: Some(wid),
-                element_index: idx,
-                element,
-                ..
-            } => match u32::try_from(wid) {
-                Ok(wid) => (idx, wid, element),
-                Err(_) => return ToolResult::error("window_id is out of range for macOS."),
-            },
-            cua_driver_core::element_token::ResolvedElement::Element {
-                window_id: None, ..
-            } => {
-                return ToolResult::error(
-                    "set_value requires window_id when element_index is used \
-                 (omit only when supplying element_token, which carries it).",
-                )
-            }
-        };
+        let (element_index, window_id, element_guard) =
+            match self.state.snapshots.resolve(pid, &args) {
+                Ok(cua_driver_core::element_token::ResolvedElement::None) => {
+                    return ToolResult::error(
+                        "set_value requires element_token to address the target element.",
+                    )
+                }
+                Ok(cua_driver_core::element_token::ResolvedElement::Element {
+                    window_id,
+                    element_index,
+                    element,
+                }) => match u32::try_from(window_id) {
+                    Ok(window_id) => (element_index, window_id, element),
+                    Err(_) => return ToolResult::error("window_id is out of range for macOS."),
+                },
+                Err(refusal) => return refusal,
+            };
 
         let element_ptr = element_guard.as_ptr();
 
@@ -170,18 +145,49 @@ impl Tool for SetValueTool {
             Err(refusal_result) => return refusal_result,
         };
 
-        let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
-        let center_guard = element_guard.clone();
-        if let Ok(Some((screen_x, screen_y))) = tokio::task::spawn_blocking(move || unsafe {
-            crate::ax::bindings::element_screen_center(center_guard.as_ptr() as AXUIElementRef)
+        // A file's name as Finder lists it takes an AXValue write and reads it
+        // back, but the file is never renamed. Refuse before anything moves.
+        // Finder's Get Info Name field does the same.
+        let name_guard = element_guard.clone();
+        if let Ok(Some(reason)) = tokio::task::spawn_blocking(move || unsafe {
+            let element = name_guard.as_ptr() as AXUIElementRef;
+            if file_name_cell(element) {
+                Some(LIST_RENAME_ROUTE)
+            } else if get_info_name_field(pid, element) {
+                Some(GET_INFO_RENAME_ROUTE)
+            } else {
+                None
+            }
         })
         .await
+        {
+            return file_name_needs_rename(pid, window_id, reason);
+        }
+
+        let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
+        let center_guard = element_guard.clone();
+        if let Ok((Some((screen_x, screen_y)), target_rect)) =
+            tokio::task::spawn_blocking(move || unsafe {
+                let el = center_guard.as_ptr() as AXUIElementRef;
+                (
+                    crate::ax::bindings::element_screen_center(el),
+                    crate::ax::bindings::element_screen_rect(el),
+                )
+            })
+            .await
         {
             crate::cursor::overlay::send_command(
                 cursor_key.clone(),
                 cursor_overlay::OverlayCommand::PinAbove(window_id as u64),
             );
-            crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), screen_x, screen_y, Some(window_id as u64)).await;
+            crate::cursor::overlay::animate_cursor_to_target(
+                cursor_key.clone(),
+                screen_x,
+                screen_y,
+                Some(window_id as u64),
+                target_rect,
+            )
+            .await;
             self.state
                 .cursor_registry
                 .update_position(&cursor_key, screen_x, screen_y);
@@ -240,7 +246,6 @@ impl Tool for SetValueTool {
                     write_text_control(
                         &role,
                         || unsafe { crate::ax::bindings::attribute_settable(element, "AXValue") },
-                        || unsafe { file_name_cell(element) },
                         || unsafe { super::type_text::catalyst_text_control_of(element) },
                         || unsafe { search_like(element, &role) },
                         || {
@@ -275,7 +280,6 @@ impl Tool for SetValueTool {
 
         match result {
             Ok(Ok(SetValueAttempt::Refused)) => nonsettable_text_refusal(super::edit_commit::read_only_note(pid)),
-            Ok(Ok(SetValueAttempt::FileNameNeedsRename)) => file_name_needs_rename(pid, window_id),
             Ok(Ok(SetValueAttempt::CatalystNeedsTyping)) => catalyst_text_needs_typing(pid, window_id),
             Ok(Ok(SetValueAttempt::CatalystDidNotTake(now))) => catalyst_text_did_not_take(pid, window_id, now),
             Ok(Ok(SetValueAttempt::Applied(mut outcome, catalyst))) => {
@@ -310,8 +314,6 @@ impl Tool for SetValueTool {
 
 enum SetValueAttempt {
     Refused,
-    /// A file's name shown in a list: nothing was focused or written.
-    FileNameNeedsRename,
     /// A Mac Catalyst search-like text control: nothing was focused or written.
     CatalystNeedsTyping,
     /// A Mac Catalyst text control that did not hold the value written; what
@@ -333,14 +335,14 @@ fn is_text_control_role(role: &str) -> bool {
 
 /// The ordered route for one set_value on the retained element. Refusals come
 /// before any side effect: a read-only text control first (it keeps
-/// precedence), then a file's name shown in a list, then a Mac Catalyst
-/// search-like field. Only then is the field prepared (`prepare_focus`, not
+/// precedence), then a Mac Catalyst search-like field. (A file's name in a
+/// Finder list or Get Info is refused earlier, before the cursor moves.) Only
+/// then is the field prepared (`prepare_focus`, not
 /// for Catalyst fields) and the value written.
 #[allow(clippy::too_many_arguments)]
 fn write_text_control(
     role: &str,
     read_settable: impl FnOnce() -> Option<bool>,
-    file_name: impl FnOnce() -> bool,
     catalyst: impl FnOnce() -> super::type_text::CatalystText,
     search: impl FnOnce() -> bool,
     prepare_focus: impl FnOnce() -> anyhow::Result<()>,
@@ -349,9 +351,6 @@ fn write_text_control(
     use super::type_text::CatalystText;
     if text_value_not_settable(role, read_settable) {
         return Ok(SetValueAttempt::Refused);
-    }
-    if role == "AXTextField" && file_name() {
-        return Ok(SetValueAttempt::FileNameNeedsRename);
     }
     // Only text controls pay for the ancestry read.
     let catalyst = if is_text_control_role(role) { catalyst() } else { CatalystText::No };
@@ -368,16 +367,6 @@ fn write_text_control(
         Written::Outcome(outcome) => SetValueAttempt::Applied(outcome, catalyst),
         Written::DidNotTake(now) => SetValueAttempt::CatalystDidNotTake(now),
     })
-}
-
-/// A file's name as a list shows it (Finder's list and icon views): a text
-/// field naming a file (AXFilename, a file:// AXURL) that is not being
-/// edited. Writing its AXValue changes what the list shows, never the file.
-/// Finder's rename editor is a separate focused field and stays writable.
-unsafe fn file_name_cell(element: AXUIElementRef) -> bool {
-    copy_string_attr(element, "AXFilename").is_some_and(|name| !name.is_empty())
-        && crate::ax::bindings::copy_url_attr(element).is_some_and(|url| url.starts_with("file://"))
-        && crate::ax::bindings::copy_bool_attr(element, "AXFocused") != Some(true)
 }
 
 /// A search-like text field: the role or subrole says so, or its
@@ -427,26 +416,6 @@ fn catalyst_read_back(
          and type_text instead.",
     );
     Written::Outcome(outcome)
-}
-
-const FILE_NAME_NEEDS_RENAME: &str = "file_name_needs_rename";
-
-/// The refusal for set_value on a file's name shown in a list.
-fn file_name_needs_rename(pid: i32, window_id: u32) -> ToolResult {
-    let reason = "This is a file's name as the list shows it. A value write changes only what \
-                  the list shows, never the file, so nothing was written. Rename: click the \
-                  item, press return (or invoke_menu File > Rename), select all with cmd+a \
-                  (Finder selects the name without its extension), type_text the full new name, \
-                  press return, then check the list shows it.";
-    ToolResult::error(format!("set_value refused ({FILE_NAME_NEEDS_RENAME}): {reason}"))
-        .with_structured(serde_json::json!({
-            "code": FILE_NAME_NEEDS_RENAME,
-            "effect": "refused",
-            "path": "ax",
-            "pid": pid,
-            "window_id": window_id,
-            "reason": reason,
-        }))
 }
 
 const CATALYST_TEXT_DID_NOT_TAKE: &str = "catalyst_text_did_not_take";
@@ -538,12 +507,88 @@ fn nonsettable_text_refusal(note: &str) -> ToolResult {
     }))
 }
 
+// ── File name cells ──────────────────────────────────────────────────────────
+
+const FILE_NAME_NEEDS_RENAME: &str = "file_name_needs_rename";
+
+/// Whether `element` is a file's name as a list shows it (Finder's list and
+/// icon views): a text field that names a file and is not being edited.
+/// Finder's inline rename editor is focused, so it stays writable.
+unsafe fn file_name_cell(element: AXUIElementRef) -> bool {
+    copy_string_attr(element, "AXRole").as_deref() == Some("AXTextField")
+        && is_file_name_cell(
+            copy_string_attr(element, "AXFilename").as_deref(),
+            copy_url_attr(element).as_deref(),
+            copy_bool_attr(element, "AXFocused"),
+        )
+}
+
+fn is_file_name_cell(filename: Option<&str>, url: Option<&str>, focused: Option<bool>) -> bool {
+    filename.is_some_and(|name| !name.is_empty())
+        && url.is_some_and(|url| url.starts_with("file://"))
+        && focused != Some(true)
+}
+
+/// Whether `element` is the Name & Extension field of Finder's Get Info
+/// window. It names no file through AXFilename or AXURL, so `file_name_cell`
+/// misses it, yet an AXValue write there renames nothing either.
+unsafe fn get_info_name_field(pid: i32, element: AXUIElementRef) -> bool {
+    is_get_info_name_field(
+        crate::apps::bundle_id_for_pid(pid).as_deref(),
+        copy_string_attr(element, "AXRole").as_deref(),
+        copy_string_attr(element, "AXIdentifier").as_deref(),
+        copy_bool_attr(element, "AXFocused"),
+    )
+}
+
+fn is_get_info_name_field(
+    bundle_id: Option<&str>,
+    role: Option<&str>,
+    identifier: Option<&str>,
+    focused: Option<bool>,
+) -> bool {
+    bundle_id == Some("com.apple.finder")
+        && role == Some("AXTextField")
+        && identifier == Some("Name")
+        && focused != Some(true)
+}
+
+const LIST_RENAME_ROUTE: &str = "This is a file's name as the list shows it. Writing its AXValue \
+    changes only what the list shows, never the file, so nothing was written. To rename the \
+    file: click this element to select the item, then with Finder frontmost send press_key \
+    return, hotkey cmd+a (Finder selects the name without its extension), type_text the full \
+    new name, and press_key return, each with scope:\"desktop\". Then check the new name in a \
+    fresh get_window_state.";
+
+const GET_INFO_RENAME_ROUTE: &str = "This is the Name & Extension field of Finder's Get Info \
+    window. Writing its AXValue changes only what the field shows, never the file, so nothing \
+    was written. To rename the file: take a fresh get_window_state of this window and click the \
+    field's centre in its screenshot pixels (pass its capture_id), then hotkey cmd+a, type_text \
+    the full new name with its extension, and press_key return, each with \
+    delivery_mode:\"foreground\" on this window. A changed extension makes Finder ask for \
+    confirmation in a dialog first. Then check the new name in a fresh listing of the folder; \
+    this window's title changes with it.";
+
+fn file_name_needs_rename(pid: i32, window_id: u32, reason: &str) -> ToolResult {
+    ToolResult::error(format!(
+        "set_value refused ({FILE_NAME_NEEDS_RENAME}): {reason}"
+    ))
+    .with_structured(serde_json::json!({
+        "code": FILE_NAME_NEEDS_RENAME,
+        "effect": "refused",
+        "path": "ax",
+        "pid": pid,
+        "window_id": window_id,
+        "reason": reason,
+    }))
+}
+
 // ── Blocking implementation (runs on spawn_blocking thread) ─────────────────
 
 /// Outcome of a `set_value` write.
 ///
-/// `verified` is `None` for paths that do not perform a value read-back (the
-/// AXPopUpButton path drives menu items rather than writing AXValue), and
+/// `verified` is `None` when nothing could be read back (Safari's DOM path for
+/// a `<select>`, an unreadable AXValue or pop-up value), and
 /// `Some(false)` when a read-back ran but could not confirm the write. A
 /// successful `AXUIElementSetAttributeValue` return code is not by itself
 /// evidence that the value landed: web content behind an AXWebArea accepts the
@@ -572,6 +617,9 @@ fn apply_verification_label(outcome: &mut SetValueOutcome) {
     if outcome.verified != Some(true) {
         if let Some(rest) = outcome.detail.strip_prefix("✅ Set") {
             outcome.detail = format!("📨 Sent (unverified){rest}");
+        } else if let Some(rest) = outcome.detail.strip_prefix("✅ Selected") {
+            // A pop-up pick that apply_surface_trust downgraded (web content).
+            outcome.detail = format!("📨 Picked (unverified){rest}");
         }
     }
 }
@@ -838,6 +886,222 @@ fn step_to_value(element: AXUIElementRef, target: f64) -> bool {
 
 // ── AXPopUpButton path ───────────────────────────────────────────────────────
 
+/// How long to wait for a popup's menu to publish its items after AXPress.
+const POPUP_OPEN_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(2500);
+/// Consecutive unchanged polls that mean the menu has finished filling in.
+const POPUP_STABLE_POLLS: u32 = 3;
+/// How long a menu gets to close at each closing step (after the pick, after
+/// AXCancel, after Escape).
+const POPUP_CLOSE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(300);
+const POPUP_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(50);
+/// AX messaging timeout while opening the menu. The target app enters its
+/// menu-tracking loop inside the AXPress, so the call would otherwise block
+/// for the full default timeout (~1.5 s) with the menu already open.
+const POPUP_PRESS_TIMEOUT_SECONDS: f32 = 0.5;
+/// How long the pop-up's shown value may take to follow the pick (AppKit
+/// updates it after the menu closes).
+const POPUP_READ_BACK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(1);
+
+/// One selectable entry of a popup: the retained AX element plus the title
+/// and value it reports.
+struct PopupOption {
+    element: AXUIElementRef,
+    title: String,
+    value: String,
+}
+
+/// Release every retained option.
+fn release_options(options: &[PopupOption]) {
+    for option in options {
+        unsafe { CFRelease(option.element as _) };
+    }
+}
+
+/// A separator (or any entry with neither title nor value): never an option.
+fn is_blank_option(title: &str, value: &str) -> bool {
+    title.trim().is_empty() && value.trim().is_empty()
+}
+
+/// The popup's options as AX exposes them: its direct children, or, when a
+/// child is an `AXMenu` (AppKit `NSPopUpButton`, Chromium `<select>`), that
+/// menu's `AXMenuItem` children. Blank entries are released and left out, so
+/// an unopened popup reads as empty instead of as one untitled option.
+fn popup_options(popup: AXUIElementRef) -> Vec<PopupOption> {
+    let mut options = Vec::new();
+    for child in unsafe { copy_children(popup) } {
+        let role = unsafe { copy_string_attr(child, "AXRole") }.unwrap_or_default();
+        if role == "AXMenu" {
+            for item in unsafe { copy_children(child) } {
+                options.push(describe_option(item));
+            }
+            unsafe { CFRelease(child as _) };
+        } else {
+            options.push(describe_option(child));
+        }
+    }
+    let (kept, blank): (Vec<_>, Vec<_>) = options
+        .into_iter()
+        .partition(|option| !is_blank_option(&option.title, &option.value));
+    release_options(&blank);
+    kept
+}
+
+fn describe_option(element: AXUIElementRef) -> PopupOption {
+    PopupOption {
+        element,
+        title: unsafe { copy_string_attr(element, "AXTitle") }.unwrap_or_default(),
+        value: unsafe { copy_string_attr(element, "AXValue") }.unwrap_or_default(),
+    }
+}
+
+/// Index of the option whose non-empty title, or else non-empty value, equals
+/// `value`, ignoring case and surrounding whitespace. An option without an
+/// AXValue is never matched through its (missing) value, and an empty request
+/// matches nothing.
+fn matching_option(options: &[(String, String)], value: &str) -> Option<usize> {
+    let wanted = value.trim().to_lowercase();
+    if wanted.is_empty() {
+        return None;
+    }
+    options.iter().position(|(title, option_value)| {
+        title.trim().to_lowercase() == wanted || option_value.trim().to_lowercase() == wanted
+    })
+}
+
+fn option_pairs(options: &[PopupOption]) -> Vec<(String, String)> {
+    options
+        .iter()
+        .map(|option| (option.title.clone(), option.value.clone()))
+        .collect()
+}
+
+fn describe_available(options: &[PopupOption]) -> String {
+    options
+        .iter()
+        .map(|option| {
+            let label = if option.title.is_empty() {
+                &option.value
+            } else {
+                &option.title
+            };
+            format!("\"{label}\"")
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
+/// Whether the popup's menu is open right now: an `AXMenu` child that already
+/// lists items. A closed AppKit popup has an empty `AXMenu` (or none), and a
+/// closed Chromium popup lists only its selected item directly.
+fn popup_menu_is_open(popup: AXUIElementRef) -> bool {
+    let mut open = false;
+    for child in unsafe { copy_children(popup) } {
+        if unsafe { copy_string_attr(child, "AXRole") }.as_deref() == Some("AXMenu") {
+            let items = unsafe { copy_children(child) };
+            open |= !items.is_empty();
+            for item in items {
+                unsafe { CFRelease(item as _) };
+            }
+        }
+        unsafe { CFRelease(child as _) };
+    }
+    open
+}
+
+/// Poll the pop-up's own menu until it reads closed, for one closing step.
+fn popup_menu_closes(popup: AXUIElementRef) -> bool {
+    let deadline = std::time::Instant::now() + POPUP_CLOSE_TIMEOUT;
+    loop {
+        if !popup_menu_is_open(popup) {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(POPUP_POLL_INTERVAL);
+    }
+}
+
+/// Close the menu this call opened and say whether it closed: `Some(true)`
+/// closed, `Some(false)` still open, `None` unknown.
+///
+/// Evidence comes from the pop-up's own menu first and WindowServer second.
+/// A picked item closes its menu by itself, so after a pick the menu first
+/// gets time to close. Then AXCancel goes to the pop-up's menu (enough for
+/// AppKit). Escape (Chromium's menu ignores AXCancel) is sent only while the
+/// pop-up's own menu still reads open and WindowServer does not show that no
+/// menu window this call opened is left; Escape reaching a window instead of
+/// a menu would cancel a sheet. When the pop-up's menu reads closed,
+/// WindowServer must also show no menu window this call opened.
+fn close_popup_menu(
+    popup: AXUIElementRef,
+    pid: i32,
+    menus_before: &[u32],
+    picked: bool,
+) -> Option<bool> {
+    if !(picked && popup_menu_closes(popup)) {
+        for child in unsafe { copy_children(popup) } {
+            if unsafe { copy_string_attr(child, "AXRole") }.as_deref() == Some("AXMenu") {
+                let _ = unsafe { perform_action(child, "AXCancel") };
+            }
+            unsafe { CFRelease(child as _) };
+        }
+        if !popup_menu_closes(popup) {
+            if crate::windows::new_menu_windows(pid, menus_before) == Some(0) {
+                // The two readings disagree: say so rather than send a key.
+                return None;
+            }
+            let _ = crate::input::keyboard::press_key_no_auth(pid, "escape", &[]);
+            if !popup_menu_closes(popup) {
+                return Some(false);
+            }
+        }
+    }
+    crate::windows::wait_for_new_menus_closed(pid, menus_before)
+}
+
+fn closed_note(closed: Option<bool>) -> String {
+    match closed {
+        Some(true) => String::new(),
+        Some(false) => {
+            " Its menu is still open: press escape on the window before other input.".into()
+        }
+        None => " Whether its menu closed could not be read: check before other input.".into(),
+    }
+}
+
+/// Whether a pop-up's shown value names the picked option: its title, or its
+/// own non-empty value. An empty shown value proves nothing.
+fn shows_option(shown: &str, title: &str, value: &str) -> bool {
+    let shown = shown.trim();
+    let (title, value) = (title.trim(), value.trim());
+    !shown.is_empty()
+        && ((!title.is_empty() && shown.eq_ignore_ascii_case(title))
+            || (!value.is_empty() && shown.eq_ignore_ascii_case(value)))
+}
+
+/// The pop-up's shown choice, polled until it reads the picked option or the
+/// read-back timeout passes.
+fn read_back_popup(element: AXUIElementRef, is_picked: impl Fn(&str) -> bool) -> Option<String> {
+    let deadline = std::time::Instant::now() + POPUP_READ_BACK_TIMEOUT;
+    loop {
+        // Only AXValue is the choice: a title can be a fixed label.
+        let shown = unsafe { copy_string_attr(element, "AXValue") };
+        if shown.as_deref().is_some_and(&is_picked) || std::time::Instant::now() >= deadline {
+            return shown;
+        }
+        std::thread::sleep(POPUP_POLL_INTERVAL);
+    }
+}
+
+/// Wait for the thread whose AXPress opened the menu, so no AX call outlives
+/// this tool call. The press returns once the menu closes or its timeout fires.
+fn join_press(press_thread: &mut Option<std::thread::JoinHandle<()>>) {
+    if let Some(press) = press_thread.take() {
+        let _ = press.join();
+    }
+}
+
 fn select_popup_option(
     element: AXUIElementRef,
     element_index: usize,
@@ -845,171 +1109,248 @@ fn select_popup_option(
     value: &str,
     element_title: &str,
 ) -> anyhow::Result<SetValueOutcome> {
-    let mut options = unsafe { popup_options(element) };
+    let mut options = popup_options(element);
     let mut opened = false;
-    if options.is_empty() {
-        let app_name = crate::apps::get_app_name_for_pid(pid).unwrap_or_default();
-        if app_name == "Safari" {
-            // Safari/WebKit <select>: no AX children while closed.
-            return set_select_via_js(element_index, element_title, value).map(|detail| {
-                SetValueOutcome { detail, verified: None, changed: None }
-            });
+    let mut press_thread = None;
+    let mut menus_before = Vec::new();
+
+    if matching_option(&option_pairs(&options), value).is_none() {
+        // Safari/WebKit: no AX children while the popup is closed. Set the
+        // <select> through the DOM instead of opening a menu.
+        if options.is_empty() {
+            let app_name = crate::apps::get_app_name_for_pid(pid).unwrap_or_default();
+            if app_name == "Safari" {
+                return set_select_via_js(element_index, element_title, value).map(|detail| {
+                    SetValueOutcome {
+                        detail,
+                        verified: None,
+                        changed: None,
+                    }
+                });
+            }
         }
-        // A closed AppKit pop-up (a Save panel's encoding) shows its items
-        // only while its menu is open: open it, pick, read back.
+        // AppKit NSPopUpButton and Chromium <select> publish their items only
+        // while the menu is open (a closed Chromium popup lists just the
+        // selected one). Open it, wait for the full list, press the match,
+        // and close the menu again whatever happens. While the menu is open
+        // the app's menu tracking holds key focus, so the window that was key
+        // loses it until the menu closes.
+        //
+        // The AXPress returns only once the app's menu tracking lets it (or
+        // the messaging timeout fires), so run it on its own thread and read
+        // the items as soon as they appear.
+        let already_open = popup_menu_is_open(element);
+        // A menu left open by an earlier click is this call's to close once it
+        // presses an item there, so it is not counted as open before.
+        if !already_open {
+            menus_before = crate::windows::menu_window_ids(pid).unwrap_or_default();
+        }
+        let closed_titles = if already_open {
+            Vec::new()
+        } else {
+            option_pairs(&options)
+        };
+        release_options(&options);
         opened = true;
-        let err = unsafe { perform_action(element, "AXPress") };
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-        while options.is_empty() && std::time::Instant::now() < deadline {
-            std::thread::sleep(std::time::Duration::from_millis(50));
-            options = unsafe { popup_options(element) };
+        // Pressing an open popup again would close its menu.
+        if !already_open {
+            let popup_address = element as usize;
+            press_thread = Some(std::thread::spawn(move || unsafe {
+                let popup = popup_address as AXUIElementRef;
+                crate::ax::bindings::AXUIElementSetMessagingTimeout(
+                    popup,
+                    POPUP_PRESS_TIMEOUT_SECONDS,
+                );
+                let _ = perform_action(popup, "AXPress");
+                crate::ax::bindings::AXUIElementSetMessagingTimeout(popup, 0.0);
+            }));
+        }
+        let deadline = std::time::Instant::now() + POPUP_OPEN_TIMEOUT;
+        let mut last_seen: Vec<(String, String)> = Vec::new();
+        let mut stable_polls = 0;
+        loop {
+            options = popup_options(element);
+            let seen = option_pairs(&options);
+            if matching_option(&seen, value).is_some() {
+                break;
+            }
+            // The menu is open once the list differs from the closed one; it
+            // is complete once the list stops changing.
+            if !seen.is_empty() && seen != closed_titles {
+                stable_polls = if seen == last_seen {
+                    stable_polls + 1
+                } else {
+                    0
+                };
+                if stable_polls >= POPUP_STABLE_POLLS {
+                    break;
+                }
+            }
+            last_seen = seen;
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            release_options(&options);
+            std::thread::sleep(POPUP_POLL_INTERVAL);
         }
         if options.is_empty() {
-            let closed = unsafe { close_popup_menu(element, pid) };
+            let closed = close_popup_menu(element, pid, &menus_before, false);
+            join_press(&mut press_thread);
             anyhow::bail!(
-                "AXPopUpButton [{element_index}] \"{element_title}\" showed no options \
-                 (pressing it to open its menu returned AX error {err}).{}",
+                "AXPopUpButton [{element_index}] \"{element_title}\" exposed no options even \
+                 after its menu was opened, so nothing was selected. Click the popup, then \
+                 choose the option with press_key (down, return) or a pixel click on the item.{}",
                 closed_note(closed)
-            );
+            )
         }
     }
-    let titles: Vec<String> = options.iter().map(|o| o.title.clone()).filter(|t| !t.is_empty()).collect();
-    let chosen = match_option(&options, value);
-    let result = match chosen {
+
+    let pick = match matching_option(&option_pairs(&options), value) {
         Some(i) => {
-            let err = unsafe { perform_action(options[i].element, "AXPress") };
+            let option = &options[i];
+            let err = unsafe { perform_action(option.element, "AXPress") };
             if err == kAXErrorSuccess {
-                Ok((options[i].title.clone(), options[i].value.clone()))
+                Ok((option.title.clone(), option.value.clone()))
             } else {
-                Err(format!("AXPress on option '{}' failed with AX error {err}", options[i].title))
+                Err(format!(
+                    "AXPress on option '{}' failed with AX error {err}",
+                    option.title
+                ))
             }
         }
         None => Err(format!(
             "No option matching '{value}' in AXPopUpButton [{element_index}] \"{element_title}\". \
              Available: [{}]",
-            titles.iter().map(|t| format!("\"{t}\"")).collect::<Vec<_>>().join(", ")
+            describe_available(&options)
         )),
     };
-    for option in &options {
-        unsafe { CFRelease(option.element as _) };
-    }
-    let (picked_title, picked_value) = match result {
+    release_options(&options);
+    let (picked_title, picked_value) = match pick {
         Ok(picked) => picked,
         Err(error) => {
-            let closed = if opened { unsafe { close_popup_menu(element, pid) } } else { Some(true) };
+            let closed = if opened {
+                close_popup_menu(element, pid, &menus_before, false)
+            } else {
+                Some(true)
+            };
+            join_press(&mut press_thread);
             anyhow::bail!("{error}.{}", closed_note(closed));
         }
     };
-    // The menu closes when its item is chosen; make sure it did.
     let closed = if opened {
-        match crate::windows::wait_for_no_menu(pid) {
-            Some(true) => Some(true),
-            _ => unsafe { close_popup_menu(element, pid) },
-        }
+        close_popup_menu(element, pid, &menus_before, true)
     } else {
         Some(true)
     };
+    join_press(&mut press_thread);
+
     // The pop-up may show the chosen option's title or its own value.
     let is_picked = |shown: &str| shows_option(shown, &picked_title, &picked_value);
-    let picked = if picked_title.is_empty() { picked_value.clone() } else { picked_title.clone() };
+    let picked = if picked_title.is_empty() {
+        picked_value.clone()
+    } else {
+        picked_title.clone()
+    };
     let shown = read_back_popup(element, is_picked);
     let (verified, how) = match &shown {
         Some(now) if is_picked(now) => (Some(true), format!("it now shows '{now}'")),
-        Some(now) => (Some(false), format!("it still shows '{now}'; verify via screenshot")),
-        None => (None, "its shown value is not readable through AX; could not confirm".to_owned()),
+        Some(now) => (
+            Some(false),
+            format!("it still shows '{now}'; verify via screenshot"),
+        ),
+        None => (
+            None,
+            "its shown value is not readable through AX; could not confirm".to_owned(),
+        ),
     };
-    let mark = if verified == Some(true) { "✅ Selected" } else { "📨 Picked (unverified)" };
-    let route = if opened { "opened its menu and pressed the item" } else { "pressed the item without opening the menu" };
+    let mark = if verified == Some(true) {
+        "✅ Selected"
+    } else {
+        "📨 Picked (unverified)"
+    };
+    let route = if opened {
+        "opened its menu and pressed the item"
+    } else {
+        "pressed the item without opening the menu"
+    };
     Ok(SetValueOutcome {
         detail: format!(
             "{mark} '{picked}' in AXPopUpButton [{element_index}] \"{element_title}\" ({route}); {how}.{}",
-            if closed == Some(true) { String::new() } else { closed_note(closed) }
+            closed_note(closed)
         ),
         verified,
         changed: None,
     })
 }
 
-/// One option of a pop-up: its retained element and title.
-struct PopupOption {
-    element: AXUIElementRef,
-    title: String,
-    value: String,
-}
+#[cfg(test)]
+mod popup_option_tests {
+    use super::{is_blank_option, matching_option, shows_option};
 
-/// The pop-up's options: its children, through the AXMenu AppKit puts
-/// between a pop-up and its items while the menu is open. Each element is
-/// retained; the caller releases them.
-unsafe fn popup_options(element: AXUIElementRef) -> Vec<PopupOption> {
-    let mut items = Vec::new();
-    for child in copy_children(element) {
-        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
-            items.extend(copy_children(child));
-            CFRelease(child as _);
-        } else {
-            items.push(child);
-        }
+    fn pairs(titles: &[&str]) -> Vec<(String, String)> {
+        titles
+            .iter()
+            .map(|title| ((*title).to_owned(), String::new()))
+            .collect()
     }
-    items
-        .into_iter()
-        .map(|item| {
-            let title = copy_string_attr(item, "AXTitle").unwrap_or_default();
-            let value = copy_string_attr(item, "AXValue").unwrap_or_default();
-            PopupOption { element: item, title, value }
-        })
-        .collect()
-}
 
-/// Whether a pop-up's shown value names the option: its title, or its own
-/// non-empty value.
-fn shows_option(shown: &str, title: &str, value: &str) -> bool {
-    shown.eq_ignore_ascii_case(title) || (!value.is_empty() && shown.eq_ignore_ascii_case(value))
-}
-
-/// The option whose title, or else non-empty value, matches (case-insensitive).
-fn match_option(options: &[PopupOption], value: &str) -> Option<usize> {
-    option_index(options.iter().map(|o| (o.title.as_str(), o.value.as_str())), value)
-}
-
-fn option_index<'a>(options: impl Iterator<Item = (&'a str, &'a str)>, value: &str) -> Option<usize> {
-    let wanted = value.to_lowercase();
-    options
-        .into_iter()
-        .position(|(title, v)| title.to_lowercase() == wanted || (!v.is_empty() && v.to_lowercase() == wanted))
-}
-
-/// The pop-up's shown choice, polled for up to a second until it reads
-/// the picked option (AppKit updates it after the menu closes).
-fn read_back_popup(element: AXUIElementRef, is_picked: impl Fn(&str) -> bool) -> Option<String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
-    loop {
-        // Only AXValue is the choice: a title can be a fixed label.
-        let shown = unsafe { copy_string_attr(element, "AXValue") };
-        if shown.as_deref().is_some_and(&is_picked)
-            || std::time::Instant::now() >= deadline
-        {
-            return shown;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
+    #[test]
+    fn matches_title_ignoring_case_and_whitespace() {
+        let options = pairs(&["Open", "Duplicate", "Closed"]);
+        assert_eq!(matching_option(&options, "duplicate"), Some(1));
+        assert_eq!(matching_option(&options, "  Closed "), Some(2));
+        assert_eq!(matching_option(&options, "Pending"), None);
     }
-}
 
-/// Cancel the pop-up's open menu and read WindowServer's list back.
-unsafe fn close_popup_menu(element: AXUIElementRef, pid: i32) -> Option<bool> {
-    for child in copy_children(element) {
-        if copy_string_attr(child, "AXRole").as_deref() == Some("AXMenu") {
-            let _ = perform_action(child, "AXCancel");
-        }
-        CFRelease(child as _);
+    #[test]
+    fn matches_value_when_title_differs() {
+        let options = vec![("Duplicate of".to_owned(), "dup".to_owned())];
+        assert_eq!(matching_option(&options, "DUP"), Some(0));
     }
-    crate::windows::wait_for_no_menu(pid)
-}
 
-fn closed_note(closed: Option<bool>) -> String {
-    match closed {
-        Some(true) => String::new(),
-        Some(false) => " Its menu is still open: press escape on the window before other input.".into(),
-        None => " Whether its menu closed could not be read: check before other input.".into(),
+    /// T120: an option without an AXValue is not matched by an empty request
+    /// (upstream picked "Daily" for ""), and an empty request matches nothing.
+    #[test]
+    fn a_missing_value_never_matches() {
+        let options = vec![
+            ("Daily".to_owned(), String::new()),
+            (String::new(), "w".to_owned()),
+            ("Weekly".to_owned(), "w".to_owned()),
+        ];
+        assert_eq!(matching_option(&options, ""), None);
+        assert_eq!(matching_option(&options, "  "), None);
+        assert_eq!(matching_option(&options, "daily"), Some(0));
+        assert_eq!(matching_option(&options, "W"), Some(1));
+        assert_eq!(matching_option(&options, "Monthly"), None);
+    }
+
+    #[test]
+    fn separators_are_blank_options() {
+        assert!(is_blank_option("", ""));
+        assert!(is_blank_option(" ", ""));
+        assert!(!is_blank_option("", "w"));
+        assert!(!is_blank_option("Daily", ""));
+    }
+
+    #[test]
+    fn a_shown_value_verifies_only_the_picked_option() {
+        assert!(
+            shows_option("w", "Weekly", "w"),
+            "a pop-up that reports the value"
+        );
+        assert!(shows_option("weekly", "Weekly", "w"));
+        assert!(shows_option(" Weekly ", "Weekly", ""));
+        assert!(
+            !shows_option("", "Daily", ""),
+            "an empty value proves nothing"
+        );
+        assert!(
+            !shows_option("", "", "x"),
+            "an empty value never matches an empty title"
+        );
+        assert!(!shows_option("", "", ""));
+        assert!(!shows_option("Daily", "Weekly", "w"));
+        assert!(!shows_option("x", "", ""));
     }
 }
 
@@ -1145,19 +1486,23 @@ mod tests {
     use crate::tools::type_text::CatalystText;
     use std::cell::Cell;
 
+    use super::{
+        file_name_needs_rename, is_file_name_cell, is_get_info_name_field, GET_INFO_RENAME_ROUTE,
+        LIST_RENAME_ROUTE,
+    };
+
     fn written() -> anyhow::Result<SetValueOutcome> {
         Ok(SetValueOutcome { detail: "✅ Set AXValue on [1] AXTextField.".into(), verified: Some(true), changed: Some(true) })
     }
 
     /// Runs the route with counters on every side effect.
     fn route(role: &str, settable: Option<bool>, catalyst: CatalystText) -> (SetValueAttempt, usize, usize, usize) {
-        route_with(role, settable, false, catalyst, false)
+        route_with(role, settable, catalyst, false)
     }
 
     fn route_with(
         role: &str,
         settable: Option<bool>,
-        file_name: bool,
         catalyst: CatalystText,
         search: bool,
     ) -> (SetValueAttempt, usize, usize, usize) {
@@ -1165,7 +1510,6 @@ mod tests {
         let attempt = write_text_control(
             role,
             || settable,
-            || file_name,
             || { ancestry.set(ancestry.get() + 1); catalyst },
             || search,
             || { focus.set(focus.get() + 1); Ok(()) },
@@ -1180,7 +1524,7 @@ mod tests {
     #[test]
     fn catalyst_search_text_is_refused_before_focus_or_write() {
         for role in ["AXTextField", "AXTextArea", "AXSearchField", "AXComboBox"] {
-            let (attempt, _, focus, write) = route_with(role, Some(true), false, CatalystText::Yes, true);
+            let (attempt, _, focus, write) = route_with(role, Some(true), CatalystText::Yes, true);
             assert!(matches!(attempt, SetValueAttempt::CatalystNeedsTyping), "{role}");
             assert_eq!((focus, write), (0, 0), "{role}: nothing prepared or written");
         }
@@ -1206,7 +1550,7 @@ mod tests {
     /// native focus preparation, and its read-back decides the result.
     #[test]
     fn catalyst_form_field_is_written_without_focus_preparation() {
-        let (attempt, _, focus, write) = route_with("AXTextField", Some(true), false, CatalystText::Yes, false);
+        let (attempt, _, focus, write) = route_with("AXTextField", Some(true), CatalystText::Yes, false);
         assert!(matches!(attempt, SetValueAttempt::Applied(_, CatalystText::Yes)));
         assert_eq!((focus, write), (0, 1));
         let kept = super::catalyst_read_back(written().unwrap(), "Ada Lovelace", || Some("Ada Lovelace".into()));
@@ -1228,45 +1572,12 @@ mod tests {
     }
 
     #[test]
-    fn a_pop_up_option_matches_its_title_or_its_own_value_only() {
-        let options = [("", ""), ("Daily", ""), ("Weekly", "w")];
-        assert_eq!(super::option_index(options.into_iter(), ""), Some(0), "a blank item stays selectable");
-        assert_eq!(super::option_index(options.into_iter(), "daily"), Some(1));
-        assert_eq!(super::option_index(options.into_iter(), "W"), Some(2));
-        assert_eq!(super::option_index(options.into_iter(), "Monthly"), None);
-        assert!(super::shows_option("w", "Weekly", "w"), "a pop-up that reports the value");
-        assert!(super::shows_option("weekly", "Weekly", "w"));
-        assert!(!super::shows_option("", "Daily", ""), "an empty value proves nothing");
-        assert!(!super::shows_option("Daily", "Weekly", "w"));
-    }
-
-    #[test]
     fn search_like_fields_are_named_by_role_subrole_or_their_text() {
         assert!(super::is_search_like("AXSearchField", None, &[]));
         assert!(super::is_search_like("AXTextField", Some("AXSearchField"), &[]));
         assert!(super::is_search_like("AXTextField", None, &[Some("Search messages".into())]));
         assert!(super::is_search_like("AXTextField", None, &[None, Some("probe-search".into())]));
         assert!(!super::is_search_like("AXTextField", None, &[Some("Display name".into()), None]));
-    }
-
-    /// G1: a file's name as a list shows it is refused before anything is
-    /// focused or written, ahead of the Catalyst checks.
-    #[test]
-    fn a_file_name_cell_is_refused_before_focus_or_write() {
-        let (attempt, ancestry, focus, write) = route_with("AXTextField", Some(true), true, CatalystText::No, false);
-        assert!(matches!(attempt, SetValueAttempt::FileNameNeedsRename));
-        assert_eq!((ancestry, focus, write), (0, 0, 0));
-        // Only text fields: another role keeps its own path.
-        let (attempt, _, _, write) = route_with("AXSlider", Some(true), true, CatalystText::No, false);
-        assert!(matches!(attempt, SetValueAttempt::Applied(..)));
-        assert_eq!(write, 1);
-        let reason = super::file_name_needs_rename(7, 42).structured_content.unwrap()["reason"]
-            .as_str()
-            .unwrap()
-            .to_owned();
-        for needed in ["never the file", "nothing was written", "return", "cmd+a", "type_text"] {
-            assert!(reason.contains(needed), "missing {needed:?}: {reason}");
-        }
     }
 
     #[test]
@@ -1404,6 +1715,140 @@ mod tests {
         assert_eq!(
             outcome.detail,
             "📨 Sent (unverified) AXValue on [4] AXTextField."
+        );
+    }
+
+    #[test]
+    fn a_listed_file_name_is_a_file_name_cell() {
+        let url = Some("file:///Users/me/lab/charlie.bin");
+        assert!(is_file_name_cell(Some("charlie.bin"), url, Some(false)));
+        assert!(is_file_name_cell(Some("charlie.bin"), url, None));
+    }
+
+    #[test]
+    fn rename_editor_and_ordinary_fields_stay_writable() {
+        let url = Some("file:///Users/me/lab/charlie.bin");
+        // Finder's inline rename editor is focused while editing.
+        assert!(!is_file_name_cell(Some("charlie.bin"), url, Some(true)));
+        // A plain text field names no file.
+        assert!(!is_file_name_cell(None, None, Some(false)));
+        assert!(!is_file_name_cell(Some(""), url, Some(false)));
+        assert!(!is_file_name_cell(Some("charlie.bin"), None, Some(false)));
+        assert!(!is_file_name_cell(
+            Some("page"),
+            Some("https://example.com/page"),
+            None
+        ));
+    }
+
+    #[test]
+    fn get_info_name_field_is_refused_and_its_neighbours_are_not() {
+        const FINDER: Option<&str> = Some("com.apple.finder");
+        // (bundle id, role, AXIdentifier, AXFocused, refused). Identifiers are
+        // the ones Finder reported on macOS 26.4.
+        let cases = [
+            (FINDER, "AXTextField", Some("Name"), Some(false), true),
+            (FINDER, "AXTextField", Some("Name"), None, true),
+            // A real click starts an edit session; Return then commits an
+            // AXValue write, so the focused field stays writable.
+            (FINDER, "AXTextField", Some("Name"), Some(true), false),
+            // The "Name & Extension" disclosure triangle shares the identifier.
+            (FINDER, "AXDisclosureTriangle", Some("Name"), None, false),
+            // Tags field, list inline rename editor, list name cell.
+            (FINDER, "AXTextField", Some("_NS:34"), None, false),
+            (
+                FINDER,
+                "AXTextField",
+                Some("ShrinkToFit Text Field"),
+                Some(true),
+                false,
+            ),
+            (FINDER, "AXTextField", None, Some(false), false),
+            (FINDER, "AXTextArea", Some("Comments"), None, false),
+            // The same field shape in another app.
+            (
+                Some("com.example.notes"),
+                "AXTextField",
+                Some("Name"),
+                None,
+                false,
+            ),
+            (None, "AXTextField", Some("Name"), None, false),
+        ];
+        for (bundle, role, identifier, focused, refused) in cases {
+            assert_eq!(
+                is_get_info_name_field(bundle, Some(role), identifier, focused),
+                refused,
+                "{bundle:?} {role} {identifier:?} {focused:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn get_info_refusal_names_the_foreground_route() {
+        let result = file_name_needs_rename(7, 42, GET_INFO_RENAME_ROUTE);
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["code"], "file_name_needs_rename");
+        let reason = data["reason"].as_str().unwrap();
+        for needed in [
+            "Get Info",
+            "nothing was written",
+            "screenshot pixels",
+            "capture_id",
+            "cmd+a",
+            "type_text",
+            "return",
+            "delivery_mode:\"foreground\"",
+        ] {
+            assert!(reason.contains(needed), "missing {needed:?}: {reason}");
+        }
+    }
+
+    #[test]
+    fn file_name_refusal_names_the_rename_route() {
+        let result = file_name_needs_rename(7, 42, LIST_RENAME_ROUTE);
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.unwrap();
+        assert_eq!(data["code"], "file_name_needs_rename");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(
+            (data["pid"].as_i64(), data["window_id"].as_u64()),
+            (Some(7), Some(42))
+        );
+        let reason = data["reason"].as_str().unwrap();
+        for needed in [
+            "never the file",
+            "nothing was written",
+            "return",
+            "cmd+a",
+            "type_text",
+            "desktop",
+        ] {
+            assert!(reason.contains(needed), "missing {needed:?}: {reason}");
+        }
+    }
+
+    /// A pop-up pick on web content that apply_surface_trust downgrades must
+    /// not keep saying "Selected": the text and the effect agree.
+    #[test]
+    fn a_downgraded_pop_up_pick_does_not_say_selected() {
+        let mut outcome = SetValueOutcome {
+            detail: "✅ Selected 'Weekly' in AXPopUpButton [3] \"Digest\" (pressed the item \
+                     without opening the menu); it now shows 'Weekly'."
+                .to_owned(),
+            verified: Some(true),
+            changed: None,
+        };
+        apply_surface_trust(&mut outcome, true);
+        apply_verification_label(&mut outcome);
+        assert_eq!(outcome.verified, Some(false));
+        assert!(!outcome.detail.contains("Selected"), "{}", outcome.detail);
+        assert!(
+            outcome
+                .detail
+                .starts_with("📨 Picked (unverified) 'Weekly'"),
+            "{}",
+            outcome.detail
         );
     }
 }

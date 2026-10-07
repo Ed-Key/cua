@@ -36,12 +36,18 @@ pub struct AppInfo {
     pub last_used: Option<String>,
 }
 
-/// Enumerate running apps with NSApplicationActivationPolicyRegular.
+/// Enumerate running apps with NSApplicationActivationPolicyRegular, one
+/// entry per process, sorted by name then pid.
 ///
-/// This stays entirely inside AppKit so listing or classifying an application
-/// never triggers the macOS Automation permission for System Events.
+/// This stays inside AppKit and libproc, so listing or classifying an
+/// application never triggers the macOS Automation permission for System
+/// Events. `active` is the WindowServer's front process (see
+/// [`frontmost_pid`]), read once for the whole list.
 pub fn list_running_apps() -> Vec<AppInfo> {
-    list_running_apps_native()
+    let front = frontmost_pid();
+    let mut apps = list_running_apps_native(front);
+    apps.sort_by(|a, b| a.name.cmp(&b.name).then(a.pid.cmp(&b.pid)));
+    apps
 }
 
 /// Every live pid, from the kernel's process table; `None` when it could
@@ -99,26 +105,38 @@ fn running_applications() -> Vec<objc2::rc::Retained<objc2_app_kit::NSRunningApp
     apps.into_iter().filter(|app| unsafe { !app.isTerminated() }).collect()
 }
 
-fn list_running_apps_native() -> Vec<AppInfo> {
-    objc2::rc::autoreleasepool(|_| list_running_apps_in_pool())
-}
-
-fn list_running_apps_in_pool() -> Vec<AppInfo> {
-    running_applications().iter().filter_map(|app| app_info(app)).collect()
+fn list_running_apps_native(front: Option<i32>) -> Vec<AppInfo> {
+    objc2::rc::autoreleasepool(|_| {
+        running_applications()
+            .iter()
+            .filter_map(|app| app_info(app, front))
+            .collect()
+    })
 }
 
 /// The running regular app with `pid` (one fresh lookup, not a scan), or
 /// `None` when no such app runs.
 pub fn running_app(pid: i32) -> Option<AppInfo> {
     use objc2_app_kit::NSRunningApplication;
+    let front = frontmost_pid();
     objc2::rc::autoreleasepool(|_| {
         let app = unsafe { NSRunningApplication::runningApplicationWithProcessIdentifier(pid) }?;
-        app_info(&app)
+        app_info(&app, front)
     })
 }
 
-/// A regular, live app as [`AppInfo`]; `None` for anything else.
-fn app_info(app: &objc2_app_kit::NSRunningApplication) -> Option<AppInfo> {
+/// The `.app` path a running application was launched from, when known.
+fn bundle_path(app: &objc2_app_kit::NSRunningApplication) -> Option<String> {
+    unsafe {
+        app.bundleURL()
+            .and_then(|url| url.path())
+            .map(|path| path.to_string())
+    }
+}
+
+/// A regular, live app as [`AppInfo`]; `None` for anything else. `front`
+/// is the WindowServer's front pid.
+fn app_info(app: &objc2_app_kit::NSRunningApplication, front: Option<i32>) -> Option<AppInfo> {
     use objc2_app_kit::NSApplicationActivationPolicy;
     unsafe {
         if app.isTerminated() || app.activationPolicy() != NSApplicationActivationPolicy::Regular {
@@ -134,12 +152,43 @@ fn app_info(app: &objc2_app_kit::NSRunningApplication) -> Option<AppInfo> {
             pid,
             bundle_id: app.bundleIdentifier().map(|value| value.to_string()),
             running: true,
-            active: app.isActive(),
-            launch_path: None,
+            active: front == Some(pid),
+            launch_path: bundle_path(app),
             kind: Some("desktop".to_owned()),
             last_used: None,
         })
     }
+}
+
+/// Live `(pid, active, bundle path)` entries per bundle identifier.
+type RunningAppStates = std::collections::HashMap<String, Vec<(i32, bool, Option<String>)>>;
+
+/// Live state for every running process that reports a bundle identifier,
+/// across ALL activation policies. The `Regular`-only filter of
+/// [`list_running_apps`] must not decide whether an *installed* app is
+/// running: bundles shipped with `LSUIElement = true` (Cua Driver itself,
+/// many menu-bar apps) run as `Accessory`, never enter the standalone list,
+/// and would otherwise surface as `running = false / pid = 0` while windows
+/// and the accessibility tree see the live process (#3060). Read from the
+/// same fresh lookups as the running list, with `active` from `front`.
+fn running_app_states(front: Option<i32>) -> RunningAppStates {
+    let mut states = RunningAppStates::new();
+    objc2::rc::autoreleasepool(|_| {
+        for app in running_applications() {
+            let pid = unsafe { app.processIdentifier() };
+            let Some(bundle_id) = (unsafe { app.bundleIdentifier() }).map(|value| value.to_string()) else {
+                continue;
+            };
+            if pid <= 0 || bundle_id.is_empty() {
+                continue;
+            }
+            states
+                .entry(bundle_id)
+                .or_default()
+                .push((pid, front == Some(pid), bundle_path(&app)));
+        }
+    });
+    states
 }
 
 /// Launch an app by bundle ID via NSWorkspace, background only (no focus
@@ -487,8 +536,35 @@ fn bundle_id_for_app_path(app_path: &str) -> Option<String> {
 ///   * `launch_path` (filesystem `.app` path when known, else `None`),
 ///   * `kind` (`"desktop"` on macOS).
 pub fn list_all_apps() -> Vec<AppInfo> {
-    let mut running = list_running_apps();
+    // One front pid for both views, so the running list and the installed
+    // entries upgraded from live state agree on which app is active.
+    let front = frontmost_pid();
+    let mut running = list_running_apps_native(front);
+    running.sort_by(|a, b| a.name.cmp(&b.name).then(a.pid.cmp(&b.pid)));
+    let running_states = running_app_states(front);
     let installed = scan_installed_apps();
+    merge_app_lists(running, installed, &running_states)
+}
+
+/// Pure merge behind [`list_all_apps`] — extracted so the identity rules
+/// are testable without a live NSWorkspace:
+///
+/// * standalone entries keep the `Regular`-only contract of
+///   [`list_running_apps`] (helpers and UI agents stay out of the list);
+/// * installed entries resolve `running` / `pid` / `active` against the
+///   all-policies running-state map by bundle id and bundle path, so an installed `.app`
+///   whose process runs as an accessory reports its live state instead
+///   of the `pid = 0` scan defaults (#3060). Exact bundle paths distinguish
+///   installed copies that share an identifier. Bundle-id-only fallback is
+///   allowed only when the installed copy is unambiguous;
+/// * installed entries already covered by a standalone running entry are
+///   dropped — the standalone entry wins and is backfilled with the
+///   `launch_path` / `last_used` the installed scan resolved.
+pub(crate) fn merge_app_lists(
+    mut running: Vec<AppInfo>,
+    mut installed: Vec<AppInfo>,
+    running_states: &RunningAppStates,
+) -> Vec<AppInfo> {
     // Lookup: bundle_id → (launch_path, last_used) from the installed scan.
     let installed_by_bundle: std::collections::HashMap<String, (Option<String>, Option<String>)> =
         installed
@@ -513,10 +589,47 @@ pub fn list_all_apps() -> Vec<AppInfo> {
         }
     }
 
+    let installed_bundle_counts = installed
+        .iter()
+        .filter_map(|app| app.bundle_id.clone())
+        .fold(
+            std::collections::HashMap::<String, usize>::new(),
+            |mut counts, bundle| {
+                *counts.entry(bundle).or_default() += 1;
+                counts
+            },
+        );
+
+    // Upgrade installed entries whose live process runs outside the Regular
+    // list. Prefer the exact bundle path so duplicate debug/release copies do
+    // not all inherit one process's live state.
+    for app in installed.iter_mut() {
+        let Some(bundle_id) = app.bundle_id.as_deref() else {
+            continue;
+        };
+        let Some(candidates) = running_states.get(bundle_id) else {
+            continue;
+        };
+        let exact = app.launch_path.as_deref().and_then(|installed_path| {
+            candidates
+                .iter()
+                .find(|(_, _, live_path)| live_path.as_deref() == Some(installed_path))
+        });
+        let selected = exact.or_else(|| {
+            (installed_bundle_counts.get(bundle_id) == Some(&1))
+                .then(|| candidates.last())
+                .flatten()
+        });
+        if let Some(&(pid, active, _)) = selected {
+            app.running = true;
+            app.pid = pid;
+            app.active = active;
+        }
+    }
+
     let running_bundles: std::collections::HashSet<String> =
         running.iter().filter_map(|a| a.bundle_id.clone()).collect();
 
-    let mut installed = installed;
     // Remove apps already in running list.
     installed.retain(|a| {
         !a.bundle_id
@@ -524,9 +637,8 @@ pub fn list_all_apps() -> Vec<AppInfo> {
             .is_some_and(|b| running_bundles.contains(b))
     });
 
-    let mut all = running;
-    all.extend(installed);
-    all
+    running.extend(installed);
+    running
 }
 
 fn scan_installed_apps() -> Vec<AppInfo> {
@@ -762,17 +874,155 @@ pub fn format_app_list(apps: &[AppInfo]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::finder_folder_handoff;
+    use super::{finder_folder_handoff, live_pids, merge_app_lists, AppInfo};
+
+    fn app(name: &str, pid: i32, bundle: Option<&str>, running: bool) -> AppInfo {
+        AppInfo {
+            name: name.to_owned(),
+            pid,
+            bundle_id: bundle.map(str::to_owned),
+            running,
+            active: false,
+            launch_path: None,
+            kind: None,
+            last_used: None,
+        }
+    }
+
+    fn states(pairs: &[(&str, i32, bool, Option<&str>)]) -> super::RunningAppStates {
+        pairs.iter().fold(
+            super::RunningAppStates::new(),
+            |mut states, (bundle, pid, active, path)| {
+                states.entry((*bundle).to_owned()).or_default().push((
+                    *pid,
+                    *active,
+                    path.map(str::to_owned),
+                ));
+                states
+            },
+        )
+    }
+
+    #[test]
+    fn installed_app_running_as_accessory_reports_live_state() {
+        // The #3060 shape: CuaDriver.app ships LSUIElement=true, so its live
+        // process runs as Accessory and never enters the Regular list.
+        let mut entry = app("Cua Driver", 0, Some("com.trycua.driver"), false);
+        entry.launch_path = Some("/Applications/CuaDriver.app".to_owned());
+        let merged = merge_app_lists(
+            vec![],
+            vec![entry],
+            &states(&[(
+                "com.trycua.driver",
+                31438,
+                false,
+                Some("/Applications/CuaDriver.app"),
+            )]),
+        );
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].running);
+        assert_eq!(merged[0].pid, 31438);
+        // The upgrade must not clobber the fields the installed scan owns.
+        assert_eq!(
+            merged[0].launch_path.as_deref(),
+            Some("/Applications/CuaDriver.app")
+        );
+    }
+
+    #[test]
+    fn installed_app_not_running_keeps_scan_defaults() {
+        let merged = merge_app_lists(
+            vec![],
+            vec![app("TextEdit", 0, Some("com.apple.TextEdit"), false)],
+            &states(&[]),
+        );
+        assert_eq!(merged.len(), 1);
+        assert!(!merged[0].running);
+        assert_eq!(merged[0].pid, 0);
+    }
+
+    #[test]
+    fn regular_running_app_wins_over_installed_entry() {
+        let running = vec![app("Safari", 100, Some("com.apple.Safari"), true)];
+        let installed = vec![{
+            let mut entry = app("Safari", 0, Some("com.apple.Safari"), false);
+            entry.launch_path = Some("/Applications/Safari.app".to_owned());
+            entry
+        }];
+        let merged = merge_app_lists(
+            running,
+            installed,
+            &states(&[(
+                "com.apple.Safari",
+                100,
+                true,
+                Some("/Applications/Safari.app"),
+            )]),
+        );
+        assert_eq!(merged.len(), 1);
+        assert!(merged[0].running);
+        assert_eq!(merged[0].pid, 100);
+        assert_eq!(
+            merged[0].launch_path.as_deref(),
+            Some("/Applications/Safari.app")
+        );
+    }
+
+    #[test]
+    fn accessory_process_without_installed_bundle_adds_no_entry() {
+        // A background helper with a bundle id but no installed .app must not
+        // materialize a row just because it appears in the states map.
+        let merged = merge_app_lists(
+            vec![],
+            vec![],
+            &states(&[("dev.helper.agent", 9, false, None)]),
+        );
+        assert!(merged.is_empty());
+    }
+
+    #[test]
+    fn duplicate_bundle_ids_upgrade_only_the_live_bundle_path() {
+        let mut release = app("Cua Driver", 0, Some("com.trycua.driver"), false);
+        release.launch_path = Some("/Applications/CuaDriver.app".to_owned());
+        let mut debug = app("Cua Driver", 0, Some("com.trycua.driver"), false);
+        debug.launch_path = Some("/Users/test/CuaDriver.app".to_owned());
+
+        let merged = merge_app_lists(
+            vec![],
+            vec![release, debug],
+            &states(&[(
+                "com.trycua.driver",
+                42,
+                false,
+                Some("/Users/test/CuaDriver.app"),
+            )]),
+        );
+
+        assert!(!merged[0].running);
+        assert_eq!(merged[0].pid, 0);
+        assert!(merged[1].running);
+        assert_eq!(merged[1].pid, 42);
+    }
 
     #[test]
     fn finder_folder_handoff_is_narrowly_selected() {
         let folder = std::env::temp_dir().to_string_lossy().into_owned();
 
-        assert!(finder_folder_handoff("com.apple.finder", &[folder.clone()]));
+        assert!(finder_folder_handoff(
+            "com.apple.finder",
+            std::slice::from_ref(&folder)
+        ));
         assert!(!finder_folder_handoff("com.apple.TextEdit", &[folder]));
         assert!(!finder_folder_handoff(
             "com.apple.finder",
             &["https://example.com".to_owned()]
         ));
+    }
+
+    /// The process table this module reads sees this very process.
+    #[test]
+    fn live_pids_include_this_process() {
+        let own = std::process::id() as i32;
+        assert!(live_pids().expect("readable process table").contains(&own));
     }
 }

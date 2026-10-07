@@ -787,7 +787,13 @@ fn transport_from_legacy(
         "SetCursorPos" => ActionTransport::WindowsSetCursorPos,
         "atspi" | "wayland_atspi" | "x11_atspi" => ActionTransport::LinuxAtSpiAction,
         "pty" => ActionTransport::LinuxPty,
-        "mpx_uinput" | "mpx_pointer" => ActionTransport::LinuxX11MpxUinput,
+        // set_value's keyboard fallback on Linux: the field (or combo box)
+        // is clicked open with the session's MPX pointer, or with XTest in
+        // the foreground, and typed into or picked from.
+        "mpx_uinput" | "mpx_pointer" | "click_type_mpx" | "click_select_mpx" => {
+            ActionTransport::LinuxX11MpxUinput
+        }
+        "click_type_fg" | "click_select_fg" => ActionTransport::LinuxXTest,
         "x11_xsendevent" => ActionTransport::LinuxXSendEvent,
         "x11_pixel" | "x11_pixel_fg" | "x11_xtest_fg" | "xtest" | "xtest_desktop"
         | "xtest_core_grab" => ActionTransport::LinuxXTest,
@@ -983,9 +989,8 @@ fn actual_delivery_from_legacy(
     {
         return Some(ActualDelivery::NotApplicable);
     }
-    match structured_delivery_mode(args, structured) {
-        Some(delivery) => return Some(delivery),
-        None => {}
+    if let Some(delivery) = structured_delivery_mode(args, structured) {
+        return Some(delivery);
     }
     match raw_path {
         Some(path) if path.ends_with("_fg") => Some(ActualDelivery::Foreground),
@@ -1691,6 +1696,48 @@ mod tests {
     }
 
     #[test]
+    fn linux_set_value_keyboard_fallback_paths_normalize() {
+        // A successful set_value fallback must carry an execution record;
+        // without a transport the registry reports action_outcome_mismatch.
+        for (path, mode, transport, delivery) in [
+            (
+                "click_type_fg",
+                "foreground",
+                ActionTransport::LinuxXTest,
+                ActualDelivery::Foreground,
+            ),
+            (
+                "click_select_fg",
+                "foreground",
+                ActionTransport::LinuxXTest,
+                ActualDelivery::Foreground,
+            ),
+            (
+                "click_type_mpx",
+                "background",
+                ActionTransport::LinuxX11MpxUinput,
+                ActualDelivery::Background,
+            ),
+            (
+                "click_select_mpx",
+                "background",
+                ActionTransport::LinuxX11MpxUinput,
+                ActualDelivery::Background,
+            ),
+        ] {
+            let record = ActionExecutionRecord::from_legacy(
+                "set_value",
+                &serde_json::json!({ "delivery_mode": mode }),
+                &serde_json::json!({ "path": path, "verified": false, "effect": "unverifiable" }),
+            )
+            .unwrap_or_else(|| panic!("{path} should normalize"));
+            assert_eq!(record.transport, transport, "{path}");
+            assert_eq!(record.actual_delivery, Some(delivery), "{path}");
+            record.public_result().expect("public result");
+        }
+    }
+
+    #[test]
     fn mpx_pointer_window_change_evidence_publishes_confirmed_effect() {
         // Linux MPX real-pointer click that opened a context menu: the popup
         // appearing is window-change evidence, so `confirmed` survives.
@@ -1908,6 +1955,34 @@ mod tests {
             Some(cua_driver_contract::ActionDeliveryMode::Foreground)
         );
         assert_eq!(public.route, cua_driver_contract::ActionRoute::GlobalInput);
+    }
+
+    #[test]
+    fn foreground_cgevent_path_is_preserved_when_effect_is_unverifiable() {
+        let record = ActionExecutionRecord::from_legacy(
+            "click",
+            &serde_json::json!({"delivery_mode": "foreground"}),
+            &serde_json::json!({
+                "path": "cgevent_fg",
+                "verified": false,
+                "effect": "unverifiable",
+            }),
+        )
+        .expect("foreground CGEvent result should normalize");
+
+        assert_eq!(record.transport, ActionTransport::MacosCgEventHid);
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Foreground));
+
+        let public = record.public_result().expect("public ActionResult");
+        assert_eq!(
+            public.effect,
+            cua_driver_contract::ActionEffect::Unverifiable
+        );
+        assert_eq!(public.route, cua_driver_contract::ActionRoute::GlobalInput);
+        assert_eq!(
+            public.delivery.map(|delivery| delivery.mode),
+            Some(cua_driver_contract::ActionDeliveryMode::Foreground)
+        );
     }
 
     #[test]

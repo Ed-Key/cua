@@ -212,14 +212,34 @@ impl ToolDef {
     }
 }
 
-fn advertised_runtime_input_schema(tool_name: &str, schema: &Value) -> Value {
-    let mut schema = schema.clone();
-    if !crate::action_target::supports_typed_target(tool_name) {
-        return schema;
+/// First argument name absent from the tool's advertised closed schema.
+fn unknown_argument(def: &ToolDef, args: &Value) -> Option<String> {
+    let schema = advertised_runtime_input_schema(&def.name, &def.input_schema);
+    if schema["additionalProperties"] != false {
+        return None;
     }
+    let properties = schema.get("properties").and_then(Value::as_object);
+    args.as_object()?
+        .keys()
+        .find(|name| !properties.is_some_and(|properties| properties.contains_key(*name)))
+        .cloned()
+}
+
+pub(crate) fn advertised_runtime_input_schema(tool_name: &str, schema: &Value) -> Value {
+    let mut schema = schema.clone();
+    let closed = schema["additionalProperties"] == false;
     let Some(properties) = schema.get_mut("properties").and_then(Value::as_object_mut) else {
         return schema;
     };
+    // Dispatch reads `session` for every tool, so every closed schema must admit it.
+    if closed {
+        properties
+            .entry("session")
+            .or_insert_with(crate::tool_schema::session_schema);
+    }
+    if !crate::action_target::supports_typed_target(tool_name) {
+        return schema;
+    }
     // Reuse the portable contract's exact tagged-union schema while retaining
     // the live runtime's broader legacy `scope=window|desktop` decoder.
     if let Some(portable) = cua_driver_contract::tool_contract(tool_name) {
@@ -260,7 +280,7 @@ fn advertised_runtime_input_schema(tool_name: &str, schema: &Value) -> Value {
 /// - `accessibility.tree`, `accessibility.tree.structured`,
 ///   `accessibility.tree.bounded`, `accessibility.window_state`,
 ///   `accessibility.element_tokens` (Surface 6 — tool accepts the
-///   opaque `element_token` arg alongside the integer `element_index`)
+///   opaque `element_token` arg)
 /// - `app.launch`, `app.list`, `app.kill`, `window.list`,
 ///   `window.activate`, `window.frame.set`, `window.debug_info`
 /// - `system.permissions.tcc`,
@@ -293,8 +313,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         // ── input.pointer ────────────────────────────────────────────
         //
         // Surface 6: tools that accept the opaque `element_token` arg
-        // (in addition to the integer `element_index`) claim the
-        // `accessibility.element_tokens` token so consumers can branch
+        // claim the `accessibility.element_tokens` token so consumers can branch
         // on its presence — Hermes' wrapper currently does this by name
         // for each tool; the capability token removes that coupling.
         "double_click" => &[
@@ -356,8 +375,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
             "accessibility.tree.structured",
             "accessibility.tree.bounded",
             // Surface 6: emits `element_token` on every structured
-            // element entry — paired with the existing integer
-            // `element_index`.
+            // element entry (and `<snapshot_id>:N` for tree row [N]).
             "accessibility.element_tokens",
             // capture_mode:"vision" returns a window screenshot — see
             // platform-{macos,windows,linux}/src/tools/get_window_state.rs.
@@ -400,6 +418,7 @@ pub fn default_capabilities_for(tool_name: &str) -> Vec<String> {
         "stop_recording" => &["recording.stop"],
         "get_recording_state" => &["recording.state"],
         "replay_trajectory" => &["recording.replay"],
+        "run_actions" => &["input.batch"],
         "install_ffmpeg" => &["recording.install_dependency"],
         "install_extension" => &["extension.install"],
 
@@ -605,6 +624,13 @@ pub struct TrustedInvocationEvidence {
     session_id: Option<String>,
     transport_session_id: Option<String>,
     browser_download_mcp_host_approved: bool,
+    /// Who originated the input (`_input_origin`): a trusted host relaying
+    /// a human's input marks it so no agent cursor is drawn for it.
+    input_origin: Option<crate::agent_cursor::InputOrigin>,
+    /// Window-relative pixels are native window pixels (see
+    /// [`ToolRegistry::invoke_with_native_window_pixels`]). Never read from
+    /// arguments: only that in-process entry point sets it.
+    native_window_pixels: bool,
 }
 
 impl TrustedInvocationEvidence {
@@ -624,9 +650,35 @@ impl TrustedInvocationEvidence {
                 .remove(crate::browser::download::MCP_HOST_DOWNLOAD_APPROVAL_ARG)
                 .and_then(|value| value.as_bool())
                 == Some(true);
+            evidence.input_origin = arguments
+                .remove(crate::agent_cursor::INPUT_ORIGIN_ARG)
+                .and_then(|value| {
+                    value
+                        .as_str()
+                        .and_then(crate::agent_cursor::InputOrigin::parse)
+                });
         }
         crate::tool_args::sanitize_reserved_args(args);
         evidence
+    }
+
+    /// Record the call's input origin for the cursor key it resolves to
+    /// (`session`, else `_session_id`, else `cursor_id`, after namespacing),
+    /// so every platform overlay and the cursor hook embedder see it.
+    fn record_input_origin(&self, args: &Value) {
+        let Some(origin) = self.input_origin else {
+            return;
+        };
+        if let Some(key) = ["session", "_session_id", "cursor_id"]
+            .into_iter()
+            .find_map(|key| {
+                args.get(key)
+                    .and_then(Value::as_str)
+                    .filter(|v| !v.is_empty())
+            })
+        {
+            crate::agent_cursor::set_input_origin(key, origin);
+        }
     }
 
     fn apply_runtime_args(&self, args: &mut Value) {
@@ -645,6 +697,12 @@ impl TrustedInvocationEvidence {
         if self.browser_download_mcp_host_approved {
             arguments.insert(
                 crate::browser::download::MCP_HOST_DOWNLOAD_APPROVAL_ARG.to_owned(),
+                Value::Bool(true),
+            );
+        }
+        if self.native_window_pixels {
+            arguments.insert(
+                crate::snapshot_store::NATIVE_WINDOW_PIXELS_ARG.to_owned(),
                 Value::Bool(true),
             );
         }
@@ -699,6 +757,7 @@ impl ToolRegistry {
         let weak_captures = Arc::downgrade(&capture_service);
         let session_end_hook =
             crate::session::register_scoped_session_end_hook(move |session_id| {
+                crate::agent_cursor::forget_input_origin(session_id);
                 if let Some(ownership) = weak_ownership.upgrade() {
                     ownership.remove_session(session_id);
                 }
@@ -917,6 +976,17 @@ impl ToolRegistry {
         self.register(Box::new(GetSessionStateTool));
         self.register(Box::new(EndSessionTool));
         self.register(Box::new(PipTurnTool));
+        self.register_batch_tools();
+    }
+
+    /// Register `run_actions`, which re-enters this registry for every step.
+    /// Called from [`Self::register_session_tools`] so every platform that
+    /// registers sessions gets it; [`Self::init_self_weak`] supplies the
+    /// registry handle, as for `replay_trajectory`.
+    fn register_batch_tools(&mut self) {
+        self.register(Box::new(crate::batch_tools::RunActionsTool::new(
+            self.replay_registry.clone(),
+        )));
     }
 
     pub fn register_perception_tool(
@@ -955,6 +1025,34 @@ impl ToolRegistry {
     /// Call this once, immediately after `Arc::new(registry)`.
     pub fn init_self_weak(self: &Arc<Self>) {
         *self.replay_registry.lock().unwrap() = Arc::downgrade(self);
+    }
+
+    /// Registered tools whose advertised input schema cannot admit a valid
+    /// call through the dispatch argument check. Open schemas bypass that
+    /// check, so each must be named in `open`.
+    pub fn input_conformance_violations(&self, open: &[&str]) -> Vec<String> {
+        let mut violations = Vec::new();
+        for name in &self.order {
+            let def = self.tools[name].def();
+            let schema = advertised_runtime_input_schema(name, &def.input_schema);
+            if schema["additionalProperties"] != false {
+                if !open.contains(&name.as_str()) {
+                    violations.push(format!("{name}: input schema is not closed"));
+                }
+                continue;
+            }
+            if schema.pointer("/properties/session").is_none() {
+                violations.push(format!("{name}: input schema does not accept `session`"));
+            }
+            let properties = &schema["properties"];
+            for field in schema["required"].as_array().into_iter().flatten() {
+                let field = field.as_str().unwrap_or_default();
+                if properties.get(field).is_none() {
+                    violations.push(format!("{name}: required `{field}` is not advertised"));
+                }
+            }
+        }
+        violations
     }
 
     pub fn tools_list(&self) -> Value {
@@ -1006,11 +1104,43 @@ impl ToolRegistry {
 
     /// Invoke a tool by name and (if recording is enabled) write its result to disk.
     pub async fn invoke(&self, name: &str, args: Value) -> ToolResult {
+        self.invoke_in_process(name, args, false).await
+    }
+
+    /// Invoke for a trusted in-process host whose window-relative pixel
+    /// arguments (`x`/`y`, `from_x`/`to_y`, ...) are native window pixels
+    /// it measured itself, for example a Space stream relaying a viewer's
+    /// input at the captured window's native geometry.
+    ///
+    /// Window-relative pixel actions otherwise need a current snapshot of
+    /// that window with a screenshot owned by the calling session, which
+    /// supplies the screenshot-to-native scale. This entry point uses scale
+    /// 1.0 instead and needs no prior read. Element targets are unchanged:
+    /// they still take an `element_token` from a current snapshot.
+    ///
+    /// It is a Rust API only. The marker it sets travels as trusted
+    /// invocation evidence, never as a caller argument: dispatch strips every
+    /// underscore-prefixed argument before evidence is applied, no protocol
+    /// adapter extracts the marker, and nested registry calls (replay) do not
+    /// inherit it. MCP, the CLI, the SDK ABI and the wire therefore cannot
+    /// reach it.
+    pub async fn invoke_with_native_window_pixels(&self, name: &str, args: Value) -> ToolResult {
+        self.invoke_in_process(name, args, true).await
+    }
+
+    async fn invoke_in_process(
+        &self,
+        name: &str,
+        args: Value,
+        native_window_pixels: bool,
+    ) -> ToolResult {
         if let Ok(context) = DISPATCH_AUTHORIZATION_CONTEXT.try_with(Arc::clone) {
             let mut args = args;
-            let evidence = DISPATCH_TRUSTED_INVOCATION_EVIDENCE
+            let mut evidence = DISPATCH_TRUSTED_INVOCATION_EVIDENCE
                 .try_with(Clone::clone)
                 .unwrap_or_default();
+            // Only the outermost in-process call vouches for its pixels.
+            evidence.native_window_pixels = native_window_pixels;
             crate::tool_args::sanitize_reserved_args(&mut args);
             if let Some(bound_session) = context.public_session() {
                 let Some(arguments) = args.as_object_mut() else {
@@ -1047,14 +1177,43 @@ impl ToolRegistry {
                 ))
             }
         };
-        self.invoke_with_context(name, args, context).await
+        let evidence = TrustedInvocationEvidence {
+            native_window_pixels,
+            ..TrustedInvocationEvidence::default()
+        };
+        self.invoke_with_context_and_evidence(name, args, context, evidence)
+            .await
     }
 
     /// Invoke from a protocol adapter that already stripped caller-owned
     /// reserved fields before adding its own transport evidence.
     #[doc(hidden)]
-    pub async fn invoke_from_trusted_adapter(&self, name: &str, mut args: Value) -> ToolResult {
-        let evidence = TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
+    pub async fn invoke_from_trusted_adapter(&self, name: &str, args: Value) -> ToolResult {
+        self.invoke_from_trusted_adapter_in_process(name, args, false)
+            .await
+    }
+
+    /// [`Self::invoke_from_trusted_adapter`] for an in-process host whose
+    /// window-relative pixels are native window pixels; see
+    /// [`Self::invoke_with_native_window_pixels`].
+    #[doc(hidden)]
+    pub async fn invoke_from_trusted_adapter_with_native_window_pixels(
+        &self,
+        name: &str,
+        args: Value,
+    ) -> ToolResult {
+        self.invoke_from_trusted_adapter_in_process(name, args, true)
+            .await
+    }
+
+    async fn invoke_from_trusted_adapter_in_process(
+        &self,
+        name: &str,
+        mut args: Value,
+        native_window_pixels: bool,
+    ) -> ToolResult {
+        let mut evidence = TrustedInvocationEvidence::extract_from_adapter_args(&mut args);
+        evidence.native_window_pixels = native_window_pixels;
         let context = match crate::session_authorization::configured_registry()
             .and_then(|registry| registry.legacy_context())
         {
@@ -1158,16 +1317,33 @@ impl ToolRegistry {
             return ToolResult::error(format!("Unknown tool: {name}"));
         };
 
+        // MCP types `arguments` as an object and transports substitute `{}`
+        // when it is absent, but a client can still send any JSON value.
+        // Everything below indexes into the object (session stamping,
+        // protected-resource fingerprints, replay rewrites), so refuse other
+        // shapes here instead of panicking the dispatcher on a caller's input.
+        if !args.is_object() {
+            return ToolResult::error(format!(
+                "{resolved_name}: invalid arguments: expected a JSON object"
+            ))
+            .with_structured(serde_json::json!({
+                "code": "invalid_arguments",
+                "tool": resolved_name,
+                "detail": "arguments must be a JSON object",
+            }));
+        }
+
         // Normalize deprecated public argument spellings before any policy,
         // consent, recording, or implementation layer interprets the call.
         normalize_delivery_mode_args(tool.def(), &mut args);
+        let unknown_argument = unknown_argument(tool.def(), &args);
         if let Err(result) = crate::action_target::normalize_action_target(resolved_name, &mut args)
         {
             return result;
         }
         // After target normalization: a typed `target` has become pid/window_id
         // and is left alone.
-        crate::element_cache::fill_target_from_element_token(&mut args);
+        crate::snapshot_store::fill_target_from_element_token(&mut args);
         tool.resolve_target(&mut args).await;
         if let Err(result) = crate::action_target::enforce_delivery_target(resolved_name, &args) {
             return result;
@@ -1214,6 +1390,7 @@ impl ToolRegistry {
         if session_selecting_tool(resolved_name) {
             adopt_implicit_session(&mut args, &runtime_prefix);
         }
+        evidence.record_input_origin(&args);
         let runtime_session = args
             .get("_session_id")
             .and_then(Value::as_str)
@@ -1337,6 +1514,13 @@ impl ToolRegistry {
             return protected_refusal(
                 "os_permission_prompt_requires_trusted_host",
                 "operating-system permission prompts must be initiated by a trusted host outside the agent tool path; call check_permissions with prompt=false to inspect state",
+            );
+        }
+
+        if let Some(name) = unknown_argument {
+            return protected_refusal(
+                "invalid_arguments",
+                &format!("{resolved_name}: unknown argument {name}"),
             );
         }
 
@@ -1614,6 +1798,7 @@ impl ToolRegistry {
 
         // Reserve and capture the turn before dispatch so recorded evidence
         // shows the application immediately before the action changed it.
+        // Exclude session lifecycle calls, including one-shot CLI teardown.
         let should_record = !tool.def().read_only
             && !matches!(
                 resolved_name,
@@ -1625,6 +1810,9 @@ impl ToolRegistry {
                     | "act_and_read"
                     // Its steps are recorded as the calls they are.
                     | "browser_steps"
+                    | "run_actions"
+                    | "start_session"
+                    | "end_session"
             );
         let private_consent_turn = is_existing_profile_prepare(resolved_name, &args);
         let _desktop_action = if requires_desktop_coordination(
@@ -1647,9 +1835,18 @@ impl ToolRegistry {
         };
         let pending_turn = should_record
             .then(|| {
+                // Use the same trusted identities the recording owner was minted from.
+                let caller = crate::recording::RecordingCaller {
+                    session: runtime_session.as_deref(),
+                    transport: args.get("_transport_session_id").and_then(Value::as_str),
+                };
                 if private_consent_turn {
-                    self.recording
-                        .begin_private_turn(resolved_name, &recording_args, start_ms)
+                    self.recording.begin_private_turn(
+                        resolved_name,
+                        &recording_args,
+                        start_ms,
+                        caller,
+                    )
                 } else {
                     // A capture-bound click whose capture is already unknown,
                     // expired, or superseded is refused by every platform
@@ -1663,6 +1860,7 @@ impl ToolRegistry {
                         resolved_name,
                         &recording_args,
                         start_ms,
+                        caller,
                         predicted_refusal,
                     )
                 }
@@ -1854,15 +2052,15 @@ impl ToolRegistry {
             );
         }
         if result.is_error != Some(true) && matches!(name, "start_session" | "end_session") {
-            self.history.as_ref().map(|history| {
+            if let Some(history) = self.history.as_ref() {
                 history.session_event(
                     public_args
                         .get("session")
                         .and_then(Value::as_str)
                         .or(runtime_session.as_deref()),
                     name == "start_session",
-                )
-            });
+                );
+            }
         }
 
         // Record non-read-only, non-recording tool calls. The recording-
@@ -3390,6 +3588,11 @@ mod runtime_isolation_tests {
                 },
                 "additionalProperties": false
             })
+        } else if name == "check_permissions" {
+            serde_json::json!({
+                "type": "object", "properties": {"prompt": {"type": "boolean"}},
+                "additionalProperties": false
+            })
         } else {
             serde_json::json!({"type": "object"})
         };
@@ -3552,6 +3755,89 @@ mod runtime_isolation_tests {
         let registry = Arc::new(registry);
         registry.init_self_weak();
         registry
+    }
+
+    fn recording_scope_registry(hits: Arc<AtomicUsize>) -> Arc<super::ToolRegistry> {
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ReplayProbe {
+            hits,
+            def: super::ToolDef {
+                name: "probe".into(),
+                description: "runtime-local recording-scope probe".into(),
+                input_schema: serde_json::json!({
+                    "type": "object",
+                    "properties": { "session": { "type": "string" } },
+                }),
+                read_only: false,
+                destructive: false,
+                idempotent: true,
+                open_world: false,
+            },
+        }));
+        registry.register_recording_tools();
+        registry.register_session_tools();
+        let registry = Arc::new(registry);
+        registry.init_self_weak();
+        registry
+    }
+
+    #[tokio::test]
+    async fn recording_keeps_only_the_owning_session_and_never_lifecycle_calls() {
+        let registry = recording_scope_registry(Arc::new(AtomicUsize::new(0)));
+        let context = unrestricted_context();
+        let output = tempfile::tempdir().expect("temp dir");
+
+        let started = registry
+            .invoke_with_context(
+                "start_recording",
+                serde_json::json!({
+                    "output_dir": output.path(),
+                    "record_video": false,
+                    "session": "owner",
+                }),
+                context.clone(),
+            )
+            .await;
+        assert_ne!(started.is_error, Some(true), "{started:?}");
+
+        for (tool, session) in [
+            ("probe", "other"),
+            ("end_session", "other"),
+            ("end_session", "owner-lifecycle"),
+        ] {
+            let result = registry
+                .invoke_with_context(
+                    tool,
+                    serde_json::json!({ "session": session }),
+                    context.clone(),
+                )
+                .await;
+            assert_ne!(result.is_error, Some(true), "{tool} {session}: {result:?}");
+        }
+
+        let owned = registry
+            .invoke_with_context(
+                "probe",
+                serde_json::json!({ "session": "owner" }),
+                context.clone(),
+            )
+            .await;
+        assert_ne!(owned.is_error, Some(true), "{owned:?}");
+        registry
+            .invoke_with_context("stop_recording", serde_json::json!({}), context)
+            .await;
+
+        let action: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(output.path().join("turn-00001").join("action.json"))
+                .expect("the owning session's action is turn-00001"),
+        )
+        .expect("parse action.json");
+        assert_eq!(action["tool"], "probe");
+        assert_eq!(action["arguments"]["session"], "owner");
+        assert!(
+            !output.path().join("turn-00002").exists(),
+            "foreign and lifecycle calls must not leave turn folders"
+        );
     }
 
     #[tokio::test]
@@ -4239,8 +4525,177 @@ resources:
         }
     }
 
+    /// A trusted host relaying a human's input (a Cua Spaces viewer) marks
+    /// the call human-origin: its session draws no agent cursor on any
+    /// platform. A public caller cannot claim that origin.
     #[tokio::test]
-    async fn canonical_dispatch_normalizes_legacy_delivery_mode_before_execution() {
+    async fn trusted_human_origin_suppresses_the_agent_cursor_and_is_not_forgeable() {
+        use crate::agent_cursor::{input_origin, overlay_suppressed, InputOrigin};
+        let hits = Arc::new(AtomicUsize::new(0));
+        let last_args = Arc::new(Mutex::new(None));
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ArgumentProbe {
+            hits: hits.clone(),
+            last_args: last_args.clone(),
+            def: super::ToolDef {
+                name: "click".into(),
+                description: "test input".into(),
+                input_schema: serde_json::json!({"type": "object"}),
+                read_only: false,
+                destructive: false,
+                idempotent: false,
+                open_world: false,
+            },
+        }));
+        let registry = Arc::new(registry);
+        let session_of = |args: &serde_json::Value| {
+            args["_session_id"]
+                .as_str()
+                .expect("session key")
+                .to_owned()
+        };
+
+        let result = registry
+            .invoke_from_trusted_adapter(
+                "click",
+                serde_json::json!({"_session_id": "viewer-human-origin-1", "_input_origin": "human"}),
+            )
+            .await;
+        assert_ne!(result.is_error, Some(true), "{result:?}");
+        let received = last_args.lock().unwrap().clone().expect("arguments");
+        let human = session_of(&received);
+        assert!(human.ends_with("viewer-human-origin-1"));
+        assert_eq!(input_origin(&human), InputOrigin::Human);
+        assert!(overlay_suppressed(&human));
+
+        // An agent's trusted session keeps its cursor.
+        registry
+            .invoke_from_trusted_adapter(
+                "click",
+                serde_json::json!({"_session_id": "agent-origin-run-1"}),
+            )
+            .await;
+        let agent = session_of(&last_args.lock().unwrap().clone().unwrap());
+        assert!(!overlay_suppressed(&agent));
+
+        // A public caller's reserved argument is stripped, never honoured.
+        registry
+            .invoke(
+                "click",
+                serde_json::json!({"session": "forged-human-origin-1", "_input_origin": "human"}),
+            )
+            .await;
+        let forged = last_args.lock().unwrap().clone().unwrap();
+        assert!(forged.get("_input_origin").is_none());
+        assert!(!overlay_suppressed(&session_of(&forged)));
+        assert!(!overlay_suppressed(forged["session"].as_str().unwrap()));
+        assert_eq!(hits.load(Ordering::SeqCst), 3);
+
+        // Ending the session forgets its origin.
+        crate::session::end_session(&human);
+        assert!(!overlay_suppressed(&human));
+    }
+
+    /// Calls `click` through the registry it is registered in.
+    struct NestedClickProbe {
+        registry: Arc<std::sync::OnceLock<std::sync::Weak<super::ToolRegistry>>>,
+        def: super::ToolDef,
+    }
+
+    #[async_trait::async_trait]
+    impl super::Tool for NestedClickProbe {
+        fn def(&self) -> &super::ToolDef {
+            &self.def
+        }
+
+        async fn invoke(&self, _args: serde_json::Value) -> crate::protocol::ToolResult {
+            let registry = self.registry.get().and_then(std::sync::Weak::upgrade);
+            registry
+                .expect("registry is alive")
+                .invoke("click", serde_json::json!({}))
+                .await
+        }
+    }
+
+    #[tokio::test]
+    async fn native_window_pixels_come_only_from_the_in_process_entry_points() {
+        use crate::snapshot_store::NATIVE_WINDOW_PIXELS_ARG;
+        let hits = Arc::new(AtomicUsize::new(0));
+        let last_args = Arc::new(Mutex::new(None));
+        let handle = Arc::new(std::sync::OnceLock::new());
+        let def = |name: &str| super::ToolDef {
+            name: name.into(),
+            description: "test input".into(),
+            input_schema: serde_json::json!({"type": "object"}),
+            read_only: false,
+            destructive: false,
+            idempotent: false,
+            open_world: false,
+        };
+        let mut registry = super::ToolRegistry::new();
+        registry.register(Box::new(ArgumentProbe {
+            hits: hits.clone(),
+            last_args: last_args.clone(),
+            def: def("click"),
+        }));
+        registry.register(Box::new(NestedClickProbe {
+            registry: handle.clone(),
+            // A read-only composite, so it holds no input lane while the
+            // nested click runs.
+            def: super::ToolDef {
+                read_only: true,
+                ..def("list_windows")
+            },
+        }));
+        let registry = Arc::new(registry);
+        handle.set(Arc::downgrade(&registry)).unwrap();
+        let marked = |args: &Option<serde_json::Value>| {
+            args.as_ref().expect("arguments")[NATIVE_WINDOW_PIXELS_ARG]
+                == serde_json::Value::Bool(true)
+        };
+        let forged = serde_json::json!({ NATIVE_WINDOW_PIXELS_ARG: true });
+
+        // A public or adapter caller cannot assert native pixels.
+        registry.invoke("click", forged.clone()).await;
+        assert!(!marked(&last_args.lock().unwrap()));
+        registry
+            .invoke_from_trusted_adapter("click", forged.clone())
+            .await;
+        assert!(!marked(&last_args.lock().unwrap()));
+
+        // The in-process entry points do.
+        registry
+            .invoke_with_native_window_pixels("click", serde_json::json!({}))
+            .await;
+        assert!(marked(&last_args.lock().unwrap()));
+        registry
+            .invoke_from_trusted_adapter_with_native_window_pixels(
+                "click",
+                serde_json::json!({"_session_id": "native-pixels-viewer"}),
+            )
+            .await;
+        let received = last_args.lock().unwrap().clone();
+        assert!(marked(&received));
+        assert!(received.unwrap()["_session_id"]
+            .as_str()
+            .unwrap()
+            .ends_with("native-pixels-viewer"));
+
+        // A nested call (replay) does not inherit the outer call's claim.
+        // (The outer probe's result is not a list_windows payload; only the
+        // nested click's arguments matter here.)
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            registry.invoke_with_native_window_pixels("list_windows", serde_json::json!({})),
+        )
+        .await
+        .expect("the nested call completes");
+        assert_eq!(hits.load(Ordering::SeqCst), 5);
+        assert!(!marked(&last_args.lock().unwrap()));
+    }
+
+    #[tokio::test]
+    async fn dispatch_checks_argument_names_after_alias_normalization() {
         let hits = Arc::new(AtomicUsize::new(0));
         let last_args = Arc::new(Mutex::new(None));
         let mut registry = super::ToolRegistry::new();
@@ -4254,7 +4709,8 @@ resources:
                     "type": "object",
                     "properties": {
                         "delivery_mode": crate::tool_schema::delivery_mode_schema()
-                    }
+                    },
+                    "additionalProperties": false
                 }),
                 read_only: false,
                 destructive: false,
@@ -4267,7 +4723,7 @@ resources:
         let result = registry
             .invoke_with_context(
                 "click",
-                serde_json::json!({"dispatch": "foreground"}),
+                serde_json::json!({"dispatch": "foreground", "session": "schema-test"}),
                 standard_context(),
             )
             .await;
@@ -4277,6 +4733,24 @@ resources:
         let received = last_args.lock().unwrap().clone().expect("arguments");
         assert_eq!(received["delivery_mode"], "foreground");
         assert!(received.get("dispatch").is_none());
+
+        let result = registry
+            .invoke_with_context(
+                "click",
+                serde_json::json!({"unknown": null}),
+                standard_context(),
+            )
+            .await;
+        assert_eq!(result.is_error, Some(true));
+        assert_eq!(
+            result.structured_content.unwrap()["refusal"]["code"],
+            "invalid_arguments"
+        );
+        assert_eq!(
+            hits.load(Ordering::SeqCst),
+            1,
+            "must refuse before invocation"
+        );
     }
 
     #[tokio::test]
@@ -4453,7 +4927,7 @@ resources:
             let denied = registry
                 .invoke_with_context(
                     "check_permissions",
-                    serde_json::json!({"prompt": true, "session": "permissions"}),
+                    serde_json::json!({"prompt": true, "session": "permissions", "unknown": null}),
                     context,
                 )
                 .await;
@@ -5170,7 +5644,7 @@ resources:
     }
 
     #[tokio::test]
-    async fn element_tokens_are_bound_to_the_dispatch_runtime_generation() {
+    async fn element_tokens_resolve_only_in_the_runtime_that_published_them() {
         let pid = 8_675_309;
         let (first_cache, token) = DISPATCH_RUNTIME_SCOPE
             .scope("token-dispatch-runtime-a".to_owned(), async {
@@ -5188,30 +5662,23 @@ resources:
         let structured = DISPATCH_RUNTIME_SCOPE
             .scope("token-dispatch-runtime-b".to_owned(), async {
                 second_cache
-                    .resolve_element_args(pid, None, Some(&token), None, None, "click")
+                    .resolve(pid, &serde_json::json!({ "element_token": token }))
                     .unwrap_err()
             })
             .await
             .structured_content
             .unwrap();
-        assert_eq!(
-            structured["refusal"]["message"],
-            "element_token belongs to another runtime generation"
-        );
-        assert_eq!(
-            structured.pointer("/refusal/code"),
-            Some(&serde_json::Value::String("generation_mismatch".into()))
-        );
+        assert_eq!(structured["refusal"]["code"], "stale_element_token");
 
         let owner = DISPATCH_RUNTIME_SCOPE
             .scope("token-dispatch-runtime-a".to_owned(), async {
-                first_cache.resolve_element_args(pid, None, Some(&token), None, None, "click")
+                first_cache.resolve(pid, &serde_json::json!({ "element_token": token }))
             })
             .await;
         assert!(matches!(
             owner.unwrap(),
             crate::element_token::ResolvedElement::Element {
-                window_id: Some(44),
+                window_id: 44,
                 element_index: 0,
                 element: 0,
                 ..
@@ -5233,7 +5700,7 @@ resources:
         let fill = |scope: &'static str, args: serde_json::Value| {
             DISPATCH_RUNTIME_SCOPE.scope(scope.to_owned(), async move {
                 let mut args = args;
-                crate::element_cache::fill_target_from_element_token(&mut args);
+                crate::snapshot_store::fill_target_from_element_token(&mut args);
                 args
             })
         };
@@ -5266,7 +5733,7 @@ resources:
                     "target": {"kind": "window", "pid": pid, "window_id": 45},
                 });
                 crate::action_target::normalize_action_target("click", &mut args).unwrap();
-                crate::element_cache::fill_target_from_element_token(&mut args);
+                crate::snapshot_store::fill_target_from_element_token(&mut args);
                 args
             })
             .await;
@@ -5642,7 +6109,11 @@ fn synthesize_action_label(tool_name: &str, args: &Value) -> String {
     };
     let summary = match tool_name {
         "click" | "double_click" | "right_click" => {
-            if let Some(idx) = args.opt_u64("element_index") {
+            if let Some((_, idx)) = args
+                .opt_str("element_token")
+                .as_deref()
+                .and_then(crate::element_token::parse_token)
+            {
                 format!("element_index={idx}")
             } else if let (Some(x), Some(y)) = (args.opt_f64("x"), args.opt_f64("y")) {
                 format!("({x:.0}, {y:.0})")
@@ -5695,7 +6166,7 @@ mod capability_tests {
             "_public_session_label": "research",
             "_transport_session_id": format!("{prefix}proxy-1"),
         });
-        let public = serde_json::json!({"pid": 42, "window_id": 7, "element_index": 3});
+        let public = serde_json::json!({"pid": 42, "window_id": 7, "element_token": "s00000001:3"});
         let frame = pip_frame("click", &args, &public, prefix, None);
         assert_eq!(frame.session_key, format!("{prefix}research"));
         assert_eq!(frame.session_label.as_deref(), Some("research"));

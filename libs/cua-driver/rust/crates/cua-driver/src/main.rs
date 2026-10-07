@@ -34,6 +34,7 @@ mod perception_cli;
 mod private_worker;
 mod proxy;
 mod release_channel;
+mod release_source;
 mod responsibility;
 mod sdk_adapter;
 mod serve;
@@ -652,6 +653,7 @@ fn main() {
     if let Some(code) = chrome_native_host::run_if_requested() {
         std::process::exit(code);
     }
+    cua_driver_core::build_info::init(env!("CUA_DRIVER_GIT_SHA"));
     cua_driver_sdk::configure_perception_client_resolver(
         extension_manager::perception_client_resolver(),
     );
@@ -908,23 +910,16 @@ fn main() {
 
             // Keep the main thread alive for the daemon.
             //
-            // The overlay's loop is checked first: it is the only consumer of
-            // the cursor command channel (actions wait on it), and its
-            // NSApplication run loop also drains the main-queue blocks PiP
-            // posts. Running PiP's own loop while the cursor is on starved
-            // that channel and hung every action.
+            // The agent-cursor overlay and PiP both need the AppKit main run
+            // loop. The overlay's loop is NSApplication.run() plus the cursor
+            // command consumer, so it also drains the dispatch_async_f calls
+            // that create the PiP window and push its frames. Run it whenever
+            // the cursor is enabled; PiP's own loop alone would leave cursor
+            // commands unconsumed and hang every action.
             if cursor_cfg.enabled {
-                // Render the agent-cursor overlay: park the main thread in the
-                // AppKit run loop so the overlay NSWindow draws. `run_on_main_thread`
-                // self-guards on `has_graphic_access()` and returns immediately
-                // when the daemon has no Window Server session — fall through to
-                // join so the daemon still serves headless. The serve thread runs
-                // on its background thread regardless.
                 platform_macos::cursor::overlay::run_on_main_thread();
                 let _ = serve_handle.join();
             } else if pip_cfg.enabled {
-                // PiP needs the AppKit run loop to process the dispatch_async_f
-                // calls that update its panels.
                 platform_macos::pip::run_appkit_main_loop();
             } else {
                 // No overlay: still run a main run loop, or macOS never
@@ -1099,6 +1094,15 @@ fn main() -> anyhow::Result<()> {
     if let Some(code) = chrome_native_host::run_if_requested() {
         std::process::exit(code);
     }
+    cua_driver_core::build_info::init(env!("CUA_DRIVER_GIT_SHA"));
+    // An elevated Driver runs shell launches through this executable with a
+    // standard-user token (#3607). Checked before other Driver work.
+    #[cfg(target_os = "windows")]
+    if let Some(code) =
+        platform_windows::standard_user_launch::run_shell_launch_helper_if_requested()
+    {
+        std::process::exit(code);
+    }
     cua_driver_sdk::configure_perception_client_resolver(
         extension_manager::perception_client_resolver(),
     );
@@ -1132,27 +1136,27 @@ fn main() -> anyhow::Result<()> {
     match command {
         cli::Command::Telemetry(command) => {
             run_telemetry_command(command);
-            return Ok(());
+            Ok(())
         }
         cli::Command::ListTools => {
             let tools = inspect_tools_without_runtime();
             cli::run_list_tools(&tools);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Describe(name) => {
             let tools = inspect_tools_without_runtime();
             cli::run_describe(&tools, &name);
-            return Ok(());
+            Ok(())
         }
         cli::Command::McpConfig { client } => {
             cli::run_mcp_config(client.as_deref());
-            return Ok(());
+            Ok(())
         }
         cli::Command::Manifest { pretty } => {
             // Surface 8: machine-readable CLI manifest. Read-only — no
             // registry build needed.
             cli::run_manifest(pretty);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Call {
             tool,
@@ -1161,7 +1165,7 @@ fn main() -> anyhow::Result<()> {
             socket,
         } => {
             cli::run_call(&tool, json_args, screenshot_out_file, socket);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Serve {
             socket,
@@ -1224,7 +1228,7 @@ fn main() -> anyhow::Result<()> {
             })
             .join()
             .ok();
-            return Ok(());
+            Ok(())
         }
         cli::Command::Stop {
             socket,
@@ -1235,7 +1239,7 @@ fn main() -> anyhow::Result<()> {
                 Some(pid) => stop::run_pid_bound_stop_cmd(&sp, pid),
                 None => serve::run_stop_cmd(&sp),
             }
-            return Ok(());
+            Ok(())
         }
         cli::Command::Revoke {
             socket,
@@ -1244,18 +1248,18 @@ fn main() -> anyhow::Result<()> {
         } => {
             let sp = socket.unwrap_or_else(serve::default_socket_path);
             serve::run_revoke_cmd(&sp, session.as_deref(), all);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Status { socket } => {
             let sp = socket.unwrap_or_else(serve::default_socket_path);
             let pid_path = serve::default_pid_file_path();
             serve::run_status_cmd(&sp, &pid_path);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Sessions { json, socket } => {
             let sp = socket.unwrap_or_else(serve::default_socket_path);
             serve::run_sessions_list_cmd(&sp, json);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Recording {
             subcommand,
@@ -1263,7 +1267,7 @@ fn main() -> anyhow::Result<()> {
             socket,
         } => {
             cli::run_recording_cmd(&subcommand, &args, socket.as_deref());
-            return Ok(());
+            Ok(())
         }
         cli::Command::History {
             subcommand,
@@ -1273,20 +1277,20 @@ fn main() -> anyhow::Result<()> {
             confirmed,
         } => {
             cli::run_history_cmd(&subcommand, &args, socket.as_deref(), json, confirmed);
-            return Ok(());
+            Ok(())
         }
         cli::Command::DumpDocs { pretty, doc_type } => {
             let tools = inspect_tools_without_runtime();
             cli::run_dump_docs_with_type(&tools, pretty, &doc_type);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Update { apply, json } => {
             cli::run_update_cmd(apply, json);
-            return Ok(());
+            Ok(())
         }
         cli::Command::CheckUpdate { json, no_cache } => {
             cli::run_check_update_cmd(json, no_cache);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Channel {
             subcommand,
@@ -1294,7 +1298,7 @@ fn main() -> anyhow::Result<()> {
             json,
         } => {
             cli::run_channel_cmd(&subcommand, value.as_deref(), json);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Doctor { json } => {
             // Long-running interactive entry point — kick off the
@@ -1304,31 +1308,31 @@ fn main() -> anyhow::Result<()> {
                 version_check::maybe_announce_update();
             }
             cli::run_doctor_cmd(json);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Diagnose => {
             cli::run_diagnose_cmd();
-            return Ok(());
+            Ok(())
         }
         cli::Command::Permissions { subcommand, json } => {
             cli::run_permissions_cmd(&subcommand, json);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Autostart { subcommand } => {
             autostart::run_autostart_cmd(&subcommand);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Skills { subcommand, flags } => {
             skills::run(&subcommand, &flags);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Extension { args } => {
             extension_manager::run(&args);
-            return Ok(());
+            Ok(())
         }
         cli::Command::Perception { args } => {
             perception_cli::run(&args);
-            return Ok(());
+            Ok(())
         }
         cli::Command::CursorTheme { args } => {
             run_cursor_theme_command(&args);
@@ -1345,7 +1349,7 @@ fn main() -> anyhow::Result<()> {
                 value.as_deref(),
                 socket.as_deref(),
             );
-            return Ok(());
+            Ok(())
         }
         cli::Command::Mcp {
             socket,
@@ -1391,7 +1395,7 @@ fn main() -> anyhow::Result<()> {
                 std::process::exit(1);
             }
             telemetry::flush_pending(std::time::Duration::from_millis(750));
-            return Ok(());
+            Ok(())
         }
     }
 }

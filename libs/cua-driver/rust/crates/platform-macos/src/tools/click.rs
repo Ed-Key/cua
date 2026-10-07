@@ -2,7 +2,7 @@
 //!
 //! Two addressing modes:
 //!
-//! * **AX path** (`element_index` + `window_id`): performs AXAction on the cached
+//! * **AX path** (`element_token`): performs AXAction on the cached
 //!   element. Fires via AX RPC — the target app never needs to be frontmost.
 //!   Extra behaviors vs. the naive dispatch:
 //!   - AXTextField / AXTextArea: 800 ms post-click delay for WebKit DOM focus settle.
@@ -104,10 +104,7 @@ fn nearest_selectable_container_center(element_ptr: usize) -> Option<(f64, f64)>
         if owns_current {
             unsafe { CFRelease(current as CFTypeRef) };
         }
-        let Some(parent) = parent else {
-            return None;
-        };
-        current = parent;
+        current = parent?;
         owns_current = true;
     }
 
@@ -134,6 +131,59 @@ const SELECTION_READBACK_TIMEOUT: std::time::Duration = std::time::Duration::fro
 const SELECTION_READBACK_POLL: std::time::Duration = std::time::Duration::from_millis(25);
 const SELECTION_READBACK_SETTLE: std::time::Duration = std::time::Duration::from_millis(200);
 const SELECTION_READBACK_STABILITY: std::time::Duration = std::time::Duration::from_millis(250);
+
+/// AXPress on a radio button or checkbox that advertises it: a press whose
+/// effect the control's own AXValue shows.
+fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
+    ax_action == "AXPress"
+        && matches!(role, "AXRadioButton" | "AXCheckBox")
+        && advertised.iter().any(|action| action == "AXPress")
+}
+
+/// AX errors that AppKit apps return from a press they performed (#3835).
+/// Errors that mean the request never reached the app (illegal argument,
+/// invalid element, cannot complete, API disabled) are not among them.
+fn press_error_may_have_acted(err: crate::ax::bindings::AXError) -> bool {
+    use crate::ax::bindings::{
+        kAXErrorActionUnsupported, kAXErrorAttributeUnsupported, kAXErrorFailure,
+    };
+    matches!(
+        err,
+        kAXErrorFailure | kAXErrorAttributeUnsupported | kAXErrorActionUnsupported
+    )
+}
+
+/// Whether a toggle's value moving from `before` to `now` is what pressing it
+/// does: a checkbox changes state; a radio button becomes selected (a radio
+/// turning off was another radio's press).
+fn toggle_press_shows(role: &str, before: &str, now: &str) -> bool {
+    now != before && (role != "AXRadioButton" || now == "1")
+}
+
+/// The value `read` returns when, before `timeout`, it satisfies `shows` and
+/// a second read `stability` later agrees on it. Some apps (Finder's toolbar
+/// view switcher) apply a press and still return an AX error.
+fn settled_value(
+    shows: impl Fn(&str) -> bool,
+    mut read: impl FnMut() -> Option<String>,
+    timeout: std::time::Duration,
+    poll: std::time::Duration,
+    stability: std::time::Duration,
+) -> Option<String> {
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        if let Some(now) = read().filter(|now| shows(now)) {
+            std::thread::sleep(stability);
+            if read().as_deref() == Some(now.as_str()) {
+                return Some(now);
+            }
+        }
+        if std::time::Instant::now() >= deadline {
+            return None;
+        }
+        std::thread::sleep(poll);
+    }
+}
 
 fn pixel_activation_policy(
     button: &str,
@@ -218,10 +268,10 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "click".into(),
         description:
-            "Click an element or point. Prefer element_token (or element_index + snapshot_id) \
-             from get_window_state; it works on background or hidden windows without moving \
-             the pointer. Use x,y in get_window_state screenshot pixels only for surfaces \
-             missing from the tree. Background by default. \
+            "Click an element or point. Prefer element_token from get_window_state; it works \
+             on background or hidden windows without moving the pointer. Use x,y in \
+             get_window_state screenshot pixels only for surfaces missing from the tree. To \
+             choose a pop-up option use set_value. Background by default. \
              Details: skill://cua-driver/WORKFLOW.md"
             .into(),
         input_schema: serde_json::json!({
@@ -234,11 +284,9 @@ fn def() -> &'static ToolDef {
             "required": [],
             "properties": {
                 "session": cua_driver_core::tool_schema::session_schema(),
-                "pid":           { "type": "integer", "description": "Target process ID." },
-                "window_id":     { "type": "integer", "description": "Target window ID; required with element_index, carried by element_token." },
-                "element_index": cua_driver_core::tool_schema::element_index_schema(),
+                "pid":           { "type": "integer", "description": "Target process ID. Optional with element_token." },
+                "window_id":     { "type": "integer", "description": "Target window ID; required with x,y, carried by element_token." },
                 "element_token": cua_driver_core::tool_schema::element_token_schema(),
-                "snapshot_id": cua_driver_core::tool_schema::snapshot_id_schema(),
                 "capture_id": { "type": "string", "description": "Capture ID from get_window_state or get_desktop_state that x,y were read from; stale captures are refused." },
                 "x":             { "type": "number",  "description": "X in screenshot pixels: get_window_state for a window, get_desktop_state for the desktop." },
                 "y":             { "type": "number",  "description": "Y in the same screenshot pixels." },
@@ -425,7 +473,7 @@ impl Tool for ClickTool {
             };
         }
 
-        let pid = match args.require_i32("pid") {
+        let pid = match super::target_pid(&self.state, &args) {
             Ok(v) => v,
             Err(e) => return e,
         };
@@ -433,21 +481,8 @@ impl Tool for ClickTool {
         // the calling session's cursor, not the shared "default" one.
         let cursor_key = super::cursor_tools::resolve_cursor_key(&args);
 
-        // Surface 6: resolve element_token / element_index precedence
-        // BEFORE the pixel-path fallback. Token wins on disagreement; a
-        // stale token returns an explicit error instead of silently
-        // falling back to the integer (Surface 6 hard constraint).
-        let element_token_arg = args.opt_str("element_token");
         let window_id_arg = args.opt_u64("window_id");
-        let element_index_arg = args.opt_u64("element_index").map(|v| v as usize);
-        let resolved = match self.state.element_cache.resolve_element_args(
-            pid,
-            element_index_arg,
-            element_token_arg.as_deref(),
-            args.opt_str("snapshot_id").as_deref(),
-            window_id_arg,
-            "click",
-        ) {
+        let resolved = match self.state.snapshots.resolve(pid, &args) {
             Ok(r) => r,
             Err(e) => return e,
         };
@@ -593,7 +628,7 @@ impl Tool for ClickTool {
             // instead of Apple); a click must not land on that other row.
             let snapshot_row = self
                 .state
-                .element_cache
+                .snapshots
                 .with_latest_payload(pid, u64::from(wid), |payload| {
                     payload.rows.indexed.get(&idx).map(|(_, signature)| signature.clone())
                 })
@@ -624,12 +659,17 @@ impl Tool for ClickTool {
             // Animate cursor to element center BEFORE firing AX action,
             // mirroring Swift's `performElementClick` → `animateAndWait(to:)`.
             let center_guard = element_guard.clone();
-            let center = tokio::task::spawn_blocking(move || unsafe {
-                crate::ax::bindings::element_screen_center(center_guard.as_ptr() as AXUIElementRef)
+            // The element's screen rect rides along on the glide so motion
+            // styles can time by target size and highlight the target.
+            let (center, target_rect) = tokio::task::spawn_blocking(move || unsafe {
+                let el = center_guard.as_ptr() as AXUIElementRef;
+                (
+                    crate::ax::bindings::element_screen_center(el),
+                    element_screen_rect(el),
+                )
             })
             .await
-            .ok()
-            .flatten();
+            .unwrap_or((None, None));
 
             // Surface 5: button=middle on the AX path has no AX equivalent.
             // Fall back to a pixel middle-click at the element's screen-space center
@@ -641,7 +681,7 @@ impl Tool for ClickTool {
                     Some(c) => c,
                     None => {
                         return ToolResult::error(
-                            "click(button=middle) on element_index: could not resolve element \
+                            "click(button=middle) on element_token: could not resolve element \
                          center for the pixel-middle-click fallback. Pass x, y directly.",
                         )
                     }
@@ -650,7 +690,14 @@ impl Tool for ClickTool {
                     cursor_key.clone(),
                     cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                 );
-                crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy, Some(wid as u64)).await;
+                crate::cursor::overlay::animate_cursor_to_target(
+                    cursor_key.clone(),
+                    cx,
+                    cy,
+                    Some(wid as u64),
+                    target_rect,
+                )
+                .await;
                 self.state
                     .cursor_registry
                     .update_position(&cursor_key, cx, cy);
@@ -773,7 +820,14 @@ impl Tool for ClickTool {
                         cursor_key.clone(),
                         cursor_overlay::OverlayCommand::PinAbove(wid as u64),
                     );
-                    crate::cursor::overlay::animate_cursor_to(cursor_key.clone(), cx, cy, Some(wid as u64)).await;
+                    crate::cursor::overlay::animate_cursor_to_target(
+                        cursor_key.clone(),
+                        cx,
+                        cy,
+                        Some(wid as u64),
+                        target_rect,
+                    )
+                    .await;
                     self.state
                         .cursor_registry
                         .update_position(&cursor_key, cx, cy);
@@ -832,10 +886,8 @@ impl Tool for ClickTool {
                             let has_modifiers = !selection_modifiers.is_empty();
                             let action = || {
                                 outcome = Some(perform_ax_click(
-                                    element_ptr,
-                                    idx,
-                                    pid,
-                                    wid,
+                                    (element_ptr, idx),
+                                    (pid, wid),
                                     &action_clone,
                                     &ck,
                                     selection_pixel,
@@ -880,10 +932,8 @@ impl Tool for ClickTool {
                             Ok((outcome, fronted))
                         } else {
                             perform_ax_click(
-                                element_ptr,
-                                idx,
-                                pid,
-                                wid,
+                                (element_ptr, idx),
+                                (pid, wid),
                                 &action_clone,
                                 &ck,
                                 selection_pixel,
@@ -1176,14 +1226,13 @@ impl Tool for ClickTool {
             // backend after resolving the requested screen point. This keeps
             // targeting (PX) orthogonal to delivery (AX) and avoids making a
             // Chromium/AppKit window key merely to satisfy first-mouse rules.
-            if !delivery_mode.is_foreground()
-                && window_id.is_some()
-                && button_str == "left"
-                && count == 1
-                && modifiers.is_empty()
-            {
+            if let Some(hit_test_wid) = window_id.filter(|_| {
+                !delivery_mode.is_foreground()
+                    && button_str == "left"
+                    && count == 1
+                    && modifiers.is_empty()
+            }) {
                 let focus_only = action == "focus";
-                let hit_test_wid = window_id.expect("guarded by window_id.is_some() above");
                 // An AX press needs no activation, so guard it like the AX
                 // element path: this route used to return with no focus
                 // protection at all (measured: every delayed self-activation
@@ -1545,9 +1594,7 @@ impl Tool for ClickTool {
                 Err(e) => ToolResult::error(format!("Task error: {e}")),
             }
         } else {
-            ToolResult::error(
-                "Provide either (element_index + window_id) or (x + y). pid is always required.",
-            )
+            ToolResult::error("Provide either element_token or (x + y). pid is required for x,y clicks; an element_token carries its own pid.")
         }
     }
 }
@@ -1657,32 +1704,6 @@ fn focus_text_entry(
     ))
 }
 
-/// A press whose effect a toggle's own value shows: AXPress on a radio
-/// button or checkbox that advertises it.
-fn toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
-    ax_action == "AXPress"
-        && matches!(role, "AXRadioButton" | "AXCheckBox")
-        && advertised.iter().any(|action| action == "AXPress")
-}
-
-/// The toggle's new value when, within half a second, it moved away from
-/// `before` and two reads 100 ms apart agree on it.
-fn settled_change(before: &str, mut read: impl FnMut() -> Option<String>) -> Option<String> {
-    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
-    loop {
-        if let Some(now) = read().filter(|now| now != before) {
-            std::thread::sleep(std::time::Duration::from_millis(100));
-            if read().as_deref() == Some(now.as_str()) {
-                return Some(now);
-            }
-        }
-        if std::time::Instant::now() >= deadline {
-            return None;
-        }
-        std::thread::sleep(std::time::Duration::from_millis(50));
-    }
-}
-
 /// Returns `(summary_text, needs_webkit_delay, suspected_noop,
 /// selection_verified, selection_via_pixel)`.
 ///
@@ -1691,11 +1712,12 @@ fn settled_change(before: &str, mut read: impl FnMut() -> Option<String>) -> Opt
 /// the driver's only signal that the press likely did nothing. The caller turns
 /// it into `effect: "suspected_noop"` + an escalation hint so the agent crosses
 /// to the vision/pixel path instead of trusting a hollow success.
+///
+/// `element` is the cached AX element pointer and its snapshot index; `window`
+/// is the target (pid, window_id).
 fn perform_ax_click(
-    element_ptr: usize,
-    idx: usize,
-    pid: i32,
-    window_id: u32,
+    element: (usize, usize),
+    window: (i32, u32),
     ax_action: &str,
     cursor_key: &str,
     selection_pixel: Option<SelectionPixelTarget>,
@@ -1704,6 +1726,8 @@ fn perform_ax_click(
     snapshot_row: Option<&str>,
     prior_front: Option<i32>,
 ) -> anyhow::Result<(String, bool, bool, bool, bool)> {
+    let (element_ptr, idx) = element;
+    let (pid, window_id) = window;
     let element = element_ptr as AXUIElementRef;
     let action_label = crate::ax::tree::display_action_name(ax_action.to_owned());
 
@@ -1868,10 +1892,12 @@ fn perform_ax_click(
     let alive_before = unsafe { crate::ax::bindings::element_is_alive(element) };
     // A toggle's value before the press: some apps (Finder's toolbar view
     // switcher) apply the press and still return an AX error.
-    let toggle_before = toggle_press(ax_action, &role, &advertised)
-        .then(|| unsafe { crate::ax::bindings::copy_stringish_attr(element, "AXValue") })
-        .flatten()
-        .map(|value| value.state_value);
+    let read_value = || unsafe {
+        crate::ax::bindings::copy_stringish_attr(element, "AXValue").map(|value| value.state_value)
+    };
+    let toggle_before = is_toggle_press(ax_action, &role, &advertised)
+        .then(read_value)
+        .flatten();
     let err = unsafe { crate::ax::bindings::perform_action(element, ax_action) };
     if crate::ax::bindings::action_replaced_element(err, alive_before, || unsafe {
         crate::ax::bindings::element_gone_after_action(element)
@@ -1892,11 +1918,14 @@ fn perform_ax_click(
         ));
     }
     if err != crate::ax::bindings::kAXErrorSuccess {
-        if let Some(before) = toggle_before {
-            let read = || unsafe {
-                crate::ax::bindings::copy_stringish_attr(element, "AXValue").map(|value| value.state_value)
-            };
-            if let Some(now) = settled_change(&before, read) {
+        if let Some(before) = toggle_before.filter(|_| press_error_may_have_acted(err)) {
+            if let Some(now) = settled_value(
+                |now| toggle_press_shows(&role, &before, now),
+                read_value,
+                SELECTION_READBACK_TIMEOUT,
+                SELECTION_READBACK_POLL,
+                SELECTION_READBACK_STABILITY,
+            ) {
                 return Ok((
                     format!(
                         "✅ Performed {action_label} on [{idx}] {role} \"{title}\": its value is now \
@@ -1944,7 +1973,7 @@ fn perform_ax_click(
                 summary.push_str(
                     "\n\n⚠️ This is a popup/select button. The native macOS menu closes \
                      immediately when the window is in the background. Do NOT use click \
-                     again — instead, use:\n  set_value(pid, window_id, element_index, value)\n\
+                     again — instead, use:\n  set_value(pid, element_token, value)\n\
                      Available options: [",
                 );
                 summary.push_str(&opt_list);
@@ -2709,29 +2738,6 @@ fn select_row(
 mod tests {
     use super::*;
 
-    /// G3: Finder's toolbar view switcher applies the press and returns an
-    /// AX error; only a toggle's own settled value turns that into success.
-    #[test]
-    fn an_erroring_toggle_press_counts_only_when_its_value_settles_elsewhere() {
-        let press = vec!["AXPress".to_owned()];
-        assert!(toggle_press("AXPress", "AXRadioButton", &press));
-        assert!(toggle_press("AXPress", "AXCheckBox", &press));
-        assert!(!toggle_press("AXPress", "AXButton", &press), "a button has no value to show it");
-        assert!(!toggle_press("AXPick", "AXRadioButton", &press));
-        assert!(!toggle_press("AXPress", "AXRadioButton", &[]), "not advertised");
-
-        let mut reads = vec![Some("1".to_owned()), Some("1".to_owned())].into_iter();
-        assert_eq!(settled_change("0", || reads.next().flatten()), Some("1".to_owned()));
-        // Flickered and came back: no change.
-        let mut reads = vec![Some("1".to_owned()), Some("0".to_owned())]
-            .into_iter()
-            .chain(std::iter::repeat(Some("0".to_owned())));
-        assert_eq!(settled_change("0", || reads.next().flatten()), None);
-        // Never moved, or unreadable.
-        assert_eq!(settled_change("0", || Some("0".to_owned())), None);
-        assert_eq!(settled_change("0", || None), None);
-    }
-
     /// A scripted app for `climb_row_ladder`: which rungs apply, what each
     /// identity check reads, what each send does and what each read-back
     /// shows. Every call is logged in order.
@@ -2906,6 +2912,69 @@ mod tests {
     fn background_pointer_rung_uses_the_pixel_activation_recipe() {
         assert!(pointer_rung_activates_without_raise(false));
         assert!(!pointer_rung_activates_without_raise(true));
+    }
+
+    /// #3835: Finder's toolbar view switcher applies an AXPress and returns
+    /// -25205. Only a radio button or checkbox qualifies for the read-back.
+    #[test]
+    fn toggle_press_is_an_advertised_press_on_a_radio_or_checkbox() {
+        let press = vec!["AXPress".to_owned()];
+        assert!(is_toggle_press("AXPress", "AXRadioButton", &press));
+        assert!(is_toggle_press("AXPress", "AXCheckBox", &press));
+        assert!(
+            !is_toggle_press("AXPress", "AXButton", &press),
+            "a button has no value that shows the press"
+        );
+        assert!(!is_toggle_press("AXPick", "AXRadioButton", &press));
+        assert!(
+            !is_toggle_press("AXPress", "AXRadioButton", &[]),
+            "AXPress not advertised"
+        );
+    }
+
+    /// Only errors an app returns after acting qualify; errors that mean the
+    /// request never reached the app keep failing (#3835).
+    #[test]
+    fn only_errors_an_app_returns_after_acting_qualify() {
+        assert!(press_error_may_have_acted(-25200));
+        assert!(press_error_may_have_acted(-25205));
+        assert!(press_error_may_have_acted(-25206));
+        for refused in [-25201, -25202, -25204, -25211] {
+            assert!(!press_error_may_have_acted(refused), "{refused}");
+        }
+    }
+
+    /// A checkbox press shows as any state change; a radio press only as the
+    /// radio becoming selected.
+    #[test]
+    fn toggle_press_shows_as_the_value_the_press_produces() {
+        assert!(toggle_press_shows("AXCheckBox", "0", "1"));
+        assert!(toggle_press_shows("AXCheckBox", "1", "0"));
+        assert!(toggle_press_shows("AXCheckBox", "2", "1"), "mixed state");
+        assert!(!toggle_press_shows("AXCheckBox", "1", "1"));
+        assert!(toggle_press_shows("AXRadioButton", "0", "1"));
+        assert!(
+            !toggle_press_shows("AXRadioButton", "1", "0"),
+            "a radio turning off was another radio's press"
+        );
+        assert!(!toggle_press_shows("AXRadioButton", "1", "1"));
+    }
+
+    /// An erroring toggle press counts only when the value shows the press
+    /// and a second read agrees on it.
+    #[test]
+    fn erroring_toggle_press_counts_only_when_its_value_settles() {
+        let zero = std::time::Duration::ZERO;
+        let settled = |reads: Vec<Option<&str>>| {
+            let mut reads = reads.into_iter().map(|read| read.map(str::to_owned));
+            let shows = |now: &str| toggle_press_shows("AXRadioButton", "0", now);
+            settled_value(shows, || reads.next().flatten(), zero, zero, zero)
+        };
+        assert_eq!(settled(vec![Some("1"), Some("1")]), Some("1".to_owned()));
+        assert_eq!(settled(vec![Some("1"), Some("0")]), None, "flickered back");
+        assert_eq!(settled(vec![Some("1"), None]), None, "second read failed");
+        assert_eq!(settled(vec![Some("0")]), None, "never moved");
+        assert_eq!(settled(vec![None]), None, "unreadable");
     }
 
     /// Surface 5: schema must advertise the new `button` field with the three

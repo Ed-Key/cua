@@ -61,7 +61,7 @@ impl Tool for ZoomTool {
             },
         };
         let session_id = args.opt_str("_session_id");
-        let (pid, screenshot) = match self.state.element_cache.screenshot_context_for_zoom(
+        let (pid, screenshot) = match self.state.snapshots.screenshot_context_for_zoom(
             requested_pid,
             u64::from(window_id),
             session_id.as_deref(),
@@ -106,8 +106,7 @@ impl Tool for ZoomTool {
         match result {
             Ok(Ok(crop)) => {
                 // Store zoom context so from_zoom clicks can translate back.
-                if let Err(refusal) = state.zoom_registry.set_if_current(
-                    &state.element_cache,
+                if let Err(refusal) = state.snapshots.set_zoom(
                     pid,
                     session_id.as_deref(),
                     ZoomContext {

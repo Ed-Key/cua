@@ -45,10 +45,11 @@ impl Tool for StartRecordingTool {
     fn def(&self) -> &ToolDef {
         START_REC_DEF.get_or_init(|| ToolDef {
             name: "start_recording".into(),
-            description: "Record every later action tool call into turn-NNNNN folders under \
-                output_dir: before and after state and screenshots, action.json, click markers. \
-                record_video:true also writes recording.mp4 (ScreenCaptureKit on macOS 15+, \
-                ffmpeg elsewhere). Details: skill://cua-driver/RECORDING.md"
+            description: "Record the calling session's later action tool calls into turn-NNNNN \
+                folders under output_dir: before and after state and screenshots, action.json, click \
+                markers. record_video:true also writes recording.mp4 (ScreenCaptureKit on macOS 15+, \
+                ffmpeg elsewhere). Other sessions and start_session/end_session are not recorded; \
+                `cua-driver recording start` records daemon-wide. Details: skill://cua-driver/RECORDING.md"
                 .into(),
             input_schema: json!({
                 "type": "object",
@@ -74,7 +75,8 @@ impl Tool for StartRecordingTool {
                         "type": "boolean",
                         "default": true,
                         "description": "false records screenshots and actions without state."
-                    }
+                    },
+                    "session": crate::tool_schema::session_schema()
                 },
                 "additionalProperties": false
             }),
@@ -267,7 +269,7 @@ impl Tool for ReplayTrajectoryTool {
             // with its caveats about element-indexed actions and recording-
             // during-replay semantics.
             description: "Re-run each turn's recorded tool call from a start_recording directory, \
-                in order. Element-indexed actions fail because indices do not survive; pixel and \
+                in order. Element-token actions fail because tokens do not survive; pixel and \
                 keyboard actions replay. Details: skill://cua-driver/RECORDING.md".into(),
             input_schema: json!({
                 "type": "object",

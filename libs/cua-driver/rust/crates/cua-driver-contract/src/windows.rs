@@ -39,9 +39,8 @@ pub enum ElementFields {
     /// Every field.
     Full,
     // Declared last so the existing UniFFI ordinals keep their values.
-    /// Omit the `elements` array; address elements by tree index with
-    /// `element_token` = `<snapshot_id>:<index>` or `element_index` +
-    /// `snapshot_id`. The macOS default.
+    /// Omit the `elements` array; address a tree row `[index]` with
+    /// `element_token` = `<snapshot_id>:<index>`. The macOS default.
     #[default]
     None,
 }
@@ -161,6 +160,37 @@ pub struct GetWindowStateInput {
     #[schemars(schema_with = "timeout_ms_schema")]
     #[uniffi(default = None)]
     pub timeout_ms: Option<u32>,
+    /// Tree form: `markdown` (default), `elements`, or `both`. On macOS an
+    /// alias of element_fields (markdown = none, elements or both = full);
+    /// not with element_fields.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "tree_format_schema")]
+    #[uniffi(default = None)]
+    pub tree_format: Option<String>,
+    /// Return only what changed since this earlier `snapshot_id`. On macOS it
+    /// asks for the diff mode change list; a snapshot that is not this
+    /// session's previous look gives a full read.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "string_schema")]
+    #[uniffi(default = None)]
+    pub since: Option<String>,
+    /// Include `_note` and the full `background_input` report (on macOS:
+    /// background_input on every read).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
+    pub verbose: Option<bool>,
+    /// Restore the previous full response (both representations, all
+    /// metadata, platform walk limits). On macOS: element_fields full and
+    /// diff false unless those are passed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schemars(schema_with = "bool_schema")]
+    #[uniffi(default = None)]
+    pub full_output: Option<bool>,
+}
+
+fn tree_format_schema(_: &mut schemars::SchemaGenerator) -> schemars::Schema {
+    schemars::json_schema!({"type":"string", "enum":["markdown","elements","both"]})
 }
 
 /// Bounds of the accessibility-walk budget, shared with every live backend
@@ -206,6 +236,9 @@ impl ToolInput for GetWindowStateInput {
         if self.include_accessibility_tree == Some(false) && self.include_screenshot == Some(false)
         {
             return Err("window observation requires accessibility or screenshot capture".into());
+        }
+        if self.tree_format.is_some() && self.element_fields.is_some() {
+            return Err("pass tree_format or element_fields, not both".into());
         }
         Ok(())
     }
@@ -470,6 +503,24 @@ pub struct WindowStateOutput {
     pub truncated: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub truncation_reason: Option<String>,
+    /// Plain-language line saying the tree was cut at `max_elements` and how
+    /// to read more.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub truncation_hint: Option<String>,
+    /// Which representation this response carries.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_format: Option<String>,
+    /// The `since` snapshot_id the caller asked to diff against.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since: Option<String>,
+    /// `diff`, `no_change`, or the reason a full read was returned instead
+    /// (`unknown_snapshot`, `other_window`, `view_changed`, `too_much_changed`,
+    /// `diff_too_large`, `no_snapshot`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub since_status: Option<String>,
+    /// Added/changed/removed rows against `since`, one per line.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tree_diff: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub screenshot_width: Option<u32>,
     #[serde(default, skip_serializing_if = "Option::is_none")]

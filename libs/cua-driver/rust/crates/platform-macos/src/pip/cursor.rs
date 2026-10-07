@@ -284,8 +284,6 @@ mod tests {
         let side = (sprite_box(hotspot) * scale).ceil() as u32;
         let center = f64::from(side) / 2.0;
         for heading in HEADINGS {
-            // The anchor that puts the tip on the pixmap's center.
-            let (ox, oy) = cursor_overlay::default_anchor_for_tip((0.0, 0.0), heading);
             for action in CursorAction::ALL {
                 let mut visual = CursorVisualState::default();
                 visual.begin(action, None, None);
@@ -295,8 +293,9 @@ mod tests {
                     cursor_overlay::theme::paint_default_theme(
                         &mut pm,
                         &visual,
-                        (center + ox * scale) as f32,
-                        (center + oy * scale) as f32,
+                        // The painter draws the hotspot (the tip) here.
+                        center as f32,
+                        center as f32,
                         heading as f32,
                         scale as f32,
                         1.0,
@@ -346,14 +345,13 @@ mod tests {
             let center = f64::from(side) / 2.0;
             let mut reach = 0.0f64;
             for heading in HEADINGS {
-                let (ax, ay) = cursor_overlay::anchor_for_tip((0.0, 0.0), heading, hotspot);
                 let mut pm = tiny_skia::Pixmap::new(side, side).unwrap();
                 cursor_overlay::paint_compiled_theme(
                     &mut pm,
                     &theme,
                     &visual,
-                    (center + ax * scale) as f32,
-                    (center + ay * scale) as f32,
+                    center as f32,
+                    center as f32,
                     heading as f32,
                     scale as f32,
                     1.0,

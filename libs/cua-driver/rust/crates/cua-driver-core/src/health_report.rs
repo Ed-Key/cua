@@ -223,6 +223,11 @@ pub struct Report {
     pub driver_version: String,
     pub overall: Overall,
     pub checks: Vec<CheckEntry>,
+    /// Build identity of the running process (source revision and the
+    /// sha256 of the executable actually running). Additive under
+    /// `schema_version="1"`; absent from older drivers.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build: Option<crate::build_info::BuildInfo>,
 }
 
 // ── Provider trait ───────────────────────────────────────────────────────────
@@ -368,7 +373,7 @@ fn def() -> &'static ToolDef {
         // The description commits to the `schema_version="1"` output contract
         // (a test pins it). The full check matrix and output shape live in the
         // skill's TOOLS.md so the tool list stays short.
-        description: r#"One-call driver diagnostics: version, platform, session, permissions, and capabilities, with overall ok, degraded, or failed and a status and hint per check. Output contract schema_version="1"; tolerate unknown check names. include or skip limit the checks. Details: skill://cua-driver/TOOLS.md"#.into(),
+        description: r#"One-call driver diagnostics: version, platform, session, permissions, and capabilities, with overall ok, degraded, or failed and a status and hint per check. Output contract schema_version="1"; tolerate unknown check names. include or skip limit the checks. macOS skips direct capture: for standalone CuaDriver verify it with `cua-driver permissions grant`; an embedded driver uses its host's permission flow (the standalone command does not verify the host). Details: skill://cua-driver/TOOLS.md"#.into(),
         input_schema: json!({
             "type": "object",
             "properties": {
@@ -423,6 +428,7 @@ impl Tool for HealthReportTool {
             driver_version: env!("CARGO_PKG_VERSION").to_owned(),
             overall: compute_overall(&checks),
             checks,
+            build: Some(crate::build_info::current()),
         };
 
         let text = text_summary(&report);
@@ -542,6 +548,14 @@ mod tests {
         let chosen = select_checks(macos_names(), &BTreeSet::new(), &skip);
         assert!(!chosen.contains(NAME_TCC_ACCESSIBILITY));
         assert!(chosen.contains(NAME_BINARY_VERSION));
+    }
+
+    #[test]
+    fn advertised_capture_remediation_is_owner_scoped() {
+        let description = &def().description;
+        assert!(description.contains("For standalone CuaDriver"));
+        assert!(description.contains("does not verify"));
+        assert!(def().read_only);
     }
 
     // ── compute_overall ──────────────────────────────────────────────

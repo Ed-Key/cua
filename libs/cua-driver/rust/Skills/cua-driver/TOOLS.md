@@ -30,7 +30,8 @@ check `describe <tool>` there.
 ## get_window_state
 
 - Target with `pid` + `window_id`, or on macOS with `app` alone (app name, any case, or exact bundle id). `app` reads the app's only titled window on the current Space. It fails with `app_not_running`, `app_window_not_found`, or `app_window_ambiguous` (which lists `candidates` with `window_id`, `pid`, and `title`). Other platforms refuse `app`.
-- macOS `background_input` (the per-route background capability report) comes on the first read of a window in a session and again when it changes or on `diff:false`; otherwise it is omitted because it is unchanged.
+- macOS `background_input` (the per-route background capability report) comes on the first read of a window in a session and again when it changes, on a full look (`diff:false`), or with `verbose:true`; otherwise it is omitted because it is unchanged.
+- Upstream's shape arguments are accepted on macOS as aliases of the fork's, not with upstream's output. `full_output:true` defaults `element_fields` to `"full"` and `diff` to false (explicit `element_fields` or `diff` wins; the typed SDK and the test kit send `full_output` only when no shape argument is passed). `tree_format:"markdown"` is `element_fields:"none"`; `"elements"` and `"both"` are `"full"`, and `tree_markdown` stays in the response either way. Passing `tree_format` with `element_fields` is refused. `since:<snapshot_id>` asks for the diff: when it names this window's latest snapshot and that look is comparable, the response is the fork's change list (`tree_markdown` plus the `diff` object), never upstream's `tree_diff`, `since_status` or `diff_counts`; any other `since` returns the full outline. `verbose:true` sends `background_input` on every read. The default node budget stays 2000 (upstream's 250 applies on Windows and Linux).
 - Returns `tree_markdown`, the window's tree as text with actionable rows tagged `[N]` (their `element_index`). On macOS the default `element_fields:"none"` omits `structuredContent.elements`; the tree's first line reads `element_token = <snapshot_id>:<index>`, so row `[N]` has token `<snapshot_id>:N`. Pass `element_fields:"compact"` or `"full"` to get element records. Other platforms always return `elements`.
 - Record fields: `element_index`, `element_token`, `role`, `label`, `value` (the element's AXValue; use it to check what a field holds), `actions` (AX action names, omitted when empty), and `screenshot_frame`. Compact records omit `frame`, `parent_index`, `depth`, `enabled` when true, and `selected` when false; `element_fields:"full"` returns every field.
 - `include_accessibility_tree:false` skips the tree walk and returns the screenshot plus `window_bounds`, `screenshot_scale`, `screenshot_width`/`screenshot_height`, `app_name`, and `window_title` (the capture-only path, for example a live preview). Setting both `include_accessibility_tree:false` and `include_screenshot:false` is an error.
@@ -42,6 +43,7 @@ check `describe <tool>` there.
   - `window_id_not_found`: the window no longer exists; refresh `list_windows`.
   - `window_owner_pid_mismatch`: another process owns the window; retry with the reported `owner_pid`. A sandboxed app's Open/Save panel is hosted by a separate panel process.
   - `degraded_reason: ax_window_unresolved`: the window is live but its accessibility surface is not; the tree is empty, the screenshot is present, and background input is refused until it resolves. Re-read, or act with `delivery_mode:"foreground"`.
+  - `degraded_reason: ax_app_launching` with `truncation_reason: app_lookup_timeout`: the app has not finished launching and did not answer accessibility within `timeout_ms`; the tree is empty. Re-read in a moment or with a larger `timeout_ms`.
   - `px_frame_mismatch` or `px_capture_unavailable`: the screenshot or pixel frame could not be proven against the window bounds (a coherent 1x or 2x image), so it is omitted instead of guessed. The accessibility payload is still valid.
 
 ## get_desktop_state
@@ -55,7 +57,7 @@ check `describe <tool>` there.
 
 ## click
 
-- Element path (`element_token`, or `element_index` with `snapshot_id`): an accessibility action on the cached element. It works on background, hidden, minimized, and other-Space windows without moving the real pointer or stealing focus, and the element's cached role and label tell you what you clicked. The visible agent cursor follows the configured motion policy.
+- Element path (`element_token`): an accessibility action on the cached element. It works on background, hidden, minimized, and other-Space windows without moving the real pointer or stealing focus, and the element's cached role and label tell you what you clicked. The visible agent cursor follows the configured motion policy.
 - Pixel path (`x`,`y`): synthesized mouse events posted to the pid. It needs a visible on-screen window to anchor the conversion. Use it for canvas, video, WebGL, and custom-drawn surfaces that are absent from the tree.
 - `button`: on the pixel path, the matching mouse button. On the element path, `"right"` performs `AXShowMenu` (the same as `right_click`) and `"middle"`, which has no accessibility equivalent, falls back to a pixel middle-click at the element's center.
 - `capture_id`: with `x`,`y`, the driver admits and consumes that exact capture before dispatch. A stale, mismatched, or out-of-bounds capture is refused without fallback.
@@ -105,6 +107,11 @@ check `describe <tool>` there.
 - `observe` selects `query`, `query_context`, `element_fields` (none by default, so the read is the tree only), and an optional screenshot for the final read.
 - The result carries each child result, including errors, and `stopped_at` (1-based) when a step stopped the run. There is no semantic verification; the fresh read shows what happened.
 - It is not a transaction against other clients or user input. macOS only; Windows and Linux are not supported yet.
+
+## run_actions
+
+- Listed only in the full tool profile (`cua-driver mcp --tools full`). Steps are `{tool, args}` for click, double_click, right_click, set_value, type_text, press_key, hotkey, scroll or drag; all are validated before the first runs, and the batch stops at the first failure.
+- Each step's report carries only the first line of that tool's result, so outcome lines are not included. `observe` reads once at the end (default `include_screenshot:false`, `max_elements:200`). On macOS prefer `act_and_read` with `steps` for one window.
 
 ## run_sequence
 

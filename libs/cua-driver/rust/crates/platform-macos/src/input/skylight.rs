@@ -602,8 +602,8 @@ impl SpaceQuery {
 // ── Focus-without-raise ───────────────────────────────────────────────────────
 
 /// Activate `target_pid`'s window `target_wid` without raising any windows
-/// or triggering Space-follow. Ported from yabai's
-/// `window_manager_focus_window_without_raise`.
+/// or triggering Space-follow. Derived from yabai (MIT); see
+/// THIRD_PARTY_NOTICES.md.
 ///
 /// Recipe (target-only):
 /// 1. `SLSGetWindowOwner + SLSGetConnectionPSN` → target PSN, with

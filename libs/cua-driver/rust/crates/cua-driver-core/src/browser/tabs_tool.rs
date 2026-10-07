@@ -36,7 +36,8 @@ impl BrowserTabsTool {
                     "properties": {
                         "action": {
                             "type": "string",
-                            "enum": ["list", "open", "activate", "load", "close", "move", "group", "ungroup", "update_group"]
+                            "enum": ["list", "open", "activate", "load", "close", "move", "group", "ungroup", "update_group"],
+                            "description": "Tab operation."
                         },
                         "tab_id": { "type": "integer", "description": "One tab, for activate or load." },
                         "tab_ids": {
@@ -51,8 +52,8 @@ impl BrowserTabsTool {
                         "group": { "type": "boolean", "default": true, "description": "open: add the tab to the window's \"Cua\" group." },
                         "group_id": { "type": "integer", "description": "Existing group for group or update_group." },
                         "title": { "type": "string", "description": "Group name for group or update_group." },
-                        "color": { "type": "string", "enum": GROUP_COLORS },
-                        "collapsed": { "type": "boolean" },
+                        "color": { "type": "string", "enum": GROUP_COLORS, "description": "Group color for group or update_group." },
+                        "collapsed": { "type": "boolean", "description": "Collapse the group, for group or update_group." },
                         "pid": { "type": "integer", "description": "Chrome pid from list; required for every change." },
                         "session": crate::tool_schema::session_schema()
                     },

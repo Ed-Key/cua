@@ -13,10 +13,10 @@ use serde::{Deserialize, Serialize};
 
 use super::engine::{release_grant_claim, unsupported_engine_refusal};
 use super::platform::{
-    BrowserConsentOutcome, BrowserConsentRequest, ExistingProfileSetupOutcome,
-    ExistingProfileSetupRequest, IsolatedBrowserProcess, PrepareAction, PrepareAttachment,
-    PrepareAttachmentKind, PrepareOutcome, PrepareProfile, PrepareProfileMode, PrepareRequest,
-    PrepareSideEffects, PrepareStrategy,
+    BrowserConsentAction, BrowserConsentOutcome, BrowserConsentRequest,
+    ExistingProfileSetupOutcome, ExistingProfileSetupRequest, IsolatedBrowserProcess,
+    PrepareAction, PrepareAttachment, PrepareAttachmentKind, PrepareOutcome, PrepareProfile,
+    PrepareProfileMode, PrepareRequest, PrepareSideEffects, PrepareStrategy,
 };
 use super::refusal::{BrowserRefusal, BrowserRefusalCode};
 use super::types::{
@@ -62,19 +62,91 @@ fn validate_profile(profile: &PrepareProfile) -> Result<(), BrowserRefusal> {
 
 async fn claim_with_optional_consent<T, Claim, Consent>(
     claim: &mut Pin<Box<Claim>>,
+    action: &BrowserConsentAction,
     consent: Consent,
 ) -> Result<(anyhow::Result<T>, bool), BrowserRefusal>
 where
     Claim: Future<Output = anyhow::Result<T>>,
     Consent: Future<Output = Result<BrowserConsentOutcome, BrowserRefusal>>,
 {
+    // A timeout may stop observation, but must not detach a committed native worker.
     let mut consent = Box::pin(consent);
-    tokio::select! {
-        result = claim.as_mut() => Ok((result, false)),
-        outcome = consent.as_mut() => match outcome? {
-            BrowserConsentOutcome::Accepted => Ok((claim.as_mut().await, true)),
-            BrowserConsentOutcome::NotPresent => Ok((claim.as_mut().await, false)),
+    let (result, outcome) = {
+        let mut bounded = Box::pin(tokio::time::timeout(
+            Duration::from_secs(4),
+            consent.as_mut(),
+        ));
+        tokio::select! {
+            result = claim.as_mut() => {
+                if !action.started() {
+                    return Ok((result, false));
+                }
+                (Some(result), bounded.await)
+            },
+            outcome = bounded.as_mut() => (None, outcome),
+        }
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome?,
+        Err(_) => {
+            if action.started() {
+                consent.await.map_err(|mut error| {
+                    error
+                        .message
+                        .push_str(" (consent attempt deadline expired)");
+                    error
+                })?;
+            }
+            return Err(refusal(
+                BrowserRefusalCode::BrowserWrongTargetRefused,
+                "browser consent did not settle within its bounded attempt",
+            ));
+        }
+    };
+    let accepted = outcome == BrowserConsentOutcome::Accepted;
+    if action.started() && !accepted {
+        return Err(refusal(
+            BrowserRefusalCode::BrowserWrongTargetRefused,
+            "browser consent action did not produce a confirmed outcome",
+        ));
+    }
+    Ok((
+        match result {
+            Some(result) => result,
+            None => claim.as_mut().await,
         },
+        accepted,
+    ))
+}
+
+/// Claim, handling a browser consent prompt if the claim is still pending
+/// after 500 ms. `prompt_possible: false` (the extension route, which never
+/// raises Chrome's prompt) awaits the claim alone and never builds or polls
+/// the consent future.
+async fn claim_with_delayed_consent<T, Claim, Consent, MakeConsent>(
+    prompt_possible: bool,
+    claim: Claim,
+    consent: MakeConsent,
+) -> Result<(anyhow::Result<T>, bool), BrowserRefusal>
+where
+    MakeConsent: FnOnce(BrowserConsentAction) -> Consent,
+    Claim: Future<Output = anyhow::Result<T>>,
+    Consent: Future<Output = Result<BrowserConsentOutcome, BrowserRefusal>>,
+{
+    if !prompt_possible {
+        return Ok((claim.await, false));
+    }
+    let mut claim = Box::pin(claim);
+    let initial = tokio::select! {
+        result = &mut claim => Some(result),
+        _ = tokio::time::sleep(Duration::from_millis(500)) => None,
+    };
+    match initial {
+        Some(result) => Ok((result, false)),
+        None => {
+            let action = BrowserConsentAction::default();
+            claim_with_optional_consent(&mut claim, &action, consent(action.clone())).await
+        }
     }
 }
 
@@ -82,14 +154,17 @@ async fn retry_claim_after_accepted_consent<T, Retry>(
     initial: anyhow::Result<T>,
     accepted_consent: bool,
     retry: Retry,
-) -> (anyhow::Result<T>, Option<anyhow::Error>)
+) -> Result<(anyhow::Result<T>, Option<anyhow::Error>, bool), BrowserRefusal>
 where
-    Retry: Future<Output = anyhow::Result<T>>,
+    Retry: Future<Output = Result<(anyhow::Result<T>, bool), BrowserRefusal>>,
 {
     match initial {
-        Ok(value) => (Ok(value), None),
-        Err(initial_error) if accepted_consent => (retry.await, Some(initial_error)),
-        Err(error) => (Err(error), None),
+        Ok(value) => Ok((Ok(value), None, false)),
+        Err(initial_error) if accepted_consent => {
+            let (result, displayed_consent_prompt) = retry.await?;
+            Ok((result, Some(initial_error), displayed_consent_prompt))
+        }
+        Err(error) => Ok((Err(error), None, false)),
     }
 }
 
@@ -370,14 +445,49 @@ fn cleanup_created_profile_as_browser(
 fn configure_linux_isolated_browser_command(
     command: &mut Command,
     native_wayland: bool,
-    no_sandbox: bool,
+    sandbox: LinuxBrowserSandbox,
 ) {
     command.arg("--password-store=basic");
     if native_wayland {
         command.arg("--ozone-platform=wayland");
     }
-    if no_sandbox {
-        command.arg("--no-sandbox");
+    match sandbox {
+        LinuxBrowserSandbox::Full => {}
+        LinuxBrowserSandbox::NoSeccomp => {
+            command.arg("--disable-seccomp-filter-sandbox");
+        }
+        LinuxBrowserSandbox::None => {
+            command.arg("--no-sandbox");
+        }
+    }
+}
+
+/// How much of Chromium's own sandbox the runtime carries. The image decides
+/// (libs/images/common/desktop/browser-sandbox.sh writes the variables into
+/// the session environment); nothing is guessed here.
+#[cfg(target_os = "linux")]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LinuxBrowserSandbox {
+    /// Namespaces and seccomp-bpf, as shipped.
+    Full,
+    /// gVisor on arm64: namespaces work, the renderer's seccomp-bpf filter
+    /// kills every tab, so only that layer goes off.
+    NoSeccomp,
+    /// No unprivileged user namespaces (a container under docker's default
+    /// seccomp profile): the container boundary is the sandbox.
+    None,
+}
+
+#[cfg(target_os = "linux")]
+fn linux_browser_sandbox(var: impl Fn(&str) -> Option<String>) -> LinuxBrowserSandbox {
+    let on = |name: &str| var(name).as_deref() == Some("1");
+    // CUA_E2E_BROWSER_NO_SANDBOX is the older test spelling.
+    if on("CUA_DRIVER_BROWSER_NO_SANDBOX") || on("CUA_E2E_BROWSER_NO_SANDBOX") {
+        LinuxBrowserSandbox::None
+    } else if on("CUA_DRIVER_BROWSER_NO_SECCOMP_SANDBOX") {
+        LinuxBrowserSandbox::NoSeccomp
+    } else {
+        LinuxBrowserSandbox::Full
     }
 }
 
@@ -407,8 +517,8 @@ fn isolated_browser_command(executable: &str, profile: &Path) -> Command {
             .is_ok_and(|session| session.eq_ignore_ascii_case("wayland"))
             && std::env::var_os("WAYLAND_DISPLAY").is_some()
             && std::env::var_os("DISPLAY").is_none();
-        let no_sandbox = std::env::var("CUA_E2E_BROWSER_NO_SANDBOX").as_deref() == Ok("1");
-        configure_linux_isolated_browser_command(&mut command, native_wayland, no_sandbox);
+        let sandbox = linux_browser_sandbox(|name| std::env::var(name).ok());
+        configure_linux_isolated_browser_command(&mut command, native_wayland, sandbox);
     }
     let stderr = if std::env::var_os("CUA_E2E_BROWSER_STDERR").is_some() {
         Stdio::inherit()
@@ -1177,72 +1287,13 @@ impl BrowserEngine {
             cleanup_remote_debugging,
             protected_consent,
         );
-        let (claimed, displayed_consent_prompt) = {
-            let ws_url = endpoint.ws_url.clone();
-            let mut claim = Box::pin(self.pool.claim_existing(&ws_url, grant.generation, || {
-                self.existing_profile_grants.is_current(
-                    &request.session,
-                    request.transport_session.as_deref(),
-                    pid,
-                    grant.generation,
-                )
-            }));
-            // The extension route never raises Chrome's remote-debugging prompt,
-            // so a slow claim there must not press Allow on some other client's.
-            let prompt_possible =
-                endpoint.transport != super::types::EndpointTransport::ExtensionRelay;
-            let initial = tokio::select! {
-                result = &mut claim => Some(result),
-                _ = tokio::time::sleep(Duration::from_millis(500)), if prompt_possible => None,
-            };
-            if let Some(result) = initial {
-                (result, false)
-            } else {
-                match claim_with_optional_consent(
-                    &mut claim,
-                    self.platform
-                        .handle_existing_profile_consent(BrowserConsentRequest {
-                            pid,
-                            window_id,
-                            attempt: 1,
-                        }),
-                )
-                .await
-                {
-                    Ok(result) => result,
-                    Err(error) => {
-                        // The connection future may hold the pool mutex while
-                        // awaiting its WebSocket handshake. Cancel it before
-                        // revoking the grant, which also needs that mutex.
-                        drop(claim);
-                        self.revoke_existing_profile_grant(
-                            &request.session,
-                            request.transport_session.as_deref(),
-                            pid,
-                        )
-                        .await;
-                        let error = with_setup_side_effects(error, &setup);
-                        if setup_pending {
-                            return Err(setup_guard
-                                .as_mut()
-                                .expect("setup guard exists while setup is pending")
-                                .abort(error)
-                                .await);
-                        }
-                        return Err(error);
-                    }
-                }
-            }
-        };
-        // Chrome on Windows can reject the WebSocket handshake that was
-        // pending while its native remote-debugging consent prompt was open.
-        // After an explicit acceptance, make one fresh, bounded dial to the
-        // same attested endpoint under the same grant. The driver does not
-        // request consent again or broaden the approved target; the browser
-        // still owns any transport-level UI for the fresh connection.
-        let (claimed, initial_claim_error) = retry_claim_after_accepted_consent(
-            claimed,
-            displayed_consent_prompt,
+        // The extension route never raises Chrome's remote-debugging prompt, so
+        // a slow claim there (initial or fresh) must never reach the consent
+        // handler: it could press Allow on a prompt raised for another client.
+        let prompt_possible =
+            endpoint.transport != super::types::EndpointTransport::ExtensionRelay;
+        let (claimed, displayed_consent_prompt) = match claim_with_delayed_consent(
+            prompt_possible,
             self.pool
                 .claim_existing(&endpoint.ws_url, grant.generation, || {
                     self.existing_profile_grants.is_current(
@@ -1252,8 +1303,93 @@ impl BrowserEngine {
                         grant.generation,
                     )
                 }),
+            |action| {
+                self.platform
+                    .handle_existing_profile_consent(BrowserConsentRequest {
+                        action,
+                        pid,
+                        window_id,
+                        attempt: 1,
+                    })
+            },
         )
-        .await;
+        .await
+        {
+            Ok(result) => result,
+            Err(error) => {
+                // The helper owns and cancels the connection future before it
+                // returns a consent error. Grant revocation can therefore take
+                // the same socket-pool mutex without deadlocking.
+                self.revoke_existing_profile_grant(
+                    &request.session,
+                    request.transport_session.as_deref(),
+                    pid,
+                )
+                .await;
+                let error = with_setup_side_effects(error, &setup);
+                if setup_pending {
+                    return Err(setup_guard
+                        .as_mut()
+                        .expect("setup guard exists while setup is pending")
+                        .abort(error)
+                        .await);
+                }
+                return Err(error);
+            }
+        };
+        // Chrome on Windows can reject the WebSocket handshake that was
+        // pending while its native remote-debugging consent prompt was open.
+        // After an explicit acceptance, make one fresh, bounded dial to the
+        // same attested endpoint under the same grant. The driver does not
+        // broaden the approved target. Because Chrome can require consent for
+        // each genuinely new browser-level socket, the one fresh dial handles
+        // one exact browser-owned prompt against the same PID and window. The
+        // extension route never accepts a prompt, so it never redials here,
+        // and the fresh dial carries the same consent gate regardless.
+        let retry = claim_with_delayed_consent(
+            prompt_possible,
+            self.pool
+                .claim_existing(&endpoint.ws_url, grant.generation, || {
+                    self.existing_profile_grants.is_current(
+                        &request.session,
+                        request.transport_session.as_deref(),
+                        pid,
+                        grant.generation,
+                    )
+                }),
+            |action| {
+                self.platform
+                    .handle_existing_profile_consent(BrowserConsentRequest {
+                        action,
+                        pid,
+                        window_id,
+                        attempt: 2,
+                    })
+            },
+        );
+        let (claimed, initial_claim_error, fresh_consent_prompt) =
+            match retry_claim_after_accepted_consent(claimed, displayed_consent_prompt, retry).await
+            {
+                Ok(result) => result,
+                Err(error) => {
+                    self.revoke_existing_profile_grant(
+                        &request.session,
+                        request.transport_session.as_deref(),
+                        pid,
+                    )
+                    .await;
+                    let error = with_prepare_side_effects(error, &setup, displayed_consent_prompt);
+                    if setup_pending {
+                        return Err(setup_guard
+                            .as_mut()
+                            .expect("setup guard exists while setup is pending")
+                            .abort(error)
+                            .await);
+                    }
+                    return Err(error);
+                }
+            };
+        let displayed_consent_prompt = displayed_consent_prompt || fresh_consent_prompt;
         if let Err(_final_claim_error) = claimed {
             self.revoke_existing_profile_grant(
                 &request.session,
@@ -1340,6 +1476,246 @@ mod tests {
     use super::*;
 
     #[tokio::test]
+    async fn spawned_attestation_retries_absence_but_propagates_profile_errors() {
+        use super::super::types::EndpointTransport;
+        use super::super::v2_tests::fixture;
+        for case in ["missing", "wrong_url", "malformed", "unreadable"] {
+            let f = fixture().await;
+            let endpoint = OwnedEndpoint {
+                ws_url: "ws://127.0.0.1:9222/devtools/browser/expected".into(),
+                http_port: Some(9222),
+                transport: EndpointTransport::DevToolsActivePort,
+                ownership: EndpointOwnershipProof {
+                    method: EndpointOwnershipMethod::DevtoolsActivePortsFile,
+                    owner_pid: 1,
+                    listener_pid: None,
+                    detail: None,
+                },
+            };
+            let first = match case {
+                "missing" => Ok(None),
+                "wrong_url" => {
+                    let mut wrong = endpoint.clone();
+                    wrong.ws_url.push_str("-host");
+                    Ok(Some(wrong))
+                }
+                "malformed" => Err(refusal(
+                    BrowserRefusalCode::BrowserEndpointOwnerMismatch,
+                    "malformed second read",
+                )),
+                _ => Err(refusal(
+                    BrowserRefusalCode::BrowserRouteUnavailable,
+                    "unreadable second read",
+                )),
+            };
+            f.state.lock().unwrap().endpoint_responses = [first, Ok(Some(endpoint.clone()))].into();
+            let result = attest_spawned_endpoint(&f.engine, 1, endpoint.clone()).await;
+            if matches!(case, "missing" | "wrong_url") {
+                assert_eq!(result.unwrap().ws_url, endpoint.ws_url);
+                assert_eq!(f.state.lock().unwrap().endpoint_discovery_count, 2);
+            } else {
+                assert_eq!(
+                    result.unwrap_err().code,
+                    if case == "malformed" {
+                        BrowserRefusalCode::BrowserEndpointOwnerMismatch
+                    } else {
+                        BrowserRefusalCode::BrowserRouteUnavailable
+                    }
+                );
+                assert_eq!(f.state.lock().unwrap().endpoint_discovery_count, 1);
+            }
+        }
+    }
+
+    struct DropSignal(Arc<std::sync::atomic::AtomicBool>);
+
+    impl Drop for DropSignal {
+        fn drop(&mut self) {
+            self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+
+    #[tokio::test]
+    async fn claim_completion_preserves_started_consent_confirmation() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let confirmed = Arc::new(AtomicBool::new(false));
+        let confirmation = confirmed.clone();
+        let (action_tx, action_rx) = tokio::sync::oneshot::channel();
+        let mut claim = Box::pin(async {
+            action_rx.await.unwrap();
+            Ok::<_, anyhow::Error>(7_u8)
+        });
+        let action = BrowserConsentAction::default();
+        let marker = action.clone();
+        let consent = async move {
+            marker.perform(|| ());
+            action_tx.send(()).unwrap();
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            confirmation.store(true, Ordering::SeqCst);
+            Ok(BrowserConsentOutcome::Accepted)
+        };
+        let (result, displayed) = claim_with_optional_consent(&mut claim, &action, consent)
+            .await
+            .unwrap();
+        assert_eq!(result.unwrap(), 7);
+        assert!(displayed, "performed consent must be reported");
+        assert!(
+            confirmed.load(Ordering::SeqCst),
+            "post-action confirmation was cancelled"
+        );
+    }
+
+    #[tokio::test]
+    async fn started_consent_settles_success_refusal_and_timeout_for_both_claim_results() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for claim_succeeds in [true, false] {
+            for outcome in 0..4 {
+                let action = BrowserConsentAction::default();
+                let marker = action.clone();
+                let settled = Arc::new(AtomicBool::new(false));
+                let settle_marker = settled.clone();
+                let dropped = Arc::new(AtomicBool::new(false));
+                let drop_signal = DropSignal(dropped.clone());
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                let mut claim = Box::pin(async move {
+                    rx.await.unwrap();
+                    if claim_succeeds {
+                        Ok(7_u8)
+                    } else {
+                        Err(anyhow::anyhow!("claim failed"))
+                    }
+                });
+                let consent = async move {
+                    let _drop_signal = drop_signal;
+                    marker.perform(|| tx.send(()).unwrap());
+                    if outcome >= 2 {
+                        // Model Linux's non-cancellable native action worker.
+                        tokio::task::spawn_blocking(|| {
+                            std::thread::sleep(Duration::from_millis(4100));
+                        })
+                        .await
+                        .unwrap();
+                    } else {
+                        tokio::time::sleep(Duration::from_millis(10)).await;
+                    }
+                    settle_marker.store(true, Ordering::SeqCst);
+                    if outcome == 0 || outcome == 2 {
+                        Ok(BrowserConsentOutcome::Accepted)
+                    } else {
+                        Err(refusal(
+                            BrowserRefusalCode::BrowserConsentRevoked,
+                            "native action refused",
+                        ))
+                    }
+                };
+                let result = claim_with_optional_consent(&mut claim, &action, consent).await;
+                assert!(dropped.load(Ordering::SeqCst));
+                match outcome {
+                    0 => {
+                        let (claim, displayed) = result.unwrap();
+                        assert_eq!(claim.is_ok(), claim_succeeds);
+                        assert!(displayed && settled.load(Ordering::SeqCst));
+                    }
+                    1 | 3 => assert_eq!(
+                        result.unwrap_err().code,
+                        BrowserRefusalCode::BrowserConsentRevoked
+                    ),
+                    _ => {
+                        assert_eq!(
+                            result.unwrap_err().code,
+                            BrowserRefusalCode::BrowserWrongTargetRefused
+                        );
+                        assert!(
+                            settled.load(Ordering::SeqCst),
+                            "committed worker was detached on timeout"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn timed_out_consent_drains_before_pending_claim_is_dropped() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let claim_dropped = Arc::new(AtomicBool::new(false));
+        let claim_guard = DropSignal(claim_dropped.clone());
+        let worker_done = Arc::new(AtomicBool::new(false));
+        let finished = worker_done.clone();
+        let dropped_during_worker = claim_dropped.clone();
+        let result = claim_with_delayed_consent(
+            true,
+            async move {
+                let _guard = claim_guard;
+                std::future::pending::<anyhow::Result<u8>>().await
+            },
+            |action| async move {
+                action
+                    .perform(|| {
+                        tokio::task::spawn_blocking(move || {
+                            std::thread::sleep(Duration::from_millis(4100));
+                            assert!(!dropped_during_worker.load(Ordering::SeqCst));
+                            finished.store(true, Ordering::SeqCst);
+                        })
+                    })
+                    .await
+                    .unwrap();
+                Ok(BrowserConsentOutcome::Accepted)
+            },
+        )
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            BrowserRefusalCode::BrowserWrongTargetRefused
+        );
+        assert!(
+            worker_done.load(Ordering::SeqCst),
+            "attempt returned before worker settlement"
+        );
+        assert!(
+            claim_dropped.load(Ordering::SeqCst),
+            "caller must be able to revoke without a pending claim"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_claim_failure_cancels_unused_consent_without_waiting() {
+        let dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let signal = DropSignal(dropped.clone());
+        let mut claim = Box::pin(async { Err::<u8, _>(anyhow::anyhow!("dial failed")) });
+        let consent = async move {
+            let _signal = signal;
+            std::future::pending::<Result<BrowserConsentOutcome, BrowserRefusal>>().await
+        };
+        let (result, displayed) = tokio::time::timeout(
+            Duration::from_millis(100),
+            claim_with_optional_consent(&mut claim, &BrowserConsentAction::default(), consent),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert_eq!(result.unwrap_err().to_string(), "dial failed");
+        assert!(!displayed);
+        assert!(dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn started_action_cannot_settle_as_not_present() {
+        let action = BrowserConsentAction::default();
+        let marker = action.clone();
+        let mut claim = Box::pin(std::future::pending::<anyhow::Result<u8>>());
+        let result = claim_with_optional_consent(&mut claim, &action, async move {
+            marker.perform(|| ());
+            Ok(BrowserConsentOutcome::NotPresent)
+        })
+        .await;
+        assert_eq!(
+            result.unwrap_err().code,
+            BrowserRefusalCode::BrowserWrongTargetRefused
+        );
+    }
+
+    #[tokio::test]
     async fn completed_claim_wins_while_optional_consent_is_absent() {
         let mut claim = Box::pin(async {
             tokio::time::sleep(Duration::from_millis(10)).await;
@@ -1352,9 +1728,10 @@ mod tests {
                 "no consent surface",
             ))
         };
-        let (result, displayed) = claim_with_optional_consent(&mut claim, consent)
-            .await
-            .expect("the completed claim should win the race");
+        let (result, displayed) =
+            claim_with_optional_consent(&mut claim, &BrowserConsentAction::default(), consent)
+                .await
+                .expect("the completed claim should win the race");
         assert_eq!(result.unwrap(), 7);
         assert!(!displayed);
     }
@@ -1366,43 +1743,181 @@ mod tests {
             Ok::<_, anyhow::Error>(9_u8)
         });
         let (result, displayed) =
-            claim_with_optional_consent(&mut claim, async { Ok(BrowserConsentOutcome::Accepted) })
-                .await
-                .expect("accepted consent should resume the existing claim");
+            claim_with_optional_consent(&mut claim, &BrowserConsentAction::default(), async {
+                Ok(BrowserConsentOutcome::Accepted)
+            })
+            .await
+            .expect("accepted consent should resume the existing claim");
         assert_eq!(result.unwrap(), 9);
         assert!(displayed);
     }
 
     #[tokio::test]
+    async fn rejected_initial_claim_handles_consent_for_the_one_fresh_dial() {
+        let attempts = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (first_approved, first_waiting) = tokio::sync::oneshot::channel();
+        let first_attempts = attempts.clone();
+        let (initial, displayed) = claim_with_delayed_consent(
+            true,
+            async move {
+                first_waiting.await.expect("first consent should complete");
+                Err::<u8, _>(anyhow::anyhow!("first handshake rejected"))
+            },
+            |action| async move {
+                assert!(!action.started());
+                first_attempts.lock().unwrap().push(1_u8);
+                action.perform(|| first_approved.send(()).unwrap());
+                Ok(BrowserConsentOutcome::Accepted)
+            },
+        )
+        .await
+        .expect("first consent should remain bound to the initial claim");
+
+        let (second_approved, second_waiting) = tokio::sync::oneshot::channel();
+        let second_attempts = attempts.clone();
+        let retry = claim_with_delayed_consent(
+            true,
+            async move {
+                second_waiting
+                    .await
+                    .expect("second consent should complete");
+                Ok::<_, anyhow::Error>(11_u8)
+            },
+            |action| async move {
+                assert!(!action.started());
+                second_attempts.lock().unwrap().push(2_u8);
+                action.perform(|| second_approved.send(()).unwrap());
+                Ok(BrowserConsentOutcome::Accepted)
+            },
+        );
+        let (result, initial_error, fresh_displayed) =
+            retry_claim_after_accepted_consent(initial, displayed, retry)
+                .await
+                .expect("the bounded fresh claim should handle its own consent");
+
+        assert_eq!(result.unwrap(), 11);
+        assert_eq!(
+            initial_error.expect("initial error").to_string(),
+            "first handshake rejected"
+        );
+        assert!(fresh_displayed);
+        assert_eq!(*attempts.lock().unwrap(), vec![1, 2]);
+    }
+
+    #[tokio::test]
+    async fn immediately_completed_fresh_claim_does_not_poll_second_consent() {
+        let consent_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let consent_marker = consent_polled.clone();
+        let retry =
+            claim_with_delayed_consent(true, async { Ok::<_, anyhow::Error>(17_u8) }, |_| async move {
+                consent_marker.store(true, std::sync::atomic::Ordering::SeqCst);
+                Ok(BrowserConsentOutcome::Accepted)
+            });
+        let (result, initial_error, fresh_displayed) = retry_claim_after_accepted_consent(
+            Err(anyhow::anyhow!("first handshake rejected")),
+            true,
+            retry,
+        )
+        .await
+        .expect("the immediate fresh claim should win before consent");
+
+        assert_eq!(result.unwrap(), 17);
+        assert!(initial_error.is_some());
+        assert!(!fresh_displayed);
+        assert!(!consent_polled.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn closed_prompt_gate_awaits_a_slow_claim_without_consent() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        for prompt_possible in [false, true] {
+            let polled = Arc::new(AtomicBool::new(false));
+            let marker = polled.clone();
+            let (result, displayed) = claim_with_delayed_consent(
+                prompt_possible,
+                async {
+                    tokio::time::sleep(Duration::from_millis(700)).await;
+                    Ok::<_, anyhow::Error>(5_u8)
+                },
+                |_| async move {
+                    marker.store(true, Ordering::SeqCst);
+                    Ok(BrowserConsentOutcome::Accepted)
+                },
+            )
+            .await
+            .expect("the slow claim completes");
+            assert_eq!(result.unwrap(), 5);
+            // Closed gate (extension route): no consent call, even past 500 ms.
+            // Open gate: the same slow claim does ask, so the gate is what holds.
+            assert_eq!(displayed, prompt_possible);
+            assert_eq!(polled.load(Ordering::SeqCst), prompt_possible);
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_second_consent_cancels_the_fresh_claim_before_returning() {
+        let claim_dropped = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let drop_signal = DropSignal(claim_dropped.clone());
+        let retry = claim_with_delayed_consent(
+            true,
+            async move {
+                let _drop_signal = drop_signal;
+                std::future::pending::<anyhow::Result<u8>>().await
+            },
+            |action| async move {
+                action.perform(|| ());
+                Err(refusal(
+                    BrowserRefusalCode::BrowserConsentRevoked,
+                    "second consent was revoked",
+                ))
+            },
+        );
+        let error = retry_claim_after_accepted_consent(
+            Err(anyhow::anyhow!("first handshake rejected")),
+            true,
+            retry,
+        )
+        .await
+        .expect_err("the second consent refusal must fail closed");
+
+        assert_eq!(error.code, BrowserRefusalCode::BrowserConsentRevoked);
+        assert!(claim_dropped.load(std::sync::atomic::Ordering::SeqCst));
+    }
+
+    #[tokio::test]
     async fn accepted_consent_retries_one_failed_claim_with_a_fresh_dial() {
-        let (result, initial_error) = retry_claim_after_accepted_consent(
+        let (result, initial_error, fresh_displayed) = retry_claim_after_accepted_consent(
             Err(anyhow::anyhow!("pre-consent handshake rejected")),
             true,
-            async { Ok::<_, anyhow::Error>(11_u8) },
+            async { Ok((Ok::<_, anyhow::Error>(11_u8), false)) },
         )
-        .await;
+        .await
+        .expect("the fresh claim should succeed");
         assert_eq!(result.unwrap(), 11);
         assert_eq!(
             initial_error.expect("initial error").to_string(),
             "pre-consent handshake rejected"
         );
+        assert!(!fresh_displayed);
     }
 
     #[tokio::test]
     async fn claim_failure_without_accepted_consent_is_not_retried() {
         let retry_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let retry_marker = retry_polled.clone();
-        let (result, initial_error) = retry_claim_after_accepted_consent(
+        let (result, initial_error, fresh_displayed) = retry_claim_after_accepted_consent(
             Err::<u8, _>(anyhow::anyhow!("connection refused")),
             false,
             async move {
                 retry_marker.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok::<_, anyhow::Error>(12_u8)
+                Ok((Ok::<_, anyhow::Error>(12_u8), false))
             },
         )
-        .await;
+        .await
+        .expect("a claim without accepted consent should not retry");
         assert_eq!(result.unwrap_err().to_string(), "connection refused");
         assert!(initial_error.is_none());
+        assert!(!fresh_displayed);
         assert!(!retry_polled.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -1410,14 +1925,16 @@ mod tests {
     async fn successful_claim_does_not_retry_after_accepted_consent() {
         let retry_polled = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let retry_marker = retry_polled.clone();
-        let (result, initial_error) =
+        let (result, initial_error, fresh_displayed) =
             retry_claim_after_accepted_consent(Ok::<_, anyhow::Error>(13_u8), true, async move {
                 retry_marker.store(true, std::sync::atomic::Ordering::SeqCst);
-                Ok::<_, anyhow::Error>(14_u8)
+                Ok((Ok::<_, anyhow::Error>(14_u8), false))
             })
-            .await;
+            .await
+            .expect("a successful claim should not retry");
         assert_eq!(result.unwrap(), 13);
         assert!(initial_error.is_none());
+        assert!(!fresh_displayed);
         assert!(!retry_polled.load(std::sync::atomic::Ordering::SeqCst));
     }
 
@@ -1425,20 +1942,25 @@ mod tests {
     async fn accepted_consent_limits_a_failed_fresh_dial_to_one_retry() {
         let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
         let attempt_counter = attempts.clone();
-        let (result, initial_error) = retry_claim_after_accepted_consent(
+        let (result, initial_error, fresh_displayed) = retry_claim_after_accepted_consent(
             Err::<u8, _>(anyhow::anyhow!("pre-consent handshake rejected")),
             true,
             async move {
                 attempt_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-                Err::<u8, _>(anyhow::anyhow!("fresh handshake rejected"))
+                Ok((
+                    Err::<u8, _>(anyhow::anyhow!("fresh handshake rejected")),
+                    true,
+                ))
             },
         )
-        .await;
+        .await
+        .expect("the bounded fresh claim should return its connection result");
         assert_eq!(result.unwrap_err().to_string(), "fresh handshake rejected");
         assert_eq!(
             initial_error.expect("initial error").to_string(),
             "pre-consent handshake rejected"
         );
+        assert!(fresh_displayed);
         assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
@@ -1577,7 +2099,7 @@ mod tests {
     #[test]
     fn isolated_launch_can_select_native_wayland_and_test_vm_sandbox_mode() {
         let mut command = Command::new("chromium-under-test");
-        configure_linux_isolated_browser_command(&mut command, true, true);
+        configure_linux_isolated_browser_command(&mut command, true, LinuxBrowserSandbox::None);
         let args = command
             .get_args()
             .map(|arg| arg.to_string_lossy().into_owned())
@@ -1585,5 +2107,46 @@ mod tests {
         assert!(args.iter().any(|arg| arg == "--password-store=basic"));
         assert!(args.iter().any(|arg| arg == "--ozone-platform=wayland"));
         assert!(args.iter().any(|arg| arg == "--no-sandbox"));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn isolated_launch_sandbox_flags_follow_the_image_variables() {
+        let flags = |vars: &[(&str, &str)]| {
+            let vars = vars
+                .iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect::<std::collections::HashMap<_, _>>();
+            let sandbox = linux_browser_sandbox(|name| vars.get(name).cloned());
+            let mut command = Command::new("chromium-under-test");
+            configure_linux_isolated_browser_command(&mut command, false, sandbox);
+            command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .filter(|arg| arg.contains("sandbox"))
+                .collect::<Vec<_>>()
+        };
+        assert!(flags(&[]).is_empty());
+        assert_eq!(
+            flags(&[("CUA_DRIVER_BROWSER_NO_SECCOMP_SANDBOX", "1")]),
+            ["--disable-seccomp-filter-sandbox"]
+        );
+        assert_eq!(
+            flags(&[("CUA_DRIVER_BROWSER_NO_SANDBOX", "1")]),
+            ["--no-sandbox"]
+        );
+        assert_eq!(
+            flags(&[("CUA_E2E_BROWSER_NO_SANDBOX", "1")]),
+            ["--no-sandbox"]
+        );
+        // --no-sandbox already drops the seccomp layer with the rest.
+        assert_eq!(
+            flags(&[
+                ("CUA_DRIVER_BROWSER_NO_SANDBOX", "1"),
+                ("CUA_DRIVER_BROWSER_NO_SECCOMP_SANDBOX", "1"),
+            ]),
+            ["--no-sandbox"]
+        );
+        assert!(flags(&[("CUA_DRIVER_BROWSER_NO_SECCOMP_SANDBOX", "0")]).is_empty());
     }
 }
