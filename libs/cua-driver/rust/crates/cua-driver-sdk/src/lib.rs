@@ -2033,12 +2033,13 @@ mod tests {
     #[test]
     fn exported_typed_methods_cover_every_published_contract() {
         // pip_turn is for an MCP client's hooks (its turn events reach the
-        // daemon's preview panel); the SDK exports no method for it.
+        // daemon's preview panel) and browser_steps is an MCP batching
+        // convenience over the typed browser tools; the SDK exports neither.
         let mut expected = cua_driver_contract::manifest()
             .tools
             .into_iter()
             .map(|tool| tool.name)
-            .filter(|name| name != "pip_turn")
+            .filter(|name| name != "pip_turn" && name != "browser_steps")
             .collect::<Vec<_>>();
         expected.sort();
         let mut exported = EXPORTED_TOOL_NAMES.to_vec();

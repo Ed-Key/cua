@@ -484,7 +484,7 @@ async fn action_read_records_only_the_child_action() {
 }
 
 fn scroll_input() -> Value {
-    json!({"pid":42,"window_id":7,"action":"scroll","element_token":"fresh-token",
+    json!({"pid":42,"window_id":7,"action":"scroll","element_token":"s0000002a:3",
         "direction":"up","by":"page","amount":4})
 }
 

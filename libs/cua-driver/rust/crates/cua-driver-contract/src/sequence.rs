@@ -124,8 +124,10 @@ impl SequenceStep {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct RunSequenceInput {
+    /// Target process ID.
     #[schemars(schema_with = "positive_integer_schema")]
     pub pid: i64,
+    /// Target window ID; every step acts in this window.
     #[schemars(schema_with = "positive_integer_schema")]
     pub window_id: u64,
     /// Short run label; repeat it on every call. Omit for the implicit session.
@@ -136,6 +138,7 @@ pub struct RunSequenceInput {
     )]
     #[schemars(schema_with = "string_schema")]
     pub session: Option<String>,
+    /// 1 to 8 actions run in order, each verified before the next.
     #[schemars(length(min = 1, max = 8))]
     pub steps: Vec<SequenceStep>,
 }

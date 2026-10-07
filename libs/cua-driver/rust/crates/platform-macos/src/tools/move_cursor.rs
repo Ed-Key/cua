@@ -275,14 +275,15 @@ mod tests {
             (60.0, 80.0, 2.0, None, (500.0, 100.0), (530.0, 140.0)),
             (60.0, 80.0, 2.0, None, (-1440.0, -900.0), (-1410.0, -860.0)),
         ] {
-            // No delivered screenshot: the shared lookup (the one pixel
-            // clicks use) keeps native pixels. The downscale ratio math is
+            // Native window pixels (the trusted in-process flag): the shared
+            // lookup (the one pixel clicks use) keeps them; without it a
+            // window-pixel move needs this session's screenshot. The downscale ratio math is
             // covered by geometry::screenshot_to_screen.
             assert_eq!(ratio, None::<f64>);
             let tool = tool();
             let commands = RefCell::new(Vec::new());
             let result = tool.invoke_overlay(
-                json!({"x": x, "y": y, "scope": "window", "pid": 800, "window_id": 11, "session": "slice-a-move"}),
+                json!({"x": x, "y": y, "scope": "window", "pid": 800, "window_id": 11, "session": "slice-a-move", "_native_window_pixels": true}),
                 |pid, wid| async move {
                     assert_eq!((pid, wid), (800, 11));
                     Ok(frame(scale, origin.0, origin.1))
@@ -304,7 +305,7 @@ mod tests {
     #[tokio::test]
     async fn typed_window_normalization_reaches_the_same_move_operation() {
         let tool = tool();
-        let mut args = json!({"x":60,"y":80,"session":"slice-a-move", "target":{"kind":"window","pid":800,"window_id":11}});
+        let mut args = json!({"x":60,"y":80,"session":"slice-a-move", "_native_window_pixels": true, "target":{"kind":"window","pid":800,"window_id":11}});
         normalize_action_target("move_cursor", &mut args).unwrap();
         let result = tool
             .invoke_overlay(
@@ -409,7 +410,7 @@ mod tests {
             let expected = px_frame::refusal(&error);
             let result = tool
                 .invoke_overlay(
-                    json!({"x":60,"y":80,"pid":800,"window_id":11,"session":"slice-a-move"}),
+                    json!({"x":60,"y":80,"pid":800,"window_id":11,"session":"slice-a-move", "_native_window_pixels": true}),
                     |_, _| std::future::ready(Err(px_frame::refusal(&error))),
                     |key, wid, x, y| {
                         commands.borrow_mut().push((key, wid, x, y));
@@ -468,7 +469,7 @@ mod tests {
             let commands = RefCell::new(Vec::new());
             let result = tool
                 .invoke_overlay(
-                    json!({"x":60,"y":80,"pid":800,"window_id":11,"session":"slice-a-move"}),
+                    json!({"x":60,"y":80,"pid":800,"window_id":11,"session":"slice-a-move", "_native_window_pixels": true}),
                     |pid, wid| {
                         std::future::ready(require_window_owner(pid, wid, owner).map(|()| {
                             captured.set(true);

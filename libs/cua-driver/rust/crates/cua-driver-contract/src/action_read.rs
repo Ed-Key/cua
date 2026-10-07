@@ -15,6 +15,9 @@ fn present<'de, D: Deserializer<'de>, T: Deserialize<'de>>(d: D) -> Result<Optio
 fn string(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":"string"})
 }
+fn element_token(_: &mut SchemaGenerator) -> Schema {
+    json_schema!({"type":"string","pattern":"^s[0-9a-f]{8}:[0-9]+$"})
+}
 fn boolean(_: &mut SchemaGenerator) -> Schema {
     json_schema!({"type":"boolean"})
 }
@@ -291,8 +294,10 @@ pub struct ActionReadObservation {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct ActAndReadInput {
+    /// Target process ID.
     #[schemars(schema_with = "pid")]
     pub pid: u32,
+    /// Target window ID; every step acts in this window.
     #[schemars(schema_with = "window")]
     pub window_id: u32,
     /// Single-action form: click, set_value or scroll. Omit when passing steps.
@@ -310,7 +315,7 @@ pub struct ActAndReadInput {
         skip_serializing_if = "Option::is_none",
         deserialize_with = "present"
     )]
-    #[schemars(schema_with = "string")]
+    #[schemars(schema_with = "element_token")]
     #[uniffi(default = None)]
     pub element_token: Option<String>,
     #[serde(
@@ -358,6 +363,7 @@ pub struct ActAndReadInput {
     #[schemars(schema_with = "string")]
     #[uniffi(default = None)]
     pub session: Option<String>,
+    /// What the closing get_window_state read returns; defaults to the tree only.
     #[serde(default)]
     #[uniffi(default)]
     pub observe: ActionReadObservation,

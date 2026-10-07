@@ -373,7 +373,7 @@ fn def() -> &'static ToolDef {
         // The description commits to the `schema_version="1"` output contract
         // (a test pins it). The full check matrix and output shape live in the
         // skill's TOOLS.md so the tool list stays short.
-        description: r#"One-call driver diagnostics: version, platform, session, permissions, and capabilities, with overall ok, degraded, or failed and a status and hint per check. Output contract schema_version="1"; tolerate unknown check names. include or skip limit the checks. macOS skips direct capture: for standalone CuaDriver verify it with `cua-driver permissions grant`; an embedded driver uses its host's permission flow (the standalone command does not verify the host). Details: skill://cua-driver/TOOLS.md"#.into(),
+        description: r#"One-call driver diagnostics: version, platform, session, permissions, and capabilities, with overall ok, degraded, or failed and a status and hint per check. Output contract schema_version="1"; tolerate unknown check names. include or skip limit the checks. macOS skips direct capture. For standalone CuaDriver, verify it with `cua-driver permissions grant`; an embedded driver uses its host's permission flow (the standalone command does not verify the host). Details: skill://cua-driver/TOOLS.md"#.into(),
         input_schema: json!({
             "type": "object",
             "properties": {

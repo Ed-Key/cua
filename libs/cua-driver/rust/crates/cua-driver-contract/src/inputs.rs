@@ -558,6 +558,7 @@ impl ToolInput for EndSessionInput {
 
 /// A client hook reporting that the agent's turn started or ended.
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
+#[serde(deny_unknown_fields)]
 pub struct PipTurnInput {
     /// The client's hook event name: UserPromptSubmit, Stop, StopFailure or
     /// SessionEnd. Any other value is ignored.

@@ -406,7 +406,13 @@ const FfiConverterTypeActionReadStep = (() => {
 })();
 
 export type ActAndReadInput = {
+    /**
+     * Target process ID.
+     */
     pid: number,
+    /**
+     * Target window ID; every step acts in this window.
+     */
     windowId: number,
     /**
      * Single-action form: click, set_value or scroll. Omit when passing steps.
@@ -436,6 +442,9 @@ export type ActAndReadInput = {
      * Short run label; repeat it on every call. Omit for the implicit session.
      */
     session?: string,
+    /**
+     * What the closing get_window_state read returns; defaults to the tree only.
+     */
     observe: ActionReadObservation,
     /**
      * Instead of action: 1 to 8 actions run in order, stopping at the first failure.
@@ -6559,12 +6568,21 @@ const FfiConverterTypeSequenceStep = (() => {
 })();
 
 export type RunSequenceInput = {
+    /**
+     * Target process ID.
+     */
     pid: bigint,
+    /**
+     * Target window ID; every step acts in this window.
+     */
     windowId: bigint,
     /**
      * Short run label; repeat it on every call. Omit for the implicit session.
      */
     session?: string,
+    /**
+     * 1 to 8 actions run in order, each verified before the next.
+     */
     steps: Array<SequenceStep>
 }
 

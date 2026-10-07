@@ -61,6 +61,7 @@
           },
           "element_token": {
             "description": "Single-action form: the target element. Omit when passing steps.",
+            "pattern": "^s[0-9a-f]{8}:[0-9]+$",
             "type": "string"
           },
           "observe": {
@@ -69,6 +70,7 @@
               "include_screenshot": false,
               "query_context": false
             },
+            "description": "What the closing get_window_state read returns; defaults to the tree only.",
             "properties": {
               "element_fields": {
                 "description": "Passed to get_window_state: \"none\" (default, tree only), \"compact\" or \"full\" element records.",
@@ -105,6 +107,7 @@
             "type": "object"
           },
           "pid": {
+            "description": "Target process ID.",
             "maximum": 2147483647,
             "minimum": 1,
             "type": "integer"
@@ -200,6 +203,7 @@
             "type": "string"
           },
           "window_id": {
+            "description": "Target window ID; every step acts in this window.",
             "maximum": 4294967295,
             "minimum": 1,
             "type": "integer"
@@ -5230,7 +5234,7 @@
       },
       "schema_mode": "canonical_runtime",
       "input_schema": {
-        "additionalProperties": true,
+        "additionalProperties": false,
         "description": "A client hook reporting that the agent's turn started or ended.",
         "properties": {
           "event": {
@@ -5667,6 +5671,7 @@
         "additionalProperties": false,
         "properties": {
           "pid": {
+            "description": "Target process ID.",
             "minimum": 1,
             "type": "integer"
           },
@@ -5675,6 +5680,7 @@
             "type": "string"
           },
           "steps": {
+            "description": "1 to 8 actions run in order, each verified before the next.",
             "items": {
               "additionalProperties": false,
               "properties": {
@@ -5868,6 +5874,7 @@
             "type": "array"
           },
           "window_id": {
+            "description": "Target window ID; every step acts in this window.",
             "minimum": 1,
             "type": "integer"
           }
