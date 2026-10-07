@@ -204,8 +204,7 @@ fn run_native_named_groups(spec: &BrowserSpec) {
                 serde_json::json!({
                     "pid": fixture.pid,
                     "window_id": fixture.window_id,
-                    "element_index": targets[0],
-                    "snapshot_id": snapshot.snapshot_id(),
+                    "element_token": snapshot.element_token(targets[0]),
                     "delivery_mode": "foreground",
                 }),
             );
@@ -5823,8 +5822,9 @@ document.addEventListener('click', e => backgroundClickEvents.push({
                     * scale)
                     .into();
             } else {
-                args["element_index"] = button["element_index"].clone();
-                args["snapshot_id"] = snapshot.snapshot_id().into();
+                args["element_token"] = snapshot
+                    .element_token(button["element_index"].as_u64().unwrap())
+                    .into();
             }
             let ws = cdp_page_websocket_for_url(fixture.cdp_port, &fixture.server.page_url());
             let read = || {
