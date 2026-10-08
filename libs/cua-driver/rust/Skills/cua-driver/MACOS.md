@@ -327,6 +327,11 @@ so, and `set_value` on its field, then `press_key` return, end it without
 `bring_to_front` (the return needs `delivery_mode:"foreground"` when Finder has
 more than one window: the background key is refused there).
 
+The same holds for an Open or Save panel, or a browser's file chooser, that
+a cua action brought forward without meaning to (a desktop-scope click on
+it activates its app): the app stays in front while the panel is open, and
+the app in front before comes back once a cua action closes the panel.
+
 `drag` is the exception: macOS has no background drag. A window-scoped
 `drag` needs `delivery_mode:"foreground"` and `window_id`; without them it
 refuses with `background_unavailable` and sends nothing. The foreground drag

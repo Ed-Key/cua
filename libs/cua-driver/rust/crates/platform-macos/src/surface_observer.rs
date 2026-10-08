@@ -629,6 +629,45 @@ impl Tool for SurfaceNoted {
         if self.role != Role::Read {
             crate::window_change_detector::end_lingering_focus_guards();
         }
+        if self.role != Role::Action {
+            return self.observed(args).await;
+        }
+        // Any native action, a failed or windowless one too, can bring an app
+        // showing a panel forward (a desktop click on it): the front read
+        // first is owed back once the panel closes (`crate::front_lease`).
+        let before = tokio::task::spawn_blocking(crate::front_lease::Before::read)
+            .await
+            .ok();
+        // As `crate::outcome::begin` decides, these have no outcome watch to
+        // settle in; a windowless click may have just closed the panel.
+        let windowless =
+            pid_of(&args).is_none() || args.get("scope").and_then(Value::as_str) == Some("desktop");
+        let scroll = self.inner.def().name == "scroll";
+        let mut result = self.observed(args).await;
+        if let Some(before) = before {
+            let settle_here = if windowless {
+                Some(crate::front_lease::WINDOWLESS_SETTLE)
+            } else if scroll || result.is_error == Some(true) {
+                Some(std::time::Duration::ZERO)
+            } else {
+                None
+            };
+            let words = tokio::task::spawn_blocking(move || {
+                crate::front_lease::after_action(before, settle_here)
+            })
+            .await
+            .ok()
+            .flatten();
+            if let Some(words) = words {
+                cua_driver_core::outcome::append(&mut result, &words);
+            }
+        }
+        result
+    }
+}
+
+impl SurfaceNoted {
+    async fn observed(&self, args: Value) -> ToolResult {
         let Some(pid) = pid_of(&args) else {
             return self.inner.invoke(args).await;
         };

@@ -536,7 +536,7 @@ pub(crate) fn is_chromium(name: &str, bundle_id: &str) -> bool {
         .any(|token| products.contains(&token))
 }
 
-fn browser_product(name: &str, bundle_id: &str) -> BrowserProduct {
+pub(crate) fn browser_product(name: &str, bundle_id: &str) -> BrowserProduct {
     let name = name.to_ascii_lowercase();
     let bundle_id = bundle_id.to_ascii_lowercase();
     if bundle_id.starts_with("com.google.chrome") || name == "google chrome" {

@@ -2075,10 +2075,16 @@ impl OutcomeWatch for Watch {
         let pid = self.scope.pid;
         let line = self.describe_after().await;
         // After the app settled, whatever the reads gave: hand back a front
-        // an inline edit held, and say where the front is; with no lease,
-        // say when the app's edit is open behind it (`crate::front_lease`).
+        // an inline edit or a panel held, and say where the front is; with
+        // no lease, say when the app's edit is open behind it; and name the
+        // route that needs no browser file chooser (`crate::front_lease`).
         let front = tokio::task::spawn_blocking(move || {
-            crate::front_lease::settle().or_else(|| crate::front_lease::edit_open_behind(pid))
+            let front =
+                crate::front_lease::settle().or_else(|| crate::front_lease::edit_open_behind(pid));
+            match (front, crate::front_lease::chooser_hint(pid)) {
+                (Some(front), Some(hint)) => Some(format!("{front}; {hint}")),
+                (front, hint) => front.or(hint.map(str::to_owned)),
+            }
         })
         .await
         .ok()
