@@ -704,6 +704,9 @@ Use a current semantic ref whose `actions` contains `upload`, then call
 `browser_set_input_files` with one to 32 absolute regular-file paths. The tool
 rejects symlinks and directories, bypasses the native file picker, and returns
 only the assigned file count. Paths are redacted from trajectory arguments.
+When a page click already opened the browser's native file chooser, press its
+Cancel (a background `click` on the button) and use `browser_set_input_files`
+instead of working the chooser.
 
 ### Downloads
 

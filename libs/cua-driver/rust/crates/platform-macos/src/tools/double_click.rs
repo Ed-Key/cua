@@ -124,17 +124,28 @@ impl Tool for DoubleClickTool {
             // Thread the resolved session cursor key into the blocking AX path
             // so its ClickPulse lands on THIS session's cursor, not "default".
             let ck = cursor_key.clone();
-            let result = tokio::task::spawn_blocking(move || {
-                ax_double_click(
-                    pid,
-                    wid,
-                    element_guard.as_ptr(),
-                    idx,
-                    &ck,
-                    has_ax_open,
-                    delivery_mode.is_foreground(),
-                )
-            })
+            // An AXOpen needs no activation, so guard it as click guards its
+            // AXPress: AXOpen on an Open/Save panel row activates the panel's
+            // app (measured, and it fails there with -25205).
+            let foreground = delivery_mode.is_foreground();
+            let result = crate::focus_guard::with_focus_suppressed(
+                (!foreground).then_some(pid),
+                crate::apps::frontmost_pid(),
+                "double_click.AXOpen",
+                || {
+                    tokio::task::spawn_blocking(move || {
+                        ax_double_click(
+                            pid,
+                            wid,
+                            element_guard.as_ptr(),
+                            idx,
+                            &ck,
+                            has_ax_open,
+                            foreground,
+                        )
+                    })
+                },
+            )
             .await;
 
             return match result {

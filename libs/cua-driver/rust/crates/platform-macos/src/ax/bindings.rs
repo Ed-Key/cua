@@ -724,6 +724,146 @@ pub fn inline_edit_state(pid: i32) -> Option<bool> {
     }
 }
 
+/// An Open or Save panel, or another sheet, that an app shows (see
+/// [`panel_state`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Panel {
+    Save,
+    Open,
+    Sheet,
+}
+
+impl Panel {
+    /// AppKit identifies its file panels as `save-panel` / `open-panel`, as a
+    /// sheet (TextEdit's Save, Chrome's file chooser) or as a window of their
+    /// own (TextEdit's File > Open...).
+    fn from_identifier(identifier: Option<&str>) -> Self {
+        match identifier {
+            Some("save-panel") => Panel::Save,
+            Some("open-panel") => Panel::Open,
+            _ => Panel::Sheet,
+        }
+    }
+
+    pub fn name(self) -> &'static str {
+        match self {
+            Panel::Save => "Save panel",
+            Panel::Open => "Open panel",
+            Panel::Sheet => "sheet",
+        }
+    }
+}
+
+/// The panels `pid` shows, each with the WindowServer id of the window that
+/// holds it (the panel window itself, or the window a sheet is attached to):
+/// a sheet on any of its windows, or a window of its own that identifies as
+/// an Open or Save panel. Empty only when every window and its children
+/// answered; `None` when a read failed or the reads ran past their budget (a
+/// busy app).
+pub fn panel_state(pid: i32) -> Option<Vec<(Panel, u32)>> {
+    const READ_TIMEOUT_SECONDS: f32 = 0.2;
+    const BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+    let deadline = std::time::Instant::now() + BUDGET;
+    // Checked before every query: past the budget the read is unknown.
+    let live = || (std::time::Instant::now() < deadline).then_some(());
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, READ_TIMEOUT_SECONDS);
+        let windows = copy_element_array_attr_checked(app, "AXWindows", 64);
+        CFRelease(app as CFTypeRef);
+        let windows = match windows {
+            Ok(windows) => windows,
+            Err(error) if error == kAXErrorNoValue => return Some(Vec::new()),
+            Err(_) => return None,
+        };
+        // An identifier that is not there names a plain window or sheet; one
+        // that did not answer leaves the whole read unknown.
+        let identifier = |element: AXUIElementRef| -> Option<Panel> {
+            live()?;
+            match copy_string_attr_checked(element, "AXIdentifier") {
+                Ok(id) => Some(Panel::from_identifier(Some(&id))),
+                Err(error) if error == kAXErrorNoValue || error == kAXErrorAttributeUnsupported => {
+                    Some(Panel::Sheet)
+                }
+                Err(_) => None,
+            }
+        };
+        // The panels of one window; the holder's id is read only when one is found.
+        let read = |window: AXUIElementRef| -> Option<Vec<(Panel, u32)>> {
+            AXUIElementSetMessagingTimeout(window, READ_TIMEOUT_SECONDS);
+            let holder = || {
+                live()?;
+                ax_get_window_id_checked(window).ok().flatten()
+            };
+            let own = identifier(window)?;
+            if own != Panel::Sheet {
+                return Some(vec![(own, holder()?)]);
+            }
+            live()?;
+            let (children, error) = copy_children_error(window);
+            let mut kinds = (error.is_none()).then(Vec::new);
+            for child in &children {
+                if let Some(found) = kinds.as_mut() {
+                    AXUIElementSetMessagingTimeout(*child, READ_TIMEOUT_SECONDS);
+                    let kind = live().and_then(|()| match copy_string_attr_checked(*child, "AXRole") {
+                        Ok(role) if role == "AXSheet" => identifier(*child).map(Some),
+                        Ok(_) => Some(None),
+                        Err(_) => None,
+                    });
+                    match kind {
+                        Some(Some(kind)) => found.push(kind),
+                        Some(None) => {}
+                        None => kinds = None,
+                    }
+                }
+                CFRelease(*child as CFTypeRef);
+            }
+            let kinds = kinds?;
+            if kinds.is_empty() {
+                return Some(Vec::new());
+            }
+            let holder = holder()?;
+            Some(kinds.into_iter().map(|kind| (kind, holder)).collect())
+        };
+        let mut panels = Some(Vec::new());
+        for window in &windows {
+            if let Some(found) = panels.as_mut() {
+                match read(*window) {
+                    Some(more) => found.extend(more),
+                    None => panels = None,
+                }
+            }
+            CFRelease(*window as CFTypeRef);
+        }
+        // A read that finished past the budget is not trusted either.
+        live()?;
+        panels
+    }
+}
+
+/// The WindowServer id of `pid`'s focused AX window (a sheet's own id when
+/// a sheet is focused), each read bounded as [`panel_state`]'s are.
+pub fn focused_window_bounded(pid: i32) -> Option<u32> {
+    const READ_TIMEOUT_SECONDS: f32 = 0.2;
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, READ_TIMEOUT_SECONDS);
+        let window = copy_element_attr(app, "AXFocusedWindow");
+        CFRelease(app as CFTypeRef);
+        let window = window?;
+        AXUIElementSetMessagingTimeout(window, READ_TIMEOUT_SECONDS);
+        let id = ax_get_window_id_checked(window).ok().flatten();
+        CFRelease(window as CFTypeRef);
+        id
+    }
+}
+
 /// Where `pid`'s keyboard focus is, as a menu command's wait reads it.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum FocusState {
@@ -817,6 +957,20 @@ pub fn await_inline_edit(pid: i32, target: u32, budget: std::time::Duration) -> 
             return false;
         }
         std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+#[cfg(test)]
+mod panel_tests {
+    use super::Panel;
+
+    #[test]
+    fn appkit_file_panels_are_named_by_their_identifier() {
+        assert_eq!(Panel::from_identifier(Some("save-panel")), Panel::Save);
+        assert_eq!(Panel::from_identifier(Some("open-panel")), Panel::Open);
+        assert_eq!(Panel::from_identifier(Some("_NS:34")), Panel::Sheet);
+        assert_eq!(Panel::from_identifier(None), Panel::Sheet);
+        assert_eq!(Panel::Save.name(), "Save panel");
     }
 }
 
