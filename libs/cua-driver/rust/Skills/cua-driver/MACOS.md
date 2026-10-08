@@ -489,15 +489,20 @@ read disabled while their app is behind; the shortcut is checked again
 against the window it reaches). It keeps that route only when a read shortly
 after shows an effect (the clipboard, the app's windows, what the window
 shows, the item's own title or check mark, whether the app still runs).
-Otherwise (no effect, an item missing from its closed menu, no shortcut, a
-hidden app or minimized window, a focus not proven outside web content, a
-keyboard layout that puts the shortcut's character on another key, and every
-Finder command, since Finder ends a rename or new folder name when it is not
-in front) it falls back to the foreground route: it temporarily activates the exact
-target window, because the on-screen macOS menu bar belongs to the frontmost
-application, resolves each immediate child from live AX state, uses only
-`AXPress`/`AXPick`-class actions, and restores the prior application
-afterward on a best-effort basis.
+Otherwise it falls back to the foreground route, and the result says why.
+For example: the press shows no effect; the item is missing from its closed
+menu, opens a submenu, or sits under a menu that reads disabled; the window
+cannot be made key from behind and read back as the app's focused window;
+the app is Finder (which ends a rename or new folder name when it is not in
+front); or the item needs its shortcut (it reads disabled from behind, or
+has no AX press) and that cannot be sent safely: no single-character
+shortcut, a hidden app or minimized window (or that state unreadable), a
+focus not proven outside web content, or a keyboard layout not proven to
+type the shortcut's character on the key sent. The foreground route
+temporarily activates the exact target window, because the on-screen macOS
+menu bar belongs to the frontmost application, resolves each immediate child
+from live AX state, uses only `AXPress`/`AXPick`-class actions, and restores
+the prior application afterward on a best-effort basis.
 The result says which route ran and why (`delivery.mode` is `background` only
 when the app never came to the front). A command whose effect no read can see
 may then run twice, once from behind and once in front; the result says when
