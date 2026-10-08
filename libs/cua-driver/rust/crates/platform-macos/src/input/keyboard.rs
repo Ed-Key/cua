@@ -760,6 +760,109 @@ fn modifier_flags(modifiers: &[&str]) -> CGEventFlags {
     flags
 }
 
+#[link(name = "Carbon", kind = "framework")]
+extern "C" {
+    fn TISCopyCurrentKeyboardLayoutInputSource() -> *const std::ffi::c_void;
+    fn TISGetInputSourceProperty(
+        source: *const std::ffi::c_void,
+        key: *const std::ffi::c_void,
+    ) -> *const std::ffi::c_void;
+    static kTISPropertyUnicodeKeyLayoutData: *const std::ffi::c_void;
+    fn LMGetKbdType() -> u8;
+    #[allow(clippy::too_many_arguments)]
+    fn UCKeyTranslate(
+        layout: *const std::ffi::c_void,
+        key_code: u16,
+        action: u16,
+        modifier_state: u32,
+        keyboard_type: u32,
+        options: u32,
+        dead_key_state: *mut u32,
+        max_length: libc::c_ulong,
+        actual_length: *mut libc::c_ulong,
+        text: *mut u16,
+    ) -> i32;
+}
+
+#[link(name = "System", kind = "framework")]
+extern "C" {
+    static _dispatch_main_q: u8;
+    fn dispatch_async_f(
+        queue: *const std::ffi::c_void,
+        context: *mut std::ffi::c_void,
+        work: unsafe extern "C" fn(*mut std::ffi::c_void),
+    );
+}
+
+/// What the current keyboard layout types for `key_code` with no modifier.
+/// Text Input Sources must be read on the main thread.
+unsafe fn layout_text_on_main(key_code: u16) -> Option<String> {
+    use core_foundation::base::{CFRelease, CFTypeRef};
+    let source = TISCopyCurrentKeyboardLayoutInputSource();
+    if source.is_null() {
+        return None;
+    }
+    let data = TISGetInputSourceProperty(source, kTISPropertyUnicodeKeyLayoutData);
+    let text = (!data.is_null()).then(|| {
+        let layout =
+            core_foundation::data::CFDataGetBytePtr(data as core_foundation::data::CFDataRef);
+        let mut dead_keys = 0u32;
+        let mut text = [0u16; 8];
+        let mut length: libc::c_ulong = 0;
+        // kUCKeyActionDisplay, no modifiers, kUCKeyTranslateNoDeadKeysMask.
+        let status = UCKeyTranslate(
+            layout.cast(),
+            key_code,
+            3,
+            0,
+            u32::from(LMGetKbdType()),
+            1,
+            &mut dead_keys,
+            text.len() as libc::c_ulong,
+            &mut length,
+            text.as_mut_ptr(),
+        );
+        let length = (length as usize).min(text.len());
+        (status == 0 && length > 0).then(|| String::from_utf16_lossy(&text[..length]))
+    });
+    CFRelease(source as CFTypeRef);
+    text.flatten()
+}
+
+struct LayoutRequest {
+    key_code: u16,
+    tx: std::sync::mpsc::SyncSender<Option<String>>,
+}
+
+unsafe extern "C" fn layout_text_request(context: *mut std::ffi::c_void) {
+    let request = Box::from_raw(context.cast::<LayoutRequest>());
+    let _ = request.tx.send(layout_text_on_main(request.key_code));
+}
+
+/// The text the current keyboard layout gives `key` (named as
+/// [`key_name_to_code`] reads it) with no modifier; `None` when unknown
+/// (the main thread did not answer within 500 ms). Key codes here are US
+/// positions, so this tells whether a character shortcut lands on the key
+/// that types that character in the layout in use.
+pub(crate) fn layout_text_for(key: &str) -> Option<String> {
+    let key_code = key_name_to_code(key).ok()?;
+    if objc2_foundation::MainThreadMarker::new().is_some() {
+        return unsafe { layout_text_on_main(key_code) };
+    }
+    let (tx, rx) = std::sync::mpsc::sync_channel(1);
+    let request = Box::into_raw(Box::new(LayoutRequest { key_code, tx }));
+    unsafe {
+        dispatch_async_f(
+            (&raw const _dispatch_main_q).cast(),
+            request.cast(),
+            layout_text_request,
+        );
+    }
+    rx.recv_timeout(std::time::Duration::from_millis(500))
+        .ok()
+        .flatten()
+}
+
 pub(super) fn key_name_to_code(key: &str) -> anyhow::Result<u16> {
     let code = match key.to_lowercase().as_str() {
         "return" | "enter" => 36,

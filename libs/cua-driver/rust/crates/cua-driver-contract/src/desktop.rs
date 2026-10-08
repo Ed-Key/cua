@@ -232,7 +232,7 @@ fn set_window_frame() -> ToolContract {
 fn invoke_menu() -> ToolContract {
     contract::<InvokeMenuInput, ActionResult>(
         "invoke_menu",
-        "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. On macOS the previous front app is back in front afterward. Details: skill://cua-driver/MACOS.md",
+        "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. On macOS it runs the command from behind when a read then shows an effect; otherwise it activates the app for the command and brings the previous front app back (not while an inline editor it opened, such as Finder's Rename, is open). The result says which route ran and why. Details: skill://cua-driver/MACOS.md",
         &["menu.path.invoke", "accessibility.menu.native"],
         ToolAnnotations {
             read_only: false,

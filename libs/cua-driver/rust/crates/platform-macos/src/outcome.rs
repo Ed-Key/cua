@@ -155,6 +155,20 @@ pub(crate) struct Facts {
     /// its own): the texts next to it, as (role, text), where the stepper
     /// shows its number. `None` for any other target.
     pub nearby: Option<Vec<(String, String)>>,
+    /// The general pasteboard's change count: a copy or cut moves it.
+    pub clipboard: Option<isize>,
+    /// The window's frame in WindowServer, in whole points (a View menu
+    /// command can resize it).
+    pub frame: Option<[i64; 4]>,
+    /// The app's windows in WindowServer (not menus, at least 100 pt a
+    /// side), by id, with whether each is on screen: a panel an app opens
+    /// while it is behind stays off screen, where accessibility does not
+    /// list it.
+    pub server_windows: Option<Vec<(u32, bool)>>,
+    /// A fingerprint of what the window shows ([`shown_signature`]): a
+    /// command whose only effect is a label or a static text (Calculator's
+    /// display after View > Hide Thousands Separator) changes it.
+    pub shown: Option<u64>,
 }
 
 /// What the disk adds to a settled change (read once, after the facts).
@@ -498,6 +512,16 @@ pub(crate) fn describe(
         }
         _ => {}
     }
+    if matches!((before.clipboard, after.clipboard), (Some(a), Some(b)) if a != b) {
+        parts.push("the clipboard changed".into());
+    }
+    if let (Some(a), Some(b)) = (before.frame, after.frame) {
+        if a[2..] != b[2..] {
+            parts.push(format!("window resized to {} x {}", b[2], b[3]));
+        } else if a != b {
+            parts.push("window moved".into());
+        }
+    }
     match (before.edited, after.edited) {
         (Some(true), Some(false)) => parts.push("no unsaved changes".into()),
         (Some(false), Some(true)) => parts.push("unsaved changes".into()),
@@ -560,6 +584,19 @@ pub(crate) fn describe(
         }
         for w in a.iter().filter(|w| !b.contains(w)) {
             parts.push(format!("window closed: {} (window_id {})", quote(&w.title), w.id));
+        }
+    }
+    // A window WindowServer lists off screen that was not there before and
+    // that accessibility does not list (a panel of an app behind).
+    if let (Some(a), Some(b)) = (&before.server_windows, &after.server_windows) {
+        let in_ax = |id: u32| after.windows.iter().flatten().any(|w| w.id == id);
+        for (id, _) in b
+            .iter()
+            .filter(|(id, shown)| !shown && !in_ax(*id) && !a.iter().any(|(old, _)| old == id))
+        {
+            parts.push(format!(
+                "window opened off screen (window_id {id}; an app that is not in front keeps windows such as panels hidden)"
+            ));
         }
     }
     // The target is the same retained element both times, so outside a list
@@ -672,6 +709,9 @@ pub(crate) fn describe(
         }
     }
     let still_open = (!still_open.is_empty()).then(|| format!("still open: {}", names(&still_open)));
+    if parts.is_empty() && matches!((before.shown, after.shown), (Some(a), Some(b)) if a != b) {
+        parts.push("text or labels in the window changed (read the window to see which)".into());
+    }
     if parts.is_empty() && before != after {
         let mut line =
             "the window changed in a way this line does not describe; read it if it matters".to_owned();
@@ -687,7 +727,7 @@ pub(crate) fn describe(
             "a change came and went (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: read the window before repeating the action".to_owned()
         } else if complete && command && settle == Settle::MenuCommandUnchanged {
             format!(
-                "{} within {seconds:.1} s (no window opened or closed, and focus, selection, list items, values, title, document, sheets and popovers are as before); not settled: a command can finish later or act on a window already open, so read the window before repeating it",
+                "{} within {seconds:.1} s (no window opened or closed, and focus, selection, list items, values, title, document, sheets, popovers, the clipboard and the window frame are as before); not settled: a command can finish later or act on a window already open, so read the window before repeating it",
                 cua_driver_core::outcome::NO_EFFECT
             )
         } else if complete && command {
@@ -1271,6 +1311,12 @@ struct Scope {
     opener_in_list: Option<bool>,
     /// The target is a stepper's increment or decrement button.
     stepper: bool,
+    /// Read the clipboard, the window's frame, the app's WindowServer
+    /// windows and what the window shows: what a menu command changes that
+    /// the other facts miss (a copy, a View command, a panel opened from
+    /// behind, a display's text). invoke_menu only: other tools' watches
+    /// stay as they were.
+    extras: bool,
 }
 
 /// One read of every fact; `keep` also returns the retained window for the
@@ -1426,6 +1472,15 @@ unsafe fn read_pass(scope: &Scope, keep: bool) -> Pass {
             element as AXUIElementRef,
             crate::ax::tree::AX_MESSAGING_TIMEOUT_SECONDS,
         );
+    }
+    // Last, outside the reader's budget: these never make a read
+    // incomplete, and a fingerprint that runs out is only unknown.
+    if scope.extras {
+        facts.clipboard = pasteboard_change_count();
+        facts.frame = crate::windows::window_bounds_by_id(scope.window_id)
+            .map(|b| [b.x, b.y, b.width, b.height].map(|v| v.round() as i64));
+        facts.server_windows = server_windows(scope.pid);
+        facts.shown = window.as_ref().and_then(|w| shown_signature(w.0));
     }
     Pass {
         facts,
@@ -1744,6 +1799,171 @@ fn surface_closed(before: &Facts, now: &Facts) -> bool {
     sheets || menus
 }
 
+/// `pid`'s windows as [`Facts::server_windows`] lists them, sorted by id;
+/// `None` for an empty list (the watched window exists, so the enumeration
+/// failed).
+fn server_windows(pid: i32) -> Option<Vec<(u32, bool)>> {
+    let mut windows: Vec<(u32, bool)> = crate::windows::all_windows_any_layer()
+        .into_iter()
+        .filter(|w| {
+            w.pid == pid && w.layer < 100 && w.bounds.width >= 100.0 && w.bounds.height >= 100.0
+        })
+        .map(|w| (w.window_id, w.is_on_screen))
+        .collect();
+    windows.sort_unstable();
+    (!windows.is_empty()).then_some(windows)
+}
+
+/// The general pasteboard's change count, which every write to it moves.
+pub(crate) fn pasteboard_change_count() -> Option<isize> {
+    use objc2::runtime::AnyObject;
+    use objc2::{class, msg_send};
+    unsafe {
+        let board: *mut AnyObject = msg_send![class!(NSPasteboard), generalPasteboard];
+        if board.is_null() {
+            return None;
+        }
+        let count: isize = msg_send![board, changeCount];
+        Some(count)
+    }
+}
+
+/// How many elements, and how long, a read of what the window shows may take.
+const SHOWN_ELEMENTS: usize = 400;
+const SHOWN_BUDGET: Duration = Duration::from_millis(150);
+
+/// A fingerprint of what the window shows: each named element's depth,
+/// role, title, description, and a static text's value, in walk order.
+/// `None` when the walk did not finish within [`SHOWN_ELEMENTS`] and
+/// [`SHOWN_BUDGET`].
+pub(crate) unsafe fn shown_signature(window: AXUIElementRef) -> Option<u64> {
+    use std::hash::{Hash, Hasher};
+    let deadline = std::time::Instant::now() + SHOWN_BUDGET;
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    let mut stack = vec![(
+        core_foundation::base::CFRetain(window as CFTypeRef) as AXUIElementRef,
+        0usize,
+    )];
+    let mut seen = 0;
+    let mut complete = true;
+    while let Some((element, depth)) = stack.pop() {
+        seen += 1;
+        let left = deadline.saturating_duration_since(std::time::Instant::now());
+        if complete && (seen > SHOWN_ELEMENTS || left.is_zero()) {
+            complete = false;
+        }
+        if complete {
+            // No single read may outlast the walk's budget.
+            let _ = AXUIElementSetMessagingTimeout(element, left.as_secs_f32().clamp(0.01, 0.1));
+            // A failed read (not a missing attribute) leaves the fingerprint
+            // unknown: hashing it as absent could pass for a change later.
+            let mut read = |attribute: &str| match crate::ax::bindings::copy_string_attr_checked(
+                element, attribute,
+            ) {
+                Ok(text) => Some(text),
+                Err(
+                    crate::ax::bindings::kAXErrorNoValue
+                    | crate::ax::bindings::kAXErrorAttributeUnsupported,
+                ) => None,
+                Err(_) => {
+                    complete = false;
+                    None
+                }
+            };
+            let role = read("AXRole");
+            let value = if role.as_deref() == Some("AXStaticText") {
+                read("AXValue")
+            } else {
+                None
+            };
+            let (title, description) = (read("AXTitle"), read("AXDescription"));
+            let named =
+                |text: &Option<String>| text.as_deref().is_some_and(|text| !text.is_empty());
+            // Unnamed containers come and go on their own: a text view's
+            // insertion-point indicator appears as an empty group after a key.
+            if named(&title) || named(&description) || named(&value) {
+                (depth, &role, title, description, value).hash(&mut hasher);
+            }
+            let (children, failed) = crate::ax::bindings::copy_children_reporting(element);
+            complete &= !failed;
+            for child in children.into_iter().rev() {
+                stack.push((child, depth + 1));
+            }
+        }
+        CFRelease(element as CFTypeRef);
+    }
+    complete.then(|| hasher.finish())
+}
+
+/// Whether two reads differ in a fact both of them know: a fact one read
+/// could not get (`None`) is no change either way, also inside an element
+/// (a value or length one read could not get).
+pub(crate) fn known_facts_differ(a: &Facts, b: &Facts) -> bool {
+    fn differs<T: PartialEq>(a: &Option<T>, b: &Option<T>) -> bool {
+        matches!((a, b), (Some(a), Some(b)) if a != b)
+    }
+    fn collection_differs(a: &Option<Collection>, b: &Option<Collection>) -> bool {
+        let items_differ = |a: &[Item], b: &[Item]| {
+            a.len() != b.len()
+                || a.iter()
+                    .zip(b)
+                    .any(|(a, b)| a.name != b.name || differs(&a.value, &b.value))
+        };
+        matches!((a, b), (Some(a), Some(b)) if a.role != b.role
+            || a.label != b.label
+            || matches!((&a.items, &b.items), (Some(x), Some(y)) if items_differ(x, y))
+            || differs(&a.count, &b.count)
+            || differs(&a.selected, &b.selected)
+            || differs(&a.more, &b.more))
+    }
+    fn element_differs(a: &Option<Element>, b: &Option<Element>) -> bool {
+        matches!((a, b), (Some(a), Some(b)) if a.role != b.role
+            || a.label != b.label
+            || differs(&a.value, &b.value)
+            || differs(&a.length, &b.length))
+    }
+    differs(&a.window_present, &b.window_present)
+        || differs(&a.title, &b.title)
+        || differs(&a.document, &b.document)
+        || differs(&a.file, &b.file)
+        || differs(&a.edited, &b.edited)
+        || differs(&a.sheets, &b.sheets)
+        || differs(&a.windows, &b.windows)
+        || element_differs(&a.focus, &b.focus)
+        || element_differs(&a.target, &b.target)
+        || collection_differs(&a.collection, &b.collection)
+        || differs(&a.menus, &b.menus)
+        || element_differs(&a.opener, &b.opener)
+        || differs(&a.nearby, &b.nearby)
+        || differs(&a.clipboard, &b.clipboard)
+        || differs(&a.frame, &b.frame)
+        || differs(&a.server_windows, &b.server_windows)
+        || differs(&a.shown, &b.shown)
+}
+
+/// One full read of a window's facts as a menu command's watch reads them
+/// (no target, no menus, and without the clipboard, frame and WindowServer
+/// windows, which the caller reads itself), or `None` when the app did not
+/// answer every read. invoke_menu compares reads around a press made from
+/// behind, to tell whether the press did anything.
+pub(crate) fn command_facts(pid: i32, window_id: u32) -> Option<Facts> {
+    let scope = Scope {
+        pid,
+        window_id,
+        target: None,
+        collection: None,
+        opener: None,
+        menus: false,
+        command: true,
+        target_in_list: None,
+        opener_in_list: None,
+        stepper: false,
+        extras: false,
+    };
+    let pass = unsafe { read_pass(&scope, false) };
+    pass.complete.then_some(pass.facts)
+}
+
 /// Start a watch for one native action, or `None` when the action has no
 /// window to watch (desktop scope, scroll, an unknown window).
 pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWatch>> {
@@ -1774,6 +1994,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
     };
     let watch_menus = tool != "invoke_menu";
     let command = tool == "invoke_menu" || tool == "hotkey";
+    let tool_is_menu = tool == "invoke_menu";
     tokio::task::spawn_blocking(move || {
         let window_id = window_id.or_else(|| unsafe { focused_window_id(pid) })?;
         let opener = target
@@ -1789,6 +2010,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             command,
             target_in_list: None,
             opener_in_list: None,
+            extras: tool_is_menu,
             stepper: target.as_ref().is_some_and(|t| unsafe {
                 let element = t.as_ptr() as AXUIElementRef;
                 let yes = is_stepper_part(&mut Reader::new(), element);
@@ -2031,6 +2253,178 @@ mod tests {
         assert_eq!(super::with_kept_front("x".into(), false), "x");
         let line = super::with_kept_front("window opened: \"\" (window_id 9)".into(), true);
         assert!(line.starts_with("window opened") && line.contains("stays in front") && line.contains("cancels"), "{line}");
+    }
+
+    /// invoke_menu's reads around a press from behind: a fact that one read
+    /// could not get is no change, a known fact that differs is one.
+    #[test]
+    fn only_known_facts_count_as_a_change() {
+        let before = Facts {
+            clipboard: Some(1),
+            ..window("note.txt")
+        };
+        assert!(!known_facts_differ(&before, &before.clone()));
+        let unread = Facts {
+            title: None,
+            sheets: None,
+            clipboard: None,
+            ..before.clone()
+        };
+        assert!(!known_facts_differ(&before, &unread) && !known_facts_differ(&unread, &before));
+        assert!(known_facts_differ(
+            &before,
+            &Facts {
+                title: Some("other".into()),
+                ..before.clone()
+            }
+        ));
+        assert!(known_facts_differ(
+            &before,
+            &Facts {
+                clipboard: Some(2),
+                ..before.clone()
+            }
+        ));
+        // A focused field whose value one read could not get: no change.
+        let area = |value: Option<&str>| Element {
+            role: "AXTextArea".into(),
+            label: "".into(),
+            value: value.map(Into::into),
+            length: None,
+        };
+        let typed = Facts {
+            focus: Some(area(Some("abc"))),
+            ..before.clone()
+        };
+        assert!(!known_facts_differ(
+            &typed,
+            &Facts {
+                focus: Some(area(None)),
+                ..before.clone()
+            }
+        ));
+        assert!(known_facts_differ(
+            &typed,
+            &Facts {
+                focus: Some(area(Some("abcd"))),
+                ..before.clone()
+            }
+        ));
+        // A list whose selection one read could not get: no change.
+        let list = |selected: Option<Vec<String>>| Collection {
+            role: "AXTable".into(),
+            label: "files".into(),
+            items: None,
+            count: Some(2),
+            selected,
+            more: None,
+        };
+        let picked = Facts {
+            collection: Some(list(Some(vec!["a".into()]))),
+            ..before.clone()
+        };
+        assert!(!known_facts_differ(
+            &picked,
+            &Facts {
+                collection: Some(list(None)),
+                ..before.clone()
+            }
+        ));
+        assert!(known_facts_differ(
+            &picked,
+            &Facts {
+                collection: Some(list(Some(vec!["b".into()]))),
+                ..before.clone()
+            }
+        ));
+    }
+
+    /// A copy changes only the clipboard, a View menu command only the
+    /// frame, a panel opened from behind only an off-screen window: each is
+    /// named, so a menu command that did those is not called "no effect".
+    #[test]
+    fn clipboard_frame_and_offscreen_windows_are_named() {
+        let before = Facts {
+            clipboard: Some(4),
+            frame: Some([10, 20, 230, 408]),
+            server_windows: Some(vec![(1, true)]),
+            windows: Some(Vec::new()),
+            ..window("Calculator")
+        };
+        let line =
+            |after: &Facts| describe(&before, after, &DiskNotes::default(), Settle::Settled, true);
+        assert_eq!(
+            line(&Facts {
+                clipboard: Some(5),
+                ..before.clone()
+            }),
+            "the clipboard changed"
+        );
+        assert_eq!(
+            line(&Facts {
+                frame: Some([10, 20, 674, 408]),
+                ..before.clone()
+            }),
+            "window resized to 674 x 408"
+        );
+        assert_eq!(
+            line(&Facts {
+                frame: Some([30, 20, 230, 408]),
+                ..before.clone()
+            }),
+            "window moved"
+        );
+        let panel = Facts {
+            server_windows: Some(vec![(1, true), (2, false)]),
+            ..before.clone()
+        };
+        assert!(
+            line(&panel).starts_with("window opened off screen (window_id 2"),
+            "{}",
+            line(&panel)
+        );
+        // A window accessibility lists is described by it, not again here;
+        // one already there that only went off screen is no new window.
+        let hidden = Facts {
+            server_windows: Some(vec![(1, false)]),
+            ..before.clone()
+        };
+        assert!(!line(&hidden).contains("opened off screen"));
+        // A label or static text that changed with nothing else: said, so a
+        // menu command that only did that is not called "no effect".
+        let shown = Facts {
+            shown: Some(1),
+            ..before.clone()
+        };
+        let from_shown =
+            |after: &Facts| describe(&shown, after, &DiskNotes::default(), Settle::Settled, true);
+        assert!(from_shown(&Facts {
+            shown: Some(2),
+            ..shown.clone()
+        })
+        .starts_with("text or labels in the window changed"));
+        assert_eq!(
+            from_shown(&Facts {
+                shown: Some(2),
+                clipboard: Some(5),
+                ..shown.clone()
+            }),
+            "the clipboard changed"
+        );
+        // Unknown reads name nothing.
+        let unknown = Facts {
+            clipboard: None,
+            frame: None,
+            server_windows: None,
+            ..before.clone()
+        };
+        let said = line(&unknown);
+        assert!(
+            !said.contains("clipboard")
+                && !said.contains("resized")
+                && !said.contains("off screen"),
+            "{said}"
+        );
     }
 
     /// A command (invoke_menu, hotkey) with nothing seen is not called

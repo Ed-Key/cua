@@ -505,15 +505,7 @@ impl Tool for HotkeyTool {
                 // navigation or toggle chord that did land repeats it, so the
                 // next step is a read.
                 let structured = delivered_structured(fg);
-                // Apps often drop a background menu shortcut (TextEdit ignores
-                // Cmd+S); invoke_menu runs the same command by path.
-                let menu_hint = if !fg && cmd_chord {
-                    " Read the window before sending it again: only if a fresh read shows its \
-                     effect missing, run the same command with invoke_menu, e.g. path \
-                     [\"File\",\"Save\"]."
-                } else {
-                    " Read the window before sending it again."
-                };
+                let menu_hint = menu_hint(fg, cmd_chord);
                 ToolResult::text(format!(
                     "Pressed {key_display} on pid {pid}{label}.{menu_hint}{}",
                     changes.result_suffix()
@@ -523,6 +515,24 @@ impl Tool for HotkeyTool {
             Ok(Err(e)) => ToolResult::error(format!("hotkey failed: {e}")),
             Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
+    }
+}
+
+/// What a delivered chord's result suggests next. Apps often drop a
+/// background menu shortcut (Calculator ignored Cmd+C and TextEdit Cmd+S
+/// sent this way to a native window, which is not made key first);
+/// invoke_menu runs the same command by path, from behind when it can, so
+/// it is named with the route it takes and when it would bring the app
+/// forward.
+fn menu_hint(foreground: bool, cmd_chord: bool) -> &'static str {
+    if !foreground && cmd_chord {
+        " Read the window before sending it again: only if a fresh read shows its effect missing, \
+         run the same command with invoke_menu, e.g. path [\"File\",\"Save\"]. invoke_menu tries it \
+         from behind first, with the window selected as the app's key window, and brings the app \
+         to the front only when it cannot run from behind or shows no effect there; its result \
+         says which route ran."
+    } else {
+        " Read the window before sending it again."
     }
 }
 
@@ -549,6 +559,22 @@ mod tests {
             let structured = delivered_structured(foreground);
             assert!(structured.get("escalation").is_none());
             assert_eq!(structured["effect"], "unverifiable");
+        }
+    }
+
+    /// A background Cmd chord that did nothing once sent an agent to
+    /// invoke_menu, which then brought Calculator to the front (errand T6).
+    /// The hint names invoke_menu only with the route it takes.
+    #[test]
+    fn the_menu_hint_says_invoke_menu_tries_from_behind_first() {
+        let hint = menu_hint(false, true);
+        assert!(hint.contains("invoke_menu"), "{hint}");
+        assert!(
+            hint.contains("from behind first") && hint.contains("to the front only when it cannot"),
+            "{hint}"
+        );
+        for (foreground, cmd_chord) in [(true, true), (false, false), (true, false)] {
+            assert!(!menu_hint(foreground, cmd_chord).contains("invoke_menu"));
         }
     }
 
