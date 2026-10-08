@@ -1773,9 +1773,6 @@ struct Watch {
     scope: Scope,
     before: Facts,
     before_complete: bool,
-    /// When the watch began: a foreground action that then left the app in
-    /// front for an inline edit is named in the line.
-    started: Instant,
     /// Keep the target, the list and a menu's opener alive for the after-reads.
     _target: Option<RetainedElement>,
     _collection: Option<RetainedElement>,
@@ -2062,7 +2059,6 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             scope,
             before: pass.facts,
             before_complete: pass.complete,
-            started: Instant::now(),
             _target: target,
             _collection: pass.holder,
             _opener: opener,
@@ -2076,6 +2072,23 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
 #[async_trait]
 impl OutcomeWatch for Watch {
     async fn finish(self: Box<Self>) -> Option<String> {
+        let line = self.describe_after().await;
+        // After the app settled, whatever the reads gave: hand back a front
+        // an inline edit held, and say where the front is (`crate::front_lease`).
+        let front = tokio::task::spawn_blocking(crate::front_lease::settle)
+            .await
+            .ok()
+            .flatten();
+        match (line, front) {
+            (Some(line), Some(front)) => Some(format!("{line}; {front}")),
+            (line, front) => line.or(front),
+        }
+    }
+}
+
+impl Watch {
+    /// What the action changed, once the app settled.
+    async fn describe_after(self: Box<Self>) -> Option<String> {
         let watch = *self;
         if !watch.before_complete {
             // Nothing to compare with: say so rather than guess.
@@ -2160,26 +2173,9 @@ impl OutcomeWatch for Watch {
         })
         .await
         .ok()?;
-        let line = with_kept_front(
-            line,
-            crate::input::skylight::kept_front_since(watch.scope.pid, watch.started),
-        );
         drop(watch);
         Some(line)
     }
-}
-
-/// The line, plus why the previous front app was not brought back when a
-/// foreground action left this app in front for an inline edit.
-fn with_kept_front(line: String, kept: bool) -> String {
-    if !kept {
-        return line;
-    }
-    format!(
-        "{line}; this app stays in front: it has an inline edit open (a rename or a popover's \
-         field), which it cancels when it loses the front, so the previous front app was not \
-         brought back"
-    )
 }
 
 #[cfg(test)]
@@ -2246,13 +2242,6 @@ mod tests {
         let after = before.clone();
         assert!(describe(&before, &after, &DiskNotes::default(), Settle::Unchanged, true)
             .ends_with("; still open: a menu"));
-    }
-
-    #[test]
-    fn a_kept_front_is_named_after_the_line() {
-        assert_eq!(super::with_kept_front("x".into(), false), "x");
-        let line = super::with_kept_front("window opened: \"\" (window_id 9)".into(), true);
-        assert!(line.starts_with("window opened") && line.contains("stays in front") && line.contains("cancels"), "{line}");
     }
 
     /// invoke_menu's reads around a press from behind: a fact that one read

@@ -3579,7 +3579,7 @@
     },
     {
       "name": "invoke_menu",
-      "description": "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. On macOS it runs the command from behind when a read then shows an effect; otherwise it activates the app for the command and brings the previous front app back (not while an inline editor it opened, such as Finder's Rename, is open). The result says which route ran and why. Details: skill://cua-driver/MACOS.md",
+      "description": "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. On macOS it runs the command from behind when a read then shows an effect; otherwise it activates the app for the command and brings the previous front app back; when the command opened an inline editor, such as Finder's Rename, the app stays in front and the previous front app comes back after a later action ends the edit. The result says which route ran and why. Details: skill://cua-driver/MACOS.md",
       "platforms": [
         "macos",
         "windows",

@@ -321,6 +321,8 @@ impl Tool for BringToFrontTool {
 /// The whole tool body. It never awaits (it polls with short sleeps), so the
 /// PiP focus button calls it directly from a plain background thread.
 pub(crate) fn bring_to_front_blocking(args: Value) -> ToolResult {
+    // The caller chooses the front: an inline edit's hand-back is no longer owed.
+    crate::front_lease::end();
     let pid = match args.get("pid").and_then(Value::as_i64) {
         Some(p) => match libc::pid_t::try_from(p) {
             Ok(pid) => pid,

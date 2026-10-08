@@ -685,9 +685,43 @@ pub fn raise_exact_window(pid: i32, window_id: u32) -> bool {
 /// Whether `pid`'s keyboard focus is a text control in a WindowServer child
 /// window of `target`: an inline editor (Finder's rename field) or a
 /// popover's field (a tag editor). Such an edit lives only while its app is
-/// active: Finder cancels an inline rename when it loses the front.
+/// active: Finder ends an inline rename (saving the field) when it loses the front.
 pub fn inline_edit_open(pid: i32, target: u32) -> bool {
     focus_state(pid, target) == FocusState::InlineEdit
+}
+
+/// Whether `pid` has an inline edit open in any of its windows: its focus is
+/// a text control in a WindowServer child window (Finder's rename field, a
+/// sheet's field). `Some(false)` only when the focused element and its role
+/// answered (a text control also needs its window and that window's parent
+/// query), `None` when they did not (a busy app).
+pub fn inline_edit_state(pid: i32) -> Option<bool> {
+    const READ_TIMEOUT_SECONDS: f32 = 0.2;
+    unsafe {
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, READ_TIMEOUT_SECONDS);
+        let element = copy_element_attr(app, "AXFocusedUIElement");
+        CFRelease(app as CFTypeRef);
+        let element = element?;
+        AXUIElementSetMessagingTimeout(element, READ_TIMEOUT_SECONDS);
+        let role = copy_string_attr(element, "AXRole");
+        let window = ax_get_window_id(element);
+        CFRelease(element as CFTypeRef);
+        let text = matches!(
+            role.as_deref(),
+            Some("AXTextField" | "AXTextArea" | "AXComboBox")
+        );
+        match (role, window) {
+            (None, _) => None,
+            (Some(_), _) if !text => Some(false),
+            (Some(_), None) => None,
+            (Some(_), Some(window)) => crate::input::skylight::window_parent(window)
+                .map(|parent| parent.is_some_and(|parent| parent != window)),
+        }
+    }
 }
 
 /// Where `pid`'s keyboard focus is, as a menu command's wait reads it.

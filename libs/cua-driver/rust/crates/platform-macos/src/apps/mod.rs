@@ -700,6 +700,18 @@ pub fn restore_prior_app(pid: i32) -> bool {
     crate::input::skylight::restore_front_pid(pid, &mut || true) || activate_pid(pid)
 }
 
+/// Whether `prior` is (or within a short bound becomes) the front app:
+/// activation is asynchronous and NSWorkspace's front app can lag it.
+pub fn confirm_front(prior: i32) -> bool {
+    let deadline = std::time::Instant::now() + std::time::Duration::from_millis(500);
+    let mut front = frontmost_pid() == Some(prior);
+    while !front && std::time::Instant::now() < deadline {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        front = frontmost_pid() == Some(prior);
+    }
+    front
+}
+
 /// Returns `true` if the app was found and activate was attempted.
 /// For restoring the user's app prefer [`restore_prior_app`].
 pub fn activate_pid(pid: i32) -> bool {

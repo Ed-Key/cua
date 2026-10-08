@@ -34,7 +34,7 @@ const WEB_AREA_ROLE: &str = "AXWebArea";
 const WEB_AREA_MAX_DEPTH: u32 = 10;
 const WEB_AREA_PROBE_NODES: u32 = 400;
 
-type ProcessStartStamp = (u64, u64);
+pub(crate) type ProcessStartStamp = (u64, u64);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WebContent {
@@ -96,7 +96,7 @@ fn executable_path(pid: i32) -> Option<std::path::PathBuf> {
 
 /// Kernel start time of a process: `(pbi_start_tvsec, pbi_start_tvusec)`.
 /// `None` when the process is gone or proc info is unreadable.
-fn process_start_stamp(pid: i32) -> Option<ProcessStartStamp> {
+pub(crate) fn process_start_stamp(pid: i32) -> Option<ProcessStartStamp> {
     // SAFETY: proc_pidinfo writes at most `size` bytes into `info` and returns
     // the number of bytes filled (<= size) or <= 0 on failure.
     unsafe {
