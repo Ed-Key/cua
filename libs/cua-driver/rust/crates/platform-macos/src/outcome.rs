@@ -2072,13 +2072,17 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
 #[async_trait]
 impl OutcomeWatch for Watch {
     async fn finish(self: Box<Self>) -> Option<String> {
+        let pid = self.scope.pid;
         let line = self.describe_after().await;
         // After the app settled, whatever the reads gave: hand back a front
-        // an inline edit held, and say where the front is (`crate::front_lease`).
-        let front = tokio::task::spawn_blocking(crate::front_lease::settle)
-            .await
-            .ok()
-            .flatten();
+        // an inline edit held, and say where the front is; with no lease,
+        // say when the app's edit is open behind it (`crate::front_lease`).
+        let front = tokio::task::spawn_blocking(move || {
+            crate::front_lease::settle().or_else(|| crate::front_lease::edit_open_behind(pid))
+        })
+        .await
+        .ok()
+        .flatten();
         match (line, front) {
             (Some(line), Some(front)) => Some(format!("{line}; {front}")),
             (line, front) => line.or(front),

@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 use async_trait::async_trait;
 use core_graphics::display::CGDisplay;
 use cua_driver_core::{
-    protocol::ToolResult,
+    protocol::{Content, ToolResult},
     tool::{Tool, ToolDef},
 };
 use objc2_app_kit::{NSApplicationActivationOptions, NSRunningApplication};
@@ -314,15 +314,21 @@ impl Tool for BringToFrontTool {
     }
 
     async fn invoke(&self, args: Value) -> ToolResult {
-        bring_to_front_blocking(args)
+        bring(args, true)
     }
 }
 
-/// The whole tool body. It never awaits (it polls with short sleeps), so the
-/// PiP focus button calls it directly from a plain background thread.
+/// The PiP focus button's path: the user chose the front, so nothing is owed
+/// to anyone. It never awaits (it polls with short sleeps), so the button
+/// calls it directly from a plain background thread.
 pub(crate) fn bring_to_front_blocking(args: Value) -> ToolResult {
-    // The caller chooses the front: an inline edit's hand-back is no longer owed.
     crate::front_lease::end();
+    bring(args, false)
+}
+
+/// The whole tool body. `agent`: the agent asked, so the result names the
+/// app the front was taken from (`crate::front_lease::Taking`).
+fn bring(args: Value, agent: bool) -> ToolResult {
     let pid = match args.get("pid").and_then(Value::as_i64) {
         Some(p) => match libc::pid_t::try_from(p) {
             Ok(pid) => pid,
@@ -410,6 +416,7 @@ pub(crate) fn bring_to_front_blocking(args: Value) -> ToolResult {
             }));
         }
 
+        let taking = agent.then(|| crate::front_lease::Taking::read(pid));
         // The persistent kCPSNoWindows request owns process activation
         // without broadly ordering every application window. The separate
         // kCPSUserGenerated sequence then makes only the requested window
@@ -444,15 +451,17 @@ pub(crate) fn bring_to_front_blocking(args: Value) -> ToolResult {
             || skylight_exact_accepted
             || cocoa_accepted
             || ax_window_requested;
-        return exact_result(
+        let result = exact_result(
             pid,
             window_id,
             path,
             request_accepted,
             wait_for_exact_window(pid, window_id),
         );
+        return with_hand_back(result, pid, taking);
     }
 
+    let taking = agent.then(|| crate::front_lease::Taking::read(pid));
     let request_accepted = unsafe {
         app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows)
     };
@@ -476,7 +485,7 @@ pub(crate) fn bring_to_front_blocking(args: Value) -> ToolResult {
         "request_accepted": request_accepted,
         "process_activated": activated,
     });
-    if activated {
+    let result = if activated {
         ToolResult::text(format!("Brought pid {pid} to the foreground."))
             .with_structured(structured)
     } else {
@@ -484,6 +493,60 @@ pub(crate) fn bring_to_front_blocking(args: Value) -> ToolResult {
             "bring_to_front: pid {pid} did not become frontmost (request_accepted={request_accepted})."
         ))
         .with_structured(structured)
+    };
+    with_hand_back(result, pid, taking)
+}
+
+/// The one line that tells the agent how to give the front back.
+fn hand_back_line(name: &str, bundle_id: Option<&str>, pid: i32, target_name: &str) -> String {
+    let id = bundle_id.map_or_else(|| format!("pid {pid}"), |id| format!("{id}, pid {pid}"));
+    format!(
+        "{name} ({id}) was in front before; when you are done with {target_name}, give it the \
+         front back with bring_to_front pid {pid}."
+    )
+}
+
+/// Add the hand-back line to the text and, for clients that show only
+/// structuredContent, as `summary` with `previous_front`.
+fn with_hand_back(
+    mut result: ToolResult,
+    target: i32,
+    taking: Option<crate::front_lease::Taking>,
+) -> ToolResult {
+    let Some(owed) = taking.and_then(|taking| taking.finish(target)) else {
+        return result;
+    };
+    let target_name = crate::apps::running_app(target)
+        .map(|app| app.name)
+        .unwrap_or_else(|| format!("pid {target}"));
+    let line = hand_back_line(
+        &owed.name,
+        owed.bundle_id.as_deref(),
+        owed.pid,
+        &target_name,
+    );
+    add_line(
+        &mut result,
+        &line,
+        json!({
+            "pid": owed.pid,
+            "bundle_id": owed.bundle_id,
+            "name": owed.name,
+        }),
+    );
+    result
+}
+
+fn add_line(result: &mut ToolResult, line: &str, previous_front: Value) {
+    let mut summary = line.to_owned();
+    if let Some(Content::Text { text, .. }) = result.content.first_mut() {
+        text.push(' ');
+        text.push_str(line);
+        summary = text.clone();
+    }
+    if let Some(Value::Object(map)) = result.structured_content.as_mut() {
+        map.insert("previous_front".into(), previous_front);
+        map.insert("summary".into(), summary.into());
     }
 }
 
@@ -783,6 +846,44 @@ mod tests {
         assert_eq!(structured["status"], "activated");
         assert_eq!(structured["activated"], true);
         assert_eq!(structured["exact_window_effect"]["verified"], true);
+    }
+
+    #[test]
+    fn the_hand_back_line_names_the_app_and_how_to_give_the_front_back() {
+        let line = hand_back_line("Terminal", Some("com.apple.Terminal"), 512, "TextEdit");
+        assert_eq!(
+            line,
+            "Terminal (com.apple.Terminal, pid 512) was in front before; when you are done with \
+             TextEdit, give it the front back with bring_to_front pid 512."
+        );
+        assert!(hand_back_line("x", None, 9, "y").starts_with("x (pid 9) was in front before;"));
+        // Success and partial results both carry it, in the text and in
+        // structuredContent (the only part some clients show).
+        for mut result in [
+            exact_result(
+                42,
+                7,
+                "cocoa_ax",
+                true,
+                observation(Some(42), Some(true), Some(7), Some(7), true),
+            ),
+            exact_result(
+                42,
+                7,
+                "cocoa_ax",
+                true,
+                observation(Some(42), Some(true), Some(8), Some(7), true),
+            ),
+        ] {
+            add_line(&mut result, &line, json!({"pid": 512}));
+            let structured = result.structured_content.as_ref().expect("structured");
+            let Some(Content::Text { text, .. }) = result.content.first() else {
+                panic!("text content");
+            };
+            assert!(text.ends_with(&line));
+            assert_eq!(structured["summary"].as_str(), Some(text.as_str()));
+            assert_eq!(structured["previous_front"]["pid"], 512);
+        }
     }
 
     #[test]

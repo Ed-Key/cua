@@ -675,7 +675,7 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
     // front for that editor.
     if crate::tools::edit_commit::app_saves_on_end_editing(pid) {
         return Background::skipped(
-            "this app ends an inline edit (Rename, New Folder) when it is not in front, so its menu commands run in front",
+            "this app ends an inline edit (Rename, New Folder) when it loses the front, so its menu commands run in front",
         );
     }
     unsafe {
@@ -1600,7 +1600,7 @@ mod tests {
         assert!(!summary(&front).contains("foreground because"));
         let kept = Ran::Foreground {
             front: Some(FrontAfter::KeptForInlineEdit),
-            why: Some("this app ends an inline edit (Rename, New Folder) when it is not in front, so its menu commands run in front".into()),
+            why: Some("this app ends an inline edit (Rename, New Folder) when it loses the front, so its menu commands run in front".into()),
             unhidden: false,
         };
         let text = summary(&kept);

@@ -120,6 +120,10 @@ is safe even for apps that normally foreground on media-load
 For authorized foreground input, use the Cua action's
 `delivery_mode:"foreground"`. For requested persistent foreground state, use
 `bring_to_front`. Neither requires a shell activation workaround.
+`bring_to_front` does not give the front back: its result names the app that
+was in front before (the user's app, also after an earlier `bring_to_front` or
+a kept inline edit), and the agent gives it the front back with
+`bring_to_front` on that pid once the step that needed the front is done.
 
 When a cua-driver call surprises you, diagnose cua-driver first:
 
@@ -317,7 +321,11 @@ editor closed by itself. It does not when another app is in front by then or
 a mouse press that was not cua's came during the edit, and `bring_to_front`
 cancels it. Each action's Outcome line says which happened. Ending the edit
 is the agent's job: an agent that stops with the editor open leaves Finder in
-front.
+front. An editor that opens after the front was handed back (New Folder in a
+window showing the Desktop, at times) stays open behind; the Outcome line says
+so, and `set_value` on its field, then `press_key` return, end it without
+`bring_to_front` (the return needs `delivery_mode:"foreground"` when Finder has
+more than one window: the background key is refused there).
 
 `drag` is the exception: macOS has no background drag. A window-scoped
 `drag` needs `delivery_mode:"foreground"` and `window_id`; without them it
