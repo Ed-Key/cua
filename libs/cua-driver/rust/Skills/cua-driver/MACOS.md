@@ -581,10 +581,11 @@ value is reported as unverifiable rather than as zero characters delivered.
 **User:** "Open the Downloads folder in Finder."
 
 1. `launch_app({bundle_id: "com.apple.finder", urls: ["~/Downloads"]})`
-   → `{pid: 844, windows: [{window_id: 6123, title: "Downloads", ...}]}`.
-   Idempotent launch; plus Finder opens a hidden window rooted at
+   → `{pid: 844, requested_windows: [6123], opened_windows: [6123], windows: [{window_id: 6123, title: "Downloads", ...}, ...]}`.
+   Idempotent launch; plus Finder opens a background window rooted at
    `~/Downloads` via `application(_:open:)`: zero activation, no
-   focus steal. The `windows` array lets you skip a `list_windows` hop.
+   focus steal. `requested_windows` names that window, so you skip a
+   `list_windows` hop and never mistake an older Finder window for it.
 2. `get_window_state({pid: 844, window_id: 6123})` → verify an
    `AXWindow` whose title contains "Downloads" is present with a
    populated AX subtree (sidebar, list view, files).

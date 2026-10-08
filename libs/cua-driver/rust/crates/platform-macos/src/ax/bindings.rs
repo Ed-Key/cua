@@ -1367,6 +1367,73 @@ pub fn ax_window_ids_of_pid(pid: i32) -> Option<std::collections::HashSet<u32>> 
     }
 }
 
+/// `pid`'s `AXWindows` as `(CGWindowID, AXDocument)`: the document is the
+/// file URL a document window shows (TextEdit, Preview), `None` for windows
+/// without one. `None` overall when the list cannot be read in full within
+/// `budget` (not trusted, an AX error on the list, a window id or a document,
+/// or a slow app), so an unknown answer is never taken for "no document".
+pub fn ax_window_documents_of_pid(
+    pid: i32,
+    budget: std::time::Duration,
+) -> Option<Vec<(u32, Option<String>)>> {
+    const MAX_WINDOWS: usize = 64;
+    unsafe {
+        if !AXIsProcessTrusted() {
+            return None;
+        }
+        let deadline = std::time::Instant::now() + budget;
+        let app = AXUIElementCreateApplication(pid);
+        if app.is_null() {
+            return None;
+        }
+        AXUIElementSetMessagingTimeout(app, AX_WINDOW_IDS_TIMEOUT_SECONDS);
+        let windows = copy_element_array_attr_checked(app, "AXWindows", MAX_WINDOWS);
+        CFRelease(app as CFTypeRef);
+        let windows = windows.ok()?;
+        let mut documents = Some(Vec::with_capacity(windows.len()));
+        for &window in &windows {
+            if std::time::Instant::now() >= deadline {
+                documents = None;
+            }
+            let Some(list) = documents.as_mut() else {
+                break;
+            };
+            AXUIElementSetMessagingTimeout(window, AX_WINDOW_IDS_TIMEOUT_SECONDS);
+            // A failed read (a timeout, an app that cannot answer) makes the
+            // whole list unknown; only "no such attribute or value" means the
+            // window shows no document.
+            let document = match copy_attribute_checked(window, "AXDocument") {
+                Ok(value) => match cf_plain_string(value.as_CFTypeRef()) {
+                    Some(text) => Some(text),
+                    // A value that is not text is unknown, not "no document".
+                    None => {
+                        documents = None;
+                        continue;
+                    }
+                },
+                Err(kAXErrorNoValue | kAXErrorAttributeUnsupported) => None,
+                Err(_) => {
+                    documents = None;
+                    continue;
+                }
+            };
+            match ax_get_window_id_checked(window) {
+                Ok(Some(id)) => list.push((id, document)),
+                // A window without a readable id (Finder's desktop answers
+                // -25201) cannot be one of the snapshot's windows. Only one that
+                // names a document could hide the requested one.
+                Ok(None) | Err(_) if document.is_none() => {}
+                Ok(None) | Err(_) => documents = None,
+            }
+        }
+        for window in windows {
+            CFRelease(window as CFTypeRef);
+        }
+        // A read that finished past its budget is not trusted either.
+        documents.filter(|_| std::time::Instant::now() < deadline)
+    }
+}
+
 /// AX messaging timeout for [`ax_window_ids_of_pid`], in seconds. Window
 /// enumeration calls it once per app, so a hung app must not stall it.
 const AX_WINDOW_IDS_TIMEOUT_SECONDS: f32 = 0.25;

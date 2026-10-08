@@ -707,6 +707,43 @@ impl Dispatcher {
     }
 }
 
+// ── Activation log ───────────────────────────────────────────────────────────
+
+/// The last activation sequence the observer saw per pid, and the last
+/// sequence handed out. Lets an action ask afterwards whether an app came to
+/// the front while it ran, even for a flash a lease undid within
+/// milliseconds (a poll of the front app misses those).
+static ACTIVATION_LOG: Mutex<(u64, Option<HashMap<i32, u64>>)> = Mutex::new((0, None));
+
+fn record_activation(pid: i32) {
+    if let Ok(mut log) = ACTIVATION_LOG.lock() {
+        log.0 += 1;
+        let sequence = log.0;
+        log.1.get_or_insert_with(HashMap::new).insert(pid, sequence);
+    }
+}
+
+/// The current point in the activation log. Installs the observer first, so
+/// every activation after the mark is recorded.
+pub fn activation_mark() -> u64 {
+    let _ = FocusStealPreventer::shared();
+    log_mark()
+}
+
+fn log_mark() -> u64 {
+    ACTIVATION_LOG.lock().map(|log| log.0).unwrap_or(0)
+}
+
+/// Whether `pid` was activated after `mark`. Notifications arrive on the
+/// observer queue a little after the switch, so ask once the action settled.
+pub fn activated_since(mark: u64, pid: i32) -> bool {
+    ACTIVATION_LOG
+        .lock()
+        .ok()
+        .and_then(|log| log.1.as_ref().and_then(|last| last.get(&pid).copied()))
+        .is_some_and(|sequence| sequence > mark)
+}
+
 // ── Observer registration ────────────────────────────────────────────────────
 
 /// Register the NSWorkspace.didActivateApplicationNotification observer.
@@ -786,6 +823,7 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
     };
 
     tracing::debug!(activated_pid, "focus activation notification received");
+    record_activation(activated_pid);
     dispatcher.dispatch_activation(
         activated_pid,
         || {
@@ -1361,6 +1399,18 @@ mod tests {
 
     /// Dispatcher::add returns a handle, the entry is reachable by
     /// match, and remove() drops it.
+    /// An activation recorded after a mark is seen for its pid only, and
+    /// one recorded before the mark is not.
+    #[test]
+    fn activation_log_reports_activations_after_the_mark() {
+        record_activation(-4242);
+        let mark = log_mark();
+        assert!(!activated_since(mark, -4242));
+        record_activation(-4243);
+        assert!(activated_since(mark, -4243));
+        assert!(!activated_since(mark, -4242));
+    }
+
     #[test]
     fn latest_nonmatching_registration_does_not_change_the_winner() {
         let d = Arc::new(Dispatcher::new());

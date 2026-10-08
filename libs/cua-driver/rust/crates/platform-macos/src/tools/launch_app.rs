@@ -15,9 +15,12 @@ fn def() -> &'static ToolDef {
         name: "launch_app".into(),
         description:
             "Launch an app in the background without bringing it forward, by bundle_id \
-             (preferred) or name. Returns pid, launch_state, and a windows array (list_windows \
-             shape) for get_window_state. urls opens files or folders in it. For browser \
-             DevTools use browser_prepare."
+             (preferred) or name. Returns pid, launch_state, a windows array (list_windows \
+             shape) for get_window_state, and opened_windows (ids that appeared during the \
+             call). urls opens files or folders in it; requested_windows then names the windows \
+             showing them, reused_windows the ones of those that existed before the call. \
+             self_activation_suppressed is false if the app came to the front at any point. \
+             For browser DevTools use browser_prepare."
             .into(),
         input_schema: serde_json::json!({
             "type": "object",
@@ -153,35 +156,63 @@ impl Tool for LaunchAppTool {
             s
         };
 
+        // What the call starts from: the activation log, the user's front
+        // app, and (off the async runtime) the windows on screen. Afterwards
+        // the result names the windows this call opened and says whether the
+        // app came forward.
+        let activation_mark = crate::focus_steal::activation_mark();
+        let prior_frontmost = crate::apps::frontmost_pid();
+        let plain_open = additional_arguments.is_empty() && env.is_empty() && !creates_new_instance;
+
+        // A file the running app already shows is not sent again. An app
+        // handed a document it has open brings that window forward and
+        // activates itself (TextEdit did, for up to 20 ms, under the guard).
+        let reuse_bundle_id = response_bundle_id
+            .clone()
+            .filter(|_| plain_open && !urls.is_empty());
+        let reuse_urls = urls.clone();
+        let Ok((windows_before, running_pid, reused)) = tokio::task::spawn_blocking(move || {
+            let windows_before: Vec<(u32, i32)> = crate::windows::all_windows()
+                .into_iter()
+                .map(|w| (w.window_id, w.pid))
+                .collect();
+            let running_pid = reuse_bundle_id.as_deref().and_then(running_pid_for_bundle);
+            let reused: Vec<(String, u32)> = running_pid
+                .and_then(|pid| {
+                    crate::ax::bindings::ax_window_documents_of_pid(pid, AX_DOCUMENTS_BUDGET)
+                })
+                .map(|documents| already_open(&reuse_urls, &documents))
+                .unwrap_or_default();
+            (windows_before, running_pid, reused)
+        })
+        .await
+        else {
+            return ToolResult::error("Task error: window snapshot before the launch failed");
+        };
+        let urls_to_open: Vec<String> = urls
+            .iter()
+            .filter(|url| !reused.iter().any(|(open, _)| open == *url))
+            .cloned()
+            .collect();
+        // Every requested url was already open: nothing is sent at all.
+        let reused_pid = running_pid.filter(|_| !urls.is_empty() && urls_to_open.is_empty());
+
         // ── Layer-3 focus-steal suppression (3-phase wrap) ───────────────
         //
-        // Captures the prior frontmost pid, arms a wildcard suppression
-        // BEFORE the launch (covers self-activations the target fires
-        // synchronously during `open()`), then upgrades to a targeted
-        // suppression keyed to the actual launched pid. Briefly holds
-        // BOTH leases so a self-activation arriving in the wildcard→
-        // targeted gap is still caught — that race is what hoang17's
-        // Swift PR #1521 explicitly fixes; we do not regress it here.
-        //
-        // After 500ms (enough for `applicationDidFinishLaunching` +
-        // any reflex `NSApp.activate(...)` to fire and get suppressed)
-        // both leases are dropped. The belt-and-braces step at the end
-        // re-activates the prior frontmost if the target is still
-        // frontmost — handles the intra-`open()` synchronous activation
-        // that fired before we could arm with the real pid.
-        let prior_frontmost = crate::apps::frontmost_pid();
-        let finder_folder_handoff = response_bundle_id.as_deref().is_some_and(|bundle_id| {
-            additional_arguments.is_empty()
-                && env.is_empty()
-                && !creates_new_instance
-                && crate::apps::finder_folder_handoff(bundle_id, &urls)
-        });
-
-        // Finder's synchronous folder-open selector must be allowed to activate
-        // long enough to perform the request. Use the ordinary targeted
-        // post-launch guard to restore the prior foreground app immediately.
+        // Arms a wildcard suppression BEFORE the launch (covers
+        // self-activations the target fires synchronously during `open()`),
+        // then upgrades to a targeted suppression keyed to the launched pid,
+        // holding BOTH leases briefly so an activation in the gap is still
+        // caught (hoang17's Swift PR #1521). The targeted lease holds for the
+        // activation window AND the window wait (an app that activates with
+        // its first window is still caught); then the belt-and-braces loop
+        // re-activates the prior frontmost if the target is still in front.
+        // Finder folders take this same path: `openURLs` with
+        // `activates = false` opens a background window there, where
+        // `selectFile:inFileViewerRootedAtPath:` activated Finder before any
+        // lease could see it.
         let wildcard_lease = prior_frontmost
-            .filter(|_| !finder_folder_handoff)
+            .filter(|_| reused_pid.is_none())
             .map(|prior| {
                 crate::focus_steal::FocusStealPreventer::begin_suppression(
                     None,
@@ -190,301 +221,229 @@ impl Tool for LaunchAppTool {
                 )
             });
 
-        // Predicate captured BEFORE moving inputs into spawn_blocking.
-        // Same condition that selects the `openURLs:withApplicationAtURL:`
-        // chain over the simpler `openApplicationAtURL:` path. Used after
-        // the spawn returns to size the suppression window — the slow
-        // path triggers a SECOND activation when the file-open delivers,
-        // which lands AFTER the bundle-only-launch activation window.
-        let slow_launch_path = !urls.is_empty()
-            || !additional_arguments.is_empty()
-            || !env.is_empty()
-            || creates_new_instance;
+        // The slow path (`openURLs:withApplicationAtURL:`) triggers a SECOND
+        // activation when the file-open delivers, after the bundle-only
+        // activation window; it sizes the suppression window below.
+        let slow_launch_path = !urls_to_open.is_empty() || !plain_open;
 
-        // Move the launch closure inputs into spawn_blocking. The
-        // blocking task returns (pid, app_info, windows). Suppression
-        // upgrade happens AFTER the blocking call returns (back on the
-        // async runtime), then we sleep holding the targeted lease.
-        let launch_result = tokio::task::spawn_blocking(move || {
-            let pid = if let Some(ref bid) = bundle_id {
-                if urls.is_empty()
-                    && additional_arguments.is_empty()
-                    && env.is_empty()
-                    && !creates_new_instance
-                {
-                    crate::apps::launch_app(bid)?
-                } else {
-                    crate::apps::launch_with_urls_by_bundle(
-                        bid,
-                        &urls,
-                        &additional_arguments,
-                        &env,
-                        creates_new_instance,
-                    )?
-                }
-            } else {
-                let n = name.as_deref().unwrap();
-                if urls.is_empty()
-                    && additional_arguments.is_empty()
-                    && env.is_empty()
-                    && !creates_new_instance
-                {
-                    crate::apps::launch_app_by_name(n)?
-                } else {
-                    crate::apps::launch_with_urls_by_name(
-                        n,
-                        &urls,
-                        &additional_arguments,
-                        &env,
-                        creates_new_instance,
-                    )?
-                }
-            };
+        let launch_urls = urls_to_open.clone();
+        let launch_result = match reused_pid {
+            Some(pid) => Ok(Ok(pid)),
+            None => {
+                tokio::task::spawn_blocking(move || {
+                    let pid = if let Some(ref bid) = bundle_id {
+                        if launch_urls.is_empty() && plain_open {
+                            crate::apps::launch_app(bid)?
+                        } else {
+                            crate::apps::launch_with_urls_by_bundle(
+                                bid,
+                                &launch_urls,
+                                &additional_arguments,
+                                &env,
+                                creates_new_instance,
+                            )?
+                        }
+                    } else {
+                        let n = name.as_deref().unwrap();
+                        if launch_urls.is_empty() && plain_open {
+                            crate::apps::launch_app_by_name(n)?
+                        } else {
+                            crate::apps::launch_with_urls_by_name(
+                                n,
+                                &launch_urls,
+                                &additional_arguments,
+                                &env,
+                                creates_new_instance,
+                            )?
+                        }
+                    };
+                    Ok::<_, anyhow::Error>(pid)
+                })
+                .await
+            }
+        };
+        let launched_at = std::time::Instant::now();
 
-            // Retry loop: LaunchServices returns before WindowServer has
-            // registered the new windows. Poll up to 5x100ms.
-            let windows = resolve_windows_for_pid(pid);
+        let pid = match launch_result {
+            Ok(Ok(pid)) => pid,
+            Ok(Err(e)) => return structured_launch_failure(&e),
+            Err(e) => return ToolResult::error(format!("Task error: {e}")),
+        };
 
-            let app_info: Option<crate::apps::AppInfo> = {
-                crate::apps::running_app(pid)
-            };
+        // The prior front app to guard, when something was sent to an app
+        // that was not already in front.
+        let guard_prior = prior_frontmost
+            .filter(|prior| *prior != pid)
+            .filter(|_| reused_pid.is_none());
+        let targeted_lease = guard_prior.map(|prior| {
+            crate::focus_steal::FocusStealPreventer::begin_suppression(
+                Some(pid),
+                prior,
+                "LaunchAppTool.post",
+            )
+        });
+        // Now safe to drop the wildcard: targeted is armed.
+        drop(wildcard_lease);
 
-            Ok::<_, anyhow::Error>((pid, app_info, windows))
+        let cold = !windows_before.iter().any(|(_, owner)| *owner == pid);
+        let wait = WindowWait {
+            before: windows_before.iter().map(|(id, _)| *id).collect(),
+            deadline: launched_at
+                + std::time::Duration::from_millis(launch_wait_ms(!urls_to_open.is_empty(), cold)),
+            sent_urls: urls_to_open,
+            reused: reused.iter().map(|(_, id)| *id).collect(),
+        };
+        if targeted_lease.is_some() {
+            // Hold the targeted lease over the whole post-launch activation
+            // window: 500 ms covers `applicationDidFinishLaunching` plus any
+            // reflex `NSApp.activate`; the slow path holds 2500 ms because
+            // Electron apps re-`app.focus()` from their `open-file` handler
+            // ~700-2000 ms after `openURLs` returns.
+            let window_ms: u64 = if slow_launch_path { 2500 } else { 500 };
+            tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
+        }
+        // The window wait runs after the activation window, still under the
+        // lease, so what it reports is fresh at return. Its deadline counts
+        // from the launch's return, so the lease time is not added to it.
+        let found = tokio::task::spawn_blocking(move || {
+            let found = await_launch_windows(pid, &wait);
+            let prior_name = prior_frontmost
+                .and_then(crate::apps::running_app)
+                .map(|app| app.name);
+            (found, crate::apps::running_app(pid), prior_name)
         })
         .await;
+        drop(targeted_lease);
+        let Ok((found, app_info, prior_name)) = found else {
+            return ToolResult::error("Task error: window wait after the launch failed");
+        };
 
-        // Upgrade to targeted suppression now that we know the real pid.
-        // Keep the wildcard lease alive until immediately AFTER we've
-        // armed the targeted one — that's the PR #1521 overlap window.
-        //
-        // `self_activation_suppressed` is the outcome of the belt-and-
-        // braces demotion check: `None` when the check didn't run
-        // (no prior frontmost / launch failed / pid == prior), `Some(true)`
-        // when the target was NOT frontmost after the suppression window
-        // (or we successfully re-demoted it), `Some(false)` when the
-        // re-demote failed and the target is still stealing focus.
-        // Surfaced in the structured response so callers can observe
-        // whether focus-steal prevention actually held.
-        let mut self_activation_suppressed: Option<bool> = None;
-        if let Ok(Ok((pid, _, _))) = &launch_result {
-            if let Some(prior) = prior_frontmost {
-                if *pid != prior {
-                    let targeted_lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
-                        Some(*pid),
-                        prior,
-                        "LaunchAppTool.post",
+        let mut seen_in_loop = false;
+        if let Some(prior) = guard_prior {
+            // Belt-and-braces loop: demote the target if it pops back to the
+            // front after the lease dropped. Up to 5 x 200 ms, only while it
+            // is in front.
+            for _ in 0..5 {
+                if crate::apps::frontmost_pid() != Some(pid) {
+                    // Not frontmost: nothing to do this tick.
+                    continue;
+                }
+                seen_in_loop = true;
+                let activated = crate::apps::restore_prior_app(prior);
+                if crate::apps::frontmost_pid() == Some(pid) {
+                    tracing::warn!(
+                        target: "platform_macos::tools::launch_app",
+                        launched_pid = pid,
+                        prior_pid = prior,
+                        activate_pid_returned = activated,
+                        "belt-and-braces demotion iteration failed: \
+                         launched app remained frontmost after \
+                         re-activating prior — will retry"
                     );
-                    // Now safe to drop the wildcard — targeted is armed.
-                    drop(wildcard_lease);
-                    // Hold the targeted lease long enough to cover the
-                    // ENTIRE post-launch activation window.
-                    //
-                    // - Fast path (bundle-only launch, no urls/args/env):
-                    //   500ms covers `applicationDidFinishLaunching` plus
-                    //   any reflex `NSApp.activate(...)`. Matches Swift
-                    //   LaunchAppTool.swift exactly.
-                    //
-                    // - Slow path (urls / additional_arguments / env /
-                    //   creates_new_instance): 2500ms. The slow-path
-                    //   `openURLs:withApplicationAtURL:` chain triggers a
-                    //   second activation when the file-open delivers to
-                    //   the just-launched app — Electron apps (VSCode,
-                    //   Cursor, Slack) re-`app.focus()` from inside their
-                    //   `open-file` JS handler, AFTER our 500ms window
-                    //   would have already closed. Empirically VSCode's
-                    //   late activation can land anywhere from ~700ms to
-                    //   ~2000ms after the openURLs return. The observer-
-                    //   based lease catches any activation that lands
-                    //   WHILE held, so widening the window converts the
-                    //   late activation from a contract violation into
-                    //   another auto-demote.
-                    let window_ms: u64 = if slow_launch_path { 2500 } else { 500 };
-                    tokio::time::sleep(std::time::Duration::from_millis(window_ms)).await;
-                    drop(targeted_lease);
-
-                    // Belt-and-braces LOOP: if the target ever pops back
-                    // to the foreground after the lease drops (rare —
-                    // observer already covered the suppression window —
-                    // but happens when the activation fires literally on
-                    // the same tokio tick the lease dropped), demote it.
-                    // Loop 5x200ms = 1s of post-window coverage. Each
-                    // iteration is cheap (one frontmost_pid + maybe one
-                    // activate_pid call) so this stays well under the
-                    // RPC budget even when the demote keeps working.
-                    let mut demotion_succeeded = true;
-                    for _ in 0..5 {
-                        let frontmost_now = crate::apps::frontmost_pid();
-                        if frontmost_now != Some(*pid) {
-                            // Not frontmost — nothing to do this tick.
-                            continue;
-                        }
-                        let activated = crate::apps::restore_prior_app(prior);
-                        let still_frontmost = crate::apps::frontmost_pid() == Some(*pid);
-                        if still_frontmost {
-                            tracing::warn!(
-                                target: "platform_macos::tools::launch_app",
-                                launched_pid = *pid,
-                                prior_pid = prior,
-                                activate_pid_returned = activated,
-                                "belt-and-braces demotion iteration failed: \
-                                 launched app remained frontmost after \
-                                 re-activating prior — will retry"
-                            );
-                            demotion_succeeded = false;
-                        } else {
-                            demotion_succeeded = true;
-                        }
-                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-                    }
-                    // Final in-call state determines the structured response.
-                    let final_frontmost = crate::apps::frontmost_pid();
-                    self_activation_suppressed =
-                        Some(final_frontmost != Some(*pid) && demotion_succeeded);
-
-                    // Detached late-activation watchdog (slow path only).
-                    //
-                    // Why: Electron apps with no workspace open (cold-
-                    // launched VSCode / Cursor / Slack with a file URL)
-                    // re-activate AGAIN when their Welcome window
-                    // finishes loading — empirically 4-8 seconds after
-                    // the `openURLs:withApplicationAtURL:` call returns.
-                    // That's well past the in-call suppression window
-                    // and any reasonable extension of it that an agent
-                    // workflow would tolerate as caller latency.
-                    //
-                    // Solution: hold a fresh observer-backed lease in
-                    // the background for ~8s, demoting if the launched
-                    // pid pops back. The caller doesn't wait — the tool
-                    // already returned its honest `self_activation_
-                    // suppressed` for the in-call window. The detached
-                    // task just keeps the no-foreground-steal contract
-                    // honored past the RPC boundary.
-                    //
-                    // Note on process lifecycle: this watchdog only runs
-                    // when the tokio runtime stays alive — i.e. in the
-                    // long-running `cua-driver mcp` / `cua-driver serve`
-                    // daemon modes. The one-shot `cua-driver call` mode
-                    // exits as soon as the tool returns, taking the
-                    // detached task with it. Acceptable because the
-                    // contract is "no foreground steal during a session
-                    // the agent is driving" — `cua-driver call` doesn't
-                    // have a session that outlives the call.
-                    //
-                    // Tradeoffs:
-                    // - Caller latency unchanged (~2.5s for slow path).
-                    // - Total observer coverage: ~10.5s post-launch.
-                    // - CPU: the observer fires per activation event,
-                    //   not per poll; the 250ms tick is just for the
-                    //   manual belt-and-braces demote. Cheap.
-                    // - A user click on the launched app ends the watchdog:
-                    //   real input moves the event counters, the loop stops,
-                    //   and its guard lets user activations through. (It
-                    //   used to demote the user for up to ~10s.)
-                    if slow_launch_path {
-                        let launched_pid = *pid;
-                        let prior_pid = prior;
-                        tokio::spawn(async move {
-                            let baseline = crate::focus_steal::read_input_activity();
-                            let _lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
-                                Some(launched_pid),
-                                prior_pid,
-                                "LaunchAppTool.watchdog",
-                            )
-                            .linger_until(
-                                std::time::Instant::now() + std::time::Duration::from_secs(9),
-                            );
-                            let mut late_activations = 0u32;
-                            for _ in 0..32 {
-                                // 32 × 250ms = 8s
-                                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
-                                if crate::focus_steal::user_input_since(&baseline) {
-                                    break; // the user is acting; their choice wins
-                                }
-                                if crate::apps::frontmost_pid() == Some(launched_pid) {
-                                    late_activations += 1;
-                                    let _ = crate::apps::restore_prior_app(prior_pid);
-                                }
-                            }
-                            if late_activations > 0 {
-                                tracing::warn!(
-                                    target: "platform_macos::tools::launch_app",
-                                    launched_pid,
-                                    prior_pid,
-                                    late_activations,
-                                    "watchdog demoted post-RPC late activations \
-                                     — slow-path window may need tuning"
-                                );
-                            }
-                        });
-                    }
-                } else {
-                    // pid == prior frontmost (re-launch of an already-
-                    // frontmost app). Just drop the wildcard.
-                    drop(wildcard_lease);
                 }
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
             }
-        } else {
-            // Launch failed; just drop the lease.
-            drop(wildcard_lease);
-        }
 
-        match launch_result {
-            Ok(Ok((pid, app_info, windows))) => {
-                let (app_name, bid) = response_identity(
-                    app_info.as_ref(),
-                    response_bundle_id.as_deref(),
-                    response_requested_name.as_deref(),
-                );
-
-                let mut summary =
-                    format!("Launched {app_name} (pid {pid}) in background.{port_summary}");
-
-                if !windows.is_empty() {
-                    summary.push_str("\n\nWindows:");
-                    for w in &windows {
-                        let title = if w.title.is_empty() {
-                            "(no title)".to_owned()
-                        } else {
-                            format!("\"{}\"", w.title)
-                        };
-                        summary.push_str(&format!("\n- {title} [window_id: {}]", w.window_id));
+            // Detached late-activation watchdog (slow path only). Electron
+            // apps with no workspace open re-activate when their Welcome
+            // window loads, 4-8 s after `openURLs` returns. A fresh lease
+            // demotes those for ~9 s more without holding up the caller. It
+            // runs only while the daemon lives (`mcp` / `serve`), and real
+            // user input ends it so a user's own click on the app wins.
+            if slow_launch_path {
+                let launched_pid = pid;
+                let prior_pid = prior;
+                tokio::spawn(async move {
+                    let baseline = crate::focus_steal::read_input_activity();
+                    let _lease = crate::focus_steal::FocusStealPreventer::begin_suppression(
+                        Some(launched_pid),
+                        prior_pid,
+                        "LaunchAppTool.watchdog",
+                    )
+                    .linger_until(std::time::Instant::now() + std::time::Duration::from_secs(9));
+                    let mut late_activations = 0u32;
+                    for _ in 0..32 {
+                        // 32 × 250ms = 8s
+                        tokio::time::sleep(std::time::Duration::from_millis(250)).await;
+                        if crate::focus_steal::user_input_since(&baseline) {
+                            break; // the user is acting; their choice wins
+                        }
+                        if crate::apps::frontmost_pid() == Some(launched_pid) {
+                            late_activations += 1;
+                            let _ = crate::apps::restore_prior_app(prior_pid);
+                        }
                     }
-                    summary.push_str(&format!(
-                        "\n→ Call get_window_state(pid: {pid}, window_id) to inspect. The app was \
-                         not activated; that read's background_input reports which input routes \
-                         the window has now."
-                    ));
-                }
-
-                let windows_json: Vec<Value> = windows
-                    .iter()
-                    .map(|w| {
-                        let mut record = super::list_windows::window_record_json(w);
-                        record["input_readiness"] = input_readiness_pointer(pid, w.window_id);
-                        record
-                    })
-                    .collect();
-
-                let mut structured = serde_json::json!({
-                    "pid": pid,
-                    "bundle_id": bid,
-                    "name": app_name,
-                    "windows": windows_json,
-                    "launch_state": launch_state(true, true, !windows.is_empty()),
+                    if late_activations > 0 {
+                        tracing::warn!(
+                            target: "platform_macos::tools::launch_app",
+                            launched_pid,
+                            prior_pid,
+                            late_activations,
+                            "watchdog demoted post-RPC late activations \
+                             — slow-path window may need tuning"
+                        );
+                    }
                 });
-                // Only emit `self_activation_suppressed` when the
-                // belt-and-braces demotion check actually ran. `None`
-                // means the launch didn't enter the focus-steal path
-                // (no prior frontmost, or pid == prior) — surfacing
-                // a stale `false` would be misleading.
-                if let Some(suppressed) = self_activation_suppressed {
-                    structured["self_activation_suppressed"] = serde_json::Value::Bool(suppressed);
-                }
-                ToolResult::text(summary).with_structured(structured)
             }
-            Ok(Err(e)) => structured_launch_failure(&e),
-            Err(e) => ToolResult::error(format!("Task error: {e}")),
         }
+
+        // `(seen_front, front_restored)`: whether the app was seen in front
+        // at any point during the call (an activation notification, even one
+        // a lease undid within milliseconds, or a front sample), and whether
+        // the prior front app was in front at return. `None` when the check
+        // did not apply (no prior front app, or the app was already in
+        // front). Taken last, so the window wait counts too.
+        let activation = prior_frontmost.filter(|prior| *prior != pid).map(|prior| {
+            let final_frontmost = crate::apps::frontmost_pid();
+            let seen_front = seen_in_loop
+                || final_frontmost == Some(pid)
+                || crate::focus_steal::activated_since(activation_mark, pid);
+            (seen_front, final_frontmost == Some(prior))
+        });
+
+        let (app_name, bid) = response_identity(
+            app_info.as_ref(),
+            response_bundle_id.as_deref(),
+            response_requested_name.as_deref(),
+        );
+        let summary = launch_summary(
+            &app_name,
+            pid,
+            &port_summary,
+            &found,
+            !urls.is_empty(),
+            activation,
+            prior_name.as_deref(),
+        );
+
+        let windows_json: Vec<Value> = found
+            .windows
+            .iter()
+            .map(|w| {
+                let mut record = super::list_windows::window_record_json(w);
+                record["input_readiness"] = input_readiness_pointer(pid, w.window_id);
+                record
+            })
+            .collect();
+
+        let mut structured = serde_json::json!({
+            "pid": pid,
+            "bundle_id": bid,
+            "name": app_name,
+            "windows": windows_json,
+            "opened_windows": found.opened,
+            "launch_state": launch_state(true, true, found.ready),
+        });
+        if !urls.is_empty() {
+            structured["requested_windows"] = serde_json::json!(found.requested);
+            structured["reused_windows"] = serde_json::json!(found.reused());
+        }
+        // Only when the activation check ran (see `activation`).
+        if let Some((seen_front, front_restored)) = activation {
+            structured["self_activation_suppressed"] = Value::Bool(!seen_front);
+            structured["front_restored"] = Value::Bool(front_restored);
+        }
+        ToolResult::text(summary).with_structured(structured)
     }
 }
 
@@ -515,24 +474,343 @@ fn protected_host_launch_refusal() -> ToolResult {
 
 // ── Blocking helpers ──────────────────────────────────────────────────────────
 
-/// Poll for the pid's layer-0 windows, retrying up to 5x100ms to absorb
-/// LaunchServices → WindowServer latency (mirrors the Swift reference).
-fn resolve_windows_for_pid(pid: i32) -> Vec<crate::windows::WindowInfo> {
-    for attempt in 0..5 {
-        let mut found: Vec<_> = crate::windows::all_windows()
+/// The pid of the one running app with this bundle id. `None` when none or
+/// several run: LaunchServices picks the instance that gets the urls, so a
+/// window of another instance cannot stand in for one.
+fn running_pid_for_bundle(bundle_id: &str) -> Option<i32> {
+    let mut pids = crate::apps::list_running_apps()
+        .into_iter()
+        .filter(|app| app.bundle_id.as_deref() == Some(bundle_id))
+        .map(|app| app.pid);
+    let pid = pids.next()?;
+    pids.next().is_none().then_some(pid)
+}
+
+/// Wall-clock cap on one read of an app's window documents, so a slow app
+/// cannot stall the launch.
+const AX_DOCUMENTS_BUDGET: std::time::Duration = std::time::Duration::from_millis(500);
+
+/// A local path or `file://` URL as a comparable path: decoded, without a
+/// trailing slash, symlinks resolved when the file exists (/tmp is
+/// /private/tmp in AXDocument). `None` for remote and custom URLs.
+fn document_path(raw: &str) -> Option<PathBuf> {
+    let path = local_file_target(raw)?;
+    let path = PathBuf::from(path.to_string_lossy().trim_end_matches('/'));
+    Some(std::fs::canonicalize(&path).unwrap_or(path))
+}
+
+/// The requested urls a window already shows, as `(url, window_id)`, from
+/// the app's `(window_id, AXDocument)` list.
+fn already_open(urls: &[String], documents: &[(u32, Option<String>)]) -> Vec<(String, u32)> {
+    urls.iter()
+        .filter_map(|url| {
+            let wanted = document_path(url)?;
+            documents
+                .iter()
+                .find(|(_, document)| {
+                    document.as_deref().and_then(document_path).as_ref() == Some(&wanted)
+                })
+                .map(|(id, _)| (url.clone(), *id))
+        })
+        .collect()
+}
+
+/// How long after the launch returns the window wait may run: 3 s when urls
+/// were sent, 2 s for a cold launch (500 ms was too short under load), else
+/// 500 ms (a running app answers with the windows it has).
+fn launch_wait_ms(urls_sent: bool, cold: bool) -> u64 {
+    if urls_sent {
+        3000
+    } else if cold {
+        2000
+    } else {
+        500
+    }
+}
+
+/// What the window wait looks for.
+struct WindowWait {
+    /// Every window id on screen before the call.
+    before: std::collections::HashSet<u32>,
+    /// When to stop waiting: counted from the launch's return, so the time
+    /// the suppression leases already held counts toward it.
+    deadline: std::time::Instant,
+    /// The urls sent to the app (requested urls minus the reused ones).
+    sent_urls: Vec<String>,
+    /// Windows that already showed a requested url; nothing was sent for them.
+    reused: Vec<u32>,
+}
+
+/// The app's windows after the launch, and which of them answer the call.
+struct LaunchWindows {
+    /// Every layer-0 window of the pid: requested first, then the rest.
+    windows: Vec<crate::windows::WindowInfo>,
+    /// Windows that appeared during the call.
+    opened: Vec<u32>,
+    /// Windows showing the requested urls (opened or existing).
+    requested: Vec<u32>,
+    /// Existing windows that already showed a requested file: nothing was
+    /// sent for those urls.
+    skipped: Vec<u32>,
+    /// Existing windows the app opened nothing next to, matched by title
+    /// (a Finder folder that was already open; Finder names no document).
+    matched_by_title: Vec<u32>,
+    /// With urls: every requested url has its window. Without: a window exists.
+    ready: bool,
+}
+
+impl LaunchWindows {
+    /// Requested windows that existed before the call.
+    fn reused(&self) -> Vec<u32> {
+        self.requested
+            .iter()
+            .copied()
+            .filter(|id| !self.opened.contains(id))
+            .collect()
+    }
+}
+
+/// Which windows answer the request: `(requested, matched_by_title, ready)`.
+/// Pure, so the rules are testable. `skipped` are the windows that already
+/// showed a requested file (nothing sent for it) and are still on screen;
+/// `skipped_missing` says one of them closed meanwhile, which leaves its url
+/// unanswered. `titles` is the window snapshot, `(id, title)`.
+/// - no urls sent: the skipped windows (all urls were open already) or, for a
+///   plain launch, any window;
+/// - only local files sent, and the app names documents (AXDocument): the
+///   windows of the snapshot whose document is a sent file, once every sent
+///   file has one;
+/// - otherwise (remote urls, or an app that names no document on any window,
+///   like a Finder folder window) the windows that appeared during the call,
+///   ready once there is one per sent url. An unreadable document list
+///   (`None`) is never taken for "names no document".
+/// - on the last poll, when no window appeared at all, each local folder or
+///   file whose name is the title of exactly one window, a different window
+///   per url, is taken as shown there (Finder brings an open folder's window
+///   forward instead of opening one). That matches the name, not the path,
+///   and the result says so. Never earlier: a new window may still come.
+#[allow(clippy::too_many_arguments)]
+fn requested_windows(
+    sent_urls: &[String],
+    skipped: &[u32],
+    skipped_missing: bool,
+    opened: &[u32],
+    documents: Option<&[(u32, Option<String>)]>,
+    titles: &[(u32, &str)],
+    has_window: bool,
+    last_poll: bool,
+) -> (Vec<u32>, Vec<u32>, bool) {
+    let mut requested = skipped.to_vec();
+    if sent_urls.is_empty() {
+        let ready = if requested.is_empty() && !skipped_missing {
+            has_window
+        } else {
+            !skipped_missing
+        };
+        return (requested, Vec::new(), ready);
+    }
+    let files: Vec<PathBuf> = sent_urls.iter().filter_map(|u| document_path(u)).collect();
+    let all_files = files.len() == sent_urls.len();
+    let Some(documents) = documents.or((!all_files).then_some(&[][..])) else {
+        return (requested, Vec::new(), false);
+    };
+    // Only windows in the snapshot count: one the AX read found after the
+    // window list was taken is picked up on the next poll.
+    let in_snapshot = |id: &u32| titles.iter().any(|(window, _)| window == id);
+    if all_files && documents.iter().any(|(_, document)| document.is_some()) {
+        let matched: Vec<u32> = files
+            .iter()
+            .filter_map(|file| {
+                documents
+                    .iter()
+                    .filter(|(id, _)| in_snapshot(id))
+                    .find(|(_, d)| d.as_deref().and_then(document_path).as_ref() == Some(file))
+                    .map(|(id, _)| *id)
+            })
+            .collect();
+        let ready = matched.len() == files.len() && !skipped_missing;
+        for id in matched {
+            if !requested.contains(&id) {
+                requested.push(id);
+            }
+        }
+        return (requested, Vec::new(), ready);
+    }
+    if opened.is_empty() && last_poll && all_files {
+        let mut by_title: Vec<u32> = Vec::new();
+        for file in &files {
+            let Some(name) = file.file_name().and_then(|name| name.to_str()) else {
+                break;
+            };
+            let mut hits = titles.iter().filter(|(_, title)| *title == name);
+            match (hits.next(), hits.next()) {
+                (Some((id, _)), None) if !by_title.contains(id) => by_title.push(*id),
+                _ => break,
+            }
+        }
+        if by_title.len() == files.len() {
+            requested.extend(by_title.iter().filter(|id| !skipped.contains(id)));
+            return (requested, by_title, !skipped_missing);
+        }
+    }
+    requested.extend(opened.iter().filter(|id| !skipped.contains(id)));
+    (
+        requested,
+        Vec::new(),
+        opened.len() >= sent_urls.len() && !skipped_missing,
+    )
+}
+
+/// Poll the pid's windows until the requested ones are there or the deadline
+/// passes (see `launch_wait_ms`). The window list read before the launch
+/// tells new windows from old ones, which a plain "any window" check cannot:
+/// a running app answered with its old windows before the new one registered.
+fn await_launch_windows(pid: i32, wait: &WindowWait) -> LaunchWindows {
+    loop {
+        let last_poll = std::time::Instant::now() >= wait.deadline;
+        let mut windows: Vec<_> = crate::windows::all_windows()
             .into_iter()
             .filter(|w| w.pid == pid && w.layer == 0)
             .filter(|w| w.bounds.width > 1.0 && w.bounds.height > 1.0)
             .collect();
-        if !found.is_empty() {
-            rank_launch_windows(&mut found);
-            return found;
+        let opened: Vec<u32> = windows
+            .iter()
+            .map(|w| w.window_id)
+            .filter(|id| !wait.before.contains(id))
+            .collect();
+        let documents = if wait.sent_urls.is_empty() {
+            None
+        } else {
+            crate::ax::bindings::ax_window_documents_of_pid(pid, AX_DOCUMENTS_BUDGET)
+        };
+        // A window that already showed a requested file and closed meanwhile
+        // leaves that url unanswered.
+        let skipped: Vec<u32> = wait
+            .reused
+            .iter()
+            .copied()
+            .filter(|id| windows.iter().any(|w| w.window_id == *id))
+            .collect();
+        let skipped_missing = skipped.len() < wait.reused.len();
+        let titles: Vec<(u32, &str)> = windows
+            .iter()
+            .map(|w| (w.window_id, w.title.as_str()))
+            .collect();
+        let (requested, matched_by_title, ready) = requested_windows(
+            &wait.sent_urls,
+            &skipped,
+            skipped_missing,
+            &opened,
+            documents.as_deref(),
+            &titles,
+            !windows.is_empty(),
+            last_poll,
+        );
+        if ready || last_poll {
+            rank_launch_windows(&mut windows);
+            windows.sort_by_key(|w| !requested.contains(&w.window_id));
+            return LaunchWindows {
+                windows,
+                opened,
+                requested,
+                skipped,
+                matched_by_title,
+                ready,
+            };
         }
-        if attempt < 4 {
-            std::thread::sleep(std::time::Duration::from_millis(100));
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
+fn window_line(window: &crate::windows::WindowInfo) -> String {
+    let title = if window.title.is_empty() {
+        "(no title)".to_owned()
+    } else {
+        format!("\"{}\"", window.title)
+    };
+    format!("{title} [window_id: {}]", window.window_id)
+}
+
+/// The text result: what was opened or reused, and what happened to the front.
+fn launch_summary(
+    app_name: &str,
+    pid: i32,
+    port_summary: &str,
+    found: &LaunchWindows,
+    urls_requested: bool,
+    activation: Option<(bool, bool)>,
+    prior_name: Option<&str>,
+) -> String {
+    // Only a check that ran may say "not activated"; without one (no prior
+    // front app, or the app was already in front) the text claims nothing.
+    let not_activated = matches!(activation, Some((false, _)));
+    let mut summary = if not_activated {
+        format!("Launched {app_name} (pid {pid}) in background.{port_summary}")
+    } else {
+        format!("Launched {app_name} (pid {pid}).{port_summary}")
+    };
+    if let Some((true, restored)) = activation {
+        let prior = prior_name.unwrap_or("the previous front app");
+        summary.push_str(&if restored {
+            format!(
+                "\n{app_name} came to the front during the call; {prior} was put back in front."
+            )
+        } else {
+            format!(
+                "\n{app_name} came to the front during the call and {prior} is not back in front."
+            )
+        });
+    }
+    if urls_requested {
+        let by_id = |id: &u32| found.windows.iter().find(|w| w.window_id == *id);
+        for id in &found.requested {
+            let line = by_id(id)
+                .map(window_line)
+                .unwrap_or_else(|| format!("[window_id: {id}]"));
+            if found.skipped.contains(id) {
+                summary.push_str(&format!(
+                    "\nAlready open, reused (nothing sent to the app): {line}"
+                ));
+            } else if found.matched_by_title.contains(id) {
+                summary.push_str(&format!(
+                    "\nAlready open: the app opened no new window, and this is the one window \
+                     titled with the requested name (matched by name, not by path): {line}"
+                ));
+            } else if found.opened.contains(id) {
+                summary.push_str(&format!("\nOpened for the request: {line}"));
+            } else {
+                summary.push_str(&format!(
+                    "\nAlready open, the app showed this existing window: {line}"
+                ));
+            }
+        }
+        if !found.ready {
+            summary.push_str(
+                "\nNo window for every requested url appeared in time; the app may have \
+                 opened them in an existing window or tab, or later. Check with list_windows.",
+            );
         }
     }
-    vec![]
+    if !found.windows.is_empty() {
+        summary.push_str("\n\nWindows:");
+        for w in &found.windows {
+            let new = if found.opened.contains(&w.window_id) {
+                " (new)"
+            } else {
+                ""
+            };
+            summary.push_str(&format!("\n- {}{new}", window_line(w)));
+        }
+        summary.push_str(&format!(
+            "\n→ Call get_window_state(pid: {pid}, window_id) to inspect. {}",
+            if not_activated {
+                "The app was not activated; that read's background_input reports which input routes the window has now."
+            } else {
+                "Its background_input reports which input routes the window has now."
+            }
+        ));
+    }
+    summary
 }
 
 fn rank_launch_windows(windows: &mut [crate::windows::WindowInfo]) {
@@ -721,8 +999,9 @@ fn hex_value(byte: u8) -> Option<u8> {
 #[cfg(test)]
 mod tests {
     use super::{
-        is_cua_driver_bundle_id, local_file_target, normalize_launch_url, preflight_file_urls,
-        rank_launch_windows, response_identity, structured_launch_failure, LaunchAppTool,
+        already_open, is_cua_driver_bundle_id, launch_summary, local_file_target,
+        normalize_launch_url, preflight_file_urls, rank_launch_windows, requested_windows,
+        response_identity, structured_launch_failure, LaunchAppTool, LaunchWindows,
     };
     use cua_driver_core::tool::Tool;
     use serde_json::json;
@@ -785,6 +1064,263 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![3, 2, 1]
         );
+    }
+
+    fn sent(urls: &[&str]) -> Vec<String> {
+        urls.iter().map(|u| u.to_string()).collect()
+    }
+
+    fn docs(list: &[(u32, Option<&str>)]) -> Vec<(u32, Option<String>)> {
+        list.iter()
+            .map(|(id, d)| (*id, d.map(str::to_owned)))
+            .collect()
+    }
+
+    /// A file already shown in a window is matched through AXDocument, file
+    /// URL or path, percent-encoded or not; other urls are left to send.
+    #[test]
+    fn already_open_matches_axdocument_file_urls() {
+        let documents = docs(&[
+            (5, Some("file:///nonexistent-cua/My%20Notes.txt")),
+            (6, None),
+        ]);
+        let urls = vec![
+            "/nonexistent-cua/My Notes.txt".to_owned(),
+            "/nonexistent-cua/other.txt".to_owned(),
+            "https://example.com".to_owned(),
+        ];
+        assert_eq!(
+            already_open(&urls, &documents),
+            vec![("/nonexistent-cua/My Notes.txt".to_owned(), 5)]
+        );
+    }
+
+    /// `requested_windows` for a mid-wait poll with the given snapshot.
+    fn poll(
+        sent_urls: &[String],
+        opened: &[u32],
+        documents: Option<&[(u32, Option<String>)]>,
+        titles: &[(u32, &str)],
+    ) -> (Vec<u32>, Vec<u32>, bool) {
+        requested_windows(
+            sent_urls,
+            &[],
+            false,
+            opened,
+            documents,
+            titles,
+            true,
+            false,
+        )
+    }
+
+    /// The requested window of a document app is the one whose AXDocument
+    /// is the sent file, not an older window that appeared first (TextEdit
+    /// restoring a previous document on a cold launch).
+    #[test]
+    fn requested_window_is_the_document_window_once_it_names_the_file() {
+        let file = sent(&["/nonexistent-cua/probe.txt"]);
+        let restored_only = docs(&[(7, Some("file:///nonexistent-cua/old.txt"))]);
+        assert_eq!(
+            poll(&file, &[7], Some(&restored_only), &[(7, "old.txt")]),
+            (vec![], vec![], false),
+            "a restored window is not the requested one"
+        );
+        let both = docs(&[
+            (7, Some("file:///nonexistent-cua/old.txt")),
+            (8, Some("file:///nonexistent-cua/probe.txt")),
+        ]);
+        let snapshot = [(7, "old.txt"), (8, "probe.txt")];
+        assert_eq!(
+            poll(&file, &[7, 8], Some(&both), &snapshot),
+            (vec![8], vec![], true)
+        );
+        assert_eq!(
+            poll(&file, &[7], Some(&both), &[(7, "old.txt")]),
+            (vec![], vec![], false),
+            "a document window the window list does not have yet waits for the next poll"
+        );
+    }
+
+    /// An app that names no document on any window (a Finder folder window)
+    /// and remote urls fall back to the windows the call opened, one per url;
+    /// no new window means not ready, never "ready with old windows".
+    #[test]
+    fn requested_windows_fall_back_to_opened_windows() {
+        let folder = sent(&["/nonexistent-cua/folder"]);
+        let finder = docs(&[(1, None), (9, None)]);
+        let snapshot = [(1, "Desktop"), (9, "folder")];
+        assert_eq!(
+            poll(&folder, &[9], Some(&finder), &snapshot),
+            (vec![9], vec![], true)
+        );
+        assert_eq!(
+            poll(&folder, &[], Some(&finder), &snapshot),
+            (vec![], vec![], false)
+        );
+        let two = sent(&["/nonexistent-cua/a", "/nonexistent-cua/b"]);
+        assert_eq!(
+            poll(&two, &[9], Some(&finder), &snapshot),
+            (vec![9], vec![], false),
+            "one new window does not answer two urls"
+        );
+        let remote = sent(&["https://example.com"]);
+        assert_eq!(poll(&remote, &[], None, &[]), (vec![], vec![], false));
+        assert_eq!(
+            poll(&remote, &[4], None, &[(4, "")]),
+            (vec![4], vec![], true)
+        );
+    }
+
+    /// Finder brings an already-open folder's window forward instead of
+    /// opening one: on the last poll, with no new window, the one window
+    /// titled with the folder's name answers. Never before the last poll,
+    /// never when two windows share the title, never one window for two urls.
+    #[test]
+    fn existing_window_matched_by_title_only_on_the_last_poll() {
+        let last = |urls: &[String], opened: &[u32], titles: &[(u32, &str)]| {
+            let finder = docs(&[(1, None), (6, None)]);
+            requested_windows(urls, &[], false, opened, Some(&finder), titles, true, true)
+        };
+        let folder = sent(&["/nonexistent-cua/trip"]);
+        let titles = [(1, "Desktop"), (6, "trip")];
+        assert_eq!(
+            poll(&folder, &[], Some(&docs(&[(1, None), (6, None)])), &titles),
+            (vec![], vec![], false),
+            "a new window may still be on its way"
+        );
+        assert_eq!(last(&folder, &[], &titles), (vec![6], vec![6], true));
+        assert_eq!(
+            last(&folder, &[], &[(1, "trip"), (6, "trip")]),
+            (vec![], vec![], false)
+        );
+        assert_eq!(
+            last(&folder, &[9], &titles),
+            (vec![9], vec![], true),
+            "a new window wins over a title match"
+        );
+        let same_name = sent(&["/nonexistent-cua/a/trip", "/nonexistent-cua/b/trip"]);
+        assert_eq!(last(&same_name, &[], &titles), (vec![], vec![], false));
+    }
+
+    /// An unreadable document list is unknown, not "no documents": local
+    /// files are not ready on a new window alone.
+    #[test]
+    fn unreadable_documents_never_make_a_file_request_ready() {
+        let file = sent(&["/nonexistent-cua/probe.txt"]);
+        assert_eq!(
+            poll(&file, &[9], None, &[(9, "x")]),
+            (vec![], vec![], false)
+        );
+    }
+
+    /// Nothing sent: a fully reused request is ready with its windows; a
+    /// plain launch is ready when the app has any window; a reused window
+    /// that closed leaves its url unanswered, here and alongside sent urls.
+    #[test]
+    fn requested_windows_without_sent_urls_and_closed_reused_windows() {
+        let none: &[String] = &[];
+        let plain = |skipped: &[u32], missing: bool, has_window: bool| {
+            requested_windows(none, skipped, missing, &[], None, &[], has_window, false)
+        };
+        assert_eq!(plain(&[3], false, true), (vec![3], vec![], true));
+        assert_eq!(plain(&[], false, true), (vec![], vec![], true));
+        assert_eq!(plain(&[], false, false), (vec![], vec![], false));
+        assert_eq!(plain(&[], true, true), (vec![], vec![], false));
+        let file = sent(&["/nonexistent-cua/b.txt"]);
+        let documents = docs(&[(8, Some("file:///nonexistent-cua/b.txt"))]);
+        assert_eq!(
+            requested_windows(
+                &file,
+                &[],
+                true,
+                &[8],
+                Some(&documents),
+                &[(8, "b.txt")],
+                true,
+                false
+            ),
+            (vec![8], vec![], false),
+            "the closed reused window's url is still unanswered"
+        );
+    }
+
+    fn found(requested: &[u32], skipped: &[u32], ready: bool) -> LaunchWindows {
+        LaunchWindows {
+            windows: vec![
+                window(9, "trip", 800.0, 600.0),
+                window(1, "Desktop", 800.0, 600.0),
+            ],
+            opened: vec![9],
+            requested: requested.to_vec(),
+            skipped: skipped.to_vec(),
+            matched_by_title: Vec::new(),
+            ready,
+        }
+    }
+
+    /// The text never says "not activated" when the app was seen in front,
+    /// and names the opened or reused window.
+    #[test]
+    fn summary_reports_activation_and_the_requested_window() {
+        let quiet = launch_summary(
+            "Finder",
+            42,
+            "",
+            &found(&[9], &[], true),
+            true,
+            Some((false, true)),
+            Some("Terminal"),
+        );
+        assert!(quiet.starts_with("Launched Finder (pid 42) in background."));
+        assert!(quiet.contains("Opened for the request: \"trip\" [window_id: 9]"));
+        assert!(quiet.contains("- \"trip\" [window_id: 9] (new)"));
+        assert!(quiet.contains("The app was not activated"));
+
+        let flashed = launch_summary(
+            "Finder",
+            42,
+            "",
+            &found(&[9], &[], true),
+            true,
+            Some((true, true)),
+            Some("Terminal"),
+        );
+        assert!(!flashed.contains("in background"));
+        assert!(!flashed.contains("not activated"));
+        assert!(flashed
+            .contains("Finder came to the front during the call; Terminal was put back in front."));
+
+        let stuck = launch_summary(
+            "Finder",
+            42,
+            "",
+            &found(&[9], &[], true),
+            true,
+            Some((true, false)),
+            Some("Terminal"),
+        );
+        assert!(stuck.contains("Terminal is not back in front"));
+
+        let reused = launch_summary(
+            "Finder",
+            42,
+            "",
+            &found(&[1], &[1], true),
+            true,
+            Some((false, true)),
+            None,
+        );
+        assert!(reused.contains(
+            "Already open, reused (nothing sent to the app): \"Desktop\" [window_id: 1]"
+        ));
+
+        let unchecked = launch_summary("Finder", 42, "", &found(&[9], &[], true), true, None, None);
+        assert!(!unchecked.contains("in background"));
+        assert!(!unchecked.contains("not activated"));
+
+        let missing = launch_summary("Finder", 42, "", &found(&[], &[], false), true, None, None);
+        assert!(missing.contains("No window for every requested url appeared in time"));
     }
 
     #[test]
