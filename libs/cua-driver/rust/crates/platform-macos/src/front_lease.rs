@@ -6,7 +6,7 @@
 //! remembered here, and gets the front back once a later cua action finds
 //! the edit ended. Nothing else is tracked: one lease (only one app can be in
 //! front), begun where the front is kept, settled at the end of every native
-//! action's outcome watch, cleared by `bring_to_front`.
+//! action's outcome watch, ended by `bring_to_front` as the table says.
 //!
 //! | Event (settled after a cua action) | Lease | Front |
 //! |---|---|---|
@@ -16,7 +16,14 @@
 //! | another app is in front (the user's or the agent's choice) | cleared | left alone |
 //! | a mouse press that was not cua's came during the edit, open or not | cleared | left alone (the user is working) |
 //! | the previous app quit | cleared | left alone |
-//! | `bring_to_front` | cleared | the agent's choice |
+//! | the agent's `bring_to_front` moved the front, or chose the app itself | cleared | the agent's choice; its result names the app owed |
+//! | the PiP Focus button | cleared | the user's choice |
+//!
+//! The agent's own `bring_to_front` is not handed back by cua (it cannot
+//! tell when the agent's step that needed the front is over). Its result
+//! names the app the front was taken from, carried through the agent's
+//! later `bring_to_front` calls while the app it brought stays in front
+//! (`Taking`).
 
 use std::sync::Mutex;
 
@@ -114,9 +121,208 @@ pub(crate) fn begin(target: i32, before: Before) {
     });
 }
 
-/// The agent (or the user, through the PiP) chose the front app.
+/// The user chose the front app through the PiP: nothing is owed to anyone.
 pub(crate) fn end() {
     *lease() = None;
+    *taken() = None;
+}
+
+/// The front the agent's own `bring_to_front` took: the app it brought and
+/// the app it took the front from, carried to the agent's next
+/// `bring_to_front` while that app is still in front. cua does not give it
+/// back itself (it cannot tell when the agent's step is over); the result
+/// names it so the agent can.
+struct Taken {
+    brought: i32,
+    brought_app: Option<ProcessStartStamp>,
+    owed: Owed,
+    /// Mouse buttons counted just before the front was taken.
+    input: InputActivity,
+}
+
+static TAKEN: Mutex<Option<Taken>> = Mutex::new(None);
+
+fn taken() -> std::sync::MutexGuard<'static, Option<Taken>> {
+    TAKEN
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// The app the front was taken from, as the hint names it.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct Owed {
+    pub(crate) pid: i32,
+    stamp: Option<ProcessStartStamp>,
+    pub(crate) name: String,
+    pub(crate) bundle_id: Option<String>,
+}
+
+impl Owed {
+    fn of(pid: i32) -> Self {
+        let app = crate::apps::running_app(pid);
+        Owed {
+            pid,
+            stamp: process_start_stamp(pid),
+            // running_app lists regular apps only; an accessory app has one too.
+            bundle_id: app
+                .as_ref()
+                .and_then(|app| app.bundle_id.clone())
+                .or_else(|| crate::apps::bundle_id_for_pid(pid)),
+            name: app.map(|app| app.name).unwrap_or_else(|| name(pid)),
+        }
+    }
+}
+
+/// Whether a claim on the front still stands for the front app now: the app
+/// holding the front (Finder for a lease, the app the last `bring_to_front`
+/// brought) is that same process, the app it was taken from still runs, and
+/// no mouse press that was not cua's came since (the user is working there).
+fn holds(holder: i32, holder_same: bool, front: i32, owed_running: bool, user_input: bool) -> bool {
+    holder == front && holder_same && owed_running && !user_input
+}
+
+/// What happens to the carried record once the call is over.
+#[derive(Debug, PartialEq, Eq)]
+enum Record {
+    /// The target did not come to the front: nothing changed.
+    Keep,
+    /// The front went back to the app it was owed to, or nothing is owed.
+    Clear,
+    /// The target is in front now, owing the named app.
+    Set,
+}
+
+fn record_after(target: i32, target_in_front: bool, owed: Option<i32>) -> Record {
+    match owed {
+        // The front did not read before the call: what is carried stands.
+        None => Record::Keep,
+        _ if !target_in_front => Record::Keep,
+        Some(owed) if owed != target => Record::Set,
+        Some(_) => Record::Clear,
+    }
+}
+
+/// Whether the agent's `bring_to_front` of `target` ends a lease on
+/// `holder`: it does when it moved the front, or chose the holder itself; a
+/// call that left the holder in front (a failed activation) leaves the lease.
+fn ends_lease(holder: i32, target: i32, front_after: Option<i32>) -> bool {
+    front_after.is_some_and(|front| front != holder || target == holder)
+}
+
+/// Whether the result names `owed`: not when the agent is handing the front
+/// back to it, nor when it is still in front.
+fn names(owed: i32, target: i32, front_after: Option<i32>) -> bool {
+    owed != target && front_after != Some(owed)
+}
+
+/// What the agent's `bring_to_front` reads just before it activates (after
+/// its arguments were checked): the app it takes the front from. It holds
+/// the lease lock until `finish`, so an action's settle cannot hand the
+/// front back in the middle of the activation (as `end()` serialized it).
+pub(crate) struct Taking {
+    owed: Option<Owed>,
+    held: std::sync::MutexGuard<'static, Option<Lease>>,
+    input: InputActivity,
+}
+
+impl Taking {
+    /// `target`: the app the call brings forward.
+    pub(crate) fn read(target: i32) -> Self {
+        // The lease first: a settle in progress (it holds the lock while it
+        // hands the front back) finishes before the mouse counters and the
+        // front are read.
+        let mut held = lease();
+        let input = crate::focus_steal::read_input_activity();
+        let front = crate::apps::frontmost_pid();
+        // The app the agent's last bring_to_front took the front from, while
+        // `holder` (the app it brought) still holds it.
+        let carried_for = |holder: i32| {
+            taken().as_ref().and_then(|taken| {
+                holds(
+                    taken.brought,
+                    same_app(taken.brought_app, process_start_stamp(taken.brought)),
+                    holder,
+                    same_app(taken.owed.stamp, process_start_stamp(taken.owed.pid)),
+                    crate::focus_steal::user_input_since(&taken.input),
+                )
+                .then(|| taken.owed.clone())
+            })
+        };
+        let lease_holder = held.as_ref().map(|lease| lease.target);
+        let from_lease = held.as_ref().and_then(|lease| {
+            let stands = holds(
+                lease.target,
+                same_app(lease.target_app, process_start_stamp(lease.target)),
+                front?,
+                same_app(lease.previous_app, process_start_stamp(lease.previous)),
+                crate::focus_steal::user_input_since(&lease.input),
+            );
+            // The lease owes the app the agent brought: that one owes on.
+            stands.then(|| {
+                carried_for(lease.previous).unwrap_or_else(|| Owed {
+                    pid: lease.previous,
+                    stamp: lease.previous_app,
+                    name: lease.previous_name.clone(),
+                    bundle_id: crate::apps::bundle_id_for_pid(lease.previous),
+                })
+            })
+        });
+        // The agent chose the lease's own app: its choice is final.
+        if lease_holder == Some(target) {
+            *held = None;
+        }
+        Taking {
+            owed: from_lease
+                .or_else(|| carried_for(front?))
+                .or_else(|| front.map(Owed::of)),
+            held,
+            input,
+        }
+    }
+
+    /// After the activation: end the lease it replaced, carry the owed app
+    /// while `target` is in front, and return the app the result names.
+    pub(crate) fn finish(mut self, target: i32) -> Option<Owed> {
+        let front_after = crate::apps::frontmost_pid();
+        let holder = self.held.as_ref().map(|lease| lease.target);
+        if holder.is_some_and(|holder| ends_lease(holder, target, front_after)) {
+            *self.held = None;
+        }
+        let owed_pid = self.owed.as_ref().map(|owed| owed.pid);
+        match record_after(target, front_after == Some(target), owed_pid) {
+            Record::Keep => {}
+            Record::Clear => *taken() = None,
+            Record::Set => {
+                *taken() = Some(Taken {
+                    brought: target,
+                    brought_app: process_start_stamp(target),
+                    owed: self.owed.clone()?,
+                    input: self.input,
+                })
+            }
+        }
+        self.owed
+            .filter(|owed| names(owed.pid, target, front_after))
+    }
+}
+
+/// With no lease held: `pid`'s inline edit is open while it is behind. An
+/// editor that opens after the front was handed back (New Folder on a
+/// Desktop window, measured) stays open there, and the agent can end it from
+/// behind; without this the result reads as if the app needed the front.
+pub(crate) fn edit_open_behind(pid: i32) -> Option<String> {
+    if !crate::tools::edit_commit::app_saves_on_end_editing(pid)
+        || crate::apps::frontmost_pid()? == pid
+        || crate::ax::bindings::inline_edit_state(pid) != Some(true)
+    {
+        return None;
+    }
+    let app = name(pid);
+    Some(format!(
+        "{app}'s inline edit is open with {app} behind, and stays open there: set_value on its \
+         field, then press_key return (delivery_mode:\"foreground\" if the key is refused), end \
+         it; bring_to_front is not needed"
+    ))
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -361,6 +567,55 @@ mod tests {
             decide(FINDER, true, Some(FINDER), false, true, None),
             Step::Unread
         );
+    }
+
+    /// The bring_to_front hint's table (research/2026-10-08-bring-to-front):
+    /// a claim names its owed app only while its holder is the same process
+    /// in front, the owed app runs, and the user has not pressed the mouse.
+    #[test]
+    fn a_claim_names_its_owed_app_only_while_it_holds_the_front() {
+        // Finder in front for its edit (lease), or TextEdit brought by the
+        // agent (carried): Terminal is named.
+        assert!(holds(FINDER, true, FINDER, true, false));
+        assert!(holds(TEXTEDIT, true, TEXTEDIT, true, false));
+        // The user switched to Calculator: the front app is named instead.
+        assert!(!holds(TEXTEDIT, true, 40, true, false));
+        // The user pressed the mouse in the app the agent brought.
+        assert!(!holds(TEXTEDIT, true, TEXTEDIT, true, true));
+        // The owed app quit, or the holder's pid now names another process.
+        assert!(!holds(TEXTEDIT, true, TEXTEDIT, false, false));
+        assert!(!holds(TEXTEDIT, false, TEXTEDIT, true, false));
+    }
+
+    #[test]
+    fn the_carried_record_follows_what_the_call_did() {
+        // TextEdit came to the front from Terminal: carry Terminal.
+        assert_eq!(record_after(TEXTEDIT, true, Some(TERMINAL)), Record::Set);
+        // Terminal is given the front back: nothing is owed any more.
+        assert_eq!(record_after(TERMINAL, true, Some(TERMINAL)), Record::Clear);
+        // The hand-back failed (Terminal is not in front): keep owing it.
+        assert_eq!(record_after(TERMINAL, false, Some(TERMINAL)), Record::Keep);
+        assert_eq!(record_after(TEXTEDIT, false, Some(TERMINAL)), Record::Keep);
+        // The front did not read before the call: what is carried stands.
+        assert_eq!(record_after(TEXTEDIT, true, None), Record::Keep);
+    }
+
+    #[test]
+    fn bring_to_front_ends_a_lease_only_when_it_moved_the_front_or_chose_its_app() {
+        assert!(ends_lease(FINDER, TEXTEDIT, Some(TEXTEDIT)));
+        assert!(ends_lease(FINDER, FINDER, Some(FINDER)));
+        // A failed activation left Finder (and its edit) in front.
+        assert!(!ends_lease(FINDER, TEXTEDIT, Some(FINDER)));
+        assert!(!ends_lease(FINDER, TEXTEDIT, None));
+    }
+
+    #[test]
+    fn the_result_names_the_owed_app_unless_it_has_the_front() {
+        assert!(names(TERMINAL, TEXTEDIT, Some(TEXTEDIT)));
+        assert!(names(TERMINAL, TEXTEDIT, None));
+        // Handing back, or nothing moved.
+        assert!(!names(TERMINAL, TERMINAL, Some(TERMINAL)));
+        assert!(!names(TERMINAL, TEXTEDIT, Some(TERMINAL)));
     }
 
     /// Row finder_was_front: nothing is owed when Finder was the user's
