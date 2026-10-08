@@ -1336,6 +1336,12 @@ pub(super) fn target_is_web_content(
     }
 }
 
+/// Whether the window's own focused element is proven to sit outside web
+/// content (an unreadable or unavailable focus is not proof).
+pub(super) fn window_focus_is_proven_native(pid: i32, window_id: u32) -> bool {
+    classify_target_web_area(pid, None, Some(window_id)) == WebAreaClassification::NonWebContent
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum WebAreaClassification {
     WebContent,

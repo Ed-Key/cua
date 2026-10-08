@@ -83,8 +83,9 @@ frontmost is true'`). Mutating it is not.
 **Corollary: the AXMenuBar rule.** Do not manually drive a background
 application's `AXMenuBarItem`: the visible macOS menu bar belongs to the
 frontmost app, and command items may be disabled otherwise. Use `invoke_menu`
-for a known application-menu path. It owns the necessary temporary activation,
-resolves every AX level live, and restores the prior app on a best-effort basis. Prefer an in-window
+for a known application-menu path. It runs the command from behind when it
+can, owns the temporary activation when it cannot, resolves every AX level
+live, and restores the prior app on a best-effort basis. Prefer an in-window
 element action when the same command has an ordinary control, and prefer
 `set_window_frame` for exact geometry. Full rationale is in “Navigating native
 menu bars” below.
@@ -479,11 +480,33 @@ move is the px form of `type_text`: focus and type in one call.
 ## Navigating native menu bars (AXMenuBar)
 
 Use `invoke_menu({pid, window_id, path:[...]})` when the desired command has a
-known native application-menu path. The tool temporarily activates the exact
-target window because the on-screen macOS menu bar belongs to the frontmost
-application, resolves each immediate child from live AX state, uses only
-`AXPress`/`AXPick`-class actions, and restores the prior application afterward
-on a best-effort basis.
+known native application-menu path. When another app is in front, it first
+runs the command from behind, without activating the target: it finds the
+item in the closed menus and, with `window_id` made key from behind, presses
+it through AX, or sends its keyboard shortcut when the item reads disabled
+there (items that act on a window's content, such as Copy, Paste and Save,
+read disabled while their app is behind; the shortcut is checked again
+against the window it reaches). It keeps that route only when a read shortly
+after shows an effect (the clipboard, the app's windows, what the window
+shows, the item's own title or check mark, whether the app still runs).
+Otherwise it falls back to the foreground route, and the result says why.
+For example: the press shows no effect; the item is missing from its closed
+menu, opens a submenu, or sits under a menu that reads disabled; the window
+cannot be made key from behind and read back as the app's focused window;
+the app is Finder (which ends a rename or new folder name when it is not in
+front); or the item needs its shortcut (it reads disabled from behind, or
+has no AX press) and that cannot be sent safely: no single-character
+shortcut, a hidden app or minimized window (or that state unreadable), a
+focus not proven outside web content, or a keyboard layout not proven to
+type the shortcut's character on the key sent. The foreground route
+temporarily activates the exact target window, because the on-screen macOS
+menu bar belongs to the frontmost application, resolves each immediate child
+from live AX state, uses only `AXPress`/`AXPick`-class actions, and restores
+the prior application afterward on a best-effort basis.
+The result says which route ran and why (`delivery.mode` is `background` only
+when the app never came to the front). A command whose effect no read can see
+may then run twice, once from behind and once in front; the result says when
+the item was pressed from behind first.
 It refuses missing, duplicate, disabled, or non-actionable segments and never
 falls back to pixels. A missing segment's refusal lists what that menu holds;
 titles written with "..." match the "…" macOS menus use. When a path fails
