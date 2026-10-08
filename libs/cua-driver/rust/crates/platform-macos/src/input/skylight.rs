@@ -411,6 +411,12 @@ pub(super) fn set_integer_field(event_ptr: *mut c_void, field: u32, value: i64) 
 /// WindowServer is the only place that links it back to its Finder window.
 /// `None` means no parent (a top-level window) or the query is unavailable.
 pub fn window_parent_id(window_id: u32) -> Option<u32> {
+    window_parent(window_id).flatten()
+}
+
+/// [`window_parent_id`], telling a top-level window (`Some(None)`) from a
+/// query that did not answer (`None`).
+pub fn window_parent(window_id: u32) -> Option<Option<u32>> {
     type QueryWindows = unsafe extern "C" fn(u32, *const c_void, u32) -> *const c_void;
     type CopyWindows = unsafe extern "C" fn(*const c_void) -> *const c_void;
     type Advance = unsafe extern "C" fn(*const c_void) -> bool;
@@ -440,7 +446,7 @@ pub fn window_parent_id(window_id: u32) -> Option<u32> {
         let mut parent = None;
         while advance(iterator) {
             if window_of(iterator) == window_id {
-                parent = Some(parent_of(iterator)).filter(|id| *id != 0);
+                parent = Some(Some(parent_of(iterator)).filter(|id| *id != 0));
                 break;
             }
         }
@@ -930,6 +936,9 @@ pub fn with_foreground_assist(
     let prev_ok = get_front_process_fn()
         .map(|f| unsafe { f(prev_psn.as_mut_ptr() as *mut c_void) } == 0)
         .unwrap_or(false);
+    // Owed the front back if the action keeps the target in front for an
+    // inline edit (see `crate::front_lease`).
+    let before = crate::front_lease::Before::now(front_pid());
 
     let mut target_psn = [0u8; 8];
     if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
@@ -963,7 +972,7 @@ pub fn with_foreground_assist(
 
     let result = body();
 
-    if prev_ok && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid) {
+    if prev_ok && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before) {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
@@ -975,16 +984,19 @@ pub fn with_foreground_assist(
 /// opened (Finder's rename field shows a moment after Return).
 const INLINE_EDIT_WAIT: std::time::Duration = std::time::Duration::from_millis(250);
 
-/// When the target was left in front because an inline edit was open, per
-/// pid: the action's outcome line says so.
-static KEPT_FRONT: std::sync::Mutex<Vec<(i32, std::time::Instant)>> = std::sync::Mutex::new(Vec::new());
-
 /// Whether a foreground action that succeeded must leave its target in
 /// front: its app has an inline edit open (a text field in a child window of
-/// the target), which the app cancels when it loses the front (Finder's
-/// rename). Handing the front back would undo what the action opened, so the
-/// target stays in front and the outcome line says why.
-pub(crate) fn keeps_front_for_inline_edit(succeeded: bool, pid: libc::pid_t, window_id: u32) -> bool {
+/// the target), which the app ends when it loses the front (Finder's rename,
+/// which then saves whatever the field holds). Handing the front back would
+/// end what the action opened, so the target stays in front, and
+/// [`crate::front_lease`] owes the front app read in `before` the front once
+/// a later action finds the edit ended.
+pub(crate) fn keeps_front_for_inline_edit(
+    succeeded: bool,
+    pid: libc::pid_t,
+    window_id: u32,
+    before: crate::front_lease::Before,
+) -> bool {
     // Measured for Finder only (its inline rename); other apps keep the
     // brief activation.
     if !succeeded
@@ -993,22 +1005,8 @@ pub(crate) fn keeps_front_for_inline_edit(succeeded: bool, pid: libc::pid_t, win
     {
         return false;
     }
-    note_kept_front(pid);
+    crate::front_lease::begin(pid, before);
     true
-}
-
-pub(crate) fn note_kept_front(pid: i32) {
-    if let Ok(mut kept) = KEPT_FRONT.lock() {
-        kept.retain(|(_, at)| at.elapsed() < std::time::Duration::from_secs(60));
-        kept.push((pid, std::time::Instant::now()));
-    }
-}
-
-/// Whether `pid` was left in front for an inline edit at or after `since`.
-pub(crate) fn kept_front_since(pid: i32, since: std::time::Instant) -> bool {
-    KEPT_FRONT
-        .lock()
-        .is_ok_and(|kept| kept.iter().any(|(kept_pid, at)| *kept_pid == pid && *at >= since))
 }
 
 /// Upper bound on how long [`with_foreground_assist`] waits for a requested
@@ -1117,6 +1115,7 @@ pub fn with_foreground_hid_activation(
     let prev_ok = get_front_process_fn()
         .map(|f| unsafe { f(prev_psn.as_mut_ptr() as *mut c_void) } == 0)
         .unwrap_or(false);
+    let before = crate::front_lease::Before::now(front_pid());
 
     let mut target_psn = [0u8; 8];
     if !get_process_psn_for_window(target_wid, target_pid, &mut target_psn) {
@@ -1163,7 +1162,7 @@ pub fn with_foreground_hid_activation(
     let result = action();
     std::thread::sleep(std::time::Duration::from_millis(40));
 
-    if prev_ok && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid) {
+    if prev_ok && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before) {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 

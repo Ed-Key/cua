@@ -307,6 +307,18 @@ surface that only accepts events while frontmost (the canvas/viewport/game
 case below). Unmodified `element_token` (AX) actions remain background-capable
 and hold the no-foreground contract without the flag.
 
+One exception to restoring at once: when a foreground action (or
+`invoke_menu`) leaves Finder's inline rename or new-folder name field open,
+Finder stays in front, because it ends the edit (saving what the field holds)
+when it loses the front. The driver remembers the app that was in front and
+brings it back at the end of the first later action that reads the edit
+ended: a `press_key` return or escape on the field, or any action once the
+editor closed by itself. It does not when another app is in front by then or
+a mouse press that was not cua's came during the edit, and `bring_to_front`
+cancels it. Each action's Outcome line says which happened. Ending the edit
+is the agent's job: an agent that stops with the editor open leaves Finder in
+front.
+
 `drag` is the exception: macOS has no background drag. A window-scoped
 `drag` needs `delivery_mode:"foreground"` and `window_id`; without them it
 refuses with `background_unavailable` and sends nothing. The foreground drag

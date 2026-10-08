@@ -34,7 +34,7 @@ enum FrontAfter {
     Restored,
     NotConfirmed,
     /// The command opened an inline editor; handing the front back would
-    /// cancel it.
+    /// end it.
     KeptForInlineEdit,
 }
 
@@ -1121,7 +1121,7 @@ fn summary(ran: &Ran) -> String {
             text.push_str(match front {
                 Some(FrontAfter::Restored) => " The target app was active only for the menu action; the previous front app is front again.",
                 Some(FrontAfter::NotConfirmed) => " The target app was activated for the menu action; the previous front app was not confirmed back in front.",
-                Some(FrontAfter::KeptForInlineEdit) => " The target app stays in front: the command opened an inline editor, which the app cancels when it loses the front, so the previous front app was not brought back.",
+                Some(FrontAfter::KeptForInlineEdit) => " The target app stays in front: the command opened an inline editor, which the app ends when it loses the front (the Outcome line says when the previous front app comes back).",
                 None => "",
             });
             if *unhidden {
@@ -1147,18 +1147,6 @@ fn words(list: &[&str]) -> String {
         [one] => (*one).into(),
         [rest @ .., last] => format!("{} and {last}", rest.join(", ")),
     }
-}
-
-/// Whether `prior` is (or within a short bound becomes) the front app:
-/// activation is asynchronous and NSWorkspace's front app can lag it.
-fn confirm_front(prior: i32) -> bool {
-    let deadline = std::time::Instant::now() + Duration::from_millis(500);
-    let mut front = crate::apps::frontmost_pid() == Some(prior);
-    while !front && std::time::Instant::now() < deadline {
-        std::thread::sleep(Duration::from_millis(20));
-        front = crate::apps::frontmost_pid() == Some(prior);
-    }
-    front
 }
 
 fn refusal(message: String) -> ToolResult {
@@ -1213,6 +1201,9 @@ impl Tool for InvokeMenuTool {
             let _mutation = mutation;
             // apps::frontmost_pid reads WindowServer first, so it is live here.
             let prior_frontmost = crate::apps::frontmost_pid();
+            // Read with it, in case the foreground route keeps the app in
+            // front for an inline edit (see `crate::front_lease`).
+            let before = crate::front_lease::Before::now(prior_frontmost);
             // From behind first, when another app is in front: the command
             // then runs without the target coming forward.
             let mut why_foreground = None;
@@ -1227,8 +1218,9 @@ impl Tool for InvokeMenuTool {
                         // The lease puts the previous app back when the target
                         // activates itself; confirm it, and ask once more if not.
                         let restored = !activated
-                            || confirm_front(prior)
-                            || (crate::apps::restore_prior_app(prior) && confirm_front(prior));
+                            || crate::apps::confirm_front(prior)
+                            || (crate::apps::restore_prior_app(prior)
+                                && crate::apps::confirm_front(prior));
                         return Ok(Ran::Background {
                             press,
                             changed,
@@ -1264,6 +1256,7 @@ impl Tool for InvokeMenuTool {
                 && crate::ax::bindings::await_inline_edit_after_menu(pid, window_id, INLINE_EDIT_WAIT);
             if kept {
                 front_restored = Some(FrontAfter::KeptForInlineEdit);
+                crate::front_lease::begin(pid, before);
             }
             if let Some(prior_pid) = other_front.filter(|_| !kept) {
                 let restored_exact = prior_frontmost_window.is_some_and(|prior_window_id| {
@@ -1272,7 +1265,7 @@ impl Tool for InvokeMenuTool {
                 if !restored_exact {
                     let _ = crate::apps::restore_prior_app(prior_pid);
                 }
-                front_restored = Some(if confirm_front(prior_pid) {
+                front_restored = Some(if crate::apps::confirm_front(prior_pid) {
                     FrontAfter::Restored
                 } else {
                     FrontAfter::NotConfirmed
