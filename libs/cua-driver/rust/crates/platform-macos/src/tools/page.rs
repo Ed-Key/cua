@@ -48,13 +48,17 @@ impl PageBackend for MacOsPageBackend {
                 .unwrap_or(false);
 
         if use_ax_fallback {
-            return ax_text_fallback(pid, window_id).await;
+            let text = ax_text_fallback(pid, window_id).await?;
+            return Ok(format!("{}\n{text}", ax_note(NO_JS_ROUTE)));
         }
 
-        // Try JS path first; on error, fall back to AX walk.
+        // Try JS path first; on error, fall back to AX walk and say so.
         match execute_js("document.body.innerText", &bundle_id, pid, window_id).await {
             Ok(result) => Ok(result),
-            Err(_) => ax_text_fallback(pid, window_id).await,
+            Err(error) => {
+                let text = ax_text_fallback(pid, window_id).await?;
+                Ok(format!("{}\n{text}", ax_note(&error.to_string())))
+            }
         }
     }
 
@@ -74,15 +78,25 @@ impl PageBackend for MacOsPageBackend {
 
         if use_ax_fallback {
             let results = ax_query_fallback(pid, window_id, css_selector).await?;
-            return Ok(format_ax_elements(&results));
+            return Ok(format!(
+                "{} {}\n{}",
+                ax_note(NO_JS_ROUTE),
+                ax_query_note(css_selector, &bundle_id),
+                format_ax_elements(&results)
+            ));
         }
 
         let js = build_query_selector_js(css_selector, attributes);
         match execute_js(&js, &bundle_id, pid, window_id).await {
             Ok(result) => Ok(result),
-            Err(_) => {
+            Err(error) => {
                 let results = ax_query_fallback(pid, window_id, css_selector).await?;
-                Ok(format_ax_elements(&results))
+                Ok(format!(
+                    "{} {}\n{}",
+                    ax_note(&error.to_string()),
+                    ax_query_note(css_selector, &bundle_id),
+                    format_ax_elements(&results)
+                ))
             }
         }
     }
@@ -306,6 +320,37 @@ async fn execute_js(js: &str, bundle_id: &str, pid: i32, window_id: u64) -> anyh
     anyhow::bail!("Unsupported browser: bundle_id={bundle_id}");
 }
 
+const NO_JS_ROUTE: &str = "this app has no JavaScript route";
+
+/// First line of a result read through accessibility instead of page
+/// JavaScript (`why`: the reason JavaScript did not run or failed), so the
+/// reader knows it is the window's accessibility content, not the DOM.
+fn ax_note(why: &str) -> String {
+    format!(
+        "Read through accessibility (the whole window, browser toolbar included), not the \
+         page's DOM: {}.",
+        why.trim_end_matches('.')
+    )
+}
+
+/// What an accessibility read of `css_selector` answers.
+fn ax_query_note(css_selector: &str, bundle_id: &str) -> String {
+    let matched = if matches!(css_selector.trim(), "*" | "") {
+        "every element is listed".to_owned()
+    } else if AXPageReader::matches_all(css_selector) {
+        format!("{css_selector:?} is not a selector it understands, so every element is listed")
+    } else {
+        format!("{css_selector:?} is matched by accessibility role only")
+    };
+    let pointer = if BrowserJs::supports(bundle_id) && bundle_id != "com.apple.Safari" {
+        " For this page's DOM use get_browser_state (snapshot_format dom_refs_v1 also lists \
+         hidden inputs such as file inputs)."
+    } else {
+        ""
+    };
+    format!("{matched}; no attributes are read.{pointer}")
+}
+
 /// Extract page text via the AX tree.
 async fn ax_text_fallback(pid: i32, window_id: u64) -> anyhow::Result<String> {
     let window_id = u32::try_from(window_id)
@@ -419,4 +464,25 @@ fn required_finite(value: &serde_json::Value, key: &str, raw: &str) -> anyhow::R
                 "click_element: probe JSON missing/invalid required field '{key}' (raw: {raw:?})"
             )
         })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn accessibility_results_say_they_are_not_the_dom() {
+        assert!(ax_note("Google Chrome is not running")
+            .starts_with("Read through accessibility (the whole window"));
+        assert!(ax_note("Google Chrome is not running.")
+            .ends_with("not the page's DOM: Google Chrome is not running."));
+        let note = ax_query_note("input[type=file]", "com.google.Chrome");
+        assert!(note.contains("not a selector it understands, so every element is listed"));
+        assert!(note.contains("get_browser_state"));
+        let note = ax_query_note("button", "com.apple.Safari");
+        assert!(note.contains("matched by accessibility role only"));
+        assert!(!note.contains("get_browser_state"));
+        assert!(!ax_query_note("a", "com.example.tauri").contains("get_browser_state"));
+        assert!(ax_query_note("*", "com.google.Chrome").starts_with("every element is listed;"));
+    }
 }

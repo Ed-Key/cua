@@ -147,6 +147,7 @@ The typed browser tools give exact targeting, endpoint ownership, and consent; t
 Actions:
 
 - `get_text`: visible page text. `query_dom`: elements matching `css_selector`, with the requested `attributes`.
+- macOS browsers: JavaScript through Apple Events runs only when macOS already allows cua-driver to control that browser, so `page` never raises the Automation consent prompt. Otherwise, or when that route fails, the result's first line says it was read through accessibility instead (the whole window, no DOM attributes) and why; use `get_browser_state` for the DOM.
 - `execute_javascript`: run `javascript` and return the result.
 - `click_element`: click the element matching `selector`, animating the agent cursor to its center first so the user sees it. Prefer it over `execute_javascript('el.click()')` when visible cursor feedback matters.
 - `insert_text`: insert `text` at the DOM focus in one native operation (CDP `Input.insertText`). Rich-text editors treat it like an IME commit, so try it before `type_keystrokes` when a contenteditable discarded a script write. Focus the field first.

@@ -63,6 +63,11 @@ impl AXPageReader {
         lines_out.join("\n")
     }
 
+    /// Whether `query` lists every element for `selector` (it names no role).
+    pub fn matches_all(selector: &str) -> bool {
+        css_selector_to_ax_roles(selector).is_empty()
+    }
+
     /// Query elements from AX tree markdown by CSS selector (maps to AX roles).
     pub fn query(selector: &str, tree_markdown: &str) -> Vec<AXElement> {
         let roles = css_selector_to_ax_roles(selector);

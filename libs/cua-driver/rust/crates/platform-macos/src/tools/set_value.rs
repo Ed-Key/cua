@@ -1389,6 +1389,14 @@ fn set_select_via_js(
          }})()"
     );
 
+    let consent = crate::browser::browser_js::automation_consent("com.apple.Safari");
+    if consent != crate::browser::browser_js::AutomationConsent::Allowed {
+        anyhow::bail!(
+            "could not set the Safari <select> through JavaScript: {}",
+            consent.refusal("Safari")
+        );
+    }
+
     let apple_script =
         format!("tell application \"Safari\" to do JavaScript \"{js}\" in front document");
 

@@ -28,6 +28,133 @@ fn app_name_for_bundle(bundle_id: &str) -> Option<&'static str> {
     }
 }
 
+/// Whether macOS lets this driver send Apple Events to an app, read without
+/// asking (TCC Automation). An osascript child counts as the driver, so when
+/// this is not `Allowed`, running osascript against the app would show the
+/// "wants access to control" system prompt (or fail if denied).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AutomationConsent {
+    Allowed,
+    /// Not decided yet: sending would show the consent prompt.
+    WouldPrompt,
+    Denied,
+    NotRunning,
+    /// Another status, or no answer within the bound.
+    Unknown(i32),
+}
+
+impl AutomationConsent {
+    fn from_status(status: i32) -> Self {
+        match status {
+            0 => Self::Allowed,
+            -1744 => Self::WouldPrompt, // errAEEventWouldRequireUserConsent
+            -1743 => Self::Denied,      // errAEEventNotPermitted
+            -600 => Self::NotRunning,   // procNotFound
+            other => Self::Unknown(other),
+        }
+    }
+
+    /// Why Apple Events were not sent to `app_name`, for a result.
+    pub fn refusal(self, app_name: &str) -> String {
+        match self {
+            Self::Allowed => String::new(),
+            Self::WouldPrompt => format!(
+                "macOS has not yet allowed cua-driver to control {app_name} with Apple Events \
+                 (Automation), and asking would show a system prompt, so none were sent"
+            ),
+            Self::Denied => format!(
+                "macOS does not allow cua-driver to control {app_name} with Apple Events \
+                 (Automation is off for it in System Settings)"
+            ),
+            Self::NotRunning => format!("{app_name} is not running"),
+            Self::Unknown(status) => format!(
+                "macOS did not confirm that cua-driver may control {app_name} with Apple Events \
+                 (status {status}), so none were sent"
+            ),
+        }
+    }
+}
+
+/// AEDataModel.h declares Apple Event types under `#pragma pack(2)`: 12 bytes.
+#[repr(C, packed(2))]
+struct AEDesc {
+    descriptor_type: u32,
+    data_handle: *mut std::ffi::c_void,
+}
+
+#[link(name = "CoreServices", kind = "framework")]
+extern "C" {
+    fn AECreateDesc(
+        type_code: u32,
+        data: *const std::ffi::c_void,
+        size: isize,
+        result: *mut AEDesc,
+    ) -> i16;
+    fn AEDisposeDesc(desc: *mut AEDesc) -> i16;
+    fn AEDeterminePermissionToAutomateTarget(
+        target: *const AEDesc,
+        event_class: u32,
+        event_id: u32,
+        ask_user_if_needed: u8,
+    ) -> i32;
+}
+
+const TYPE_APPLICATION_BUNDLE_ID: u32 = u32::from_be_bytes(*b"bund");
+const TYPE_WILD_CARD: u32 = u32::from_be_bytes(*b"****");
+
+/// The bundle that receives the Apple Events osascript sends for `bundle_id`
+/// (a Chrome web app shim is scripted through Google Chrome).
+fn apple_events_target(bundle_id: &str) -> &str {
+    if bundle_id.starts_with(CHROME_APP_BUNDLE_PREFIX) {
+        "com.google.Chrome"
+    } else {
+        bundle_id
+    }
+}
+
+/// Ask TCC whether Apple Events to `bundle_id` are allowed, never prompting.
+/// Blocks up to 2 s; no answer counts as unknown. At most four questions are
+/// out at once, so a stalled TCC does not pile up threads.
+pub fn automation_consent(bundle_id: &str) -> AutomationConsent {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static IN_FLIGHT: AtomicUsize = AtomicUsize::new(0);
+    const ERR_AE_TIMEOUT: i32 = -1712;
+    if IN_FLIGHT.fetch_add(1, Ordering::AcqRel) >= 4 {
+        IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        return AutomationConsent::Unknown(ERR_AE_TIMEOUT);
+    }
+    let target = apple_events_target(bundle_id).to_owned();
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        let mut desc = AEDesc {
+            descriptor_type: 0,
+            data_handle: std::ptr::null_mut(),
+        };
+        let status = unsafe {
+            let created = AECreateDesc(
+                TYPE_APPLICATION_BUNDLE_ID,
+                target.as_ptr().cast(),
+                target.len() as isize,
+                &mut desc,
+            );
+            if created != 0 {
+                i32::from(created)
+            } else {
+                let status =
+                    AEDeterminePermissionToAutomateTarget(&desc, TYPE_WILD_CARD, TYPE_WILD_CARD, 0);
+                AEDisposeDesc(&mut desc);
+                status
+            }
+        };
+        IN_FLIGHT.fetch_sub(1, Ordering::AcqRel);
+        let _ = tx.send(status);
+    });
+    rx.recv_timeout(Duration::from_secs(2)).map_or(
+        AutomationConsent::Unknown(ERR_AE_TIMEOUT),
+        AutomationConsent::from_status,
+    )
+}
+
 impl BrowserJs {
     /// Returns true if this bundle ID is a supported browser.
     pub fn supports(bundle_id: &str) -> bool {
@@ -58,6 +185,14 @@ impl BrowserJs {
             );
         }
         ensure_applescript_process_identity(bundle_id, expected_pid)?;
+
+        let consent = {
+            let bundle_id = bundle_id.to_owned();
+            tokio::task::spawn_blocking(move || automation_consent(&bundle_id)).await?
+        };
+        if consent != AutomationConsent::Allowed {
+            anyhow::bail!("{}", consent.refusal(app_name));
+        }
 
         let escaped_js = escape_js_for_applescript(javascript);
 
@@ -91,15 +226,28 @@ end tell"#
         let app_name = app_name_for_bundle(bundle_id)
             .ok_or_else(|| anyhow::anyhow!("Unsupported browser bundle: {bundle_id}"))?;
 
-        // Quit the browser.
-        let quit_script = format!("tell application \"{app_name}\" to quit");
-        let _ = tokio::process::Command::new("/usr/bin/osascript")
-            .arg("-e")
-            .arg(&quit_script)
-            .output()
-            .await;
-
-        tokio::time::sleep(Duration::from_secs(1)).await;
+        // Quit the browser (Apple Events: only when already allowed, never
+        // raising the consent prompt).
+        let consent = {
+            let bundle_id = bundle_id.to_owned();
+            tokio::task::spawn_blocking(move || automation_consent(&bundle_id)).await?
+        };
+        match consent {
+            AutomationConsent::Allowed => {
+                let quit_script = format!("tell application \"{app_name}\" to quit");
+                let _ = tokio::process::Command::new("/usr/bin/osascript")
+                    .arg("-e")
+                    .arg(&quit_script)
+                    .output()
+                    .await;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+            AutomationConsent::NotRunning => {}
+            other => anyhow::bail!(
+                "{}. Quit {app_name} yourself, then call this again.",
+                other.refusal(app_name)
+            ),
+        }
 
         // Find profile directory.
         let home = std::env::var("HOME").unwrap_or_default();
@@ -402,6 +550,54 @@ fn rand_u64() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn automation_consent_maps_tcc_statuses() {
+        assert_eq!(
+            AutomationConsent::from_status(0),
+            AutomationConsent::Allowed
+        );
+        assert_eq!(
+            AutomationConsent::from_status(-1744),
+            AutomationConsent::WouldPrompt
+        );
+        assert_eq!(
+            AutomationConsent::from_status(-1743),
+            AutomationConsent::Denied
+        );
+        assert_eq!(
+            AutomationConsent::from_status(-600),
+            AutomationConsent::NotRunning
+        );
+        assert_eq!(
+            AutomationConsent::from_status(-50),
+            AutomationConsent::Unknown(-50)
+        );
+        assert!(AutomationConsent::WouldPrompt
+            .refusal("Google Chrome")
+            .contains("asking would show a system prompt"));
+        assert!(AutomationConsent::Unknown(-50)
+            .refusal("Safari")
+            .contains("status -50"));
+    }
+
+    #[test]
+    fn ae_desc_matches_the_packed_c_layout() {
+        assert_eq!(std::mem::size_of::<AEDesc>(), 12);
+        assert_eq!(std::mem::align_of::<AEDesc>(), 2);
+    }
+
+    #[test]
+    fn chrome_app_shims_are_checked_against_chrome() {
+        assert_eq!(
+            apple_events_target("com.google.Chrome.app.abc"),
+            "com.google.Chrome"
+        );
+        assert_eq!(
+            apple_events_target("com.brave.Browser"),
+            "com.brave.Browser"
+        );
+    }
 
     fn target(title: &str, same_bounds_ordinal: usize) -> NativeWindowTarget {
         NativeWindowTarget {
