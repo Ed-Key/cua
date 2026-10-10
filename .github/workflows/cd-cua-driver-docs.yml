@@ -103,7 +103,7 @@ jobs:
             libei-dev libxkbcommon-dev libx11-dev libxi-dev libxtst-dev libxext-dev
 
       - name: Setup Rust toolchain
-        uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+        uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
 
       - name: Take the native macOS and Windows snapshots
         uses: actions/download-artifact@v4

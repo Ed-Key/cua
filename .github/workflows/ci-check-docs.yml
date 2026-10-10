@@ -159,7 +159,7 @@ jobs:
       # Restore the release build that CI: cua-driver contract clients saves
       # from main. Its MCP discovery job installs the same toolchain, so the
       # cache key matches. Pull requests never save.
-      - uses: dtolnay/rust-toolchain@stable
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         if: matrix.library == 'cua-driver'
       - uses: Swatinem/rust-cache@9d47c6ad4b02e050fd481d890b2ea34778fd09d6 # v2
         if: matrix.library == 'cua-driver'
