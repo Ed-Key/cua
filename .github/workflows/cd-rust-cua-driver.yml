@@ -268,7 +268,7 @@ jobs:
             VERSION="${{ inputs.version }}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
           targets: ${{ matrix.target }}
       - uses: actions/cache@v4
@@ -361,7 +361,7 @@ jobs:
             VERSION="${{ inputs.version }}"
           fi
           echo "version=$VERSION" >> "$GITHUB_OUTPUT"
-      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
           targets: ${{ matrix.target }}
       # rustup can drop non-host std components while updating an existing
@@ -694,7 +694,7 @@ jobs:
             exit 1
           fi
           echo "Imported $CERT_COUNT Developer ID Application certificate(s)"
-      - uses: dtolnay/rust-toolchain@4716b85f2fac3e324e64fa2810f6b5c3905760a5 # 1.97.1
+      - uses: dtolnay/rust-toolchain@fb523f40495206854c36b250850817ae0f83e3d1 # 1.99.0
         with:
           targets: aarch64-apple-darwin, x86_64-apple-darwin
       - name: Ensure Rust targets are installed
