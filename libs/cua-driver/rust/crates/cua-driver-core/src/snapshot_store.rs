@@ -545,14 +545,25 @@ pub fn current_runtime_store<S: SnapshotPayload>() -> Option<Arc<SnapshotStore<S
 /// caller to repeat `pid` only turned token-only calls into errors. Dispatch
 /// runs this after typed-target normalization and before authorization, so
 /// policy, consent and the outcome watcher see the same target the tool acts
-/// on. A caller's own pid or window_id is never overridden, and a scoped
-/// (desktop) call keeps its meaning. Stale, foreign-runtime or malformed
-/// tokens are left alone; the tool reports them.
+/// on. A caller's own pid or window_id is never overridden, and a desktop
+/// scoped call keeps its meaning. A call that names its pid but no
+/// window gets the token's window when the token's snapshot is of that same
+/// pid, so `{pid, element_token}` names the window the tool acts in, as a
+/// token alone does (the PiP shows that window); a token of another pid
+/// adds nothing. Stale, foreign-runtime or malformed tokens are left alone;
+/// the tool reports them.
 pub fn fill_target_from_element_token(args: &mut serde_json::Value) {
     let Some(object) = args.as_object_mut() else {
         return;
     };
-    if object.contains_key("scope") || object.get("pid").is_some_and(|pid| !pid.is_null()) {
+    if object.get("scope").and_then(serde_json::Value::as_str) == Some("desktop") {
+        return;
+    }
+    let given_pid = object.get("pid").filter(|pid| !pid.is_null()).cloned();
+    let has_window = object
+        .get("window_id")
+        .is_some_and(|window| !window.is_null());
+    if given_pid.is_some() && has_window {
         return;
     }
     let Some((snapshot_id, _)) = object
@@ -571,11 +582,14 @@ pub fn fill_target_from_element_token(args: &mut serde_json::Value) {
     let Some((pid, window_id)) = store.and_then(|store| store.locate(snapshot_id)) else {
         return;
     };
-    object.insert("pid".into(), pid.into());
-    if object
-        .get("window_id")
-        .is_none_or(serde_json::Value::is_null)
-    {
+    match given_pid {
+        Some(given) if given.as_i64() != Some(i64::from(pid)) => return,
+        Some(_) => {}
+        None => {
+            object.insert("pid".into(), pid.into());
+        }
+    }
+    if !has_window {
         object.insert("window_id".into(), window_id.into());
     }
 }

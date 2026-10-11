@@ -110,6 +110,98 @@ pub(super) fn known_windows() -> Option<std::collections::HashSet<u32>> {
     (!known.is_empty()).then_some(known)
 }
 
+/// Why a window the user cannot see is still there: its card stays, with
+/// its last picture, dimmed and badged (Ed's call; Codex keeps the last
+/// frame with no mark).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Away {
+    Minimized,
+    Hidden,
+    OtherSpace,
+}
+
+impl Away {
+    /// For logs: "minimized", "hidden", "other-space".
+    pub(super) fn name(self) -> &'static str {
+        match self {
+            Away::Minimized => "minimized",
+            Away::Hidden => "hidden",
+            Away::OtherSpace => "other-space",
+        }
+    }
+}
+
+/// Whether a window WindowServer knows is away, and why: not on screen
+/// while its app is hidden, or while its Spaces (`space_ids`, when
+/// readable and not empty) leave out the current one of its display;
+/// otherwise off screen means minimized. On screen is not away.
+// ponytail: an inactive native tab is an off-screen window of the current
+// Space too, so it reads as minimized; ask AX (`AXMinimized`) if that badge
+// ever matters.
+pub(super) fn classify_away(
+    on_screen: bool,
+    app_hidden: bool,
+    space_ids: Option<&[u64]>,
+    current_space: Option<u64>,
+) -> Option<Away> {
+    if on_screen {
+        return None;
+    }
+    if app_hidden {
+        return Some(Away::Hidden);
+    }
+    match (space_ids, current_space) {
+        (Some(ids), Some(current)) if !ids.is_empty() && !ids.contains(&current) => {
+            Some(Away::OtherSpace)
+        }
+        _ => Some(Away::Minimized),
+    }
+}
+
+/// The away windows among `ids`, from `all` (WindowServer's full list, on
+/// and off screen). A window not in the list is gone, not away (the closing
+/// rule drops it).
+pub(super) fn away_windows(ids: &[u32], all: &[WindowInfo]) -> Vec<(u32, Away)> {
+    let off: Vec<&WindowInfo> = all
+        .iter()
+        .filter(|window| ids.contains(&window.window_id) && !window.is_on_screen)
+        .collect();
+    if off.is_empty() {
+        return Vec::new();
+    }
+    let spaces = crate::input::skylight::SpaceQuery::new();
+    off.into_iter()
+        .filter_map(|window| {
+            let space_ids = spaces
+                .as_ref()
+                .and_then(|q| q.window_space_ids(window.window_id));
+            let current = spaces.as_ref().and_then(|q| {
+                q.current_space_for_window(window.window_id)
+                    .or(q.current_space_id())
+            });
+            classify_away(false, app_hidden(window.pid), space_ids.as_deref(), current)
+                .map(|away| (window.window_id, away))
+        })
+        .collect()
+}
+
+/// Whether the app `pid` is hidden (Hide, cmd-H). `NSRunningApplication` is
+/// safe off the main thread.
+fn app_hidden(pid: i32) -> bool {
+    use objc2::msg_send;
+    use objc2::runtime::AnyObject;
+    objc2::rc::autoreleasepool(|_| unsafe {
+        let app: *mut AnyObject = msg_send![
+            objc2::class!(NSRunningApplication),
+            runningApplicationWithProcessIdentifier: pid
+        ];
+        !app.is_null() && {
+            let hidden: bool = msg_send![app, isHidden];
+            hidden
+        }
+    })
+}
+
 /// The frame of `window` in `windows` (CoreGraphics, top-left origin),
 /// tagged with that window's id so it is never taken for another's.
 pub(super) fn frame_of(windows: &[WindowInfo], window: Option<u32>) -> Option<(u32, Area)> {
@@ -187,6 +279,43 @@ mod tests {
         list.push(window(7, 42, 0, (100.0, 100.0, 800.0, 600.0)));
         list.push(window(8, 43, 0, (0.0, 33.0, 1512.0, 900.0))); // below: irrelevant
         list
+    }
+
+    /// Rows 7 and 8 of the plan's table: an off-screen window is away, and
+    /// why; on screen it is not.
+    #[test]
+    fn classify_away_by_reason() {
+        assert_eq!(
+            classify_away(true, true, Some(&[2]), Some(1)),
+            None,
+            "on screen is never away"
+        );
+        assert_eq!(
+            classify_away(false, true, Some(&[1]), Some(1)),
+            Some(Away::Hidden)
+        );
+        assert_eq!(
+            classify_away(false, false, Some(&[2]), Some(1)),
+            Some(Away::OtherSpace)
+        );
+        assert_eq!(
+            classify_away(false, false, Some(&[1]), Some(1)),
+            Some(Away::Minimized)
+        );
+        // Unreadable or empty Space data is not taken for another Space.
+        assert_eq!(
+            classify_away(false, false, Some(&[]), Some(1)),
+            Some(Away::Minimized)
+        );
+        assert_eq!(
+            classify_away(false, false, None, Some(1)),
+            Some(Away::Minimized)
+        );
+        assert_eq!(
+            classify_away(false, false, Some(&[2]), None),
+            Some(Away::Minimized)
+        );
+        assert_eq!(Away::Minimized.name(), "minimized");
     }
 
     #[test]

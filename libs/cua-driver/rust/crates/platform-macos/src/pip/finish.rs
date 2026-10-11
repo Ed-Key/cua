@@ -8,7 +8,7 @@
 //! A window is FINISHED for a session when a `verify_state` on it was fully
 //! satisfied at or after the session last acted in it, or when the session
 //! ended after last acting in it, unless its latest verification (after
-//! that action) was not satisfied. Finished back windows collapse to chips;
+//! that action) was not satisfied. A finished back window's card gets a check badge;
 //! a finished front window shows a check badge on its card.
 //!
 //! A session ends when the agent says so (`end_session`). Its control
@@ -32,8 +32,9 @@
 //! finale). The finale shows the session's verified claims not yet shown as
 //! a checklist (latest status per label, the five most recent, oldest first;
 //! only a satisfied claim gets a check) under a "Verified n of m" line, or,
-//! with none (at session end only), the windows it touched as a row of
-//! chips. Rows come in one by one, then the panel holds and fades.
+//! with none (at session end only), the windows it touched as checklist
+//! rows under a "Worked in n windows" line. Rows come in one by one, then the panel holds 30 s from
+//! the finale's start and fades.
 //!
 //! ## Event ordering
 //!
@@ -47,17 +48,18 @@
 //! | Event | Verdicts (per window) | Claims (per label) | Lifecycle: finale, idle deadline, user close | Picture and stack |
 //! |---|---|---|---|---|
 //! | Action note (on push; a frame that names a window its pid does not own is dropped before its note: no event at all) | records the action at its event ms (the session's last action is the newest of them), and the window it touched (identity and app, titled with the app name until a frame names it); ends a session finish older than it | none are dropped, but a claim older than the session's last action is no longer proof: it waits for a later finale | only if newer than the last applied action: cancels the finale (one playing, or a proof finale still waiting for its quiet period), restarts the idle deadline, lifts a user close | none |
-//! | Captured frame (a session's panel is created only by a frame whose capture succeeded; a frame with no picture for a session with no panel is dropped, and its action note waits for the panel a later frame creates) | resolves a pid-only action to its window at the action's event ms (replacing that action's app-only chip) and names the touched window (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card (and its shape, from the window's size), back items, window titles. While the user's pick is the front card (see `hands`) and the frame is of another window: that window joins or refreshes as the first back card with this still, title and shape on its own card, and the header, the live stream and the visibility answer stay the pick's |
-//! | Verification | latest by event ms per window (an older one never wins; a repeat with the same event time and status is not news) | latest by event ms per predicate (its identity on its window, not its display label, which may collide: two predicates with one label are two rows), kept across finales; an older one is ignored, and so is a repeat with the same event time and status | if it brought news: replays a playing finale. Proof (a satisfied claim newer than the session's last action) starts the proof timer; unsatisfied or unknown news starts nothing by itself. Before the session's first capture the panel does not exist yet: the evidence is kept for it, and its proof timer starts with the panel | chips and cards follow the verdicts; the front card shows its check badge while its window is finished; a shown panel stays up while proof waits for its finale, and fades as soon as news calls that proof off |
+//! | Captured frame (a session's panel is created only by a frame whose capture succeeded; a frame with no picture for a session with no panel is dropped, and its action note waits for the panel a later frame creates) | resolves a pid-only action to its window at the action's event ms and names the touched window (idempotent; never ends a newer session finish) | none | none when its action was already applied (dedupe by event ms; the note always is, unless the panel did not exist yet); otherwise as its action note | still, header, front card (and its shape, from the window's size), back items, window titles. While the user's pick is the front card (see `hands`) and the frame is of another window: that window joins or refreshes as the first back card with this still, title and shape on its own card, and the header, the live stream and the visibility answer stay the pick's |
+//! | Verification | latest by event ms per window (an older one never wins; a repeat with the same event time and status is not news) | latest by event ms per predicate (its identity on its window, not its display label, which may collide: two predicates with one label are two rows), kept across finales; an older one is ignored, and so is a repeat with the same event time and status | if it brought news: replays a playing finale. Proof (a satisfied claim newer than the session's last action) starts the proof timer; unsatisfied or unknown news starts nothing by itself. Before the session's first capture the panel does not exist yet: the evidence is kept for it, and its proof timer starts with the panel | each card's check badge follows the verdicts; the front card shows its check badge while its window is finished; a shown panel stays up while proof waits for its finale, and fades as soon as news calls that proof off |
 //! | Idle timer (8 s after the last action) | none: idle is not done | none | none: no finale | the panel fades (a quiet hide), unless proof is waiting for its finale or the user holds it (see `hands`: it then fades when the hold is over); never while the session acts in an open turn |
 //! | Proof timer (8 s after the later of the session's last action and the proof's arrival, with no newer action) | none | the waiting proof is settled: it never comes due again by itself, played or not (its claims stay unshown until a finale displays them) | if a satisfied claim newer than the last action is still unshown and unsettled, the checklist plays (every unshown claim, latest status per predicate: a claim that flipped to unsatisfied shows as that): on the panel if it is up, and a quietly hidden panel is shown for it, unless the user closed the panel or the target window is fully visible (then nothing plays). The user's hold never moves this timer | the panel fades after |
-//! | `end_session` | the session finishes (now), always, whatever a finale is doing: each window it touched counts as finished unless its latest verification since its last action was not satisfied | none | a finale already playing keeps playing; otherwise one plays if anything is unshown (the checklist with claims, else the chips row) and the panel is up or may come up for it (not closed by the user, target window not fully visible); then the panel closes | back cards collapse to chips; the panel leaves the live set |
+//! | `end_session` | the session finishes (now), always, whatever a finale is doing: each window it touched counts as finished unless its latest verification since its last action was not satisfied | none | a finale already playing keeps playing; otherwise one plays if anything is unshown (the checklist of claims, else of the touched windows) and the panel is up or may come up for it (not closed by the user, target window not fully visible); then the panel closes | back cards stay, each with its check badge; the panel leaves the live set |
 //! | The session's control connection closing (or its host ending it) | only while the work is fresh, by event time: the session's last action is at most 8 s older than the close, or a finale is playing, or proof is waiting for its finale. Then as `end_session`. Otherwise none: not a finish | none | fresh: as `end_session`. Otherwise none: no finale plays and nothing is marked shown | fresh: as `end_session`. Otherwise the panel closes quietly and leaves the live set |
 //! | Idle-TTL eviction (the core reclaimed the session after 300 s idle; its connection may revive it) | none: not a finish | none | none: no finale plays, one playing is cut | the panel closes quietly and leaves the live set; a revived session starts a new panel on its next frame |
 //! | Turn open (the session acted in a turn the client's hooks opened) | none | none | the idle deadline does not apply until the turn ends; proof keeps its badge and evidence, but its finale waits for the turn's end (one finale per turn); the user's close as always | the panel stays up (unless the user closed it, the target window is fully visible, or neither applies and it waits for its first frame), and the visibility poll keeps answering for it |
 //! | Turn finished (the client's Stop, then 1.5 s with no action from its connection) | as `end_session` | none | as `end_session` (the playing finale keeps playing, else one plays if anything is unshown, the turn's proof as its checklist, and the panel may come up for it), but the session and its panel stay for the next turn; no proof plays its own finale after it | the panel fades after the finale (at once without one, unless the user holds it); a newer action brings it back, and finished marks give way to that action as after any finish |
 //! | Turn ended quietly (StopFailure, the turn's 5 min lease with no action, a new prompt after an interrupted turn) | none | none | no finale, now or for proof waiting then | the panel fades (unless the user holds it) |
-//! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim by predicate, and each touched window a chip or checklist stood for by its action: app and event time, so it holds when the window resolves meanwhile); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades, or, while the user holds it, stays with the finished state up and fades when the hold is over (an ended session's panel closes either way) |
+//! | Verification news while a finale plays | as Verification | as Verification | the finale's rows are rebuilt; its deadline (30 s from its start) is kept | badges follow |
+//! | Finale timer | none | marks shown exactly what that finale displayed, as of when it was built (each claim by predicate, and each touched window a checklist stood for by its action: app and event time, so it holds when the window resolves meanwhile); anything newer or later stays unshown; the watermarks stay | ends only the finale of its own generation | the panel fades, or, while the user holds it, stays with the finished state up and fades when the hold is over (an ended session's panel closes either way) |
 //! | User close | none | none | ends any finale (its timer goes stale); closed until an action newer than the close, and nothing else (not `end_session`, not proof, not the user's hold) shows the panel or plays a finale | the panel hides (an ending one closes) |
 //! | The user's hands on the panel (pointer on it, press, release, click on a back card, scroll, Focus) | none | none | none: the agent's clock, the proof timer and every finale run as if the user were not there | see the table in `hands`: a held panel stays up and keeps its back cards, and a clicked card stays in front |
 //! | Cursor update (the overlay's render thread, once per rendered frame, carrying the cursor's animated screen point, the window its last action targeted, and whether its click pulse is on) | none | none | none | only the front card's cursor sprite, and only while the cursor's window is the displayed one (a raised back card, or a new target whose capture is pending, hides it): it moves to the point mapped into the well from the target window's last known frame, looked up for that window (a raised card's window has none until the poll finds it) (see `cursor`), is re-placed when that frame, the displayed target or the well changes, and hides while the cursor is off that window, disabled or faded, or the panel has no frame; the first update of each click pulse that lands in the well logs "PiP cursor" once |
@@ -83,8 +85,9 @@ use super::{Tag, IDLE_HIDE_AFTER};
 
 /// Checklist rows at most.
 pub(super) const CHECKLIST_ROWS: usize = 5;
-/// Chips in the no-claims finale row at most.
-pub(super) const CHIP_ROW: usize = 5;
+/// Windows a session remembers as touched, and so rows in a no-claims
+/// finale at most.
+pub(super) const WINDOW_ROWS: usize = 5;
 /// Labels whose watermark a session keeps.
 // ponytail: past this many distinct labels the oldest watermark is dropped
 // (an older check of that label could then show again); raise it if agents
@@ -97,10 +100,11 @@ pub(super) const STAGGER: Duration = Duration::from_millis(70);
 pub(super) const ROW_IN: Duration = Duration::from_millis(150);
 /// A mark draws (and pops) over this long.
 pub(super) const MARK_IN: Duration = Duration::from_millis(180);
-/// The finished state stays up this long once every row is in.
-pub(super) const HOLD: Duration = Duration::from_millis(2000);
-/// Room a finale keeps from the well's top and bottom (and its sides, for
-/// chips).
+/// The finished state stays up this long from when it starts (its rows come
+/// in during the first second), then the panel fades; a new action ends it
+/// sooner. Codex holds its finished cards the same 30 s.
+pub(super) const HOLD: Duration = Duration::from_secs(30);
+/// Room a finale keeps from the well's top and bottom.
 pub(super) const FINALE_PAD: f64 = 6.0;
 /// A checklist row (a capsule) and the gap between rows, at full size and
 /// at the smallest the finale shrinks them to before it hides rows.
@@ -226,10 +230,14 @@ impl Verdicts {
     /// app named `app_name`. The source of truth for touched windows: the
     /// window is touched now (titled with the app name until a frame names
     /// it), even if its capture never lands (coalesced, or dropped when the
-    /// session ends).
+    /// session ends). An action that names no window (a pid alone) is
+    /// recorded (it reopens that app's windows) but touches no window: no
+    /// card or row is guessed for it.
     pub(super) fn note_action(&mut self, target: Tag, at_ms: u64, app_name: &str) {
         self.record_action(target, at_ms);
-        self.touch(target, at_ms, None, app_name);
+        if target.1.is_some() {
+            self.touch(target, at_ms, None, app_name);
+        }
     }
 
     /// A captured frame of the session acting in `tag` (titled `title`) at
@@ -242,19 +250,10 @@ impl Verdicts {
     /// Touch `tag` for an action at `at_ms`: a frame's `title` names it; a
     /// note keeps a known title, else uses `fallback`. A newer action in a
     /// shown window is new work; the frame of an action already shown is
-    /// not. A window resolved for a pid-only action replaces that action's
-    /// app-only entry (and inherits whether it was shown).
+    /// not.
     fn touch(&mut self, tag: Tag, at_ms: u64, title: Option<&str>, fallback: &str) {
-        if tag == (None, None) {
+        if tag.1.is_none() {
             return;
-        }
-        let mut placeholder_shown = false;
-        if let (Some(pid), Some(_)) = tag {
-            self.touched.retain(|touched| {
-                let placeholder = touched.tag == (Some(pid), None) && touched.at_ms <= at_ms;
-                placeholder_shown |= placeholder && touched.at_ms == at_ms && touched.shown;
-                !placeholder
-            });
         }
         let (at_ms, shown, known_title) =
             match self.touched.iter().find(|touched| touched.tag == tag) {
@@ -262,7 +261,7 @@ impl Verdicts {
                     (known.at_ms, known.shown, known.title.clone())
                 }
                 Some(known) => (at_ms, false, known.title.clone()),
-                None => (at_ms, placeholder_shown, String::new()),
+                None => (at_ms, false, String::new()),
             };
         let title = match title.filter(|title| !title.is_empty()) {
             Some(title) => title.to_owned(),
@@ -282,7 +281,7 @@ impl Verdicts {
                 shown,
             },
         );
-        self.touched.truncate(CHIP_ROW);
+        self.touched.truncate(WINDOW_ROWS);
     }
 
     /// A `verify_state` on `pid`'s `window` whose predicates were observed
@@ -397,7 +396,7 @@ impl Verdicts {
     /// oldest first), or with none the touched windows not yet shown. It
     /// records what it displays, as of which event, for `finale_shown`; a
     /// checklist stands for its stretch's touched windows too (as of now),
-    /// so they do not come back as chips later.
+    /// so they do not come back as rows later.
     pub(super) fn finale(&self) -> Finale {
         let windows: Vec<&Touched> = self.touched.iter().filter(|t| !t.shown).collect();
         let window_marks = windows.iter().map(|touched| Displayed::Window {
@@ -436,10 +435,10 @@ impl Verdicts {
             };
         }
         Finale {
-            rows: Rows::Chips(
+            rows: Rows::Windows(
                 windows
                     .iter()
-                    .map(|touched| FinaleChip {
+                    .map(|touched| WindowRow {
                         tag: touched.tag,
                         title: touched.title.clone(),
                         finished: touched.tag.1.is_some_and(|window| self.finished(window)),
@@ -489,19 +488,21 @@ impl Verdicts {
     }
 }
 
+/// A touched window's row in a no-claims finale.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct FinaleChip {
+pub(super) struct WindowRow {
     pub(super) tag: Tag,
     pub(super) title: String,
-    /// Only a finished window's chip gets a check.
+    /// Only a finished window's row gets a check.
     pub(super) finished: bool,
 }
 
-/// A finale's rows.
+/// A finale's rows: the verified claims, or with none the touched windows.
+/// Both are shown as the checklist inside the front card.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Rows {
     Checklist(Vec<Claim>),
-    Chips(Vec<FinaleChip>),
+    Windows(Vec<WindowRow>),
 }
 
 /// One item a finale displays, as of the event it displays it with.
@@ -526,29 +527,54 @@ pub(super) struct Finale {
 }
 
 impl Finale {
+    /// Always the checklist in the front card (for logs and checks).
     pub(super) fn kind(&self) -> &'static str {
+        "checklist"
+    }
+
+    /// What the checklist lists: "claims" or "windows" (for logs).
+    pub(super) fn of(&self) -> &'static str {
         match self.rows {
-            Rows::Checklist(_) => "checklist",
-            Rows::Chips(_) => "chips",
+            Rows::Checklist(_) => "claims",
+            Rows::Windows(_) => "windows",
         }
     }
 
     pub(super) fn len(&self) -> usize {
         match &self.rows {
             Rows::Checklist(rows) => rows.len(),
-            Rows::Chips(chips) => chips.len(),
+            Rows::Windows(windows) => windows.len(),
         }
     }
 
-    /// The checklist's caption: "Verified n of m" (m rows, n satisfied);
-    /// `None` for chips.
-    pub(super) fn caption(&self) -> Option<String> {
+    /// The checklist's caption: "Verified n of m" (m rows, n satisfied), or
+    /// "Worked in n windows".
+    pub(super) fn caption(&self) -> String {
         match &self.rows {
             Rows::Checklist(rows) => {
                 let satisfied = rows.iter().filter(|row| row.satisfied == Some(true)).count();
-                Some(format!("Verified {satisfied} of {}", rows.len()))
+                format!("Verified {satisfied} of {}", rows.len())
             }
-            Rows::Chips(_) => None,
+            Rows::Windows(windows) => match windows.len() {
+                1 => "Worked in 1 window".to_owned(),
+                n => format!("Worked in {n} windows"),
+            },
+        }
+    }
+
+    /// Each row as the checklist draws it: its label and its mark (a check
+    /// for a satisfied claim or a finished window, a cross for an
+    /// unsatisfied claim, a dash otherwise).
+    pub(super) fn checklist(&self) -> Vec<(String, Option<bool>)> {
+        match &self.rows {
+            Rows::Checklist(rows) => rows
+                .iter()
+                .map(|row| (row.label.clone(), row.satisfied))
+                .collect(),
+            Rows::Windows(windows) => windows
+                .iter()
+                .map(|row| (row.title.clone(), row.finished.then_some(true)))
+                .collect(),
         }
     }
 
@@ -567,11 +593,11 @@ impl Finale {
                     format!("{status}: {}", row.label)
                 })
                 .collect(),
-            Rows::Chips(chips) => chips
+            Rows::Windows(windows) => windows
                 .iter()
-                .map(|chip| {
-                    let status = if chip.finished { "finished" } else { "plain" };
-                    format!("{status}: {}", chip.title)
+                .map(|row| {
+                    let status = if row.finished { "finished" } else { "plain" };
+                    format!("{status}: {}", row.title)
                 })
                 .collect(),
         }
@@ -627,52 +653,6 @@ pub(super) fn checklist_fit(well_h: f64, rows: usize) -> ChecklistFit {
     fit(row_height, gap, visible, rows - visible)
 }
 
-/// How a row of chips fits a well: `per_row` chips to a row (at least one),
-/// the first `visible` of them in `rows` rows, and the `hidden` rest counted
-/// by a "+n more" line under the rows when they do not all fit the height
-/// (a tall window's card is narrow), so every window is shown or counted.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(super) struct ChipFit {
-    pub(super) per_row: usize,
-    pub(super) rows: usize,
-    pub(super) visible: usize,
-    pub(super) hidden: usize,
-}
-
-impl ChipFit {
-    /// Height of the whole block: the rows of `chip_h` chips `gap` apart,
-    /// and the more line.
-    pub(super) fn height(&self, chip_h: f64, gap: f64) -> f64 {
-        let more = if self.hidden > 0 { MORE_LINE } else { 0.0 };
-        self.rows as f64 * chip_h + self.rows.saturating_sub(1) as f64 * gap + more
-    }
-}
-
-/// Fit `chips` chips of `chip` size, `gap` apart, into a `well`.
-pub(super) fn chip_grid(well: (f64, f64), chips: usize, chip: (f64, f64), gap: f64) -> ChipFit {
-    let room = (well.0 - 2.0 * FINALE_PAD + gap).max(0.0);
-    let per_row = ((room / (chip.0 + gap)).floor() as usize).max(1);
-    let all = ChipFit {
-        per_row,
-        rows: chips.div_ceil(per_row),
-        visible: chips,
-        hidden: 0,
-    };
-    let available = (well.1 - 2.0 * FINALE_PAD).max(0.0);
-    if all.height(chip.1, gap) <= available {
-        return all;
-    }
-    // Rows that fit above the more line (at least one).
-    let rows = (((available - MORE_LINE + gap) / (chip.1 + gap)).floor() as usize).clamp(1, all.rows);
-    let visible = chips.min(rows * per_row);
-    ChipFit {
-        per_row,
-        rows,
-        visible,
-        hidden: chips - visible,
-    }
-}
-
 /// When row `index` of a finale starts to come in, and when its mark
 /// starts to draw (as the row lands), from the start of the finale.
 pub(super) fn row_timing(index: usize) -> (Duration, Duration) {
@@ -680,10 +660,11 @@ pub(super) fn row_timing(index: usize) -> (Duration, Duration) {
     (appear, appear + ROW_IN)
 }
 
-/// How long a finale of `rows` rows stays up before the panel fades.
+/// How long a finale of `rows` rows stays up before the panel fades: the
+/// hold, or longer if its rows were still coming in by then.
 pub(super) fn finale_duration(rows: usize) -> Duration {
     match rows.checked_sub(1) {
-        Some(last) => row_timing(last).1 + MARK_IN + HOLD,
+        Some(last) => HOLD.max(row_timing(last).1 + MARK_IN),
         None => HOLD,
     }
 }
@@ -914,7 +895,7 @@ mod tests {
     fn checklist(verdicts: &Verdicts) -> Vec<Claim> {
         match verdicts.finale().rows {
             Rows::Checklist(rows) => rows,
-            Rows::Chips(_) => Vec::new(),
+            Rows::Windows(_) => Vec::new(),
         }
     }
 
@@ -993,7 +974,7 @@ mod tests {
         verdicts.finish_session(200);
         assert_eq!(
             verdicts.finale().rows,
-            Rows::Chips(vec![FinaleChip {
+            Rows::Windows(vec![WindowRow {
                 tag: A,
                 title: "Notes".into(),
                 finished: true
@@ -1010,10 +991,11 @@ mod tests {
         // A later note does not rename a window a frame named.
         verdicts.note_action(B, 120, "Mail");
         assert_eq!(verdicts.touched().next().unwrap().1, "Inbox");
-        // A pid-only action's app chip becomes its window's when the frame
-        // resolves it: one chip, not two.
+        // Row 3 of the plan's table: a pid-only action touches no window (no
+        // app-named row is guessed for it), but still reopens that app.
         let mut verdicts = Verdicts::default();
         verdicts.note_action((Some(3), None), 100, "Safari");
+        assert_eq!(verdicts.touched().count(), 0);
         verdicts.act((Some(3), Some(30)), "Docs", 100);
         let touched: Vec<(Tag, String)> = verdicts.touched().collect();
         assert_eq!(touched, [((Some(3), Some(30)), "Docs".to_owned())]);
@@ -1264,7 +1246,7 @@ mod tests {
         assert!(!verdicts.finished(10), "its latest check failed");
         let (finale, _) = quiet(&mut verdicts, &mut life).unwrap();
         assert_eq!(finale.log_rows(), ["satisfied: sent", "unsatisfied: saved"]);
-        assert_eq!(finale.caption().as_deref(), Some("Verified 1 of 2"));
+        assert_eq!(finale.caption(), "Verified 1 of 2");
         // The only proof fails before the timer: nothing is proved any
         // more, so nothing plays.
         let (mut verdicts, mut life) = proved();
@@ -1414,7 +1396,7 @@ mod tests {
     }
 
     #[test]
-    fn with_claims_the_finale_is_a_checklist_and_without_them_chips() {
+    fn with_claims_the_finale_lists_them_and_without_them_the_windows() {
         let mut verdicts = Verdicts::default();
         verdicts.act(A, "Notes", 100);
         verdicts.act(B, "Mail", 110);
@@ -1426,13 +1408,13 @@ mod tests {
         assert!(!verdicts.finished(20));
         assert_eq!(
             verdicts.finale().rows,
-            Rows::Chips(vec![
-                FinaleChip {
+            Rows::Windows(vec![
+                WindowRow {
                     tag: B,
                     title: "Mail".into(),
                     finished: false
                 },
-                FinaleChip {
+                WindowRow {
                     tag: A,
                     title: "Notes".into(),
                     finished: true
@@ -1450,12 +1432,33 @@ mod tests {
         let finale = verdicts.finale();
         assert_eq!(finale.kind(), "checklist");
         assert_eq!(finale.log_rows(), ["unsatisfied: text area holds \"hi\""]);
-        assert_eq!(finale.caption().as_deref(), Some("Verified 0 of 1"));
+        assert_eq!(finale.caption(), "Verified 0 of 1");
         verdicts.verify(1, 10, 400, true, vec![claim("saved", Some(true))]);
-        assert_eq!(verdicts.finale().caption().as_deref(), Some("Verified 1 of 2"));
-        let mut chips = Verdicts::default();
-        chips.act(A, "Notes", 100);
-        assert_eq!(chips.finale().caption(), None);
+        assert_eq!(verdicts.finale().caption(), "Verified 1 of 2");
+        // Row 11 of the plan's table: with no claims the checklist lists the
+        // touched windows, a check on each finished one.
+        let mut windows = Verdicts::default();
+        windows.act(A, "Notes", 100);
+        windows.act(B, "Mail", 110);
+        windows.finish_session(200);
+        let finale = windows.finale();
+        assert_eq!((finale.kind(), finale.of()), ("checklist", "windows"));
+        assert_eq!(finale.caption(), "Worked in 2 windows");
+        assert_eq!(
+            finale.checklist(),
+            [
+                ("Mail".to_owned(), Some(true)),
+                ("Notes".to_owned(), Some(true))
+            ]
+        );
+        let mut one = Verdicts::default();
+        one.act(A, "Notes", 100);
+        assert_eq!(one.finale().caption(), "Worked in 1 window");
+        assert_eq!(
+            one.finale().checklist(),
+            [("Notes".to_owned(), None)],
+            "not finished: no check"
+        );
     }
 
     // ── Row: end_session ─────────────────────────────────────────────────
@@ -1725,10 +1728,10 @@ mod tests {
         verdicts.act(A, "Notes", 100);
         verdicts.verify(1, 10, 150, true, vec![claim("saved", Some(true))]);
         verdicts.finale_shown(&verdicts.finale());
-        assert_eq!(verdicts.finale().rows, Rows::Chips(vec![]), "A was shown");
+        assert_eq!(verdicts.finale().rows, Rows::Windows(vec![]), "A was shown");
         verdicts.act(B, "Mail", 300);
         let finale = verdicts.finale();
-        let Rows::Chips(chips) = &finale.rows else {
+        let Rows::Windows(chips) = &finale.rows else {
             panic!("no new claims: chips");
         };
         assert_eq!(chips.len(), 1);
@@ -1736,7 +1739,7 @@ mod tests {
         verdicts.finale_shown(&finale);
         // A late frame of an action already shown is not new work.
         verdicts.act(A, "Notes", 100);
-        assert_eq!(verdicts.finale().rows, Rows::Chips(vec![]));
+        assert_eq!(verdicts.finale().rows, Rows::Windows(vec![]));
     }
 
     #[test]
@@ -1750,7 +1753,7 @@ mod tests {
         let playing = verdicts.finale();
         verdicts.act(a_window, "Notes", 400);
         verdicts.finale_shown(&playing);
-        let Rows::Chips(chips) = verdicts.finale().rows else {
+        let Rows::Windows(chips) = verdicts.finale().rows else {
             panic!("chips");
         };
         let tags: Vec<Tag> = chips.iter().map(|chip| chip.tag).collect();
@@ -1764,7 +1767,7 @@ mod tests {
         assert_eq!(playing.kind(), "checklist");
         verdicts.act(a_window, "Notes", 400);
         verdicts.finale_shown(&playing);
-        let Rows::Chips(chips) = verdicts.finale().rows else {
+        let Rows::Windows(chips) = verdicts.finale().rows else {
             panic!("chips");
         };
         let tags: Vec<Tag> = chips.iter().map(|chip| chip.tag).collect();
@@ -1792,23 +1795,6 @@ mod tests {
     }
 
     #[test]
-    fn row_finale_timer_keeps_an_action_shown_when_its_window_resolves_meanwhile() {
-        // A pid-only action shows as an app chip; while that finale plays,
-        // the backlogged capture resolves it to its window. The timer still
-        // marks it shown: it does not replay in the next stretch.
-        let mut verdicts = Verdicts::default();
-        verdicts.note_action((Some(3), None), 100, "Safari");
-        let playing = verdicts.finale();
-        assert_eq!(playing.len(), 1);
-        verdicts.act((Some(3), Some(30)), "Docs", 100);
-        verdicts.finale_shown(&playing);
-        assert_eq!(verdicts.finale().rows, Rows::Chips(vec![]));
-        // A newer action in that app is still new work.
-        verdicts.act((Some(3), Some(30)), "Docs", 200);
-        assert_eq!(verdicts.finale().len(), 1);
-    }
-
-    #[test]
     fn the_finale_fits_the_well_by_shrinking_rows_then_counting_the_rest() {
         // The default well (320x200): five rows at full size.
         let fit = checklist_fit(200.0, 5);
@@ -1828,22 +1814,6 @@ mod tests {
         assert_eq!(fit.visible + fit.hidden, 5, "every result shown or counted");
         // One row always fits somewhere.
         assert_eq!(checklist_fit(10.0, 1).visible + checklist_fit(10.0, 1).hidden, 1);
-        // Chips: five in one row at the default width, wrapped in two at
-        // the smallest.
-        let chips = |well, count| chip_grid(well, count, (48.0, 48.0), 12.0);
-        let fit = |per_row, rows, visible, hidden| ChipFit { per_row, rows, visible, hidden };
-        assert_eq!(chips((320.0, 200.0), 5), fit(5, 1, 5, 0));
-        assert_eq!(chips((228.0, 144.0), 5), fit(3, 2, 5, 0));
-        // A tall window's card (Calculator's, 113x200) takes one chip a row
-        // and three rows: the other two are counted.
-        let tall = chips((113.0, 200.0), 5);
-        assert_eq!(tall, fit(1, 3, 3, 2));
-        assert!(tall.height(48.0, 12.0) <= 200.0 - 2.0 * FINALE_PAD, "{tall:?}");
-        assert_eq!(chips((113.0, 200.0), 3), fit(1, 3, 3, 0));
-        // A very wide window's card (320x145): one row.
-        assert_eq!(chips((320.0, 145.0), 5), fit(5, 1, 5, 0));
-        // Never fewer than one chip, even in a well too small for it.
-        assert_eq!(chips((20.0, 30.0), 2), fit(1, 1, 1, 1));
     }
 
     #[test]
@@ -1862,15 +1832,16 @@ mod tests {
     }
 
     #[test]
-    fn rows_come_in_70_ms_apart_and_the_panel_holds_before_fading() {
+    fn rows_come_in_70_ms_apart_and_the_finished_state_holds_thirty_seconds() {
         assert_eq!(row_timing(0), (Duration::ZERO, ROW_IN));
         assert_eq!(
             row_timing(3),
             (Duration::from_millis(210), Duration::from_millis(360))
         );
-        // Five rows: last row in at 280 ms, its mark lands at 430 + 180 ms,
-        // then the 2 s hold: about 2.6 s in all.
-        assert_eq!(finale_duration(5), Duration::from_millis(2610));
+        // Row 11 of the plan's table: the finished state holds 30 s from its
+        // start, whatever its row count (five rows are in by 610 ms).
+        assert_eq!(finale_duration(5), Duration::from_secs(30));
+        assert_eq!(finale_duration(1), Duration::from_secs(30));
         assert_eq!(finale_duration(0), HOLD);
     }
 

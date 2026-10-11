@@ -24,7 +24,7 @@
 //! in a corner for minutes must not keep a panel up for minutes.
 //!
 //! "On the panel" is read from the real pointer position against every
-//! visible surface of the panel (front card, bar, back cards, chips), by the
+//! visible surface of the panel (front card, bar, back cards), by the
 //! panel's pointer poll: entered and exited events are not trusted (a
 //! warped pointer sends none, and their order across two panels is not
 //! guaranteed). Moving between surfaces of one panel is not leaving it; the
@@ -47,7 +47,7 @@
 //! | Panel appears (or a card changes) under a resting pointer | none | none until the pointer moves or presses | none | as without a pointer |
 //! | Pointer leaves the panel | restarts: a full idle period starts now | lasts that period | none | as above until the hold is over; their own action times are never rewritten |
 //! | Press on a card, the bar or a resize band | none | on until the release, wherever the pointer goes meanwhile | none | as above |
-//! | Release (delivered, or found missing by the poll after `RELEASE_GRACE`), also outside the panel | restarts | lasts a full idle period from the release | a click (no drag, no resize) on a back card or chip: pick = that window, or cleared if it is the window the agent last acted in | as above |
+//! | Release (delivered, or found missing by the poll after `RELEASE_GRACE`), also outside the panel | restarts | lasts a full idle period from the release | a click (no drag, no resize) on a back card: pick = that window, or cleared if it is the window the agent last acted in | as above |
 //! | Agent acts in another window while a pick is set | none (the agent's clock and lifecycle run as ever) | none | stays in front | the acted window joins or refreshes as the first back card; its still goes to its own card |
 //! | Agent acts in the picked window | none | none | stays | none |
 //! | Picked window closes | none | none | cleared; the agent's latest window comes to the front if the stack still holds it | the closed window's card drops |
@@ -169,7 +169,7 @@ impl<K: Copy + PartialEq> Hands<K> {
         self.pick
     }
 
-    /// The user clicked the back card or chip of `card`, which comes to the
+    /// The user clicked the back card of `card`, which comes to the
     /// front: it is the pick, unless it is the window the agent last acted
     /// in (`agent`), which clears the pick so the panel follows the agent
     /// again.

@@ -1,9 +1,8 @@
 //! A panel's card stack: the window the agent is acting in is the front
-//! card, and up to three windows it acted in recently are back items. A back
-//! window the session is not finished with is a card fanned behind the
-//! front one, each a few points up and to the left of the card in front of
-//! it; a finished one collapses into a chip (app icon, green check) in a
-//! column left of the cards. Back items trail the front card on a loose
+//! card, and up to three windows it acted in recently are back cards fanned
+//! behind it, each a few points up and to the left of the card in front of
+//! it, each in its own window's shape (`back_rest`); a finished window's
+//! card carries a check badge. Back cards trail the front card on a
 //! spring when the panel is dragged. Near the top or left edge of the
 //! screen the whole stack is mirrored through the front card (`Fan`):
 //! below it, or right of it, so it stays on screen.
@@ -15,7 +14,7 @@
 //! area, not a landscape frame to fit into. The panel window is sized for
 //! the square that holds any such card (`hold`), and that square's
 //! bottom-right corner is the card's anchor: a shape change grows or shrinks
-//! it up and left (`shaped_frame`), and the back items follow its top-left.
+//! it up and left (`front_frame`), and the back cards follow its top-left.
 //!
 //! Everything here is pure (unit tested): the stack model, the front card's
 //! shape, where each item rests, the springs that animate items back to rest (after a promotion)
@@ -26,9 +25,9 @@
 //!
 //! Panel coordinates have their origin at the bottom-left of the DECK: the
 //! front card plus the `STACK_MARGIN` above and left of it where back cards
-//! rest. The window is the deck with `LAG_ROOM` on every side (and the chip
-//! column on the left), so trailing items never leave it; `to_window` maps
-//! panel coordinates into it.
+//! rest. The window is the deck with `LAG_ROOM` on every side (and
+//! `TRAIL_PAD` more on the left), so trailing items never leave it;
+//! `to_window` maps panel coordinates into it.
 
 use std::time::{Duration, Instant};
 
@@ -36,9 +35,11 @@ use cursor_overlay::Spring;
 
 use super::Area;
 
-/// Front card plus up to three back items (cards and chips together).
+/// Front card plus up to three back cards.
 pub(super) const MAX_CARDS: usize = 4;
-/// A back card drops this long after the session last acted in its window.
+/// A back card drops this long after the session last acted in its window,
+/// except while its hooked turn is open or its finished state is up
+/// (`Keep::no_expiry`).
 pub(super) const BACK_CARD_TTL: Duration = Duration::from_secs(30);
 /// Each card sits this far up and left of the one in front of it. Also the
 /// height of a back card's title strip, which is what peeks out above.
@@ -57,34 +58,19 @@ pub(super) const DEPTH_ALPHA: [f64; MAX_CARDS] = [1.0, 0.92, 0.8, 0.7];
 /// Natural frequency of the restack spring (an item moving to a new place):
 /// settles in ~250 ms.
 pub(super) const RESTACK_OMEGA: f64 = 30.0;
-/// Chip: a glass circle holding the app icon, a check badge on its lower
-/// right (the window title is its tooltip).
-pub(super) const CHIP: f64 = 44.0;
-pub(super) const CHIP_ICON: f64 = 32.0;
-/// The check badge on a chip, and its white ring.
-pub(super) const CHIP_BADGE: f64 = 16.0;
-pub(super) const CHIP_BADGE_RING: f64 = 1.5;
-/// A chip's whole frame: the circle plus the badge's overhang.
-pub(super) const CHIP_W: f64 = CHIP + 4.0;
-pub(super) const CHIP_H: f64 = CHIP + 4.0;
-/// Between chips in the column (just past the glass merge distance, so
-/// resting chips stay round), and between the column and the cards (a
-/// resting chip's circle sits inside the merge distance, so it fuses with
-/// the front card like liquid and pulls free when it lags).
-const CHIP_ROW_GAP: f64 = 12.0;
-const CHIP_GAP: f64 = 2.0;
+/// The check badge on a finished window's card, and its white ring.
+pub(super) const BADGE: f64 = 16.0;
+pub(super) const BADGE_RING: f64 = 1.5;
 /// Glass views closer than this merge into one shape.
 pub(super) const GLASS_SPACING: f64 = 11.0;
-/// The chip column's width, left of the deck.
-pub(super) const TRAIL_PAD: f64 = CHIP_GAP + CHIP_W;
+/// Extra room left of the deck, inside the window (where a chip column used
+/// to be). Kept so the panel window's frame, which placement and the lab's
+/// checks read, does not change.
+pub(super) const TRAIL_PAD: f64 = 50.0;
 /// Room on every side of the deck for trailing items, inside the window.
 pub(super) const LAG_ROOM: f64 = TRAIL_LAG_CAP;
-/// The window's inset left of the deck: the chip column plus lag room.
+/// The window's inset left of the deck.
 pub(super) const INSET_LEFT: f64 = TRAIL_PAD + LAG_ROOM;
-/// The farthest a chip reaches left of the panel window: with the most back
-/// cards that still leave room for a chip (placement reserves this).
-pub(super) const CHIP_REACH: f64 =
-    CHIP_GAP + CHIP_W - STACK_MARGIN + (MAX_CARDS - 2) as f64 * CARD_STEP;
 /// Smallest front card the user can resize to.
 pub(super) const MIN_CARD: (f64, f64) = (240.0, 180.0);
 /// Largest front card, as a fraction of the screen's visible frame.
@@ -117,6 +103,10 @@ impl<K: PartialEq + Copy, V: Default> CardStack<K, V> {
 
     pub(super) fn cards(&self) -> &[Card<K, V>] {
         &self.cards
+    }
+
+    pub(super) fn cards_mut(&mut self) -> &mut [Card<K, V>] {
+        &mut self.cards
     }
 
     pub(super) fn keys(&self) -> Vec<K> {
@@ -184,7 +174,8 @@ impl<K: PartialEq + Copy, V: Default> CardStack<K, V> {
     /// Who leaves the stack at `now`. A back card whose window is `gone`
     /// always does. Unless `keep` holds the stack (the user's hands are on
     /// the panel), so does a back card the session has not acted in for
-    /// `BACK_CARD_TTL`, and the deepest back cards beyond `MAX_CARDS`; a
+    /// `BACK_CARD_TTL` (not while `keep.no_expiry`: the turn is open or its
+    /// finished state is up), and the deepest back cards beyond `MAX_CARDS`; a
     /// window `keep` protects (the user's pick) stays whatever its age or
     /// depth, and the next deepest goes instead. The front card always
     /// stays. Whether anything dropped.
@@ -196,6 +187,7 @@ impl<K: PartialEq + Copy, V: Default> CardStack<K, V> {
             depth == 1
                 || (!gone(&card.key)
                     && (keep.held
+                        || keep.no_expiry
                         || keep.protects(&card.key)
                         || now.saturating_duration_since(card.acted) < BACK_CARD_TTL))
         });
@@ -217,6 +209,9 @@ pub(super) struct Keep<K> {
     /// interaction less than the idle period old): no back card expires and
     /// none is evicted by capacity.
     pub(super) held: bool,
+    /// No back card expires by age: the session's hooked turn is open, or
+    /// its finished state is up. Capacity eviction still applies.
+    pub(super) no_expiry: bool,
     /// Windows that stay whatever their age or depth: the user's pick, and
     /// behind it the window the agent last acted in (what the panel follows
     /// again when the pick is over).
@@ -257,19 +252,17 @@ pub(super) fn own_pixels<K: PartialEq, P>(key: K, still: Option<&(K, P)>) -> Opt
         .map(|(_, pixels)| pixels)
 }
 
-/// Where a stack item is drawn: the front card (in the panel), a back card
-/// at a depth (1 = right behind the front), or a chip in the chip column
-/// (0 = bottom).
+/// Where a stack item is drawn: the front card, or a back card at a depth
+/// (1 = right behind the front).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Slot {
     Front,
     Card(usize),
-    Chip(usize),
 }
 
-/// Views a panel has for its items: the front card, a card per back depth,
-/// a chip per back item.
-pub(super) const VIEWS: usize = 1 + 2 * (MAX_CARDS - 1);
+/// Views a panel has for its items: the front card and a card per back
+/// depth.
+pub(super) const VIEWS: usize = MAX_CARDS;
 
 impl Slot {
     /// Index of the view that draws this slot, `0..VIEWS`.
@@ -277,7 +270,6 @@ impl Slot {
         match self {
             Slot::Front => 0,
             Slot::Card(depth) => depth,
-            Slot::Chip(row) => MAX_CARDS + row,
         }
     }
 
@@ -286,50 +278,22 @@ impl Slot {
         match self {
             Slot::Front => DEPTH_ALPHA[0],
             Slot::Card(depth) => DEPTH_ALPHA[depth.min(MAX_CARDS - 1)],
-            Slot::Chip(_) => 1.0,
         }
     }
 }
 
-/// Each item's slot, front first, from whether each item's window is
-/// finished: back items the session finished with are chips (in stack
-/// order, bottom up), the rest are cards (in stack order, front to back).
-/// The front card stays a card either way.
-pub(super) fn slots(finished: &[bool]) -> Vec<Slot> {
-    let (mut cards, mut chips) = (0, 0);
-    finished
-        .iter()
-        .enumerate()
-        .map(|(index, &done)| match (index, done) {
-            (0, _) => Slot::Front,
-            (_, true) => {
-                chips += 1;
-                Slot::Chip(chips - 1)
-            }
-            (_, false) => {
-                cards += 1;
-                Slot::Card(cards)
+/// The slots of a stack of `items` (at least the front card, at most
+/// `MAX_CARDS`): the front card, then a card per depth.
+pub(super) fn slots(items: usize) -> Vec<Slot> {
+    (0..items.clamp(1, MAX_CARDS))
+        .map(|depth| {
+            if depth == 0 {
+                Slot::Front
+            } else {
+                Slot::Card(depth)
             }
         })
         .collect()
-}
-
-/// Resting frame of `slot` in panel coordinates (AppKit, origin
-/// bottom-left of the panel window) for a front card of `card` size, with
-/// `back_cards` cards behind it. Chips sit in a column just left of the
-/// leftmost card, from the bottom up; they may extend left of the panel
-/// window (into the trail window's `TRAIL_PAD`).
-pub(super) fn slot_frame(card: (f64, f64), slot: Slot, back_cards: usize) -> Area {
-    match slot {
-        Slot::Front => rest_frame(card, 0),
-        Slot::Card(depth) => rest_frame(card, depth),
-        Slot::Chip(row) => Area {
-            x: STACK_MARGIN - back_cards as f64 * CARD_STEP - CHIP_GAP - CHIP_W,
-            y: row as f64 * (CHIP_H + CHIP_ROW_GAP),
-            w: CHIP_W,
-            h: CHIP_H,
-        },
-    }
 }
 
 // ── Card shape ────────────────────────────────────────────────────────────
@@ -388,101 +352,158 @@ pub(super) fn card_shape(bounds: (f64, f64), window: Option<(f64, f64)>) -> (f64
     ((own.0 * scale).round().max(1.0), (own.1 * scale).round().max(1.0))
 }
 
-/// Resting frame of `slot` for a front card of `card` size in a panel whose
-/// window holds cards up to `bounds` (see `hold`): `slot_frame`, with the
-/// front card's bottom-right corner on that square's. That corner is the
-/// panel's anchor (its cascade slot,
-/// or where the user dragged it), so a card that changes shape grows or
-/// shrinks up and left, and the back items keep their places against its
-/// top and left edges.
-pub(super) fn shaped_frame(
-    bounds: (f64, f64),
-    card: (f64, f64),
-    slot: Slot,
-    back_cards: usize,
-) -> Area {
-    let frame = slot_frame(card, slot, back_cards);
+/// Resting frame of the front card of `card` size in a panel whose window
+/// holds cards up to `bounds` (see `hold`): its bottom-right corner on that
+/// square's. That corner is the panel's anchor (its cascade slot, or where
+/// the user dragged it), so a card that changes shape grows or shrinks up
+/// and left, and the back cards keep their places against its top and left
+/// edges.
+pub(super) fn front_frame(bounds: (f64, f64), card: (f64, f64)) -> Area {
+    let frame = rest_frame(card, 0);
     Area {
         x: frame.x + bounds.0 - card.0,
         ..frame
     }
 }
 
-/// Which way the back items fan out from the front card. By default up and
-/// left (title strips peek above, chips sit left); near the top of the
-/// screen's visible frame they hang below instead, near its left edge they
-/// go right, so they stay on screen where a click reaches them.
+/// Resting frames of the back cards whose own card sizes (their windows'
+/// shapes in the size box, see `card_shape`) are `owns`, depth 1 first,
+/// behind the front card resting at `front`, in a panel whose window holds
+/// cards up to `bounds`, fanned by `fan`. By default each card's top-left
+/// corner sits a step up and left of the card in front of it, the card
+/// scaled by its depth about that corner (as `rest_frame`), and it stays
+/// inside the deck, so a card wider or taller than the front one grows into
+/// the deck's room up and left of it, and every card's strip stays out
+/// from under the card in front. On an axis the fan flips, the corner is
+/// the opposite one, a step outward, and the card stays between the front
+/// card's near edge and `STACK_MARGIN` past the deck (shrunk, keeping its
+/// shape, if it is too big for that), so it stays on the front card's side
+/// of the screen and in the window with `TRAIL_LAG_CAP - STACK_MARGIN` of
+/// lag room at least. Cards of the front card's own shape rest exactly as
+/// `rest_frame` (mirrored) says.
+pub(super) fn back_rests(
+    bounds: (f64, f64),
+    front: Area,
+    owns: &[(f64, f64)],
+    fan: Fan,
+) -> Vec<Area> {
+    let deck = deck_size(bounds);
+    // Where each axis may reach.
+    let (x_lo, x_hi) = if fan.right {
+        (front.x, deck.0 + STACK_MARGIN)
+    } else {
+        (0.0, deck.0)
+    };
+    let (y_lo, y_hi) = if fan.below {
+        (-STACK_MARGIN, front.y + front.h)
+    } else {
+        (0.0, deck.1)
+    };
+    let mut prev = front;
+    let mut rests = Vec::with_capacity(owns.len());
+    for (index, own) in owns.iter().enumerate() {
+        let depth = index + 1;
+        let scale = DEPTH_SCALE[depth.min(MAX_CARDS - 1)];
+        // The strip edge steps from the card in front, and room is kept for
+        // the strips of the depths behind this one, so no card ever covers a
+        // deeper card's strip; the card is shrunk (keeping its shape) to fit
+        // the room that leaves.
+        let behind = (MAX_CARDS - 1).saturating_sub(depth) as f64 * CARD_STEP;
+        let right = prev.x + prev.w + CARD_STEP;
+        let bottom = prev.y - CARD_STEP;
+        let cap = y_hi - behind;
+        let room_w = if fan.right { right - x_lo } else { x_hi - x_lo };
+        let room_h = if fan.below { y_hi - bottom } else { cap - y_lo };
+        let (w, h) = (own.0 * scale, own.1 * scale);
+        let fit = 1f64.min(room_w / w).min(room_h / h);
+        let (w, h) = (w * fit, h * fit);
+        let x = if fan.right {
+            right - w
+        } else {
+            (prev.x - CARD_STEP).min(x_hi - w).max(x_lo)
+        };
+        let y = if fan.below {
+            bottom
+        } else {
+            // A card taller than the room under its strip rises (its strip
+            // with it) rather than reaching below the deck.
+            (prev.y + prev.h + CARD_STEP).max(y_lo + h).min(cap) - h
+        };
+        prev = Area { x, y, w, h };
+        rests.push(prev);
+    }
+    rests
+}
+
+/// The back card at `depth` of `back_rests`.
+pub(super) fn back_rest(
+    bounds: (f64, f64),
+    front: Area,
+    owns: &[(f64, f64)],
+    depth: usize,
+    fan: Fan,
+) -> Area {
+    back_rests(bounds, front, &owns[..depth], fan)[depth - 1]
+}
+
+/// How far back cards resting at `backs` (unmirrored) reach past the front
+/// card at `front`: left of its left edge and above its top edge. What the
+/// fan decision weighs (`fan_for`).
+pub(super) fn stack_reach(front: Area, backs: &[Area]) -> (f64, f64) {
+    backs.iter().fold((0.0_f64, 0.0_f64), |(left, up), back| {
+        (
+            left.max(front.x - back.x),
+            up.max(back.y + back.h - (front.y + front.h)),
+        )
+    })
+}
+
+/// How far back cards resting at `backs` reach past the deck of a panel
+/// whose window holds cards up to `bounds`, where the window keeps only
+/// `LAG_ROOM` (right, top and bottom; left it has `TRAIL_PAD` more): the
+/// trail's lag gives up that much (`Trail::room`).
+pub(super) fn deck_overhang(bounds: (f64, f64), backs: &[Area]) -> f64 {
+    let deck = deck_size(bounds);
+    backs.iter().fold(0.0_f64, |most, back| {
+        most.max(back.x + back.w - deck.0)
+            .max(-back.y)
+            .max(back.y + back.h - deck.1)
+            .max(-back.x - TRAIL_PAD)
+    })
+}
+
+/// Which way the back cards fan out from the front card. By default up and
+/// left (title strips peek above); near the top of the screen's visible
+/// frame they hang below instead, near its left edge they go right, so they
+/// stay on screen where a click reaches them.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) struct Fan {
     pub(super) below: bool,
     pub(super) right: bool,
 }
 
-/// How far the back items reach left of the front card at most: the
-/// deepest card that still leaves room for a chip, and that chip.
-pub(super) const LEFT_REACH: f64 = (MAX_CARDS - 2) as f64 * CARD_STEP + CHIP_GAP + CHIP_W;
-
-/// The tallest chip column: every back item a chip.
-pub(super) const CHIP_COLUMN: f64 = (MAX_CARDS - 1) as f64 * (CHIP_H + CHIP_ROW_GAP) - CHIP_ROW_GAP;
-
-/// How far the back items reach past a front card `card_h` tall on the
-/// side they fan to vertically: the deepest card's strip, or a full chip
-/// column taller than the card.
-pub(super) fn vertical_reach(card_h: f64) -> f64 {
-    STACK_MARGIN.max(CHIP_COLUMN - card_h)
-}
-
 /// The fan for a front card drawn at `card` (screen rect, AppKit
-/// bottom-left origin) on a screen whose visible frame is `visible`: below
-/// when the strips (or chips) above would leave the frame's top, right when
-/// the cards and chips on the left would leave its left edge.
-pub(super) fn fan_for(card: Area, visible: Area) -> Fan {
+/// bottom-left origin) on a screen whose visible frame is `visible`, with
+/// back cards reaching `reach` (left, up) past it (`stack_reach`; never
+/// counted as less than a full stack's strips, `STACK_MARGIN`): below when
+/// the cards above would leave the frame's top, right when the cards on the
+/// left would leave its left edge.
+pub(super) fn fan_for(card: Area, visible: Area, reach: (f64, f64)) -> Fan {
     Fan {
-        below: visible.y + visible.h - (card.y + card.h) < vertical_reach(card.h),
-        right: card.x - visible.x < LEFT_REACH,
-    }
-}
-
-/// `frame` (a resting frame, panel coordinates) mirrored through the
-/// front card `front` along the axes `fan` flips, so a back card peeks
-/// below or right of it and a chip column sits on its right.
-pub(super) fn fanned(frame: Area, front: Area, fan: Fan) -> Area {
-    Area {
-        x: if fan.right {
-            2.0 * front.x + front.w - frame.x - frame.w
-        } else {
-            frame.x
-        },
-        y: if fan.below {
-            2.0 * front.y + front.h - frame.y - frame.h
-        } else {
-            frame.y
-        },
-        ..frame
+        below: visible.y + visible.h - (card.y + card.h) < reach.1.max(STACK_MARGIN),
+        right: card.x - visible.x < reach.0.max(STACK_MARGIN),
     }
 }
 
 /// The stack item under `point` (panel coordinates): the front card first,
-/// then chips (they never overlap cards), then cards front to back. `frames`
-/// are where each item of `layout` is drawn.
+/// then cards front to back. `frames` are where each item of `layout` is
+/// drawn.
 pub(super) fn item_at(point: (f64, f64), layout: &[Slot], frames: &[Area]) -> Option<usize> {
     let mut order: Vec<usize> = (0..layout.len().min(frames.len())).collect();
-    order.sort_by_key(|&index| match layout[index] {
-        Slot::Front => 0,
-        Slot::Chip(_) => 1,
-        Slot::Card(depth) => 1 + depth,
-    });
+    order.sort_by_key(|&index| layout[index].view());
     order
         .into_iter()
         .find(|&index| contains(&frames[index], point))
-}
-
-/// Number of back cards among `slots`.
-pub(super) fn back_cards(slots: &[Slot]) -> usize {
-    slots
-        .iter()
-        .filter(|slot| matches!(slot, Slot::Card(_)))
-        .count()
 }
 
 // ── Layout ────────────────────────────────────────────────────────────────
@@ -493,8 +514,8 @@ pub(super) fn deck_size(card: (f64, f64)) -> (f64, f64) {
     (card.0 + STACK_MARGIN, card.1 + STACK_MARGIN)
 }
 
-/// Panel window size for a front card of `card` size: the deck with the
-/// chip column and lag room around it.
+/// Panel window size for a front card of `card` size: the deck with lag
+/// room around it (and `TRAIL_PAD` more on the left).
 pub(super) fn window_size(card: (f64, f64)) -> (f64, f64) {
     let (w, h) = deck_size(card);
     (w + INSET_LEFT + LAG_ROOM, h + 2.0 * LAG_ROOM)
@@ -638,49 +659,29 @@ impl Motion {
 
 // ── Loose trail ───────────────────────────────────────────────────────────
 
-/// The feel of the chips following a dragged panel, tuned to Codex Computer
-/// Use's PiP: loose and playful. At a normal drag speed (~800 pt/s) a chip
-/// hangs ~90 pt behind (measured right after each drag event, when it has
-/// not moved yet); when the drag stops it swings ~15 pt past its resting
-/// place (one visible overshoot) and settles in ~0.7 s. Between events the
-/// lag is `2·ζ·v/ω`: lower `TRAIL_OMEGA` is looser (more lag, slower
-/// settle), lower `TRAIL_ZETA` is bouncier (0.55 gives one visible
-/// overshoot; 1.0 would give none).
-pub(super) const TRAIL_OMEGA: f64 = 12.5;
-pub(super) const TRAIL_ZETA: f64 = 0.55;
-/// Back cards follow more firmly than chips: less lag, no visible swing.
+/// The feel of the back cards following a dragged panel: firm, with no
+/// visible swing. Between drag events the lag is `2·ζ·v/ω` (lower ω is
+/// looser, lower ζ bouncier).
 pub(super) const CARD_TRAIL_OMEGA: f64 = 14.5;
 pub(super) const CARD_TRAIL_ZETA: f64 = 0.7;
 /// Lag never exceeds this, so a violent fling cannot throw the trail far
 /// off its panel (and never out of the window's `LAG_ROOM`).
 pub(super) const TRAIL_LAG_CAP: f64 = 140.0;
 
-/// The back items' offsets from their resting places (chips on one spring,
-/// back cards on a firmer one), and the measurement of the last drag's chip
-/// lag (for logs).
+/// The back cards' offset from their resting places, and the measurement
+/// of the last drag's lag (for logs).
 #[derive(Default)]
 pub(super) struct Trail {
-    chips: Spring,
     cards: Spring,
     /// A drag is moving the panel.
     dragging: bool,
-    /// Largest chip lag since the current drag started.
+    /// Largest lag since the current drag started.
     max_lag: f64,
     /// When the last drag ended, until its settle is reported.
     released: Option<Instant>,
-    /// How far the back items reach past the deck where the window has
-    /// only `LAG_ROOM` (`fan_reach`): the lag gives up that much of it.
+    /// How far the back cards reach past the deck where the window has only
+    /// `LAG_ROOM` (`deck_overhang`): the lag gives up that much of it.
     reach: f64,
-}
-
-/// How far a stack fanned by `fan` around a front card `card_h` tall
-/// reaches past the deck where the window keeps only `LAG_ROOM`: right or
-/// below it when mirrored, above the deck's stack margin when a chip column
-/// is taller than the card.
-pub(super) fn fan_reach(fan: Fan, card_h: f64) -> f64 {
-    let right = if fan.right { LEFT_REACH } else { 0.0 };
-    let vertical = vertical_reach(card_h) - if fan.below { 0.0 } else { STACK_MARGIN };
-    right.max(vertical)
 }
 
 fn spring_moving(spring: &Spring) -> bool {
@@ -692,49 +693,42 @@ impl Trail {
     pub(super) fn offset(&self, slot: Slot) -> (f64, f64) {
         match slot {
             Slot::Front => (0.0, 0.0),
-            Slot::Chip(_) => (self.chips.ox, self.chips.oy),
             Slot::Card(_) => (self.cards.ox, self.cards.oy),
         }
     }
 
     pub(super) fn moving(&self) -> bool {
-        spring_moving(&self.chips) || spring_moving(&self.cards)
+        spring_moving(&self.cards)
     }
 
-    /// The stack fans by `fan` around a front card `card_h` tall: the lag
-    /// is capped so its items never leave the window.
-    pub(super) fn fan(&mut self, fan: Fan, card_h: f64) {
-        self.reach = fan_reach(fan, card_h);
+    /// The back cards reach `reach` past the deck (`deck_overhang`): the
+    /// lag is capped so they never leave the window.
+    pub(super) fn room(&mut self, reach: f64) {
+        self.reach = reach;
     }
 
     /// The panel was dragged by `delta`: the back items stay where they
     /// are on screen (at most `TRAIL_LAG_CAP` behind, less a mirrored
     /// stack's reach), and spring after it.
     pub(super) fn panel_dragged(&mut self, delta: (f64, f64)) {
-        // Never negative (a tiny custom size box under a tall chip
-        // column): no lag at all then, and no division by a zero length.
+        // Never negative: no lag at all then, and no division by a zero
+        // length.
         let cap = (TRAIL_LAG_CAP - self.reach).max(0.0);
         if !self.dragging {
             self.dragging = true;
             self.max_lag = 0.0;
             self.released = None;
         }
-        for spring in [&mut self.chips, &mut self.cards] {
-            let (x, y) = (spring.ox - delta.0, spring.oy - delta.1);
-            let length = x.hypot(y);
-            let scale = if length > cap {
-                cap / length
-            } else {
-                1.0
-            };
-            (spring.ox, spring.oy) = (x * scale, y * scale);
-        }
+        let spring = &mut self.cards;
+        let (x, y) = (spring.ox - delta.0, spring.oy - delta.1);
+        let length = x.hypot(y);
+        let scale = if length > cap { cap / length } else { 1.0 };
+        (spring.ox, spring.oy) = (x * scale, y * scale);
         self.measure();
     }
 
     /// The panel moved without a drag (placed, resized): no trailing.
     pub(super) fn snap(&mut self) {
-        self.chips = Spring::default();
         self.cards = Spring::default();
     }
 
@@ -748,20 +742,19 @@ impl Trail {
 
     /// Advance by `dt` seconds. Whether anything is still moving.
     pub(super) fn step(&mut self, dt: f64) -> bool {
-        let chips = damped_step(&mut self.chips, TRAIL_OMEGA, TRAIL_ZETA, dt);
         let cards = damped_step(&mut self.cards, CARD_TRAIL_OMEGA, CARD_TRAIL_ZETA, dt);
         self.measure();
-        chips || cards
+        cards
     }
 
     fn measure(&mut self) {
         if self.dragging || self.released.is_some() {
-            self.max_lag = self.max_lag.max(self.chips.ox.hypot(self.chips.oy));
+            self.max_lag = self.max_lag.max(self.cards.ox.hypot(self.cards.oy));
         }
     }
 
     /// Once per drag, when the trail has come to rest after it: the largest
-    /// chip lag it showed (pt) and how long it took to settle after release.
+    /// lag it showed (pt) and how long it took to settle after release.
     pub(super) fn settled(&mut self, now: Instant) -> Option<(f64, Duration)> {
         if self.dragging || self.moving() {
             return None;
@@ -1134,27 +1127,156 @@ mod tests {
         let held = hold(BOX);
         assert_eq!(held, (320.0, 320.0));
         assert_eq!(hold((200.0, 320.0)), held);
-        let anchor = corner(shaped_frame(held, BOX, Slot::Front, 0));
+        let anchor = corner(front_frame(held, BOX));
         assert_eq!(anchor, (STACK_MARGIN + held.0, 0.0), "the square's corner");
         let deck = deck_size(held);
         for window in [(900.0, 600.0), (230.0, 408.0), (300.0, 1400.0), (1400.0, 300.0), (200.0, 120.0)] {
             let card = card_shape(BOX, Some(window));
-            let front = shaped_frame(held, card, Slot::Front, 2);
+            let front = front_frame(held, card);
             // The tallest card and its back cards stay inside the deck the
             // window is sized for.
-            let deepest = shaped_frame(held, card, Slot::Card(MAX_CARDS - 1), 3);
-            assert!(deepest.x >= 0.0 && deepest.y + deepest.h <= deck.1, "{window:?}");
+            let deepest = back_rest(
+                held,
+                front,
+                &[card; MAX_CARDS],
+                MAX_CARDS - 1,
+                Fan::default(),
+            );
+            assert!(
+                deepest.x >= 0.0 && deepest.y + deepest.h <= deck.1,
+                "{window:?}"
+            );
             assert_eq!(corner(front), anchor, "{window:?}");
             assert_eq!((front.w, front.h), card);
-            // The back items keep their places against its top-left: each
-            // card a step up and left, the chips left of the last card.
-            let back = shaped_frame(held, card, Slot::Card(1), 2);
+            // The back cards keep their places against its top-left: each
+            // a step up and left.
+            let back = back_rest(held, front, &[card; MAX_CARDS], 1, Fan::default());
             assert_eq!(back.x, front.x - CARD_STEP);
             assert_eq!(back.y + back.h, front.y + front.h + CARD_STEP);
-            let chip = shaped_frame(held, card, Slot::Chip(0), 2);
-            assert_eq!(chip.x + chip.w, front.x - 2.0 * CARD_STEP - CHIP_GAP);
-            assert_eq!(chip.y, 0.0);
         }
+    }
+
+    /// The B12 rows of the plan: each back card keeps its own window's
+    /// shape, inside the deck, whatever the front card's shape.
+    #[test]
+    fn a_back_card_keeps_its_own_shape() {
+        let held = hold(BOX);
+        let deck = deck_size(held);
+        let tall = card_shape(BOX, Some((230.0, 408.0))); // Calculator
+        let wide = card_shape(BOX, Some((673.0, 439.0))); // a TextEdit document
+                                                          // A 16:10 card behind a 1:2 front card: wider than tall, and wider
+                                                          // than the front card, inside the deck.
+        let front = front_frame(held, tall);
+        let back = back_rest(held, front, &[wide; MAX_CARDS], 1, Fan::default());
+        assert!(back.w > back.h && back.w > front.w + 60.0, "{back:?}");
+        assert!(
+            (back.w / back.h - wide.0 / wide.1).abs() < 1e-9,
+            "its own proportions"
+        );
+        assert!(
+            back.x >= 0.0
+                && back.x + back.w <= deck.0
+                && back.y >= 0.0
+                && back.y + back.h <= deck.1
+        );
+        assert_eq!(
+            back.y + back.h,
+            front.y + front.h + CARD_STEP,
+            "its strip still peeks above"
+        );
+        // The reverse: a tall card behind a wide one rises above it.
+        let front = front_frame(held, wide);
+        let back = back_rest(held, front, &[tall; MAX_CARDS], 1, Fan::default());
+        assert!(back.h > back.w && back.y + back.h > front.y + front.h + CARD_STEP);
+        assert!(back.y >= 0.0 && back.y + back.h <= deck.1, "{back:?}");
+        assert_eq!(back.x, front.x - CARD_STEP);
+        // A card of the front card's own shape rests where it always did.
+        for depth in 1..MAX_CARDS {
+            let front = front_frame(held, wide);
+            let rest = rest_frame(wide, depth);
+            let same = back_rest(held, front, &[wide; MAX_CARDS], depth, Fan::default());
+            assert_eq!(
+                same,
+                Area {
+                    x: rest.x + held.0 - wide.0,
+                    ..rest
+                },
+                "depth {depth}"
+            );
+        }
+    }
+
+    /// Code review 3: a big back card in front of a small one never hides
+    /// the small one's strip (each card steps from the card in front of it).
+    #[test]
+    fn every_back_cards_strip_stays_exposed() {
+        let held = hold(BOX);
+        let front = front_frame(held, card_shape(BOX, Some((200.0, 200.0))));
+        let owns = [
+            card_shape(BOX, Some((1000.0, 1000.0))),
+            card_shape(BOX, Some((150.0, 150.0))),
+        ];
+        let backs = back_rests(held, front, &owns, Fan::default());
+        let (near, deep) = (backs[0], backs[1]);
+        assert!(
+            deep.y + deep.h >= near.y + near.h + CARD_STEP - 1e-9,
+            "{near:?} {deep:?}"
+        );
+        assert!(deep.y + deep.h <= deck_size(held).1 + 1e-9);
+        // Mirrored below: each bottom strip a step under the one in front.
+        let below = back_rests(
+            held,
+            front,
+            &owns,
+            Fan {
+                below: true,
+                right: false,
+            },
+        );
+        assert!(below[1].y <= below[0].y - CARD_STEP + 1e-9, "{below:?}");
+    }
+
+    #[test]
+    fn a_mirrored_back_card_stays_in_the_window() {
+        let held = hold(BOX);
+        let (ww, wh) = window_size(held);
+        let tall = card_shape(BOX, Some((230.0, 408.0)));
+        let wide = card_shape(BOX, Some((673.0, 439.0)));
+        for (front_card, own) in [(tall, wide), (wide, tall), (wide, wide), (tall, tall)] {
+            let front = front_frame(held, front_card);
+            for below in [false, true] {
+                for right in [false, true] {
+                    let fan = Fan { below, right };
+                    let backs: Vec<Area> = (1..MAX_CARDS)
+                        .map(|depth| back_rest(held, front, &[own; MAX_CARDS], depth, fan))
+                        .collect();
+                    let overhang = deck_overhang(held, &backs);
+                    assert!(overhang <= STACK_MARGIN + 1e-9, "{fan:?}: {overhang}");
+                    let lag = TRAIL_LAG_CAP - overhang;
+                    for back in &backs {
+                        let w = to_window(*back);
+                        assert!(
+                            w.x - lag >= -1e-6
+                                && w.y - lag >= -1e-6
+                                && w.x + w.w + lag <= ww + 1e-6
+                                && w.y + w.h + lag <= wh + 1e-6,
+                            "{fan:?} {front_card:?} {own:?}: {w:?} with {lag} pt of lag"
+                        );
+                    }
+                }
+            }
+        }
+        // The unmirrored stack stays inside the deck: the full lag.
+        let front = front_frame(held, tall);
+        let backs: Vec<Area> = (1..MAX_CARDS)
+            .map(|d| back_rest(held, front, &[wide; MAX_CARDS], d, Fan::default()))
+            .collect();
+        assert_eq!(deck_overhang(held, &backs), 0.0);
+        let (left, up) = stack_reach(front, &backs);
+        assert!(
+            left > CARD_STEP * 3.0 && up == CARD_STEP * 3.0,
+            "{left} {up}"
+        );
     }
 
     #[test]
@@ -1162,7 +1284,7 @@ mod tests {
         // A tall window's card is narrower than the bar's content: the bar
         // keeps its least width and its right end, reaching past the card's
         // left edge.
-        let narrow = shaped_frame(hold(BOX), (112.0, 200.0), Slot::Front, 0);
+        let narrow = front_frame(hold(BOX), (112.0, 200.0));
         let bar = bar_frame(narrow, 100.0);
         assert_eq!(bar.w, BAR_MIN_WIDTH);
         assert_eq!(bar.x + bar.w, narrow.x + narrow.w - BAR_INSET);
@@ -1170,7 +1292,7 @@ mod tests {
         assert!(layout.title.w >= 20.0, "{layout:?}");
         assert!(layout.title.x + layout.title.w < layout.focus.x);
         // A card wide enough: inset on both sides, as before.
-        let wide = shaped_frame(hold(BOX), BOX, Slot::Front, 0);
+        let wide = front_frame(hold(BOX), BOX);
         let bar = bar_frame(wide, 100.0);
         assert_eq!((bar.x, bar.w), (wide.x + BAR_INSET, wide.w - 2.0 * BAR_INSET));
     }
@@ -1182,7 +1304,11 @@ mod tests {
     }
 
     /// Nobody's hands on the panel and no pick.
-    const NOBODY: Keep<u32> = Keep { held: false, windows: [None, None] };
+    const NOBODY: Keep<u32> = Keep {
+        held: false,
+        no_expiry: false,
+        windows: [None, None],
+    };
 
     #[test]
     fn acting_in_a_new_window_pushes_it_in_front_and_keeps_three_back_items() {
@@ -1204,82 +1330,21 @@ mod tests {
     }
 
     #[test]
-    fn finished_back_windows_are_chips_and_the_rest_stay_cards() {
+    fn back_items_are_cards_by_depth() {
         use Slot::*;
-        // Front finished or not, it stays the front card.
-        assert_eq!(slots(&[true]), [Front]);
-        // Back items: finished ones are chips bottom-up, the rest cards by depth.
+        assert_eq!(slots(1), [Front]);
+        assert_eq!(slots(0), [Front], "at least the front card");
+        assert_eq!(slots(3), [Front, Card(1), Card(2)]);
         assert_eq!(
-            slots(&[false, true, false, true]),
-            [Front, Chip(0), Card(1), Chip(1)]
+            slots(9),
+            [Front, Card(1), Card(2), Card(3)],
+            "no more than the views"
         );
-        assert_eq!(
-            slots(&[false, false, false, false]),
-            [Front, Card(1), Card(2), Card(3)]
-        );
-        assert_eq!(
-            slots(&[true, true, true, true]),
-            [Front, Chip(0), Chip(1), Chip(2)]
-        );
-        // Every slot has its own view.
-        let all = [Front, Card(1), Card(2), Card(3), Chip(0), Chip(1), Chip(2)];
-        let mut views: Vec<usize> = all.iter().map(|slot| slot.view()).collect();
+        let mut views: Vec<usize> = slots(MAX_CARDS).iter().map(|slot| slot.view()).collect();
         views.sort();
         assert_eq!(views, (0..VIEWS).collect::<Vec<_>>());
     }
 
-    #[test]
-    fn chips_sit_left_of_the_cards_inside_the_trail_window() {
-        let (win_w, win_h) = deck_size(CARD);
-        for finished in [
-            [false, true, true, true],
-            [false, false, true, true],
-            [false, false, false, true],
-            [false, true, false, false],
-        ] {
-            let slots = slots(&finished);
-            let cards = back_cards(&slots);
-            let frames: Vec<Area> = slots
-                .iter()
-                .map(|slot| slot_frame(CARD, *slot, cards))
-                .collect();
-            for (slot, frame) in slots.iter().zip(&frames) {
-                // Inside the deck widened left by the chip column.
-                assert!(
-                    frame.x >= -TRAIL_PAD && frame.x + frame.w <= win_w,
-                    "{slot:?}"
-                );
-                assert!(frame.y >= 0.0 && frame.y + frame.h <= win_h, "{slot:?}");
-                // And inside the window even at the largest lag.
-                let drawn = to_window(*frame);
-                assert!(drawn.x - TRAIL_LAG_CAP >= 0.0, "{slot:?}");
-                assert!(drawn.y - TRAIL_LAG_CAP >= 0.0, "{slot:?}");
-                let (window_w, window_h) = window_size(CARD);
-                assert!(drawn.x + drawn.w + TRAIL_LAG_CAP <= window_w, "{slot:?}");
-                assert!(drawn.y + drawn.h + TRAIL_LAG_CAP <= window_h, "{slot:?}");
-                if let Slot::Chip(_) = slot {
-                    // Clear of every card (front and back), and of each other.
-                    for (other, rect) in slots.iter().zip(&frames) {
-                        if other != slot {
-                            let apart = frame.x + frame.w <= rect.x
-                                || rect.x + rect.w <= frame.x
-                                || frame.y + frame.h <= rect.y
-                                || rect.y + rect.h <= frame.y;
-                            assert!(apart, "{slot:?} overlaps {other:?}");
-                        }
-                    }
-                }
-            }
-        }
-        // CHIP_REACH is exactly the farthest any chip reaches left.
-        let reach = (0..MAX_CARDS - 1)
-            .map(|cards| -slot_frame(CARD, Slot::Chip(0), cards).x)
-            .fold(f64::MIN, f64::max);
-        assert_eq!(reach, CHIP_REACH);
-        // Three chips fit beside the smallest front card.
-        let top = slot_frame(MIN_CARD, Slot::Chip(2), 0);
-        assert!(top.y + top.h <= MIN_CARD.1);
-    }
 
     #[test]
     fn acting_in_a_back_card_promotes_it_and_the_old_front_tucks_behind() {
@@ -1323,6 +1388,44 @@ mod tests {
         assert_eq!(stack.keys(), [3], "the front card stays however old");
     }
 
+    /// Rows 9, 12 and 13 of the plan's table: inside an open turn (or while
+    /// its finished state is up) back cards stay however long the agent
+    /// works elsewhere; capacity still evicts; once the turn is over the age
+    /// limit applies again.
+    #[test]
+    fn back_cards_survive_an_open_turn_of_any_length() {
+        let t = Instant::now();
+        let turn = Keep {
+            held: false,
+            no_expiry: true,
+            windows: [None, None],
+        };
+        let mut stack = Stack::new();
+        for key in [1, 2, 3] {
+            stack.act(key, t);
+        }
+        assert!(
+            !stack.prune(at(t, 600), &turn, |_| false),
+            "ten minutes into the turn"
+        );
+        assert_eq!(stack.keys(), [3, 2, 1]);
+        stack.act(4, at(t, 600));
+        stack.act(5, at(t, 601));
+        assert!(
+            stack.prune(at(t, 601), &turn, |_| false),
+            "capacity still evicts"
+        );
+        assert_eq!(stack.keys(), [5, 4, 3, 2]);
+        assert!(
+            stack.prune(at(t, 601), &turn, |key| *key == 3),
+            "a closed window still goes"
+        );
+        assert_eq!(stack.keys(), [5, 4, 2]);
+        // The turn is over: the age limit applies again.
+        assert!(stack.prune(at(t, 631), &NOBODY, |_| false));
+        assert_eq!(stack.keys(), [5]);
+    }
+
     #[test]
     fn a_back_card_drops_when_its_window_is_gone() {
         let t = Instant::now();
@@ -1343,7 +1446,11 @@ mod tests {
     #[test]
     fn a_held_panel_drops_no_back_card_by_age_or_capacity() {
         let t = Instant::now();
-        let held = Keep { held: true, windows: [None, None] };
+        let held = Keep {
+            held: true,
+            no_expiry: false,
+            windows: [None, None],
+        };
         let mut stack = Stack::new();
         for key in [1, 2, 3, 4] {
             stack.act(key, t);
@@ -1383,7 +1490,11 @@ mod tests {
         assert_eq!(stack.keys(), [1, 2, 3]);
         assert_eq!(stack.cards()[0].acted, at(t, 4));
         // Capacity evicts the deepest item that is not protected.
-        let keep = Keep { held: false, windows: [Some(1), Some(3)] };
+        let keep = Keep {
+            held: false,
+            no_expiry: false,
+            windows: [Some(1), Some(3)],
+        };
         stack.act_behind(4, at(t, 5));
         stack.act_behind(5, at(t, 5));
         assert_eq!(stack.keys(), [1, 5, 4, 2, 3]);
@@ -1394,7 +1505,11 @@ mod tests {
         assert_eq!(stack.keys(), [1, 3]);
         // A pick that went behind (the agent's card was clicked later)
         // would be protected the same way.
-        let picked_behind = Keep { held: false, windows: [Some(3), None] };
+        let picked_behind = Keep {
+            held: false,
+            no_expiry: false,
+            windows: [Some(3), None],
+        };
         assert!(!stack.prune(at(t, 600), &picked_behind, |_| false));
         // A closed window goes even when protected.
         assert!(stack.prune(at(t, 600), &picked_behind, |key| *key == 3));
@@ -1429,13 +1544,9 @@ mod tests {
     }
 
     #[test]
-    fn presses_find_the_front_card_first_then_chips_then_cards_by_depth() {
-        let layout = slots(&[false, false, true, false]);
-        let cards = back_cards(&layout);
-        let frames: Vec<Area> = layout
-            .iter()
-            .map(|slot| slot_frame(CARD, *slot, cards))
-            .collect();
+    fn presses_find_the_front_card_first_then_cards_by_depth() {
+        let layout = slots(3);
+        let frames: Vec<Area> = (0..3).map(|depth| rest_frame(CARD, depth)).collect();
         let front = frames[0];
         let inside = |area: &Area| (area.x + 4.0, area.y + area.h - 4.0);
         // The front card wins wherever it lies over a back card.
@@ -1445,9 +1556,8 @@ mod tests {
             Some(0),
             "over the front card, not the depth-1 card under it"
         );
-        // The strip of card depth 1, the one above it (depth 2), the chip.
+        // The strip of card depth 1, and the one above it (depth 2).
         assert_eq!(item_at(inside(&frames[1]), &layout, &frames), Some(1));
-        assert_eq!(item_at(inside(&frames[3]), &layout, &frames), Some(3));
         assert_eq!(item_at(inside(&frames[2]), &layout, &frames), Some(2));
         assert_eq!(item_at((-TRAIL_PAD + 1.0, 250.0), &layout, &frames), None);
         // Window coordinates round-trip through the insets.
@@ -1510,7 +1620,7 @@ mod tests {
 
     #[test]
     fn clicks_hit_the_frontmost_card_under_the_pointer() {
-        let layout = slots(&[false; MAX_CARDS]);
+        let layout = slots(MAX_CARDS);
         let frames: Vec<Area> = (0..MAX_CARDS)
             .map(|depth| rest_frame(CARD, depth))
             .collect();
@@ -1567,7 +1677,7 @@ mod tests {
         let mut after = 0.0;
         while trail.step(dt) {
             after += dt;
-            overshoot = overshoot.max(trail.offset(Slot::Chip(0)).0);
+            overshoot = overshoot.max(trail.offset(Slot::Card(1)).0);
             assert!(trail.settled(released).is_none(), "reported while moving");
             assert!(after < 2.0, "still moving after {after:.3}s");
         }
@@ -1576,38 +1686,17 @@ mod tests {
             .settled(released + Duration::from_secs_f64(after))
             .unwrap();
         assert!(trail.settled(released).is_none(), "reported once per drag");
-        assert_eq!(trail.offset(Slot::Chip(0)), (0.0, 0.0));
+        assert_eq!(trail.offset(Slot::Card(1)), (0.0, 0.0));
         (max_lag, overshoot, settle)
     }
 
     #[test]
-    fn chips_hang_80_to_100_pt_behind_a_normal_drag_and_swing_back_once() {
+    fn back_cards_hang_behind_a_normal_drag_and_settle_without_a_swing() {
         let (max_lag, overshoot, settle) = drag_and_release(800.0);
-        assert!((80.0..=100.0).contains(&max_lag), "max lag {max_lag:.1}");
-        // Underdamped: one visible swing past rest (about 16% of the lag),
-        // the second one too small to see.
-        assert!(overshoot >= 8.0, "overshoot {overshoot:.2}");
-        assert!(overshoot <= 0.2 * max_lag, "overshoot {overshoot:.2}");
+        assert!((60.0..=100.0).contains(&max_lag), "max lag {max_lag:.1}");
+        assert!(overshoot < 6.0, "overshoot {overshoot:.2}");
         let ms = settle.as_millis();
-        assert!((600..=900).contains(&ms), "settled in {ms} ms");
-        // Back cards follow the same drag more firmly: less lag, no swing.
-        let dt = 1.0 / 60.0;
-        let mut trail = Trail::default();
-        let mut card_lag = 0.0_f64;
-        let mut t = 0.0;
-        while t < 0.5 {
-            trail.panel_dragged(((t / 0.1_f64).min(1.0) * 800.0 * dt, 0.0));
-            trail.step(dt);
-            card_lag = card_lag.max(trail.offset(Slot::Card(1)).0.abs());
-            t += dt;
-        }
-        assert!(card_lag < max_lag, "cards {card_lag:.1} vs chips {max_lag:.1}");
-        trail.release(Instant::now());
-        let mut card_overshoot = 0.0_f64;
-        while trail.step(dt) {
-            card_overshoot = card_overshoot.max(trail.offset(Slot::Card(1)).0);
-        }
-        assert!(card_overshoot < 6.0, "card overshoot {card_overshoot:.2}");
+        assert!((300..=900).contains(&ms), "settled in {ms} ms");
     }
 
     #[test]
@@ -1619,46 +1708,32 @@ mod tests {
     }
 
     #[test]
-    fn a_mirrored_stack_lags_only_as_far_as_its_window_has_room() {
-        // A fling caps the lag at the room left past the mirrored items.
-        for fan in [
-            Fan { below: false, right: true },
-            Fan { below: true, right: false },
-            Fan { below: true, right: true },
-        ] {
-            for card_h in [233.0, 109.0] {
-                let mut trail = Trail::default();
-                trail.fan(fan, card_h);
-                for _ in 0..20 {
-                    trail.panel_dragged((-60.0, 60.0));
-                }
-                let (x, y) = trail.offset(Slot::Chip(0));
-                let reach = fan_reach(fan, card_h);
-                assert!((x.hypot(y) - (TRAIL_LAG_CAP - reach)).abs() < 1e-6, "{fan:?} {card_h}");
+    fn a_stack_lags_only_as_far_as_its_window_has_room() {
+        // A fling caps the lag at the room left past the back cards.
+        for reach in [0.0, 14.0, STACK_MARGIN] {
+            let mut trail = Trail::default();
+            trail.room(reach);
+            for _ in 0..20 {
+                trail.panel_dragged((-60.0, 60.0));
             }
+            let (x, y) = trail.offset(Slot::Card(1));
+            assert!(
+                (x.hypot(y) - (TRAIL_LAG_CAP - reach)).abs() < 1e-6,
+                "{reach}"
+            );
         }
-        // A tiny card (a 60x40 custom box) under a tall chip column: no
-        // lag, never a reversed or NaN offset.
+        // No room at all: no lag, never a reversed or NaN offset.
         let mut trail = Trail::default();
-        trail.fan(Fan { below: true, right: false }, 27.0);
+        trail.room(TRAIL_LAG_CAP + 10.0);
         trail.panel_dragged((10.0, 0.0));
-        assert_eq!(trail.offset(Slot::Chip(0)), (0.0, 0.0));
-        // A 109 pt card's three-chip column hangs 59 pt below it.
-        assert_eq!(fan_reach(Fan { below: true, right: false }, 109.0), CHIP_COLUMN - 109.0);
-        let mut trail = Trail::default();
-        trail.fan(Fan::default(), 233.0);
-        for _ in 0..20 {
-            trail.panel_dragged((-60.0, 60.0));
-        }
-        let (x, y) = trail.offset(Slot::Chip(0));
-        assert!((x.hypot(y) - TRAIL_LAG_CAP).abs() < 1e-6, "the default fan keeps the full lag");
+        assert_eq!(trail.offset(Slot::Card(1)), (0.0, 0.0));
     }
 
     #[test]
     fn a_snap_drops_any_lag_without_a_report() {
         let mut trail = Trail::default();
         trail.panel_dragged((50.0, 0.0));
-        assert_eq!(trail.offset(Slot::Chip(0)), (-50.0, 0.0));
+        assert_eq!(trail.offset(Slot::Card(1)), (-50.0, 0.0));
         assert_eq!(trail.offset(Slot::Front), (0.0, 0.0), "the front never lags");
         trail.snap();
         assert!(!trail.moving());
@@ -1856,7 +1931,7 @@ mod tests {
 
     #[test]
     fn presses_are_classified_by_region() {
-        let layout = slots(&[false; MAX_CARDS]);
+        let layout = slots(MAX_CARDS);
         let frames: Vec<Area> = (0..MAX_CARDS)
             .map(|depth| rest_frame(CARD, depth))
             .collect();
@@ -1941,52 +2016,140 @@ mod tests {
         let visible = Area { x: 0.0, y: 0.0, w: 1440.0, h: 875.0 };
         // A card `top` points under the visible top, its left edge at `x`.
         let card = |x: f64, top: f64| Area { x, y: visible.h - top - 233.0, w: 274.0, h: 233.0 };
+        let strips = (STACK_MARGIN, STACK_MARGIN);
         // The default spot (bottom right) and the middle: up and left.
         let home = Area { x: 1150.0, y: 16.0, w: 274.0, h: 233.0 };
-        assert_eq!(fan_for(home, visible), Fan::default());
-        assert_eq!(fan_for(card(600.0, 300.0), visible), Fan::default());
+        assert_eq!(fan_for(home, visible, strips), Fan::default());
+        assert_eq!(fan_for(card(600.0, 300.0), visible, strips), Fan::default());
         // Under the visible top by less than the stack's margin: below.
-        assert_eq!(fan_for(card(600.0, 0.0), visible), Fan { below: true, right: false });
-        assert!(fan_for(card(600.0, STACK_MARGIN - 1.0), visible).below);
-        assert!(!fan_for(card(600.0, STACK_MARGIN), visible).below);
-        // Closer to the left edge than the deepest card and its chip: right.
-        assert_eq!(fan_for(card(0.0, 300.0), visible), Fan { below: false, right: true });
-        assert!(fan_for(card(LEFT_REACH - 1.0, 300.0), visible).right);
-        assert!(!fan_for(card(LEFT_REACH, 300.0), visible).right);
+        assert_eq!(
+            fan_for(card(600.0, 0.0), visible, strips),
+            Fan {
+                below: true,
+                right: false
+            }
+        );
+        assert!(fan_for(card(600.0, STACK_MARGIN - 1.0), visible, strips).below);
+        assert!(!fan_for(card(600.0, STACK_MARGIN), visible, strips).below);
+        // Closer to the left edge than the deepest card: right.
+        assert_eq!(
+            fan_for(card(0.0, 300.0), visible, strips),
+            Fan {
+                below: false,
+                right: true
+            }
+        );
+        assert!(fan_for(card(STACK_MARGIN - 1.0, 300.0), visible, strips).right);
+        assert!(!fan_for(card(STACK_MARGIN, 300.0), visible, strips).right);
+        // A wide back card reaching 120 pt left, or a tall one 150 pt up,
+        // flips sooner; a small reach never counts as less than the strips.
+        assert!(fan_for(card(100.0, 300.0), visible, (120.0, 0.0)).right);
+        assert!(fan_for(card(600.0, 100.0), visible, (0.0, 150.0)).below);
+        assert_eq!(
+            fan_for(card(600.0, 300.0), visible, (0.0, 0.0)),
+            Fan::default()
+        );
         // The top-left corner: both.
-        assert_eq!(fan_for(card(0.0, 0.0), visible), Fan { below: true, right: true });
+        assert_eq!(
+            fan_for(card(0.0, 0.0), visible, strips),
+            Fan {
+                below: true,
+                right: true
+            }
+        );
         // On a second screen the same rule holds against its own frame.
-        let other = Area { x: 1440.0, ..visible };
-        let there = Area { x: 1440.0, ..card(0.0, 0.0) };
-        assert_eq!(fan_for(there, other), Fan { below: true, right: true });
+        let other = Area {
+            x: 1440.0,
+            ..visible
+        };
+        let there = Area {
+            x: 1440.0,
+            ..card(0.0, 0.0)
+        };
+        assert_eq!(
+            fan_for(there, other, strips),
+            Fan {
+                below: true,
+                right: true
+            }
+        );
     }
 
     #[test]
     fn a_fanned_stack_is_the_default_one_mirrored_through_the_front_card() {
         let card = (274.0, 233.0);
-        let layout = slots(&[false, false, true, true]);
-        let cards = back_cards(&layout);
-        let front = slot_frame(card, Slot::Front, cards);
-        let both = Fan { below: true, right: true };
-        for slot in &layout {
-            let normal = slot_frame(card, *slot, cards);
-            let flipped = fanned(normal, front, both);
-            assert_eq!((flipped.w, flipped.h), (normal.w, normal.h), "{slot:?} keeps its size");
-            assert_eq!(fanned(flipped, front, both), normal, "{slot:?}: mirrored twice is itself");
+        let held = hold((320.0, 200.0));
+        let front = front_frame(held, card);
+        let mirror = |frame: Area, fan: Fan| Area {
+            x: if fan.right {
+                2.0 * front.x + front.w - frame.x - frame.w
+            } else {
+                frame.x
+            },
+            y: if fan.below {
+                2.0 * front.y + front.h - frame.y - frame.h
+            } else {
+                frame.y
+            },
+            ..frame
+        };
+        for fan in [
+            Fan {
+                below: true,
+                right: true,
+            },
+            Fan {
+                below: true,
+                right: false,
+            },
+            Fan {
+                below: false,
+                right: true,
+            },
+        ] {
+            for depth in 1..MAX_CARDS {
+                let normal = back_rest(held, front, &[card; MAX_CARDS], depth, Fan::default());
+                assert_eq!(
+                    back_rest(held, front, &[card; MAX_CARDS], depth, fan),
+                    mirror(normal, fan),
+                    "{fan:?} depth {depth}"
+                );
+            }
         }
-        assert_eq!(fanned(front, front, both), front, "the front card stays put");
         // A back card peeks below and right by its step.
-        let back = fanned(slot_frame(card, Slot::Card(1), cards), front, both);
+        let back = back_rest(
+            held,
+            front,
+            &[card; MAX_CARDS],
+            1,
+            Fan {
+                below: true,
+                right: true,
+            },
+        );
         assert_eq!(back.x + back.w, front.x + front.w + CARD_STEP);
         assert_eq!(back.y, front.y - CARD_STEP);
-        // Chips sit right of the cards, hanging from the card's top down.
-        let chip = fanned(slot_frame(card, Slot::Chip(0), cards), front, both);
-        assert_eq!(chip.x, front.x + front.w + cards as f64 * CARD_STEP + CHIP_GAP);
-        assert_eq!(chip.y + chip.h, front.y + front.h);
-        // Only the axis that flips moves.
-        let normal = slot_frame(card, Slot::Card(1), cards);
-        assert_eq!(fanned(normal, front, Fan { below: false, right: true }).y, normal.y);
-        assert_eq!(fanned(normal, front, Fan { below: true, right: false }).x, normal.x);
+        // A wide card behind a narrow front card, flipped right: it stays
+        // right of the front card's left edge (on screen), shrunk to fit, and
+        // keeps its shape.
+        let narrow = card_shape((320.0, 200.0), Some((300.0, 1400.0)));
+        let wide = card_shape((320.0, 200.0), Some((1400.0, 300.0)));
+        let front = front_frame(held, narrow);
+        let back = back_rest(
+            held,
+            front,
+            &[wide; MAX_CARDS],
+            1,
+            Fan {
+                below: false,
+                right: true,
+            },
+        );
+        assert!(
+            back.x >= front.x && back.x + back.w <= deck_size(held).0 + STACK_MARGIN,
+            "{back:?}"
+        );
+        assert!((back.w / back.h - wide.0 / wide.1).abs() < 1e-9);
     }
 
     #[test]
@@ -1996,12 +2159,17 @@ mod tests {
         let visible = Area { x: 0.0, y: 0.0, w: 1440.0, h: 875.0 };
         let bounds = hold((320.0, 200.0));
         let (ww, wh) = window_size(bounds);
-        for card in [(274.0, 233.0), (320.0, 145.0), (240.0, 109.0), (145.0, 320.0)] {
-            // Three chips (the tallest chip column), and two cards with a chip.
-            for finished in [[false, true, true, true], [false, false, false, true]] {
-                let layout = slots(&finished);
-                let cards = back_cards(&layout);
-                let front = shaped_frame(bounds, card, Slot::Front, cards);
+        let shapes = [
+            (274.0, 233.0),
+            (320.0, 145.0),
+            (240.0, 109.0),
+            (145.0, 320.0),
+            (313.0, 204.0),
+            (180.0, 320.0),
+        ];
+        for card in shapes {
+            for own in shapes {
+                let front = front_frame(bounds, card);
                 let spots = [
                     (0.0, visible.h - card.1),
                     (visible.w - card.0, visible.h - card.1),
@@ -2013,11 +2181,30 @@ mod tests {
                 for (x, y) in spots {
                     // The panel origin that puts the front card there.
                     let origin = (x - front.x, y - front.y);
-                    let fan = fan_for(Area { x, y, w: card.0, h: card.1 }, visible);
-                    for slot in &layout {
-                        let item = fanned(shaped_frame(bounds, card, *slot, cards), front, fan);
-                        let screen = Area { x: item.x + origin.0, y: item.y + origin.1, ..item };
-                        let at = (x, y, card, slot, fan);
+                    let unmirrored: Vec<Area> = (1..MAX_CARDS)
+                        .map(|d| back_rest(bounds, front, &[own; MAX_CARDS], d, Fan::default()))
+                        .collect();
+                    let fan = fan_for(
+                        Area {
+                            x,
+                            y,
+                            w: card.0,
+                            h: card.1,
+                        },
+                        visible,
+                        stack_reach(front, &unmirrored),
+                    );
+                    let backs: Vec<Area> = (1..MAX_CARDS)
+                        .map(|d| back_rest(bounds, front, &[own; MAX_CARDS], d, fan))
+                        .collect();
+                    let lag = TRAIL_LAG_CAP - deck_overhang(bounds, &backs);
+                    for item in &backs {
+                        let screen = Area {
+                            x: item.x + origin.0,
+                            y: item.y + origin.1,
+                            ..*item
+                        };
+                        let at = (x, y, card, own, fan);
                         assert!(
                             screen.x >= visible.x - 0.5 && screen.x + screen.w <= visible.x + visible.w + 0.5,
                             "{at:?}: {screen:?} leaves the screen sideways"
@@ -2027,8 +2214,7 @@ mod tests {
                             "{at:?}: {screen:?} leaves the visible frame"
                         );
                         // Inside the panel window even at the fullest lag.
-                        let w = to_window(item);
-                        let lag = TRAIL_LAG_CAP - fan_reach(fan, card.1);
+                        let w = to_window(*item);
                         assert!(
                             w.x - lag >= -0.5 && w.y - lag >= -0.5 && w.x + w.w + lag <= ww + 0.5 && w.y + w.h + lag <= wh + 0.5,
                             "{at:?}: {w:?} with {lag} pt of lag"
