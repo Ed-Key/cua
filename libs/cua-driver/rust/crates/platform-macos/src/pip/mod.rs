@@ -41,9 +41,12 @@
 //!   banners); later panels stack upward, then wrap to a new column on the
 //!   left, so two agents' panels do not overlap. Only shown panels hold a
 //!   slot: a hidden panel releases its slot, and every time a panel is shown
-//!   it moves to the lowest free one. A panel the user dragged or resized
-//!   keeps its place and holds no slot, and an ended session's dragged
-//!   position and resized size are remembered while the daemon runs.
+//!   it moves to the lowest free one whose deck is clear of every other
+//!   shown panel. A panel the user dragged or resized keeps its place and
+//!   holds no slot, unless it is dropped (or shows again) over another
+//!   panel: then it slides the shortest way clear of it (`clear_spot`). An
+//!   ended session's dragged position and resized size are remembered while
+//!   the daemon runs.
 //! - 8 s without a new frame for that session: fade out (0.25 s), then
 //!   `orderOut`. The next frame fades it back in. Going idle is only that:
 //!   nothing is marked finished (see `finish`).
@@ -104,16 +107,17 @@
 //!
 //! The panel is a deck (see `stack`): the front card is the target described
 //! above, live; up to three windows the session acted in recently are back
-//! items. A back window the session has not finished with is a card, each
-//! `CARD_STEP` up and left of the card in front, showing its last still
-//! (only a still tagged with its own window) under a title strip. A window
-//! it finished with (see `finish`) collapses into a chip: a glass circle
-//! with its app icon and a green check badge (its title is the tooltip), in
-//! a column left of the cards. With the card resting near the top of the
-//! screen's visible frame the stack hangs below it instead (title strips at
-//! the cards' bottom edges), and near its left edge it goes right, chips
-//! included (`stack::fan_for`, decided at rest, see `sync_fan`), so back
-//! items never sit under the menu bar or off screen.
+//! cards, each `CARD_STEP` up and left of the card in front, in its own
+//! window's shape (`stack::back_rest`), showing its last still (only a
+//! still tagged with its own window) under a title strip. A window it
+//! finished with (see `finish`) keeps its card, with a check badge in the
+//! strip that pops once. A window that is minimized, hidden or on another
+//! Space keeps its card and last picture, dimmed, with a badge
+//! (`visibility::away`). With the card resting near the top of the screen's
+//! visible frame the stack hangs below it instead (title strips at the
+//! cards' bottom edges), and near its left edge it goes right
+//! (`stack::fan_for`, decided at rest, see `sync_fan`), so back cards never
+//! sit under the menu bar or off screen.
 //! Acting in a back item's window, or clicking it, springs it to the front
 //! and tucks the old front behind; a click only re-targets the panel (never
 //! focuses the window or activates cua-driver). A clicked card is the
@@ -122,22 +126,23 @@
 //! that window as the first back card instead of taking the front. Clicking
 //! the card of the window the agent last acted in clears the pick, and so
 //! does the picked window closing: the panel follows the agent again.
-//! A back item drops 30 s after the session last acted in its window (not
-//! while the user holds the panel, and never the pick), or when the window
-//! closes; beyond three back items the deepest goes (the same exceptions:
-//! a held panel keeps them all, the deepest waiting without a view).
+//! A back card drops 30 s after the session last acted in its window (not
+//! while the user holds the panel, not while its hooked turn is open or its
+//! finished state is up, and never the pick), or when the window closes;
+//! beyond three back cards the deepest goes (a held panel keeps them all,
+//! the deepest waiting without a view). A frame that names no window (a pid
+//! alone) keeps the current card; a sheet's or child window's frame shows
+//! on its owner's card (`owner_window`).
 //! Shown/hidden still follows the front card's window only.
 //!
 //! Every item is a view inside the one panel window, which is the deck (the
 //! front card plus transparent room above and left of it where back cards
-//! rest) with the chip column on its left and `stack::LAG_ROOM` on every
-//! side, so items that trail a drag never leave it. The front card and the
-//! chips share an `NSGlassEffectContainerView`, so a chip fuses into the
-//! card's glass when it rests against it and pulls free as it lags. Fully
+//! rest) with `stack::LAG_ROOM` on every side (and `stack::TRAIL_PAD` more
+//! on the left), so items that trail a drag never leave it. Fully
 //! transparent pixels let clicks through; items sit on hit plates. The
 //! panel handles its own mouse: a press on a card and a drag moves the
-//! window while the back items hang back on loose springs (see
-//! `stack::TRAIL_OMEGA`) and swing after it, a press in the band just
+//! window while the back cards hang back on a spring (see
+//! `stack::CARD_TRAIL_OMEGA`) and follow it, a press in the band just
 //! inside the front card's edges resizes it (60% of the screen at most,
 //! remembered per session like a dragged position), and a click on a back
 //! item raises it. The live stream is resized to the new well 150 ms after
@@ -150,12 +155,15 @@
 //!
 //! `verify_state` results arrive as labelled claims (`push_verification`)
 //! straight to the main queue. A window a verification proves gets its
-//! check at once (a chip behind, a badge on the front card). On proof
-//! (8 s of quiet after a satisfied claim) the front card shows a checklist
-//! of the session's recent claims, rows coming in 70 ms apart; when the
-//! session ends it shows that checklist or, with no claims, the windows it
-//! touched as chips. The finished state holds 2 s, then the panel fades. A
-//! new action cancels it and the panel is live again. Idle alone shows
+//! check badge at once, on its card. On proof (8 s of quiet after a
+//! satisfied claim) the front card shows a checklist of the session's recent
+//! claims, rows coming in 70 ms apart; when the session or its hooked turn
+//! ends it shows that checklist or, with no claims, the windows it touched as
+//! checklist rows. The back cards stay, each finished one badged once, so
+//! every window shows once. The finished state holds 30 s from its start
+//! (news replays its rows but keeps that deadline), then the panel fades; it
+//! stays up, and its cards take clicks, meanwhile. A new action (the next
+//! turn's first) cancels it and the panel is live again. Idle alone shows
 //! none of this.
 
 use std::collections::{HashMap, HashSet, VecDeque};
@@ -180,19 +188,19 @@ mod yields;
 
 use cursor::{cursor_in_well, shown_area, sprite_placement, sprite_window, Sprite};
 pub(crate) use cursor::sprite_box;
-use hands::Hands;
 use finish::{
-    checklist_fit, chip_grid, row_width, Claim, Ending, Finale, Lifecycle, News, Rows, Verdicts,
-    CAPTION_GAP, CAPTION_LINE, LABEL_X, MARK_SIZE, MORE_LINE, ROW_INSET, ROW_PAD,
+    checklist_fit, row_width, Claim, Ending, Finale, Lifecycle, News, Verdicts, CAPTION_GAP,
+    CAPTION_LINE, LABEL_X, MARK_SIZE, MORE_LINE, ROW_INSET, ROW_PAD,
 };
+use hands::Hands;
 use live::{Event, Request, StreamStep, Streams};
 use pip_preview::PipVerification;
 use stack::{
-    back_cards, bar_frame, bar_layout, card_shape, deck_size, hold, item_at, max_card,
-    own_pixels, panel_point, press_edges, pressed_item, resize_panel, resize_settled,
-    shaped_frame, slot_frame, to_window,
-    window_origin, window_size, CardStack, Fan, Keep, Motion, Slot, Trail, BAR_BUTTON, BAR_FADE_IN,
-    BAR_FADE_OUT, CHIP_REACH, DRAG_SLOP, GLASS_SPACING, MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, VIEWS,
+    back_rest, bar_frame, bar_layout, card_shape, deck_overhang, deck_size, front_frame, hold,
+    item_at, max_card, own_pixels, panel_point, press_edges, pressed_item, resize_panel,
+    resize_settled, stack_reach, to_window, window_origin, window_size, CardStack, Fan, Keep,
+    Motion, Slot, Trail, BAR_BUTTON, BAR_FADE_IN, BAR_FADE_OUT, DRAG_SLOP, GLASS_SPACING,
+    MAX_CARDS, MIN_CARD, RESIZE_DEBOUNCE, VIEWS,
 };
 
 // ── CGColor objc2 encoding shim ────────────────────────────────────────────
@@ -336,10 +344,7 @@ fn first_slot_bottom_right(
     }
 }
 
-/// Origin of a panel window of `size` in cascade `slot`. Placement works on
-/// the panel's footprint: the window plus the chip column that can reach
-/// `CHIP_REACH` left of it, so chips stay on screen and clear of the
-/// neighbouring column.
+/// Origin of a panel's deck of `size` in cascade `slot`.
 fn panel_origin(
     screen: Area,
     visible: Area,
@@ -347,10 +352,8 @@ fn panel_origin(
     anchor: Option<(i32, i32)>,
     slot: usize,
 ) -> (f64, f64) {
-    let footprint = (size.0 + CHIP_REACH, size.1);
-    let bottom_right = first_slot_bottom_right(screen, visible, footprint, anchor);
-    let (x, y) = stack_origin(bottom_right, visible, footprint, slot);
-    (x + CHIP_REACH, y)
+    let bottom_right = first_slot_bottom_right(screen, visible, size, anchor);
+    stack_origin(bottom_right, visible, size, slot)
 }
 
 /// Lowest cascade slot no live panel occupies.
@@ -363,6 +366,76 @@ fn free_slot(used: impl IntoIterator<Item = usize>) -> usize {
 /// shown panels. A dragged panel keeps its position and takes none.
 fn slot_on_show(others: impl IntoIterator<Item = usize>, dragged: bool) -> Option<usize> {
     (!dragged).then(|| free_slot(others))
+}
+
+/// How many cascade slots a shown panel looks through for one whose deck
+/// is clear of every other panel (`stack_origin` folds later slots onto
+/// the last one).
+const SLOT_SEARCH: usize = 32;
+
+/// The lowest slot not in `used` whose deck (`deck_at`) overlaps none of
+/// `decks` (the other visible panels' decks, dragged ones included), or
+/// `None` when every slot overlaps one (row 17 of the plan's table; the
+/// caller then slides the panel to a clear spot).
+fn clear_slot(
+    used: &[usize],
+    decks: &[Area],
+    deck_at: impl Fn(usize) -> Option<Area>,
+) -> Option<usize> {
+    (0..SLOT_SEARCH)
+        .filter(|slot| !used.contains(slot))
+        .find(|slot| {
+            deck_at(*slot).is_some_and(|deck| !decks.iter().any(|other| overlaps(deck, *other)))
+        })
+}
+
+/// Positive-area intersection of two rects (touching is not overlapping).
+fn overlaps(a: Area, b: Area) -> bool {
+    a.x < b.x + b.w && b.x < a.x + a.w && a.y < b.y + b.h && b.y < a.y + a.h
+}
+
+/// Where a deck at `deck` that overlaps one of `others` goes (rows 16 and
+/// 17 of the plan's table): the nearest origin inside `visible` that clears
+/// every other deck by `STACK_GAP`, trying each side of each other deck
+/// (and the screen's edges) on each axis. `None` when it overlaps nothing
+/// (the user's spot is kept) or no clear spot exists (too many panels: it
+/// stays where it is).
+fn clear_spot(deck: Area, others: &[Area], visible: Area) -> Option<(f64, f64)> {
+    if !others.iter().any(|other| overlaps(deck, *other)) {
+        return None;
+    }
+    let mut xs = vec![deck.x, visible.x, visible.x + visible.w - deck.w];
+    let mut ys = vec![deck.y, visible.y, visible.y + visible.h - deck.h];
+    for other in others {
+        xs.extend([other.x - STACK_GAP - deck.w, other.x + other.w + STACK_GAP]);
+        ys.extend([other.y - STACK_GAP - deck.h, other.y + other.h + STACK_GAP]);
+    }
+    let inside = |x: f64, y: f64| {
+        x >= visible.x - 0.5
+            && x + deck.w <= visible.x + visible.w + 0.5
+            && y >= visible.y - 0.5
+            && y + deck.h <= visible.y + visible.h + 0.5
+    };
+    let mut best: Option<((f64, f64), f64)> = None;
+    for &x in &xs {
+        for &y in &ys {
+            let spot = Area { x, y, ..deck };
+            let spaced = |other: &Area| Area {
+                x: other.x - STACK_GAP,
+                y: other.y - STACK_GAP,
+                w: other.w + 2.0 * STACK_GAP,
+                h: other.h + 2.0 * STACK_GAP,
+            };
+            if !inside(x, y) || others.iter().any(|other| overlaps(spot, spaced(other))) {
+                continue;
+            }
+            let distance = (x - deck.x).hypot(y - deck.y);
+            if best.is_none_or(|(_, d)| distance < d) {
+                best = Some(((x, y), distance));
+            }
+        }
+    }
+    best.map(|(spot, _)| spot)
 }
 
 /// Whether a panel whose last frame arrived at `last_action` should fade out.
@@ -566,12 +639,15 @@ struct Panel {
     front_badge_mark: usize,
     front_badge_glyph: usize,
     front_badge_on: bool,
+    /// The front card's away overlay (a dim and a centered badge) and its
+    /// badge's icon, and which away reason it shows (see `sync_front_away`).
+    front_away: usize,
+    front_away_icon: usize,
+    front_away_on: Option<visibility::Away>,
     focus: usize,
     close: usize,
     /// Back card views, depth 1 first.
     backs: [BackView; MAX_CARDS - 1],
-    /// Chip views, bottom row first.
-    chips: [ChipView; MAX_CARDS - 1],
     /// Each view's hit plate (see `new_hit_plate`), indexed like
     /// `Slot::view`, framed and hidden with its view.
     plates: [usize; VIEWS],
@@ -597,6 +673,9 @@ struct Panel {
     finale_view: Option<usize>,
     /// The finale that overlay displays: its timer marks exactly this shown.
     displayed: Option<Finale>,
+    /// When the finished state that is playing ends (set when it starts;
+    /// a replay for news keeps it).
+    finale_deadline: Instant,
     /// Media time the finale's rows started animating in, so a rebuild for
     /// a resized well continues their animation instead of restarting it.
     finale_start: f64,
@@ -667,22 +746,18 @@ struct Panel {
     aside: u32,
 }
 
-/// A back card's views.
+/// A back card's views: the card, its still, the title strip's app icon
+/// and title, the check badge (its view, mark and glyph layers) and the
+/// away badge at the strip's end.
 struct BackView {
     view: usize,
     image_view: usize,
     icon: usize,
     title: usize,
-}
-
-/// A chip's views: its badge's view is 0, and its mark and glyph layers
-/// null, when it has no badge.
-struct ChipView {
-    view: usize,
     badge: usize,
-    icon: usize,
-    mark: usize,
-    glyph: usize,
+    badge_mark: usize,
+    badge_glyph: usize,
+    away: usize,
 }
 
 /// What a card shows besides live pixels, kept so a window that goes behind
@@ -708,6 +783,14 @@ struct CardInfo {
     /// still framed as it was, so it is never shown under the new framing.
     still_page: bool,
     still_crop: Option<Area>,
+    /// Its check badge popped in (once per finish: cleared when the window
+    /// is no longer finished), so moving to another depth or to the front
+    /// shows it without playing the pop again.
+    completed: bool,
+    /// Its window is minimized, hidden or on another Space (see
+    /// `visibility::away`): the card keeps its last picture, dimmed, with a
+    /// badge.
+    away: Option<visibility::Away>,
 }
 
 /// A retained `NSImage`, released on drop (like all panel state, only on
@@ -965,6 +1048,9 @@ struct CaptureWorker {
     watched: Mutex<HashMap<String, Vec<u32>>>,
     /// Sessions in an open hooked turn: polled however long ago they acted.
     in_turn: Mutex<HashSet<String>>,
+    /// Sessions whose finished state is up: polled while it holds (away
+    /// marks, closed back windows).
+    finishing: Mutex<HashSet<String>>,
 }
 
 impl CaptureWorker {
@@ -986,6 +1072,7 @@ impl CaptureWorker {
             active: Mutex::new(HashMap::new()),
             watched: Mutex::new(HashMap::new()),
             in_turn: Mutex::new(HashSet::new()),
+            finishing: Mutex::new(HashSet::new()),
         });
         let looping = worker.clone();
         std::thread::Builder::new()
@@ -1039,7 +1126,18 @@ impl CaptureWorker {
         lock(&self.active).remove(session_key);
         lock(&self.watched).remove(session_key);
         lock(&self.in_turn).remove(session_key);
+        lock(&self.finishing).remove(session_key);
         lock(&self.captured).remove(session_key);
+    }
+
+    /// The session's finished state is up (`true`) or over: the poll keeps
+    /// answering for it while it holds. Ignored once the session ended.
+    fn finishing(&self, session_key: &str, up: bool) {
+        if !up {
+            lock(&self.finishing).remove(session_key);
+        } else if self.is_live(session_key) {
+            lock(&self.finishing).insert(session_key.to_owned());
+        }
     }
 
     /// Sessions that pushed a frame within the idle window or act in an open
@@ -1048,9 +1146,12 @@ impl CaptureWorker {
     fn active_targets(&self, now: Instant) -> Vec<(String, Target, bool, Vec<u32>)> {
         let watched = lock(&self.watched);
         let in_turn = lock(&self.in_turn);
+        let finishing = lock(&self.finishing);
         lock(&self.active)
             .iter()
-            .filter(|(key, (_, _, pushed))| !idle_hide_due(*pushed, now) || in_turn.contains(*key))
+            .filter(|(key, (_, _, pushed))| {
+                !idle_hide_due(*pushed, now) || in_turn.contains(*key) || finishing.contains(*key)
+            })
             .map(|(key, (target, page, _))| {
                 let windows = watched.get(key).cloned().unwrap_or_default();
                 (key.clone(), *target, *page, windows)
@@ -1203,10 +1304,89 @@ struct VisibilityUpdate {
     target_frame: Option<(u32, Area)>,
     /// Back-card windows that no longer exist.
     gone: Vec<u32>,
+    /// The target's and back cards' windows that are away (minimized,
+    /// hidden, another Space), and why; the rest are on screen or gone.
+    away: Vec<(u32, visibility::Away)>,
+}
+
+/// The window whose card `window` (of `pid`) shows: its farthest ancestor
+/// within a few levels that `pid` owns, so a sheet or a child window (a
+/// popover, an inline editor) shares its owner's card, as Codex folds them;
+/// `window` itself when it has none. `parent_of` is WindowServer's parent
+/// link, `owned` whether `pid` owns a window.
+fn owner_window(
+    pid: i32,
+    window: u32,
+    parent_of: impl Fn(u32) -> Option<u32>,
+    owned: impl Fn(i32, u32) -> bool,
+) -> u32 {
+    let (mut current, mut owner) = (window, window);
+    for _ in 0..5 {
+        match parent_of(current) {
+            Some(parent) if parent != current => {
+                if owned(pid, parent) {
+                    owner = parent;
+                }
+                current = parent;
+            }
+            _ => break,
+        }
+    }
+    owner
+}
+
+/// Child windows folded into their owner's card (child -> owner), so the
+/// cursor, which names the window its action targeted, still shows on the
+/// owner's card. Written where frames are pushed; read on the main queue.
+static FOLDS: Mutex<Option<HashMap<u32, u32>>> = Mutex::new(None);
+
+/// Fold `target`'s window into its owner (see `owner_window`), noting the
+/// fold for the cursor. WindowServer calls, so never on the main thread.
+fn fold_target(target: Target) -> Target {
+    let (Some(pid), Some(window)) = target else {
+        return target;
+    };
+    let owner = owner_window(
+        pid,
+        window,
+        crate::input::skylight::window_parent_id,
+        |pid, id| {
+            crate::windows::resolve_window_owner(pid, id) == crate::windows::WindowOwner::SamePid
+        },
+    );
+    let mut folds = lock(&FOLDS);
+    let folds = folds.get_or_insert_with(HashMap::new);
+    if owner == window {
+        // A window that is (or became) top-level stands for itself.
+        folds.remove(&window);
+    } else {
+        // ponytail: a small map with no expiry; cleared past 256 folds.
+        if folds.len() > 256 {
+            folds.clear();
+        }
+        if folds.insert(window, owner) != Some(owner) {
+            tracing::info!(target: "pip", pid, window, owner, "PiP child window folded into its owner's card");
+        }
+    }
+    (Some(pid), Some(owner))
+}
+
+/// The card window a cursor update's window stands for (see `FOLDS`).
+fn folded(window: Option<u32>) -> Option<u32> {
+    let window = window?;
+    Some(
+        lock(&FOLDS)
+            .as_ref()
+            .and_then(|folds| folds.get(&window).copied())
+            .unwrap_or(window),
+    )
 }
 
 impl PipBackend for MacosPipBackend {
     fn push_frame(&self, frame: PipFrame) {
+        let mut frame = frame;
+        (frame.target_pid, frame.target_window_id) =
+            fold_target((frame.target_pid, frame.target_window_id));
         let target = (frame.target_pid, frame.target_window_id);
         // One CGWindowList read, as the action's own tool made to find its
         // window. Here and not on the capture worker, so a dropped frame
@@ -1223,13 +1403,29 @@ impl PipBackend for MacosPipBackend {
             target,
             timestamp_ms: frame.timestamp_ms,
         };
-        self.worker.push(frame);
+        // A frame that names no window (a pid alone) keeps the current card
+        // rather than guessing one (row 3 of the plan's table): its action is
+        // the session's activity, but nothing is captured, so it never opens
+        // or switches a card.
+        if frame.target_window_id.is_some() {
+            self.worker.push(frame);
+        }
         dispatch_to_main(action, apply_action_cb);
     }
 
     /// Straight to the main queue: never waits on a capture, and the
-    /// timestamps (not arrival order) decide what is finished.
+    /// timestamps (not arrival order) decide what is finished. A sheet's or
+    /// child window's verification counts for its owner's card, as its
+    /// actions do.
     fn push_verification(&self, verification: PipVerification) {
+        let mut verification = verification;
+        let target = (
+            Some(verification.target_pid),
+            Some(verification.target_window_id),
+        );
+        if let (_, Some(owner)) = fold_target(target) {
+            verification.target_window_id = owner;
+        }
         dispatch_to_main(verification, apply_verify_cb);
     }
 
@@ -1356,15 +1552,16 @@ fn poll_visibility(worker: &CaptureWorker) {
             continue;
         }
         let (windows, displays) = visibility::snapshot();
-        // Every window WindowServer knows (any Space, minimized included),
-        // only when some back card needs checking. An empty answer is a
-        // failed lookup, not every window closing.
-        let known = active
-            .iter()
-            .any(|(_, _, _, watched)| !watched.is_empty())
-            .then(visibility::known_windows)
-            .flatten();
+        // Every window WindowServer knows (any Space, minimized included):
+        // which back cards closed and which cards are away. An empty answer
+        // is a failed lookup, not every window closing.
+        let all = crate::windows::all_windows_any_layer();
+        let known: Option<HashSet<u32>> =
+            (!all.is_empty()).then(|| all.iter().map(|window| window.window_id).collect());
         for (key, target, page, watched) in active {
+            let mut checked = watched.clone();
+            checked.extend(target.1);
+            let away = visibility::away_windows(&checked, &all);
             let visible = visibility::target_fully_visible(target, &windows, &displays, own_pid);
             let resolved_window = resolve_target_window(target);
             let target_frame = visibility::frame_of(&windows, resolved_window);
@@ -1391,6 +1588,7 @@ fn poll_visibility(worker: &CaptureWorker) {
                     resolved_window,
                     target_frame,
                     gone,
+                    away,
                 },
                 visibility_cb,
             );
@@ -1458,14 +1656,14 @@ unsafe fn apply_cursor(state: &mut State, update: &CursorUpdate) -> bool {
     let well = well_size(panel.laid_out);
     panel.cursor_at = update.image.map(|_| (update.x, update.y));
     panel.cursor_box = update.sprite_box;
-    panel.cursor_window = update.window;
+    panel.cursor_window = folded(update.window);
     // Only over the live picture of the window the cursor works in: not
     // under a finale, not over a raised back card or a target whose
     // capture is pending, and only with a window frame to map into.
     let displayed = current_tag(panel.target, panel.resolved_window);
     let point = match (
         update.image,
-        sprite_window(update.window, displayed, shown_frame(panel)),
+        sprite_window(panel.cursor_window, displayed, shown_frame(panel)),
         panel.finale_view,
     ) {
         (Some(_), Some(frame), None) => cursor_in_well(frame, (update.x, update.y), well),
@@ -1635,6 +1833,9 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
         return;
     }
     if !has_panel {
+        // The session works again while its ended panel holds its finished
+        // state (row 20): that panel goes now, new work supersedes it.
+        supersede_ending(state, &key);
         let Some(panel) = create_panel(state, &key, frame.session_label.as_deref()) else {
             return;
         };
@@ -1644,6 +1845,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     }
     let worker = state.worker.clone();
     let pressed = state.gesture.as_ref().map(|gesture| gesture.id);
+    let turn_open = state.turn_open.contains(&key);
     let Some(panel) = state.panels.get_mut(&key) else {
         return;
     };
@@ -1668,7 +1870,7 @@ unsafe fn apply_frame(state: &mut State, update: FrameUpdate) {
     if tag.is_some() {
         panel.agent = tag;
     }
-    let keep = keep(panel, pressed, now);
+    let keep = keep(panel, pressed, now, turn_open);
     // The pick rows of the table in `hands`: the user's pick stays the
     // front card. The window the session acted in joins or refreshes as the
     // first back card and this frame's picture goes to its own card; the
@@ -1843,23 +2045,59 @@ fn user_holds(panel: &Panel, pressed: Option<i64>, now: Instant) -> bool {
 }
 
 /// What `panel`'s stack may not drop at `now`: nothing by age or capacity
-/// while the user holds it, and never the pick, nor the agent's latest
-/// window behind a pick.
-fn keep(panel: &Panel, pressed: Option<i64>, now: Instant) -> Keep<Tag> {
+/// while the user holds it, nothing by age while its hooked turn is open
+/// (`turn_open`) or its finished state is up, and never the pick, nor the
+/// agent's latest window behind a pick.
+fn keep(panel: &Panel, pressed: Option<i64>, now: Instant, turn_open: bool) -> Keep<Tag> {
     let pick = panel.hands.pick();
     Keep {
         held: user_holds(panel, pressed, now),
+        no_expiry: turn_open || panel.lifecycle.playing(),
         windows: [pick, pick.and(panel.agent)],
     }
 }
 
 /// Resting frame of `slot` with the front card as it is drawn now (the
 /// size box fitted to the displayed window's shape), on the side the stack
-/// fans to (`Panel::fan`).
-fn resting(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
+/// fans to (`Panel::fan`, or `fan`).
+fn resting(panel: &Panel, slot: Slot) -> Area {
+    resting_fanned(panel, slot, panel.fan)
+}
+
+/// `resting` on the side `fan` says. A back card takes its own window's
+/// shape in the size box (`stack::back_rest`); a card whose window's size
+/// is not known yet takes the front card's.
+fn resting_fanned(panel: &Panel, slot: Slot, fan: Fan) -> Area {
     let bounds = hold(panel.card);
-    let front = shaped_frame(bounds, panel.front, Slot::Front, back_cards);
-    stack::fanned(shaped_frame(bounds, panel.front, slot, back_cards), front, panel.fan)
+    let front = front_frame(bounds, panel.front);
+    match slot {
+        Slot::Front => front,
+        Slot::Card(depth) => {
+            // Each back card steps from the one in front of it, so their
+            // own shapes up to this depth all count.
+            let owns: Vec<(f64, f64)> = (1..=depth)
+                .map(|depth| {
+                    panel
+                        .cards
+                        .cards()
+                        .get(depth)
+                        .and_then(|card| card.data.shape)
+                        .map_or(panel.front, |shape| card_shape(panel.card, Some(shape)))
+                })
+                .collect();
+            back_rest(bounds, front, &owns, depth, fan)
+        }
+    }
+}
+
+/// Resting frames of the back cards, unmirrored (for the fan decision).
+fn back_rests_unfanned(panel: &Panel) -> Vec<Area> {
+    panel
+        .layout
+        .iter()
+        .filter(|slot| **slot != Slot::Front)
+        .map(|slot| resting_fanned(panel, *slot, Fan::default()))
+        .collect()
 }
 
 /// Decide which way the back items fan (`stack::fan_for`) from where the
@@ -1873,8 +2111,8 @@ unsafe fn sync_fan(panel: &mut Panel) {
     }
     let window = panel.window as *mut AnyObject;
     let frame: NSRect = msg_send![window, frame];
-    let cards = back_cards(&panel.layout);
-    let front = to_window(resting(panel, Slot::Front, cards));
+    let front_rest = resting(panel, Slot::Front);
+    let front = to_window(front_rest);
     let Some(visible) = card_visible_frame(window, front) else {
         return;
     };
@@ -1883,7 +2121,11 @@ unsafe fn sync_fan(panel: &mut Panel) {
         y: frame.origin.y + front.y,
         ..front
     };
-    let fan = stack::fan_for(card, visible);
+    let fan = stack::fan_for(
+        card,
+        visible,
+        stack_reach(front_rest, &back_rests_unfanned(panel)),
+    );
     if fan == panel.fan {
         return;
     }
@@ -1891,7 +2133,7 @@ unsafe fn sync_fan(panel: &mut Panel) {
     panel.fan = fan;
     if panel.shown {
         for (index, slot) in panel.layout.clone().into_iter().enumerate() {
-            let rest = resting(panel, slot, cards);
+            let rest = resting(panel, slot);
             if drawn[index] != rest {
                 panel.motion[slot.view()].restack(drawn[index], rest);
             }
@@ -1944,12 +2186,11 @@ unsafe fn set_shape(panel: &mut Panel, shape: Option<(f64, f64)>) -> bool {
     panel.shape = shape;
     let front = card_shape(panel.card, shape);
     if front != panel.front {
-        let cards = back_cards(&panel.layout);
         let drawn = settle_frames(panel);
         panel.front = front;
         if panel.shown {
             for (index, slot) in panel.layout.clone().into_iter().enumerate() {
-                let rest = resting(panel, slot, cards);
+                let rest = resting(panel, slot);
                 if drawn[index] != rest {
                     panel.motion[slot.view()].restack(drawn[index], rest);
                 }
@@ -2035,8 +2276,7 @@ unsafe extern "C" fn apply_verify_cb(ctx: *mut c_void) {
 }
 
 /// Record a finished `verify_state`: its claims for the checklist, and
-/// whether its window is now finished (a finished back window collapses to
-/// a chip).
+/// whether its window is now finished (its card gets its check badge).
 unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
     let PipVerification {
         timestamp_ms,
@@ -2094,7 +2334,7 @@ unsafe fn apply_verify(state: &mut State, verification: PipVerification) {
     // shown stale.
     if let Some(generation) = panel.lifecycle.restart() {
         let finale = finish::replayed(&mut panel.verdicts);
-        play_finale(panel, &key, &finale, generation);
+        replay_finale(panel, &key, &finale, generation);
         return;
     }
     if news == News::Proof {
@@ -2142,6 +2382,11 @@ unsafe fn apply_action(state: &mut State, action: Action) {
     let worker = state.worker.clone();
     // The touched window's stand-in title until a frame names it.
     let app = app_name(target.0);
+    // The session works again while its ended panel holds its finished
+    // state (row 20): that panel goes now, new work supersedes it. (In
+    // main-queue order a note queued before the session's end ran before
+    // it, so this note is newer.)
+    supersede_ending(state, &key);
     // Main-queue order, as for verifications.
     let Some(panel) = state.panels.get_mut(&key) else {
         if !worker.is_live(&key) {
@@ -2163,6 +2408,55 @@ unsafe fn apply_action(state: &mut State, action: Action) {
     note_finished(panel, &key);
     if restacked {
         announce_stack(panel, &key);
+    }
+    // A frame that names no window brings no capture (and so no refresh of
+    // its own): the panel comes back up with its current card now.
+    if target.1.is_none() {
+        refresh(state, &key);
+    }
+}
+
+/// Close the ended panel of session `key` still holding its finished state,
+/// if any: new work under that key supersedes it. A press on it is over.
+unsafe fn supersede_ending(state: &mut State, key: &str) {
+    let Some(index) = state.ending.iter().position(|panel| panel.key == key) else {
+        return;
+    };
+    let panel = state.ending.remove(index);
+    if state
+        .gesture
+        .as_ref()
+        .is_some_and(|gesture| gesture.id == panel.id)
+    {
+        state.gesture = None;
+    }
+    close_panel(panel, FADE);
+}
+
+/// Mark each card whose window is in `away` (from the poll) as away, and
+/// the rest as back on screen, logging each change.
+fn mark_away(panel: &mut Panel, away: &[(u32, visibility::Away)]) {
+    let key = panel.key.clone();
+    for card in panel.cards.cards_mut() {
+        let Some(window) = card.key.1 else {
+            continue;
+        };
+        let now = away
+            .iter()
+            .find(|(id, _)| *id == window)
+            .map(|(_, why)| *why);
+        if now == card.data.away {
+            continue;
+        }
+        match now {
+            Some(why) => {
+                tracing::info!(target: "pip", session = %key, window, reason = why.name(), "PiP card away: dimmed with a badge");
+            }
+            None => {
+                tracing::info!(target: "pip", session = %key, window, "PiP card back on screen")
+            }
+        }
+        card.data.away = now;
     }
 }
 
@@ -2194,15 +2488,20 @@ unsafe fn note_finished(panel: &mut Panel, key: &str) {
 /// card and says the same in full, so the badge hides under one.
 unsafe fn sync_front_badge(panel: &mut Panel) {
     let window = panel.cards.front_key().and_then(|tag| tag.1);
-    let on = panel.finale_view.is_none()
-        && window.is_some_and(|window| panel.verdicts.finished(window));
+    let finished = window.is_some_and(|window| panel.verdicts.finished(window));
+    // Popped once per finish per card (`CardInfo::completed`).
+    let popped = panel
+        .cards
+        .front_mut()
+        .is_some_and(|front| std::mem::replace(&mut front.data.completed, finished));
+    let on = panel.finale_view.is_none() && finished;
     if on == panel.front_badge_on {
         return;
     }
     panel.front_badge_on = on;
     let badge = panel.front_badge as *mut AnyObject;
     let _: () = msg_send![badge, setHidden: !on];
-    if on {
+    if on && !popped {
         // It comes in like a finale row's mark: a fade, a pop, the check
         // drawn.
         let layer: *mut AnyObject = msg_send![badge, layer];
@@ -2274,35 +2573,19 @@ unsafe fn app_icon(app: *mut AnyObject) -> *mut AnyObject {
     msg_send![app, icon]
 }
 
-/// Where each of the panel's items is drawn, from which windows are
-/// finished (at least the front card).
+/// Where each of the panel's items is drawn: the front card and a card per
+/// depth. A held panel evicts nobody (see `hands`), so the stack can run
+/// past the views there are: the deepest items then wait without one.
 fn item_slots(panel: &Panel) -> Vec<Slot> {
-    // A held panel evicts nobody (see `hands`), so the stack can run past
-    // the views there are: the deepest items then wait without one.
-    let finished: Vec<bool> = panel
-        .cards
-        .cards()
-        .iter()
-        .take(MAX_CARDS)
-        .map(|card| {
-            card.key
-                .1
-                .is_some_and(|window| panel.verdicts.finished(window))
-        })
-        .collect();
-    let slots = stack::slots(&finished);
-    if slots.is_empty() {
-        vec![Slot::Front]
-    } else {
-        slots
-    }
+    stack::slots(panel.cards.cards().len())
 }
 
 /// Apply `change` to the panel (its card stack or its verdicts). If the
-/// order or any item's slot changed, each item starts where its window was
-/// drawn and springs to its new place (a card collapsing into a chip, a
-/// chip coming forward), the back items show their windows, and the poll
-/// watches their windows. Whether anything changed.
+/// order changed, each item starts where its window was drawn and springs
+/// to its new place, the back cards show their windows, and the poll
+/// watches their windows; with the same order, a back card whose window's
+/// shape changed glides to its new frame. The back cards' badges follow
+/// the verdicts either way. Whether the stack changed.
 unsafe fn restack(
     panel: &mut Panel,
     key: &str,
@@ -2312,26 +2595,42 @@ unsafe fn restack(
     let old = panel.cards.keys();
     let old_layout = panel.layout.clone();
     let drawn = settle_frames(panel);
+    let old_rests: Vec<Area> = old_layout
+        .iter()
+        .map(|slot| resting(panel, *slot))
+        .collect();
     change(panel);
     // The front window, or what is known about it, may have changed.
     sync_front_badge(panel);
     let new = panel.cards.keys();
     let layout = item_slots(panel);
     if new == old && layout == old_layout {
+        let mut moved = false;
+        for (index, slot) in layout.iter().enumerate() {
+            let rest = resting(panel, *slot);
+            if rest != old_rests[index] {
+                panel.motion[slot.view()].restack(drawn[index], rest);
+                moved = true;
+            }
+        }
+        render_backs(panel);
+        if moved {
+            apply_card_frames(panel);
+            start_ticking();
+            sync_fan(panel);
+        }
         return false;
     }
     panel.layout = layout.clone();
-    let cards = back_cards(&layout);
     for (index, from) in stack::previous_depths(&old, &new).into_iter().enumerate() {
         let Some(&slot) = layout.get(index) else {
             continue;
         };
         let views = slot_views(panel, slot);
-        let rest = resting(panel, slot, cards);
+        let rest = resting(panel, slot);
         match from {
             Some(from) => {
-                // Moved, or its place moved (chips shift when cards come
-                // and go): spring from where it was drawn.
+                // Moved, or its place moved: spring from where it was drawn.
                 if drawn.get(from).is_some_and(|drawn| *drawn != rest) {
                     panel.motion[slot.view()].restack(drawn[from], rest);
                 }
@@ -2353,6 +2652,9 @@ unsafe fn restack(
     render_backs(panel);
     apply_card_frames(panel);
     start_ticking();
+    // The stack's reach changed with its cards: near an edge it may fan the
+    // other way now.
+    sync_fan(panel);
     // The poll checks the back cards' windows for closing, and the front
     // card's too while it is the user's pick (a closed pick is cleared).
     let first = if panel.hands.pick().is_some() { 0 } else { 1.min(new.len()) };
@@ -2452,12 +2754,7 @@ unsafe fn announce_stack(panel: &Panel, key: &str) {
         .map(|card| card.data.title.as_str())
         .collect();
     let count = titles.len();
-    let chips = panel
-        .layout
-        .iter()
-        .filter(|slot| matches!(slot, Slot::Chip(_)))
-        .count();
-    tracing::info!(target: "pip", session = %key, cards = count, chips, ?titles, "PiP card stack changed");
+    tracing::info!(target: "pip", session = %key, cards = count, ?titles, "PiP card stack changed");
     let title = format!(
         "cua PiP · {} · {count} card{}",
         panel.name,
@@ -2568,15 +2865,19 @@ unsafe extern "C" fn visibility_cb(ctx: *mut c_void) {
             if let Some(id) = unpicked {
                 follow_agent(state, id, is_gone);
             }
+            let turn_open = state.turn_open.contains(key);
             let Some(panel) = state.panels.get_mut(key) else {
                 return;
             };
             // Back cards whose window closed or went quiet drop (none by
-            // age or capacity under the user's hands).
+            // age or capacity under the user's hands, none by age in an
+            // open turn or a finished state). The away rows: a minimized,
+            // hidden or other-Space window's card stays, dimmed and badged.
             let now = Instant::now();
-            let keep = keep(panel, pressed, now);
+            let keep = keep(panel, pressed, now, turn_open);
             let mut restacked = restack(panel, key, &worker, |panel| {
                 panel.cards.prune(now, &keep, is_gone);
+                mark_away(panel, &update.away);
             });
             let mut reshaped = false;
             let same = panel.target == update.target && panel.page == update.page;
@@ -2743,6 +3044,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
         anchor,
         gesture,
         turn_open,
+        worker,
         ..
     } = state;
     // An ended session's panel keeps its slot while its finale is up.
@@ -2752,6 +3054,18 @@ unsafe fn refresh(state: &mut State, key: &str) {
         .map(|(_, panel)| panel)
         .chain(ending.iter())
         .filter_map(|panel| panel.slot)
+        .collect();
+    // The other shown panels' decks, which a panel shown now must not cover.
+    let decks: Vec<Area> = panels
+        .iter()
+        .filter(|(other, _)| other.as_str() != key)
+        .map(|(_, panel)| panel)
+        .chain(ending.iter())
+        .filter(|panel| panel.shown)
+        .map(|panel| {
+            let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
+            deck_of(area_of(frame))
+        })
         .collect();
     let Some(panel) = panels.get_mut(key) else {
         return;
@@ -2777,6 +3091,8 @@ unsafe fn refresh(state: &mut State, key: &str) {
     // panel stays up while proof waits for its finale (no fade out and back
     // in between the idle deadline and the proof timer).
     let finale = panel.lifecycle.playing();
+    // The poll keeps answering while the finished state holds.
+    worker.finishing(key, finale);
     let waiting = own_proof && panel.shown && panel.verdicts.proof_waiting();
     // Nor does it go from under the user's hands (see `hands`): a press
     // that started on it, the pointer resting on it, or an interaction less
@@ -2791,7 +3107,7 @@ unsafe fn refresh(state: &mut State, key: &str) {
         finale,
     ) {
         if !panel.shown {
-            place_on_show(panel, others, *image_size, *anchor);
+            place_on_show(panel, others, decks, *image_size, *anchor);
         }
         show(panel);
     } else {
@@ -2863,15 +3179,23 @@ fn now_ms() -> u64 {
         .map_or(0, |elapsed| elapsed.as_millis() as u64)
 }
 
-/// Show `finale` (from the top) and time its end under `generation`.
+/// Show `finale` (from the top) and time its end under `generation`: the
+/// finished state's one deadline starts now.
 unsafe fn play_finale(panel: &mut Panel, key: &str, finale: &Finale, generation: u64) {
-    tracing::info!(target: "pip", session = %key, rows = ?finale.log_rows(), kind = %finale.kind(), "PiP finished state");
+    panel.finale_deadline = Instant::now() + finish::finale_duration(finale.len());
+    replay_finale(panel, key, finale, generation);
+}
+
+/// Show `finale` (from the top) under `generation`, ending at the deadline
+/// the playing finished state already has: news that rebuilds its rows
+/// never extends it (row 19 of the plan's table).
+unsafe fn replay_finale(panel: &mut Panel, key: &str, finale: &Finale, generation: u64) {
+    let left = panel
+        .finale_deadline
+        .saturating_duration_since(Instant::now());
+    tracing::info!(target: "pip", session = %key, rows = ?finale.log_rows(), kind = %finale.kind(), of = finale.of(), hold_ms = left.as_millis() as u64, "PiP finished state");
     show_finale_view(panel, finale, CACurrentMediaTime());
-    dispatch_to_main_after(
-        finish::finale_duration(finale.len()),
-        (panel.id, generation),
-        finale_end_cb,
-    );
+    dispatch_to_main_after(left, (panel.id, generation), finale_end_cb);
 }
 
 /// A finale's time is up: an ended session's panel closes; a live one
@@ -2903,6 +3227,7 @@ unsafe extern "C" fn finale_end_cb(ctx: *mut c_void) {
                     })
                 });
             if let Some(key) = key {
+                prune_aged(state, &key);
                 refresh(state, &key);
             }
         });
@@ -2920,23 +3245,23 @@ unsafe fn remove_finale_view(panel: &mut Panel) {
     }
 }
 
-/// Gap between finale chips.
-const FINALE_CHIP_GAP: f64 = 12.0;
 /// The scrim under the finale, and the white of a row's capsule over it.
 const SCRIM_ALPHA: f64 = 0.6;
 const ROW_FILL: f64 = 0.16;
-/// The white of a finale chip's disc over the scrim: a little more than a
-/// row's capsule, since it carries an icon, not text.
-const DISC_FILL: f64 = 0.28;
 /// The front card's check badge sits this far inside its bottom-right
 /// corner (clear of the corner's curve).
 const FRONT_BADGE_INSET: f64 = 8.0;
 /// The panel fades slower after a finale than after going idle.
 const FINALE_FADE: Duration = Duration::from_millis(400);
+/// A back card's check and away badges, in its 14 pt title strip.
+const BACK_BADGE: f64 = 12.0;
+/// How dark an away window's card gets, and its badge on the front card.
+const AWAY_DIM: f64 = 0.55;
+const AWAY_ICON: f64 = 28.0;
 
 /// Put the finale over the front card's image well: a dark scrim with the
-/// checklist rows (capsules under a "Verified n of m" line) or the touched
-/// windows' chips, animating in one by one from media time `start` (a
+/// checklist rows (capsules under a "Verified n of m" or "Worked in n
+/// windows" line), animating in one by one from media time `start` (a
 /// rebuild for a resized well passes the original start, so rows already in
 /// stay in).
 unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
@@ -2969,198 +3294,129 @@ unsafe fn show_finale_view(panel: &mut Panel, finale: &Finale, start: f64) {
     let white: *mut AnyObject = msg_send![class!(NSColor), whiteColor];
     let capsule_color: *mut AnyObject = msg_send![white, colorWithAlphaComponent: ROW_FILL];
     let capsule: *mut CGColor = msg_send![capsule_color, CGColor];
-    match &finale.rows {
-        Rows::Checklist(rows) => {
-            // Shrunk, or cut with a "+n more" line, to fit the well.
-            let fit = checklist_fit(well_h, rows.len());
-            let (row_h, gap) = (fit.row_height, fit.gap);
-            let pitch = row_h + gap;
-            let top = (well_h + fit.height()) / 2.0;
-            // Width sizable, flexible top and bottom: stays centered.
-            const ROW_MASK: u64 = 2 | 8 | 32;
-            if let Some(text) = finale.caption() {
-                let caption = new_label(
-                    NSRect::new(
-                        NSPoint::new(ROW_INSET + ROW_PAD, top - CAPTION_LINE),
-                        NSSize::new((well_w - 2.0 * ROW_INSET).max(0.0), CAPTION_LINE),
-                    ),
-                    11.0,
-                    0.23,
-                    false,
-                );
-                let dim: *mut AnyObject = msg_send![white, colorWithAlphaComponent: 0.7_f64];
-                let _: () = msg_send![caption, setTextColor: dim];
-                let _: () = msg_send![caption, setAutoresizingMask: ROW_MASK];
-                set_text(caption as usize, &text);
-                let _: () = msg_send![caption, setWantsLayer: true];
-                let caption_layer: *mut AnyObject = msg_send![caption, layer];
-                animate_row(caption_layer, std::ptr::null_mut(), std::ptr::null_mut(), 0, start, (-10.0, 0.0));
-                let _: () = msg_send![overlay, addSubview: caption];
-            }
-            let rows_top = top - CAPTION_LINE - CAPTION_GAP;
-            if fit.hidden > 0 {
-                let more = new_label(
-                    NSRect::new(
-                        NSPoint::new(
-                            ROW_INSET + ROW_PAD,
-                            rows_top - fit.visible as f64 * pitch + gap - MORE_LINE,
-                        ),
-                        NSSize::new((well_w - 2.0 * ROW_INSET).max(0.0), MORE_LINE),
-                    ),
-                    11.0,
-                    0.23,
-                    false,
-                );
-                let dim: *mut AnyObject = msg_send![white, colorWithAlphaComponent: 0.7_f64];
-                let _: () = msg_send![more, setTextColor: dim];
-                let _: () = msg_send![more, setAutoresizingMask: ROW_MASK];
-                set_text(more as usize, &format!("+{} more", fit.hidden));
-                let _: () = msg_send![more, setWantsLayer: true];
-                let more_layer: *mut AnyObject = msg_send![more, layer];
-                animate_row(more_layer, std::ptr::null_mut(), std::ptr::null_mut(), fit.visible, start, (-10.0, 0.0));
-                let _: () = msg_send![overlay, addSubview: more];
-            }
-            for (index, row) in rows.iter().take(fit.visible).enumerate() {
-                let kind = match row.satisfied {
-                    Some(true) => Mark::Check,
-                    Some(false) => Mark::Warning,
-                    None => Mark::Unknown,
-                };
-                let label = new_label(NSRect::ZERO, 13.0, 0.0, false);
-                let alpha = match row.satisfied {
-                    Some(true) => 1.0,
-                    Some(false) => 0.8,
-                    None => 0.6,
-                };
-                let color: *mut AnyObject = msg_send![white, colorWithAlphaComponent: alpha];
-                let _: () = msg_send![label, setTextColor: color];
-                set_text(label as usize, &row.label);
-                let _: () = msg_send![label, sizeToFit];
-                let fitted: NSRect = msg_send![label, frame];
-                // The capsule fits its text, but never wider than the well
-                // (the label then truncates with an ellipsis).
-                let row_w = row_width(fitted.size.width, well_w);
-                let _: () = msg_send![
-                    label,
-                    setFrame: NSRect::new(
-                        NSPoint::new(LABEL_X, (row_h - 16.0) / 2.0),
-                        NSSize::new((row_w - LABEL_X - ROW_PAD).max(0.0), 16.0)
-                    )
-                ];
-                // The row: a translucent capsule sized to its text, in a
-                // plain view that carries the animation. Not glass: an
-                // NSGlassEffectView nested inside the card's glass renders
-                // nothing (and takes the overlay's scrim with it).
-                let frame = NSRect::new(
-                    NSPoint::new(ROW_INSET, rows_top - (index + 1) as f64 * pitch + gap),
-                    NSSize::new(row_w, row_h),
-                );
-                let view = new_view(class!(NSView), frame);
-                let view_layer = host_layer(view);
-                let _: () = msg_send![view, setAutoresizingMask: 8u64 | 32];
-                let bounds = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
-                let body = new_view(class!(NSView), bounds);
-                let body_layer = host_layer(body);
-                let (mark, glyph) = new_mark(MARK_SIZE, kind);
-                let _: () = msg_send![
-                    mark,
-                    setFrame: NSRect::new(
-                        NSPoint::new(ROW_PAD, (row_h - MARK_SIZE) / 2.0),
-                        NSSize::new(MARK_SIZE, MARK_SIZE)
-                    )
-                ];
-                let _: () = msg_send![body_layer, setCornerRadius: row_h / 2.0];
-                let _: () = msg_send![body_layer, setBackgroundColor: capsule];
-                let _: () = msg_send![body_layer, addSublayer: mark];
-                let _: () = msg_send![body, addSubview: label];
-                let _: () = msg_send![body, setAutoresizingMask: 18u64];
-                add_subview(view, body);
-                animate_row(view_layer, mark, glyph, index, start, (-10.0, 0.0));
-                add_subview(overlay, view);
-            }
-        }
-        Rows::Chips(chips) => {
-            use stack::{CHIP_H, CHIP_W};
-            // Wrapped into rows that fit the well's width, the block
-            // centered; what does not fit a narrow card's height is counted.
-            let fit = chip_grid(
-                (well_w, well_h),
-                chips.len(),
-                (CHIP_W, CHIP_H),
-                FINALE_CHIP_GAP,
-            );
-            let per_row = fit.per_row;
-            let block_h = fit.height(CHIP_H, FINALE_CHIP_GAP);
-            let block_top = (well_h + block_h) / 2.0;
-            if fit.hidden > 0 {
-                let more = new_label(
-                    NSRect::new(
-                        NSPoint::new(0.0, block_top - block_h),
-                        NSSize::new(well_w, MORE_LINE),
-                    ),
-                    11.0,
-                    0.23,
-                    false,
-                );
-                let dim: *mut AnyObject = msg_send![white, colorWithAlphaComponent: 0.7_f64];
-                let _: () = msg_send![more, setTextColor: dim];
-                let _: () = msg_send![more, setAlignment: TEXT_CENTER];
-                // Width sizable, flexible top and bottom: stays centered.
-                let _: () = msg_send![more, setAutoresizingMask: 2u64 | 8 | 32];
-                set_text(more as usize, &format!("+{} more", fit.hidden));
-                let _: () = msg_send![more, setWantsLayer: true];
-                let more_layer: *mut AnyObject = msg_send![more, layer];
-                animate_row(more_layer, std::ptr::null_mut(), std::ptr::null_mut(), fit.visible, start, (0.0, -6.0));
-                let _: () = msg_send![overlay, addSubview: more];
-            }
-            // Badges above every chip's glass (see `new_chip`).
-            let badges = new_view(
-                decor_view_class(),
-                NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(well_w, well_h)),
-            );
-            let _: () = msg_send![badges, setAutoresizingMask: 18u64];
-            for (index, chip) in chips.iter().take(fit.visible).enumerate() {
-                let (row, column) = (index / per_row, index % per_row);
-                let in_row = per_row.min(fit.visible - row * per_row) as f64;
-                let row_w = in_row * CHIP_W + (in_row - 1.0).max(0.0) * FINALE_CHIP_GAP;
-                let x = (well_w - row_w) / 2.0 + column as f64 * (CHIP_W + FINALE_CHIP_GAP);
-                let y = block_top - (row + 1) as f64 * CHIP_H - row as f64 * FINALE_CHIP_GAP;
-                // The same chip as in the trail, so one shape means finished;
-                // a plain disc, since glass in here would cover its badge.
-                let view = new_chip(overlay, badges, chip.finished, false);
-                for part in [view.view, view.badge].into_iter().filter(|&part| part != 0) {
-                    let part = part as *mut AnyObject;
-                    let _: () = msg_send![part, setFrameOrigin: NSPoint::new(x, y)];
-                    let _: () = msg_send![part, setHidden: false];
-                    // Flexible margins: stays centered.
-                    let _: () = msg_send![part, setAutoresizingMask: 1u64 | 4 | 8 | 32];
-                }
-                let _: () = msg_send![view.view as *mut AnyObject, setToolTip: ns_string(&chip.title)];
-                let app: *mut AnyObject = match chip.tag.0 {
-                    Some(pid) => msg_send![
-                        class!(NSRunningApplication),
-                        runningApplicationWithProcessIdentifier: pid
-                    ],
-                    None => std::ptr::null_mut(),
-                };
-                let _: () = msg_send![view.icon as *mut AnyObject, setImage: app_icon(app)];
-                let view_layer: *mut AnyObject = msg_send![view.view as *mut AnyObject, layer];
-                animate_row(view_layer, std::ptr::null_mut(), std::ptr::null_mut(), index, start, (0.0, -6.0));
-                if view.badge != 0 {
-                    // The badge comes in with its chip, then its check pops.
-                    let badge_layer: *mut AnyObject = msg_send![view.badge as *mut AnyObject, layer];
-                    animate_row(
-                        badge_layer,
-                        view.mark as *mut AnyObject,
-                        view.glyph as *mut AnyObject,
-                        index,
-                        start,
-                        (0.0, -6.0),
-                    );
-                }
-            }
-            add_subview(overlay, badges);
-        }
+    // The claims, or with none the touched windows, as rows (see `finish`).
+    let rows = finale.checklist();
+    // Shrunk, or cut with a "+n more" line, to fit the well.
+    let fit = checklist_fit(well_h, rows.len());
+    let (row_h, gap) = (fit.row_height, fit.gap);
+    let pitch = row_h + gap;
+    let top = (well_h + fit.height()) / 2.0;
+    // Width sizable, flexible top and bottom: stays centered.
+    const ROW_MASK: u64 = 2 | 8 | 32;
+    {
+        let text = finale.caption();
+        let caption = new_label(
+            NSRect::new(
+                NSPoint::new(ROW_INSET + ROW_PAD, top - CAPTION_LINE),
+                NSSize::new((well_w - 2.0 * ROW_INSET).max(0.0), CAPTION_LINE),
+            ),
+            11.0,
+            0.23,
+            false,
+        );
+        let dim: *mut AnyObject = msg_send![white, colorWithAlphaComponent: 0.7_f64];
+        let _: () = msg_send![caption, setTextColor: dim];
+        let _: () = msg_send![caption, setAutoresizingMask: ROW_MASK];
+        set_text(caption as usize, &text);
+        let _: () = msg_send![caption, setWantsLayer: true];
+        let caption_layer: *mut AnyObject = msg_send![caption, layer];
+        animate_row(
+            caption_layer,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            0,
+            start,
+            (-10.0, 0.0),
+        );
+        let _: () = msg_send![overlay, addSubview: caption];
+    }
+    let rows_top = top - CAPTION_LINE - CAPTION_GAP;
+    if fit.hidden > 0 {
+        let more = new_label(
+            NSRect::new(
+                NSPoint::new(
+                    ROW_INSET + ROW_PAD,
+                    rows_top - fit.visible as f64 * pitch + gap - MORE_LINE,
+                ),
+                NSSize::new((well_w - 2.0 * ROW_INSET).max(0.0), MORE_LINE),
+            ),
+            11.0,
+            0.23,
+            false,
+        );
+        let dim: *mut AnyObject = msg_send![white, colorWithAlphaComponent: 0.7_f64];
+        let _: () = msg_send![more, setTextColor: dim];
+        let _: () = msg_send![more, setAutoresizingMask: ROW_MASK];
+        set_text(more as usize, &format!("+{} more", fit.hidden));
+        let _: () = msg_send![more, setWantsLayer: true];
+        let more_layer: *mut AnyObject = msg_send![more, layer];
+        animate_row(
+            more_layer,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            fit.visible,
+            start,
+            (-10.0, 0.0),
+        );
+        let _: () = msg_send![overlay, addSubview: more];
+    }
+    for (index, (text, satisfied)) in rows.iter().take(fit.visible).enumerate() {
+        let kind = match satisfied {
+            Some(true) => Mark::Check,
+            Some(false) => Mark::Warning,
+            None => Mark::Unknown,
+        };
+        let label = new_label(NSRect::ZERO, 13.0, 0.0, false);
+        let alpha = match satisfied {
+            Some(true) => 1.0,
+            Some(false) => 0.8,
+            None => 0.6,
+        };
+        let color: *mut AnyObject = msg_send![white, colorWithAlphaComponent: alpha];
+        let _: () = msg_send![label, setTextColor: color];
+        set_text(label as usize, text);
+        let _: () = msg_send![label, sizeToFit];
+        let fitted: NSRect = msg_send![label, frame];
+        // The capsule fits its text, but never wider than the well
+        // (the label then truncates with an ellipsis).
+        let row_w = row_width(fitted.size.width, well_w);
+        let _: () = msg_send![
+            label,
+            setFrame: NSRect::new(
+                NSPoint::new(LABEL_X, (row_h - 16.0) / 2.0),
+                NSSize::new((row_w - LABEL_X - ROW_PAD).max(0.0), 16.0)
+            )
+        ];
+        // The row: a translucent capsule sized to its text, in a
+        // plain view that carries the animation. Not glass: an
+        // NSGlassEffectView nested inside the card's glass renders
+        // nothing (and takes the overlay's scrim with it).
+        let frame = NSRect::new(
+            NSPoint::new(ROW_INSET, rows_top - (index + 1) as f64 * pitch + gap),
+            NSSize::new(row_w, row_h),
+        );
+        let view = new_view(class!(NSView), frame);
+        let view_layer = host_layer(view);
+        let _: () = msg_send![view, setAutoresizingMask: 8u64 | 32];
+        let bounds = NSRect::new(NSPoint::new(0.0, 0.0), frame.size);
+        let body = new_view(class!(NSView), bounds);
+        let body_layer = host_layer(body);
+        let (mark, glyph) = new_mark(MARK_SIZE, kind);
+        let _: () = msg_send![
+            mark,
+            setFrame: NSRect::new(
+                NSPoint::new(ROW_PAD, (row_h - MARK_SIZE) / 2.0),
+                NSSize::new(MARK_SIZE, MARK_SIZE)
+            )
+        ];
+        let _: () = msg_send![body_layer, setCornerRadius: row_h / 2.0];
+        let _: () = msg_send![body_layer, setBackgroundColor: capsule];
+        let _: () = msg_send![body_layer, addSublayer: mark];
+        let _: () = msg_send![body, addSubview: label];
+        let _: () = msg_send![body, setAutoresizingMask: 18u64];
+        add_subview(view, body);
+        animate_row(view_layer, mark, glyph, index, start, (-10.0, 0.0));
+        add_subview(overlay, view);
     }
     let _: () = msg_send![panel.front_view as *mut AnyObject, addSubview: overlay];
     let _: () = msg_send![overlay, release];
@@ -3246,7 +3502,7 @@ unsafe fn new_mark(size: f64, kind: Mark) -> (*mut AnyObject, *mut AnyObject) {
 unsafe fn new_check_badge(size: f64) -> (*mut AnyObject, *mut AnyObject) {
     let (mark, glyph) = new_mark(size, Mark::Check);
     let white: *mut CGColor = msg_send![white_color(), CGColor];
-    let _: () = msg_send![mark, setBorderWidth: stack::CHIP_BADGE_RING];
+    let _: () = msg_send![mark, setBorderWidth: stack::BADGE_RING];
     let _: () = msg_send![mark, setBorderColor: white];
     (mark, glyph)
 }
@@ -3343,27 +3599,103 @@ fn moved_from(here: (f64, f64), placed: (f64, f64)) -> bool {
 }
 
 /// Called as a hidden panel is about to be shown: take the lowest free
-/// cascade slot and move there, unless the user dragged the panel.
+/// cascade slot whose deck is clear of the other visible panels' `decks`
+/// and move there, unless the user dragged the panel; a dragged panel that
+/// would show over another panel slides clear of it (see `clear_spot`).
 unsafe fn place_on_show(
     panel: &mut Panel,
     others: Vec<usize>,
+    decks: Vec<Area>,
     image_size: (f64, f64),
     anchor: Option<(i32, i32)>,
 ) {
     let window = panel.window as *mut AnyObject;
     let frame: NSRect = msg_send![window, frame];
     panel.dragged |= moved_from((frame.origin.x, frame.origin.y), panel.placed);
-    panel.slot = slot_on_show(others, panel.dragged);
-    if let Some(origin) = panel
-        .slot
-        .and_then(|slot| slot_origin(hold(panel_size(image_size)), anchor, slot))
-    {
+    let held = hold(panel_size(image_size));
+    panel.slot = slot_on_show(others.iter().copied(), panel.dragged).and_then(|_| {
+        clear_slot(&others, &decks, |slot| {
+            slot_origin(held, anchor, slot).map(|origin| {
+                deck_of(Area {
+                    x: origin.0,
+                    y: origin.1,
+                    w: frame.size.width,
+                    h: frame.size.height,
+                })
+            })
+        })
+    });
+    if let Some(origin) = panel.slot.and_then(|slot| slot_origin(held, anchor, slot)) {
         let _: () = msg_send![window, setFrameOrigin: NSPoint::new(origin.0, origin.1)];
         panel.placed = origin;
+    } else if panel.slot.is_none() {
+        slide_clear(panel, &decks, false);
+        if !panel.dragged {
+            // Placed there for want of a clear slot, not by the user: the
+            // next show looks for a slot again.
+            let frame: NSRect = msg_send![window, frame];
+            panel.placed = (frame.origin.x, frame.origin.y);
+        }
     }
     // A cascade slot, or where the user left it (a remembered panel).
     sync_fan(panel);
 }
+
+/// A panel window's deck (AppKit screen rect): the window less its insets,
+/// what never overlaps another panel's.
+fn deck_of(window: Area) -> Area {
+    Area {
+        x: window.x + stack::INSET_LEFT,
+        y: window.y + stack::LAG_ROOM,
+        w: window.w - stack::INSET_LEFT - stack::LAG_ROOM,
+        h: window.h - 2.0 * stack::LAG_ROOM,
+    }
+}
+
+/// The decks of every shown panel but `id` (live or ending).
+unsafe fn other_decks(state: &State, id: i64) -> Vec<Area> {
+    state
+        .panels
+        .values()
+        .chain(state.ending.iter())
+        .filter(|panel| panel.id != id && panel.shown)
+        .map(|panel| {
+            let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
+            deck_of(area_of(frame))
+        })
+        .collect()
+}
+
+/// Move a panel whose deck overlaps one of `decks` to the nearest clear
+/// spot on its screen (`clear_spot`), gliding there when `animate`.
+unsafe fn slide_clear(panel: &mut Panel, decks: &[Area], animate: bool) {
+    let window = panel.window as *mut AnyObject;
+    let frame: NSRect = msg_send![window, frame];
+    let deck = deck_of(area_of(frame));
+    let front = to_window(settle_frame(panel, Slot::Front));
+    let Some(visible) = card_visible_frame(window, front) else {
+        return;
+    };
+    let Some((x, y)) = clear_spot(deck, decks, visible) else {
+        return;
+    };
+    let origin = (x - stack::INSET_LEFT, y - stack::LAG_ROOM);
+    let to = NSRect::new(NSPoint::new(origin.0, origin.1), frame.size);
+    if animate {
+        let _: () = msg_send![class!(NSAnimationContext), beginGrouping];
+        let context: *mut AnyObject = msg_send![class!(NSAnimationContext), currentContext];
+        let _: () = msg_send![context, setDuration: PANEL_SLIDE.as_secs_f64()];
+        let animator: *mut AnyObject = msg_send![window, animator];
+        let _: () = msg_send![animator, setFrame: to display: true];
+        let _: () = msg_send![class!(NSAnimationContext), endGrouping];
+    } else {
+        let _: () = msg_send![window, setFrame: to display: true];
+    }
+    tracing::info!(target: "pip", session = %panel.key, dx = x - deck.x, dy = y - deck.y, "PiP panel moved clear of another panel");
+}
+
+/// How long a dropped panel takes to slide clear of another.
+const PANEL_SLIDE: Duration = Duration::from_millis(250);
 
 /// What happened to a live frame handed to the panel.
 enum LiveShown {
@@ -3514,7 +3846,7 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
         // The `end_session`, connection closing and idle-TTL eviction rows
         // of the table in `finish`. A finished session is done whatever its
         // finale is doing: its windows count as finished, so back cards
-        // collapse into chips. Then its finale plays (or keeps playing) and
+        // get their check badges. Then its finale plays (or keeps playing) and
         // the panel closes when it is over. An expired session, and one
         // whose connection closed after its work went stale, only closes.
         tracing::info!(target: "pip", session = %key, ?end, "PiP session ended");
@@ -3543,7 +3875,8 @@ unsafe extern "C" fn end_session_cb(ctx: *mut c_void) {
                     .chain(state.ending.iter())
                     .filter_map(|panel| panel.slot)
                     .collect();
-                place_on_show(&mut panel, others, state.image_size, state.anchor);
+                let decks = other_decks(state, panel.id);
+                place_on_show(&mut panel, others, decks, state.image_size, state.anchor);
                 show(&mut panel);
             }
         }
@@ -3625,7 +3958,29 @@ unsafe fn apply_turn(state: &mut State, key: &str, turn: PipTurn) {
             play_finale(panel, key, finale, *generation);
         }
     }
+    // The turn is over: back cards past the age limit go now, unless its
+    // finished state is up (then when it ends).
+    prune_aged(state, key);
     refresh(state, key);
+}
+
+/// Drop the back cards the stack keeps no longer by age (rows 12 and 13 of
+/// the plan's table): once a turn is over the age limit applies again, at
+/// its quiet end or when its finished state ends.
+unsafe fn prune_aged(state: &mut State, key: &str) {
+    let worker = state.worker.clone();
+    let pressed = state.gesture.as_ref().map(|gesture| gesture.id);
+    let turn_open = state.turn_open.contains(key);
+    let Some(panel) = state.panels.get_mut(key) else {
+        return;
+    };
+    let now = Instant::now();
+    let keep = keep(panel, pressed, now, turn_open);
+    if restack(panel, key, &worker, |panel| {
+        panel.cards.prune(now, &keep, |_| false);
+    }) {
+        announce_stack(panel, key);
+    }
 }
 
 /// Fade the panel out over `fade`, then close it.
@@ -4373,22 +4728,13 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         .collect();
     backs.reverse();
 
-    // The chips and the front card share one glass container: a resting
-    // chip fuses into the card, a lagging one pulls free.
+    // The front card's glass container.
     let deck = glass_container(stack_view, bounds);
-    // Their badges sit above the container: glass there draws over its
-    // non-glass siblings, so a badge in the deck would sit under the rim.
-    let badges = new_view(decor_view_class(), bounds);
-    let _: () = msg_send![badges, setAutoresizingMask: 18u64];
-    add_subview(stack_view, badges);
-    let chips: Vec<ChipView> = (1..MAX_CARDS)
-        .map(|_| new_chip(deck, badges, true, true))
-        .collect();
 
     // Front card: the picture itself, with continuous rounded corners and
     // the window's shadow, shaped like its window (see `set_shape`). Its
     // chrome is the hover bar below.
-    let front_frame = slot_frame(card, Slot::Front, 0);
+    let front_frame = stack::rest_frame(card, 0);
     let front_view = new_view(card_view_class(), ns_rect(front_frame));
     let card_layer = host_layer(front_view);
     let _: () = msg_send![card_layer, setCornerRadius: CORNER_RADIUS];
@@ -4460,20 +4806,54 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
     let _: () = msg_send![placeholder, setHidden: true];
     add_subview(front_view, placeholder);
 
-    // The front window's check badge (see `sync_front_badge`): the chips'
-    // badge, inside the card's bottom-right corner, above the picture.
+    // The away overlay (see `sync_front_away`): a dim over the picture with
+    // the reason's badge in the middle.
+    let front_away = new_view(
+        decor_view_class(),
+        NSRect::new(
+            NSPoint::new(0.0, 0.0),
+            NSSize::new(front_frame.w, front_frame.h),
+        ),
+    );
+    let away_layer = host_layer(front_away);
+    let dim: *mut AnyObject = msg_send![
+        class!(NSColor),
+        colorWithSRGBRed: 0.0_f64
+        green: 0.0_f64
+        blue: 0.0_f64
+        alpha: AWAY_DIM
+    ];
+    let dim: *mut CGColor = msg_send![dim, CGColor];
+    let _: () = msg_send![away_layer, setBackgroundColor: dim];
+    let _: () = msg_send![front_away, setAutoresizingMask: 18u64];
+    let front_away_icon = new_icon_view(NSRect::new(
+        NSPoint::new(
+            (front_frame.w - AWAY_ICON) / 2.0,
+            (front_frame.h - AWAY_ICON) / 2.0,
+        ),
+        NSSize::new(AWAY_ICON, AWAY_ICON),
+    ));
+    let _: () = msg_send![front_away_icon, setContentTintColor: white_color()];
+    // Flexible margins: stays centered.
+    let _: () = msg_send![front_away_icon, setAutoresizingMask: 1u64 | 4 | 8 | 32];
+    let _: () = msg_send![front_away, addSubview: front_away_icon];
+    let _: () = msg_send![front_away, setHidden: true];
+    add_subview(front_view, front_away);
+
+    // The front window's check badge (see `sync_front_badge`), inside the
+    // card's bottom-right corner, above the picture.
     let front_badge = new_view(
         decor_view_class(),
         NSRect::new(
             NSPoint::new(
-                front_frame.w - stack::CHIP_BADGE - FRONT_BADGE_INSET,
+                front_frame.w - stack::BADGE - FRONT_BADGE_INSET,
                 FRONT_BADGE_INSET,
             ),
-            NSSize::new(stack::CHIP_BADGE, stack::CHIP_BADGE),
+            NSSize::new(stack::BADGE, stack::BADGE),
         ),
     );
     let front_badge_layer = host_layer(front_badge);
-    let (front_badge_mark, front_badge_glyph) = new_check_badge(stack::CHIP_BADGE);
+    let (front_badge_mark, front_badge_glyph) = new_check_badge(stack::BADGE);
     let _: () = msg_send![front_badge_layer, addSublayer: front_badge_mark];
     // Flexible left and top margins: it stays in that corner.
     let _: () = msg_send![front_badge, setAutoresizingMask: 1u64 | 32];
@@ -4562,10 +4942,12 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         front_badge_mark: front_badge_mark as usize,
         front_badge_glyph: front_badge_glyph as usize,
         front_badge_on: false,
+        front_away: front_away as usize,
+        front_away_icon: front_away_icon as usize,
+        front_away_on: None,
         focus: focus as usize,
         close: close as usize,
         backs: backs.try_into().ok()?,
-        chips: chips.try_into().ok()?,
         plates,
         cards: CardStack::new(),
         layout: vec![Slot::Front],
@@ -4579,6 +4961,7 @@ unsafe fn create_panel(state: &mut State, key: &str, label: Option<&str>) -> Opt
         lifecycle: Lifecycle::default(),
         finale_view: None,
         displayed: None,
+        finale_deadline: Instant::now(),
         finale_start: 0.0,
         after_finale: false,
         turn_done: false,
@@ -4670,7 +5053,7 @@ unsafe fn new_hit_plate(parent: *mut AnyObject) -> usize {
 /// Hidden until the stack has a card at its depth. Its views follow the
 /// card's frame through autoresizing.
 unsafe fn new_back_card(parent: *mut AnyObject, card: (f64, f64), depth: usize) -> BackView {
-    let frame = to_window(slot_frame(card, Slot::Card(depth), 0));
+    let frame = to_window(stack::rest_frame(card, depth));
     let (w, h) = (frame.w, frame.h);
     let view = new_view(class!(NSView), ns_rect(frame));
     let _: () = msg_send![view, setWantsLayer: true];
@@ -4696,6 +5079,19 @@ unsafe fn new_back_card(parent: *mut AnyObject, card: (f64, f64), depth: usize) 
     let _: () = msg_send![image_layer, setMasksToBounds: true];
     add_subview(body, image_view);
 
+    // The strip's end: the away badge, then the check badge (see
+    // `render_backs`), both hidden until needed.
+    let away = new_icon_view(NSRect::ZERO);
+    let _: () = msg_send![away, setContentTintColor: white_color()];
+    let _: () = msg_send![away, setHidden: true];
+    let _: () = msg_send![body, addSubview: away];
+    let badge = new_view(decor_view_class(), NSRect::ZERO);
+    let badge_layer = host_layer(badge);
+    let (badge_mark, badge_glyph) = new_check_badge(BACK_BADGE);
+    let _: () = msg_send![badge_layer, addSublayer: badge_mark];
+    let _: () = msg_send![badge, setHidden: true];
+    add_subview(body, badge);
+
     let _: () = msg_send![view, setHidden: true];
     add_subview(parent, view);
     let back = BackView {
@@ -4703,6 +5099,10 @@ unsafe fn new_back_card(parent: *mut AnyObject, card: (f64, f64), depth: usize) 
         image_view: image_view as usize,
         icon: icon as usize,
         title: title as usize,
+        badge: badge as usize,
+        badge_mark: badge_mark as usize,
+        badge_glyph: badge_glyph as usize,
+        away: away as usize,
     };
     place_strip(&back, false);
     back
@@ -4725,8 +5125,40 @@ unsafe fn place_strip(back: &BackView, below: bool) {
         let _: () = msg_send![view, setAutoresizingMask: mask];
     };
     place(back.icon, 10.0, strip_y + 1.0, 12.0, 12.0, 4 | pin);
-    place(back.title, 26.0, strip_y - 1.0, w - 36.0, step, 2 | pin);
-    place(back.image_view, PAD, image_y, w - 2.0 * PAD, h - step - 2.0 - PAD, 18);
+    place(
+        back.title,
+        26.0,
+        strip_y - 1.0,
+        w - 36.0 - 2.0 * (BACK_BADGE + 4.0),
+        step,
+        2 | pin,
+    );
+    place(
+        back.image_view,
+        PAD,
+        image_y,
+        w - 2.0 * PAD,
+        h - step - 2.0 - PAD,
+        18,
+    );
+    // Pinned to the strip's right end (1: flexible left margin).
+    let badge_x = w - 10.0 - BACK_BADGE;
+    place(
+        back.badge,
+        badge_x,
+        strip_y + 1.0,
+        BACK_BADGE,
+        BACK_BADGE,
+        1 | pin,
+    );
+    place(
+        back.away,
+        badge_x - 4.0 - BACK_BADGE,
+        strip_y + 1.0,
+        BACK_BADGE,
+        BACK_BADGE,
+        1 | pin,
+    );
 }
 
 /// Liquid Glass (`NSGlassEffectView`, macOS 26) hosting `body`, or an
@@ -4777,98 +5209,6 @@ unsafe fn glass_container(parent: *mut AnyObject, bounds: NSRect) -> *mut AnyObj
     let _: () = msg_send![deck, release];
     add_subview(parent, container);
     deck
-}
-
-/// A chip inside `parent`: a circle holding the app icon, with a green
-/// check badge (white ring) on its lower right when `finished`. The badge
-/// is its own view in `badges`, which must draw above the circle; it has
-/// the chip's frame, and whoever places, hides or fades the chip does the
-/// same to it. The circle is `glass` in the trail, whose `badges` sit above
-/// the glass container (glass draws over every non-glass view in its
-/// container, so a badge inside it would sit under the circle). Where
-/// `badges` cannot be outside that container (the finale's row, inside the
-/// front card), the circle is a plain translucent disc instead. Its parts
-/// stay centered (flexible margins) while the chip's frame springs from
-/// where its window was drawn. Hidden until used; the window title is its
-/// tooltip.
-unsafe fn new_chip(
-    parent: *mut AnyObject,
-    badges: *mut AnyObject,
-    finished: bool,
-    glass: bool,
-) -> ChipView {
-    use stack::{CHIP, CHIP_BADGE, CHIP_H, CHIP_ICON, CHIP_W};
-    // NSViewMinXMargin 1 | MaxXMargin 4 | MinYMargin 8 | MaxYMargin 32.
-    const CENTERED: u64 = 1 | 4 | 8 | 32;
-    let view = new_view(
-        class!(NSView),
-        NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP_W, CHIP_H)),
-    );
-    host_layer(view);
-    // The circle sits top-left in the frame; the badge overhangs bottom-right.
-    let circle = NSRect::new(
-        NSPoint::new(0.0, CHIP_H - CHIP),
-        NSSize::new(CHIP, CHIP),
-    );
-    let bounds = NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP, CHIP));
-    let body = new_view(class!(NSView), bounds);
-    if !glass {
-        let layer = host_layer(body);
-        let fill: *mut AnyObject = msg_send![white_color(), colorWithAlphaComponent: DISC_FILL];
-        let fill: *mut CGColor = msg_send![fill, CGColor];
-        let _: () = msg_send![layer, setBackgroundColor: fill];
-        let _: () = msg_send![layer, setCornerRadius: CHIP / 2.0];
-    }
-    let inset = (CHIP - CHIP_ICON) / 2.0;
-    let icon = new_icon_view(NSRect::new(
-        NSPoint::new(inset, inset),
-        NSSize::new(CHIP_ICON, CHIP_ICON),
-    ));
-    let _: () = msg_send![body, addSubview: icon];
-    let disc = if glass {
-        glass_background(bounds, body, CHIP / 2.0)
-    } else {
-        body
-    };
-    let _: () = msg_send![disc, setFrame: circle];
-    let _: () = msg_send![disc, setAutoresizingMask: CENTERED];
-    add_subview(view, disc);
-
-    let (mut mark, mut glyph) = (std::ptr::null_mut(), std::ptr::null_mut());
-    let mut host: *mut AnyObject = std::ptr::null_mut();
-    if finished {
-        // The badge's own view, in `badges` (above the glass, so the circle
-        // never cuts it), with the chip's frame so it moves with the chip.
-        host = new_view(
-            decor_view_class(),
-            NSRect::new(NSPoint::new(0.0, 0.0), NSSize::new(CHIP_W, CHIP_H)),
-        );
-        host_layer(host);
-        let badge = new_view(
-            decor_view_class(),
-            NSRect::new(
-                NSPoint::new(circle.origin.x + CHIP - CHIP_BADGE + 3.0, circle.origin.y - 3.0),
-                NSSize::new(CHIP_BADGE, CHIP_BADGE),
-            ),
-        );
-        let badge_layer = host_layer(badge);
-        (mark, glyph) = new_check_badge(CHIP_BADGE);
-        let _: () = msg_send![badge_layer, addSublayer: mark];
-        let _: () = msg_send![badge, setAutoresizingMask: CENTERED];
-        add_subview(host, badge);
-        let _: () = msg_send![host, setHidden: true];
-        add_subview(badges, host);
-    }
-
-    let _: () = msg_send![view, setHidden: true];
-    add_subview(parent, view);
-    ChipView {
-        view: view as usize,
-        badge: host as usize,
-        icon: icon as usize,
-        mark: mark as usize,
-        glyph: glyph as usize,
-    }
 }
 
 /// Lay the front card's views out for a card of `size` (nothing to do when
@@ -4983,7 +5323,7 @@ unsafe fn pointer_over(panel: &Panel) -> bool {
     let (mx, my) = mouse_location();
     let frame: NSRect = msg_send![panel.window as *mut AnyObject, frame];
     let point = (mx - frame.origin.x, my - frame.origin.y);
-    let front = to_window(view_frame(panel, Slot::Front, back_cards(&panel.layout)));
+    let front = to_window(view_frame(panel, Slot::Front));
     let inside = |area: Area| {
         point.0 >= area.x && point.0 <= area.x + area.w && point.1 >= area.y && point.1 <= area.y + area.h
     };
@@ -5002,7 +5342,7 @@ unsafe fn pointer_in(panel: &Panel) -> ((f64, f64), Option<Area>) {
 }
 
 /// Whether the pointer is on the panel right now (see `hands`): over one
-/// of its visible surfaces (the front card, the bar, a back card, a chip;
+/// of its visible surfaces (the front card, the bar, a back card;
 /// not the transparent margin), with this panel's window the topmost one at
 /// that point (not under the overview sheet, a menu or another panel).
 unsafe fn pointer_on(panel: &Panel) -> bool {
@@ -5092,18 +5432,17 @@ unsafe fn white_color() -> *mut AnyObject {
 }
 
 /// Where the view for `slot` settles, in panel coordinates: its resting
-/// frame (with `back_cards` cards in the stack) plus its restack offset.
-/// Excludes the trail lag, so a restack starts from where the item would
-/// be without it.
-fn settle_frame(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
-    panel.motion[slot.view()].frame(resting(panel, slot, back_cards))
+/// frame plus its restack offset. Excludes the trail lag, so a restack
+/// starts from where the item would be without it.
+fn settle_frame(panel: &Panel, slot: Slot) -> Area {
+    panel.motion[slot.view()].frame(resting(panel, slot))
 }
 
 /// Where the view for `slot` is drawn now: its settle frame moved by the
 /// trail's lag.
-fn view_frame(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
+fn view_frame(panel: &Panel, slot: Slot) -> Area {
     let (dx, dy) = panel.trail_motion.offset(slot);
-    let settle = settle_frame(panel, slot, back_cards);
+    let settle = settle_frame(panel, slot);
     Area {
         x: settle.x + dx,
         y: settle.y + dy,
@@ -5114,50 +5453,50 @@ fn view_frame(panel: &Panel, slot: Slot, back_cards: usize) -> Area {
 /// Where each item of the stack is drawn now, front first, in panel
 /// coordinates.
 fn item_frames(panel: &Panel) -> Vec<Area> {
-    let cards = back_cards(&panel.layout);
     panel
         .layout
         .iter()
-        .map(|slot| view_frame(panel, *slot, cards))
+        .map(|slot| view_frame(panel, *slot))
         .collect()
 }
 
 /// Where each item of the stack settles, front first, in panel coordinates.
 fn settle_frames(panel: &Panel) -> Vec<Area> {
-    let cards = back_cards(&panel.layout);
     panel
         .layout
         .iter()
-        .map(|slot| settle_frame(panel, *slot, cards))
+        .map(|slot| settle_frame(panel, *slot))
         .collect()
 }
 
-/// The views that draw `slot`: its view, and a chip's badge (which lives
-/// above the glass container; see `new_chip`).
+/// The views that draw `slot`.
 fn slot_views(panel: &Panel, slot: Slot) -> Vec<usize> {
     match slot {
         Slot::Front => vec![panel.front_view],
         Slot::Card(depth) => vec![panel.backs[depth - 1].view],
-        Slot::Chip(row) => {
-            let chip = &panel.chips[row];
-            [chip.view, chip.badge].into_iter().filter(|&view| view != 0).collect()
-        }
     }
 }
 
 /// Put every item view (and its hit plate) where it is drawn now.
 unsafe fn apply_card_frames(panel: &mut Panel) {
-    // The lag the window has room for with this fan and card.
-    panel.trail_motion.fan(panel.fan, panel.front.1);
-    let cards = back_cards(&panel.layout);
+    // The lag the window has room for with these back cards.
+    let backs: Vec<Area> = panel
+        .layout
+        .iter()
+        .filter(|slot| **slot != Slot::Front)
+        .map(|slot| resting(panel, *slot))
+        .collect();
+    panel
+        .trail_motion
+        .room(deck_overhang(hold(panel.card), &backs));
     for slot in panel.layout.clone() {
-        let placed = to_window(view_frame(panel, slot, cards));
+        let placed = to_window(view_frame(panel, slot));
         for view in slot_views(panel, slot) {
             set_frame(view, placed);
         }
         set_frame(panel.plates[slot.view()], placed);
     }
-    let front = view_frame(panel, Slot::Front, cards);
+    let front = view_frame(panel, Slot::Front);
     layout_front(panel, (front.w, front.h));
     place_bar(panel, to_window(front));
     // The window shadow follows the items' outline once they are at rest.
@@ -5166,9 +5505,11 @@ unsafe fn apply_card_frames(panel: &mut Panel) {
     }
 }
 
-/// Show each back item's window in the view for its slot (a card: title,
-/// app icon, own still; a chip: app icon and title), and hide the views
-/// (and plates) no item uses.
+/// Show each back card's window in the view for its depth (title, app
+/// icon, own still, its check badge while its window is finished, popping
+/// once per finish, and its away badge with a dimmed still while its window
+/// is minimized, hidden or on another Space), and hide the views (and
+/// plates) no item uses.
 unsafe fn render_backs(panel: &mut Panel) {
     let app_of = |pid: Option<i32>| -> *mut AnyObject {
         match pid {
@@ -5181,29 +5522,46 @@ unsafe fn render_backs(panel: &mut Panel) {
     };
     let mut used = [false; VIEWS];
     used[0] = true;
-    for (card, slot) in panel.cards.cards().iter().zip(&panel.layout) {
+    let layout = panel.layout.clone();
+    for (index, slot) in layout.iter().enumerate() {
+        let Slot::Card(depth) = *slot else {
+            continue;
+        };
         used[slot.view()] = true;
-        match *slot {
-            Slot::Front => {}
-            Slot::Card(depth) => {
-                let back = &panel.backs[depth - 1];
-                set_text(back.title, &card.data.title);
-                let _: () = msg_send![back.icon as *mut AnyObject, setImage: app_of(card.data.pid)];
-                let image = own_pixels(card.key, card.data.still.as_ref())
-                    .map_or(std::ptr::null_mut(), |image| image.0 as *mut AnyObject);
-                let _: () = msg_send![back.image_view as *mut AnyObject, setImage: image];
-            }
-            Slot::Chip(row) => {
-                let chip = &panel.chips[row];
-                let _: () = msg_send![chip.view as *mut AnyObject, setToolTip: ns_string(&card.data.title)];
-                let _: () = msg_send![chip.icon as *mut AnyObject, setImage: app_of(card.data.pid)];
-            }
+        let finished = panel.cards.cards()[index]
+            .key
+            .1
+            .is_some_and(|window| panel.verdicts.finished(window));
+        let back = &panel.backs[depth - 1];
+        let card = &mut panel.cards.cards_mut()[index];
+        set_text(back.title, &card.data.title);
+        let _: () = msg_send![back.icon as *mut AnyObject, setImage: app_of(card.data.pid)];
+        let image = own_pixels(card.key, card.data.still.as_ref())
+            .map_or(std::ptr::null_mut(), |image| image.0 as *mut AnyObject);
+        let _: () = msg_send![back.image_view as *mut AnyObject, setImage: image];
+        let badge = back.badge as *mut AnyObject;
+        let _: () = msg_send![badge, setHidden: !finished];
+        if finished && !card.data.completed {
+            let layer: *mut AnyObject = msg_send![badge, layer];
+            animate_row(
+                layer,
+                back.badge_mark as *mut AnyObject,
+                back.badge_glyph as *mut AnyObject,
+                0,
+                CACurrentMediaTime(),
+                (0.0, 0.0),
+            );
         }
+        card.data.completed = finished;
+        let away = card.data.away;
+        let _: () = msg_send![back.away as *mut AnyObject, setImage: away.map_or(std::ptr::null_mut(), |away| away_image(away))];
+        let _: () = msg_send![back.away as *mut AnyObject, setHidden: away.is_none()];
+        let dim = if away.is_some() { 1.0 - AWAY_DIM } else { 1.0 };
+        let _: () = msg_send![back.image_view as *mut AnyObject, setAlphaValue: dim];
     }
     for depth in 1..MAX_CARDS {
         let back = &panel.backs[depth - 1];
-        let slot = Slot::Card(depth);
-        if !used[slot.view()] {
+        if !used[Slot::Card(depth).view()] {
             let _: () = msg_send![
                 back.image_view as *mut AnyObject,
                 setImage: std::ptr::null_mut::<AnyObject>()
@@ -5211,19 +5569,36 @@ unsafe fn render_backs(panel: &mut Panel) {
         }
     }
     for index in 1..VIEWS {
-        let (view, badge) = match index {
-            depth if depth < MAX_CARDS => (panel.backs[depth - 1].view, 0),
-            row => (panel.chips[row - MAX_CARDS].view, panel.chips[row - MAX_CARDS].badge),
-        };
+        let view = panel.backs[index - 1].view;
         let _: () = msg_send![view as *mut AnyObject, setHidden: !used[index]];
-        if badge != 0 {
-            let _: () = msg_send![badge as *mut AnyObject, setHidden: !used[index]];
-        }
         let _: () = msg_send![panel.plates[index] as *mut AnyObject, setHidden: !used[index]];
         if !used[index] {
             panel.motion[index] = Motion::default();
         }
     }
+    sync_front_away(panel);
+}
+
+/// The badge for an away window: an SF Symbol per reason (autoreleased, or
+/// null where the symbol does not exist).
+unsafe fn away_image(away: visibility::Away) -> *mut AnyObject {
+    symbol_image(match away {
+        visibility::Away::Minimized => "dock.arrow.down.rectangle",
+        visibility::Away::Hidden => "eye.slash",
+        visibility::Away::OtherSpace => "rectangle.on.rectangle",
+    })
+}
+
+/// Dim the front card and show its away badge while its window is away
+/// (see `visibility::away`); its last picture stays under the dim.
+unsafe fn sync_front_away(panel: &mut Panel) {
+    let away = panel.cards.cards().first().and_then(|card| card.data.away);
+    if away == panel.front_away_on {
+        return;
+    }
+    panel.front_away_on = away;
+    let _: () = msg_send![panel.front_away_icon as *mut AnyObject, setImage: away.map_or(std::ptr::null_mut(), |away| away_image(away))];
+    let _: () = msg_send![panel.front_away as *mut AnyObject, setHidden: away.is_none()];
 }
 
 /// Log the trail's lag once it has settled after a drag.
@@ -5499,6 +5874,7 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
     let Some(gesture) = state.gesture.take() else {
         return;
     };
+    let decks = other_decks(state, gesture.id);
     let Some(panel) = panel_by_id(state, gesture.id) else {
         return;
     };
@@ -5513,6 +5889,8 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
         // a press would reach the Dock, and the card could never be grabbed
         // again.
         keep_card_on_screen(panel);
+        // Dropped over another agent's panel: it slides clear (row 16).
+        slide_clear(panel, &decks, true);
     }
     // Where the card came to rest decides which way its stack fans (also
     // after a click: a shape change during the press waited for this).
@@ -5551,8 +5929,7 @@ unsafe fn end_gesture(state: &mut State, click: bool) {
 unsafe fn keep_card_on_screen(panel: &mut Panel) {
     let window = panel.window as *mut AnyObject;
     let frame: NSRect = msg_send![window, frame];
-    let cards = back_cards(&panel.layout);
-    let front = to_window(settle_frame(panel, Slot::Front, cards));
+    let front = to_window(settle_frame(panel, Slot::Front));
     let Some(visible) = card_visible_frame(window, front) else {
         return;
     };
@@ -5571,7 +5948,7 @@ unsafe fn keep_card_on_screen(panel: &mut Panel) {
     let room = stack::LAG_ROOM;
     let (sx, sy) = (dx.clamp(-room, room), dy.clamp(-room, room));
     for (index, slot) in panel.layout.clone().into_iter().enumerate() {
-        let rest = resting(panel, slot, cards);
+        let rest = resting(panel, slot);
         let from = drawn[index];
         panel.motion[slot.view()].restack(
             Area {
@@ -6298,7 +6675,7 @@ mod tests {
     }
 
     #[test]
-    fn placement_keeps_the_chip_column_on_screen_and_clear_of_other_columns() {
+    fn placement_keeps_every_deck_on_screen_and_clear_of_the_others() {
         let screen = Area {
             x: 0.0,
             y: 0.0,
@@ -6316,23 +6693,21 @@ mod tests {
                 .map(|slot| panel_origin(screen, visible, SIZE, anchor, slot))
                 .collect();
             for (slot, &(x, y)) in origins.iter().enumerate() {
-                // Chips reach CHIP_REACH left of the window: still on screen.
-                assert!(x - CHIP_REACH >= visible.x, "{anchor:?} slot {slot}: {x}");
+                assert!(x >= visible.x, "{anchor:?} slot {slot}: {x}");
                 assert!(
                     x + SIZE.0 <= visible.x + visible.w,
                     "{anchor:?} slot {slot}"
                 );
                 assert!(y >= visible.y && y + SIZE.1 <= visible.y + visible.h);
             }
-            // Distinct slots' footprints (chips included) never overlap.
+            // Distinct slots' decks never overlap.
             let last = origins
                 .iter()
                 .position(|o| o == origins.last().unwrap())
                 .unwrap();
             for (i, a) in origins[..=last].iter().enumerate() {
                 for b in &origins[i + 1..=last] {
-                    let apart =
-                        (a.0 - b.0).abs() >= SIZE.0 + CHIP_REACH || (a.1 - b.1).abs() >= SIZE.1;
+                    let apart = (a.0 - b.0).abs() >= SIZE.0 || (a.1 - b.1).abs() >= SIZE.1;
                     assert!(apart, "{anchor:?}: {a:?} and {b:?} overlap");
                 }
             }
@@ -6340,6 +6715,156 @@ mod tests {
         // The default corner still puts the window's right edge at the inset.
         let (x, _) = panel_origin(screen, visible, SIZE, None, 0);
         assert_eq!(x + SIZE.0, visible.w - EDGE_INSET);
+    }
+
+    /// Row 16 of the plan's table: a panel dropped onto another slides the
+    /// shortest way clear of it, inside the screen; one dropped clear stays.
+    #[test]
+    fn a_dropped_panel_slides_clear_of_others() {
+        let visible = Area {
+            x: 0.0,
+            y: 0.0,
+            w: 1440.0,
+            h: 875.0,
+        };
+        let deck = |x: f64, y: f64| Area {
+            x,
+            y,
+            w: 362.0,
+            h: 362.0,
+        };
+        // B in the bottom-right slot; A dropped right on top of it.
+        let b = deck(1062.0, 16.0);
+        let (x, y) = clear_spot(deck(1062.0, 16.0), &[b], visible).unwrap();
+        let spot = deck(x, y);
+        assert!(!overlaps(spot, b), "{spot:?}");
+        assert!(x >= 0.0 && x + 362.0 <= 1440.0 && y >= 0.0 && y + 362.0 <= 875.0);
+        // The shortest way: just above B (390 pt) rather than left of it.
+        assert_eq!((x, y), (1062.0, 16.0 + 362.0 + STACK_GAP));
+        // Half on B: out by the smaller overlap.
+        let (x, y) = clear_spot(deck(900.0, 100.0), &[b], visible).unwrap();
+        assert_eq!((x, y), (1062.0 - STACK_GAP - 362.0, 100.0));
+        // A screen-edge spot that would only touch the other deck loses to
+        // one that keeps the gap.
+        let (x, y) = clear_spot(deck(5.0, 100.0), &[deck(362.0, 100.0)], visible).unwrap();
+        assert!(
+            x + 362.0 + STACK_GAP <= 362.0 + 1e-9
+                || y >= 100.0 + 362.0 + STACK_GAP
+                || y + 362.0 + STACK_GAP <= 100.0,
+            "{x} {y}"
+        );
+        // Clear of every other panel at once.
+        let c = deck(1062.0, 390.0);
+        let (x, y) = clear_spot(deck(1000.0, 200.0), &[b, c], visible).unwrap();
+        assert!(!overlaps(deck(x, y), b) && !overlaps(deck(x, y), c));
+    }
+
+    #[test]
+    fn the_users_spot_is_kept_when_clear() {
+        let visible = Area {
+            x: 0.0,
+            y: 0.0,
+            w: 1440.0,
+            h: 875.0,
+        };
+        let deck = |x: f64, y: f64| Area {
+            x,
+            y,
+            w: 362.0,
+            h: 362.0,
+        };
+        assert_eq!(
+            clear_spot(deck(100.0, 100.0), &[deck(1062.0, 16.0)], visible),
+            None
+        );
+        // Touching is not overlapping.
+        assert_eq!(
+            clear_spot(deck(700.0, 16.0), &[deck(1062.0, 16.0)], visible),
+            None
+        );
+        // No room anywhere: it stays.
+        let tiny = Area {
+            x: 0.0,
+            y: 0.0,
+            w: 400.0,
+            h: 400.0,
+        };
+        assert_eq!(clear_spot(deck(10.0, 10.0), &[deck(0.0, 0.0)], tiny), None);
+    }
+
+    /// Row 17: a panel shown takes the lowest free slot whose deck is clear
+    /// of every other shown panel's deck, dragged ones included.
+    #[test]
+    fn a_shown_panel_skips_slots_under_dragged_panels() {
+        let deck_at = |slot: usize| {
+            Some(Area {
+                x: 1062.0,
+                y: 16.0 + slot as f64 * 374.0,
+                w: 362.0,
+                h: 362.0,
+            })
+        };
+        assert_eq!(clear_slot(&[], &[], deck_at), Some(0));
+        assert_eq!(clear_slot(&[0], &[], deck_at), Some(1));
+        // A dragged panel sits over slot 0's place: slot 1.
+        let dragged = Area {
+            x: 1100.0,
+            y: 20.0,
+            w: 362.0,
+            h: 362.0,
+        };
+        assert_eq!(clear_slot(&[], &[dragged], deck_at), Some(1));
+        // Nothing clear (code review 4): no slot, the caller slides clear.
+        assert_eq!(clear_slot(&[0], &[], |_| None), None);
+        // The deck of a panel window is the window less its insets.
+        let window = Area {
+            x: 100.0,
+            y: 50.0,
+            w: 362.0 + stack::INSET_LEFT + stack::LAG_ROOM,
+            h: 362.0 + 2.0 * stack::LAG_ROOM,
+        };
+        assert_eq!(
+            deck_of(window),
+            Area {
+                x: 100.0 + stack::INSET_LEFT,
+                y: 50.0 + stack::LAG_ROOM,
+                w: 362.0,
+                h: 362.0
+            }
+        );
+    }
+
+    /// Row 4 of the plan's table: a sheet or child window shares its
+    /// owner's card; a top-level window, or a parent of another app (a
+    /// remote view service), is not an owner.
+    #[test]
+    fn a_child_or_sheet_folds_into_its_owner() {
+        // 30 is a sheet on 20, which is a child of 10; 10 is top-level.
+        let parent = |window: u32| match window {
+            30 => Some(20),
+            20 => Some(10),
+            40 => Some(99),
+            _ => None,
+        };
+        let owned = |pid: i32, window: u32| pid == 1 && window != 99;
+        assert_eq!(
+            owner_window(1, 30, parent, owned),
+            10,
+            "the farthest owned ancestor"
+        );
+        assert_eq!(owner_window(1, 20, parent, owned), 10);
+        assert_eq!(
+            owner_window(1, 10, parent, owned),
+            10,
+            "a top-level window is its own"
+        );
+        assert_eq!(
+            owner_window(1, 40, parent, owned),
+            40,
+            "another app's parent is not an owner"
+        );
+        // A self-parented answer never loops.
+        assert_eq!(owner_window(1, 7, |_| Some(7), owned), 7);
     }
 
     #[test]

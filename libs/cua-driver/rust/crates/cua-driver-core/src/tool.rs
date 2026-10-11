@@ -5724,6 +5724,33 @@ resources:
         .await;
         assert_eq!((window_kept["pid"].clone(), window_kept["window_id"].clone()), (pid.into(), 2.into()));
 
+        // B1: a call naming its pid but no window acts in the token's window,
+        // and says so; a token of another pid adds nothing.
+        let pid_only = fill(
+            "token-fill-runtime-a",
+            serde_json::json!({"element_token": token, "pid": pid}),
+        )
+        .await;
+        assert_eq!(
+            (pid_only["pid"].clone(), pid_only["window_id"].clone()),
+            (pid.into(), 45.into())
+        );
+        let other_pid = fill(
+            "token-fill-runtime-a",
+            serde_json::json!({"element_token": token, "pid": 1}),
+        )
+        .await;
+        assert_eq!(other_pid["pid"], 1);
+        assert!(other_pid.get("window_id").is_none());
+        // A window-scoped call is filled the same way; only desktop scope
+        // keeps its meaning (below).
+        let window_scoped = fill(
+            "token-fill-runtime-a",
+            serde_json::json!({"element_token": token, "pid": pid, "scope": "window"}),
+        )
+        .await;
+        assert_eq!(window_scoped["window_id"], 45);
+
         // Dispatch order: a typed target is normalized first, so a matching
         // token-only element click through the SDK still passes.
         let typed = DISPATCH_RUNTIME_SCOPE
@@ -6175,6 +6202,20 @@ mod capability_tests {
         assert_eq!(frame.action_label, "click: element_index=3");
         // P8: a native tool's frame frames the whole window, even a browser's.
         assert!(!frame.page);
+
+        // B1: a pid + element_token call frames the token's window once
+        // dispatch has filled it in (`fill_target_from_element_token`).
+        let mut token_call = serde_json::json!({
+            "pid": 42,
+            "element_token": "s00000001:3",
+            "_session_id": format!("{prefix}research"),
+        });
+        token_call["window_id"] = 9.into(); // what the fill adds for a snapshot of window 9
+        let frame = pip_frame("type_text", &token_call, &token_call, prefix, None);
+        assert_eq!(
+            (frame.target_pid, frame.target_window_id),
+            (Some(42), Some(9))
+        );
 
         // No session at all (one-shot CLI) shares the classic default panel.
         let bare = pip_frame("click", &serde_json::json!({}), &public, prefix, None);
