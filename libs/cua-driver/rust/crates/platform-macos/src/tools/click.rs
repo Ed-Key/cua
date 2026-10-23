@@ -177,19 +177,40 @@ fn click_dispatch(ax_action: &str, advertised: Option<&[String]>, own_fallback: 
 /// the app. Chromium answers a hit test at a new point from its cached tree
 /// first (a row under a page element that covers it), then corrects it a
 /// moment later (measured, Chrome 155: the first answer named the covered
-/// row, every later one the cover), so the answer counts only once two
-/// consecutive answers agree.
+/// row, every later one the cover), so the answer counts only once it has
+/// held for [`HIT_SETTLE_SAMPLES`] answers in a row.
 fn point_reaches_element(pid: i32, window_id: u32, element: AXUIElementRef, point: (f64, f64)) -> bool {
-    let mut last = hit_reaches_element(pid, window_id, element, point);
-    for _ in 0..3 {
-        std::thread::sleep(std::time::Duration::from_millis(60));
-        let now = hit_reaches_element(pid, window_id, element, point);
-        if now == last {
-            return now;
+    settled_hit(
+        || hit_reaches_element(pid, window_id, element, point),
+        || std::thread::sleep(HIT_SETTLE_GAP),
+    )
+}
+
+/// Answers that must agree in a row, [`HIT_SETTLE_GAP`] apart (150 ms).
+const HIT_SETTLE_SAMPLES: usize = 4;
+const HIT_SETTLE_GAP: std::time::Duration = std::time::Duration::from_millis(50);
+/// At most this many answers (400 ms); unsettled by then means no.
+const HIT_SETTLE_MAX: usize = 9;
+
+/// The hit answer once it has held for `HIT_SETTLE_SAMPLES` answers in a
+/// row; `false` when it never does within `HIT_SETTLE_MAX`.
+/// ponytail: a stability window, not proof. Chromium answers from its cache
+/// until its renderer's hit test replies, and no AX signal says it has; a
+/// renderer busy for more than 150 ms can still pass a stale answer. Upgrade
+/// path: a fresh-answer signal from Chromium, if one ever exists.
+fn settled_hit(mut sample: impl FnMut() -> bool, mut wait: impl FnMut()) -> bool {
+    let mut last = sample();
+    let mut run = 1;
+    for _ in 1..HIT_SETTLE_MAX {
+        if run >= HIT_SETTLE_SAMPLES {
+            return last;
         }
+        wait();
+        let now = sample();
+        run = if now == last { run + 1 } else { 1 };
         last = now;
     }
-    false
+    run >= HIT_SETTLE_SAMPLES && last
 }
 
 fn hit_reaches_element(pid: i32, window_id: u32, element: AXUIElementRef, point: (f64, f64)) -> bool {
@@ -2369,6 +2390,48 @@ mod action_name_tests {
 /// Incident 12: Chrome exposes a role=button row with no click listener as
 /// an AXButton offering only AXShowMenu and AXScrollToVisible; AXPress on it
 /// runs nothing. One test per row of the dispatch table.
+#[cfg(test)]
+mod settled_hit_tests {
+    use super::settled_hit;
+
+    fn run(answers: &[bool]) -> (bool, usize) {
+        let mut asked = 0;
+        let result = settled_hit(
+            || {
+                asked += 1;
+                answers[(asked - 1).min(answers.len() - 1)]
+            },
+            || {},
+        );
+        (result, asked)
+    }
+
+    #[test]
+    fn a_stale_first_answer_is_overruled_by_the_settled_one() {
+        assert_eq!(run(&[true, false, false, false, false]), (false, 5));
+    }
+
+    #[test]
+    fn two_stale_answers_in_a_row_are_not_enough() {
+        assert_eq!(run(&[true, true, false, false, false, false]), (false, 6));
+    }
+
+    #[test]
+    fn a_steady_hit_passes_after_four_answers() {
+        assert_eq!(run(&[true]), (true, 4));
+    }
+
+    #[test]
+    fn an_answer_that_never_settles_is_no() {
+        assert_eq!(run(&[true, false, true, false, true, false, true, false, true]), (false, 9));
+    }
+
+    #[test]
+    fn a_hit_that_settles_on_the_last_answer_counts() {
+        assert_eq!(run(&[false, true, false, true, false, true, true, true, true]), (true, 9));
+    }
+}
+
 #[cfg(test)]
 mod click_dispatch_tests {
     use super::{click_dispatch, ClickDispatch};
