@@ -1303,6 +1303,9 @@ pub struct TargetOccluded {
     pub point: (f64, f64),
     /// The covering window, or `None` when no window is at the point.
     pub covering: Option<CoveringWindow>,
+    /// Decided from the window list's geometry because WindowServer's hit
+    /// test was unavailable: a click-through window counts as covering.
+    pub geometry_only: bool,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -1335,7 +1338,15 @@ impl std::fmt::Display for TargetOccluded {
                 "screen point ({x:.0},{y:.0}) is not on window {} or any window; no input was sent",
                 self.window_id
             ),
+        }?;
+        if self.geometry_only {
+            write!(
+                f,
+                " (decided from window geometry: WindowServer's hit test was unavailable, so a \
+                 click-through window counts as covering)"
+            )?;
         }
+        Ok(())
     }
 }
 
@@ -1344,8 +1355,60 @@ impl std::error::Error for TargetOccluded {}
 /// How long a raised target gets to become topmost at the point.
 const RAISE_WAIT_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(400);
 
+/// `CGError SLSFindWindowAndOwner(int cid, int, int, int, CGPoint *point,
+/// CGPoint *window_point, uint32_t *window_id, int *owner_cid)`: the window
+/// WindowServer delivers a click at `point` to (the call yabai uses).
+type FindWindowAndOwnerFn = unsafe extern "C" fn(
+    c_int,
+    c_int,
+    c_int,
+    c_int,
+    *const core_graphics::geometry::CGPoint,
+    *mut core_graphics::geometry::CGPoint,
+    *mut u32,
+    *mut c_int,
+) -> i32;
+
+fn find_window_and_owner_fn() -> Option<FindWindowAndOwnerFn> {
+    static SYM: OnceLock<Option<FindWindowAndOwnerFn>> = OnceLock::new();
+    *SYM.get_or_init(|| find_sym(b"SLSFindWindowAndOwner\0").map(|p| unsafe { as_fn(p) }))
+}
+
+/// WindowServer's own hit test at a global screen point (top-left origin,
+/// negative on displays left of or above the primary).
+fn server_hit(point: (f64, f64)) -> crate::windows::ServerHit {
+    use crate::windows::ServerHit;
+    let (Some(find), Some(cid)) = (find_window_and_owner_fn(), main_connection_id()) else {
+        return ServerHit::Unavailable;
+    };
+    let at = core_graphics::geometry::CGPoint::new(point.0, point.1);
+    let mut window_point = core_graphics::geometry::CGPoint::new(0.0, 0.0);
+    let mut window_id = 0u32;
+    let mut owner_cid: c_int = 0;
+    let err = unsafe {
+        find(cid as c_int, 0, 1, 0, &at, &mut window_point, &mut window_id, &mut owner_cid)
+    };
+    match (err, window_id) {
+        (0, 0) => ServerHit::NoWindow,
+        (0, id) => ServerHit::Window(id),
+        _ => ServerHit::Unavailable,
+    }
+}
+
 fn occlusion_at(pid: libc::pid_t, window_id: u32, point: (f64, f64)) -> Option<TargetOccluded> {
-    let windows = crate::windows::composited_windows();
+    let hit = server_hit(point);
+    let mut windows = crate::windows::composited_windows();
+    // The owner and title of a hit window the composited list leaves out
+    // (an alpha-0 window that still takes clicks).
+    if let crate::windows::ServerHit::Window(id) = hit {
+        if !windows.iter().any(|window| window.window_id == id) {
+            windows.extend(
+                crate::windows::all_windows_any_layer()
+                    .into_iter()
+                    .filter(|window| window.window_id == id),
+            );
+        }
+    }
     let displays: Vec<crate::windows::WindowBounds> =
         core_graphics::display::CGDisplay::active_displays()
             .unwrap_or_default()
@@ -1360,7 +1423,8 @@ fn occlusion_at(pid: libc::pid_t, window_id: u32, point: (f64, f64)) -> Option<T
                 }
             })
             .collect();
-    let covering = match crate::windows::point_owner(
+    let (owner, geometry_only) = crate::windows::click_owner(
+        hit,
         &windows,
         &displays,
         point,
@@ -1368,7 +1432,8 @@ fn occlusion_at(pid: libc::pid_t, window_id: u32, point: (f64, f64)) -> Option<T
         std::process::id() as i32,
         crate::cursor::overlay::is_overlay_window,
         |id| crate::ax::bindings::window_belongs_to(id, window_id),
-    ) {
+    );
+    let covering = match owner {
         crate::windows::PointOwner::Target => return None,
         crate::windows::PointOwner::Other(window) => Some(CoveringWindow {
             pid: window.pid,
@@ -1377,11 +1442,18 @@ fn occlusion_at(pid: libc::pid_t, window_id: u32, point: (f64, f64)) -> Option<T
             title: window.title.clone(),
         }),
         crate::windows::PointOwner::Nothing => None,
+        crate::windows::PointOwner::Unlisted(window_id) => Some(CoveringWindow {
+            pid: 0,
+            app_name: "an unlisted".into(),
+            window_id,
+            title: String::new(),
+        }),
     };
     Some(TargetOccluded {
         window_id,
         point,
         covering,
+        geometry_only,
     })
 }
 

@@ -167,6 +167,7 @@ pub(crate) fn foreground_unavailable(
                     "window_id": window.window_id,
                     "title": window.title,
                 })),
+                "decided_by": if occluded.geometry_only { "window_list_geometry" } else { "window_server_hit_test" },
             }),
         );
     }
@@ -279,6 +280,7 @@ mod tests {
                 window_id: 12,
                 title: "cover".into(),
             }),
+            geometry_only: false,
         };
         let result = foreground_unavailable("click", 7, &anyhow::Error::new(occluded));
         assert_eq!(result.is_error, Some(true));

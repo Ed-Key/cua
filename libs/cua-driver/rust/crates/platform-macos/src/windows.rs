@@ -148,6 +148,63 @@ pub(crate) enum PointOwner<'a> {
     Other(&'a WindowInfo),
     /// No window at the point.
     Nothing,
+    /// WindowServer names a window the window list does not show.
+    Unlisted(u32),
+}
+
+/// WindowServer's own hit test at a screen point (`SLSFindWindowAndOwner`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ServerHit {
+    /// The call is missing or failed: only the window list's geometry is left.
+    Unavailable,
+    /// WindowServer found no window at the point.
+    NoWindow,
+    /// The window a click at the point goes to.
+    Window(u32),
+}
+
+/// Who a click at `point` reaches, from WindowServer's hit test `hit`, with
+/// [`point_owner`]'s geometry walk as the fallback. Same arguments as
+/// [`point_owner`]; `front_to_back` must list the hit window. The flag is
+/// true when the geometry walk decided.
+///
+/// The window list cannot tell a click-through window (AppKit's
+/// `ignoresMouseEvents`, Wispr Flow's "Status" overlay) from one that takes
+/// clicks; WindowServer's hit test skips the former. The walk decides only
+/// when the hit test is unavailable, or names a window that takes no clicks
+/// (WindowServer's pointer image, the driver's cursor overlay), which it
+/// should never do.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn click_owner<'a>(
+    hit: ServerHit,
+    front_to_back: &'a [WindowInfo],
+    displays: &[WindowBounds],
+    point: (f64, f64),
+    target_pid: i32,
+    own_pid: i32,
+    own_click_through: impl Fn(u32) -> bool,
+    belongs_to_target: impl Fn(u32) -> bool,
+) -> (PointOwner<'a>, bool) {
+    let walk = || {
+        let owner = point_owner(front_to_back, displays, point, target_pid, own_pid, &own_click_through, &belongs_to_target);
+        (owner, true)
+    };
+    let id = match hit {
+        ServerHit::Unavailable => return walk(),
+        ServerHit::NoWindow => return (PointOwner::Nothing, false),
+        ServerHit::Window(id) => id,
+    };
+    let Some(window) = front_to_back.iter().find(|window| window.window_id == id) else {
+        return (PointOwner::Unlisted(id), false);
+    };
+    if receives_no_clicks(window) || (window.pid == own_pid && own_click_through(id)) {
+        return walk();
+    }
+    if belongs_to_target(id) || (window.pid == target_pid && window.layer >= SYSTEM_LAYER) {
+        (PointOwner::Target, false)
+    } else {
+        (PointOwner::Other(window), false)
+    }
 }
 
 /// The owner of the topmost window at `(x, y)` in `front_to_back` (composited
@@ -742,6 +799,110 @@ mod tests {
             point_owner(&windows, &SCREENS, (400.0, 400.0), 40, 7, click_through, belongs),
             PointOwner::Other(WindowInfo { window_id: 13, .. })
         ));
+    }
+
+    /// Incident 13: Wispr Flow's transparent click-through "Status" window
+    /// (layer 1000) sits over the target in the window list, but WindowServer
+    /// sends a click there to the window beneath. Its hit test decides.
+    mod click_owner {
+        use super::*;
+
+        const TARGET: u32 = 10;
+        const OVERLAY: u32 = 30;
+        fn belongs(id: u32) -> bool {
+            id == TARGET || id == 11 // 11: the target's sheet
+        }
+        fn click_through(id: u32) -> bool {
+            id == 1 // the driver's cursor overlay
+        }
+        fn windows() -> Vec<WindowInfo> {
+            vec![
+                WindowInfo { app_name: "Window Server".into(), ..at(16, 175, CURSOR_LAYER, (0.0, 0.0, 2000.0, 2000.0)) },
+                at(1, 7, 0, (0.0, 0.0, 2000.0, 2000.0)),
+                WindowInfo { title: "Status".into(), ..at(OVERLAY, 80, 1000, (0.0, 33.0, 490.0, 860.0)) },
+                at(20, 7, 3, (300.0, 600.0, 200.0, 150.0)), // the driver's PiP panel
+                at(12, 40, 101, (300.0, 300.0, 100.0, 100.0)), // the target's menu
+                at(11, 40, 0, (300.0, 300.0, 150.0, 150.0)),
+                at(13, 40, 0, (100.0, 500.0, 150.0, 150.0)), // a same-app sibling
+                at(TARGET, 40, 0, (0.0, 40.0, 1100.0, 800.0)),
+            ]
+        }
+        fn owner(hit: ServerHit, point: (f64, f64)) -> Option<u32> {
+            let list = windows();
+            match click_owner(hit, &list, &SCREENS, point, 40, 7, click_through, belongs).0 {
+                PointOwner::Target => Some(TARGET),
+                PointOwner::Other(window) => Some(window.window_id),
+                PointOwner::Unlisted(id) => Some(id + 100_000),
+                PointOwner::Nothing => None,
+            }
+        }
+
+        #[test]
+        fn a_click_through_overlay_does_not_cover_the_window_that_gets_the_click() {
+            assert_eq!(owner(ServerHit::Window(TARGET), (200.0, 300.0)), Some(TARGET));
+        }
+
+        #[test]
+        fn an_overlay_that_takes_the_click_covers() {
+            assert_eq!(owner(ServerHit::Window(OVERLAY), (200.0, 300.0)), Some(OVERLAY));
+        }
+
+        #[test]
+        fn the_targets_sheets_children_and_menus_are_the_target() {
+            assert_eq!(owner(ServerHit::Window(11), (420.0, 420.0)), Some(TARGET));
+            assert_eq!(owner(ServerHit::Window(12), (350.0, 350.0)), Some(TARGET));
+        }
+
+        #[test]
+        fn a_same_process_sibling_still_covers() {
+            assert_eq!(owner(ServerHit::Window(13), (150.0, 550.0)), Some(13));
+        }
+
+        #[test]
+        fn the_drivers_own_interactive_window_covers() {
+            assert_eq!(owner(ServerHit::Window(20), (350.0, 650.0)), Some(20));
+        }
+
+        #[test]
+        fn no_window_at_the_point_is_nothing() {
+            assert_eq!(owner(ServerHit::NoWindow, (200.0, 300.0)), None);
+        }
+
+        #[test]
+        fn a_window_missing_from_the_list_is_refused_by_id() {
+            assert_eq!(owner(ServerHit::Window(999), (200.0, 300.0)), Some(100_999));
+        }
+
+        #[test]
+        fn without_the_hit_test_the_geometry_walk_decides() {
+            assert_eq!(owner(ServerHit::Unavailable, (200.0, 300.0)), Some(OVERLAY));
+            assert_eq!(owner(ServerHit::Unavailable, (700.0, 300.0)), Some(TARGET));
+        }
+
+        #[test]
+        fn a_hit_on_a_window_that_takes_no_clicks_falls_back_to_the_walk() {
+            assert_eq!(owner(ServerHit::Window(16), (200.0, 300.0)), Some(OVERLAY));
+            assert_eq!(owner(ServerHit::Window(1), (700.0, 300.0)), Some(TARGET));
+            let list = windows();
+            let decided_by_walk = |hit| click_owner(hit, &list, &SCREENS, (200.0, 300.0), 40, 7, click_through, belongs).1;
+            assert!(decided_by_walk(ServerHit::Window(16)) && decided_by_walk(ServerHit::Unavailable));
+            assert!(!decided_by_walk(ServerHit::Window(TARGET)) && !decided_by_walk(ServerHit::NoWindow));
+        }
+
+        #[test]
+        fn a_display_left_of_the_primary_uses_global_points() {
+            let target = at(TARGET, 40, 0, (-1500.0, 100.0, 1000.0, 700.0));
+            let overlay = at(OVERLAY, 80, 1000, (-1500.0, 100.0, 400.0, 700.0));
+            let list = [overlay, target];
+            let screens = [SCREENS[0].clone(), WindowBounds { x: -1600.0, y: 0.0, width: 1600.0, height: 1000.0 }];
+            let at_point = |hit| match click_owner(hit, &list, &screens, (-1400.0, 300.0), 40, 7, click_through, belongs).0 {
+                PointOwner::Target => Some(TARGET),
+                PointOwner::Other(window) => Some(window.window_id),
+                _ => None,
+            };
+            assert_eq!(at_point(ServerHit::Window(TARGET)), Some(TARGET));
+            assert_eq!(at_point(ServerHit::Window(OVERLAY)), Some(OVERLAY));
+        }
     }
 
     #[test]
