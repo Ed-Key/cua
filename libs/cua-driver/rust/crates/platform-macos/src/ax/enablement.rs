@@ -398,6 +398,40 @@ mod tests {
         std::fs::remove_dir_all(&root).unwrap();
     }
 
+    /// Chromium ships under other framework names too: the ChatGPT desktop
+    /// app bundles "Codex Framework.framework" (Chromium 155, `ChromeMain`)
+    /// with its helpers inside the framework, as Chrome does. A Chromium
+    /// renderer helper ("... (Renderer).app") marks the bundle wherever it
+    /// sits; an ordinary framework does not.
+    #[test]
+    fn chromium_is_recognised_under_any_framework_name() {
+        let root = std::env::temp_dir().join(format!("cua-chromium-shape-{}", std::process::id()));
+        let make = |app: &str, dirs: &[&str]| {
+            let exe = root.join(format!("{app}.app/Contents/MacOS/{app}"));
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            for dir in dirs {
+                std::fs::create_dir_all(root.join(format!("{app}.app/Contents/Frameworks/{dir}"))).unwrap();
+            }
+            exe
+        };
+        // ChatGPT 26.1016: helpers inside the framework.
+        let codex = make("ChatGPT", &["Codex Framework.framework/Helpers/Codex (Renderer).app", "Sparkle.framework"]);
+        assert!(bundles_electron(&codex));
+        // Chrome: helpers in the framework's version directory.
+        let chrome = make(
+            "Chrome",
+            &["Google Chrome Framework.framework/Versions/155.0.1/Helpers/Google Chrome Helper (Renderer).app"],
+        );
+        assert!(bundles_electron(&chrome));
+        // An Electron app renamed its framework but kept Electron's helper layout.
+        let renamed = make("Renamed", &["Renamed Helper (Renderer).app", "Shell Framework.framework"]);
+        assert!(bundles_electron(&renamed));
+        // A native app with ordinary frameworks.
+        let native = make("Native", &["Sparkle.framework/Versions/B/Resources", "Mantle.framework"]);
+        assert!(!bundles_electron(&native));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
     /// A slow app (each probe costs a second) still ends at the deadline:
     /// probe time counts against the budget, not only the sleeps.
     #[test]
