@@ -132,7 +132,7 @@ pub fn click_at_xy(
 /// (it lands on whatever is visually on top at the point) — exactly the
 /// foreground, vision-driven model that complements the background contract.
 pub fn click_at_xy_desktop(x: f64, y: f64, count: usize, button: &str) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, count, button, &[], false)
+    click_at_xy_desktop_inner(x, y, count, button, &[], false).map(drop)
 }
 
 /// Global HID click with physical modifier transitions. The caller must guard
@@ -144,7 +144,7 @@ pub fn click_at_xy_desktop_with_modifiers(
     button: &str,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, count, button, modifiers, false)
+    click_at_xy_desktop_inner(x, y, count, button, modifiers, false).map(drop)
 }
 
 /// Global HID modifier click that restores the user's hardware cursor after
@@ -156,9 +156,14 @@ pub fn click_at_xy_desktop_with_modifiers_preserving_cursor(
     button: &str,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, count, button, modifiers, true)
+    click_at_xy_desktop_inner(x, y, count, button, modifiers, true).map(drop)
 }
 
+/// Posts the click at the HID tap, then waits until the system has passed
+/// its button events on past every session event tap ([`HidPassage`]). An
+/// event still held or dropped by a tap when the wait ends is
+/// [`ClickNotConfirmed`]: the caller must not restore another app to the
+/// front, or a late release lands on it.
 fn click_at_xy_desktop_inner(
     x: f64,
     y: f64,
@@ -166,7 +171,7 @@ fn click_at_xy_desktop_inner(
     button: &str,
     modifiers: &[&str],
     preserve_cursor: bool,
-) -> anyhow::Result<()> {
+) -> anyhow::Result<HidPassage> {
     use core_graphics::display::CGDisplay;
     use core_graphics::event::CGEventTapLocation;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
@@ -208,6 +213,9 @@ fn click_at_xy_desktop_inner(
     // warped point, not the pre-warp one.
     unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     std::thread::sleep(std::time::Duration::from_millis(40));
+    let _dispatching = Dispatching::begin();
+    let (baseline, backlog) = hid_baseline();
+    let posted_pairs = std::cell::Cell::new(0u32);
     let result = super::keyboard::with_global_modifier_keys(modifiers, |flags| {
         if !modifiers.is_empty() {
             // Prime AppKit's cursor-tracking state after the physical modifiers
@@ -245,6 +253,7 @@ fn click_at_xy_desktop_inner(
                 (pair_index + 1) as i64,
             );
             crate::focus_steal::post_hid_mouse_event(&up);
+            posted_pairs.set(posted_pairs.get() + 1);
             if count > 1 {
                 std::thread::sleep(std::time::Duration::from_millis(80));
             }
@@ -252,6 +261,12 @@ fn click_at_xy_desktop_inner(
         Ok(())
     });
 
+    // The events must be past every session tap before anything else moves:
+    // a tap can hold them (released later onto whatever is then at the
+    // point) or drop them.
+    // Checked whenever a pair went out, even if a later one failed to build.
+    let own = posted_pairs.get();
+    let passage = (own > 0).then(|| await_hid_passage(baseline, backlog, [down_ty, up_ty], own));
     // Let AppKit consume the up event before the pointer is restored. The
     // exact foreground guard remains active around this entire helper.
     std::thread::sleep(std::time::Duration::from_millis(40));
@@ -259,7 +274,326 @@ fn click_at_xy_desktop_inner(
         let _ = CGDisplay::warp_mouse_cursor_position(prior);
         unsafe { CGAssociateMouseAndMouseCursorPosition(true) };
     }
-    result
+    match (passage, result) {
+        (Some(HidPassage::Pending), _) => {
+            note_unresolved(baseline);
+            Err(ClickNotConfirmed {
+                tap_owner: foreign_active_tap(event_mask(&[down_ty, up_ty])),
+                waited: HID_PASSAGE_TIMEOUT,
+            }
+            .into())
+        }
+        (_, Err(error)) => Err(error),
+        (Some(passage), Ok(())) => Ok(passage),
+        (None, Ok(())) => Ok(HidPassage::Unmeasured),
+    }
+}
+
+/// Where a HID-posted click's button events are, from the window server's
+/// per-type event counters: the HID system state counts an event when it is
+/// posted, the combined session state only once it has passed every session
+/// event tap (an active tap that holds an event delays that count; one that
+/// drops it means it never comes; pid-posted events move neither, measured in
+/// VM B 2026-10-23).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HidPassage {
+    /// Every button event that entered the HID stream since the click began,
+    /// the click's own included, has passed the session taps.
+    Passed,
+    /// Some of them have not (yet).
+    Pending,
+    /// The HID counters never showed the click's own events, so the counters
+    /// say nothing here; passage is unknown, as before this check existed.
+    Unmeasured,
+}
+
+/// The click's button events did not pass the session event taps in time.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ClickNotConfirmed {
+    /// The pid of another process holding an active tap on these events, if
+    /// one is listed now.
+    pub tap_owner: Option<i32>,
+    pub waited: std::time::Duration,
+}
+
+impl std::fmt::Display for ClickNotConfirmed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let owner = match self.tap_owner {
+            Some(pid) => format!(
+                "pid {pid} ({})",
+                crate::apps::get_app_name_for_pid(pid).unwrap_or_else(|| "unknown app".into())
+            ),
+            None => "another process".into(),
+        };
+        write!(
+            f,
+            "the click was posted at the HID event tap, but {} ms later the system had not passed \
+             it on: an active event tap of {owner} dropped it or still holds it",
+            self.waited.as_millis()
+        )
+    }
+}
+
+impl std::error::Error for ClickNotConfirmed {}
+
+/// How long a HID click may take to pass the session taps (an active tap
+/// holding each event 300 ms passes a click in about 620 ms).
+pub const HID_PASSAGE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1000);
+
+/// Button event types the counters track: left, right and other down and up.
+const BUTTON_TYPES: [CGEventType; 6] = [
+    CGEventType::LeftMouseDown,
+    CGEventType::LeftMouseUp,
+    CGEventType::RightMouseDown,
+    CGEventType::RightMouseUp,
+    CGEventType::OtherMouseDown,
+    CGEventType::OtherMouseUp,
+];
+
+/// HID and combined-session counts of every button event type
+/// ([`BUTTON_TYPES`]). A session tap handles events in order, so a click is
+/// through only when every button event before it is too.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ButtonCounters {
+    hid: [u32; 6],
+    session: [u32; 6],
+}
+
+impl ButtonCounters {
+    fn read() -> Self {
+        #[link(name = "CoreGraphics", kind = "framework")]
+        extern "C" {
+            fn CGEventSourceCounterForEventType(state_id: i32, event_type: u32) -> u32;
+        }
+        const COMBINED_SESSION_STATE: i32 = 0;
+        const HID_SYSTEM_STATE: i32 = 1;
+        let count = |state, ty: CGEventType| unsafe { CGEventSourceCounterForEventType(state, ty as u32) };
+        Self {
+            hid: BUTTON_TYPES.map(|ty| count(HID_SYSTEM_STATE, ty)),
+            session: BUTTON_TYPES.map(|ty| count(COMBINED_SESSION_STATE, ty)),
+        }
+    }
+
+    /// Per type: events that entered the HID stream since `base` and have
+    /// not passed the session taps.
+    fn outstanding_since(self, base: Self) -> [u32; 6] {
+        std::array::from_fn(|i| {
+            self.hid[i]
+                .wrapping_sub(base.hid[i])
+                .saturating_sub(self.session[i].wrapping_sub(base.session[i]))
+        })
+    }
+}
+
+/// An earlier HID click that never showed as passed: the counters when it
+/// began, and when it was last found unresolved.
+#[derive(Clone, Copy, Debug)]
+struct Unresolved {
+    base: ButtonCounters,
+    noted: std::time::Instant,
+}
+
+/// How long an unresolved click counts as possibly in flight. A tap that
+/// holds an event this long has dropped it for every practical purpose.
+const UNRESOLVED_FOR: std::time::Duration = std::time::Duration::from_secs(5);
+
+fn unresolved() -> &'static std::sync::Mutex<Option<Unresolved>> {
+    static UNRESOLVED: std::sync::Mutex<Option<Unresolved>> = std::sync::Mutex::new(None);
+    &UNRESOLVED
+}
+
+/// What the earlier unresolved clicks still owe at `now` (zero when none,
+/// expired, or all through; the record is then cleared).
+fn backlog_at(now: ButtonCounters) -> [u32; 6] {
+    let mut record = unresolved().lock().unwrap_or_else(|p| p.into_inner());
+    let Some(earlier) = *record else { return [0; 6] };
+    let owed = now.outstanding_since(earlier.base);
+    if earlier.noted.elapsed() >= UNRESOLVED_FOR || owed == [0; 6] {
+        *record = None;
+        return [0; 6];
+    }
+    owed
+}
+
+/// A click's baseline counters and the backlog of earlier unresolved clicks.
+fn hid_baseline() -> (ButtonCounters, [u32; 6]) {
+    let now = ButtonCounters::read();
+    (now, backlog_at(now))
+}
+
+fn note_unresolved(base: ButtonCounters) {
+    let mut record = unresolved().lock().unwrap_or_else(|p| p.into_inner());
+    // Keep the earliest base, which spans every click still owed, and its
+    // deadline: a dropped event is owed forever, so later clicks must not
+    // renew the debt.
+    *record = Some(record.unwrap_or(Unresolved { base, noted: std::time::Instant::now() }));
+}
+
+/// HID clicks being posted or awaiting passage right now.
+static DISPATCHING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// Marks a HID click from before its first post until its passage is
+/// settled (passed, or noted unresolved).
+struct Dispatching;
+
+impl Dispatching {
+    fn begin() -> Self {
+        DISPATCHING.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Self
+    }
+}
+
+impl Drop for Dispatching {
+    fn drop(&mut self) {
+        DISPATCHING.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+/// Whether a HID click cua posted may still be held by an event tap: one is
+/// being posted or awaited now, or an earlier one is unresolved. While it
+/// is, nothing that brings another app or window forward may run, or a late
+/// release lands there.
+pub fn click_in_flight() -> bool {
+    DISPATCHING.load(std::sync::atomic::Ordering::SeqCst) > 0 || backlog_at(ButtonCounters::read()) != [0; 6]
+}
+
+/// Before activating or raising anything for a new action: wait while a HID
+/// click may still be held (one being posted or awaited by another worker,
+/// or an earlier one unresolved), until it passes or counts as dropped. Never
+/// called while this thread posts one; bounded in case a worker hangs.
+pub fn await_no_click_in_flight() {
+    let give_up = std::time::Instant::now() + UNRESOLVED_FOR + HID_PASSAGE_TIMEOUT * 2;
+    while click_in_flight() && std::time::Instant::now() < give_up {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+}
+
+/// Pure passage decision for `own` pairs of the button `kinds` (indices into
+/// [`BUTTON_TYPES`]) posted since `baseline`, behind `backlog` earlier events.
+fn hid_passage(baseline: ButtonCounters, now: ButtonCounters, backlog: [u32; 6], kinds: [usize; 2], own: u32) -> HidPassage {
+    let entered = |i: usize| now.hid[i].wrapping_sub(baseline.hid[i]);
+    let passed = |i: usize| now.session[i].wrapping_sub(baseline.session[i]);
+    if kinds.iter().any(|&i| entered(i) < own) {
+        HidPassage::Unmeasured
+    } else if (0..6).all(|i| passed(i) >= entered(i).saturating_add(backlog[i])) {
+        HidPassage::Passed
+    } else {
+        // ponytail: counts, not identities. A user's button event that a tap
+        // drops during the wait reads as pending (errs toward "not
+        // confirmed"); an earlier unresolved cua click is carried as a
+        // backlog for UNRESOLVED_FOR only; a user's own click already held
+        // in a tap when this one starts can pass first and read as this one.
+        // Tag events (field 42) and watch them at the annotated session point
+        // if that ever matters; it needs an event tap of cua's own.
+        HidPassage::Pending
+    }
+}
+
+fn await_hid_passage(baseline: ButtonCounters, backlog: [u32; 6], types: [CGEventType; 2], own: u32) -> HidPassage {
+    let kinds = types.map(|ty| BUTTON_TYPES.iter().position(|t| *t as u32 == ty as u32).unwrap_or(0));
+    let deadline = std::time::Instant::now() + HID_PASSAGE_TIMEOUT;
+    loop {
+        let passage = hid_passage(baseline, ButtonCounters::read(), backlog, kinds, own);
+        if passage == HidPassage::Passed || std::time::Instant::now() >= deadline {
+            return passage;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(1));
+    }
+}
+
+/// `CGEventTapInformation` (CGEventTypes.h).
+#[repr(C)]
+#[derive(Clone, Copy, Debug, Default)]
+struct EventTapInformation {
+    event_tap_id: u32,
+    tap_point: u32,
+    options: u32,
+    events_of_interest: u64,
+    tapping_process: i32,
+    process_being_tapped: i32,
+    enabled: bool,
+    min_usec_latency: f32,
+    avg_usec_latency: f32,
+    max_usec_latency: f32,
+}
+
+extern "C" {
+    fn CGGetEventTapList(max: u32, list: *mut EventTapInformation, count: *mut u32) -> i32;
+}
+
+fn event_mask(types: &[CGEventType]) -> u64 {
+    types.iter().fold(0, |mask, ty| mask | (1u64 << (*ty as u32)))
+}
+
+/// The tap among `taps` that can drop or hold a HID-posted event of `mask`:
+/// enabled, active (options 0, not listen-only), on every process's events
+/// (not a per-process tap), and owned by another process.
+fn foreign_active_tap_in(taps: &[EventTapInformation], own_pid: i32, mask: u64) -> Option<i32> {
+    taps.iter()
+        .find(|tap| {
+            tap.enabled
+                && tap.options == 0
+                && tap.process_being_tapped == 0
+                && tap.tapping_process != own_pid
+                && tap.events_of_interest & mask != 0
+        })
+        .map(|tap| tap.tapping_process)
+}
+
+/// The pid of another process holding an enabled, active global event tap
+/// on any of `mask`'s events (Handy, Karabiner, BetterTouchTool...). Such a
+/// tap sees, and can drop or hold, a HID-posted event; pid-posted events
+/// bypass it. The list is a snapshot: a tap made after it is missed (the
+/// HID passage check still catches what it does).
+pub fn foreign_active_tap(mask: u64) -> Option<i32> {
+    let mut list = [EventTapInformation::default(); 128];
+    let mut count = 0u32;
+    // SAFETY: the list holds 128 records and CGGetEventTapList writes at most `max`.
+    if unsafe { CGGetEventTapList(list.len() as u32, list.as_mut_ptr(), &mut count) } != 0 {
+        return None;
+    }
+    foreign_active_tap_in(&list[..(count as usize).min(list.len())], std::process::id() as i32, mask)
+}
+
+/// How a foreground click was sent.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ForegroundClick {
+    /// At the HID tap, and the system passed it on past every session tap.
+    Hid(HidPassage),
+    /// To the target pid with its window fields, because `tap_owner` holds an
+    /// active tap on left clicks that could drop or hold a HID click.
+    PidAroundTap { tap_owner: i32 },
+}
+
+/// The foreground click primitive, run inside the exact-window activation
+/// guard (`with_foreground_pointer_activation`), after the occlusion check.
+/// Decided before dispatch: a plain left click goes to the pid when another
+/// process holds an active tap on left clicks (native Computer Use always
+/// posts clicks to the pid); everything else is a HID click whose passage is
+/// confirmed ([`click_at_xy_desktop_inner`]).
+#[allow(clippy::too_many_arguments)]
+pub fn foreground_click(
+    pid: i32,
+    wid: u32,
+    (x, y): (f64, f64),
+    (wx, wy): (f64, f64),
+    count: usize,
+    button: &str,
+    modifiers: &[&str],
+) -> anyhow::Result<ForegroundClick> {
+    if button == "left" && modifiers.is_empty() {
+        let left = event_mask(&[CGEventType::LeftMouseDown, CGEventType::LeftMouseUp]);
+        if let Some(tap_owner) = foreign_active_tap(left) {
+            // The pointer goes to the target as on the HID route, so apps
+            // that read it see it there.
+            move_cursor_desktop(x, y)?;
+            click_at_xy_with_window_local(
+                pid, x, y, wx, wy, wid, count.max(1), &[], WindowClickDelivery::Foreground,
+            )?;
+            return Ok(ForegroundClick::PidAroundTap { tap_owner });
+        }
+    }
+    click_at_xy_desktop_inner(x, y, count, button, modifiers, false).map(ForegroundClick::Hid)
 }
 
 /// Move the real hardware cursor to a logical desktop point.
@@ -320,7 +654,7 @@ pub fn scroll_wheel_desktop(
 /// used only by approved, bounded setup flows after an accessibility element
 /// has proven the exact target point and window.
 pub fn click_at_xy_desktop_preserving_cursor(x: f64, y: f64) -> anyhow::Result<()> {
-    click_at_xy_desktop_inner(x, y, 1, "left", &[], true)
+    click_at_xy_desktop_inner(x, y, 1, "left", &[], true).map(drop)
 }
 
 extern "C" {
@@ -427,9 +761,9 @@ fn click_at_xy_inner(
                 CGMouseButton::Left,
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(down) failed"))?;
-            if flags != CGEventFlags::CGEventFlagNull {
-                down.set_flags(flags);
-            }
+            // Always stamp the requested flags: the HID-state source would
+            // otherwise carry whatever modifiers the user physically holds.
+            down.set_flags(flags);
 
             post_mouse_event_with_mode(
                 pid,
@@ -454,9 +788,9 @@ fn click_at_xy_inner(
                 CGMouseButton::Left,
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(up) failed"))?;
-            if flags != CGEventFlags::CGEventFlagNull {
-                up.set_flags(flags);
-            }
+            // Always stamp the requested flags: the HID-state source would
+            // otherwise carry whatever modifiers the user physically holds.
+            up.set_flags(flags);
 
             post_mouse_event_with_mode(
                 pid,
@@ -2192,4 +2526,91 @@ mod tests {
             CGEventFlags::CGEventFlagCommand.bits() | CGEventFlags::CGEventFlagShift.bits();
         assert_eq!(&modifiers[1..], [expected, expected]);
     }
+
+    fn tap(options: u32, mask: u64, owner: i32, tapped: i32, enabled: bool) -> EventTapInformation {
+        EventTapInformation {
+            options,
+            events_of_interest: mask,
+            tapping_process: owner,
+            process_being_tapped: tapped,
+            enabled,
+            ..Default::default()
+        }
+    }
+
+    /// The record matches CGEventTapInformation's C layout (48 bytes).
+    #[test]
+    fn event_tap_information_has_the_c_layout() {
+        assert_eq!(std::mem::size_of::<EventTapInformation>(), 48);
+        assert_eq!(std::mem::offset_of!(EventTapInformation, events_of_interest), 16);
+        assert_eq!(std::mem::offset_of!(EventTapInformation, enabled), 32);
+    }
+
+    /// Only another process's enabled, active, global tap on the click's own
+    /// events can drop or hold a HID click (Handy's mask is 0x6001c1e).
+    #[test]
+    fn only_a_foreign_active_global_tap_on_the_buttons_counts() {
+        let left = event_mask(&[CGEventType::LeftMouseDown, CGEventType::LeftMouseUp]);
+        assert_eq!(left, 0b110);
+        let handy = 0x600_1c1e;
+        let own = 10;
+        assert_eq!(foreign_active_tap_in(&[tap(0, handy, 77, 0, true)], own, left), Some(77));
+        // Listen-only, disabled, per-process, own, or not on these events.
+        assert_eq!(foreign_active_tap_in(&[tap(1, handy, 77, 0, true)], own, left), None);
+        assert_eq!(foreign_active_tap_in(&[tap(0, handy, 77, 0, false)], own, left), None);
+        assert_eq!(foreign_active_tap_in(&[tap(0, handy, 77, 55, true)], own, left), None);
+        assert_eq!(foreign_active_tap_in(&[tap(0, handy, own, 0, true)], own, left), None);
+        assert_eq!(foreign_active_tap_in(&[tap(0, 1 << 10, 77, 0, true)], own, left), None);
+        // A keyboard-only tap among others does not hide the mouse one.
+        let taps = [tap(0, 1 << 10, 66, 0, true), tap(1, handy, 88, 0, true), tap(0, handy, 77, 0, true)];
+        assert_eq!(foreign_active_tap_in(&taps, own, left), Some(77));
+    }
+
+    /// The passage rule over the HID and combined-session counters, from the
+    /// VM B measurements: no tap passes at once; a tap holding each event
+    /// 300 ms leaves the click pending until it releases both; a dropping
+    /// tap leaves it pending; counters that never show the click say nothing.
+    #[test]
+    fn hid_passage_follows_the_session_counters() {
+        let at = |hid: [u32; 2], session: [u32; 2]| ButtonCounters {
+            hid: [hid[0], hid[1], 7, 7, 3, 3],
+            session: [session[0], session[1], 7, 7, 3, 3],
+        };
+        let left = [0, 1];
+        let none = [0; 6];
+        let base = at([100, 100], [95, 95]);
+        assert_eq!(hid_passage(base, at([101, 101], [96, 96]), none, left, 1), HidPassage::Passed);
+        assert_eq!(hid_passage(base, at([101, 101], [95, 95]), none, left, 1), HidPassage::Pending);
+        assert_eq!(hid_passage(base, at([101, 101], [96, 95]), none, left, 1), HidPassage::Pending);
+        assert_eq!(hid_passage(base, at([101, 100], [95, 95]), none, left, 1), HidPassage::Unmeasured);
+        // Two pairs (a double click); a user's click in the same window
+        // counts on both sides once it passes.
+        assert_eq!(hid_passage(base, at([102, 102], [97, 97]), none, left, 2), HidPassage::Passed);
+        assert_eq!(hid_passage(base, at([103, 103], [97, 97]), none, left, 2), HidPassage::Pending);
+        assert_eq!(hid_passage(base, at([103, 103], [98, 98]), none, left, 2), HidPassage::Passed);
+        // Counters wrap.
+        let wrap = at([u32::MAX, u32::MAX], [u32::MAX, u32::MAX]);
+        assert_eq!(hid_passage(wrap, at([0, 0], [0, 0]), none, left, 1), HidPassage::Passed);
+        // An earlier held click released now must not read as this one
+        // passing: its two events are owed first.
+        let owed = [1, 1, 0, 0, 0, 0];
+        assert_eq!(hid_passage(base, at([101, 101], [96, 96]), owed, left, 1), HidPassage::Pending);
+        assert_eq!(hid_passage(base, at([101, 101], [97, 97]), owed, left, 1), HidPassage::Passed);
+        // A held right button event holds a left click behind it.
+        let mut right_held = at([101, 101], [96, 96]);
+        right_held.hid[2] += 1;
+        assert_eq!(hid_passage(base, right_held, none, left, 1), HidPassage::Pending);
+    }
+
+    /// Outstanding events since a base: entered minus passed, per type.
+    #[test]
+    fn outstanding_counts_entered_but_not_passed() {
+        let base = ButtonCounters { hid: [10; 6], session: [8; 6] };
+        let mut now = base;
+        now.hid[0] += 2;
+        now.session[0] += 1;
+        now.session[1] += 3; // more passed than entered: earlier history, not owed
+        assert_eq!(now.outstanding_since(base), [1, 0, 0, 0, 0, 0]);
+    }
+
 }

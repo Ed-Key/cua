@@ -1049,6 +1049,8 @@ pub fn with_foreground_assist(
     target_wid: u32,
     body: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
+    // An earlier click still held by an event tap would land on this target.
+    crate::input::mouse::await_no_click_in_flight();
     let set_front = match set_front_process_fn() {
         Some(f) => f,
         None => {
@@ -1098,12 +1100,26 @@ pub fn with_foreground_assist(
 
     let result = body();
 
-    if prev_ok && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before) {
+    if prev_ok
+        && !click_may_be_in_flight(&result)
+        && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before)
+    {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
     result?;
     Ok(true)
+}
+
+/// A HID click an event tap still holds would land on whatever app is in
+/// front when it is released, so the target must stay there: this action's
+/// own click, or an earlier one still unresolved.
+fn click_may_be_in_flight<T>(result: &anyhow::Result<T>) -> bool {
+    result
+        .as_ref()
+        .err()
+        .is_some_and(|e| e.is::<crate::input::mouse::ClickNotConfirmed>())
+        || crate::input::mouse::click_in_flight()
 }
 
 /// How long a foreground action waits for an inline editor it may have
@@ -1229,13 +1245,15 @@ fn settle_attached_sheet(pid: libc::pid_t, window_id: u32) {
 /// currently frontmost. The short settles keep the target frontmost until
 /// WindowServer has routed both sides of the key chord, then restore the prior
 /// process even when the action fails.
-pub fn with_foreground_hid_activation(
+pub fn with_foreground_hid_activation<T>(
     target_pid: libc::pid_t,
     target_wid: u32,
-    action: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let set_front = set_front_process_fn()
         .ok_or_else(|| anyhow::anyhow!("foreground HID delivery is unavailable"))?;
+    // An earlier click still held by an event tap would land on this target.
+    crate::input::mouse::await_no_click_in_flight();
 
     let mut prev_psn = [0u8; 8];
     let prev_ok = get_front_process_fn()
@@ -1288,7 +1306,10 @@ pub fn with_foreground_hid_activation(
     let result = action();
     std::thread::sleep(std::time::Duration::from_millis(40));
 
-    if prev_ok && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before) {
+    if prev_ok
+        && !click_may_be_in_flight(&result)
+        && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before)
+    {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
     }
 
@@ -1481,12 +1502,12 @@ fn ensure_topmost_at(pid: libc::pid_t, window_id: u32, point: (f64, f64)) -> any
 /// [`with_foreground_hid_activation`] for a pointer event at screen `point`:
 /// after activation the exact window must be topmost there (raised if
 /// needed), or nothing is sent and the error is a [`TargetOccluded`].
-pub fn with_foreground_pointer_activation(
+pub fn with_foreground_pointer_activation<T>(
     target_pid: libc::pid_t,
     target_wid: u32,
     point: (f64, f64),
-    action: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     with_foreground_pointer_gesture(target_pid, target_wid, &[point], action)
 }
 
@@ -1499,20 +1520,31 @@ pub fn with_foreground_pointer_activation(
 /// every path out of here. While the user's hands are on such a panel the
 /// gesture waits, and past the bound nothing is sent and the error is a
 /// [`crate::pip::PipHeldByUser`].
-pub fn with_foreground_pointer_gesture(
+pub fn with_foreground_pointer_gesture<T>(
     target_pid: libc::pid_t,
     target_wid: u32,
     path: &[(f64, f64)],
-    action: impl FnOnce() -> anyhow::Result<()>,
-) -> anyhow::Result<()> {
+    action: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
     let point = *path
         .first()
         .ok_or_else(|| anyhow::anyhow!("a pointer gesture needs a point"))?;
-    let _aside = crate::pip::step_aside(path)?;
-    with_foreground_hid_activation(target_pid, target_wid, || {
+    let aside = crate::pip::step_aside(path)?;
+    let result = with_foreground_hid_activation(target_pid, target_wid, || {
         ensure_topmost_at(target_pid, target_wid, point)?;
         action()
-    })
+    });
+    if click_may_be_in_flight(&result) {
+        // A panel back over the point would take a late release: keep it
+        // aside until the click is through or counts as dropped.
+        std::thread::spawn(move || {
+            while crate::input::mouse::click_in_flight() {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            drop(aside);
+        });
+    }
+    result
 }
 
 fn preserves_exact_existing_focus(
@@ -1529,7 +1561,31 @@ fn preserves_exact_existing_focus(
 
 #[cfg(test)]
 mod tests {
-    use super::{focus_with_ax_fallback, make_key_window_record, preserves_exact_existing_focus};
+    use super::{
+        click_may_be_in_flight, focus_with_ax_fallback, make_key_window_record,
+        preserves_exact_existing_focus,
+    };
+
+    /// The front app is not restored while a click may still be held by an
+    /// event tap, however the error reached the guard.
+    #[test]
+    fn a_click_not_confirmed_keeps_the_target_in_front() {
+        let held = || -> anyhow::Result<()> {
+            Err(crate::input::mouse::ClickNotConfirmed {
+                tap_owner: Some(42),
+                waited: std::time::Duration::from_millis(1000),
+            }
+            .into())
+        };
+        let through = || -> anyhow::Result<()> {
+            held()?;
+            Ok(())
+        };
+        assert!(click_may_be_in_flight(&held()));
+        assert!(click_may_be_in_flight(&through()));
+        assert!(!click_may_be_in_flight(&anyhow::Result::<()>::Ok(())));
+        assert!(!click_may_be_in_flight(&anyhow::Result::<()>::Err(anyhow::anyhow!("occluded"))));
+    }
 
     #[test]
     fn make_key_records_address_only_the_exact_window() {

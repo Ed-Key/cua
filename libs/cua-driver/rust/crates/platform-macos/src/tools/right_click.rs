@@ -278,6 +278,13 @@ impl Tool for RightClickTool {
             .with_structured(serde_json::json!({
                 "path": super::pixel_route::path_label(route), "verified": false, "effect": "unverifiable"
             })),
+            Ok(Err(e)) if e.is::<crate::input::mouse::ClickNotConfirmed>() => {
+                super::pixel_route::not_confirmed(
+                    &format!("The right-click at ({screen_x:.1}, {screen_y:.1})"),
+                    &e,
+                )
+                .expect("checked by the guard")
+            }
             Ok(Err(e)) if route == super::pixel_route::PixelClickRoute::ForegroundHid => {
                 super::pixel_route::foreground_unavailable(
                     "Right-click",

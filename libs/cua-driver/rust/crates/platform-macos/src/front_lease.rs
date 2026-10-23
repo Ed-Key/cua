@@ -646,7 +646,12 @@ fn hand_back(lease: &Lease) -> Result<bool, Step> {
     let _intentional = crate::focus_steal::allow_intentional_activation(lease.previous);
     let mut again = Step::Restore;
     let switched = crate::input::skylight::restore_front_pid(lease.previous, &mut || {
+        // Re-checked at the last moment: a click held by an event tap would
+        // land on the app brought back, so the lease is kept for later.
         again = read_and_decide(lease);
+        if crate::input::mouse::click_in_flight() {
+            again = Step::Keep;
+        }
         again == Step::Restore
     });
     if again != Step::Restore {
@@ -659,6 +664,11 @@ fn hand_back(lease: &Lease) -> Result<bool, Step> {
 /// say where the front is. `None` when no lease is held. Blocking (AX reads
 /// and a short confirm poll).
 pub(crate) fn settle() -> Option<String> {
+    // A click an event tap still holds would land on the app brought back:
+    // the lease waits for a later settle.
+    if crate::input::mouse::click_in_flight() {
+        return None;
+    }
     let mut held = lease();
     let lease = held.as_ref()?;
     let (target, previous, hold) = (lease.target, lease.previous, lease.hold);

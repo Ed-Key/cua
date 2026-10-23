@@ -564,6 +564,13 @@ impl Tool for ClickTool {
                      (desktop scope; not driver-verified)."
                 ))
                 .with_structured(serde_json::json!({ "path": "cgevent_hid", "verified": false, "effect": "unverifiable" })),
+                Ok(Err(e)) if e.is::<crate::input::mouse::ClickNotConfirmed>() => ToolResult::text(format!(
+                    "Screen-absolute {button_label} at screen-point ({sx:.0},{sy:.0}) not confirmed: \
+                     {e}. Read the screen before repeating it."
+                ))
+                .with_structured(serde_json::json!({
+                    "path": "cgevent_hid", "verified": false, "effect": "unverifiable"
+                })),
                 Ok(Err(e)) => ToolResult::error(format!("desktop-scope click failed: {e}")),
                 Err(e) => ToolResult::error(format!("task error: {e}")),
             };
@@ -622,6 +629,12 @@ impl Tool for ClickTool {
             button_str
         };
         let count = args.u64_or("count", 1) as usize;
+        // A pixel click of count 0 is no click: the HID route used to post
+        // one pair and the pid route none, both reporting success.
+        if count == 0 && x.is_some() {
+            return ToolResult::error("click.count must be at least 1.")
+                .with_structured(serde_json::json!({ "code": "invalid_arguments" }));
+        }
         let from_zoom = args.bool_or("from_zoom", false);
         let debug_image_out = args.opt_str("debug_image_out");
         let modifiers: Vec<String> = args.str_array("modifier");
@@ -830,6 +843,13 @@ impl Tool for ClickTool {
                          (background CGEvent; not driver-verified — confirm via screenshot)."
                     ))
                     .with_structured(serde_json::json!({ "path": "cgevent", "verified": false, "effect": "unverifiable" })),
+                    Ok(Err(e)) if e.is::<crate::input::mouse::ClickNotConfirmed>() => {
+                        super::pixel_route::not_confirmed(
+                            &format!("The middle-click at element [{idx}] center"),
+                            &e,
+                        )
+                        .expect("checked by the guard")
+                    }
                     Ok(Err(e)) if super::pixel_route::is_pointer_refusal(&e) => {
                         super::pixel_route::foreground_unavailable("Middle-click", wid, &e)
                     }
@@ -1175,6 +1195,10 @@ impl Tool for ClickTool {
                         });
                     }
                     ToolResult::text(msg).with_structured(structured)
+                }
+                Ok(Err(e)) if e.is::<crate::input::mouse::ClickNotConfirmed>() => {
+                    super::pixel_route::not_confirmed(&format!("The click on element [{idx}]"), &e)
+                        .expect("checked by the guard")
                 }
                 Ok(Err(e)) if super::pixel_route::is_pointer_refusal(&e) => {
                     super::pixel_route::foreground_unavailable("click", wid, &e)
@@ -1643,55 +1667,48 @@ impl Tool for ClickTool {
                 "click.pixel",
                 || async move {
                     crate::background_mutation::spawn_blocking(move || {
-                        let do_click = move || -> anyhow::Result<()> {
+                        let do_click = move || -> anyhow::Result<Option<crate::input::mouse::ForegroundClick>> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
-                            if route == PixelClickRoute::ForegroundHid {
+                            if let (PixelClickRoute::ForegroundHid, Some(wid)) = (route, window_id) {
                                 // Warp the hardware pointer to the mapped global
-                                // point and post at the HID tap. The pointer stays
-                                // at the target, as on Windows and X11, so apps that
-                                // read the pointer when handling the event see it.
-                                return crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                                    screen_x,
-                                    screen_y,
+                                // point and post at the HID tap (or to the pid
+                                // around another process's active tap). The pointer
+                                // stays at the target, as on Windows and X11, so apps
+                                // that read the pointer when handling the event see it.
+                                return crate::input::mouse::foreground_click(
+                                    pid,
+                                    wid,
+                                    (screen_x, screen_y),
+                                    (win_local_x, win_local_y),
                                     count,
                                     &button_kind,
                                     &m,
-                                );
+                                )
+                                .map(Some);
                             }
-                            match button_kind.as_str() {
-                                "right" => {
-                                    if let Some(wid) = window_id {
-                                        return crate::input::mouse::right_click_at_xy_with_window_local(
-                                            pid, screen_x, screen_y, win_local_x, win_local_y, wid, &m,
-                                        );
-                                    }
-                                    crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m)
-                                }
-                                "middle" => {
-                                    if let Some(_wid) = window_id {
-                                        return crate::input::mouse::middle_click_at_xy_with_window_local(
-                                            pid, screen_x, screen_y, win_local_x, win_local_y, &m,
-                                        );
-                                    }
-                                    crate::input::mouse::middle_click_at_xy(pid, screen_x, screen_y, &m)
-                                }
+                            let sent: anyhow::Result<()> = match (button_kind.as_str(), window_id) {
+                                ("right", Some(wid)) => crate::input::mouse::right_click_at_xy_with_window_local(
+                                    pid, screen_x, screen_y, win_local_x, win_local_y, wid, &m,
+                                ),
+                                ("right", None) => crate::input::mouse::right_click_at_xy(pid, screen_x, screen_y, &m),
+                                ("middle", Some(_)) => crate::input::mouse::middle_click_at_xy_with_window_local(
+                                    pid, screen_x, screen_y, win_local_x, win_local_y, &m,
+                                ),
+                                ("middle", None) => crate::input::mouse::middle_click_at_xy(pid, screen_x, screen_y, &m),
                                 // "left" (default) or anything else — preserve legacy left-click path.
-                                _ => {
-                                    // When we know the window_id, use the targeted primitive so
-                                    // foreground delivery can stamp window-local coordinates and
-                                    // background delivery can retain the translated screen point
-                                    // while adding Chromium routing fields (f40, f51, f58, f91, f92).
-                                    if let Some(wid) = window_id {
-                                        return crate::input::mouse::click_at_xy_with_window_local(
-                                            pid, screen_x, screen_y,
-                                            win_local_x, win_local_y,
-                                            wid, count, &m,
-                                            crate::input::mouse::WindowClickDelivery::from_foreground(fg),
-                                        );
-                                    }
-                                    crate::input::mouse::click_at_xy(pid, screen_x, screen_y, count, &m)
-                                }
-                            }
+                                // When we know the window_id, use the targeted primitive so
+                                // foreground delivery can stamp window-local coordinates and
+                                // background delivery can retain the translated screen point
+                                // while adding Chromium routing fields (f40, f51, f58, f91, f92).
+                                (_, Some(wid)) => crate::input::mouse::click_at_xy_with_window_local(
+                                    pid, screen_x, screen_y,
+                                    win_local_x, win_local_y,
+                                    wid, count, &m,
+                                    crate::input::mouse::WindowClickDelivery::from_foreground(fg),
+                                ),
+                                (_, None) => crate::input::mouse::click_at_xy(pid, screen_x, screen_y, count, &m),
+                            };
+                            sent.map(|()| None)
                         };
                         // Foreground rung: front the exact window → HID click →
                         // restore the prior front process. The HID tap has no
@@ -1738,23 +1755,30 @@ impl Tool for ClickTool {
                 _ => "click",
             };
             match result {
-                Ok(Ok(())) => {
+                Ok(Ok(sent)) => {
                     let target = if route == PixelClickRoute::ForegroundHid {
                         format!("at screen-point ({screen_x:.0},{screen_y:.0}) for pid {pid}")
                     } else {
                         format!("to pid {pid}")
                     };
+                    let (note, path) = super::pixel_route::sent_note(route, sent);
                     ToolResult::text(format!(
-                        "✅ Posted {button_label} {target} ({}).{}",
-                        super::pixel_route::delivery_note(route),
+                        "✅ Posted {button_label} {target} ({note}).{}",
                         changes.result_suffix()
                     ))
                     .with_structured(serde_json::json!({
-                        "path": super::pixel_route::path_label(route),
+                        "path": path,
                         "verified": false,
                         "effect": "unverifiable",
                         "focus_without_raise": focus_without_raise
                     }))
+                }
+                Ok(Err(e)) if e.is::<crate::input::mouse::ClickNotConfirmed>() => {
+                    super::pixel_route::not_confirmed(
+                        &format!("The {button_label} at screen-point ({screen_x:.0},{screen_y:.0}) for pid {pid}"),
+                        &e,
+                    )
+                    .expect("checked by the guard")
                 }
                 Ok(Err(e)) if route == PixelClickRoute::ForegroundHid => {
                     super::pixel_route::foreground_unavailable(
