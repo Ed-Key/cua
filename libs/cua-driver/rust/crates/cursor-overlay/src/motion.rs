@@ -23,8 +23,10 @@ pub struct MotionConfig {
     pub arc_flow: f64,
     /// Post-arrival spring damping: 1.0 = critical, 0.3 = bouncy. [0.3, 1.0]
     pub spring: f64,
-    /// Main glide duration in milliseconds — used only as a legacy override.
-    /// When <= 0 the render engine uses speed-based timing instead. [50, 5000]
+    /// Glide duration in milliseconds. A positive value fixes every move at
+    /// this duration under `native` or `fixed` timing; 0 gives the style's
+    /// own timing (speed-based for `classic`, 1430 ms for `fixed`).
+    /// [0, 5000]
     pub glide_duration_ms: f64,
     /// Post-click dwell in milliseconds. [0, 5000]
     pub dwell_after_click_ms: f64,
@@ -61,7 +63,10 @@ impl Default for MotionConfig {
             arc_size: 0.25,
             arc_flow: 0.0,
             spring: 0.72,
-            glide_duration_ms: 0.0, // 0 = speed-based mode
+            // Fork default: a near-instant 120 ms glide at any distance.
+            // Pointer actions wait for the cursor to arrive, and the
+            // speed-based glide took up to about 2 s on long moves.
+            glide_duration_ms: 120.0,
             dwell_after_click_ms: 80.0,
             // The shared agent idle timeout (presence drops an idle agent then too).
             idle_hide_ms: cua_driver_core::agent_cursor::default_idle_hide_ms(),

@@ -136,6 +136,7 @@ impl Tool for TypeTextTool {
 
     async fn invoke(&self, args: Value) -> ToolResult {
         use cua_driver_core::tool_args::ArgsExt;
+        let deadline = posting_deadline();
         if args.opt_str("scope").as_deref() == Some("desktop")
             && args.get("pid").is_none()
             && args.get("window_id").is_none()
@@ -148,19 +149,30 @@ impl Tool for TypeTextTool {
                 cua_driver_core::text_sanitize::strip_trailing_agent_protocol_tags(&input.text)
                     .into_owned();
             let delay_ms = args.u64_or("delay_ms", 30).min(200);
-            if let Some(refusal) = synthesis_preflight(
-                TextDeliveryRoute::UnicodeSynthesis,
-                text.chars().count(),
+            let char_count = text.chars().count();
+            if let Some(refusal) = preflight_before(
+                TextDeliveryRoute::DesktopUnicode,
+                char_count,
                 delay_ms,
+                deadline,
             ) {
                 return synthesis_refusal_result("hid", &refusal, AxAttempt::NotAttempted);
             }
             let result = tokio::task::spawn_blocking(move || {
-                crate::input::keyboard::type_text_global(&text, delay_ms)
+                let posted =
+                    crate::input::keyboard::type_text_global(&text, delay_ms, Some(deadline))?;
+                if posted < char_count {
+                    // Let what was posted land before answering.
+                    std::thread::sleep(DELIVERY_DRAIN_TIMEOUT);
+                }
+                Ok::<_, anyhow::Error>(posted)
             })
             .await;
             return match result {
-                Ok(Ok(())) => {
+                Ok(Ok(posted)) if posted < char_count => {
+                    stopped_at_deadline_result(Some("hid"), posted, char_count)
+                }
+                Ok(Ok(_)) => {
                     ToolResult::text(format!(
                         "{UNCONFIRMED_PREFIX} the keys were sent to the frontmost desktop \
                          application, which gives no read-back here. {OBSERVE_BEFORE_RETYPING}"
@@ -278,7 +290,20 @@ impl Tool for TypeTextTool {
                     Err(refusal_result) => return refusal_result,
                 }
             }
+            None if !delivery_mode.is_foreground() => (
+                Some(super::acquire_background_mutation(pid).await),
+                BackgroundKeyboardPolicy::Allowed,
+            ),
             _ => (None, BackgroundKeyboardPolicy::Allowed),
+        };
+
+        let background_focus = if delivery_mode.is_foreground() {
+            None
+        } else {
+            match self.state.background_focus(&args, pid) {
+                Ok(controller) => Some(controller),
+                Err(error) => return error,
+            }
         };
         // Preparing an unfocused native field (an AXFocused write on the exact
         // addressed element) is an exact-window mutation like set_value's, not
@@ -297,6 +322,12 @@ impl Tool for TypeTextTool {
                 .is_ok(),
             _ => matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed),
         };
+
+        // A call that waited past its posting deadline (queued behind other
+        // input) sends nothing, not even the focus click.
+        if std::time::Instant::now() >= deadline {
+            return stopped_at_deadline_result(None, 0, text.chars().count());
+        }
 
         // ── px form: focus by pixel-click, then type into the focused element ──
         // Pass x,y (no element_token) for an *element px action*: pixel-click the
@@ -329,6 +360,7 @@ impl Tool for TypeTextTool {
                 from_zoom,
                 false,
                 _mutation_lease.as_ref(),
+                background_focus.as_ref(),
             )
             .await
             {
@@ -414,12 +446,17 @@ impl Tool for TypeTextTool {
 
         let blocking_policy = keyboard_policy.clone();
         let native_guard = element_guard.clone();
+        let delivery_lease = _mutation_lease.clone();
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
             "type_text.AXSelectedText",
             || async move {
                 tokio::task::spawn_blocking(move || {
+                    // The route consumes its handle before returning. Keep one
+                    // owner until the delivery lease has been released.
+                    let _focus_owner = background_focus.clone();
+                    let _delivery_lease = delivery_lease;
                     let _native_guard = native_guard;
                     type_text_blocking(
                         pid,
@@ -428,10 +465,12 @@ impl Tool for TypeTextTool {
                         delay_ms,
                         is_terminal_target,
                         KeyboardRoute {
+                            background_focus,
                             delivery_mode,
                             window_id,
                             keyboard_policy: blocking_policy,
                             prepare_native_text,
+                            deadline,
                         },
                     )
                 })
@@ -457,6 +496,9 @@ impl Tool for TypeTextTool {
                 refusal,
                 ax_attempt,
             })) => return synthesis_refusal_result(path, &refusal, ax_attempt),
+            Ok(Ok(TypeTextDelivery::StoppedAtDeadline { path, posted_chars })) => {
+                return stopped_at_deadline_result(path, posted_chars, char_count);
+            }
             Ok(Ok(TypeTextDelivery::Typed(outcome))) => Ok(Ok(outcome)),
             Ok(Err(error)) => Ok(Err(error)),
             Err(error) => Err(error),
@@ -674,20 +716,33 @@ const OBSERVE_BEFORE_RETYPING: &str = "Read the field or take a screenshot befor
      retyping can duplicate the edit.";
 
 // The daemon transport has a 120-second request deadline. Character synthesis
-// is synchronous and costs at least one 8ms key-down gap plus either the
-// requested delay or an 8ms key-up gap per character. Keep the complete
-// scheduled synthesis sleeps + read-back estimate within 100 seconds, reserving
-// 20 seconds for event construction/posting, routing, focus assistance,
-// queueing, response serialization, and transport.
+// is synchronous, so a type_text call that synthesizes characters must answer
+// within 100 seconds of reaching the registry (before any queueing), reserving
+// 20 seconds for routing, focus assistance, observation, response
+// serialization, and transport. Posting stops at the posting deadline (the
+// budget less the read-back drain) at a character boundary; the preflight
+// refuses up front what its estimate says cannot finish before it. The
+// deadline is the guarantee when the estimate is wrong: a daemon whose sleeps
+// run long (launchd throttling) or that is stalled.
 // Atomic AX writes are deliberately excluded: their cost does not scale per
 // character and a single write remains the preferred route for large text.
 const SYNTHESIS_BUDGET_MS: u64 = 100_000;
-const KEY_DOWN_GAP_MS: u64 = 8;
+
+/// When this call must stop posting characters.
+fn posting_deadline() -> std::time::Instant {
+    cua_driver_core::tool::current_dispatch_received_at().unwrap_or_else(std::time::Instant::now)
+        + std::time::Duration::from_millis(SYNTHESIS_BUDGET_MS)
+        - DELIVERY_DRAIN_TIMEOUT
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TextDeliveryRoute {
     AtomicAx,
-    UnicodeSynthesis,
+    /// PID-routed Unicode keys (`type_text_with_delay`).
+    PidUnicode,
+    /// Desktop-scope Unicode keys through the HID queue (`type_text_global`).
+    DesktopUnicode,
+    /// Physical US-keyboard transitions (`type_text_physical_global`).
     PhysicalSynthesis,
 }
 
@@ -697,6 +752,7 @@ struct SynthesisRefusal {
     estimated_duration_ms: u64,
     per_character_ms: u64,
     max_chunk_chars: usize,
+    budget_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -718,33 +774,47 @@ impl AxAttempt {
     }
 }
 
+/// The sleeps each synthesis route schedules per character (keyboard.rs) at
+/// key gap `gap_ms`.
+fn per_character_ms(route: TextDeliveryRoute, delay_ms: u64, gap_ms: u64) -> u64 {
+    match route {
+        TextDeliveryRoute::AtomicAx => 0,
+        // The gap after the key-down, then the delay (the gap when it is 0).
+        TextDeliveryRoute::PidUnicode => {
+            gap_ms.saturating_add(if delay_ms > 0 { delay_ms } else { gap_ms })
+        }
+        // The gap after the key-down, then max(delay, gap).
+        TextDeliveryRoute::DesktopUnicode => gap_ms.saturating_add(delay_ms.max(gap_ms)),
+        // The gap after each of up to four events (Shift down, key down, key
+        // up, Shift up: a payload-independent worst case), then whatever the
+        // delay adds beyond one gap.
+        TextDeliveryRoute::PhysicalSynthesis => gap_ms
+            .saturating_mul(4)
+            .saturating_add(delay_ms.saturating_sub(gap_ms)),
+    }
+}
+
+/// Refuse synthesis whose estimate (scheduled sleeps plus the read-back
+/// drain) exceeds `budget_ms`, the time left to answer.
 fn synthesis_preflight(
     route: TextDeliveryRoute,
     requested_chars: usize,
     delay_ms: u64,
+    gap_ms: u64,
+    budget_ms: u64,
 ) -> Option<SynthesisRefusal> {
     if route == TextDeliveryRoute::AtomicAx {
         return None;
     }
-    let per_character_ms = match route {
-        TextDeliveryRoute::AtomicAx => unreachable!(),
-        // PID-routed and desktop Unicode paths post one key-down and one
-        // key-up, sleeping 8ms after the down and max(delay, 8) after the up.
-        TextDeliveryRoute::UnicodeSynthesis => {
-            KEY_DOWN_GAP_MS.saturating_add(delay_ms.max(KEY_DOWN_GAP_MS))
-        }
-        // Physical HID may need Shift down/up around each printable key. Use
-        // that four-event worst case for a payload-independent safe bound.
-        TextDeliveryRoute::PhysicalSynthesis => 24u64.saturating_add(delay_ms.max(8)),
-    };
+    let per_character_ms = per_character_ms(route, delay_ms, gap_ms);
     let drain_ms = DELIVERY_DRAIN_TIMEOUT.as_millis() as u64;
     let estimated_duration_ms = (requested_chars as u64)
         .saturating_mul(per_character_ms)
         .saturating_add(drain_ms);
-    if estimated_duration_ms <= SYNTHESIS_BUDGET_MS {
+    if estimated_duration_ms <= budget_ms {
         return None;
     }
-    let max_chunk_chars = SYNTHESIS_BUDGET_MS
+    let max_chunk_chars = budget_ms
         .saturating_sub(drain_ms)
         .checked_div(per_character_ms)
         .unwrap_or_default() as usize;
@@ -753,7 +823,57 @@ fn synthesis_preflight(
         estimated_duration_ms,
         per_character_ms,
         max_chunk_chars,
+        budget_ms,
     })
+}
+
+/// [`synthesis_preflight`] at the daemon's key gap, with the time left before
+/// `deadline` (plus the drain that follows it) as the budget.
+fn preflight_before(
+    route: TextDeliveryRoute,
+    requested_chars: usize,
+    delay_ms: u64,
+    deadline: std::time::Instant,
+) -> Option<SynthesisRefusal> {
+    let left =
+        deadline.saturating_duration_since(std::time::Instant::now()) + DELIVERY_DRAIN_TIMEOUT;
+    synthesis_preflight(
+        route,
+        requested_chars,
+        delay_ms,
+        crate::input::keyboard::key_gap().as_millis() as u64,
+        left.as_millis() as u64,
+    )
+}
+
+/// Posting stopped at the posting deadline, at a character boundary, so the
+/// call could still answer. Posted is not landed, and resending the whole
+/// text would duplicate what did land: the next step is to read the field.
+fn stopped_at_deadline_result(
+    path: Option<&'static str>,
+    posted_chars: usize,
+    requested_chars: usize,
+) -> ToolResult {
+    let mut structured = serde_json::json!({
+        "code": "type_text_stopped_at_deadline",
+        "effect": if posted_chars == 0 { "none" } else { "partial" },
+        "requested_chars": requested_chars,
+        "posted_chars": posted_chars,
+        "retryable": false,
+        "escalation": {
+            "recommended": "verify_state",
+            "reason": "Posted keys are not proof that they landed. Read the field, then type only what is missing.",
+        },
+    });
+    if let Some(path) = path {
+        structured["path"] = serde_json::json!(path);
+    }
+    ToolResult::error(format!(
+        "type_text stopped at its time limit after posting {posted_chars} of {requested_chars} \
+         character(s), so that it could still answer. Read the field, then type only what is \
+         missing; do not resend the whole text."
+    ))
+    .with_structured(structured)
 }
 
 fn synthesis_refusal_result(
@@ -787,7 +907,7 @@ fn synthesis_refusal_result(
         "effect": effect,
         "requested_chars": refusal.requested_chars,
         "estimated_duration_ms": refusal.estimated_duration_ms,
-        "synthesis_budget_ms": SYNTHESIS_BUDGET_MS,
+        "synthesis_budget_ms": refusal.budget_ms,
         "per_character_ms": refusal.per_character_ms,
         "max_chunk_chars": refusal.max_chunk_chars,
         "synthesized_chars": 0,
@@ -805,13 +925,13 @@ fn synthesis_refusal_result(
             refusal.requested_chars,
             refusal.estimated_duration_ms,
             refusal.per_character_ms,
-            SYNTHESIS_BUDGET_MS,
+            refusal.budget_ms,
             refusal.max_chunk_chars,
         )
     } else {
         format!(
             "type_text did not synthesize character events because {} characters require an estimated {}ms, exceeding the {}ms budget; the preceding atomic AX attempt was unverifiable, so re-read the target before retrying",
-            refusal.requested_chars, refusal.estimated_duration_ms, SYNTHESIS_BUDGET_MS,
+            refusal.requested_chars, refusal.estimated_duration_ms, refusal.budget_ms,
         )
     };
     ToolResult::error(message).with_structured(structured)
@@ -1076,6 +1196,20 @@ enum TypeTextDelivery {
         refusal: SynthesisRefusal,
         ax_attempt: AxAttempt,
     },
+    /// Key posting reached the posting deadline after `posted_chars`; no
+    /// path when the deadline had passed before any route ran.
+    StoppedAtDeadline {
+        path: Option<&'static str>,
+        posted_chars: usize,
+    },
+}
+
+/// What the keystroke rung saw: the read-back after every character was
+/// posted (verified, delivered_chars, unconfirmed), or a stop at the posting
+/// deadline after this many characters.
+enum Keyed {
+    ReadBack(bool, Option<usize>, Option<Unconfirmed>),
+    Stopped(usize),
 }
 
 /// Decide the keyboard policy for a window-addressed background `type_text`.
@@ -1313,29 +1447,6 @@ pub(super) fn target_in_web_area(
     ))
 }
 
-/// Whether a background key may prepare this target's window as web content.
-/// Positively classified web content qualifies. An unreadable window focus
-/// qualifies only in a Chromium-family process: a background Electron window
-/// often cannot report its focused element, but a native window with that gap
-/// must not receive synthetic focus changes.
-pub(super) fn target_is_web_content(
-    pid: i32,
-    element_ptr_and_idx: Option<(usize, Option<usize>)>,
-    window_id: Option<u32>,
-) -> bool {
-    match classify_target_web_area(pid, element_ptr_and_idx, window_id) {
-        WebAreaClassification::WebContent => true,
-        WebAreaClassification::WindowFocusUnavailable => {
-            crate::browser::electron_js::ElectronJs::is_electron(pid)
-                || crate::browser::platform::is_chromium(
-                    &crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
-                    &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
-                )
-        }
-        WebAreaClassification::NonWebContent | WebAreaClassification::Incomplete => false,
-    }
-}
-
 /// Whether the window's own focused element is proven to sit outside web
 /// content (an unreadable or unavailable focus is not proof).
 pub(super) fn window_focus_is_proven_native(pid: i32, window_id: u32) -> bool {
@@ -1429,17 +1540,11 @@ fn classify_target_web_area(
     }
 }
 
-/// Type via CGEvent keystrokes at the current insertion point, then verify by
-/// read-back. `type_text` is deliberately non-idempotent: it must never clear
-/// an existing value merely because AX cannot read that value back.
-fn cgevent_type_verified(
+fn focus_typing_element(
     pid: i32,
-    text: &str,
-    delay_ms: u64,
-    readback: &TypingReadback,
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
-    settle_ms: u64,
-) -> anyhow::Result<(bool, Option<usize>, Option<Unconfirmed>)> {
+    reapply: bool,
+) -> anyhow::Result<()> {
     // Focus the target element so the keystrokes land in IT. Critical in
     // foreground mode: a freshly-fronted window's keyboard focus may be on the
     // search box or nowhere, so without this the text goes into the void (or the
@@ -1452,10 +1557,30 @@ fn cgevent_type_verified(
     // read-back covers apps that install their responder slightly late.
     if let Some((ptr, _)) = element_ptr_and_idx {
         let _ = crate::input::ax_actions::focus_element(ptr);
-        if settle_ms > 0 && !crate::input::ax_actions::is_element_focused(pid, ptr) {
+        if reapply && !crate::input::ax_actions::is_element_focused(pid, ptr) {
             std::thread::sleep(FOCUS_REAPPLY_DELAY);
             let _ = crate::input::ax_actions::focus_element(ptr);
         }
+    }
+    Ok(())
+}
+
+/// Type via CGEvent keystrokes at the current insertion point, then verify by
+/// read-back. `type_text` is deliberately non-idempotent: it must never clear
+/// an existing value merely because AX cannot read that value back.
+fn cgevent_type_verified(
+    pid: i32,
+    recipient_pid: i32,
+    text: &str,
+    delay_ms: u64,
+    readback: &TypingReadback,
+    element_ptr_and_idx: Option<(usize, Option<usize>)>,
+    settle_ms: u64,
+    deadline: std::time::Instant,
+) -> anyhow::Result<Keyed> {
+    // Background field focus ran inside protected preparation before recipient resolution.
+    if settle_ms > 0 {
+        focus_typing_element(pid, element_ptr_and_idx, true)?;
     }
     // First-keystroke settle (foreground rung only — caller passes `settle_ms > 0`).
     // Even once the window is front and the element focused, the surface isn't
@@ -1469,7 +1594,33 @@ fn cgevent_type_verified(
     // Focus preparation can change the caret or selection. Sample immediately
     // before posting input, while retaining the original target identity.
     let (before, selection) = readback.sample();
-    crate::input::keyboard::type_text_with_delay(pid, text, delay_ms)?;
+    if settle_ms == 0 {
+        crate::ax::keyboard_target::validate_recipient(
+            pid,
+            readback.window_id,
+            readback.element.map(|(ptr, _)| ptr).or_else(|| {
+                readback
+                    .focused
+                    .as_ref()
+                    .map(|element| element.as_CFTypeRef() as usize)
+            }),
+            recipient_pid,
+        )?;
+    }
+    let posted = crate::input::keyboard::type_text_with_delay(
+        recipient_pid,
+        text,
+        delay_ms,
+        Some(deadline),
+    )?;
+    if posted < text.chars().count() {
+        // Let what was posted land before answering, so the read that
+        // follows sees all of it. A fixed wait, not an AX read-back: a
+        // target that stops answering AX must not stretch the answer past
+        // the transport deadline.
+        std::thread::sleep(DELIVERY_DRAIN_TIMEOUT);
+        return Ok(Keyed::Stopped(posted));
+    }
 
     // CGEvent posting is asynchronous with respect to the renderer. In
     // particular, Chromium can acknowledge the posting process while a long
@@ -1494,7 +1645,7 @@ fn cgevent_type_verified(
         Some(0) if !text.is_empty() => Some(Unconfirmed::from_readback(before.as_deref(), readback.read().as_deref())),
         Some(_) => None,
     };
-    Ok((verified, delivered_chars, unconfirmed))
+    Ok(Keyed::ReadBack(verified, delivered_chars, unconfirmed))
 }
 
 #[cfg(test)]
@@ -1588,12 +1739,15 @@ fn await_typed_progress_with_selection(
 /// How `type_text_blocking` may deliver: the requested mode, the addressed
 /// window, and the background keyboard policy decided for it.
 struct KeyboardRoute {
+    background_focus: Option<Arc<crate::background_focus::HostController>>,
     delivery_mode: super::DeliveryMode,
     window_id: Option<u32>,
     keyboard_policy: BackgroundKeyboardPolicy,
     /// Whether an unfocused addressed native field may be focused (an
     /// exact-window AXFocused write) before the AX insertion.
     prepare_native_text: bool,
+    /// When key posting must stop (see [`posting_deadline`]).
+    deadline: std::time::Instant,
 }
 
 /// Best-effort-background ladder for `type_text`.
@@ -1616,11 +1770,21 @@ fn type_text_blocking(
     route: KeyboardRoute,
 ) -> anyhow::Result<TypeTextDelivery> {
     let KeyboardRoute {
+        background_focus,
         delivery_mode,
         window_id,
         keyboard_policy,
         prepare_native_text,
+        deadline,
     } = route;
+    // The worker can start after the deadline (the async side checked it
+    // before its last await): then nothing is sent, on any route.
+    if std::time::Instant::now() >= deadline {
+        return Ok(TypeTextDelivery::StoppedAtDeadline {
+            path: None,
+            posted_chars: 0,
+        });
+    }
     // A background terminal insert has no semantic AX rung: when the
     // exact-target decision restricted this request to semantic-only, there is
     // nothing safe to run, and an over-budget synthesis cannot start. Both
@@ -1629,10 +1793,11 @@ fn type_text_blocking(
         if let BackgroundKeyboardPolicy::SemanticOnly(refusal) = &keyboard_policy {
             return Ok(TypeTextDelivery::Refused(refusal.clone()));
         }
-        if let Some(refusal) = synthesis_preflight(
-            TextDeliveryRoute::UnicodeSynthesis,
+        if let Some(refusal) = preflight_before(
+            TextDeliveryRoute::PidUnicode,
             text.chars().count(),
             delay_ms,
+            deadline,
         ) {
             return Ok(TypeTextDelivery::SynthesisRefused {
                 path: PATH_KEY_EVENTS,
@@ -1658,14 +1823,15 @@ fn type_text_blocking(
             return Ok(TypeTextDelivery::CatalystNeedsFocus);
         }
         let screen_sharing_target = crate::input::keyboard::is_screen_sharing_pid(pid);
-        if let Some(refusal) = synthesis_preflight(
+        if let Some(refusal) = preflight_before(
             if screen_sharing_target {
                 TextDeliveryRoute::PhysicalSynthesis
             } else {
-                TextDeliveryRoute::UnicodeSynthesis
+                TextDeliveryRoute::PidUnicode
             },
             text.chars().count(),
             delay_ms,
+            deadline,
         ) {
             return Ok(TypeTextDelivery::SynthesisRefused {
                 path: if window_id.is_some() {
@@ -1689,14 +1855,16 @@ fn type_text_blocking(
         let do_type = || {
             cgevent_type_verified(
                 pid,
+                pid,
                 text,
                 delay_ms,
                 &readback,
                 element_ptr_and_idx,
                 foreground_settle_ms,
+                deadline,
             )
         };
-        let ((verified, delivered_chars, unconfirmed), fronted) = match window_id {
+        let (keyed, fronted) = match window_id {
             Some(wid) if screen_sharing_target => {
                 // Screen Sharing forwards physical HID transitions to the
                 // guest. PID-routed Unicode events all carry keycode 0 (the A
@@ -1704,6 +1872,7 @@ fn type_text_blocking(
                 // turn Cmd+V into plain "v". The explicit foreground rung may
                 // safely use the global HID queue while the exact target is
                 // guarded and restored.
+                let mut posted = 0;
                 crate::input::skylight::with_foreground_hid_activation(
                     pid as libc::pid_t,
                     wid,
@@ -1713,17 +1882,32 @@ fn type_text_blocking(
                                 foreground_settle_ms,
                             ));
                         }
-                        crate::input::keyboard::type_text_physical_global(text, delay_ms)
+                        posted = crate::input::keyboard::type_text_physical_global(
+                            text,
+                            delay_ms,
+                            Some(deadline),
+                        )?;
+                        if posted < text.chars().count() {
+                            // Let what was posted land while the target is
+                            // still in front.
+                            std::thread::sleep(DELIVERY_DRAIN_TIMEOUT);
+                        }
+                        Ok(())
                     },
                 )?;
-                ((false, None, Some(Unconfirmed::NoReadback)), true)
+                let keyed = if posted < text.chars().count() {
+                    Keyed::Stopped(posted)
+                } else {
+                    Keyed::ReadBack(false, None, Some(Unconfirmed::NoReadback))
+                };
+                (keyed, true)
             }
             Some(wid) => {
                 // Front → type → restore. The closure returns the read-back
                 // result; with_foreground_assist returns whether it actually
                 // fronted (Ok(false) when the fronting SPIs are unavailable —
                 // the keystrokes still ran, just as background input).
-                let mut typed_delivery = (false, None, None);
+                let mut typed_delivery = Keyed::ReadBack(false, None, None);
                 let fronted = crate::input::skylight::with_foreground_assist(
                     pid as libc::pid_t,
                     wid,
@@ -1736,6 +1920,21 @@ fn type_text_blocking(
             }
             // No window to front — best-effort background keystrokes instead.
             None => (do_type()?, false),
+        };
+        let (verified, delivered_chars, unconfirmed) = match keyed {
+            Keyed::ReadBack(verified, delivered_chars, unconfirmed) => {
+                (verified, delivered_chars, unconfirmed)
+            }
+            Keyed::Stopped(posted_chars) => {
+                return Ok(TypeTextDelivery::StoppedAtDeadline {
+                    path: Some(if fronted {
+                        PATH_KEY_EVENTS_FG
+                    } else {
+                        PATH_KEY_EVENTS
+                    }),
+                    posted_chars,
+                });
+            }
         };
         let (delivered_chars, unconfirmed) = web_zero_is_unknown(
             delivered_chars,
@@ -1766,14 +1965,38 @@ fn type_text_blocking(
             "type_text: pid {pid} is a terminal emulator; skipping AX value-set, \
              using CGEvent key-event synthesis"
         );
-        let (verified, delivered_chars, unconfirmed) = cgevent_type_verified(
+        let prepare_element = || focus_typing_element(pid, element_ptr_and_idx, false);
+        let keyed = super::with_background_key_recipient(
+            background_focus.as_ref(),
             pid,
-            text,
-            delay_ms,
-            &readback,
-            element_ptr_and_idx,
-            /*settle_ms=*/ 0,
+            window_id,
+            element_ptr_and_idx.map(|(ptr, _)| ptr),
+            element_ptr_and_idx
+                .map(|_| &prepare_element as &dyn Fn() -> anyhow::Result<()>),
+            |recipient_pid| {
+                cgevent_type_verified(
+                    pid,
+                    recipient_pid,
+                    text,
+                    delay_ms,
+                    &readback,
+                    element_ptr_and_idx,
+                    /*settle_ms=*/ 0,
+                    deadline,
+                )
+            },
         )?;
+        let (verified, delivered_chars, unconfirmed) = match keyed {
+            Keyed::ReadBack(verified, delivered_chars, unconfirmed) => {
+                (verified, delivered_chars, unconfirmed)
+            }
+            Keyed::Stopped(posted_chars) => {
+                return Ok(TypeTextDelivery::StoppedAtDeadline {
+                    path: Some(PATH_KEY_EVENTS),
+                    posted_chars,
+                });
+            }
+        };
         return Ok(TypeTextDelivery::Typed(TypeTextOutcome {
             detail: format!(" via CGEvent (terminal emulator, {delay_ms}ms delay)"),
             path: PATH_KEY_EVENTS,
@@ -1857,7 +2080,19 @@ fn type_text_blocking(
             && !target_in_web_area(pid, element_ptr_and_idx, window_id)
             && !crate::input::ax_actions::is_element_focused(pid, element as usize)
         {
-            crate::input::ax_actions::focus_element(element as usize)?;
+            let prepare_element = || crate::input::ax_actions::focus_element(element as usize);
+            if matches!(keyboard_policy, BackgroundKeyboardPolicy::Allowed) {
+                background_focus
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("background keyboard focus has no runtime owner"))?
+                    .prepare_with(window_id, || {
+                        super::validate_prepared_element_window(window_id, Some(element as usize))?;
+                        prepare_element()
+                    })?;
+            } else {
+                // Semantic-only requests retain their exact-field AX authority.
+                prepare_element()?;
+            }
             // A focus write is not proof of focus or insertion. Sample the
             // retained target and its current selection, then verify normally.
             (readback.before, readback.before_range) = readback.sample();
@@ -1953,10 +2188,11 @@ fn type_text_blocking(
         return Ok(TypeTextDelivery::Refused(refusal));
     }
 
-    if let Some(refusal) = synthesis_preflight(
-        TextDeliveryRoute::UnicodeSynthesis,
+    if let Some(refusal) = preflight_before(
+        TextDeliveryRoute::PidUnicode,
         text.chars().count(),
         delay_ms,
+        deadline,
     ) {
         return Ok(TypeTextDelivery::SynthesisRefused {
             path: PATH_KEY_EVENTS,
@@ -1970,21 +2206,38 @@ fn type_text_blocking(
     // insert-at-cursor semantics.
     // Web content: select the exact window as its process's key window for
     // the keystrokes and their readback, without raising it.
-    let (verified, delivered_chars, unconfirmed) = super::with_background_web_key_window(
+    let prepare_element = || focus_typing_element(pid, element_ptr_and_idx, false);
+    let keyed = super::with_background_key_recipient(
+        background_focus.as_ref(),
         pid,
         window_id,
         element_ptr_and_idx.map(|(ptr, _)| ptr),
-        || {
+        element_ptr_and_idx
+            .map(|_| &prepare_element as &dyn Fn() -> anyhow::Result<()>),
+        |recipient_pid| {
             cgevent_type_verified(
                 pid,
+                recipient_pid,
                 text,
                 delay_ms,
                 &readback,
                 element_ptr_and_idx,
                 /*settle_ms=*/ 0,
+                deadline,
             )
         },
     )?;
+    let (verified, delivered_chars, unconfirmed) = match keyed {
+        Keyed::ReadBack(verified, delivered_chars, unconfirmed) => {
+            (verified, delivered_chars, unconfirmed)
+        }
+        Keyed::Stopped(posted_chars) => {
+            return Ok(TypeTextDelivery::StoppedAtDeadline {
+                path: Some(PATH_KEY_EVENTS),
+                posted_chars,
+            });
+        }
+    };
     let (delivered_chars, unconfirmed) = web_zero_is_unknown(
         delivered_chars,
         unconfirmed,
@@ -2525,10 +2778,12 @@ mod tests {
             0,
             /*is_terminal_target=*/ true,
             KeyboardRoute {
+                background_focus: None,
                 delivery_mode: super::super::DeliveryMode::Background,
                 window_id: Some(7),
                 keyboard_policy: BackgroundKeyboardPolicy::SemanticOnly(refusal.clone()),
                 prepare_native_text: false,
+                deadline: posting_deadline(),
             },
         );
         match r {
@@ -2544,7 +2799,7 @@ mod tests {
         fixture.hide_value_after_write();
         // A large payload guarantees the old fallback stops at its synthesis
         // budget without posting real key events from this unit test.
-        let text = "x".repeat(6_500);
+        let text = "x".repeat(OVERSIZED_CHARS);
         let result = type_text_blocking(
             -9876,
             &text,
@@ -2552,10 +2807,12 @@ mod tests {
             0,
             false,
             KeyboardRoute {
+                background_focus: None,
                 delivery_mode: super::super::DeliveryMode::Background,
                 window_id: Some(42),
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 prepare_native_text: true,
+                deadline: posting_deadline(),
             },
         )
         .expect("accepted AX write must retain an uncertain outcome");
@@ -2576,7 +2833,7 @@ mod tests {
         use super::super::DeliveryMode::{Background, Foreground};
         // The oversized payload stops the key rung at its synthesis budget, so
         // reaching it posts no real key events from this unit test.
-        let text = "x".repeat(6_500);
+        let text = "x".repeat(OVERSIZED_CHARS);
         for (mode, addressed, focused) in [
             (Background, false, true),
             (Background, true, true),
@@ -2598,10 +2855,12 @@ mod tests {
                 0,
                 false,
                 KeyboardRoute {
+                    background_focus: None,
                     delivery_mode: mode,
                     window_id: Some(42),
                     keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                     prepare_native_text: true,
+                    deadline: posting_deadline(),
                 },
             )
             .expect("a Catalyst target is decided before any input");
@@ -2635,9 +2894,14 @@ mod tests {
         assert!(text.contains("Nothing was sent"), "{text}");
     }
 
+    /// Over the synthesis budget at any supported key gap (2 ms is the
+    /// smallest: 4 ms per character at delay 0), so reaching the key rung
+    /// refuses instead of posting real key events from a unit test.
+    const OVERSIZED_CHARS: usize = 30_000;
+
     #[test]
     fn oversized_synthesis_is_refused_before_the_terminal_event_path() {
-        let text = "x".repeat(6_500);
+        let text = "x".repeat(OVERSIZED_CHARS);
         let result = type_text_blocking(
             -1,
             &text,
@@ -2645,10 +2909,12 @@ mod tests {
             0,
             /*is_terminal_target=*/ true,
             KeyboardRoute {
+                background_focus: None,
                 delivery_mode: super::super::DeliveryMode::Background,
                 window_id: None,
                 keyboard_policy: BackgroundKeyboardPolicy::Allowed,
                 prepare_native_text: true,
+                deadline: posting_deadline(),
             },
         )
         .expect("preflight refusal must not attempt the invalid pid");
@@ -2662,20 +2928,106 @@ mod tests {
         };
         assert_eq!(path, PATH_KEY_EVENTS);
         assert_eq!(ax_attempt, AxAttempt::NotAttempted);
-        assert_eq!(refusal.requested_chars, 6_500);
-        assert_eq!(refusal.estimated_duration_ms, 106_000);
-        assert_eq!(refusal.max_chunk_chars, 6_125);
+        assert_eq!(refusal.requested_chars, OVERSIZED_CHARS);
+        assert_eq!(
+            refusal.estimated_duration_ms,
+            OVERSIZED_CHARS as u64 * refusal.per_character_ms + 2_000
+        );
+        // The budget is what is left of the call's deadline when it runs.
+        assert!(refusal.budget_ms <= SYNTHESIS_BUDGET_MS, "{refusal:?}");
+        assert_eq!(
+            refusal.max_chunk_chars as u64,
+            (refusal.budget_ms - 2_000) / refusal.per_character_ms
+        );
     }
 
     #[test]
     fn synthesis_preflight_accepts_the_exact_transport_safe_boundary() {
-        assert!(synthesis_preflight(TextDeliveryRoute::UnicodeSynthesis, 6_125, 0).is_none());
-        assert!(synthesis_preflight(TextDeliveryRoute::UnicodeSynthesis, 6_126, 0).is_some());
+        let budget = SYNTHESIS_BUDGET_MS;
+        assert!(synthesis_preflight(TextDeliveryRoute::PidUnicode, 6_125, 0, 8, budget).is_none());
+        assert!(synthesis_preflight(TextDeliveryRoute::PidUnicode, 6_126, 0, 8, budget).is_some());
+    }
+
+    /// Incident 3: the estimate used a hardcoded 8 ms gap, so with
+    /// CUA_DRIVER_KEY_GAP_MS=100 it accepted 1344 characters as 53 s and the
+    /// loop ran 188 s, past the client's deadline.
+    #[test]
+    fn the_preflight_paces_each_route_at_the_configured_gap() {
+        use TextDeliveryRoute::*;
+        assert_eq!(per_character_ms(PidUnicode, 30, 8), 38);
+        assert_eq!(per_character_ms(PidUnicode, 0, 8), 16);
+        assert_eq!(per_character_ms(PidUnicode, 30, 100), 130);
+        assert_eq!(per_character_ms(DesktopUnicode, 30, 100), 200);
+        assert_eq!(per_character_ms(DesktopUnicode, 0, 8), 16);
+        assert_eq!(per_character_ms(PhysicalSynthesis, 30, 8), 54);
+        assert_eq!(per_character_ms(PhysicalSynthesis, 0, 100), 400);
+
+        assert!(synthesis_preflight(PidUnicode, 1344, 30, 8, SYNTHESIS_BUDGET_MS).is_none());
+        let refusal = synthesis_preflight(PidUnicode, 1344, 30, 100, SYNTHESIS_BUDGET_MS)
+            .expect("1344 characters at a 100 ms gap cannot finish in the budget");
+        assert_eq!(refusal.per_character_ms, 130);
+        assert_eq!(refusal.estimated_duration_ms, 1344 * 130 + 2_000);
+        assert_eq!(refusal.max_chunk_chars, 98_000 / 130);
+        // Time spent queued shrinks the budget: with only the drain left,
+        // nothing fits.
+        let late = synthesis_preflight(PidUnicode, 2, 30, 8, 2_000).expect("no time to post");
+        assert_eq!(late.max_chunk_chars, 0);
+    }
+
+    /// Row 4: time spent queued counts against the deadline. A call whose
+    /// posting deadline has passed sends nothing.
+    #[test]
+    fn a_spent_deadline_sends_nothing() {
+        let result = type_text_blocking(
+            -1,
+            "hi",
+            None,
+            30,
+            /*is_terminal_target=*/ true,
+            KeyboardRoute {
+                background_focus: None,
+                delivery_mode: super::super::DeliveryMode::Background,
+                window_id: None,
+                keyboard_policy: BackgroundKeyboardPolicy::Allowed,
+                prepare_native_text: true,
+                deadline: std::time::Instant::now(),
+            },
+        )
+        .expect("the stop must not touch the invalid pid");
+        let TypeTextDelivery::StoppedAtDeadline { path, posted_chars } = result else {
+            panic!("a spent deadline must stop before any route runs");
+        };
+        assert_eq!((path, posted_chars), (None, 0));
+    }
+
+    #[test]
+    fn a_stop_at_the_deadline_says_posted_and_asks_for_a_read_first() {
+        let result = stopped_at_deadline_result(Some(PATH_KEY_EVENTS), 612, 1344);
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.as_ref().unwrap();
+        assert_eq!(data["code"], "type_text_stopped_at_deadline");
+        assert_eq!(data["effect"], "partial");
+        assert_eq!(data["posted_chars"], 612);
+        assert_eq!(data["requested_chars"], 1344);
+        assert_eq!(data["retryable"], false);
+        assert_eq!(data["path"], PATH_KEY_EVENTS);
+        assert!(data.get("retry_from_character").is_none());
+        let text = summary_of(&result);
+        assert!(text.contains("posting 612 of 1344"), "{text}");
+        assert!(text.contains("Read the field"), "{text}");
+
+        let none = stopped_at_deadline_result(None, 0, 5);
+        let data = none.structured_content.as_ref().unwrap();
+        assert_eq!(data["effect"], "none");
+        assert!(data.get("path").is_none());
     }
 
     #[test]
     fn large_atomic_ax_payloads_are_not_subject_to_the_synthesis_budget() {
-        assert!(synthesis_preflight(TextDeliveryRoute::AtomicAx, 100_000, 200).is_none());
+        let budget = SYNTHESIS_BUDGET_MS;
+        assert!(
+            synthesis_preflight(TextDeliveryRoute::AtomicAx, 100_000, 200, 8, budget).is_none()
+        );
         assert_eq!(
             typed_progress(Some(""), Some(&"x".repeat(11_500)), &"x".repeat(11_500)),
             TypedProgress::Complete,
@@ -2685,7 +3037,8 @@ mod tests {
 
     #[test]
     fn refusal_diagnostics_distinguish_safe_chunking_from_indeterminate_ax() {
-        let refusal = synthesis_preflight(TextDeliveryRoute::UnicodeSynthesis, 6_500, 0)
+        let budget = SYNTHESIS_BUDGET_MS;
+        let refusal = synthesis_preflight(TextDeliveryRoute::PidUnicode, 6_500, 0, 8, budget)
             .expect("payload must exceed the synthesis budget");
         let safe = synthesis_refusal_result(PATH_KEY_EVENTS, &refusal, AxAttempt::Rejected);
         let safe = safe.structured_content.expect("structured refusal");

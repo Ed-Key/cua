@@ -278,7 +278,7 @@ pub fn walk_tree_budgeted(
         // A window-scoped walk of an app that is still launching waits, within
         // the caller's budget, for the app to answer AX (see `super::launch`).
         let mut launch_wait = LaunchWait::new(budget.time_limit());
-        let (top_level, walk_these) = loop {
+        let (top_level, walk_these, top_level_read_failed) = loop {
             // Chromium/Electron apps (Arc, VS Code, Electron shells) ship their
             // web-content AX tree OFF and only build it once an assistive client
             // asks for it. Without this, the first walk of such an app returns an
@@ -293,7 +293,7 @@ pub fn walk_tree_budgeted(
             let attempt_started = Instant::now();
             super::enablement::ensure_chromium_ax_enabled(pid, app_elem);
 
-            let top_level = copy_top_level(app_elem, pid, window_id);
+            let (top_level, top_level_read_failed) = copy_top_level(app_elem, pid, window_id);
 
             // Scope: keep non-window children (menu bar) + the target window —
             // but ONLY once the target window has actually been identified. When
@@ -302,7 +302,7 @@ pub fn walk_tree_budgeted(
             // a window", which is how issue #2237 returned menu bars as panels.
             let Some(wid) = window_id else {
                 let walk = top_level.clone();
-                break (top_level, walk);
+                break (top_level, walk, top_level_read_failed);
             };
             let decision = scope_top_level(&top_level, pid, wid);
             if matches!(decision.scope, WindowScope::AxUnresolved { .. }) {
@@ -325,8 +325,9 @@ pub fn walk_tree_budgeted(
                 .map(|&index| top_level[index])
                 .collect();
             window_scope = Some(decision.scope);
-            break (top_level, walk);
+            break (top_level, walk, top_level_read_failed);
         };
+        sightings.child_read_failed |= top_level_read_failed;
 
         // Walk each top-level child at depth 0.
         for child in walk_these {
@@ -448,13 +449,13 @@ unsafe fn copy_top_level(
     app_elem: AXUIElementRef,
     pid: i32,
     window_id: Option<u32>,
-) -> Vec<AXUIElementRef> {
-    let mut top_level = copy_children(app_elem);
+) -> (Vec<AXUIElementRef>, bool) {
+    let (mut top_level, children_error) = copy_children_error(app_elem);
     // A requested window on another Space is absent from AXWindows; the
     // `_including` variant recovers it by exact CGWindowID.
-    let from_windows = match window_id {
-        Some(wid) => copy_ax_windows_including(app_elem, pid, wid),
-        None => copy_ax_windows(app_elem),
+    let (from_windows, windows_read_failed) = match window_id {
+        Some(wid) => copy_ax_windows_including_reporting(app_elem, pid, wid),
+        None => copy_ax_windows_reporting(app_elem),
     };
     for w in from_windows {
         // AXChildren and AXWindows can return different proxy pointers for
@@ -471,7 +472,7 @@ unsafe fn copy_top_level(
             CFRelease(w as CFTypeRef);
         }
     }
-    top_level
+    (top_level, children_error.is_some() || windows_read_failed)
 }
 
 /// Decide which of `top_level` a walk scoped to `wid` covers.

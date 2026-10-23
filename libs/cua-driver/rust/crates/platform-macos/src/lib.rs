@@ -18,6 +18,8 @@ pub mod ax;
 #[cfg(target_os = "macos")]
 mod background_mutation;
 #[cfg(target_os = "macos")]
+mod background_focus;
+#[cfg(target_os = "macos")]
 pub mod browser;
 #[cfg(target_os = "macos")]
 pub mod capture;
@@ -28,11 +30,15 @@ pub mod focus_guard;
 #[cfg(target_os = "macos")]
 pub mod focus_steal;
 #[cfg(target_os = "macos")]
+mod focus_event_tap;
+#[cfg(target_os = "macos")]
 mod front_lease;
 #[cfg(target_os = "macos")]
 pub mod history;
 #[cfg(target_os = "macos")]
 pub mod input;
+#[cfg(target_os = "macos")]
+mod logical_focus;
 #[cfg(target_os = "macos")]
 mod permission_observation;
 #[cfg(target_os = "macos")]

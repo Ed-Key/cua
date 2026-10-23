@@ -43,8 +43,9 @@ const MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a menu command gets to open an inline editor (File > Rename)
 /// before the previous front app is brought back.
 const INLINE_EDIT_WAIT: Duration = Duration::from_millis(1200);
-/// How long a press made from behind gets to show its effect before the
-/// foreground route runs the command instead.
+/// How long a press made from behind gets to show its effect. A press that
+/// shows none is not made again: the command may finish later (Slack's
+/// Paste, TextEdit's New), and pressing it in front as well ran it twice.
 const BACKGROUND_EFFECT_WAIT: Duration = Duration::from_millis(600);
 const BACKGROUND_POLL: Duration = Duration::from_millis(50);
 
@@ -542,26 +543,53 @@ fn choose_press(
 /// How a press made from behind ended.
 #[derive(Debug, PartialEq)]
 enum Background {
-    /// The command took effect: how it was pressed, what changed during the
-    /// wait, whether the read at the end still showed it, and whether the
-    /// app came to the front anyway (it activated itself).
-    Took {
+    /// The item was pressed from behind: how, what changed during the wait
+    /// (empty when nothing showed), whether the read at the end still
+    /// showed it, whether the app came to the front anyway (it activated
+    /// itself), and the error the press returned, if any (a menu item's
+    /// AXPress can report one and still run the command).
+    Pressed {
         press: Press,
         changed: Vec<&'static str>,
         lasted: bool,
         activated: bool,
+        error: Option<String>,
     },
-    /// Not pressed, or pressed with nothing changed: why the foreground
-    /// route runs, and whether the item was pressed from behind first.
-    Fallback { why: String, pressed: bool },
+    /// Not pressed: why the foreground route runs.
+    Skipped(String),
 }
 
 impl Background {
     fn skipped(why: impl Into<String>) -> Self {
-        Background::Fallback {
-            why: why.into(),
-            pressed: false,
-        }
+        Background::Skipped(why.into())
+    }
+}
+
+/// What the key-window run of a press from behind returned: the window
+/// could not be made key, a check before the press refused it, or the press
+/// was tried (its result, and what changed during the wait).
+type BackgroundRun =
+    anyhow::Result<Result<(Result<(), (String, bool)>, Vec<&'static str>), String>>;
+
+/// How a press from behind ended. It counts as pressed once it was sent,
+/// also when it returned an error or nothing changed; only a shortcut whose
+/// key-down was never posted counts as not pressed.
+fn verdict(ran: BackgroundRun, press: Press, lasted: bool, activated: bool) -> Background {
+    match ran {
+        Err(error) => Background::skipped(format!(
+            "the window could not be made key from behind ({error})"
+        )),
+        Ok(Err(why)) => Background::skipped(why),
+        Ok(Ok((Err((error, false)), _))) => Background::skipped(format!(
+            "the item's shortcut could not be sent from behind ({error})"
+        )),
+        Ok(Ok((sent, changed))) => Background::Pressed {
+            press,
+            changed,
+            lasted,
+            activated,
+            error: sent.err().map(|(error, _)| error),
+        },
     }
 }
 
@@ -667,8 +695,10 @@ const BACKGROUND_VERDICT_AFTER: Duration = Duration::from_millis(400);
 /// Run the final item of `path` without opening its menus or activating the
 /// app: the item is resolved through the closed menus, `window_id` is made
 /// the app's key window from behind (the selection background keys use) and
-/// read back as the app's focused window, and the press counts when a read
-/// within [`BACKGROUND_EFFECT_WAIT`] differs from two steady reads before it.
+/// read back as the app's focused window, and the result names what a read
+/// within [`BACKGROUND_EFFECT_WAIT`] showed changed against two steady reads
+/// before it (nothing, when the command shows its effect later or not at
+/// all: it is still pressed, and is not pressed again).
 fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) -> Background {
     // Finder ends a rename or a new folder's name field when it is not in
     // front, so its menu commands keep today's route, which keeps it in
@@ -750,16 +780,19 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                 std::thread::sleep(BACKGROUND_POLL);
                 let before = first.steady(&read());
                 pressed_at = Some(std::time::Instant::now());
+                // An error says whether the press was made anyway: an AX
+                // press was sent (menu items can report an error and still
+                // run the command), a shortcut once its key-down was posted.
                 let sent = match &press {
                     Press::Ax(action) => {
                         let error = perform_action(item, action);
                         (error == kAXErrorSuccess)
                             .then_some(())
-                            .ok_or(format!("AX error {error}"))
+                            .ok_or((format!("AX error {error}"), true))
                     }
                     Press::Keys { key, modifiers } => {
-                        crate::input::keyboard::hotkey(pid, key, modifiers)
-                            .map_err(|e| e.to_string())
+                        crate::input::keyboard::press_key_reporting_down(pid, key, modifiers)
+                            .map_err(|(error, down)| (error.to_string(), down))
                     }
                 };
                 // Wait with the window still key: a command that runs on a
@@ -802,36 +835,12 @@ fn press_in_background(pid: i32, window_id: u32, path: &[String], prior: i32) ->
                     CFRelease(app as CFTypeRef);
                 }
             }
-            let ms = BACKGROUND_EFFECT_WAIT.as_millis();
-            match ran {
-                Err(error) => Background::skipped(format!(
-                    "the window could not be made key from behind ({error})"
-                )),
-                Ok(Err(why)) => Background::skipped(why),
-                // Something changed: the command ran. It is not pressed again,
-                // also when the change is gone by the end (said in the result).
-                Ok(Ok((_, _, changed))) if !changed.is_empty() => Background::Took {
-                    press,
-                    changed,
-                    lasted,
-                    activated,
-                },
-                // The press returned an error and nothing changed: it may
-                // or may not have reached the app.
-                Ok(Ok((Err(error), _, _))) => Background::Fallback {
-                    why: format!(
-                        "the press from behind returned an error ({error}) and nothing changed"
-                    ),
-                    pressed: true,
-                },
-                Ok(Ok(_)) => Background::Fallback {
-                    why: format!(
-                        "nothing changed within {ms} ms after the press from behind ({})",
-                        press.words()
-                    ),
-                    pressed: true,
-                },
-            }
+            verdict(
+                ran.map(|ran| ran.map(|(sent, _, changed)| (sent, changed))),
+                press,
+                lasted,
+                activated,
+            )
         })();
         CFRelease(item as CFTypeRef);
         outcome
@@ -1028,15 +1037,17 @@ fn exact_window_is_ready(
 /// Which route ran the command.
 #[derive(Debug, PartialEq)]
 enum Ran {
-    /// Pressed from behind and a read showed its effect. `lasted`: the read
-    /// at the end still showed it; `activated`: the app came to the front
-    /// anyway; `restored`: the previous front app is front again.
+    /// Pressed from behind. `changed`: what a read during the wait showed
+    /// changed; `lasted`: the read at the end still showed it; `activated`:
+    /// the app came to the front anyway; `restored`: the previous front app
+    /// is front again; `error`: what the press returned, if an error.
     Background {
         press: Press,
         changed: Vec<&'static str>,
         lasted: bool,
         activated: bool,
         restored: bool,
+        error: Option<String>,
     },
     /// The target was activated for the menu action. `why`: why the press
     /// from behind was not used (`None` when the target was already in front
@@ -1072,18 +1083,82 @@ impl Ran {
     }
 }
 
+/// What the call does after the attempt from behind: `Ok` ends it with that
+/// route, `Err` runs the foreground route, for that reason. Once the item
+/// was pressed from behind the call ends, also when nothing showed or the
+/// press returned an error: the command may still run, and pressing it in
+/// front too can run it twice. `restore` confirms the previous front app is
+/// front again; it runs only when the app came to the front.
+fn after_background(outcome: Background, restore: impl FnOnce() -> bool) -> Result<Ran, String> {
+    match outcome {
+        Background::Skipped(why) => Err(why),
+        Background::Pressed {
+            press,
+            changed,
+            lasted,
+            activated,
+            error,
+        } => Ok(Ran::Background {
+            press,
+            changed,
+            lasted,
+            activated,
+            restored: !activated || restore(),
+            error,
+        }),
+    }
+}
+
 fn summary(ran: &Ran) -> String {
     match ran {
+        Ran::Background {
+            press,
+            changed,
+            activated,
+            restored,
+            error,
+            ..
+        } if changed.is_empty() => {
+            let mut text = format!(
+                "Pressed the menu item from behind (every step of the path resolved uniquely; {}",
+                press.words()
+            );
+            if let Some(error) = error {
+                text.push_str(&format!("; the press returned an error ({error})"));
+            }
+            if *activated {
+                text.push_str(&format!(
+                    "), but the app came to the front by itself during the command; {}",
+                    if *restored {
+                        "the previous front app is front again."
+                    } else {
+                        "the previous front app was not confirmed back in front."
+                    }
+                ));
+            } else {
+                text.push_str("): the app was not brought to the front.");
+            }
+            text.push_str(&format!(
+                " Nothing changed within {} ms after the press. The command may finish later, so it was not pressed again; read the window before repeating it, because repeating it can run it twice. What the command did is in the Outcome line.",
+                BACKGROUND_EFFECT_WAIT.as_millis()
+            ));
+            text
+        }
         Ran::Background {
             press,
             changed,
             lasted,
             activated,
             restored,
+            error,
         } => {
             let mut text = format!(
-                "Ran the menu command from behind (every step of the path resolved uniquely; {})",
-                press.words()
+                "Ran the menu command from behind (every step of the path resolved uniquely; {}{})",
+                press.words(),
+                error
+                    .as_ref()
+                    .map(|error| format!("; the press returned an error ({error})"))
+                    .unwrap_or_default()
             );
             if *activated {
                 text.push_str(&format!(
@@ -1208,28 +1283,16 @@ impl Tool for InvokeMenuTool {
             // then runs without the target coming forward.
             let mut why_foreground = None;
             if let Some(prior) = prior_frontmost.filter(|prior| *prior != pid) {
-                match press_in_background(pid, window_id, &path, prior) {
-                    Background::Took {
-                        press,
-                        changed,
-                        lasted,
-                        activated,
-                    } => {
-                        // The lease puts the previous app back when the target
-                        // activates itself; confirm it, and ask once more if not.
-                        let restored = !activated
-                            || crate::apps::confirm_front(prior)
-                            || (crate::apps::restore_prior_app(prior)
-                                && crate::apps::confirm_front(prior));
-                        return Ok(Ran::Background {
-                            press,
-                            changed,
-                            lasted,
-                            activated,
-                            restored,
-                        });
-                    }
-                    Background::Fallback { why, pressed } => why_foreground = Some((why, pressed)),
+                // The lease puts the previous app back when the target
+                // activates itself; confirm it, and ask once more if not.
+                let restore = || {
+                    crate::apps::confirm_front(prior)
+                        || (crate::apps::restore_prior_app(prior)
+                            && crate::apps::confirm_front(prior))
+                };
+                match after_background(press_in_background(pid, window_id, &path, prior), restore) {
+                    Ok(ran) => return Ok(ran),
+                    Err(why) => why_foreground = Some(why),
                 }
             }
             let prior_frontmost_window =
@@ -1274,16 +1337,11 @@ impl Tool for InvokeMenuTool {
             result
                 .map(|()| Ran::Foreground {
                     front: front_restored,
-                    why: why_foreground.as_ref().map(|(why, _)| why.clone()),
+                    why: why_foreground.clone(),
                     unhidden: hidden_before && app_hidden(pid) == Some(false),
                 })
                 .map_err(|error| match &why_foreground {
-                    Some((why, true)) => {
-                        format!("{error} (before this, the item was pressed from behind: {why})")
-                    }
-                    Some((why, false)) => {
-                        format!("{error} (it ran in the foreground because {why})")
-                    }
+                    Some(why) => format!("{error} (it ran in the foreground because {why})"),
                     None => error,
                 })
         })
@@ -1304,6 +1362,10 @@ impl Tool for InvokeMenuTool {
                 .evidence(ActionEvidence {
                     kind: EvidenceKind::NativeApiResult,
                     detail: match &ran {
+                        Ran::Background { changed, .. } if changed.is_empty() => format!(
+                            "Every menu hop resolved uniquely and the press from behind was made; no read within {} ms after it differed",
+                            BACKGROUND_EFFECT_WAIT.as_millis()
+                        ),
                         Ran::Background { .. } => "Every menu hop resolved uniquely and a read after the press from behind differed".into(),
                         Ran::Foreground { .. } => "Every menu hop resolved uniquely and AX accepted the final action".into(),
                     },
@@ -1529,6 +1591,7 @@ mod tests {
             lasted: true,
             activated: false,
             restored: true,
+            error: None,
         };
         assert!(behind.stayed_behind());
         assert_eq!(behind.transport(), ActionTransport::MacosCgEventPid);
@@ -1551,6 +1614,7 @@ mod tests {
             lasted: true,
             activated: true,
             restored: true,
+            error: None,
         };
         assert!(!came.stayed_behind());
         assert_eq!(came.transport(), ActionTransport::MacosAxAction);
@@ -1565,6 +1629,7 @@ mod tests {
             lasted: false,
             activated: true,
             restored: false,
+            error: None,
         };
         let text = summary(&lost);
         assert!(text.contains("not confirmed back in front"), "{text}");
@@ -1577,7 +1642,7 @@ mod tests {
         let fg = Ran::Foreground {
             front: Some(FrontAfter::Restored),
             why: Some(
-                "nothing changed within 600 ms after the press from behind (pressed it through accessibility)"
+                "the item was not found in its closed menu (some apps fill a menu only when it opens)"
                     .into(),
             ),
             unhidden: true,
@@ -1585,7 +1650,7 @@ mod tests {
         assert!(!fg.stayed_behind());
         let text = summary(&fg);
         assert!(
-            text.contains("It ran in the foreground because nothing changed"),
+            text.contains("It ran in the foreground because the item was not found"),
             "{text}"
         );
         assert!(
@@ -1608,6 +1673,173 @@ mod tests {
             text.contains("stays in front") && text.contains("inline edit"),
             "{text}"
         );
+    }
+
+    fn pressed(changed: Vec<&'static str>, activated: bool, error: Option<&str>) -> Background {
+        Background::Pressed {
+            press: Press::Keys {
+                key: "v".into(),
+                modifiers: vec!["cmd"],
+            },
+            changed,
+            lasted: true,
+            activated,
+            error: error.map(str::to_owned),
+        }
+    }
+
+    #[test]
+    fn a_press_from_behind_with_nothing_seen_is_not_pressed_again_in_front() {
+        // Slack's Paste: the text showed after the wait, and the foreground
+        // route pasted it a second time.
+        let ran = after_background(pressed(vec![], false, None), || {
+            panic!("the app never came to the front")
+        })
+        .expect("the press from behind ends the call");
+        assert!(ran.stayed_behind());
+        assert_eq!(ran.transport(), ActionTransport::MacosCgEventPid);
+        let text = summary(&ran);
+        assert!(
+            text.contains("from behind")
+                && text.contains("cmd+v")
+                && text.contains("600 ms")
+                && text.contains("may finish later")
+                && text.contains("read the window before repeating it")
+                && text.contains("twice")
+                && !text.contains("foreground"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_press_from_behind_that_returned_an_error_is_not_pressed_again() {
+        // A menu item's AXPress can report an error and still run the command.
+        let ran = after_background(
+            Background::Pressed {
+                press: Press::Ax("AXPress"),
+                changed: vec![],
+                lasted: false,
+                activated: false,
+                error: Some("AX error -25204".into()),
+            },
+            || true,
+        )
+        .expect("the press from behind ends the call");
+        assert!(ran.stayed_behind());
+        let text = summary(&ran);
+        assert!(
+            text.contains("AX error -25204")
+                && text.contains("may finish later")
+                && text.contains("twice"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_press_from_behind_with_nothing_seen_reports_an_app_that_came_forward() {
+        let mut asked = false;
+        let ran = after_background(pressed(vec![], true, None), || {
+            asked = true;
+            false
+        })
+        .expect("the press from behind ends the call");
+        assert!(asked, "the previous front app is confirmed");
+        assert!(!ran.stayed_behind());
+        let text = summary(&ran);
+        assert!(
+            text.contains("came to the front by itself")
+                && text.contains("not confirmed back in front"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn a_change_seen_after_the_press_ends_the_call_as_before() {
+        let ran = after_background(pressed(vec!["the clipboard"], false, None), || true)
+            .expect("the press from behind ends the call");
+        assert!(summary(&ran).contains("the clipboard changed"));
+    }
+
+    #[test]
+    fn a_press_counts_once_it_was_sent() {
+        let keys = || Press::Keys {
+            key: "v".into(),
+            modifiers: vec!["cmd"],
+        };
+        // AXPress reported an error and nothing showed: pressed.
+        assert_eq!(
+            verdict(
+                Ok(Ok((Err(("AX error -25204".into(), true)), vec![]))),
+                Press::Ax("AXPress"),
+                false,
+                false
+            ),
+            Background::Pressed {
+                press: Press::Ax("AXPress"),
+                changed: vec![],
+                lasted: false,
+                activated: false,
+                error: Some("AX error -25204".into()),
+            }
+        );
+        // Sent with nothing seen: pressed.
+        assert!(matches!(
+            verdict(Ok(Ok((Ok(()), vec![]))), keys(), false, false),
+            Background::Pressed { error: None, .. }
+        ));
+        // The key-down went out and the key-up failed: pressed.
+        assert!(matches!(
+            verdict(
+                Ok(Ok((Err(("key-up".into(), true)), vec![]))),
+                keys(),
+                false,
+                false
+            ),
+            Background::Pressed { error: Some(_), .. }
+        ));
+        // The key-down was never posted: not pressed, the foreground route runs.
+        assert!(matches!(
+            verdict(Ok(Ok((Err(("CGEventSource::new failed".into(), false)), vec![]))), keys(), false, false),
+            Background::Skipped(why) if why.contains("could not be sent from behind")
+        ));
+        // Refused before the press, or the window was never key: not pressed.
+        assert!(matches!(
+            verdict(Ok(Err("focus not proven".into())), keys(), false, false),
+            Background::Skipped(_)
+        ));
+        assert!(matches!(
+            verdict(Err(anyhow::anyhow!("rejected")), keys(), false, false),
+            Background::Skipped(why) if why.contains("could not be made key")
+        ));
+    }
+
+    #[test]
+    fn a_press_error_is_said_also_when_something_changed() {
+        let ran = after_background(
+            Background::Pressed {
+                press: Press::Ax("AXPress"),
+                changed: vec!["the app's windows"],
+                lasted: true,
+                activated: false,
+                error: Some("AX error -25204".into()),
+            },
+            || true,
+        )
+        .unwrap();
+        let text = summary(&ran);
+        assert!(
+            text.contains("AX error -25204") && text.contains("the app's windows changed"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn nothing_pressed_from_behind_still_runs_in_front() {
+        let why =
+            "the item was not found in its closed menu (some apps fill a menu only when it opens)";
+        let fallback = after_background(Background::skipped(why), || true)
+            .expect_err("the foreground route runs");
+        assert!(format!("{fallback:?}").contains("not found in its closed menu"));
     }
 
     #[test]

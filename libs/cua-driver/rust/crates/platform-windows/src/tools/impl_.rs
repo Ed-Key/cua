@@ -326,10 +326,11 @@ async fn overlay_glide_to_target(key: &str, sx: f64, sy: f64, target: Option<[f6
     // degrades under many concurrent cursors — we fire the move and sleep the
     // known duration. The click then lands a deterministic time after dispatch
     // regardless of render load, while the cursor still animates visually on the
-    // render thread. Speed-based glides (`== 0`, the default) keep the precise
-    // arrival-await since their duration depends on distance.
+    // render thread. Speed-based glides (`== 0`) and `fitts` timing (which
+    // ignores glide_duration_ms) keep the precise arrival-await since their
+    // duration depends on distance.
     let motion = crate::overlay::current_motion(key);
-    if motion.glide_duration_ms > 0.0 {
+    if motion.glide_duration_ms > 0.0 && motion.timing != cursor_overlay::MotionTiming::Fitts {
         crate::overlay::send_command(
             key.to_owned(),
             cursor_overlay::OverlayCommand::MoveTo {

@@ -99,6 +99,9 @@ pub struct AxSnapshot {
     /// Whether the session received every row (no query filter), so a later
     /// diff against these rows describes changes it can follow.
     pub full_delivered: bool,
+    /// The walk behind this look reached everything it set out to reach, so a
+    /// row missing from a later complete look was really removed.
+    pub walk_complete: bool,
     /// False for a screenshot-only look, which carries the previous rows for
     /// numbering continuity but must not resolve tokens the caller never saw.
     pub actionable: bool,
@@ -113,6 +116,9 @@ pub struct PriorLook {
     pub bounds: LookBounds,
     pub session: Option<String>,
     pub full_delivered: bool,
+    /// The walk behind this look reached everything it set out to reach, so a
+    /// row missing from a later complete look was really removed.
+    pub walk_complete: bool,
 }
 
 impl PriorLook {
@@ -139,6 +145,7 @@ impl PriorLook {
             bounds: self.bounds,
             session: self.session,
             full_delivered: self.full_delivered,
+            walk_complete: self.walk_complete,
             actionable: false,
         }
     }
@@ -158,6 +165,7 @@ impl AxSnapshot {
             bounds: LookBounds::default(),
             session: None,
             full_delivered: true,
+            walk_complete: true,
             actionable: true,
         }
     }
@@ -171,6 +179,7 @@ impl AxSnapshot {
         bounds: LookBounds,
         session: Option<String>,
         full_delivered: bool,
+        walk_complete: bool,
     ) {
         let elements: Vec<(usize, usize)> = nodes
             .iter()
@@ -187,6 +196,7 @@ impl AxSnapshot {
         self.bounds = bounds;
         self.session = session;
         self.full_delivered = full_delivered;
+        self.walk_complete = walk_complete;
         self.actionable = true;
     }
 
@@ -202,6 +212,7 @@ impl AxSnapshot {
             bounds: self.bounds,
             session: self.session.clone(),
             full_delivered: self.full_delivered,
+            walk_complete: self.walk_complete,
         }
     }
 }
@@ -273,6 +284,7 @@ mod tests {
             bounds: LookBounds::default(),
             session: None,
             full_delivered: true,
+            walk_complete: true,
             actionable: true,
         }
     }
@@ -432,6 +444,7 @@ mod tests {
             bounds,
             Some("s".into()),
             false,
+            true,
         );
         assert_eq!(owner.bounds, bounds);
         assert_eq!(owner.elements, vec![(9, ptr)]);

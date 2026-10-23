@@ -101,7 +101,7 @@ fn dispatch_with_ax_oracle(
     pid: i32,
     window_id: Option<u32>,
     explicit_element_ptr: Option<usize>,
-    dispatch: impl FnOnce() -> anyhow::Result<()>,
+    dispatch: impl FnOnce(Option<usize>) -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
     let (element_ptr, owns_element) = match explicit_element_ptr {
         Some(ptr) => (Some(ptr), false),
@@ -115,7 +115,9 @@ fn dispatch_with_ax_oracle(
         .unwrap_or((None, false)),
     };
     let before = element_ptr.and_then(|ptr| read_ax_key_state(pid, window_id, ptr));
-    let result = dispatch();
+    // The dispatch sees the element the baseline was read from, so a
+    // background route can revalidate its recipient after these reads.
+    let result = dispatch(element_ptr);
     // Native controls normally publish their new value/selection on the next
     // run-loop turn. Keep this bounded and reuse the exact retained element so
     // a focus move cannot become false confirmation from a different control.
@@ -332,10 +334,19 @@ impl Tool for PressKeyTool {
                     Err(refusal_result) => return refusal_result,
                 }
             } else {
-                None
+                Some(super::acquire_background_mutation(pid).await)
             }
         } else {
             None
+        };
+
+        let background_focus = if fg {
+            None
+        } else {
+            match self.state.background_focus(&args, pid) {
+                Ok(controller) => Some(controller),
+                Err(error) => return error,
+            }
         };
 
         // px form: pixel-click to focus, then the key goes to the focused element.
@@ -359,6 +370,7 @@ impl Tool for PressKeyTool {
                     from_zoom,
                     false,
                     _mutation_lease.as_ref(),
+                    background_focus.as_ref(),
                 )
                 .await
                 {
@@ -404,26 +416,16 @@ impl Tool for PressKeyTool {
         // wildcard snapshot suppressor and the targeted FocusGuard lease.
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let delivery_lease = _mutation_lease.clone();
 
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
             prior_front,
             "press_key.CGEvent",
             || async move {
-                // Pre-focus the element under suppression so its
-                // side-effects are captured by the snapshot + lease.
-                // Foreground delivery repeats this focus write inside its
-                // activation interval; doing it here first could activate the
-                // target before that interval records the user's app.
-                if let Some(guard) = pre_focus_guard.clone().filter(|_| !fg) {
-                    let _ = tokio::task::spawn_blocking(move || {
-                        crate::input::ax_actions::focus_element(guard.as_ptr())
-                    })
-                    .await;
-                    tokio::time::sleep(std::time::Duration::from_millis(30)).await;
-                }
-
                 tokio::task::spawn_blocking(move || {
+                    // A cancelled async caller cannot release coordination mid-delivery.
+                    let _delivery_lease = delivery_lease;
                     let pre_focus_ptr = pre_focus_guard.as_ref().map(|guard| guard.as_ptr());
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     // Foreground rung: keep the exact target frontmost through a genuine
@@ -457,26 +459,49 @@ impl Tool for PressKeyTool {
                                 // follows activation and the focus write, and its
                                 // readback precedes focus restoration, so neither
                                 // can pass for the key's effect.
-                                confirmed = dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                                    crate::input::keyboard::press_key_bare_global(&key, &m)
-                                })?;
+                                confirmed =
+                                    dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, |_| {
+                                        crate::input::keyboard::press_key_bare_global(&key, &m)
+                                    })?;
                                 Ok(())
                             },
                         )?;
                         return Ok(confirmed);
                     }
-                    // background (default): auth-envelope post, no raise.
-                    dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, || {
-                        if fg {
-                            // Foreground px form: the focus click already
-                            // handled the target; no background lease is held.
+                    if fg {
+                        // Foreground px form: the focus click already handled the target.
+                        dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, |_| {
                             crate::input::keyboard::press_key(pid, &key, &m)
-                        } else {
-                            super::with_background_web_key_window(pid, window_id, pre_focus_ptr, || {
-                                crate::input::keyboard::press_key(pid, &key, &m)
-                            })
-                        }
-                    })
+                        })
+                    } else {
+                        // Field focus stays inside protected preparation. The key
+                        // oracle and recipient follow that exact field mutation.
+                        let prepare_element = || {
+                            if let Some(ptr) = pre_focus_ptr {
+                                crate::input::ax_actions::focus_element(ptr)?;
+                                std::thread::sleep(std::time::Duration::from_millis(30));
+                            }
+                            Ok(())
+                        };
+                        super::with_background_key_recipient(
+                            background_focus.as_ref(),
+                            pid,
+                            window_id,
+                            pre_focus_ptr,
+                            pre_focus_ptr
+                                .map(|_| &prepare_element as &dyn Fn() -> anyhow::Result<()>),
+                            |recipient| {
+                                dispatch_with_ax_oracle(pid, window_id, pre_focus_ptr, |element| {
+                                    // The oracle's AX reads follow the recipient proof;
+                                    // prove it again immediately before posting.
+                                    crate::ax::keyboard_target::validate_recipient(
+                                        pid, window_id, element, recipient,
+                                    )?;
+                                    crate::input::keyboard::press_key(recipient, &key, &m)
+                                })
+                            },
+                        )
+                    }
                 })
                 .await
             },

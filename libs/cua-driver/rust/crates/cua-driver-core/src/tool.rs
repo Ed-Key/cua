@@ -36,6 +36,16 @@ tokio::task_local! {
     /// Opaque generation for runtime-owned mutable resources. Nested
     /// dispatches inherit this key, while public arguments can never select it.
     static DISPATCH_RUNTIME_SCOPE: String;
+    /// When the outermost dispatch received its call, before any queueing.
+    /// Nested dispatches inherit it: the caller's deadline covers them all.
+    static DISPATCH_RECEIVED_AT: std::time::Instant;
+}
+
+/// When the current call reached the registry, before it waited for the
+/// physical-action coordinator or anything else. Tools that must answer
+/// before the caller's transport deadline measure from here.
+pub fn current_dispatch_received_at() -> Option<std::time::Instant> {
+    DISPATCH_RECEIVED_AT.try_with(|at| *at).ok()
 }
 
 /// Return the immutable authorization context bound to the current dispatch.
@@ -1257,19 +1267,23 @@ impl ToolRegistry {
         evidence: TrustedInvocationEvidence,
     ) -> ToolResult {
         let runtime_scope = context.runtime_scope_key();
-        DISPATCH_RUNTIME_SCOPE
-            .scope(runtime_scope, async {
-                DISPATCH_TRUSTED_INVOCATION_EVIDENCE
-                    .scope(evidence.clone(), async {
-                        DISPATCH_AUTHORIZATION_CONTEXT
-                            .scope(
-                                context.clone(),
-                                self.invoke_authorized(name, args, context.as_ref(), &evidence),
-                            )
-                            .await
-                    })
-                    .await
-            })
+        let received_at = current_dispatch_received_at().unwrap_or_else(std::time::Instant::now);
+        DISPATCH_RECEIVED_AT
+            .scope(
+                received_at,
+                DISPATCH_RUNTIME_SCOPE.scope(runtime_scope, async {
+                    DISPATCH_TRUSTED_INVOCATION_EVIDENCE
+                        .scope(evidence.clone(), async {
+                            DISPATCH_AUTHORIZATION_CONTEXT
+                                .scope(
+                                    context.clone(),
+                                    self.invoke_authorized(name, args, context.as_ref(), &evidence),
+                                )
+                                .await
+                        })
+                        .await
+                }),
+            )
             .await
     }
 

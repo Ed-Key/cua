@@ -20,7 +20,7 @@ const DEFAULT_KEY_GAP: std::time::Duration = std::time::Duration::from_millis(8)
 /// Key down→up gap and inter-key pacing: `DEFAULT_KEY_GAP`, or the
 /// host's `CUA_DRIVER_KEY_GAP_MS` clamped by `cua_driver_core::key_pacing`.
 /// Read once: pacing is a launch-time knob, not a per-call one.
-fn key_gap() -> std::time::Duration {
+pub(crate) fn key_gap() -> std::time::Duration {
     static GAP: std::sync::OnceLock<std::time::Duration> = std::sync::OnceLock::new();
     *GAP.get_or_init(|| cua_driver_core::key_pacing::key_gap_from_env(DEFAULT_KEY_GAP))
 }
@@ -47,15 +47,24 @@ pub fn is_screen_sharing_pid(pid: i32) -> bool {
 
 /// Press and release a single key, delivered to `pid` without stealing focus.
 pub fn press_key(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
+    press_key_reporting_down(pid, key, modifiers).map_err(|(error, _)| error)
+}
+
+/// [`press_key`], saying on failure whether the key-down was already posted:
+/// a chord's command runs on its key-down, so it must not be sent again then.
+pub fn press_key_reporting_down(
+    pid: i32,
+    key: &str,
+    modifiers: &[&str],
+) -> Result<(), (anyhow::Error, bool)> {
     let (key, shift) = resolve_key_name(key);
     let modifiers = with_shift(modifiers, shift);
-    let key_code = key_name_to_code(&key)?;
+    let key_code = key_name_to_code(&key).map_err(|error| (error, false))?;
     let flags = modifier_flags(&modifiers);
 
-    post_key(pid, key_code, true, flags)?;
+    post_key(pid, key_code, true, flags).map_err(|error| (error, false))?;
     key_gap_sleep();
-    post_key(pid, key_code, false, key_up_flags(flags))?;
-    Ok(())
+    post_key(pid, key_code, false, key_up_flags(flags)).map_err(|error| (error, true))
 }
 
 /// Flags for the key-up half of a PID-routed key press: the chord's flags
@@ -98,13 +107,39 @@ pub fn type_text(pid: i32, text: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Post one item (a character, or one character's physical events) at a time
+/// until `deadline`, checked only between items so a key-down always gets
+/// its key-up. Returns how many items were posted.
+fn post_until<T>(
+    items: impl IntoIterator<Item = T>,
+    deadline: Option<std::time::Instant>,
+    mut post: impl FnMut(T) -> anyhow::Result<()>,
+) -> anyhow::Result<usize> {
+    let mut posted = 0;
+    for item in items {
+        if deadline.is_some_and(|deadline| std::time::Instant::now() >= deadline) {
+            break;
+        }
+        post(item)?;
+        posted += 1;
+    }
+    Ok(posted)
+}
+
 /// Type a string character-by-character with an extra `inter_char_delay_ms`
 /// pause after each character (on top of the internal down/up key gap).
-pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
+/// Stops before the first character that would start at or after `deadline`;
+/// returns how many characters were posted.
+pub fn type_text_with_delay(
+    pid: i32,
+    text: &str,
+    inter_char_delay_ms: u64,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<usize> {
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
 
-    for ch in text.chars() {
+    post_until(text.chars(), deadline, |ch| {
         let ch_str = ch.to_string();
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
@@ -125,8 +160,8 @@ pub fn type_text_with_delay(pid: i32, text: &str, inter_char_delay_ms: u64) -> a
         } else {
             key_gap_sleep();
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Send a key combination (hotkey) to `pid`.
@@ -367,13 +402,18 @@ fn release_pid_modifiers(
 
 /// Type Unicode text into the frontmost application through the global HID
 /// queue. This is the desktop-scope counterpart to PID-routed `type_text` and
-/// mirrors computer-server's frontmost pynput typing behavior.
-pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
+/// mirrors computer-server's frontmost pynput typing behavior. Stops at
+/// `deadline` like [`type_text_with_delay`]; returns the characters posted.
+pub fn type_text_global(
+    text: &str,
+    inter_char_delay_ms: u64,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<usize> {
     use core_graphics::event::CGEventTapLocation;
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
-    for ch in text.chars() {
+    post_until(text.chars(), deadline, |ch| {
         let value = ch.to_string();
         let down = CGEvent::new_keyboard_event(source.clone(), 0, true)
             .map_err(|_| anyhow::anyhow!("CGEvent keyboard down failed"))?;
@@ -387,8 +427,8 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
         up.set_flags(CGEventFlags::CGEventFlagNull);
         up.post(CGEventTapLocation::HID);
         std::thread::sleep(std::time::Duration::from_millis(inter_char_delay_ms).max(key_gap()));
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Type ASCII text through the global HID queue as physical US-keyboard
@@ -398,8 +438,13 @@ pub fn type_text_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<
 /// `with_foreground_hid_activation`. Remote-input clients such as Screen
 /// Sharing forward virtual keycodes and modifier transitions, not the Unicode
 /// payload carried by keycode 0, so the ordinary text synthesis path cannot be
-/// used for them.
-pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow::Result<()> {
+/// used for them. Stops at `deadline` between characters, never inside one
+/// character's Shift and key transitions; returns the characters posted.
+pub fn type_text_physical_global(
+    text: &str,
+    inter_char_delay_ms: u64,
+    deadline: Option<std::time::Instant>,
+) -> anyhow::Result<usize> {
     use core_graphics::event::CGEventTapLocation;
 
     // Validate the complete payload before posting its first event. A string
@@ -408,7 +453,7 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
         .chars()
         .map(physical_text_events)
         .collect::<anyhow::Result<Vec<_>>>()?;
-    for events in event_groups {
+    post_until(event_groups, deadline, |events| {
         let native_events = events
             .iter()
             .map(|event| create_bare_keyboard_event(event.key_code, event.key_down))
@@ -421,8 +466,8 @@ pub fn type_text_physical_global(text: &str, inter_char_delay_ms: u64) -> anyhow
         if !extra.is_zero() {
             std::thread::sleep(extra);
         }
-    }
-    Ok(())
+        Ok(())
+    })
 }
 
 /// Send a physical key chord as bare NULL-source events: modifier downs, base
@@ -1022,6 +1067,37 @@ mod tests {
             assert_eq!(resolve_key_name(name), (name.to_owned(), false), "{name}");
         }
         assert!(key_name_to_code(&resolve_key_name("nosuchkey").0).is_err());
+    }
+
+    /// Incident 3: posting stops at the deadline, only between items, so a
+    /// character whose key-down went out always gets its key-up.
+    #[test]
+    fn posting_stops_at_the_deadline_between_characters_only() {
+        use std::time::{Duration, Instant};
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut events = Vec::new();
+        let posted = post_until("abcdef".chars(), Some(deadline), |ch| {
+            events.push(format!("{ch} down"));
+            if ch == 'b' {
+                // The deadline passes between this key-down and its key-up.
+                std::thread::sleep(
+                    deadline.saturating_duration_since(Instant::now()) + Duration::from_millis(5),
+                );
+            }
+            events.push(format!("{ch} up"));
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(posted, 2);
+        assert_eq!(events, ["a down", "a up", "b down", "b up"]);
+
+        let spent = post_until(
+            "abc".chars(),
+            Some(Instant::now()),
+            |_| -> anyhow::Result<()> { panic!("nothing may be posted after the deadline") },
+        );
+        assert_eq!(spent.unwrap(), 0);
+        assert_eq!(post_until("abc".chars(), None, |_| Ok(())).unwrap(), 3);
     }
 
     #[test]

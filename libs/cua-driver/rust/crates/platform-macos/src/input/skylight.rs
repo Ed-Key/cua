@@ -41,6 +41,132 @@ type SetIntFieldFn = unsafe extern "C" fn(*mut c_void, u32, i64);
 /// `uint32_t CGSMainConnectionID(void)`
 type ConnectionIDFn = unsafe extern "C" fn() -> u32;
 
+type UpdateFn = unsafe extern "C" fn(u32) -> i32;
+
+/// Pair WindowServer update suppression across protected focus preparation.
+pub(crate) fn with_updates_disabled<T>(
+    body: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    static UPDATE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static FUNCTIONS: OnceLock<Option<(UpdateFn, UpdateFn)>> = OnceLock::new();
+    let &(disable, reenable) = FUNCTIONS
+        .get_or_init(|| {
+            let disable = find_sym(b"SLSDisableUpdate\0")?;
+            let reenable = find_sym(b"SLSReenableUpdate\0")?;
+            // The recovered wrappers pass the connection register unchanged and
+            // return CGError. CGSMainConnectionID uses the existing 32-bit ID ABI.
+            Some(unsafe { (as_fn(disable), as_fn(reenable)) })
+        })
+        .as_ref()
+        .ok_or_else(|| anyhow::anyhow!("protected focus update suppression is unavailable"))?;
+    let connection = connection_id_fn()
+        .ok_or_else(|| anyhow::anyhow!("protected focus WindowServer connection is unavailable"))?;
+    let _lock = UPDATE_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    let connection = unsafe { connection() };
+    with_update_pair(connection, disable, reenable, body)
+}
+
+fn with_update_pair<T>(
+    connection: u32,
+    disable: UpdateFn,
+    reenable: UpdateFn,
+    body: impl FnOnce() -> anyhow::Result<T>,
+) -> anyhow::Result<T> {
+    let status = unsafe { disable(connection) };
+    anyhow::ensure!(
+        status == 0,
+        "could not suppress WindowServer updates: {status}"
+    );
+    let mut guard = UpdateRestore {
+        connection,
+        reenable,
+        active: true,
+    };
+    let result = body();
+    let restored = guard.finish();
+    match (result, restored) {
+        (Err(error), Err(restore)) => {
+            Err(error.context(format!("update cleanup also failed: {restore}")))
+        }
+        (Err(error), Ok(())) => Err(error),
+        (Ok(_), Err(error)) => Err(error),
+        (Ok(result), Ok(())) => Ok(result),
+    }
+}
+
+struct UpdateRestore {
+    connection: u32,
+    reenable: UpdateFn,
+    active: bool,
+}
+
+impl UpdateRestore {
+    fn finish(&mut self) -> anyhow::Result<()> {
+        if self.active {
+            let status = unsafe { (self.reenable)(self.connection) };
+            anyhow::ensure!(
+                status == 0,
+                "could not reenable WindowServer updates: {status}"
+            );
+            self.active = false;
+        }
+        Ok(())
+    }
+}
+
+impl Drop for UpdateRestore {
+    fn drop(&mut self) {
+        if let Err(error) = self.finish() {
+            tracing::error!(%error, "WindowServer update cleanup failed");
+        }
+    }
+}
+
+#[cfg(test)]
+mod update_cleanup_tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn every_successful_disable_is_paired_on_success_error_and_unwind() {
+        static DISABLED: AtomicUsize = AtomicUsize::new(0);
+        static RESTORED: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn disable(connection: u32) -> i32 {
+            if connection != 42 {
+                return 1;
+            }
+            DISABLED.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        unsafe extern "C" fn restore(connection: u32) -> i32 {
+            if connection != 42 {
+                return 1;
+            }
+            RESTORED.fetch_add(1, Ordering::SeqCst);
+            0
+        }
+        assert_eq!(with_update_pair(42, disable, restore, || Ok(7)).unwrap(), 7);
+        let error =
+            with_update_pair::<()>(42, disable, restore, || anyhow::bail!("preparation failed"));
+        assert_eq!(error.unwrap_err().to_string(), "preparation failed");
+        let unwind = std::panic::catch_unwind(|| {
+            let _ = with_update_pair::<()>(42, disable, restore, || panic!("cancelled task"));
+        });
+        assert!(unwind.is_err());
+        let refusal = with_update_pair(0, disable, restore, || -> anyhow::Result<()> {
+            panic!("body must not run after failed disable");
+        });
+        assert_eq!(
+            refusal.unwrap_err().to_string(),
+            "could not suppress WindowServer updates: 1"
+        );
+        assert_eq!(DISABLED.load(Ordering::SeqCst), 3);
+        assert_eq!(RESTORED.load(Ordering::SeqCst), 3);
+    }
+}
+
 /// `uint64_t CGSGetActiveSpace(uint32_t cid)`
 type GetActiveSpaceFn = unsafe extern "C" fn(u32) -> u64;
 

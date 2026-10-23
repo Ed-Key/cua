@@ -295,10 +295,19 @@ impl Tool for HotkeyTool {
                     Err(refusal_result) => return refusal_result,
                 }
             } else {
-                None
+                Some(super::acquire_background_mutation(pid).await)
             }
         } else {
             None
+        };
+
+        let background_focus = if fg {
+            None
+        } else {
+            match self.state.background_focus(&args, pid) {
+                Ok(controller) => Some(controller),
+                Err(error) => return error,
+            }
         };
 
         // Web-content AX nodes can acknowledge AXFocused without moving the
@@ -371,6 +380,7 @@ impl Tool for HotkeyTool {
                     from_zoom,
                     window_native,
                     _mutation_lease.as_ref(),
+                    background_focus.as_ref(),
                 )
                 .await
                 {
@@ -414,6 +424,7 @@ impl Tool for HotkeyTool {
         // and the prior frontmost is restored if the activation lingers.
         let prior_front = apps::frontmost_pid();
         let snapshot = WindowChangeDetector::snapshot(prior_front);
+        let delivery_lease = _mutation_lease.clone();
 
         let result = focus_guard::with_focus_suppressed(
             Some(pid),
@@ -421,6 +432,7 @@ impl Tool for HotkeyTool {
             "hotkey.CGEvent",
             || async move {
                 tokio::task::spawn_blocking(move || {
+                    let _delivery_lease = delivery_lease;
                     let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
                     let m: Vec<&str> = modifiers.iter().map(String::as_str).collect();
                     match (fg, coordinate_focus, window_id, element_ptr) {
@@ -472,17 +484,22 @@ impl Tool for HotkeyTool {
                         }
                         // background (default): auth-envelope post to the pid, no
                         // raise — even when window_id was supplied for targeting.
-                        (false, false, _, Some(ptr)) => {
-                            focus_hotkey_element(pid, ptr)?;
-                            super::with_background_web_key_window(pid, window_id, Some(ptr), || {
-                                crate::input::keyboard::hotkey(pid, &key, &m)
-                            })
-                        }
-                        (false, _, _, element_ptr) => {
-                            super::with_background_web_key_window(pid, window_id, element_ptr, || {
-                                crate::input::keyboard::hotkey(pid, &key, &m)
-                            })
-                        }
+                        (false, false, _, Some(ptr)) => super::with_background_key_recipient(
+                            background_focus.as_ref(),
+                            pid,
+                            window_id,
+                            Some(ptr),
+                            Some(&|| focus_hotkey_element(pid, ptr)),
+                            |recipient| crate::input::keyboard::hotkey(recipient, &key, &m),
+                        ),
+                        (false, _, _, element_ptr) => super::with_background_key_recipient(
+                            background_focus.as_ref(),
+                            pid,
+                            window_id,
+                            element_ptr,
+                            None,
+                            |recipient| crate::input::keyboard::hotkey(recipient, &key, &m),
+                        ),
                         _ => crate::input::keyboard::hotkey(pid, &key, &m),
                     }
                 })

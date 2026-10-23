@@ -84,11 +84,13 @@ first action is a keyboard action shows its cursor on that window. Anonymous
 calls keep their existing cursor behavior.
 
 `set_agent_cursor_motion` changes how the cursor moves and when it hides. It
-does not change artwork. `style` picks the trajectory: `signature_arc` (the
-default), `spring_settle`, `magnetic`, `comet_swoop`, `adaptive`, or `classic`
-(the previous Dubins glide). `timing` is `native` (the style's own), `fitts`
-(scales with distance and target size), or `fixed` (`glide_duration_ms`, 1430
-ms when 0). `effects` turns `trail`, `glow`, `magnet`, `ripple`, and `squish`
+does not change artwork. `style` picks the trajectory: `classic` (the
+default, a nearly straight Dubins glide), `signature_arc`, `spring_settle`,
+`magnetic`, `comet_swoop`, or `adaptive`. `timing` is `native` (the style's
+own), `fitts` (scales with distance and target size), or `fixed`
+(`glide_duration_ms`, 1430 ms when 0). The built-in `glide_duration_ms` is 120,
+so every `native` or `fixed` move takes about 120 ms whatever the distance; 0
+restores the style's own timing. `effects` turns `trail`, `glow`, `magnet`, `ripple`, and `squish`
 on or off; null restores the style's default. From a shell, `cua-driver cursor
 motion --session <label> --style magnetic` sets the same fields. The removed `set_agent_cursor_style` operation and
 its `cursor_id`, shape, color, label, size, opacity, image-path, gradient, and

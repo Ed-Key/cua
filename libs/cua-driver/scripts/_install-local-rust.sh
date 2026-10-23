@@ -497,6 +497,19 @@ echo ""
 
 INSTALLED_BIN="$BIN_DIR/cua-driver-local"
 
+# --- macOS: the LaunchAgent runs as an interactive process -------------
+#
+# launchd spawns an agent without ProcessType as a background daemon and
+# throttles its timers: every sleep in the daemon ran 2 to 3 times long (an
+# 8 ms key gap took 27 to 45 ms), so long type_text calls outlived the
+# client's 120 s deadline. An existing agent keeps its arguments and
+# environment and only gains the key; launchd reads it at the next load.
+make_launchagent_interactive() {
+    [ -f "$1" ] || return 0
+    plutil -replace ProcessType -string Interactive "$1" \
+        || echo "${YELLOW}warning: could not set ProcessType Interactive in $1${NORMAL}" >&2
+}
+
 # --- Stop any pre-swap cua-driver daemons ------------------------------
 #
 # Mirror of install-local.ps1's daemon kill — the new binary is now
@@ -515,6 +528,7 @@ INSTALLED_BIN="$BIN_DIR/cua-driver-local"
 # session rather than the daemon.
 if [ "$OS" = "Darwin" ]; then
     launchctl unload "$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist" 2>/dev/null || true
+    make_launchagent_interactive "$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist"
 elif [ "$OS" = "Linux" ] && command -v systemctl >/dev/null 2>&1; then
     systemctl --user stop cua-driver-local.service >/dev/null 2>&1 || true
 fi
@@ -545,9 +559,15 @@ echo ""
 if [ "$INSTALL_AUTOSTART" = true ]; then
     if [ "$OS" = "Darwin" ]; then
         PLIST_PATH="$HOME/Library/LaunchAgents/com.trycua.cua-driver-local.plist"
-        echo "${BOLD}Writing LaunchAgent → $PLIST_PATH${NORMAL}"
-        mkdir -p "$(dirname "$PLIST_PATH")"
-        cat >"$PLIST_PATH" <<EOF
+        if [ -f "$PLIST_PATH" ]; then
+            # Keep its arguments and environment (made interactive above);
+            # only point it at this install's binary.
+            echo "${BOLD}Updating LaunchAgent → $PLIST_PATH${NORMAL}"
+            plutil -replace ProgramArguments.0 -string "$INSTALLED_BIN" "$PLIST_PATH"
+        else
+            echo "${BOLD}Writing LaunchAgent → $PLIST_PATH${NORMAL}"
+            mkdir -p "$(dirname "$PLIST_PATH")"
+            cat >"$PLIST_PATH" <<EOF
 <?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
@@ -560,11 +580,13 @@ if [ "$INSTALL_AUTOSTART" = true ]; then
   </array>
   <key>RunAtLoad</key><true/>
   <key>KeepAlive</key><true/>
+  <key>ProcessType</key><string>Interactive</string>
   <key>StandardOutPath</key><string>$HOME_DIR/serve.out.log</string>
   <key>StandardErrorPath</key><string>$HOME_DIR/serve.err.log</string>
 </dict>
 </plist>
 EOF
+        fi
         launchctl unload "$PLIST_PATH" 2>/dev/null || true
         launchctl load "$PLIST_PATH"
         echo "${GREEN}Loaded.${NORMAL} Manage with launchctl load / unload \"$PLIST_PATH\"."

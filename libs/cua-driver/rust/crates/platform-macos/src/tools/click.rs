@@ -401,7 +401,7 @@ impl Tool for ClickTool {
                     Err(refusal) => return refusal,
                 }
             } else {
-                let desktop_ratio = tokio::task::spawn_blocking(|| {
+                let desktop_ratio = crate::background_mutation::spawn_blocking(|| {
                     let logical_w =
                         super::get_screen_size::main_screen_size().map(|(w, _, _)| w as f64);
                     let shot_w = crate::capture::screenshot_display_bytes()
@@ -440,7 +440,7 @@ impl Tool for ClickTool {
 
             let btn = button.clone();
             let desktop_modifiers: Vec<String> = args.str_array("modifier");
-            let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            let result = crate::background_mutation::spawn_blocking(move || -> anyhow::Result<()> {
                 // Desktop scope is explicitly foreground and vision-driven: post
                 // at the global HID tap so WindowServer delivers to the window
                 // actually visible at this point. PID-posting here would silently
@@ -638,7 +638,7 @@ impl Tool for ClickTool {
             let action_guard = element_guard.clone();
             let requested = effective_action.clone();
             let press_row = snapshot_row.clone();
-            let resolved_action = tokio::task::spawn_blocking(move || unsafe {
+            let resolved_action = crate::background_mutation::spawn_blocking(move || unsafe {
                 let element = action_guard.as_ptr() as AXUIElementRef;
                 let now_reads = ["AXDescription", "AXTitle"]
                     .into_iter()
@@ -661,7 +661,7 @@ impl Tool for ClickTool {
             let center_guard = element_guard.clone();
             // The element's screen rect rides along on the glide so motion
             // styles can time by target size and highlight the target.
-            let (center, target_rect) = tokio::task::spawn_blocking(move || unsafe {
+            let (center, target_rect) = crate::background_mutation::spawn_blocking(move || unsafe {
                 let el = center_guard.as_ptr() as AXUIElementRef;
                 (
                     crate::ax::bindings::element_screen_center(el),
@@ -705,7 +705,7 @@ impl Tool for ClickTool {
 
                 let mods_owned = modifiers.clone();
                 let foreground = delivery_mode.is_foreground();
-                let result = tokio::task::spawn_blocking(move || {
+                let result = crate::background_mutation::spawn_blocking(move || {
                     let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                     if foreground && !m.is_empty() {
                         crate::input::skylight::with_foreground_pointer_activation(
@@ -747,7 +747,7 @@ impl Tool for ClickTool {
             // AXPress, and an AXFocused write can be rejected or clobbered.
             let selection_center = if ax_action == "AXPress" {
                 let selection_guard = element_guard.clone();
-                tokio::task::spawn_blocking(move || {
+                crate::background_mutation::spawn_blocking(move || {
                     let ptr = selection_guard.as_ptr();
                     crate::input::ax_actions::RowSelection::capture(ptr)
                         .and_then(|row| row.center())
@@ -867,7 +867,7 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.AXPress",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    crate::background_mutation::spawn_blocking(move || {
                         let element_ptr = element_guard.as_ptr();
                         // Menus on screen before the press, so a menu it opens
                         // is tied to this window while the action holds the
@@ -1058,7 +1058,7 @@ impl Tool for ClickTool {
                             &self.state.config.read().unwrap(),
                         );
                         let dbg_path_c = dbg_path.clone();
-                        let dbg_result = tokio::task::spawn_blocking(move || {
+                        let dbg_result = crate::background_mutation::spawn_blocking(move || {
                             let png = crate::capture::screenshot_window_bytes(wid)?;
                             let png = crate::capture::resize_png_if_needed(&png, max_dim)?;
                             crate::capture::write_crosshair_png(&png, cx, cy, &dbg_path_c)
@@ -1254,7 +1254,7 @@ impl Tool for ClickTool {
                     prior_front,
                     "click.pixel_ax",
                     || async move {
-                        tokio::task::spawn_blocking(move || unsafe {
+                        crate::background_mutation::spawn_blocking(move || unsafe {
                             let Some(element) = element_at_screen_position(pid, screen_x, screen_y) else {
                                 return Ok::<PixelHit, anyhow::Error>(PixelHit::Missed);
                             };
@@ -1423,7 +1423,7 @@ impl Tool for ClickTool {
             let focus_without_raise =
                 if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
                     let wid = window_id.expect("activation policy requires window_id");
-                    match tokio::task::spawn_blocking(move || {
+                    match crate::background_mutation::spawn_blocking(move || {
                         crate::input::mouse::prepare_background_pixel_click(pid, wid)
                     })
                     .await
@@ -1469,7 +1469,7 @@ impl Tool for ClickTool {
                 prior_front,
                 "click.pixel",
                 || async move {
-                    tokio::task::spawn_blocking(move || {
+                    crate::background_mutation::spawn_blocking(move || {
                         let do_click = move || -> anyhow::Result<()> {
                             let m: Vec<&str> = mods_owned.iter().map(String::as_str).collect();
                             if route == PixelClickRoute::ForegroundHid {
@@ -1551,7 +1551,7 @@ impl Tool for ClickTool {
             // overwrite a different app here; the wildcard suppression lease
             // handles genuine side effects.
             if activation_policy == PixelActivationPolicy::AllowTargetWithoutRaise {
-                let _ = tokio::task::spawn_blocking(move || {
+                let _ = crate::background_mutation::spawn_blocking(move || {
                     restore_after_background_pixel_click(pid, window_id, prior_front, focus_without_raise)
                 })
                 .await;

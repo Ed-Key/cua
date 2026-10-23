@@ -15,10 +15,12 @@ pub(crate) fn sprite_box(hotspot: [u16; 2]) -> f64 {
     2.0 * cursor_overlay::tip_reach(hotspot)
 }
 
-/// The sprite never shrinks the arrow below this many points tall: the
-/// smallest size at which its fill, white outline and heading still read
-/// at a glance on the panel (the outline stays a device pixel wide at 2x).
-const MIN_SPRITE_ARROW: f64 = 10.0;
+/// The sprite never shrinks the arrow below this many points tall, so its
+/// fill, white outline and heading still read on a small panel. Ed picked
+/// 7 pt (2026-10-23) from side-by-side stills of 10, 7 and 5 pt on a
+/// 360x230 panel, where a typical window shows at about a quarter scale (a
+/// 3.3 pt arrow at true scale).
+const MIN_SPRITE_ARROW: f64 = 7.0;
 
 /// How much the sprite shrinks for a well of `well` size showing the target
 /// window `window`: the preview's own scale (aspect-fit, as `cursor_in_well`
@@ -247,10 +249,20 @@ mod tests {
         // 800x600 shown in 640x480: the preview is 0.8 scale, and so is the sprite.
         assert!((sprite_scale(WINDOW, (640.0, 480.0)) - 0.8).abs() < 1e-9);
         // In 320x200 the preview is a third: below the floor, so the arrow
-        // stays MIN_SPRITE_ARROW tall.
+        // stays 7 pt tall.
         let scale = sprite_scale(WINDOW, (320.0, 200.0));
         assert_eq!(scale, floor);
-        assert!((f64::from(cursor_overlay::ARROW_HEIGHT) * scale - MIN_SPRITE_ARROW).abs() < 1e-9);
+        assert!((f64::from(cursor_overlay::ARROW_HEIGHT) * scale - 7.0).abs() < 1e-9);
+        // Ed's panel: a 1400x764 window in a 360x196 card is a fit of about
+        // 0.257, a 3.3 pt arrow at true scale, so the floor holds it at 7 pt.
+        let page = Area {
+            x: 20.0,
+            y: 60.0,
+            w: 1400.0,
+            h: 764.0,
+        };
+        let arrow = f64::from(cursor_overlay::ARROW_HEIGHT) * sprite_scale(page, (360.0, 196.0));
+        assert!((arrow - 7.0).abs() < 1e-9, "{arrow}");
         // A well larger than the window never enlarges the cursor.
         assert_eq!(sprite_scale(WINDOW, (1600.0, 1200.0)), 1.0);
     }

@@ -511,12 +511,17 @@ item in the closed menus and, with `window_id` made key from behind, presses
 it through AX, or sends its keyboard shortcut when the item reads disabled
 there (items that act on a window's content, such as Copy, Paste and Save,
 read disabled while their app is behind; the shortcut is checked again
-against the window it reaches). It keeps that route only when a read shortly
-after shows an effect (the clipboard, the app's windows, what the window
-shows, the item's own title or check mark, whether the app still runs).
-Otherwise it falls back to the foreground route, and the result says why.
-For example: the press shows no effect; the item is missing from its closed
-menu, opens a submenu, or sits under a menu that reads disabled; the window
+against the window it reaches). Once the item is pressed from behind, it is
+never pressed again in that call. The result names what a read within 600 ms
+showed changed (the clipboard, the app's windows, what the window shows, the
+item's own title or check mark, whether the app still runs). When nothing
+showed, or the press returned an error, the result says so: the command may
+finish later (a Save sheet, a new document or pasted text can show after the
+wait), so read the window before repeating it, because repeating it can run
+it twice. When the item cannot be pressed from behind, it falls back to the
+foreground route, and the result says why. For example: the item is missing
+from its closed menu, opens a submenu, or sits under a menu that reads
+disabled; the window
 cannot be made key from behind and read back as the app's focused window;
 the app is Finder (which ends a rename or new folder name when it is not in
 front); or the item needs its shortcut (it reads disabled from behind, or
@@ -529,11 +534,11 @@ menu bar belongs to the frontmost application, resolves each immediate child
 from live AX state, uses only `AXPress`/`AXPick`-class actions, and restores
 the prior application afterward on a best-effort basis.
 The result says which route ran and why (`delivery.mode` is `background` only
-when the app never came to the front). A command whose effect no read can see
-may then run twice, once from behind and once in front; the result says when
-the item was pressed from behind first.
+when the app never came to the front).
 It refuses missing, duplicate, disabled, or non-actionable segments and never
-falls back to pixels. A missing segment's refusal lists what that menu holds;
+falls back to pixels (an item that reads disabled from behind is tried by its
+shortcut instead: when the app ignores it, as Undo with nothing to undo, the
+result says nothing changed rather than refusing). A missing segment's refusal lists what that menu holds;
 titles written with "..." match the "…" macOS menus use. When a path fails
 after the tool already opened a menu, it cancels that menu and the refusal
 says whether any menu window it opened is still on screen. If the refusal says

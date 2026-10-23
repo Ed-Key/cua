@@ -599,24 +599,30 @@ impl Tool for GetWindowStateTool {
             // look is then a fresh full outline numbered from 0, which the
             // caller sees whole. Keep a separate history map if agents start
             // juggling more windows per app than that.
-            let comparable = diff_baseline(prior.as_ref(), &bounds, &session_id);
-            if let (true, Some(p)) = (want_diff && since_is_latest, comparable) {
-                let title = r
-                    .nodes
-                    .iter()
-                    .find(|n| n.role == "AXWindow")
-                    .and_then(|n| n.title.clone())
-                    .unwrap_or_default();
-                let d = crate::ax::diff::diff_outline(&p.rows, &r.nodes, &title);
-                if d.markdown.len() < r.tree_markdown.len() {
-                    r.tree_markdown = d.markdown.clone();
-                    outline_diff = Some(d);
-                }
+            if let Some(d) = choose_diff(
+                prior.as_ref(),
+                &bounds,
+                &session_id,
+                want_diff && since_is_latest,
+                &r.nodes,
+                &r.tree_markdown,
+                &r.walk,
+                &r.sightings,
+            ) {
+                r.tree_markdown = d.markdown.clone();
+                outline_diff = Some(d);
             }
             let mut owner = walk_owner
                 .take()
                 .expect("walk owner accompanies every tree result");
-            owner.renumber(&r.nodes, next_id, bounds, session_id.clone(), query.is_none());
+            owner.renumber(
+                &r.nodes,
+                next_id,
+                bounds,
+                session_id.clone(),
+                query.is_none(),
+                r.sightings.complete(&r.walk),
+            );
             owner
         });
 
@@ -1716,6 +1722,8 @@ fn element_entry(node: &crate::ax::tree::AXNode, snapshot_id: Option<u32>) -> se
 /// application changes; a different screenshot transform would leave omitted
 /// rows with frames for another image; a different `element_fields`
 /// projection would leave unchanged rows with fields the caller never got.
+/// A row missing from a read that did not reach everything is unread, not
+/// removed, so both the previous and the current read must have been complete.
 fn diff_baseline<'a>(
     prior: Option<&'a crate::ax::snapshot::PriorLook>,
     bounds: &crate::ax::snapshot::LookBounds,
@@ -1723,10 +1731,42 @@ fn diff_baseline<'a>(
 ) -> Option<&'a crate::ax::snapshot::PriorLook> {
     prior.filter(|p| {
         p.full_delivered
+            && p.walk_complete
             && p.bounds == *bounds
             && p.session == *session
             && (!p.rows.indexed.is_empty() || !p.rows.display.is_empty())
     })
+}
+
+/// Offer a diff only when both the previous and current reads proved complete
+/// coverage. Otherwise return `None` so the handler delivers the full current
+/// observation, whose partial markers describe any coverage limits.
+fn choose_diff(
+    prior: Option<&crate::ax::snapshot::PriorLook>,
+    bounds: &crate::ax::snapshot::LookBounds,
+    session: &Option<String>,
+    want_diff: bool,
+    nodes: &[crate::ax::tree::AXNode],
+    full_markdown: &str,
+    walk: &cua_driver_core::walk_budget::WalkOutcome,
+    sightings: &crate::ax::tree::WalkSightings,
+) -> Option<crate::ax::diff::OutlineDiff> {
+    if !sightings.complete(walk) {
+        return None;
+    }
+    let comparable = diff_baseline(prior, bounds, session);
+    if let (true, Some(p)) = (want_diff, comparable) {
+        let title = nodes
+            .iter()
+            .find(|n| n.role == "AXWindow")
+            .and_then(|n| n.title.clone())
+            .unwrap_or_default();
+        let d = crate::ax::diff::diff_outline(&p.rows, nodes, &title);
+        if d.markdown.len() < full_markdown.len() {
+            return Some(d);
+        }
+    }
+    None
 }
 
 /// Apply the `element_fields` projection: "none" drops the records (and the
@@ -3264,6 +3304,7 @@ mod tests {
                 bounds: prior_bounds,
                 session: Some("s".into()),
                 full_delivered: true,
+                walk_complete: true,
             };
             for after in all {
                 let bounds = crate::ax::snapshot::LookBounds {
@@ -3277,5 +3318,137 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn diff_coverage_nodes(count: usize) -> Vec<AXNode> {
+        let mut nodes = vec![node(None, "AXWindow", Some("Coverage"), 0, None, None, vec![])];
+        for id in 0..count {
+            let title = format!(
+                "Unchanged control {id}: {}",
+                "A detailed label that keeps the unchanged prefix longer than the diff. ".repeat(3)
+            );
+            nodes.push(node(
+                Some(id),
+                "AXButton",
+                Some(&title),
+                1,
+                None,
+                None,
+                vec!["AXPress".into()],
+            ));
+        }
+        nodes
+    }
+
+    fn diff_coverage_prior(nodes: &[AXNode], walk_complete: bool) -> crate::ax::snapshot::PriorLook {
+        crate::ax::snapshot::PriorLook {
+            elements: Vec::new(),
+            rows: crate::ax::diff::rows_of(nodes),
+            next_id: nodes.iter().filter_map(|n| n.element_index).max().unwrap() + 1,
+            bounds: crate::ax::snapshot::LookBounds {
+                max_elements: 250,
+                max_depth: 25,
+                ..Default::default()
+            },
+            session: Some("s".into()),
+            full_delivered: true,
+            walk_complete,
+        }
+    }
+
+    fn coverage_diff(
+        prior: &crate::ax::snapshot::PriorLook,
+        nodes: &[AXNode],
+        walk: &cua_driver_core::walk_budget::WalkOutcome,
+        sightings: &crate::ax::tree::WalkSightings,
+    ) -> Option<crate::ax::diff::OutlineDiff> {
+        let full_markdown = crate::ax::tree::render_outline(nodes, None, walk);
+        let candidate = crate::ax::diff::diff_outline(&prior.rows, nodes, "Coverage");
+        assert!(
+            candidate.markdown.len() < full_markdown.len(),
+            "the diff must qualify on size so coverage decides whether it is offered"
+        );
+        choose_diff(
+            Some(prior),
+            &prior.bounds,
+            &prior.session,
+            true,
+            nodes,
+            &full_markdown,
+            walk,
+            sightings,
+        )
+    }
+
+    #[test]
+    fn unchanged_tree_partial_second_read_reports_no_removals() {
+        let nodes = diff_coverage_nodes(9);
+        let prior = diff_coverage_prior(&nodes, true);
+        let current = &nodes[..nodes.len() - 3];
+        let mut budget = cua_driver_core::walk_budget::WalkBudget::nodes_only(current.len());
+        for _ in current {
+            assert!(budget.admit());
+        }
+        assert!(!budget.admit());
+        let walk = budget.outcome();
+        let sightings = crate::ax::tree::WalkSightings::default();
+        assert!(walk.truncated());
+        assert!(coverage_diff(&prior, current, &walk, &sightings).is_none());
+    }
+
+    #[test]
+    fn partial_to_smaller_partial_reports_no_removals() {
+        let nodes = diff_coverage_nodes(9);
+        let prior = diff_coverage_prior(&nodes, false);
+        let current = &nodes[..nodes.len() - 3];
+        let mut budget = cua_driver_core::walk_budget::WalkBudget::nodes_only(250);
+        budget.skip();
+        let walk = budget.outcome();
+        let sightings = crate::ax::tree::WalkSightings {
+            child_read_failed: true,
+            ..Default::default()
+        };
+        assert!(walk.truncated());
+        assert!(!sightings.complete(&walk));
+        assert!(coverage_diff(&prior, current, &walk, &sightings).is_none());
+    }
+
+    #[test]
+    fn complete_to_complete_real_removal_is_reported() {
+        let nodes = diff_coverage_nodes(9);
+        let prior = diff_coverage_prior(&nodes, true);
+        let current = &nodes[..nodes.len() - 1];
+        let walk = cua_driver_core::walk_budget::WalkBudget::nodes_only(250).outcome();
+        let sightings = crate::ax::tree::WalkSightings::default();
+        assert!(sightings.complete(&walk));
+        let d = coverage_diff(&prior, current, &walk, &sightings).expect("a real removal gets a diff");
+        assert_eq!(d.removed, vec![8]);
+        assert!(d.markdown.contains("removed rows: 8\n"));
+        let touched = d.touched();
+        assert!(d.added.iter().chain(&d.changed).all(|id| touched.contains(id)));
+        assert!(d.removed.iter().all(|id| !touched.contains(id)));
+    }
+
+    #[test]
+    fn partial_then_complete_makes_no_false_claims() {
+        let nodes = diff_coverage_nodes(9);
+        let partial = &nodes[..nodes.len() - 3];
+        let prior = diff_coverage_prior(partial, false);
+        let walk = cua_driver_core::walk_budget::WalkBudget::nodes_only(250).outcome();
+        let sightings = crate::ax::tree::WalkSightings::default();
+        assert!(sightings.complete(&walk));
+        assert!(coverage_diff(&prior, &nodes, &walk, &sightings).is_none());
+        assert!(coverage_diff(&prior, partial, &walk, &sightings).is_none());
+    }
+
+    #[test]
+    fn query_read_prior_never_anchors_a_diff() {
+        let nodes = diff_coverage_nodes(9);
+        let mut prior = diff_coverage_prior(&nodes, true);
+        prior.full_delivered = false;
+        let walk = cua_driver_core::walk_budget::WalkBudget::nodes_only(250).outcome();
+        let sightings = crate::ax::tree::WalkSightings::default();
+        assert!(sightings.complete(&walk));
+        assert!(coverage_diff(&prior, &nodes, &walk, &sightings).is_none());
     }
 }

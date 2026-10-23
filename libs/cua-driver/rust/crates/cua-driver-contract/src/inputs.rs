@@ -321,7 +321,7 @@ pub struct StartSessionInput {
     /// Optional initial cursor motion (style, timing, effects and tuning). The host applies it
     /// before the cursor is first made visible. A later `set_agent_cursor_motion` call wins;
     /// this wins over the saved default (`cursor.motion.*` in the driver config) and the
-    /// built-in `classic` glide (turn radius 6, nearly straight). Reduced motion always wins.
+    /// built-in `classic` glide (turn radius 6, nearly straight, 120 ms). Reduced motion always wins.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cursor_motion: Option<CursorMotionSelection>,
 }
@@ -408,7 +408,7 @@ impl ToolInput for SetAgentCursorEnabledInput {
 
 /// Cursor motion for a session, with the fields of `set_agent_cursor_motion` minus `session`.
 /// Omitted or null fields keep the saved default (`cursor.motion.*` in the driver config), then
-/// the built-in `classic` glide (turn radius 6, nearly straight).
+/// the built-in `classic` glide (turn radius 6, nearly straight, 120 ms).
 #[derive(Debug, Clone, Default, Serialize, Deserialize, JsonSchema, PartialEq, uniffi::Record)]
 #[serde(deny_unknown_fields)]
 pub struct CursorMotionSelection {
@@ -421,8 +421,9 @@ pub struct CursorMotionSelection {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "cursor_motion_style_schema")]
     pub style: Option<crate::CursorMotionStyle>,
-    /// `native` uses the style's own timing; `fitts` scales the move time with distance and
-    /// target size; `fixed` uses glide_duration_ms (1430 ms when 0).
+    /// `native` uses the style's own timing unless `glide_duration_ms` is nonzero (the 120 ms
+    /// default fixes it); `fitts` scales the move time with distance and target size; `fixed` uses
+    /// glide_duration_ms (1430 ms when 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "cursor_motion_timing_schema")]
     pub timing: Option<crate::CursorMotionTiming>,
@@ -450,8 +451,9 @@ pub struct CursorMotionSelection {
     /// to 0.3..1 (default 0.72).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub spring: Option<f64>,
-    /// Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A
-    /// nonzero value with `native` timing also fixes the duration. Clamped to 0..5000.
+    /// Move duration in milliseconds (default 120). A nonzero value fixes every move at that
+    /// duration under `native` or `fixed` timing; 0 restores the style's own timing (1430 ms
+    /// for `fixed`). Clamped to 0..5000.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub glide_duration_ms: Option<f64>,
     /// Pause after a click animation, in milliseconds. Clamped to 0..5000 (default 80).
@@ -482,8 +484,9 @@ pub struct SetAgentCursorMotionInput {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "cursor_motion_style_schema")]
     pub style: Option<crate::CursorMotionStyle>,
-    /// `native` uses the style's own timing; `fitts` scales the move time with distance and
-    /// target size; `fixed` uses glide_duration_ms (1430 ms when 0).
+    /// `native` uses the style's own timing unless `glide_duration_ms` is nonzero (the 120 ms
+    /// default fixes it); `fitts` scales the move time with distance and target size; `fixed` uses
+    /// glide_duration_ms (1430 ms when 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schemars(schema_with = "cursor_motion_timing_schema")]
     pub timing: Option<crate::CursorMotionTiming>,
@@ -506,8 +509,9 @@ pub struct SetAgentCursorMotionInput {
     /// Arrival spring damping for `classic`: 1 is critically damped, 0.3 is bouncy. Clamped
     /// to 0.3..1 (default 0.72).
     pub spring: Option<f64>,
-    /// Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A
-    /// nonzero value with `native` timing also fixes the duration. Clamped to 0..5000.
+    /// Move duration in milliseconds (default 120). A nonzero value fixes every move at that
+    /// duration under `native` or `fixed` timing; 0 restores the style's own timing (1430 ms
+    /// for `fixed`). Clamped to 0..5000.
     pub glide_duration_ms: Option<f64>,
     /// Pause after a click animation, in milliseconds. Clamped to 0..5000 (default 80).
     pub dwell_after_click_ms: Option<f64>,

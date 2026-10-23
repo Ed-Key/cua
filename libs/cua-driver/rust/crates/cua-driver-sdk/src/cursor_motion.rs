@@ -102,8 +102,8 @@ impl From<CursorMotionParams> for cm::MotionParams {
 }
 
 /// Cua Driver's default motion knobs: the overlay's built-in motion (the
-/// `classic` glide with a 6 pt turn radius), not `cua-cursor-motion`'s own
-/// `MotionParams::default`.
+/// `classic` glide with a 6 pt turn radius and a fixed 120 ms duration), not
+/// `cua-cursor-motion`'s own `MotionParams::default`.
 #[uniffi::export]
 pub fn default_cursor_motion_params() -> CursorMotionParams {
     let d: cm::MotionParams = cursor_overlay::MotionConfig::default().params();
@@ -698,8 +698,11 @@ mod tests {
 
     #[test]
     fn the_ffi_planner_matches_the_crate() {
+        // The style's own spec plays at native timing, so compare without
+        // the default fixed glide duration.
         let params = CursorMotionParams {
             style: CursorMotionStyle::CometSwoop,
+            glide_duration_ms: 0.0,
             ..default_cursor_motion_params()
         };
         let request = CursorMoveRequest {

@@ -614,6 +614,27 @@ pub unsafe fn focused_element_of_pid(pid: i32) -> Option<AXUIElementRef> {
     Some(value as AXUIElementRef)
 }
 
+/// Actual process hosting an AX element, including out-of-process views.
+/// Unavailable SPI or failed reads leave ownership unknown.
+///
+/// # Safety
+/// `element` must be a live, retained AX element.
+pub unsafe fn actual_pid(element: AXUIElementRef) -> Option<i32> {
+    if element.is_null()
+        || core_foundation::base::CFGetTypeID(element as CFTypeRef) != AXUIElementGetTypeID()
+    {
+        return None;
+    }
+    type GetActualPid = unsafe extern "C" fn(AXUIElementRef, *mut i32) -> AXError;
+    static FUNCTION: std::sync::OnceLock<Option<GetActualPid>> = std::sync::OnceLock::new();
+    let function = FUNCTION.get_or_init(|| {
+        let symbol = libc::dlsym(libc::RTLD_DEFAULT, c"_AXUIElementGetActualPid".as_ptr());
+        (!symbol.is_null()).then(|| std::mem::transmute::<*mut c_void, GetActualPid>(symbol))
+    });
+    let mut pid = -1;
+    (function.as_ref()?(element, &mut pid) == kAXErrorSuccess && pid > 0).then_some(pid)
+}
+
 /// The window an AX surface belongs to for reads, actions and focus checks.
 /// An `AXSheet` (an Open panel, a save prompt) has its own WindowServer id,
 /// but it lives inside its parent window's accessibility tree and is read
@@ -1395,20 +1416,36 @@ fn checked_window_id(error: AXError, window_id: u32) -> Result<Option<u32>, AXEr
 ///
 /// `element` must be valid, and the caller must release every returned element.
 pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
+    copy_ax_windows_reporting(element).0
+}
+
+fn ax_windows_read_failed(error: AXError) -> bool {
+    !matches!(error, kAXErrorSuccess | kAXErrorNoValue | kAXErrorAttributeUnsupported)
+}
+
+/// [`copy_ax_windows`], plus whether the read failed rather than having no value.
+///
+/// # Safety
+///
+/// `element` must be valid, and the caller must release every returned element.
+pub unsafe fn copy_ax_windows_reporting(element: AXUIElementRef) -> (Vec<AXUIElementRef>, bool) {
     let attr = CFStr::new("AXWindows");
     let mut value: CFTypeRef = std::ptr::null();
     let err = AXUIElementCopyAttributeValue(element, attr.as_concrete_TypeRef(), &mut value);
-    if err != kAXErrorSuccess || value.is_null() {
-        return vec![];
+    if err != kAXErrorSuccess {
+        return (vec![], ax_windows_read_failed(err));
+    }
+    if value.is_null() {
+        return (vec![], true);
     }
     let cf_array_type_id = CFArray::<CFTypeRef>::type_id();
     if core_foundation::base::CFGetTypeID(value) != cf_array_type_id {
         CFRelease(value);
-        return vec![];
+        return (vec![], true);
     }
     let arr = CFArray::<CFTypeRef>::wrap_under_create_rule(value as _);
     let ax_type_id = AXUIElementGetTypeID();
-    (0..arr.len())
+    let windows = (0..arr.len())
         .filter_map(|i| {
             let item = *arr.get(i)?;
             if core_foundation::base::CFGetTypeID(item) == ax_type_id {
@@ -1418,7 +1455,8 @@ pub unsafe fn copy_ax_windows(element: AXUIElementRef) -> Vec<AXUIElementRef> {
                 None
             }
         })
-        .collect()
+        .collect();
+    (windows, false)
 }
 
 /// Copy an attribute without conflating an AX failure with an absent value.
@@ -1725,7 +1763,21 @@ pub unsafe fn copy_ax_windows_including(
     pid: i32,
     window_id: u32,
 ) -> Vec<AXUIElementRef> {
-    let mut windows = copy_ax_windows(app);
+    copy_ax_windows_including_reporting(app, pid, window_id).0
+}
+
+/// [`copy_ax_windows_including`], plus whether the `AXWindows` read failed.
+///
+/// # Safety
+///
+/// `app` must be the valid application element of `pid`, and the caller must
+/// release every returned element.
+pub unsafe fn copy_ax_windows_including_reporting(
+    app: AXUIElementRef,
+    pid: i32,
+    window_id: u32,
+) -> (Vec<AXUIElementRef>, bool) {
+    let (mut windows, read_failed) = copy_ax_windows_reporting(app);
     let listed = windows
         .iter()
         .any(|&window| ax_get_window_id(window) == Some(window_id));
@@ -1734,11 +1786,28 @@ pub unsafe fn copy_ax_windows_including(
     }) {
         windows.extend(copy_ax_window_by_remote_token(pid, window_id));
     }
-    windows
+    (windows, read_failed)
 }
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn ax_windows_read_errors_distinguish_absent_values_from_failures() {
+        for error in [kAXErrorSuccess, kAXErrorNoValue, kAXErrorAttributeUnsupported] {
+            assert!(!ax_windows_read_failed(error), "error {error}");
+        }
+        for error in [
+            kAXErrorFailure,
+            kAXErrorInvalidUIElement,
+            kAXErrorCannotComplete,
+            kAXErrorActionUnsupported,
+            kAXErrorNotImplemented,
+            kAXErrorAPIDisabled,
+        ] {
+            assert!(ax_windows_read_failed(error), "error {error}");
+        }
+    }
+
     #[test]
     fn only_an_action_that_destroyed_a_live_element_counts_as_replaced() {
         use super::{action_replaced_element, kAXErrorInvalidUIElement, kAXErrorSuccess};

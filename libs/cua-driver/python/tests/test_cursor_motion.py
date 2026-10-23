@@ -177,6 +177,8 @@ class CursorMotionGoldenTests(unittest.TestCase):
     def test_the_arc_styles_are_specs(self) -> None:
         n, c = self.n, self.c
         params = n.default_cursor_motion_params()
+        # The style's own spec plays at native timing, not the fixed default.
+        params.glide_duration_ms = 0.0
         request = self.request(self.golden["cases"][0]["request"])
         spec = n.cursor_motion_spec_for_style(c.CursorMotionStyle.COMET_SWOOP, params)
         self.assertIsNotNone(spec)

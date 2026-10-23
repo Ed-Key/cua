@@ -99,24 +99,39 @@ impl Tool for TypeTextCharsTool {
                 Err(refusal_result) => return refusal_result,
             }
         } else {
-            None
+            Some(super::acquire_background_mutation(pid).await)
         };
 
-        // Pre-focus element if requested.
-        if !type_chars_only {
-            if let Some(guard) = element_guard.as_ref().cloned() {
-                let _ = tokio::task::spawn_blocking(move || {
-                    crate::input::ax_actions::focus_element(guard.as_ptr())
-                })
-                .await;
-                tokio::time::sleep(std::time::Duration::from_millis(50)).await;
-            }
-        }
-        drop(element_guard);
+        let background_focus = match self.state.background_focus(&args, pid) {
+            Ok(controller) => controller,
+            Err(error) => return error,
+        };
 
         let text_len = text.chars().count();
+        let delivery_lease = _mutation_lease.clone();
         let result = tokio::task::spawn_blocking(move || {
-            crate::input::keyboard::type_text_with_delay(pid, &text, delay_ms)
+            let _delivery_lease = delivery_lease;
+            let element_ptr = element_guard.as_ref().map(|guard| guard.as_ptr());
+            let prepare_element = || {
+                if let Some(ptr) = element_ptr.filter(|_| !type_chars_only) {
+                    crate::input::ax_actions::focus_element(ptr)?;
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                Ok(())
+            };
+            super::with_background_key_recipient(
+                Some(&background_focus),
+                pid,
+                window_id,
+                element_ptr,
+                element_ptr
+                    .filter(|_| !type_chars_only)
+                    .map(|_| &prepare_element as &dyn Fn() -> anyhow::Result<()>),
+                |recipient| {
+                    crate::input::keyboard::type_text_with_delay(recipient, &text, delay_ms, None)
+                        .map(drop)
+                },
+            )
         })
         .await;
 

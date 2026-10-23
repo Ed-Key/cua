@@ -12,6 +12,8 @@ use tokio::sync::{Mutex as AsyncMutex, OwnedMutexGuard};
 
 tokio::task_local! {
     static HELD_PID: i32;
+    static HELD_GUARD: Arc<OwnedMutexGuard<()>>;
+    static HELD_FOCUS: Option<Arc<crate::background_focus::HostController>>;
 }
 
 fn process_locks() -> &'static Mutex<HashMap<i32, Weak<AsyncMutex<()>>>> {
@@ -40,10 +42,50 @@ pub(crate) async fn acquire(pid: i32) -> OwnedMutexGuard<()> {
     process_lock(pid).lock_owned().await
 }
 
+/// Avoid waiting for another process while a host mutation lease is held.
+pub(crate) fn try_acquire(pid: i32) -> Result<OwnedMutexGuard<()>, tokio::sync::TryLockError> {
+    process_lock(pid).try_lock_owned()
+}
+
 /// Run one nested tool call with non-forgeable proof that its caller already
 /// owns this process's mutation lease.
-pub(crate) async fn with_held_lease<T>(pid: i32, future: impl Future<Output = T>) -> T {
-    HELD_PID.scope(pid, future).await
+pub(crate) async fn with_held_lease<T>(
+    pid: i32,
+    guard: Arc<OwnedMutexGuard<()>>,
+    future: impl Future<Output = T>,
+) -> T {
+    HELD_FOCUS
+        .scope(None, HELD_PID.scope(pid, HELD_GUARD.scope(guard, future)))
+        .await
+}
+
+/// Nested focus mutations retain their trusted controller through blocking delivery.
+pub(crate) async fn with_held_focus<T>(
+    focus: Arc<crate::background_focus::HostController>,
+    guard: Arc<OwnedMutexGuard<()>>,
+    future: impl Future<Output = T>,
+) -> T {
+    let pid = focus.host_pid();
+    HELD_FOCUS
+        .scope(
+            Some(focus),
+            HELD_PID.scope(pid, HELD_GUARD.scope(guard, future)),
+        )
+        .await
+}
+
+/// Nested pixel-focus work must retain its parent lease after async cancellation.
+pub(crate) fn spawn_blocking<T: Send + 'static>(
+    operation: impl FnOnce() -> T + Send + 'static,
+) -> tokio::task::JoinHandle<T> {
+    let held = HELD_GUARD.try_with(Arc::clone).ok();
+    let focus = HELD_FOCUS.try_with(Clone::clone).ok().flatten();
+    tokio::task::spawn_blocking(move || {
+        // Reverse local drop order releases coordination before final retirement.
+        let _focus_owner = focus;
+        let _held_lease = held;
+        operation()
+    })
 }
 
 pub(crate) fn held_by_current_task(pid: i32) -> bool {
@@ -89,7 +131,7 @@ mod tests {
     #[tokio::test]
     async fn nested_lease_proof_is_task_local_and_pid_bound() {
         assert!(!held_by_current_task(-91_004));
-        with_held_lease(-91_004, async {
+        with_held_lease(-91_004, Arc::new(acquire(-91_004).await), async {
             assert!(held_by_current_task(-91_004));
             assert!(!held_by_current_task(-91_005));
         })

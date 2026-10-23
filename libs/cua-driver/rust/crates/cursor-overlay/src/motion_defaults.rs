@@ -6,8 +6,9 @@
 //! settings. They seed the motion of every session cursor created after the
 //! value is read. Precedence, highest first: a per-call
 //! `set_agent_cursor_motion`, the `cursor_motion` of `start_session`, this
-//! saved default, the built-in `classic` glide with a 6 pt turn radius
-//! (`MotionConfig::default`, nearly straight). A reduced-motion theme or
+//! saved default, the built-in `classic` glide with a 6 pt turn radius and a
+//! fixed 120 ms duration (`MotionConfig::default`, nearly straight and
+//! near-instant). A reduced-motion theme or
 //! policy always wins at render time, so it overrides all of them.
 
 use crate::motion::{MotionConfig, MotionEffects, MotionStyle, MotionTiming};

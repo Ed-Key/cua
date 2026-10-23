@@ -2941,7 +2941,7 @@ const FfiConverterTypeCursorMotionOutput = (() => {
 /**
  * Cursor motion for a session, with the fields of `set_agent_cursor_motion` minus `session`.
  * Omitted or null fields keep the saved default (`cursor.motion.*` in the driver config), then
- * the built-in `classic` glide (turn radius 6, nearly straight).
+ * the built-in `classic` glide (turn radius 6, nearly straight, 120 ms).
  */
 export type CursorMotionSelection = {
     /**
@@ -2954,8 +2954,9 @@ export type CursorMotionSelection = {
      */
     style?: CursorMotionStyle,
     /**
-     * `native` uses the style's own timing; `fitts` scales the move time with distance and
-     * target size; `fixed` uses glide_duration_ms (1430 ms when 0).
+     * `native` uses the style's own timing unless `glide_duration_ms` is nonzero (the 120 ms
+     * default fixes it); `fitts` scales the move time with distance and target size; `fixed` uses
+     * glide_duration_ms (1430 ms when 0).
      */
     timing?: CursorMotionTiming,
     /**
@@ -2989,8 +2990,9 @@ export type CursorMotionSelection = {
      */
     spring?: number,
     /**
-     * Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A
-     * nonzero value with `native` timing also fixes the duration. Clamped to 0..5000.
+     * Move duration in milliseconds (default 120). A nonzero value fixes every move at that
+     * duration under `native` or `fixed` timing; 0 restores the style's own timing (1430 ms
+     * for `fixed`). Clamped to 0..5000.
      */
     glideDurationMs?: number,
     /**
@@ -7245,8 +7247,9 @@ export type SetAgentCursorMotionInput = {
      */
     style?: CursorMotionStyle,
     /**
-     * `native` uses the style's own timing; `fitts` scales the move time with distance and
-     * target size; `fixed` uses glide_duration_ms (1430 ms when 0).
+     * `native` uses the style's own timing unless `glide_duration_ms` is nonzero (the 120 ms
+     * default fixes it); `fitts` scales the move time with distance and target size; `fixed` uses
+     * glide_duration_ms (1430 ms when 0).
      */
     timing?: CursorMotionTiming,
     /**
@@ -7280,8 +7283,9 @@ export type SetAgentCursorMotionInput = {
      */
     spring?: number,
     /**
-     * Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A
-     * nonzero value with `native` timing also fixes the duration. Clamped to 0..5000.
+     * Move duration in milliseconds (default 120). A nonzero value fixes every move at that
+     * duration under `native` or `fixed` timing; 0 restores the style's own timing (1430 ms
+     * for `fixed`). Clamped to 0..5000.
      */
     glideDurationMs?: number,
     /**
@@ -7658,7 +7662,7 @@ export type StartSessionInput = {
      * Optional initial cursor motion (style, timing, effects and tuning). The host applies it
      * before the cursor is first made visible. A later `set_agent_cursor_motion` call wins;
      * this wins over the saved default (`cursor.motion.*` in the driver config) and the
-     * built-in `classic` glide (turn radius 6, nearly straight). Reduced motion always wins.
+     * built-in `classic` glide (turn radius 6, nearly straight, 120 ms). Reduced motion always wins.
      */
     cursorMotion?: CursorMotionSelection
 }

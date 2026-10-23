@@ -231,8 +231,21 @@ unsafe impl objc2::RefEncode for CGPath {
         objc2::Encoding::Pointer(&objc2::Encoding::Struct("CGPath", &[]));
 }
 
+/// A mouse event's CGEvent (`-[NSEvent CGEvent]`), typed so objc2's
+/// return-encoding check matches `^{__CGEvent=}`.
+#[repr(C)]
+struct CGEvent {
+    _opaque: [u8; 0],
+}
+
+unsafe impl objc2::RefEncode for CGEvent {
+    const ENCODING_REF: objc2::Encoding =
+        objc2::Encoding::Pointer(&objc2::Encoding::Struct("__CGEvent", &[]));
+}
+
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
+    fn CGEventGetLocation(event: *mut CGEvent) -> NSPoint;
     fn CGPathCreateMutable() -> *mut CGPath;
     fn CGPathMoveToPoint(path: *mut CGPath, transform: *const c_void, x: f64, y: f64);
     fn CGPathAddLineToPoint(path: *mut CGPath, transform: *const c_void, x: f64, y: f64);
@@ -831,6 +844,8 @@ struct Gesture {
     pressed: Option<Tag>,
     /// The pointer went past `DRAG_SLOP`: a drag, not a click.
     moved: bool,
+    /// A resize step changed the size box at some point in this press.
+    resized: bool,
     /// Since when the button has been seen up with no mouse-up delivered
     /// (see `release_missed`).
     up_since: Option<Instant>,
@@ -5759,7 +5774,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
     unsafe {
         let window = window_of(this);
         let point = event_point(this, event);
-        let mouse = mouse_location();
+        let mouse = event_screen_point(event);
         with_state(|state| {
             let Some(panel) = panel_for(state, window) else {
                 return;
@@ -5795,6 +5810,7 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
                 edges,
                 pressed,
                 moved: false,
+                resized: false,
                 up_since: None,
                 max,
             });
@@ -5802,66 +5818,98 @@ extern "C" fn stack_mouse_down(this: *mut AnyObject, _cmd: Sel, event: *mut AnyO
     }
 }
 
-extern "C" fn stack_mouse_dragged(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
-    unsafe {
-        let mouse = mouse_location();
-        let resize = with_state(|state| {
-            let State {
-                gesture,
-                panels,
-                ending,
-                ..
-            } = state;
-            let gesture = gesture.as_mut()?;
-            let panel = panels
-                .values_mut()
-                .chain(ending.iter_mut())
-                .find(|panel| panel.id == gesture.id)?;
-            let delta = (mouse.0 - gesture.mouse.0, mouse.1 - gesture.mouse.1);
-            if gesture.edges != 0 {
-                let (card, frame) = resize_panel(
-                    gesture.start,
-                    gesture.start_card,
-                    gesture.edges,
-                    delta,
-                    gesture.max,
-                );
-                set_box(panel, card);
-                return Some((panel.window, frame));
-            }
-            if !gesture.moved && delta.0.hypot(delta.1) < DRAG_SLOP {
-                return None;
-            }
-            gesture.moved = true;
-            let origin = (gesture.start.x + delta.0, gesture.start.y + delta.1);
-            let step = (origin.0 - gesture.origin.0, origin.1 - gesture.origin.1);
-            gesture.origin = origin;
-            // The back items stay put on screen, then swing after the panel.
-            panel.trail_motion.panel_dragged(step);
-            let _: () = msg_send![
-                panel.window as *mut AnyObject,
-                setFrameOrigin: NSPoint::new(origin.0, origin.1)
-            ];
-            apply_card_frames(panel);
-            start_ticking();
-            None
-        })
-        .flatten();
-        if let Some((window, frame)) = resize {
-            let _: () = msg_send![window as *mut AnyObject, setFrame: ns_rect(frame) display: true];
-            // The back items follow the resized panel at once (no lag).
-            with_state(|state| {
-                if let Some(panel) = panel_for(state, window) {
-                    panel.trail_motion.snap();
-                    apply_card_frames(panel);
-                }
-            });
+extern "C" fn stack_mouse_dragged(_this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
+    unsafe { drag_gesture_to(event_screen_point(event), false) }
+}
+
+/// Move (or resize) the panel of the press in progress for the pointer at
+/// `mouse` (screen points): from every drag event, and once more from the
+/// release (`release`), where the pointer was let go.
+unsafe fn drag_gesture_to(mouse: (f64, f64), release: bool) {
+    let resize = with_state(|state| {
+        let State {
+            gesture,
+            panels,
+            ending,
+            ..
+        } = state;
+        let gesture = gesture.as_mut()?;
+        let panel = panels
+            .values_mut()
+            .chain(ending.iter_mut())
+            .find(|panel| panel.id == gesture.id)?;
+        let delta = (mouse.0 - gesture.mouse.0, mouse.1 - gesture.mouse.1);
+        // A release within the slop of the press, after a press that changed
+        // nothing, is a click (on a resize edge too) and changes nothing: not
+        // even a clamp of the box to `max`.
+        let unchanged = !gesture.moved && !gesture.resized;
+        if release && unchanged && delta.0.hypot(delta.1) < DRAG_SLOP {
+            return None;
         }
+        if gesture.edges != 0 {
+            let (card, frame) = resize_panel(
+                gesture.start,
+                gesture.start_card,
+                gesture.edges,
+                delta,
+                gesture.max,
+            );
+            gesture.resized |= card != gesture.start_card;
+            set_box(panel, card);
+            return Some((panel.window, frame));
+        }
+        if !gesture.moved && delta.0.hypot(delta.1) < DRAG_SLOP {
+            return None;
+        }
+        gesture.moved = true;
+        let origin = (gesture.start.x + delta.0, gesture.start.y + delta.1);
+        let step = (origin.0 - gesture.origin.0, origin.1 - gesture.origin.1);
+        gesture.origin = origin;
+        // The back items stay put on screen, then swing after the panel.
+        panel.trail_motion.panel_dragged(step);
+        let _: () = msg_send![
+            panel.window as *mut AnyObject,
+            setFrameOrigin: NSPoint::new(origin.0, origin.1)
+        ];
+        apply_card_frames(panel);
+        start_ticking();
+        None
+    })
+    .flatten();
+    if let Some((window, frame)) = resize {
+        let _: () = msg_send![window as *mut AnyObject, setFrame: ns_rect(frame) display: true];
+        // The back items follow the resized panel at once (no lag).
+        with_state(|state| {
+            if let Some(panel) = panel_for(state, window) {
+                panel.trail_motion.snap();
+                apply_card_frames(panel);
+            }
+        });
     }
 }
 
-extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, _event: *mut AnyObject) {
+extern "C" fn stack_mouse_up(_this: *mut AnyObject, _cmd: Sel, event: *mut AnyObject) {
+    unsafe {
+        // A fast drag's last step can be coalesced into the release, or the
+        // whole press handled late: the release's own location ends it, so
+        // the card lands where the pointer was let go.
+        drag_gesture_to(event_screen_point(event), true);
+    }
     with_state(|state| unsafe { end_gesture(state, true) });
+}
+
+/// Where a mouse event happened, in screen points (AppKit, bottom-left
+/// origin). From the event's own CGEvent, not the live pointer, and not
+/// `locationInWindow`: a press handled late, after the pointer and the
+/// dragged window both moved on, still reads where it happened.
+unsafe fn event_screen_point(event: *mut AnyObject) -> (f64, f64) {
+    // Owned by the event (not retained here): read it at once.
+    let cg: *mut CGEvent = msg_send![event, CGEvent];
+    if cg.is_null() {
+        return mouse_location();
+    }
+    let at = CGEventGetLocation(cg);
+    stack::appkit_point((at.x, at.y), overview::primary_screen_height())
 }
 
 /// The press on a panel is over. With `click` (its mouse-up arrived), a

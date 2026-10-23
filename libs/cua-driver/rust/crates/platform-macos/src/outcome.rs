@@ -35,6 +35,12 @@ const NO_CHANGE_WAIT: Duration = Duration::from_millis(600);
 /// after the menu closes, and its work (a Finder file operation) can show
 /// later than a click's. A Move to Trash once showed after 0.6 s.
 const COMMAND_NO_CHANGE_WAIT: Duration = Duration::from_millis(1500);
+/// The same for a pointer click (click, double_click, right_click): the
+/// smallest wait of at least 250 ms that covered 99% of the first changes
+/// clicks showed in the lab's checks (all that 600 ms caught; the latest, a
+/// Catalyst click, at 380 ms; research/2026-10-23-click-outcome/phase2). Its
+/// line says the app can finish later, so the agent reads before repeating.
+const POINTER_NO_CHANGE_WAIT: Duration = Duration::from_millis(400);
 /// Once something changed: settled when reads agree for this long.
 const STABLE_FOR: Duration = Duration::from_millis(200);
 /// The same when a sheet, popover or menu closed: UIKit runs an alert
@@ -190,6 +196,9 @@ pub(crate) enum FileText {
 pub(crate) enum Settle {
     /// Nothing changed within [`NO_CHANGE_WAIT`].
     Unchanged,
+    /// A pointer click: nothing changed within [`POINTER_NO_CHANGE_WAIT`],
+    /// which does not show it did nothing (the app can finish later).
+    PointerUnchanged,
     /// A command: nothing changed within [`COMMAND_NO_CHANGE_WAIT`], which
     /// does not show it did nothing (it can finish later).
     CommandUnchanged,
@@ -205,6 +214,82 @@ pub(crate) enum Settle {
     Settled,
     /// Still changing at [`SETTLE_DEADLINE`].
     StillChanging,
+}
+
+/// Which no-change window a watch waits.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Kind {
+    /// click, double_click, right_click: [`POINTER_NO_CHANGE_WAIT`].
+    Pointer,
+    /// invoke_menu, hotkey: [`COMMAND_NO_CHANGE_WAIT`].
+    Command,
+    /// Every other action (type_text, set_value, press_key, drag):
+    /// [`NO_CHANGE_WAIT`]. A Return or Space can start a delayed command.
+    Action,
+}
+
+impl Kind {
+    pub(crate) fn of(tool: &str) -> Self {
+        match tool {
+            "click" | "double_click" | "right_click" => Self::Pointer,
+            "invoke_menu" | "hotkey" => Self::Command,
+            _ => Self::Action,
+        }
+    }
+
+    fn no_change_wait(self) -> Duration {
+        match self {
+            Self::Pointer => POINTER_NO_CHANGE_WAIT,
+            Self::Command => COMMAND_NO_CHANGE_WAIT,
+            Self::Action => NO_CHANGE_WAIT,
+        }
+    }
+
+    /// How a wait that saw no change ends.
+    fn unchanged(self) -> Settle {
+        match self {
+            Self::Command => Settle::CommandUnchanged,
+            Self::Pointer => Settle::PointerUnchanged,
+            Self::Action => Settle::Unchanged,
+        }
+    }
+}
+
+/// A read that answered in full, as the wait sees it.
+#[derive(Clone, Copy, Debug)]
+struct FullRead {
+    /// It differs from the read before the action.
+    changed: bool,
+    /// How long the reads have agreed with this one.
+    quiet: Duration,
+    /// How long they must agree to settle ([`STABLE_FOR`] or [`STABLE_AFTER_CLOSE`]).
+    stable_for: Duration,
+}
+
+/// One poll's decision: end the wait with a [`Settle`], or poll again.
+/// `read` is `None` when the read was cut by the budget; `last_full_changed`
+/// is whether the last full read (this one, when full) differs from the start.
+fn decide(kind: Kind, elapsed: Duration, read: Option<FullRead>, last_full_changed: bool) -> Option<Settle> {
+    if let Some(read) = read {
+        if read.changed && read.quiet >= read.stable_for {
+            return Some(Settle::Settled);
+        }
+        if !read.changed && elapsed >= kind.no_change_wait() {
+            return Some(kind.unchanged());
+        }
+    }
+    (elapsed >= SETTLE_DEADLINE).then(|| if last_full_changed { Settle::StillChanging } else { kind.unchanged() })
+}
+
+/// The settle the line uses, once the final read is in: a change that went
+/// back by then is not settled, and invoke_menu (the command that does not
+/// watch menus) gets its own no-effect line.
+fn final_settle(settle: Settle, back_to_start: bool, menus: bool) -> Settle {
+    match settle {
+        Settle::Settled if back_to_start => Settle::Reverted,
+        Settle::CommandUnchanged if !menus => Settle::MenuCommandUnchanged,
+        settle => settle,
+    }
 }
 
 fn quote(text: &str) -> String {
@@ -722,24 +807,34 @@ pub(crate) fn describe(
     }
     if parts.is_empty() {
         let command = matches!(settle, Settle::CommandUnchanged | Settle::MenuCommandUnchanged);
-        let seconds = if command { COMMAND_NO_CHANGE_WAIT } else { NO_CHANGE_WAIT }.as_secs_f32();
+        let wait = match settle {
+            _ if command => COMMAND_NO_CHANGE_WAIT,
+            Settle::PointerUnchanged => POINTER_NO_CHANGE_WAIT,
+            _ => NO_CHANGE_WAIT,
+        };
+        // Exact ("0.4", "0.25"), never rounded to one place.
+        let seconds = wait.as_millis() as f64 / 1000.0;
         let mut line = if complete && settle == Settle::Reverted {
             "a change came and went (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: read the window before repeating the action".to_owned()
         } else if complete && command && settle == Settle::MenuCommandUnchanged {
             format!(
-                "{} within {seconds:.1} s (no window opened or closed, and focus, selection, list items, values, title, document, sheets, popovers, the clipboard and the window frame are as before); not settled: a command can finish later or act on a window already open, so read the window before repeating it",
+                "{} within {seconds} s (no window opened or closed, and focus, selection, list items, values, title, document, sheets, popovers, the clipboard and the window frame are as before); not settled: a command can finish later or act on a window already open, so read the window before repeating it",
                 cua_driver_core::outcome::NO_EFFECT
             )
         } else if complete && command {
             format!(
-                "no change seen within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: a command can finish later, so read the window before repeating it"
+                "no change seen within {seconds} s (focus, selection, list items, values, title, document, sheets, popovers, windows); not settled: a command can finish later, so read the window before repeating it"
+            )
+        } else if complete && settle == Settle::PointerUnchanged {
+            format!(
+                "nothing it watches changed within {seconds} s (focus, selection, list items, values, title, document, sheets, popovers, menus, windows); not settled: the app can finish later, so read the window before repeating it"
             )
         } else if complete {
             format!(
-                "nothing it watches changed within {seconds:.1} s (focus, selection, list items, values, title, document, sheets, popovers, menus, windows)"
+                "nothing it watches changed within {seconds} s (focus, selection, list items, values, title, document, sheets, popovers, menus, windows)"
             )
         } else {
-            format!("no change seen within {seconds:.1} s, but the app did not answer every read")
+            format!("no change seen within {seconds} s, but the app did not answer every read")
         };
         if after.document.is_some() && after.file.is_none() {
             line.push_str("; the document's file was not checked (protected folder or unreadable)");
@@ -1304,8 +1399,8 @@ struct Scope {
     /// menu it walks fades out after the command, and reading that as "a
     /// menu opened" would also end the wait before a sheet the command opens.
     menus: bool,
-    /// A menu command or key shortcut: waits [`COMMAND_NO_CHANGE_WAIT`].
-    command: bool,
+    /// Which no-change window the watch waits.
+    kind: Kind,
     /// Set once the watch found its list (see [`Facts::target_in_list`]).
     target_in_list: Option<bool>,
     opener_in_list: Option<bool>,
@@ -1951,7 +2046,7 @@ pub(crate) fn command_facts(pid: i32, window_id: u32) -> Option<Facts> {
         collection: None,
         opener: None,
         menus: false,
-        command: true,
+        kind: Kind::Command,
         target_in_list: None,
         opener_in_list: None,
         stepper: false,
@@ -1990,7 +2085,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
         (None, window_id)
     };
     let watch_menus = tool != "invoke_menu";
-    let command = tool == "invoke_menu" || tool == "hotkey";
+    let kind = Kind::of(tool);
     let tool_is_menu = tool == "invoke_menu";
     tokio::task::spawn_blocking(move || {
         let window_id = window_id.or_else(|| unsafe { focused_window_id(pid) })?;
@@ -2004,7 +2099,7 @@ pub(crate) async fn begin(tool: &str, args: &Value) -> Option<Box<dyn OutcomeWat
             collection: None,
             opener: opener.as_ref().map(RetainedElement::as_ptr),
             menus: watch_menus,
-            command,
+            kind,
             target_in_list: None,
             opener_in_list: None,
             extras: tool_is_menu,
@@ -2119,30 +2214,22 @@ impl Watch {
             .await
             .ok()?;
             let elapsed = started.elapsed();
-            if complete {
+            let read = complete.then(|| {
                 let now = settle_key(now, &watch.before);
                 if previous.as_ref() != Some(&now) {
                     last_change = Instant::now();
                 }
-                let changed = now != watch.before;
-                let stable_for = if surface_closed(&watch.before, &now) { STABLE_AFTER_CLOSE } else { STABLE_FOR };
-                previous = Some(now);
-                if changed && last_change.elapsed() >= stable_for {
-                    break Settle::Settled;
-                }
-                if !changed && !watch.scope.command && elapsed >= NO_CHANGE_WAIT {
-                    break Settle::Unchanged;
-                }
-                if !changed && elapsed >= COMMAND_NO_CHANGE_WAIT {
-                    break Settle::CommandUnchanged;
-                }
-            }
-            if elapsed >= SETTLE_DEADLINE {
-                break match &previous {
-                    Some(facts) if *facts != watch.before => Settle::StillChanging,
-                    _ if watch.scope.command => Settle::CommandUnchanged,
-                    _ => Settle::Unchanged,
+                let read = FullRead {
+                    changed: now != watch.before,
+                    quiet: last_change.elapsed(),
+                    stable_for: if surface_closed(&watch.before, &now) { STABLE_AFTER_CLOSE } else { STABLE_FOR },
                 };
+                previous = Some(now);
+                read
+            });
+            let last_full_changed = previous.as_ref().is_some_and(|facts| *facts != watch.before);
+            if let Some(settle) = decide(watch.scope.kind, elapsed, read, last_full_changed) {
+                break settle;
             }
         };
         // Read once more, keeping what the disk notes need; when that read
@@ -2171,14 +2258,7 @@ impl Watch {
                     None => (pass.facts, DiskNotes::default(), false),
                 }
             };
-            // A change that went back by the last read is not settled.
-            let settle = if settle == Settle::Settled && after == before { Settle::Reverted } else { settle };
-            // invoke_menu is the command that does not watch menus.
-            let settle = if settle == Settle::CommandUnchanged && !scope.menus {
-                Settle::MenuCommandUnchanged
-            } else {
-                settle
-            };
+            let settle = final_settle(settle, after == before, scope.menus);
             describe(&before, &after, &disk, settle, complete_before && complete)
         })
         .await
@@ -2674,6 +2754,133 @@ mod tests {
             describe(&before, &after, &DiskNotes::default(), Settle::Settled, true),
             "AXTextArea now 25007 characters, was 25000"
         );
+    }
+
+    // The wait's event x state table (research/2026-10-23-click-outcome/plan.md,
+    // section 5), one test per row the pure parts can show.
+
+    /// A pointer click's no-change window: the smallest of at least 250 ms
+    /// that covers 99% of first changes measured in the lab (phase 2, data/first-change.md).
+    const POINTER_WAIT: Duration = Duration::from_millis(400);
+
+    fn ms(n: u64) -> Duration {
+        Duration::from_millis(n)
+    }
+
+    fn unchanged_read() -> Option<FullRead> {
+        Some(FullRead { changed: false, quiet: ms(0), stable_for: STABLE_FOR })
+    }
+
+    fn changed_read(quiet: u64, stable_for: Duration) -> Option<FullRead> {
+        Some(FullRead { changed: true, quiet: ms(quiet), stable_for })
+    }
+
+    /// Rows 1 to 4: which window each tool waits, and that it ends there.
+    #[test]
+    fn each_tool_waits_its_own_no_change_window() {
+        for tool in ["click", "double_click", "right_click"] {
+            assert_eq!(Kind::of(tool), Kind::Pointer, "{tool}");
+        }
+        for tool in ["type_text", "set_value", "press_key", "drag", "type_text_chars"] {
+            assert_eq!(Kind::of(tool), Kind::Action, "{tool}");
+        }
+        for tool in ["invoke_menu", "hotkey"] {
+            assert_eq!(Kind::of(tool), Kind::Command, "{tool}");
+        }
+        assert_eq!(Kind::Pointer.no_change_wait(), POINTER_WAIT);
+        assert!(POINTER_WAIT >= ms(250), "never below 250 ms");
+        assert_eq!(Kind::Action.no_change_wait(), ms(600));
+        assert_eq!(Kind::Command.no_change_wait(), ms(1500));
+        for (kind, wait) in [(Kind::Pointer, POINTER_WAIT), (Kind::Action, ms(600)), (Kind::Command, ms(1500))] {
+            // Row 1: unchanged before the window ends: keep polling.
+            assert_eq!(decide(kind, wait - ms(1), unchanged_read(), false), None, "{kind:?}");
+            // Rows 2 to 4: unchanged at the window: end, unchanged.
+            assert_eq!(decide(kind, wait, unchanged_read(), false), Some(kind.unchanged()), "{kind:?}");
+        }
+        assert_eq!(Kind::Action.unchanged(), Settle::Unchanged);
+        assert_eq!(Kind::Command.unchanged(), Settle::CommandUnchanged);
+    }
+
+    /// Row 2: a pointer click that saw nothing says the window exactly and
+    /// that the app can finish later, so the agent reads before repeating.
+    #[test]
+    fn a_pointer_click_with_no_change_is_not_settled() {
+        let before = window("note.txt");
+        let line = describe(&before, &before.clone(), &DiskNotes::default(), Kind::Pointer.unchanged(), true);
+        let secs = format!("{}", POINTER_WAIT.as_millis() as f64 / 1000.0);
+        assert!(line.starts_with(&format!("nothing it watches changed within {secs} s (")), "{line}");
+        assert!(line.contains("not settled: the app can finish later, so read the window before repeating it"), "{line}");
+        // Other actions keep today's line.
+        let line = describe(&before, &before.clone(), &DiskNotes::default(), Kind::Action.unchanged(), true);
+        assert!(line.starts_with("nothing it watches changed within 0.6 s") && !line.contains("not settled"), "{line}");
+    }
+
+    /// Row 5: a read cut short never ends the wait before the deadline, and
+    /// then it says the app did not answer.
+    #[test]
+    fn an_incomplete_read_keeps_the_wait_to_the_deadline() {
+        for kind in [Kind::Pointer, Kind::Action, Kind::Command] {
+            assert_eq!(decide(kind, POINTER_WAIT, None, false), None, "{kind:?}");
+            assert_eq!(decide(kind, ms(1999), None, false), None, "{kind:?}");
+            assert_eq!(decide(kind, SETTLE_DEADLINE, None, false), Some(kind.unchanged()), "{kind:?}");
+        }
+        let before = window("note.txt");
+        let line = describe(&before, &before.clone(), &DiskNotes::default(), Kind::Pointer.unchanged(), false);
+        assert!(line.contains("but the app did not answer every read"), "{line}");
+    }
+
+    /// Rows 6 and 7: a change waits until reads agree long enough, past the
+    /// no-change window too; longer after a sheet or menu closed.
+    #[test]
+    fn a_change_settles_only_when_reads_agree() {
+        for kind in [Kind::Pointer, Kind::Action, Kind::Command] {
+            assert_eq!(decide(kind, ms(1000), changed_read(150, STABLE_FOR), true), None, "{kind:?}");
+            assert_eq!(decide(kind, ms(300), changed_read(200, STABLE_FOR), true), Some(Settle::Settled), "{kind:?}");
+            assert_eq!(decide(kind, ms(900), changed_read(400, STABLE_AFTER_CLOSE), true), None, "{kind:?}");
+            assert_eq!(
+                decide(kind, ms(1200), changed_read(700, STABLE_AFTER_CLOSE), true),
+                Some(Settle::Settled),
+                "{kind:?}"
+            );
+        }
+    }
+
+    /// Row 8: a settled change that the final read shows gone is "reverted";
+    /// invoke_menu's no-change gets its own line, a hotkey's does not.
+    #[test]
+    fn the_final_read_decides_reverted_and_the_menu_line() {
+        assert_eq!(final_settle(Settle::Settled, true, true), Settle::Reverted);
+        assert_eq!(final_settle(Settle::Settled, false, true), Settle::Settled);
+        assert_eq!(final_settle(Settle::CommandUnchanged, true, false), Settle::MenuCommandUnchanged);
+        assert_eq!(final_settle(Settle::CommandUnchanged, true, true), Settle::CommandUnchanged);
+        let pointer = Kind::Pointer.unchanged();
+        assert_eq!(final_settle(pointer, true, true), pointer);
+    }
+
+    /// Row 9: still changing at the deadline.
+    #[test]
+    fn a_window_still_changing_at_the_deadline_says_so() {
+        for kind in [Kind::Pointer, Kind::Action, Kind::Command] {
+            assert_eq!(decide(kind, SETTLE_DEADLINE, changed_read(50, STABLE_FOR), true), Some(Settle::StillChanging));
+            // A cut read at the deadline after a changed full read.
+            assert_eq!(decide(kind, SETTLE_DEADLINE, None, true), Some(Settle::StillChanging));
+        }
+        let mut before = window("note.txt");
+        before.title = Some("ClickOutcome 1".into());
+        let mut after = before.clone();
+        after.title = Some("ClickOutcome 9".into());
+        let line = describe(&before, &after, &DiskNotes::default(), Settle::StillChanging, true);
+        assert!(line.ends_with("; still changing after 2 s"), "{line}");
+    }
+
+    /// Row 10: the line describes the final read, so a change that landed
+    /// after the window but before that read is named, not hidden.
+    #[test]
+    fn a_change_in_the_final_read_is_named_after_a_no_change_wait() {
+        let before = window("ClickOutcome 0");
+        let after = window("ClickOutcome 1");
+        let line = describe(&before, &after, &DiskNotes::default(), Kind::Pointer.unchanged(), true);
+        assert_eq!(line, "window title now \"ClickOutcome 1\"");
     }
 
     #[test]

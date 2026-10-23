@@ -846,6 +846,13 @@ pub(super) fn resize_edges(point: (f64, f64), card: Area) -> u8 {
     edges
 }
 
+/// A CoreGraphics global point (top-left origin of the primary screen, y
+/// down) in AppKit screen points (bottom-left origin, y up), for a primary
+/// screen `primary_h` tall. Every display shares that one flip.
+pub(super) fn appkit_point(cg: (f64, f64), primary_h: f64) -> (f64, f64) {
+    (cg.0, primary_h - cg.1)
+}
+
 /// How far to move a card drawn at `card` (screen rect, AppKit bottom-left
 /// origin) so it lies inside `visible` (the screen's visible frame: below
 /// the menu bar, above the Dock), by the least distance: (dx, dy). A card
@@ -1064,6 +1071,18 @@ pub(super) fn bar_layout(width: f64) -> BarLayout {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cg_points_flip_on_the_primary_screen_height() {
+        // Primary screen 900 pt tall: its top-left is AppKit (0, 900).
+        assert_eq!(appkit_point((0.0, 0.0), 900.0), (0.0, 900.0));
+        assert_eq!(appkit_point((640.0, 300.0), 900.0), (640.0, 600.0));
+        // A display left of and above the primary keeps negative x, and its
+        // points sit above the primary's top (y > 900).
+        assert_eq!(appkit_point((-1200.0, -200.0), 900.0), (-1200.0, 1100.0));
+        // Below the primary: negative AppKit y.
+        assert_eq!(appkit_point((100.0, 1000.0), 900.0), (100.0, -100.0));
+    }
 
     /// The default size box.
     const BOX: (f64, f64) = (320.0, 200.0);

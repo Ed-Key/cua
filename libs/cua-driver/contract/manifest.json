@@ -3579,7 +3579,7 @@
     },
     {
       "name": "invoke_menu",
-      "description": "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail; never falls back to pixels. On macOS it runs the command from behind when a read then shows an effect; otherwise it activates the app for the command and brings the previous front app back; when the command opened an inline editor, such as Finder's Rename, the app stays in front and the previous front app comes back after a later action ends the edit. The result says which route ran and why. Details: skill://cua-driver/MACOS.md",
+      "description": "Invoke an application-menu item by exact path, e.g. [\"File\",\"Save\"], resolving each level live through accessibility. Missing, ambiguous, or disabled items fail (except on macOS, where an item that reads disabled while its app is behind is tried by its shortcut, and the result says when nothing changed instead of refusing); never falls back to pixels. On macOS, when another app is in front, it presses the item from behind and never presses it again in that call (when nothing shows within 600 ms the result says so; read the window before repeating it); when the item cannot be pressed from behind, it activates the app for the command and brings the previous front app back; when the command opened an inline editor, such as Finder's Rename, the app stays in front and the previous front app comes back after a later action ends the edit. The result says which route ran and why. Details: skill://cua-driver/MACOS.md",
       "platforms": [
         "macos",
         "windows",
@@ -6981,7 +6981,7 @@
             ]
           },
           "glide_duration_ms": {
-            "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` timing also fixes the duration. Clamped to 0..5000.",
+            "description": "Move duration in milliseconds (default 120). A nonzero value fixes every move at that\nduration under `native` or `fixed` timing; 0 restores the style's own timing (1430 ms\nfor `fixed`). Clamped to 0..5000.",
             "type": [
               "number",
               "null"
@@ -7025,7 +7025,7 @@
             "type": "string"
           },
           "timing": {
-            "description": "`native` uses the style's own timing; `fitts` scales the move time with distance and\ntarget size; `fixed` uses glide_duration_ms (1430 ms when 0).",
+            "description": "`native` uses the style's own timing unless `glide_duration_ms` is nonzero (the 120 ms\ndefault fixes it); `fitts` scales the move time with distance and target size; `fixed` uses\nglide_duration_ms (1430 ms when 0).",
             "enum": [
               "native",
               "fitts",
@@ -7656,7 +7656,7 @@
           },
           "cursor_motion": {
             "additionalProperties": false,
-            "description": "Optional initial cursor motion (style, timing, effects and tuning). The host applies it\nbefore the cursor is first made visible. A later `set_agent_cursor_motion` call wins;\nthis wins over the saved default (`cursor.motion.*` in the driver config) and the\nbuilt-in `classic` glide (turn radius 6, nearly straight). Reduced motion always wins.",
+            "description": "Optional initial cursor motion (style, timing, effects and tuning). The host applies it\nbefore the cursor is first made visible. A later `set_agent_cursor_motion` call wins;\nthis wins over the saved default (`cursor.motion.*` in the driver config) and the\nbuilt-in `classic` glide (turn radius 6, nearly straight, 120 ms). Reduced motion always wins.",
             "properties": {
               "arc_flow": {
                 "description": "Added to the arc asymmetry of `signature_arc`, `spring_settle` and `comet_swoop`:\npositive moves the apex toward the destination. Clamped to -1..1 (default 0).",
@@ -7732,7 +7732,7 @@
                 ]
               },
               "glide_duration_ms": {
-                "description": "Move duration in milliseconds for `fixed` timing (1430 ms when 0, the default). A\nnonzero value with `native` timing also fixes the duration. Clamped to 0..5000.",
+                "description": "Move duration in milliseconds (default 120). A nonzero value fixes every move at that\nduration under `native` or `fixed` timing; 0 restores the style's own timing (1430 ms\nfor `fixed`). Clamped to 0..5000.",
                 "type": [
                   "number",
                   "null"
@@ -7772,7 +7772,7 @@
                 "type": "string"
               },
               "timing": {
-                "description": "`native` uses the style's own timing; `fitts` scales the move time with distance and\ntarget size; `fixed` uses glide_duration_ms (1430 ms when 0).",
+                "description": "`native` uses the style's own timing unless `glide_duration_ms` is nonzero (the 120 ms\ndefault fixes it); `fitts` scales the move time with distance and target size; `fixed` uses\nglide_duration_ms (1430 ms when 0).",
                 "enum": [
                   "native",
                   "fitts",

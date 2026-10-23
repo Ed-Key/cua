@@ -717,6 +717,7 @@ pub fn parse_command() -> Command {
         );
         println!("    --timing    native (the style's own), fitts (distance and target size), or");
         println!("                fixed (--glide-ms, 1430 ms when 0).");
+        println!("    --glide-ms  move duration (default 120 ms at any distance; 0 restores the style's timing).");
         println!("    --effects   trail, glow, magnet, ripple, squish set to on, off, or default.");
         println!();
         println!("manifest options:");
@@ -4600,7 +4601,7 @@ fn cli_docs_literal() -> serde_json::Value {
                 "options": no_options,
                 "flags": no_flags,
                 "subcommands": [
-                    {"name":"motion","abstract":"Set the cursor's motion style, timing and effects.","discussion":"Effects take on, off, or default (the style's own choice).","arguments":[],"options":[{"name":"session","short_name":null,"help":"Public label of the session that owns the cursor.","type":"String","default_value":null,"is_optional":false},{"name":"style","short_name":null,"help":"signature_arc, spring_settle, magnetic, comet_swoop, adaptive, or classic.","type":"String","default_value":null,"is_optional":true},{"name":"timing","short_name":null,"help":"native, fitts, or fixed.","type":"String","default_value":null,"is_optional":true},{"name":"effects","short_name":null,"help":"Comma-separated name=on|off|default for trail, glow, magnet, ripple, squish.","type":"String","default_value":null,"is_optional":true},{"name":"glide-ms","short_name":null,"help":"Move duration in milliseconds for fixed timing (1430 when 0).","type":"Number","default_value":null,"is_optional":true},{"name":"socket","short_name":null,"help":"Override the daemon socket path.","type":"Path","default_value":null,"is_optional":true}],"flags":[],"subcommands":[]}
+                    {"name":"motion","abstract":"Set the cursor's motion style, timing and effects.","discussion":"Effects take on, off, or default (the style's own choice).","arguments":[],"options":[{"name":"session","short_name":null,"help":"Public label of the session that owns the cursor.","type":"String","default_value":null,"is_optional":false},{"name":"style","short_name":null,"help":"signature_arc, spring_settle, magnetic, comet_swoop, adaptive, or classic.","type":"String","default_value":null,"is_optional":true},{"name":"timing","short_name":null,"help":"native, fitts, or fixed.","type":"String","default_value":null,"is_optional":true},{"name":"effects","short_name":null,"help":"Comma-separated name=on|off|default for trail, glow, magnet, ripple, squish.","type":"String","default_value":null,"is_optional":true},{"name":"glide-ms","short_name":null,"help":"Move duration in milliseconds (default 120 at any distance; 0 restores the style's own timing, 1430 for fixed).","type":"Number","default_value":null,"is_optional":true},{"name":"socket","short_name":null,"help":"Override the daemon socket path.","type":"Path","default_value":null,"is_optional":true}],"flags":[],"subcommands":[]}
                 ]
             },
             {

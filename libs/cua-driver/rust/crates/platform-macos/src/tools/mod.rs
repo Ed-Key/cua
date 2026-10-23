@@ -195,9 +195,10 @@ pub(crate) fn background_refusal_result(
 /// Exclusive per-process ownership of one background mutation. Callers must
 /// keep this value alive through actuator dispatch, focus restoration, and
 /// target-bound verification.
+#[derive(Clone)]
 pub(crate) struct BackgroundMutationLease {
     pid: i32,
-    _guard: tokio::sync::OwnedMutexGuard<()>,
+    _guard: Arc<tokio::sync::OwnedMutexGuard<()>>,
 }
 
 impl BackgroundMutationLease {
@@ -263,7 +264,39 @@ pub(crate) async fn gate_background_window_action(
 pub(crate) async fn acquire_background_mutation(pid: i32) -> BackgroundMutationLease {
     BackgroundMutationLease {
         pid,
-        _guard: crate::background_mutation::acquire(pid).await,
+        _guard: Arc::new(crate::background_mutation::acquire(pid).await),
+    }
+}
+
+#[cfg(test)]
+mod background_mutation_lifetime_tests {
+    #[tokio::test]
+    async fn cancelled_async_caller_does_not_unlock_a_running_blocking_actuator() {
+        let pid = -91_310;
+        let lease = super::acquire_background_mutation(pid).await;
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let (release, released) = std::sync::mpsc::channel();
+        let (done, completed) = tokio::sync::oneshot::channel();
+        let caller = tokio::spawn(async move {
+            crate::background_mutation::with_held_lease(pid, lease._guard.clone(), async {
+                let _caller_lease = lease;
+                crate::background_mutation::spawn_blocking(move || {
+                    let _ = started.send(());
+                    let _ = released.recv_timeout(std::time::Duration::from_secs(2));
+                    let _ = done.send(());
+                }).await.unwrap();
+            }).await;
+        });
+        ready.await.unwrap();
+        caller.abort();
+        let _ = caller.await;
+        assert!(crate::background_mutation::try_acquire(pid).is_err());
+        release.send(()).unwrap();
+        completed.await.unwrap();
+        let _released = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            crate::background_mutation::acquire(pid),
+        ).await.unwrap();
     }
 }
 
@@ -278,21 +311,45 @@ pub(crate) async fn finish_window_observation(
     snapshot.detect_async().await
 }
 
-/// Deliver a background key to web content with its exact window selected as
-/// the key window (see [`crate::input::skylight::with_background_key_window`]).
-/// Native controls and pid-only requests keep their existing path.
-pub(super) fn with_background_web_key_window<T>(
+pub(super) fn validate_prepared_element_window(
+    window_id: Option<u32>,
+    element_ptr: Option<usize>,
+) -> anyhow::Result<()> {
+    if let (Some(window_id), Some(element_ptr)) = (window_id, element_ptr) {
+        let element_window = unsafe {
+            crate::ax::exact_target::element_window_id(
+                element_ptr as crate::ax::bindings::AXUIElementRef,
+            )
+        };
+        anyhow::ensure!(
+            element_window
+                .is_some_and(|id| crate::ax::bindings::window_belongs_to(id, window_id)),
+            "background focus element changed its window before preparation"
+        );
+    }
+    Ok(())
+}
+
+/// Prepare retained host focus before resolving a fresh hosted keyboard recipient.
+pub(super) fn with_background_key_recipient<T>(
+    focus: Option<&Arc<crate::background_focus::HostController>>,
     pid: i32,
     window_id: Option<u32>,
     element_ptr: Option<usize>,
-    dispatch: impl FnOnce() -> anyhow::Result<T>,
+    prepare_element: Option<&dyn Fn() -> anyhow::Result<()>>,
+    dispatch: impl FnOnce(i32) -> anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    match window_id.filter(|_| {
-        type_text::target_is_web_content(pid, element_ptr.map(|ptr| (ptr, None)), window_id)
-    }) {
-        Some(wid) => crate::input::skylight::with_background_key_window(pid, wid, dispatch),
-        None => dispatch(),
+    let focus =
+        focus.ok_or_else(|| anyhow::anyhow!("background keyboard focus has no runtime owner"))?;
+    anyhow::ensure!(focus.host_pid() == pid, "background focus belongs to a different host");
+    match prepare_element {
+        Some(prepare_element) => focus.prepare_with(window_id, || {
+            validate_prepared_element_window(window_id, element_ptr)?;
+            prepare_element()
+        })?,
+        None => focus.prepare(window_id)?,
     }
+    crate::ax::keyboard_target::with_keyboard_recipient(pid, window_id, element_ptr, dispatch)
 }
 
 /// px-focus for the keyboard family (type_text / press_key / hotkey): focus the
@@ -316,6 +373,7 @@ pub(crate) async fn focus_by_pixel(
     from_zoom: bool,
     window_native: bool,
     mutation_lease: Option<&BackgroundMutationLease>,
+    background_focus: Option<&Arc<crate::background_focus::HostController>>,
 ) -> Result<(), cua_driver_core::protocol::ToolResult> {
     use cua_driver_core::tool::Tool;
     let mut click_args = serde_json::json!({
@@ -358,7 +416,17 @@ pub(crate) async fn focus_by_pixel(
     let click_tool = click::ClickTool::new(state.clone());
     let click = click_tool.invoke(click_args);
     let focus = if let Some(lease) = mutation_lease {
-        crate::background_mutation::with_held_lease(lease.pid, click).await
+        if let Some(focus) = background_focus {
+            if focus.host_pid() != lease.pid {
+                return Err(cua_driver_core::protocol::ToolResult::error(
+                    "pixel focus controller belongs to a different host",
+                ));
+            }
+            crate::background_mutation::with_held_focus(focus.clone(), lease._guard.clone(), click)
+                .await
+        } else {
+            crate::background_mutation::with_held_lease(lease.pid, lease._guard.clone(), click).await
+        }
     } else {
         click.await
     };
@@ -654,6 +722,7 @@ impl Default for SessionConfigRegistry {
 
 /// Shared state passed to all tools.
 pub struct ToolState {
+    pub(crate) background_focus: Arc<crate::background_focus::FocusControllers>,
     pub snapshots: Arc<Snapshots>,
     pub cursor_registry: Arc<CursorRegistry>,
     pub(crate) capture_bindings: Arc<capture_binding::MacCaptureBindings>,
@@ -686,6 +755,43 @@ pub struct ToolState {
 }
 
 impl ToolState {
+    /// Capture dispatch ownership before crossing into a blocking actuator task.
+    pub(super) fn background_focus(
+        &self,
+        args: &serde_json::Value,
+        pid: i32,
+    ) -> Result<Arc<crate::background_focus::HostController>, cua_driver_core::protocol::ToolResult>
+    {
+        let runtime = cua_driver_core::tool::current_dispatch_runtime_scope().ok_or_else(|| {
+            cua_driver_core::protocol::ToolResult::error(
+                "background keyboard focus requires authorized runtime dispatch",
+            )
+        })?;
+        let session = args
+            .get("_session_id")
+            .and_then(serde_json::Value::as_str)
+            .filter(|session| !session.is_empty() && *session != "default");
+        if session.is_some_and(|session| !session.starts_with(&format!("__cua_runtime_{runtime}:")))
+        {
+            return Err(cua_driver_core::protocol::ToolResult::error(
+                "background focus session does not belong to the dispatch runtime",
+            ));
+        }
+        self.background_focus
+            .acquire(
+                crate::logical_focus::FocusOwner {
+                    runtime,
+                    session: session.map(str::to_owned),
+                },
+                pid,
+            )
+            .map_err(|error| {
+                cua_driver_core::protocol::ToolResult::error(format!(
+                    "background focus unavailable: {error}"
+                ))
+            })
+    }
+
     pub(crate) fn look_lock(&self, pid: i32, window_id: u64) -> Arc<tokio::sync::Mutex<()>> {
         let mut locks = self.look_locks.lock().unwrap();
         // A lock only matters while someone holds or waits on it (strong
@@ -725,6 +831,7 @@ impl ToolState {
         host_bundle_id: Option<String>,
     ) -> Self {
         Self {
+            background_focus: Arc::default(),
             snapshots: Arc::new(Snapshots::new()),
             cursor_registry: Arc::new(CursorRegistry::new()),
             capture_bindings: Arc::new(capture_binding::MacCaptureBindings::new(capture_service)),
@@ -823,6 +930,28 @@ pub fn register_all(
         host_owns_permission_ux,
         host_bundle_id,
     ));
+    {
+        let focus = state.background_focus.clone();
+        registry.retain_runtime_cleanup(move || {
+            if let Err(error) = focus.retire_all() {
+                tracing::warn!(%error, "background focus runtime cleanup failed");
+            }
+        });
+        let focus = state.background_focus.clone();
+        let hook = cua_driver_core::session::register_scoped_fallible_session_end_hook(
+            "background_focus",
+            move |session| {
+                let Some((runtime, _)) = session
+                    .strip_prefix("__cua_runtime_")
+                    .and_then(|session| session.split_once(':'))
+                else {
+                    return Ok(());
+                };
+                focus.retire_session(runtime, session)
+            },
+        );
+        registry.retain_session_end_hook(hook);
+    }
     let cursor_outcome_reader = {
         let cursor_registry = state.cursor_registry.clone();
         cua_driver_core::session::register_scoped_cursor_outcome_reader(std::sync::Arc::new(

@@ -155,8 +155,8 @@ export function cursorMotionSpecForStyle(style: CursorMotionStyle, params: Curso
 
 /**
  * Cua Driver's default motion knobs: the overlay's built-in motion (the
- * `classic` glide with a 6 pt turn radius), not `cua-cursor-motion`'s own
- * `MotionParams::default`.
+ * `classic` glide with a 6 pt turn radius and a fixed 120 ms duration), not
+ * `cua-cursor-motion`'s own `MotionParams::default`.
  */
 export function defaultCursorMotionParams(): CursorMotionParams {
     return ((__rb: Uint8Array) => {

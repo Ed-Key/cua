@@ -320,6 +320,7 @@ mod native {
                         bounds: Default::default(),
                         session: None,
                         full_delivered: true,
+                        walk_complete: true,
                         actionable: true,
                     },
                 );

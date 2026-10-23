@@ -10719,8 +10719,8 @@ def cursor_motion_spec_for_style(style: cua_driver._native_contract.CursorMotion
 def default_cursor_motion_params() -> CursorMotionParams:
     """
     Cua Driver's default motion knobs: the overlay's built-in motion (the
-    `classic` glide with a 6 pt turn radius), not `cua-cursor-motion`'s own
-    `MotionParams::default`.
+    `classic` glide with a 6 pt turn radius and a fixed 120 ms duration), not
+    `cua-cursor-motion`'s own `MotionParams::default`.
 """
     _uniffi_lowered_args = (
     )

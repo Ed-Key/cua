@@ -1167,9 +1167,18 @@ mod glide_duration_tests {
     /// Run a move of `dist_pts` until it arrives and return how many seconds
     /// it took.
     fn arrival_secs(style: MotionStyle, glide_ms: f64, dist_pts: f64) -> f64 {
+        let motion = crate::MotionConfig {
+            style,
+            glide_duration_ms: glide_ms,
+            ..crate::MotionConfig::default()
+        };
+        arrival_secs_for(motion, dist_pts)
+    }
+
+    /// [`arrival_secs`] for a whole motion config.
+    fn arrival_secs_for(motion: crate::MotionConfig, dist_pts: f64) -> f64 {
         let mut core = RenderStateCore::new(CursorConfig::default());
-        core.motion.style = style;
-        core.motion.glide_duration_ms = glide_ms;
+        core.motion = motion;
         core.motion.idle_hide_ms = 0.0;
         // Heading pi: the classic glide leaves and arrives heading +x, an
         // effectively straight path of length ~dist_pts.
@@ -1205,6 +1214,44 @@ mod glide_duration_tests {
             assert!((short - 0.3).abs() < 0.06, "{style:?} short={short}");
             assert!((long - 0.3).abs() < 0.06, "{style:?} long={long}");
         }
+    }
+
+    /// The built-in default (and the saved `classic` + `native` default) is
+    /// a near-instant glide of about 120 ms, whatever the distance, so a
+    /// pointer action waits only that long for the cursor to arrive.
+    #[test]
+    fn built_in_default_glide_is_near_instant_at_any_distance() {
+        let mut saved = crate::motion_defaults::SavedMotionDefaults::default();
+        saved.style = Some(MotionStyle::Classic);
+        saved.timing = Some(crate::MotionTiming::Native);
+        let mut with_saved = crate::MotionConfig::default();
+        saved.apply(&mut with_saved);
+        for motion in [crate::MotionConfig::default(), with_saved] {
+            for dist in [50.0, 1000.0] {
+                let secs = arrival_secs_for(motion.clone(), dist);
+                assert!((secs - 0.12).abs() < 0.03, "{dist} pt took {secs} s");
+            }
+        }
+    }
+
+    /// An explicit per-session duration still wins over the default, and 0
+    /// still restores the style's distance-aware timing.
+    #[test]
+    fn explicit_glide_duration_overrides_the_default() {
+        let base = crate::MotionConfig::default();
+        let slow = base
+            .with_motion_args(&serde_json::json!({"glide_duration_ms": 600}))
+            .unwrap();
+        for dist in [50.0, 1000.0] {
+            let secs = arrival_secs_for(slow.clone(), dist);
+            assert!((secs - 0.6).abs() < 0.06, "{dist} pt took {secs} s");
+        }
+        let speed_based = base
+            .with_motion_args(&serde_json::json!({"glide_duration_ms": 0}))
+            .unwrap();
+        let short = arrival_secs_for(speed_based.clone(), 50.0);
+        let long = arrival_secs_for(speed_based, 1000.0);
+        assert!(long > short + 0.3, "short={short} long={long}");
     }
 
     #[test]
@@ -1298,6 +1345,8 @@ mod glide_duration_tests {
     fn a_very_short_comet_trail_is_faint() {
         let mut core = RenderStateCore::new(CursorConfig::default());
         core.motion.style = MotionStyle::CometSwoop;
+        // The comet's own (native) timing, not the fixed 120 ms default.
+        core.motion.glide_duration_ms = 0.0;
         core.pos = (100.0, 100.0);
         core.apply_command_base(
             OverlayCommand::MoveTo {
@@ -1456,9 +1505,14 @@ mod path_straightness_tests {
     }
 
     #[test]
-    fn default_glide_keeps_its_duration_and_ease_in_out() {
+    fn speed_based_glide_keeps_its_duration_and_ease_in_out() {
+        // `glide_duration_ms: 0` restores the speed-based classic glide.
+        let speed_based = MotionConfig {
+            glide_duration_ms: 0.0,
+            ..MotionConfig::default()
+        };
         for angle in directions() {
-            let g = glide(MotionConfig::default(), angle);
+            let g = glide(speed_based.clone(), angle);
             // A visible glide, not a teleport, and not a slow crawl.
             assert!(
                 (0.3..1.0).contains(&g.secs),
@@ -2300,6 +2354,7 @@ mod motion_equivalence_tests {
         MotionConfig {
             style: MotionStyle::SignatureArc,
             turn_radius: 80.0,
+            glide_duration_ms: 0.0,
             ..MotionConfig::default()
         }
     }

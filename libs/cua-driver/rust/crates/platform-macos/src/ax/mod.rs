@@ -21,6 +21,7 @@ pub mod diff;
 pub(crate) mod text_state;
 pub mod enablement;
 pub mod exact_target;
+pub(crate) mod keyboard_target;
 pub mod launch;
 pub mod snapshot;
 pub mod tree;
