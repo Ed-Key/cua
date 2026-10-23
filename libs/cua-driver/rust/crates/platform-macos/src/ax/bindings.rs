@@ -447,23 +447,35 @@ pub unsafe fn advertises_attribute(element: AXUIElementRef, name: &str) -> bool 
 ///
 /// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
 pub unsafe fn copy_action_names(element: AXUIElementRef) -> Vec<String> {
+    copy_action_names_checked(element).unwrap_or_default()
+}
+
+/// [`copy_action_names`], with `None` when the names could not be read (an
+/// unknown, not an element without actions).
+///
+/// # Safety
+///
+/// `element` must be a valid, live `AXUIElementRef` for the duration of the call.
+pub unsafe fn copy_action_names_checked(element: AXUIElementRef) -> Option<Vec<String>> {
     #[cfg(test)]
     if let Some(result) = test_support::copy_action_names(element) {
-        return result;
+        return Some(result);
     }
     let mut names: CFArrayRef = std::ptr::null_mut();
     let err = AXUIElementCopyActionNames(element, &mut names);
     if err != kAXErrorSuccess || names.is_null() {
-        return vec![];
+        return None;
     }
     // Use CFArray<CFStr> (the typed wrapper) to satisfy FromVoid bound.
     let arr = CFArray::<CFStr>::wrap_under_create_rule(names);
-    (0..arr.len())
-        .filter_map(|i| {
-            let cf = arr.get(i)?;
-            Some(cf.to_string())
-        })
-        .collect()
+    Some(
+        (0..arr.len())
+            .filter_map(|i| {
+                let cf = arr.get(i)?;
+                Some(cf.to_string())
+            })
+            .collect(),
+    )
 }
 
 /// Read the on-screen center of an AX element (AXPosition + AXSize → center).

@@ -140,6 +140,81 @@ fn is_toggle_press(ax_action: &str, role: &str, advertised: &[String]) -> bool {
         && advertised.iter().any(|action| action == "AXPress")
 }
 
+/// How a plain click on an element is delivered, decided before any input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ClickDispatch {
+    /// Perform this AX action.
+    Ax(String),
+    /// A pointer click at the element.
+    Pointer,
+}
+
+/// Choose AX action or pointer for a click before dispatch, as native Codex
+/// Computer Use does: an AX action only when the element offers press (or
+/// pick); otherwise a pointer click, since an AX press would run nothing
+/// (Chrome's role=button rows without a click listener return success and
+/// do nothing). Nothing is retried after dispatch. `advertised` is `None`
+/// when the action names could not be read: unknown, so the press stands.
+/// `own_fallback`: a modified click, or an element the row ladder, the
+/// selection-container or the text-entry fallback handles.
+fn click_dispatch(ax_action: &str, advertised: Option<&[String]>, own_fallback: bool) -> ClickDispatch {
+    let Some(advertised) = advertised.filter(|_| ax_action == "AXPress" && !own_fallback) else {
+        return ClickDispatch::Ax(ax_action.to_owned());
+    };
+    let offers = |name: &str| advertised.iter().any(|action| action == name);
+    if offers("AXPress") {
+        ClickDispatch::Ax("AXPress".into())
+    } else if offers("AXPick") {
+        ClickDispatch::Ax("AXPick".into())
+    } else {
+        ClickDispatch::Pointer
+    }
+}
+
+/// Whether the pid's AX hit test at screen `point` lands on `element` or one
+/// of its descendants, inside window `window_id` or one of its child
+/// windows: a pointer click there reaches the element and nothing else of
+/// the app. Chromium answers a hit test at a new point from its cached tree
+/// first (a row under a page element that covers it), then corrects it a
+/// moment later (measured, Chrome 155: the first answer named the covered
+/// row, every later one the cover), so the answer counts only once two
+/// consecutive answers agree.
+fn point_reaches_element(pid: i32, window_id: u32, element: AXUIElementRef, point: (f64, f64)) -> bool {
+    let mut last = hit_reaches_element(pid, window_id, element, point);
+    for _ in 0..3 {
+        std::thread::sleep(std::time::Duration::from_millis(60));
+        let now = hit_reaches_element(pid, window_id, element, point);
+        if now == last {
+            return now;
+        }
+        last = now;
+    }
+    false
+}
+
+fn hit_reaches_element(pid: i32, window_id: u32, element: AXUIElementRef, point: (f64, f64)) -> bool {
+    let Some(mut current) = (unsafe { element_at_screen_position(pid, point.0, point.1) }) else {
+        return false;
+    };
+    // The window or one of its own (a child popover shown in its snapshot).
+    let in_window = unsafe { crate::ax::exact_target::element_window_id(current) }
+        .is_some_and(|hit_window| crate::ax::bindings::window_belongs_to(hit_window, window_id));
+    let mut found = false;
+    for _ in 0..64 {
+        if unsafe { core_foundation::base::CFEqual(current as CFTypeRef, element as CFTypeRef) } != 0 {
+            found = true;
+            break;
+        }
+        let Some(parent) = (unsafe { copy_element_attr(current, "AXParent") }) else {
+            break;
+        };
+        unsafe { CFRelease(current as CFTypeRef) };
+        current = parent;
+    }
+    unsafe { CFRelease(current as CFTypeRef) };
+    in_window && found
+}
+
 /// AX errors that AppKit apps return from a press they performed (#3835).
 /// Errors that mean the request never reached the app (illegal argument,
 /// invalid element, cannot complete, API disabled) are not among them.
@@ -529,6 +604,11 @@ impl Tool for ClickTool {
         let from_zoom = args.bool_or("from_zoom", false);
         let debug_image_out = args.opt_str("debug_image_out");
         let modifiers: Vec<String> = args.str_array("modifier");
+        // The element path's pointer delivery (an element that offers no
+        // press): a routed pointer click at the given window pixels, without
+        // the AX hit-test press or the browser redirect already tried for the
+        // element. Ingress strips underscore arguments from public callers.
+        let pointer_only = args.get("_pointer_only").and_then(Value::as_bool) == Some(true);
 
         // PID-routed key transitions can look correct for one AX poll and then
         // collapse to a plain click once AppKit resolves the gesture. Refuse
@@ -553,8 +633,8 @@ impl Tool for ClickTool {
         // browser tool sends exactly (see browser_route::click_next); every
         // other gesture, and the internal focus click of the keyboard tools,
         // keeps native delivery.
-        if let Some(next) =
-            super::browser_route::click_next(&button_str, count, !modifiers.is_empty(), &action)
+        if let Some(next) = super::browser_route::click_next(&button_str, count, !modifiers.is_empty(), &action)
+            .filter(|_| !pointer_only)
         {
             let redirect = match (element_guard.as_ref(), x, y) {
                 (Some(guard), _, _) => {
@@ -647,7 +727,7 @@ impl Tool for ClickTool {
                 (now_reads, resolve_element_action(&requested, &copy_action_names(element)))
             })
             .await;
-            let ax_action = match resolved_action {
+            let mut ax_action = match resolved_action {
                 Ok((Some(now_reads), _)) => return element_changed_refusal(idx, &now_reads),
                 Ok((None, Ok(ax_action))) => ax_action,
                 Ok((None, Err(advertised))) => {
@@ -737,6 +817,65 @@ impl Tool for ClickTool {
                 };
             }
 
+
+            // Choose AX action or pointer before any input. An element that
+            // offers no press (Chrome's role=button rows without a click
+            // listener) gets a pointer click at its centre; an AX press would
+            // succeed and run nothing. The row ladder and the selection and
+            // text-entry fallbacks keep their own paths.
+            if ax_action == "AXPress" {
+                let dispatch_guard = element_guard.clone();
+                let has_modifiers = !modifiers.is_empty();
+                let decided = crate::background_mutation::spawn_blocking(move || {
+                    let ptr = dispatch_guard.as_ptr();
+                    let element = ptr as AXUIElementRef;
+                    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+                    // The fallbacks perform_ax_click runs: a plain click on a
+                    // list row or a text-entry control; a modified click on
+                    // an item of a selectable container.
+                    let own_fallback = if has_modifiers {
+                        crate::input::ax_actions::capture_nearest_container_selection(ptr).is_some()
+                    } else {
+                        is_text_entry_role(&role) || crate::input::ax_actions::RowSelection::capture(ptr).is_some()
+                    };
+                    let advertised = unsafe { crate::ax::bindings::copy_action_names_checked(element) };
+                    let title = ["AXTitle", "AXDescription"]
+                        .into_iter()
+                        .filter_map(|attribute| unsafe { copy_string_attr(element, attribute) })
+                        .find(|name| !name.trim().is_empty())
+                        .unwrap_or_default();
+                    let dispatch = click_dispatch("AXPress", advertised.as_deref(), own_fallback);
+                    (dispatch, format!("[{idx}] {role} \"{title}\""), advertised.unwrap_or_default())
+                })
+                .await;
+                match decided {
+                    Ok((ClickDispatch::Ax(action), _, _)) => ax_action = action,
+                    Ok((ClickDispatch::Pointer, label, advertised)) => {
+                        let actions = advertised
+                            .into_iter()
+                            .map(crate::ax::tree::display_action_name)
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let why = format!(
+                            "{label} offers no press action (actions: {})",
+                            if actions.is_empty() { "none" } else { &actions }
+                        );
+                        return self
+                            .click_element_by_pointer(
+                                &args,
+                                (pid, wid),
+                                (idx, press_row.clone()),
+                                element_guard.clone(),
+                                center,
+                                &why,
+                                delivery_mode.is_foreground(),
+                                _mutation_lease.as_ref(),
+                            )
+                            .await;
+                    }
+                    Err(e) => return ToolResult::error(format!("Task error: {e}")),
+                }
+            }
 
             // Finder icon/list items can expose a readable AXSelected state
             // while refusing both AXSelected writes and AXPress. Resolve a
@@ -1228,6 +1367,7 @@ impl Tool for ClickTool {
             // Chromium/AppKit window key merely to satisfy first-mouse rules.
             if let Some(hit_test_wid) = window_id.filter(|_| {
                 !delivery_mode.is_foreground()
+                    && !pointer_only
                     && button_str == "left"
                     && count == 1
                     && modifiers.is_empty()
@@ -1301,11 +1441,23 @@ impl Tool for ClickTool {
                                     PixelHit::Missed
                                 }
                             } else {
-                                let press = core_foundation::string::CFString::new("AXPress");
-                                if AXUIElementPerformAction(element, press.as_concrete_TypeRef())
-                                    == kAXErrorSuccess
+                                // An element that offers no press gets the
+                                // routed pointer click below instead: an AX
+                                // press on it would succeed and run nothing.
+                                // A pick-only element takes the pointer click
+                                // too: no new press-then-pointer path.
+                                let advertised = crate::ax::bindings::copy_action_names_checked(element);
+                                if click_dispatch("AXPress", advertised.as_deref(), false)
+                                    == ClickDispatch::Ax("AXPress".into())
                                 {
-                                    PixelHit::Delivered
+                                    let press = core_foundation::string::CFString::new("AXPress");
+                                    if AXUIElementPerformAction(element, press.as_concrete_TypeRef())
+                                        == kAXErrorSuccess
+                                    {
+                                        PixelHit::Delivered
+                                    } else {
+                                        PixelHit::Missed
+                                    }
                                 } else {
                                     PixelHit::Missed
                                 }
@@ -1596,6 +1748,108 @@ impl Tool for ClickTool {
         } else {
             ToolResult::error("Provide either element_token or (x + y). pid is required for x,y clicks; an element_token carries its own pid.")
         }
+    }
+}
+
+impl ClickTool {
+    /// The element path's pointer delivery, for an element that offers no
+    /// press: one routed pointer click (background) or HID click
+    /// (foreground) at its centre, through the pixel path, after proving
+    /// that the centre reaches the element in its window. Refuses, sending
+    /// nothing, when the element is disabled, has no centre, its centre lands
+    /// on something else, or the pointer rung is refused.
+    #[allow(clippy::too_many_arguments)]
+    async fn click_element_by_pointer(
+        &self,
+        args: &Value,
+        (pid, wid): (i32, u32),
+        (idx, snapshot_row): (usize, Option<String>),
+        element: crate::ax::snapshot::RetainedElement,
+        center: Option<(f64, f64)>,
+        why: &str,
+        foreground: bool,
+        lease: Option<&super::BackgroundMutationLease>,
+    ) -> ToolResult {
+        let refuse = |detail: String| {
+            ToolResult::error(format!(
+                "click refused: {why}, so it takes a pointer click, but {detail}; no input was sent. \
+                 Scroll it into view, or click by x,y off a fresh get_window_state screenshot."
+            ))
+            .with_structured(serde_json::json!({
+                "code": "element_not_at_point",
+                "effect": "refused",
+            }))
+        };
+        let element_ptr = element.as_ptr();
+        // The pointer rung's own admission first: a minimized or hidden
+        // window refuses with its reason before any hit test.
+        if let Some(lease) = lease {
+            if let Err(refusal) = lease
+                .gate_again(
+                    wid,
+                    Some(element_ptr),
+                    cua_driver_core::background_input::BackgroundAction::WindowPointer,
+                )
+                .await
+            {
+                return refusal;
+            }
+        }
+        let Some((cx, cy)) = center else {
+            return refuse("it has no on-screen centre".into());
+        };
+        let checked = crate::background_mutation::spawn_blocking(move || {
+            let ptr = element.as_ptr();
+            ensure_names_row(ptr as AXUIElementRef, idx, snapshot_row.as_deref())
+                .and_then(|()| crate::input::ax_actions::ensure_ax_action_enabled(ptr, "AXPress"))
+                .map(|()| point_reaches_element(pid, wid, ptr as AXUIElementRef, (cx, cy)))
+        })
+        .await;
+        match checked {
+            Ok(Ok(true)) => {}
+            Ok(Ok(false)) => {
+                return refuse(format!(
+                    "its centre ({cx:.0}, {cy:.0}) reaches another element or no element of window {wid}"
+                ))
+            }
+            Ok(Err(e)) if e.is::<ElementChanged>() => {
+                let changed = e.downcast_ref::<ElementChanged>().expect("checked above");
+                return element_changed_refusal(changed.idx, &changed.now_reads);
+            }
+            Ok(Err(e)) => return ToolResult::error(format!("AX action failed: {e}")),
+            Err(e) => return ToolResult::error(format!("Task error: {e}")),
+        }
+        let frame = match super::px_frame::resolve_or_refuse(wid).await {
+            Ok(frame) => frame,
+            Err(refusal) => return refusal,
+        };
+        let mut click_args = serde_json::json!({
+            "pid": pid,
+            "window_id": wid,
+            "x": (cx - frame.bounds.x) * frame.scale,
+            "y": (cy - frame.bounds.y) * frame.scale,
+            "delivery_mode": if foreground { "foreground" } else { "background" },
+            "_window_native_pixels": true,
+            "_pointer_only": true,
+        });
+        for key in ["session", "_session_id", "modifier"] {
+            if let Some(value) = args.get(key) {
+                click_args[key] = value.clone();
+            }
+        }
+        let click = Tool::invoke(self, click_args);
+        let mut result = match lease {
+            Some(lease) => {
+                crate::background_mutation::with_held_lease(lease.pid, lease._guard.clone(), click).await
+            }
+            None => click.await,
+        };
+        if result.is_error != Some(true) {
+            if let Some(cua_driver_core::protocol::Content::Text { text, .. }) = result.content.first_mut() {
+                text.push_str(&format!("\n{why}, so the click was a pointer event at its centre."));
+            }
+        }
+        result
     }
 }
 
@@ -2109,6 +2363,63 @@ mod action_name_tests {
         // A documented alias is still sent when the element does not list it.
         assert_eq!(resolve_element_action("open", &stocks_row()).as_deref(), Ok("AXOpen"));
         assert_eq!(resolve_element_action("press", &[]).as_deref(), Ok("AXPress"));
+    }
+}
+
+/// Incident 12: Chrome exposes a role=button row with no click listener as
+/// an AXButton offering only AXShowMenu and AXScrollToVisible; AXPress on it
+/// runs nothing. One test per row of the dispatch table.
+#[cfg(test)]
+mod click_dispatch_tests {
+    use super::{click_dispatch, ClickDispatch};
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    fn ax(action: &str) -> ClickDispatch {
+        ClickDispatch::Ax(action.into())
+    }
+
+    #[test]
+    fn a_web_row_without_axpress_gets_a_pointer_click() {
+        let row = names(&["AXShowMenu", "AXScrollToVisible"]);
+        assert_eq!(click_dispatch("AXPress", Some(&row), false), ClickDispatch::Pointer);
+    }
+
+    #[test]
+    fn an_element_with_no_actions_gets_a_pointer_click() {
+        assert_eq!(click_dispatch("AXPress", Some(&[]), false), ClickDispatch::Pointer);
+    }
+
+    #[test]
+    fn an_element_that_advertises_axpress_is_pressed() {
+        let button = names(&["AXPress", "AXShowMenu"]);
+        assert_eq!(click_dispatch("AXPress", Some(&button), false), ax("AXPress"));
+    }
+
+    #[test]
+    fn an_element_that_offers_only_pick_is_picked() {
+        let item = names(&["AXPick", "AXCancel"]);
+        assert_eq!(click_dispatch("AXPress", Some(&item), false), ax("AXPick"));
+    }
+
+    #[test]
+    fn unreadable_actions_are_unknown_and_keep_the_press() {
+        assert_eq!(click_dispatch("AXPress", None, false), ax("AXPress"));
+    }
+
+    #[test]
+    fn rows_selection_text_entry_and_modified_clicks_keep_their_own_path() {
+        let label = names(&["AXShowMenu"]);
+        assert_eq!(click_dispatch("AXPress", Some(&label), true), ax("AXPress"));
+    }
+
+    #[test]
+    fn other_actions_are_sent_as_asked() {
+        let row = names(&["AXShowMenu", "AXScrollToVisible"]);
+        assert_eq!(click_dispatch("AXShowMenu", Some(&row), false), ax("AXShowMenu"));
+        assert_eq!(click_dispatch("AXOpen", Some(&row), false), ax("AXOpen"));
     }
 }
 
