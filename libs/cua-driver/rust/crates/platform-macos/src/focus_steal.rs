@@ -350,10 +350,12 @@ static OWN_BUTTON_EVENTS: [std::sync::atomic::AtomicU32; 6] =
     [const { std::sync::atomic::AtomicU32::new(0) }; 6];
 
 /// Post a mouse event to the global HID tap, noting button events cua itself
-/// generates so they are not mistaken for the user choosing an app.
+/// generates so they are not mistaken for the user choosing an app. The event
+/// is stamped with the current uptime, as a hardware event is.
 pub(crate) fn post_hid_mouse_event(event: &core_graphics::event::CGEvent) {
     let kind = event.get_type() as u32;
     let Some(index) = USER_CHOICE_EVENT_TYPES.iter().position(|t| *t == kind) else {
+        let _ = crate::input::event_clock::stamp_now(event);
         event.post(core_graphics::event::CGEventTapLocation::HID);
         return;
     };
@@ -362,6 +364,7 @@ pub(crate) fn post_hid_mouse_event(event: &core_graphics::event::CGEvent) {
     // moment after the post returns.
     let mut last_post = own_posts().lock().unwrap_or_else(|p| p.into_inner());
     OWN_BUTTON_EVENTS[index].fetch_add(1, Ordering::SeqCst);
+    let _ = crate::input::event_clock::stamp_now(event);
     event.post(core_graphics::event::CGEventTapLocation::HID);
     *last_post = Some(Instant::now());
 }

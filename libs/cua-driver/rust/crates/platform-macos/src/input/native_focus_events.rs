@@ -1,6 +1,6 @@
 //! Recovered native focus notifications. Construction never posts input.
 
-use anyhow::{anyhow, ensure, Context, Result};
+use anyhow::{ensure, Context, Result};
 use core_foundation::base::{CFRetain, CFTypeRef};
 use core_graphics::event::{CGEvent, CGEventFlags};
 use core_graphics::geometry::{CGPoint, CGRect};
@@ -9,7 +9,6 @@ use objc2::{msg_send, rc::Retained, Encoding, RefEncode};
 use objc2_app_kit::{NSEvent, NSEventModifierFlags, NSEventType};
 use objc2_foundation::NSPoint;
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 #[repr(C)]
 struct NativeCGEvent {
@@ -38,7 +37,6 @@ pub(crate) struct WindowActivation {
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
-    fn CGEventSetTimestamp(event: *mut c_void, timestamp: u64);
     // CGPoint's two doubles use the same Darwin ABI as these existing bindings.
     fn CGEventSetLocation(event: *mut c_void, x: f64, y: f64);
     fn CGEventSetIntegerValueField(event: *mut c_void, field: u32, value: i64);
@@ -157,35 +155,12 @@ pub(crate) fn activation(window: Option<WindowActivation>) -> Result<Vec<CGEvent
     Ok(events)
 }
 
-#[allow(deprecated)] // Existing libc bindings expose the platform uptime ABI.
-fn uptime_nanoseconds() -> Result<u64> {
-    static TIMEBASE: OnceLock<Result<(u32, u32), i32>> = OnceLock::new();
-    let (numer, denom) = TIMEBASE
-        .get_or_init(|| {
-            let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
-            let status = unsafe { libc::mach_timebase_info(&mut info) };
-            if status == 0 && info.denom != 0 {
-                Ok((info.numer, info.denom))
-            } else {
-                Err(status)
-            }
-        })
-        .as_ref()
-        .map_err(|status| anyhow!("could not resolve uptime timebase: {status}"))?;
-    // Native send uses DispatchTime.now().uptimeNanoseconds. Both use the
-    // uptime clock; exact Swift/libdispatch conversion code was not recovered.
-    let ticks = unsafe { libc::mach_absolute_time() };
-    u64::try_from((ticks as u128 * *numer as u128) / *denom as u128)
-        .context("uptime timestamp overflow")
-}
-
 /// Post the same owned events directly, without the automation auth envelope.
 /// A successful return reports posting attempts, not target consumption.
 pub(crate) fn post(pid: i32, events: &[CGEvent]) -> Result<()> {
     ensure!(pid > 0, "native focus recipient PID is invalid");
     for event in events {
-        let timestamp = uptime_nanoseconds()?;
-        unsafe { CGEventSetTimestamp(event.as_ptr().cast(), timestamp) };
+        super::event_clock::stamp_now(event)?;
         event.post_to_pid(pid);
     }
     Ok(())
