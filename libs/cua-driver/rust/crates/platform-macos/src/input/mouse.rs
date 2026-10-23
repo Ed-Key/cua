@@ -2111,6 +2111,7 @@ fn parse_modifier_flags(modifiers: &[&str]) -> CGEventFlags {
 mod post_sink {
     use super::PostRoute;
     use core_graphics::event::{CGEvent, EventField};
+    use foreign_types::ForeignType;
     use std::cell::RefCell;
 
     pub(super) const MODIFIER_MASK: u64 = 0x0002_0000 // shift
@@ -2142,6 +2143,13 @@ mod post_sink {
         posted: Vec<Posted>,
         /// Modifier flags carried by each posted event, parallel to `posted`.
         modifiers: Vec<u64>,
+        /// `CGEventGetTimestamp` of each posted event as it reached the
+        /// transport, parallel to `posted`.
+        timestamps: Vec<u64>,
+    }
+
+    extern "C" {
+        fn CGEventGetTimestamp(event: core_graphics::sys::CGEventRef) -> u64;
     }
 
     thread_local! {
@@ -2159,6 +2167,7 @@ mod post_sink {
                     skylight_available,
                     posted: Vec::new(),
                     modifiers: Vec::new(),
+                    timestamps: Vec::new(),
                 });
             });
             Self
@@ -2173,6 +2182,16 @@ mod post_sink {
                     .borrow()
                     .as_ref()
                     .map(|state| state.modifiers.clone())
+                    .unwrap_or_default()
+            })
+        }
+
+        pub(super) fn timestamps(&self) -> Vec<u64> {
+            STATE.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .map(|state| state.timestamps.clone())
                     .unwrap_or_default()
             })
         }
@@ -2218,6 +2237,9 @@ mod post_sink {
             state
                 .modifiers
                 .push(event.get_flags().bits() & MODIFIER_MASK);
+            state
+                .timestamps
+                .push(unsafe { CGEventGetTimestamp(event.as_ptr()) });
             true
         })
     }
@@ -2613,4 +2635,109 @@ mod tests {
         assert_eq!(now.outstanding_since(base), [1, 0, 0, 0, 0, 0]);
     }
 
+    /// Mach uptime in nanoseconds, the clock of hardware event timestamps.
+    #[allow(deprecated)] // libc's timebase ABI, as native_focus_events uses it.
+    fn uptime_now() -> u64 {
+        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        unsafe {
+            libc::mach_timebase_info(&mut info);
+            (libc::mach_absolute_time() as u128 * info.numer as u128 / info.denom as u128) as u64
+        }
+    }
+
+    /// Incident 20: Chromium apps on a Mac with days of uptime dropped cua's
+    /// clicks. A hardware event carries the uptime at which it happened; cua's
+    /// carried 0, or a wall-clock fraction of a second written into raw field
+    /// 58 (the timestamp field, taken for a "click group"), so the events
+    /// looked days old. Every event handed to a transport must carry the
+    /// current uptime.
+    #[test]
+    fn every_pid_routed_mouse_event_carries_the_current_uptime() {
+        type Gesture = fn() -> anyhow::Result<()>;
+        let gestures: [(&str, Gesture, &[&str]); 7] = [
+            (
+                "background chromium click",
+                || click_at_xy_chromium(1, 100.0, 100.0, 10.0, 10.0, 7, 1, &[]),
+                &["MouseMoved", "LeftMouseDown", "LeftMouseUp", "LeftMouseDown", "LeftMouseUp"],
+            ),
+            (
+                "click without a window",
+                || click_at_xy(1, 100.0, 100.0, 1, &[]),
+                &["MouseMoved", "LeftMouseDown", "LeftMouseUp"],
+            ),
+            (
+                "foreground window click",
+                || {
+                    click_at_xy_with_window_local(
+                        1,
+                        100.0,
+                        100.0,
+                        10.0,
+                        10.0,
+                        7,
+                        1,
+                        &[],
+                        WindowClickDelivery::Foreground,
+                    )
+                },
+                &["MouseMoved", "LeftMouseDown", "LeftMouseUp"],
+            ),
+            (
+                "background right click",
+                || right_click_at_xy_with_window_local(1, 100.0, 100.0, 10.0, 10.0, 7, &[]),
+                &["MouseMoved", "RightMouseDown", "RightMouseUp"],
+            ),
+            (
+                "right click without a window",
+                || right_click_at_xy(1, 100.0, 100.0, &[]),
+                &["MouseMoved", "RightMouseDown", "RightMouseUp"],
+            ),
+            (
+                "middle click",
+                || middle_click_at_xy_with_window_local(1, 100.0, 100.0, 10.0, 10.0, &[]),
+                &["OtherMouseDown", "OtherMouseUp"],
+            ),
+            (
+                "background drag",
+                || {
+                    drag_at_xy(
+                        1,
+                        100.0,
+                        100.0,
+                        140.0,
+                        100.0,
+                        Some((10.0, 10.0)),
+                        Some((50.0, 10.0)),
+                        Some(7),
+                        0,
+                        2,
+                        &[],
+                        DragButton::Left,
+                        false,
+                    )
+                },
+                &[
+                    "MouseMoved",
+                    "LeftMouseDown",
+                    "LeftMouseDragged",
+                    "LeftMouseDragged",
+                    "LeftMouseUp",
+                ],
+            ),
+        ];
+        for (name, gesture, expected) in gestures {
+            let capture = Capture::start(true);
+            gesture().unwrap();
+            let after = uptime_now();
+            let events: Vec<String> = capture.posted().into_iter().map(|p| p.event).collect();
+            assert_eq!(events, *expected, "{name}: event sequence");
+            for (posted, stamp) in capture.posted().iter().zip(capture.timestamps()) {
+                assert!(
+                    stamp <= after && after - stamp < 1_000_000_000,
+                    "{name}: {} carries timestamp {stamp} ns, uptime is {after} ns",
+                    posted.event
+                );
+            }
+        }
+    }
 }
