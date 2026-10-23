@@ -137,6 +137,56 @@ pub(crate) fn is_pointer_refusal(cause: &anyhow::Error) -> bool {
 /// or dispatch failed. No input reaches another window in that case. A
 /// window left covering the point after the raise is `target_occluded`,
 /// naming it.
+/// The delivery note and legacy `path` label for a click sent on `route`;
+/// `sent` is how the foreground rung sent it (None: not that rung).
+pub(crate) fn sent_note(
+    route: PixelClickRoute,
+    sent: Option<crate::input::mouse::ForegroundClick>,
+) -> (String, &'static str) {
+    use crate::input::mouse::{ForegroundClick, HidPassage};
+    match sent {
+        Some(ForegroundClick::Hid(HidPassage::Passed)) => (
+            "foreground: exact window activated and confirmed topmost at the point, hardware \
+             pointer moved to the target, HID event tap; the system passed the click on past \
+             every event tap before the previous app was restored; the click's effect is not \
+             driver-verified — confirm via screenshot"
+                .into(),
+            path_label(route),
+        ),
+        Some(ForegroundClick::PidAroundTap { tap_owner }) => (
+            format!(
+                "foreground: exact window activated and confirmed topmost at the point, hardware \
+                 pointer moved to the target; posted to the pid, not the HID event tap, because \
+                 pid {tap_owner} ({}) holds an active event tap on clicks that could drop or hold \
+                 it; the click's effect is not driver-verified — confirm via screenshot",
+                crate::apps::get_app_name_for_pid(tap_owner).unwrap_or_else(|| "unknown app".into())
+            ),
+            // The pid transport with foreground delivery.
+            "cgevent_pid_fg",
+        ),
+        Some(ForegroundClick::Hid(_)) | None => (delivery_note(route).into(), path_label(route)),
+    }
+}
+
+/// A foreground click whose HID events an event tap dropped or still holds.
+/// Not an error: the click may still arrive (on the target, which was left in
+/// front), so the answer says what is known and asks for a read before any
+/// repeat.
+pub(crate) fn not_confirmed(action: &str, cause: &anyhow::Error) -> Option<ToolResult> {
+    let held = cause.downcast_ref::<crate::input::mouse::ClickNotConfirmed>()?;
+    Some(
+        ToolResult::text(format!(
+            "{action} not confirmed: {held}. The target app was left in front, so a late release \
+             lands on it and not on another app. Read the window before repeating the click."
+        ))
+        .with_structured(serde_json::json!({
+            "path": "cgevent_fg",
+            "verified": false,
+            "effect": "unverifiable",
+        })),
+    )
+}
+
 pub(crate) fn foreground_unavailable(
     action: &str,
     window_id: u32,

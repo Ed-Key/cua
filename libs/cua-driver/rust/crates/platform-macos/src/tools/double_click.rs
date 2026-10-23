@@ -244,20 +244,24 @@ impl Tool for DoubleClickTool {
                 Ok(route) => route,
                 Err(refusal) => return refusal,
             };
-        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
-            let do_click = move || -> anyhow::Result<()> {
-                if route == super::pixel_route::PixelClickRoute::ForegroundHid {
-                    // Warp the hardware pointer and post at the HID tap; see
+        let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Option<crate::input::mouse::ForegroundClick>> {
+            let do_click = move || -> anyhow::Result<Option<crate::input::mouse::ForegroundClick>> {
+                if let (super::pixel_route::PixelClickRoute::ForegroundHid, Some(wid)) = (route, window_id) {
+                    // Warp the hardware pointer and post at the HID tap (or to
+                    // the pid around another process's active tap); see
                     // `pixel_route` for the cross-platform foreground contract.
-                    return crate::input::mouse::click_at_xy_desktop_with_modifiers(
-                        screen_x,
-                        screen_y,
+                    return crate::input::mouse::foreground_click(
+                        pid,
+                        wid,
+                        (screen_x, screen_y),
+                        (win_local_x, win_local_y),
                         2,
                         "left",
                         &[],
-                    );
+                    )
+                    .map(Some);
                 }
-                if let Some(wid) = window_id {
+                let sent = if let Some(wid) = window_id {
                     crate::input::mouse::click_at_xy_with_window_local(
                         pid,
                         screen_x,
@@ -271,7 +275,8 @@ impl Tool for DoubleClickTool {
                     )
                 } else {
                     crate::input::mouse::click_at_xy(pid, screen_x, screen_y, 2, &[])
-                }
+                };
+                sent.map(|()| None)
             };
             // Foreground rung: front the exact window → HID double-click →
             // restore the prior frontmost. No input is sent unless the exact
@@ -291,13 +296,20 @@ impl Tool for DoubleClickTool {
         .await;
 
         match result {
-            Ok(Ok(())) => ToolResult::text(format!(
-                "✅ Double-clicked at ({screen_x:.1}, {screen_y:.1}) ({}).",
-                super::pixel_route::delivery_note(route)
-            ))
-            .with_structured(serde_json::json!({
-                "path": super::pixel_route::path_label(route), "verified": false, "effect": "unverifiable"
-            })),
+            Ok(Ok(sent)) => {
+                let (note, path) = super::pixel_route::sent_note(route, sent);
+                ToolResult::text(format!("✅ Double-clicked at ({screen_x:.1}, {screen_y:.1}) ({note})."))
+                    .with_structured(serde_json::json!({
+                        "path": path, "verified": false, "effect": "unverifiable"
+                    }))
+            }
+            Ok(Err(e)) if e.is::<crate::input::mouse::ClickNotConfirmed>() => {
+                super::pixel_route::not_confirmed(
+                    &format!("The double-click at ({screen_x:.1}, {screen_y:.1})"),
+                    &e,
+                )
+                .expect("checked by the guard")
+            }
             Ok(Err(e)) if route == super::pixel_route::PixelClickRoute::ForegroundHid => {
                 super::pixel_route::foreground_unavailable(
                     "Double-click",

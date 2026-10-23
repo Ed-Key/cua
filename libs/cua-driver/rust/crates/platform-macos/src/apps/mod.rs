@@ -696,8 +696,12 @@ pub fn frontmost_pid() -> Option<i32> {
 /// daemon took ~1s to return and did not stick on current macOS (measured
 /// with the focus-theft fixture). AppKit is only the fallback when the
 /// private call is unavailable.
+///
+/// Not while a HID click cua posted may still be held by an event tap: it
+/// would land on the app brought back (checked again right before the call).
 pub fn restore_prior_app(pid: i32) -> bool {
-    crate::input::skylight::restore_front_pid(pid, &mut || true) || activate_pid(pid)
+    let clear = || !crate::input::mouse::click_in_flight();
+    clear() && (crate::input::skylight::restore_front_pid(pid, &mut || clear()) || (clear() && activate_pid(pid)))
 }
 
 /// Whether `prior` is (or within a short bound becomes) the front app:

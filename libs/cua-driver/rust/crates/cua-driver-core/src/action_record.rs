@@ -803,6 +803,9 @@ fn transport_from_legacy(
             ActionTransport::LinuxCuaCompositorInject
         }
         "hid" | "cgevent_hid" | "cgevent_fg" => ActionTransport::MacosCgEventHid,
+        // A foreground click posted to the pid around another process's
+        // active event tap (macOS click and double_click).
+        "cgevent_pid_fg" => ActionTransport::MacosCgEventPid,
         "cgevent" => {
             if args
                 .get("delivery_mode")
@@ -1955,6 +1958,26 @@ mod tests {
             Some(cua_driver_contract::ActionDeliveryMode::Foreground)
         );
         assert_eq!(public.route, cua_driver_contract::ActionRoute::GlobalInput);
+    }
+
+    /// A foreground click posted to the pid around another process's active
+    /// event tap reports the pid route with foreground delivery.
+    #[test]
+    fn foreground_click_posted_to_the_pid_reports_the_pid_route() {
+        let record = ActionExecutionRecord::from_legacy(
+            "click",
+            &serde_json::json!({"delivery_mode": "foreground"}),
+            &serde_json::json!({"path": "cgevent_pid_fg", "verified": false, "effect": "unverifiable"}),
+        )
+        .expect("pid-routed foreground click should normalize");
+        assert_eq!(record.transport, ActionTransport::MacosCgEventPid);
+        assert_eq!(record.actual_delivery, Some(ActualDelivery::Foreground));
+        let public = record.public_result().expect("public ActionResult");
+        assert_eq!(public.route, cua_driver_contract::ActionRoute::SyntheticEvents);
+        assert_eq!(
+            public.delivery.map(|delivery| delivery.mode),
+            Some(cua_driver_contract::ActionDeliveryMode::Foreground)
+        );
     }
 
     #[test]

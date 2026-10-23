@@ -64,21 +64,45 @@ enum Attempt {
 }
 
 /// Chromium or Electron: a known browser by name or bundle id, or an app
-/// whose bundle carries `Electron Framework.framework` next to its executable.
+/// whose bundle carries Chromium (see [`bundles_chromium`]).
 /// Only these get the legacy `AXEnhancedUserInterface` opt-in.
 fn is_chromium_family(pid: i32) -> bool {
     crate::browser::platform::is_chromium(
         &crate::apps::get_app_name_for_pid(pid).unwrap_or_default(),
         &crate::apps::bundle_id_for_pid(pid).unwrap_or_default(),
-    ) || executable_path(pid).is_some_and(|exe| bundles_electron(&exe))
+    ) || executable_path(pid).is_some_and(|exe| bundles_chromium(&exe))
 }
 
-fn bundles_electron(executable: &std::path::Path) -> bool {
+/// Whether the app bundle around `executable` ships Chromium: an
+/// `Electron Framework.framework`, or a Chromium renderer helper app
+/// (`... (Renderer).app`) beside the frameworks (Electron's layout) or inside
+/// any framework's `Helpers` (Chrome's, and the ChatGPT desktop app's
+/// `Codex Framework.framework`). Chromium names its helpers this way whatever
+/// the product calls its framework.
+fn bundles_chromium(executable: &std::path::Path) -> bool {
     // <App>.app/Contents/MacOS/<exe> -> <App>.app/Contents/Frameworks/...
-    executable
-        .parent()
-        .and_then(std::path::Path::parent)
-        .is_some_and(|contents| contents.join("Frameworks/Electron Framework.framework").exists())
+    let Some(frameworks) = executable.parent().and_then(std::path::Path::parent).map(|c| c.join("Frameworks"))
+    else {
+        return false;
+    };
+    if frameworks.join("Electron Framework.framework").exists() {
+        return true;
+    }
+    let entries = |dir: &std::path::Path| -> Vec<std::path::PathBuf> {
+        std::fs::read_dir(dir)
+            .map(|read| read.flatten().map(|entry| entry.path()).collect())
+            .unwrap_or_default()
+    };
+    let renderer = |path: &std::path::Path| {
+        path.file_name().is_some_and(|name| name.to_string_lossy().ends_with("(Renderer).app"))
+    };
+    entries(&frameworks).iter().any(|entry| {
+        renderer(entry)
+            || (entry.extension().is_some_and(|ext| ext == "framework")
+                && std::iter::once(entry.join("Helpers"))
+                    .chain(entries(&entry.join("Versions")).into_iter().map(|v| v.join("Helpers")))
+                    .any(|helpers| entries(&helpers).iter().any(|h| renderer(h))))
+    })
 }
 
 fn executable_path(pid: i32) -> Option<std::path::PathBuf> {
@@ -391,10 +415,44 @@ mod tests {
         let root = std::env::temp_dir().join(format!("cua-electron-shape-{}", std::process::id()));
         let exe = root.join("Fake.app/Contents/MacOS/Fake");
         std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
-        assert!(!bundles_electron(&exe));
+        assert!(!bundles_chromium(&exe));
         std::fs::create_dir_all(root.join("Fake.app/Contents/Frameworks/Electron Framework.framework"))
             .unwrap();
-        assert!(bundles_electron(&exe));
+        assert!(bundles_chromium(&exe));
+        std::fs::remove_dir_all(&root).unwrap();
+    }
+
+    /// Chromium ships under other framework names too: the ChatGPT desktop
+    /// app bundles "Codex Framework.framework" (Chromium 155, `ChromeMain`)
+    /// with its helpers inside the framework, as Chrome does. A Chromium
+    /// renderer helper ("... (Renderer).app") marks the bundle wherever it
+    /// sits; an ordinary framework does not.
+    #[test]
+    fn chromium_is_recognised_under_any_framework_name() {
+        let root = std::env::temp_dir().join(format!("cua-chromium-shape-{}", std::process::id()));
+        let make = |app: &str, dirs: &[&str]| {
+            let exe = root.join(format!("{app}.app/Contents/MacOS/{app}"));
+            std::fs::create_dir_all(exe.parent().unwrap()).unwrap();
+            for dir in dirs {
+                std::fs::create_dir_all(root.join(format!("{app}.app/Contents/Frameworks/{dir}"))).unwrap();
+            }
+            exe
+        };
+        // ChatGPT 26.1016: helpers inside the framework.
+        let codex = make("ChatGPT", &["Codex Framework.framework/Helpers/Codex (Renderer).app", "Sparkle.framework"]);
+        assert!(bundles_chromium(&codex));
+        // Chrome: helpers in the framework's version directory.
+        let chrome = make(
+            "Chrome",
+            &["Google Chrome Framework.framework/Versions/155.0.1/Helpers/Google Chrome Helper (Renderer).app"],
+        );
+        assert!(bundles_chromium(&chrome));
+        // An Electron app renamed its framework but kept Electron's helper layout.
+        let renamed = make("Renamed", &["Renamed Helper (Renderer).app", "Shell Framework.framework"]);
+        assert!(bundles_chromium(&renamed));
+        // A native app with ordinary frameworks.
+        let native = make("Native", &["Sparkle.framework/Versions/B/Resources", "Mantle.framework"]);
+        assert!(!bundles_chromium(&native));
         std::fs::remove_dir_all(&root).unwrap();
     }
 

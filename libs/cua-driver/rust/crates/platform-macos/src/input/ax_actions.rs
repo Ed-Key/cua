@@ -101,6 +101,29 @@ pub(crate) fn find_row(
     None
 }
 
+/// Whether `element` sits inside an `AXWebArea` (bounded walk up its
+/// parents, stopping at the window or application).
+unsafe fn inside_web_area(element: AXUIElementRef) -> bool {
+    let mut current = element;
+    CFRetain(current as CFTypeRef);
+    let mut found = false;
+    for _ in 0..40 {
+        match copy_string_attr(current, "AXRole").as_deref() {
+            Some("AXWebArea") => {
+                found = true;
+                break;
+            }
+            Some("AXWindow") | Some("AXApplication") | None => break,
+            _ => {}
+        }
+        let Some(parent) = copy_element_attr(current, "AXParent") else { break };
+        CFRelease(current as CFTypeRef);
+        current = parent;
+    }
+    CFRelease(current as CFTypeRef);
+    found
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RowKind {
     /// AppKit / SwiftUI collection row: accepts AX selection writes.
@@ -261,6 +284,13 @@ impl RowSelection {
                     let (peers, _, any, _) = scan_selection(parent, None);
                     (peers, any, false)
                 })
+            })
+            // Web content is never a Catalyst row: its AXSelected follows
+            // aria-selected, not what the page does on a click (the ChatGPT
+            // sidebar switches chats and leaves the mark where it was), so
+            // the read-back would call a working click a failure.
+            .filter(|(_, kind)| {
+                *kind != RowKind::Catalyst || !inside_web_area(element_ptr as AXUIElementRef)
             });
             let mut result = None;
             for (at, (element, parent)) in elements.into_iter().enumerate() {
