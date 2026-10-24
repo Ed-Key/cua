@@ -918,7 +918,7 @@ fn focus_state(pid: i32, target: u32) -> FocusState {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
-            return FocusState::Elsewhere;
+            return FocusState::Unknown;
         }
         AXUIElementSetMessagingTimeout(app, READ_TIMEOUT_SECONDS);
         let element = copy_element_attr(app, "AXFocusedUIElement");
@@ -936,7 +936,9 @@ fn focus_state(pid: i32, target: u32) -> FocusState {
         // editor is its own child window; no ancestor walk needed).
         let window = ax_get_window_id(element);
         CFRelease(element as CFTypeRef);
-        if is_inline_edit(role.as_deref(), window, target, window_belongs_to) {
+        if role.is_none() || window.is_none() {
+            FocusState::Unknown
+        } else if is_inline_edit(role.as_deref(), window, target, window_belongs_to) {
             FocusState::InlineEdit
         } else {
             FocusState::Elsewhere
@@ -986,11 +988,9 @@ fn inline_edit_wait(
     loop {
         match read() {
             FocusState::InlineEdit => return true,
-            // Item 26 red stub: the pre-fix decision (unreadable focus counts as
-            // elsewhere, and so does the old focus before an expected editor).
-            FocusState::InMenu => elsewhere_since = None,
-            FocusState::Elsewhere | FocusState::Unknown => {
-                let _ = editor_expected;
+            FocusState::InMenu | FocusState::Unknown => elsewhere_since = None,
+            FocusState::Elsewhere if editor_expected => {}
+            FocusState::Elsewhere => {
                 let since = *elsewhere_since.get_or_insert_with(&elapsed);
                 if elapsed().saturating_sub(since) >= SETTLED {
                     return false;
