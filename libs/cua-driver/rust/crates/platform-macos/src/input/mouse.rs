@@ -60,8 +60,11 @@ fn skylight_available() -> bool {
     crate::input::skylight::is_available()
 }
 
-/// Hand one stamped event to its transport.
+/// Hand one field-stamped event to its transport, with the current uptime as
+/// its timestamp.
 fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
+    // An event left at 0 still posts: receivers then see it from boot, as before.
+    let _ = crate::input::event_clock::stamp_now(event);
     #[cfg(test)]
     if post_sink::record(route, event) {
         return;
@@ -173,7 +176,6 @@ fn click_at_xy_desktop_inner(
     preserve_cursor: bool,
 ) -> anyhow::Result<HidPassage> {
     use core_graphics::display::CGDisplay;
-    use core_graphics::event::CGEventTapLocation;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let prior = if preserve_cursor {
@@ -229,7 +231,7 @@ fn click_at_xy_desktop_inner(
             )
             .map_err(|_| anyhow::anyhow!("CGEvent::new_mouse_event(move) failed"))?;
             moved.set_flags(flags);
-            moved.post(CGEventTapLocation::HID);
+            crate::focus_steal::post_hid_mouse_event(&moved);
             std::thread::sleep(std::time::Duration::from_millis(12));
         }
 
@@ -616,7 +618,7 @@ pub fn scroll_wheel_desktop(
     delta_x_per_tick: i32,
     ticks: usize,
 ) -> anyhow::Result<()> {
-    use core_graphics::event::{CGEventTapLocation, ScrollEventUnit};
+    use core_graphics::event::ScrollEventUnit;
 
     move_cursor_desktop(x, y)?;
     std::thread::sleep(std::time::Duration::from_millis(40));
@@ -642,7 +644,7 @@ pub fn scroll_wheel_desktop(
             return Err(anyhow::anyhow!("CGEventCreateScrollWheelEvent2 failed"));
         }
         let event = unsafe { CGEvent::from_ptr(event_ref) };
-        event.post(CGEventTapLocation::HID);
+        crate::focus_steal::post_hid_mouse_event(&event);
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
     Ok(())
@@ -719,36 +721,18 @@ fn click_at_xy_inner(
     post_mode: MousePostMode,
 ) -> anyhow::Result<()> {
     let (x, y) = screen;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let point = CGPoint::new(x, y);
     let flags = parse_modifier_flags(modifiers);
 
-    // Shared click-group ID (f58) when window_id is known: keeps all pairs
-    // in one gesture so WindowServer / Chromium coalesce them correctly.
-    let click_group_id: Option<i64> = wid.map(|_| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as i64
-    });
-
     super::keyboard::with_pid_modifier_keys(pid, modifiers, || {
         // Prime the target window's cursor-tracking state with a leading
         // mouseMoved so an AppKit NSButton / NSView hit-tests the down at the
         // right point. Without it the synthetic mouseDown on a backgrounded
         // AppKit control is silently ignored.
-        post_mouse_moved_primer(
-            pid,
-            &source,
-            point,
-            window_local,
-            wid,
-            click_group_id,
-            post_mode,
-        );
+        post_mouse_moved_primer(pid, &source, point, window_local, wid, post_mode);
         std::thread::sleep(std::time::Duration::from_millis(12));
 
         for pair_index in 0..count {
@@ -765,17 +749,7 @@ fn click_at_xy_inner(
             // otherwise carry whatever modifiers the user physically holds.
             down.set_flags(flags);
 
-            post_mouse_event_with_mode(
-                pid,
-                &down,
-                window_local,
-                wid,
-                click_group_id,
-                click_state,
-                0,
-                3,
-                post_mode,
-            );
+            post_mouse_event_with_mode(pid, &down, window_local, wid, click_state, 0, 3, post_mode);
             // 28 ms down→up gap: an NSButton's mouseDown enters a modal
             // tracking loop that polls for the matching mouseUp; too tight a
             // gap can race the loop's first poll and the click is dropped.
@@ -792,17 +766,7 @@ fn click_at_xy_inner(
             // otherwise carry whatever modifiers the user physically holds.
             up.set_flags(flags);
 
-            post_mouse_event_with_mode(
-                pid,
-                &up,
-                window_local,
-                wid,
-                click_group_id,
-                click_state,
-                0,
-                3,
-                post_mode,
-            );
+            post_mouse_event_with_mode(pid, &up, window_local, wid, click_state, 0, 3, post_mode);
 
             if count > 1 {
                 std::thread::sleep(std::time::Duration::from_millis(80));
@@ -842,14 +806,21 @@ pub fn prepare_background_pixel_click(pid: i32, wid: u32) -> bool {
 ///  3. Target down/up pair(s) at real coordinates (f0=3/3), clickState 1→N.
 ///
 /// All events carry:
-///  - f0  = gesture phase marker (move=2, primerDown=1, primerUp=2, target=3)
+///  - f0  = kCGMouseEventNumber (move=2, primer down=1, primer up=2, target
+///    pairs=3); a hardware down and its up share one number, the primer's do not
 ///  - f1  = mouseEventClickState (1 for single, 1→2 for double)
 ///  - f3  = 0  (left button)
 ///  - f7  = 3  (NSEventSubtypeTouch)
 ///  - f40 = target pid   (Chromium synthetic-event filter)
 ///  - f51 / f91 / f92 = CGWindowID (window routing)
-///  - f58 = constant click-group ID across all events (gesture coalescing)
-///  - `CGEventSetWindowLocation` per-event (screen point for both routes)
+///  - the current uptime as the timestamp, stamped at dispatch (raw field 58 is
+///    the timestamp; it once carried a wall-clock "click group" fraction, so
+///    Chromium apps saw events from just after boot, incident 20)
+///  - `CGEventSetWindowLocation` per-event: the window-local point. With a
+///    current timestamp the receiver uses it as given (VM B, Chrome 155,
+///    2026-10-23: a screen point landed one window origin away). While the
+///    timestamp was stale it was read as a screen point instead, which is why
+///    the screen point used to be stamped here.
 ///
 /// Uses the SkyLight route required by Chromium-compatible targets, with the
 /// public API only as a fallback when the private symbol is unavailable.
@@ -881,14 +852,14 @@ fn chromium_click_route_plan(
     count: usize,
 ) -> Vec<ChromiumClickRouteStep> {
     let screen_target = (screen_x, screen_y);
-    let _ = (win_local_x, win_local_y);
+    let local_target = (win_local_x, win_local_y);
     let off_screen = (-1.0, -1.0);
     let mut steps = vec![
         ChromiumClickRouteStep {
             kind: ChromiumClickEventKind::Move,
             event_location: screen_target,
-            skylight_window_location: screen_target,
-            public_window_location: screen_target,
+            skylight_window_location: local_target,
+            public_window_location: local_target,
             click_state: 0,
             phase: 2,
             button_number: 0,
@@ -925,8 +896,8 @@ fn chromium_click_route_plan(
         steps.push(ChromiumClickRouteStep {
             kind: ChromiumClickEventKind::Down,
             event_location: screen_target,
-            skylight_window_location: screen_target,
-            public_window_location: screen_target,
+            skylight_window_location: local_target,
+            public_window_location: local_target,
             click_state,
             phase: 3,
             button_number: 0,
@@ -936,8 +907,8 @@ fn chromium_click_route_plan(
         steps.push(ChromiumClickRouteStep {
             kind: ChromiumClickEventKind::Up,
             event_location: screen_target,
-            skylight_window_location: screen_target,
-            public_window_location: screen_target,
+            skylight_window_location: local_target,
+            public_window_location: local_target,
             click_state,
             phase: 3,
             button_number: 0,
@@ -949,10 +920,9 @@ fn chromium_click_route_plan(
 }
 
 /// Post the route plan for the Chromium-compatible background left-click
-/// recipe. `CGEvent::new_mouse_event` starts with the screen-space location.
-/// `CGEventSetWindowLocation` uses the screen point for both SkyLight and the
-/// public PID fallback. macOS interprets the stamped location in screen space
-/// even when the public route is used for a background process.
+/// recipe. `CGEvent::new_mouse_event` starts with the screen-space location;
+/// `CGEventSetWindowLocation` carries the window-local point on both SkyLight
+/// and the public PID fallback.
 #[allow(clippy::too_many_arguments)]
 pub fn click_at_xy_chromium(
     pid: i32,
@@ -964,20 +934,11 @@ pub fn click_at_xy_chromium(
     count: usize,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let route_plan = chromium_click_route_plan(screen_x, screen_y, win_local_x, win_local_y, count);
     let flags = parse_modifier_flags(modifiers);
     let window_id = wid as i64;
-
-    // All 5 events share the same click-group ID so WindowServer / Chromium
-    // treat the sequence as one gesture (Swift: field 58).
-    let click_group_id = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .subsec_nanos() as i64;
 
     // Stamp required fields onto a CGEvent.  All captured values are Copy so
     // this closure is Fn (callable multiple times).
@@ -986,7 +947,7 @@ pub fn click_at_xy_chromium(
         let set = |f: u32, v: i64| {
             crate::input::skylight::set_integer_field(ptr, f, v);
         };
-        set(0, step.phase); // kCGMouseEventNumber (gesture phase)
+        set(0, step.phase); // kCGMouseEventNumber
         set(1, step.click_state); // kCGMouseEventClickState
         set(3, step.button_number); // kCGMouseEventButtonNumber (left)
         set(7, step.subtype); // kCGMouseEventSubtype (NSEventSubtypeTouch)
@@ -996,7 +957,6 @@ pub fn click_at_xy_chromium(
             set(91, window_id); // kCGMouseEventWindowUnderMousePointer
             set(92, window_id); // kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent
         }
-        set(58, click_group_id); // click-group ID (gesture coalescing)
         crate::input::skylight::set_window_location(
             ptr,
             step.skylight_window_location.0,
@@ -1117,8 +1077,6 @@ pub fn drag_at_xy_observed<F>(
 where
     F: FnMut(f64, f64),
 {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     if foreground_hid {
         return drag_at_xy_window_foreground_observed(
             pid,
@@ -1168,13 +1126,6 @@ where
         DragButton::Middle => 2,
     };
 
-    let click_group_id: Option<i64> = wid.map(|_| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as i64
-    });
-
     let steps = steps.max(1);
     let step_delay_ms = if steps > 1 {
         duration_ms / steps as u64
@@ -1185,15 +1136,7 @@ where
     // Prime the routed target's cursor-tracking state immediately before the
     // press, matching the click path's stamped mouseMoved + settle interval.
     let from_pt = CGPoint::new(from_x, from_y);
-    post_mouse_moved_primer(
-        pid,
-        &source,
-        from_pt,
-        from_local,
-        wid,
-        click_group_id,
-        MousePostMode::Both,
-    );
+    post_mouse_moved_primer(pid, &source, from_pt, from_local, wid, MousePostMode::Both);
     std::thread::sleep(std::time::Duration::from_millis(12));
 
     // MouseDown at start.
@@ -1202,16 +1145,7 @@ where
     if flags != CGEventFlags::CGEventFlagNull {
         down.set_flags(flags);
     }
-    post_mouse_event(
-        pid,
-        &down,
-        from_local,
-        wid,
-        click_group_id,
-        1,
-        button_number,
-        0,
-    );
+    post_mouse_event(pid, &down, from_local, wid, 1, button_number, 0);
     observe(from_x, from_y);
     std::thread::sleep(std::time::Duration::from_millis(16));
 
@@ -1229,7 +1163,7 @@ where
         if flags != CGEventFlags::CGEventFlagNull {
             drag.set_flags(flags);
         }
-        post_mouse_event(pid, &drag, il, wid, click_group_id, 1, button_number, 0);
+        post_mouse_event(pid, &drag, il, wid, 1, button_number, 0);
         observe(ix, iy);
         if step_delay_ms > 0 {
             std::thread::sleep(std::time::Duration::from_millis(step_delay_ms));
@@ -1246,7 +1180,7 @@ where
     if flags != CGEventFlags::CGEventFlagNull {
         up.set_flags(flags);
     }
-    post_mouse_event(pid, &up, to_local, wid, click_group_id, 1, button_number, 0);
+    post_mouse_event(pid, &up, to_local, wid, 1, button_number, 0);
     // Chromium may process the final pointerup on the next run-loop turn. In
     // the foreground rung the caller restores the previous app immediately
     // after this function returns, so let the target consume the release and
@@ -1264,7 +1198,6 @@ fn post_drag_mouse_event(
     button: CGMouseButton,
     window_local: Option<(f64, f64)>,
     wid: Option<u32>,
-    click_group_id: Option<i64>,
     click_state: i64,
     button_number: i64,
     subtype: i64,
@@ -1283,7 +1216,6 @@ fn post_drag_mouse_event(
         &event,
         window_local,
         wid,
-        click_group_id,
         click_state,
         button_number,
         subtype,
@@ -1312,7 +1244,6 @@ where
     F: FnMut(f64, f64),
 {
     use core_graphics::display::CGDisplay;
-    use std::time::{SystemTime, UNIX_EPOCH};
 
     let (cg_button, down_type, dragged_type, up_type, button_number) = match button {
         DragButton::Left => (
@@ -1337,12 +1268,6 @@ where
             2,
         ),
     };
-    let click_group_id = wid.map(|_| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as i64
-    });
     let steps = steps.max(1);
     let step_delay_ms = if steps > 1 {
         duration_ms / steps as u64
@@ -1395,7 +1320,6 @@ where
                 event_button,
                 local,
                 wid,
-                click_group_id,
                 click_state,
                 event_button_number,
                 subtype,
@@ -1412,7 +1336,6 @@ where
                         cg_button,
                         None,
                         wid,
-                        click_group_id,
                         1,
                         button_number,
                         0,
@@ -1703,7 +1626,7 @@ fn middle_click_at_xy_inner(
     if flags != CGEventFlags::CGEventFlagNull {
         down.set_flags(flags);
     }
-    post_mouse_event(pid, &down, window_local, None, None, 1, 2, 3);
+    post_mouse_event(pid, &down, window_local, None, 1, 2, 3);
     std::thread::sleep(std::time::Duration::from_millis(16));
 
     let up = CGEvent::new_mouse_event(
@@ -1716,7 +1639,7 @@ fn middle_click_at_xy_inner(
     if flags != CGEventFlags::CGEventFlagNull {
         up.set_flags(flags);
     }
-    post_mouse_event(pid, &up, window_local, None, None, 1, 2, 3);
+    post_mouse_event(pid, &up, window_local, None, 1, 2, 3);
 
     Ok(())
 }
@@ -1760,19 +1683,10 @@ fn right_click_at_xy_inner(
     wid: Option<u32>,
     modifiers: &[&str],
 ) -> anyhow::Result<()> {
-    use std::time::{SystemTime, UNIX_EPOCH};
-
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let point = CGPoint::new(x, y);
     let flags = parse_modifier_flags(modifiers);
-
-    let click_group_id: Option<i64> = wid.map(|_| {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .subsec_nanos() as i64
-    });
 
     // Prime cursor-tracking state at the target so AppKit hit-tests the
     // right-down at the right NSView (same rationale as the left path).
@@ -1782,7 +1696,6 @@ fn right_click_at_xy_inner(
         point,
         window_local,
         wid,
-        click_group_id,
         MousePostMode::SkyLightPreferred,
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
@@ -1804,7 +1717,6 @@ fn right_click_at_xy_inner(
         &down,
         window_local,
         wid,
-        click_group_id,
         1,
         1,
         3,
@@ -1827,7 +1739,6 @@ fn right_click_at_xy_inner(
         &up,
         window_local,
         wid,
-        click_group_id,
         1,
         1,
         3,
@@ -1855,7 +1766,6 @@ fn right_click_at_xy_inner(
 /// - f3  = `button_number`  (kCGMouseEventButtonNumber: 0=left, 1=right, 2=middle)
 /// - f7  = 3                (kCGMouseEventSubtype = NSEventSubtypeTouch)
 /// - f51 = window_id        (windowNumber, NSEvent bridge equivalent)
-/// - f58 = click_group_id   (gesture coalescing across pairs)
 /// - f91 = window_id        (kCGMouseEventWindowUnderMousePointer)
 /// - f92 = window_id        (kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent)
 ///
@@ -1869,7 +1779,6 @@ pub(super) fn post_mouse_event(
     event: &CGEvent,
     window_local: Option<(f64, f64)>,
     wid: Option<u32>,
-    click_group_id: Option<i64>,
     click_state: i64,
     button_number: i64,
     subtype: i64,
@@ -1879,7 +1788,6 @@ pub(super) fn post_mouse_event(
         event,
         window_local,
         wid,
-        click_group_id,
         click_state,
         button_number,
         subtype,
@@ -1893,7 +1801,6 @@ fn post_mouse_event_with_mode(
     event: &CGEvent,
     window_local: Option<(f64, f64)>,
     wid: Option<u32>,
-    click_group_id: Option<i64>,
     click_state: i64,
     button_number: i64,
     subtype: i64,
@@ -1907,7 +1814,7 @@ fn post_mouse_event_with_mode(
     }
 
     // Chromium / AppKit window-routing fields — stamp when window_id is known.
-    if let (Some(wid), Some(cgid)) = (wid, click_group_id) {
+    if let Some(wid) = wid {
         let window_id = wid as i64;
         let set = |f: u32, v: i64| {
             crate::input::skylight::set_integer_field(event_ptr, f, v);
@@ -1916,7 +1823,6 @@ fn post_mouse_event_with_mode(
         set(3, button_number); // kCGMouseEventButtonNumber (0=left, 1=right, 2=middle)
         set(7, subtype); // kCGMouseEventSubtype (touch for clicks, normal for drags)
         set(51, window_id); // windowNumber
-        set(58, cgid); // click-group ID (gesture coalescing)
         set(91, window_id); // kCGMouseEventWindowUnderMousePointer
         set(92, window_id); // kCGMouseEventWindowUnderMousePointerThatCanHandleThisEvent
     }
@@ -1944,7 +1850,6 @@ fn post_mouse_moved_primer(
     point: CGPoint,
     window_local: Option<(f64, f64)>,
     wid: Option<u32>,
-    click_group_id: Option<i64>,
     mode: MousePostMode,
 ) {
     if let Ok(mv) = CGEvent::new_mouse_event(
@@ -1953,7 +1858,7 @@ fn post_mouse_moved_primer(
         point,
         CGMouseButton::Left,
     ) {
-        post_mouse_event_with_mode(pid, &mv, window_local, wid, click_group_id, 0, 0, 3, mode);
+        post_mouse_event_with_mode(pid, &mv, window_local, wid, 0, 0, 3, mode);
     }
 }
 
@@ -2013,12 +1918,6 @@ pub fn scroll_wheel_at_xy(
         CGPoint::new(screen_x, screen_y),
         window_local,
         wid,
-        Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default()
-                .subsec_nanos() as i64,
-        ),
         MousePostMode::Both,
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
@@ -2060,8 +1959,7 @@ pub fn scroll_wheel_at_xy(
 
         // Belt+suspenders post: SkyLight reaches backgrounded Chromium/Catalyst;
         // the public path lands on AppKit/WKWebView. Mouse-class → no auth envelope.
-        crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
-        event.post_to_pid(pid as libc::pid_t);
+        dispatch_mouse_event(PostRoute::SkyLightAndPublic, pid, &event);
 
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
@@ -2111,6 +2009,7 @@ fn parse_modifier_flags(modifiers: &[&str]) -> CGEventFlags {
 mod post_sink {
     use super::PostRoute;
     use core_graphics::event::{CGEvent, EventField};
+    use foreign_types::ForeignType;
     use std::cell::RefCell;
 
     pub(super) const MODIFIER_MASK: u64 = 0x0002_0000 // shift
@@ -2142,6 +2041,13 @@ mod post_sink {
         posted: Vec<Posted>,
         /// Modifier flags carried by each posted event, parallel to `posted`.
         modifiers: Vec<u64>,
+        /// `CGEventGetTimestamp` of each posted event as it reached the
+        /// transport, parallel to `posted`.
+        timestamps: Vec<u64>,
+    }
+
+    extern "C" {
+        fn CGEventGetTimestamp(event: core_graphics::sys::CGEventRef) -> u64;
     }
 
     thread_local! {
@@ -2159,6 +2065,7 @@ mod post_sink {
                     skylight_available,
                     posted: Vec::new(),
                     modifiers: Vec::new(),
+                    timestamps: Vec::new(),
                 });
             });
             Self
@@ -2173,6 +2080,16 @@ mod post_sink {
                     .borrow()
                     .as_ref()
                     .map(|state| state.modifiers.clone())
+                    .unwrap_or_default()
+            })
+        }
+
+        pub(super) fn timestamps(&self) -> Vec<u64> {
+            STATE.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .map(|state| state.timestamps.clone())
                     .unwrap_or_default()
             })
         }
@@ -2218,6 +2135,9 @@ mod post_sink {
             state
                 .modifiers
                 .push(event.get_flags().bits() & MODIFIER_MASK);
+            state
+                .timestamps
+                .push(unsafe { CGEventGetTimestamp(event.as_ptr()) });
             true
         })
     }
@@ -2253,8 +2173,8 @@ mod tests {
                 ChromiumClickRouteStep {
                     kind: ChromiumClickEventKind::Move,
                     event_location: (564.0, 504.0),
-                    skylight_window_location: (564.0, 504.0),
-                    public_window_location: (564.0, 504.0),
+                    skylight_window_location: (394.0, 310.0),
+                    public_window_location: (394.0, 310.0),
                     click_state: 0,
                     phase: 2,
                     button_number: 0,
@@ -2286,8 +2206,8 @@ mod tests {
                 ChromiumClickRouteStep {
                     kind: ChromiumClickEventKind::Down,
                     event_location: (564.0, 504.0),
-                    skylight_window_location: (564.0, 504.0),
-                    public_window_location: (564.0, 504.0),
+                    skylight_window_location: (394.0, 310.0),
+                    public_window_location: (394.0, 310.0),
                     click_state: 1,
                     phase: 3,
                     button_number: 0,
@@ -2297,8 +2217,8 @@ mod tests {
                 ChromiumClickRouteStep {
                     kind: ChromiumClickEventKind::Up,
                     event_location: (564.0, 504.0),
-                    skylight_window_location: (564.0, 504.0),
-                    public_window_location: (564.0, 504.0),
+                    skylight_window_location: (394.0, 310.0),
+                    public_window_location: (394.0, 310.0),
                     click_state: 1,
                     phase: 3,
                     button_number: 0,
@@ -2308,28 +2228,15 @@ mod tests {
             ]
         );
 
-        let screen_to_canvas = (-frame.bounds.x, -frame.bounds.y);
-        let unconverted_journal_point = (
-            capture_local.0 + screen_to_canvas.0,
-            capture_local.1 + screen_to_canvas.1,
-        );
-        assert_eq!(unconverted_journal_point, (224.0, 116.0));
-        assert!(!(292.0..=496.0).contains(&unconverted_journal_point.0));
-
+        // The receiver uses a currently timestamped event's window location as
+        // window-local, so the target pair carries the capture-local point.
         let delivered = plan
             .iter()
             .find(|step| step.kind == ChromiumClickEventKind::Down && step.phase == 3)
             .expect("target mouse-down step");
         assert_eq!(delivered.event_location, (564.0, 504.0));
-        assert_eq!(delivered.skylight_window_location, (564.0, 504.0));
-        assert_eq!(delivered.public_window_location, (564.0, 504.0));
-        let skylight_journal_point = (
-            delivered.skylight_window_location.0 + screen_to_canvas.0,
-            delivered.skylight_window_location.1 + screen_to_canvas.1,
-        );
-        assert_eq!(skylight_journal_point, capture_local);
-        assert!((292.0..=496.0).contains(&skylight_journal_point.0));
-        assert!((132.0..=310.0).contains(&skylight_journal_point.1));
+        assert_eq!(delivered.skylight_window_location, capture_local);
+        assert_eq!(delivered.public_window_location, capture_local);
     }
 
     #[test]
@@ -2613,4 +2520,120 @@ mod tests {
         assert_eq!(now.outstanding_since(base), [1, 0, 0, 0, 0, 0]);
     }
 
+    /// Mach uptime in nanoseconds, the clock of hardware event timestamps.
+    #[allow(deprecated)] // libc's timebase ABI, as native_focus_events uses it.
+    fn uptime_now() -> u64 {
+        let mut info = libc::mach_timebase_info { numer: 0, denom: 0 };
+        unsafe {
+            libc::mach_timebase_info(&mut info);
+            (libc::mach_absolute_time() as u128 * info.numer as u128 / info.denom as u128) as u64
+        }
+    }
+
+    /// Incident 20: Chromium apps on a Mac with days of uptime dropped cua's
+    /// clicks. A hardware event carries the uptime at which it happened; cua's
+    /// carried 0, or a wall-clock fraction of a second written into raw field
+    /// 58 (the timestamp field, taken for a "click group"), so the events
+    /// looked days old. Every event handed to a transport must carry the
+    /// current uptime.
+    #[test]
+    fn every_pid_routed_mouse_event_carries_the_current_uptime() {
+        type Gesture = fn() -> anyhow::Result<()>;
+        let gestures: [(&str, Gesture, &[&str]); 8] = [
+            (
+                "background chromium click",
+                || click_at_xy_chromium(1, 100.0, 100.0, 10.0, 10.0, 7, 1, &[]),
+                &[
+                    "MouseMoved",
+                    "LeftMouseDown",
+                    "LeftMouseUp",
+                    "LeftMouseDown",
+                    "LeftMouseUp",
+                ],
+            ),
+            (
+                "click without a window",
+                || click_at_xy(1, 100.0, 100.0, 1, &[]),
+                &["MouseMoved", "LeftMouseDown", "LeftMouseUp"],
+            ),
+            (
+                "foreground window click",
+                || {
+                    click_at_xy_with_window_local(
+                        1,
+                        100.0,
+                        100.0,
+                        10.0,
+                        10.0,
+                        7,
+                        1,
+                        &[],
+                        WindowClickDelivery::Foreground,
+                    )
+                },
+                &["MouseMoved", "LeftMouseDown", "LeftMouseUp"],
+            ),
+            (
+                "background right click",
+                || right_click_at_xy_with_window_local(1, 100.0, 100.0, 10.0, 10.0, 7, &[]),
+                &["MouseMoved", "RightMouseDown", "RightMouseUp"],
+            ),
+            (
+                "right click without a window",
+                || right_click_at_xy(1, 100.0, 100.0, &[]),
+                &["MouseMoved", "RightMouseDown", "RightMouseUp"],
+            ),
+            (
+                "middle click",
+                || middle_click_at_xy_with_window_local(1, 100.0, 100.0, 10.0, 10.0, &[]),
+                &["OtherMouseDown", "OtherMouseUp"],
+            ),
+            (
+                "background drag",
+                || {
+                    drag_at_xy(
+                        1,
+                        100.0,
+                        100.0,
+                        140.0,
+                        100.0,
+                        Some((10.0, 10.0)),
+                        Some((50.0, 10.0)),
+                        Some(7),
+                        0,
+                        2,
+                        &[],
+                        DragButton::Left,
+                        false,
+                    )
+                },
+                &[
+                    "MouseMoved",
+                    "LeftMouseDown",
+                    "LeftMouseDragged",
+                    "LeftMouseDragged",
+                    "LeftMouseUp",
+                ],
+            ),
+            (
+                "background scroll",
+                || scroll_wheel_at_xy(1, 100.0, 100.0, Some((10.0, 10.0)), Some(7), -120, 0, 2),
+                &["MouseMoved", "ScrollWheel", "ScrollWheel"],
+            ),
+        ];
+        for (name, gesture, expected) in gestures {
+            let capture = Capture::start(true);
+            gesture().unwrap();
+            let after = uptime_now();
+            let events: Vec<String> = capture.posted().into_iter().map(|p| p.event).collect();
+            assert_eq!(events, *expected, "{name}: event sequence");
+            for (posted, stamp) in capture.posted().iter().zip(capture.timestamps()) {
+                assert!(
+                    stamp <= after && after - stamp < 1_000_000_000,
+                    "{name}: {} carries timestamp {stamp} ns, uptime is {after} ns",
+                    posted.event
+                );
+            }
+        }
+    }
 }
