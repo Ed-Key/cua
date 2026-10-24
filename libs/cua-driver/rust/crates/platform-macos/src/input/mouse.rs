@@ -176,6 +176,9 @@ fn click_at_xy_desktop_inner(
     preserve_cursor: bool,
 ) -> anyhow::Result<HidPassage> {
     use core_graphics::display::CGDisplay;
+    // From the pointer warp to the passage verdict, no other worker's
+    // foreground action may run (inside an activation helper, its turn).
+    let _turn = hold_foreground_turn()?;
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
     let prior = if preserve_cursor {
@@ -459,17 +462,6 @@ pub fn click_in_flight() -> bool {
     DISPATCHING.load(std::sync::atomic::Ordering::SeqCst) > 0 || backlog_at(ButtonCounters::read()) != [0; 6]
 }
 
-/// Before activating or raising anything for a new action: wait while a HID
-/// click may still be held (one being posted or awaited by another worker,
-/// or an earlier one unresolved), until it passes or counts as dropped. Never
-/// called while this thread posts one; bounded in case a worker hangs.
-pub fn await_no_click_in_flight() {
-    let give_up = std::time::Instant::now() + UNRESOLVED_FOR + HID_PASSAGE_TIMEOUT * 2;
-    while click_in_flight() && std::time::Instant::now() < give_up {
-        std::thread::sleep(std::time::Duration::from_millis(20));
-    }
-}
-
 /// The foreground turn: one foreground action at a time (its activation,
 /// its input and the hand-back of the front), owned by the thread doing it.
 /// The MCP layer's desktop coordinator belongs to the async call and is
@@ -501,15 +493,37 @@ impl TurnLock {
     }
 
     /// Hold the turn, waiting up to `wait` while another thread holds it.
-    fn take(&self, _wait: std::time::Duration) -> Option<Turn<'_>> {
-        // Stub with the old behaviour (no turn at all); the fix follows.
-        Some(Turn { lock: self, nested: false, _thread_bound: std::marker::PhantomData })
+    fn take(&self, wait: std::time::Duration) -> Option<Turn<'_>> {
+        let me = std::thread::current().id();
+        let deadline = std::time::Instant::now() + wait;
+        let mut state = self.state.lock().unwrap_or_else(|p| p.into_inner());
+        loop {
+            match state.0 {
+                Some(holder) if holder != me => {
+                    let left = deadline.saturating_duration_since(std::time::Instant::now());
+                    if left.is_zero() {
+                        return None;
+                    }
+                    state = self.freed.wait_timeout(state, left).unwrap_or_else(|p| p.into_inner()).0;
+                }
+                _ => {
+                    state.0 = Some(me);
+                    state.1 += 1;
+                    return Some(Turn { lock: self, nested: state.1 > 1, _thread_bound: std::marker::PhantomData });
+                }
+            }
+        }
     }
 }
 
 impl Drop for Turn<'_> {
     fn drop(&mut self) {
-        let _ = self.lock;
+        let mut state = self.lock.state.lock().unwrap_or_else(|p| p.into_inner());
+        state.1 -= 1;
+        if state.1 == 0 {
+            state.0 = None;
+            self.lock.freed.notify_all();
+        }
     }
 }
 
@@ -562,7 +576,8 @@ const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
 /// invoke_menu foreground route): take the foreground turn, then wait while
 /// a HID click cua posted may still be held by an event tap, whose late
 /// release would land on what comes forward, until it passes or counts as
-/// dropped. Refused: nothing may be activated or sent.
+/// dropped. Refused: nothing may be activated or sent. A nested admission on
+/// the holding thread does not wait again: the outer one did.
 pub fn foreground_turn() -> Result<ForegroundTurn, ForegroundBusy> {
     admit(&FOREGROUND, TURN_WAIT, click_in_flight, UNRESOLVED_FOR + HID_PASSAGE_TIMEOUT * 2)
 }
@@ -573,10 +588,19 @@ fn admit(
     in_flight: impl Fn() -> bool,
     click_wait: std::time::Duration,
 ) -> Result<Turn<'_>, ForegroundBusy> {
+    let started = std::time::Instant::now();
     let turn = lock.take(turn_wait).ok_or(ForegroundBusy::EarlierAction { waited: turn_wait })?;
-    // Stub with the old behaviour (wait, then go ahead anyway); the fix follows.
+    if turn.nested {
+        return Ok(turn);
+    }
     let give_up = std::time::Instant::now() + click_wait;
-    while in_flight() && std::time::Instant::now() < give_up {
+    while in_flight() {
+        if std::time::Instant::now() >= give_up {
+            return Err(ForegroundBusy::ClickHeld {
+                tap_owner: foreign_active_tap(event_mask(&BUTTON_TYPES)),
+                waited: started.elapsed(),
+            });
+        }
         std::thread::sleep(std::time::Duration::from_millis(20));
     }
     Ok(turn)

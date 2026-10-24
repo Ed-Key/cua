@@ -1049,8 +1049,10 @@ pub fn with_foreground_assist(
     target_wid: u32,
     body: impl FnOnce() -> anyhow::Result<()>,
 ) -> anyhow::Result<bool> {
-    // An earlier click still held by an event tap would land on this target.
-    crate::input::mouse::await_no_click_in_flight();
+    // The foreground turn, held through the restore below: no other worker
+    // may activate or post meanwhile, and an earlier click still held by an
+    // event tap would land on this target.
+    let _turn = crate::input::mouse::foreground_turn()?;
     let set_front = match set_front_process_fn() {
         Some(f) => f,
         None => {
@@ -1252,8 +1254,9 @@ pub fn with_foreground_hid_activation<T>(
 ) -> anyhow::Result<T> {
     let set_front = set_front_process_fn()
         .ok_or_else(|| anyhow::anyhow!("foreground HID delivery is unavailable"))?;
-    // An earlier click still held by an event tap would land on this target.
-    crate::input::mouse::await_no_click_in_flight();
+    // The foreground turn, held through the restore below (see
+    // `with_foreground_assist`).
+    let _turn = crate::input::mouse::foreground_turn()?;
 
     let mut prev_psn = [0u8; 8];
     let prev_ok = get_front_process_fn()
@@ -1529,6 +1532,8 @@ pub fn with_foreground_pointer_gesture<T>(
     let point = *path
         .first()
         .ok_or_else(|| anyhow::anyhow!("a pointer gesture needs a point"))?;
+    // Before the PiP step-aside, so the whole gesture is one turn.
+    let _turn = crate::input::mouse::foreground_turn()?;
     let aside = crate::pip::step_aside(path)?;
     let result = with_foreground_hid_activation(target_pid, target_wid, || {
         ensure_topmost_at(target_pid, target_wid, point)?;

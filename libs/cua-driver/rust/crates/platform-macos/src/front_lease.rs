@@ -664,8 +664,10 @@ fn hand_back(lease: &Lease) -> Result<bool, Step> {
 /// say where the front is. `None` when no lease is held. Blocking (AX reads
 /// and a short confirm poll).
 pub(crate) fn settle() -> Option<String> {
-    // A click an event tap still holds would land on the app brought back:
-    // the lease waits for a later settle.
+    // A click an event tap still holds would land on the app brought back,
+    // and another worker's foreground action must not have the front moved
+    // under it: the lease waits for a later settle.
+    let _turn = crate::input::mouse::try_foreground_turn()?;
     if crate::input::mouse::click_in_flight() {
         return None;
     }

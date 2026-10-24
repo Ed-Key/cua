@@ -416,6 +416,10 @@ fn bring(args: Value, agent: bool) -> ToolResult {
             }));
         }
 
+        let _turn = match admit(pid, Some(window_id)) {
+            Ok(turn) => turn,
+            Err(refused) => return refused,
+        };
         let taking = agent.then(|| crate::front_lease::Taking::read(pid));
         // The persistent kCPSNoWindows request owns process activation
         // without broadly ordering every application window. The separate
@@ -461,6 +465,10 @@ fn bring(args: Value, agent: bool) -> ToolResult {
         return with_hand_back(result, pid, taking);
     }
 
+    let _turn = match admit(pid, None) {
+        Ok(turn) => turn,
+        Err(refused) => return refused,
+    };
     let taking = agent.then(|| crate::front_lease::Taking::read(pid));
     let request_accepted = unsafe {
         app.activateWithOptions(NSApplicationActivationOptions::NSApplicationActivateAllWindows)
@@ -495,6 +503,30 @@ fn bring(args: Value, agent: bool) -> ToolResult {
         .with_structured(structured)
     };
     with_hand_back(result, pid, taking)
+}
+
+/// The foreground admission every activation passes
+/// ([`crate::input::mouse::foreground_turn`]): it waits while a click cua
+/// posted may still be held by an event tap (bringing this app forward would
+/// let its late release land here) or another worker's foreground action
+/// runs, and refuses with nothing activated when that does not end in time.
+/// The turn is held until the result is built.
+fn admit(pid: i32, window_id: Option<u32>) -> Result<crate::input::mouse::ForegroundTurn, ToolResult> {
+    use crate::input::mouse::ForegroundBusy;
+    crate::input::mouse::foreground_turn().map_err(|busy| {
+        let code = match busy {
+            ForegroundBusy::ClickHeld { .. } => "bring_to_front_click_in_flight",
+            ForegroundBusy::EarlierAction { .. } => "bring_to_front_foreground_busy",
+        };
+        ToolResult::error(format!("bring_to_front: {busy}."))
+            .with_structured(json!({
+                "code": code,
+                "pid": pid,
+                "window_id": window_id,
+                "activated": false,
+                "request_accepted": false,
+            }))
+    })
 }
 
 /// The one line that tells the agent how to give the front back.

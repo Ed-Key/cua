@@ -292,6 +292,8 @@ impl NativeInputState {
         if self.config.delivery_mode == InteractiveDeliveryMode::PersistentForeground
             && crate::apps::frontmost_pid() != Some(self.config.pid)
         {
+            let _turn = crate::input::mouse::foreground_turn()
+                .map_err(|busy| InteractiveInputError::Native(busy.to_string()))?;
             if !crate::input::skylight::set_front_process_persistently(
                 self.config.pid as libc::pid_t,
                 self.config.window_id,

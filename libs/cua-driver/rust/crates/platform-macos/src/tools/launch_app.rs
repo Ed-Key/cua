@@ -231,6 +231,10 @@ impl Tool for LaunchAppTool {
             Some(pid) => Ok(Ok(pid)),
             None => {
                 tokio::task::spawn_blocking(move || {
+                    // A launched app can bring itself forward; while a click
+                    // cua posted may still be held by an event tap, its late
+                    // release would land there. Held for the launch call.
+                    let _turn = crate::input::mouse::foreground_turn()?;
                     let pid = if let Some(ref bid) = bundle_id {
                         if launch_urls.is_empty() && plain_open {
                             crate::apps::launch_app(bid)?
@@ -896,6 +900,8 @@ fn structured_launch_failure(error: &anyhow::Error) -> ToolResult {
             LaunchError::Timeout => ("LAUNCH_CALLBACK_TIMEOUT", true),
             LaunchError::BadUrl(_) => ("APP_URL_INVALID", false),
         }
+    } else if error.is::<crate::input::mouse::ForegroundBusy>() {
+        ("FOREGROUND_BUSY", false)
     } else {
         ("LAUNCH_FAILED", false)
     };

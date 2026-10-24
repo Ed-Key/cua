@@ -122,18 +122,20 @@ pub(crate) fn web_ancestry(roles: impl IntoIterator<Item = Option<String>>) -> W
     for role in roles.into_iter().take(WEB_ANCESTRY_STEPS) {
         match role.as_deref() {
             Some("AXWebArea") => return WebAncestry::Inside,
-            Some("AXWindow") | Some("AXApplication") | None => return WebAncestry::Outside,
+            Some("AXWindow") | Some("AXApplication") => return WebAncestry::Outside,
+            None => return WebAncestry::Unknown,
             _ => {}
         }
     }
-    WebAncestry::Outside
+    WebAncestry::Unknown
 }
 
 /// Whether a row of `kind` may be handled as found. Web content is never a
 /// Catalyst row: its AXSelected follows aria-selected, not what the page does
-/// on a click, so the Catalyst read-back and retry ladder would misjudge it.
+/// on a click, so the Catalyst read-back and retry ladder would misjudge it
+/// and could act twice. Only a walk that reached the window proves it is not.
 fn catalyst_row_allowed(kind: RowKind, ancestry: impl FnOnce() -> WebAncestry) -> bool {
-    kind != RowKind::Catalyst || ancestry() != WebAncestry::Inside
+    kind != RowKind::Catalyst || ancestry() == WebAncestry::Outside
 }
 
 /// [`web_ancestry`] of `element`, walking its AXParent chain lazily.

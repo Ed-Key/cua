@@ -1295,6 +1295,13 @@ impl Tool for InvokeMenuTool {
                     Err(why) => why_foreground = Some(why),
                 }
             }
+            // The foreground admission, held through the hand-back below.
+            let _turn = crate::input::mouse::foreground_turn().map_err(|busy| {
+                let why = why_foreground.as_deref().map_or_else(String::new, |why| {
+                    format!(" (the foreground route was needed because {why})")
+                });
+                format!("invoke_menu: {busy}{why}")
+            })?;
             let prior_frontmost_window =
                 prior_frontmost.and_then(crate::ax::bindings::focused_window_id_of_pid);
             let hidden_before = app_hidden(pid) == Some(true);
