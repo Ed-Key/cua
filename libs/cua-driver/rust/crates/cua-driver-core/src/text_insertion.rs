@@ -74,7 +74,13 @@ pub fn classify_insertion(
     if inserted == text {
         Complete
     } else if inserted.is_empty() && selection.length == 0 {
-        Unchanged
+        // A caret that moved while the value reads the same is evidence of
+        // an edit whose value has not caught up yet (item 25), not of none.
+        if after_selection.is_some_and(|after| after != selection) {
+            Unverifiable
+        } else {
+            Unchanged
+        }
     } else {
         Partial(inserted.chars().count())
     }

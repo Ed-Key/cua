@@ -2257,8 +2257,7 @@ fn type_text_blocking(
 /// skips the read-back; a timeout or a generic failure may hide a write that
 /// took effect, and typing the text after it would insert it twice (item 25).
 fn read_back_ax_write(err: crate::ax::bindings::AXError) -> bool {
-    // Item 25 red stub: the pre-fix decision.
-    err == kAXErrorSuccess
+    err == kAXErrorSuccess || !crate::input::ax_actions::ax_write_rejected(err)
 }
 
 /// Whether `element` is the focused element of its window (`window_id`), or
