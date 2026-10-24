@@ -123,7 +123,8 @@ pub async fn run_direct(
                         continue;
                     }
                 };
-                surface.observe(&request);
+                // A refused call identifies nobody, here as in the session
+                // observation below, so both keep the same first identity.
                 if let Some(refusal) = surface.refusal(&request, era) {
                     writer
                         .write_all(serde_json::to_string(&refusal)?.as_bytes())
@@ -132,6 +133,7 @@ pub async fn run_direct(
                     writer.flush().await?;
                     continue;
                 }
+                surface.observe(&request);
                 let method = request.method.clone();
                 apply_direct_session_identity(&mut request, &transport_session);
                 let initialize_metadata = (!session_observed)
@@ -418,7 +420,8 @@ where
                         continue;
                     }
                 };
-                surface.observe(&req);
+                // A refused call identifies nobody, here as in the session
+                // observation below, so both keep the same first identity.
                 if let Some(refusal) = surface.refusal(&req, era) {
                     writer
                         .write_all(serde_json::to_string(&refusal)?.as_bytes())
@@ -427,6 +430,7 @@ where
                     writer.flush().await?;
                     continue;
                 }
+                surface.observe(&req);
                 let method = req.method.clone();
                 let initialize_metadata =
                     (!session_observed).then(|| req.client_metadata()).flatten();
@@ -510,9 +514,13 @@ where
     Ok(())
 }
 
+/// How long the first named request waits for the daemon to take the name.
+const ANNOUNCE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Tell the daemon which MCP client this session belongs to, so the PiP
-/// preview can show the right app. Awaited but never fatal: an older daemon
-/// answers "Unknown method" and nothing else depends on it.
+/// preview can show the right app. Awaited for at most `ANNOUNCE_TIMEOUT`,
+/// never fatal: an older daemon answers "Unknown method", a stalled one only
+/// costs the name (display only).
 async fn announce_client_name(socket_path: &str, session_id: &str, client_name: String) {
     let req = DaemonRequest {
         method: "session_client".into(),
@@ -522,8 +530,38 @@ async fn announce_client_name(socket_path: &str, session_id: &str, client_name: 
         observation_origin: None,
         client_kind: None,
     };
-    let socket = socket_path.to_owned();
-    let _ = tokio::task::spawn_blocking(move || send_request(&socket, &req)).await;
+    #[cfg(unix)]
+    {
+        // One line out, one line back, all cancellable: dropped on timeout.
+        let exchange = async {
+            let mut stream = tokio::net::UnixStream::connect(socket_path).await?;
+            stream
+                .write_all((serde_json::to_string(&req)? + "\n").as_bytes())
+                .await?;
+            let mut reply = String::new();
+            BufReader::new(stream).read_line(&mut reply).await?;
+            anyhow::Ok(())
+        };
+        if tokio::time::timeout(ANNOUNCE_TIMEOUT, exchange)
+            .await
+            .is_err()
+        {
+            warn!("the daemon did not take the MCP client name in time");
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // ponytail: on timeout the blocking exchange runs on to send_request's
+        // own deadline on one worker thread; use an async named pipe if that matters.
+        let socket = socket_path.to_owned();
+        let exchange = tokio::task::spawn_blocking(move || send_request(&socket, &req));
+        if tokio::time::timeout(ANNOUNCE_TIMEOUT, exchange)
+            .await
+            .is_err()
+        {
+            warn!("the daemon did not take the MCP client name in time");
+        }
+    }
 }
 
 fn proxy_knows_tool(cached_tools_list: &serde_json::Value, name: &str) -> bool {
@@ -1258,6 +1296,136 @@ mod tests {
             .into_iter()
             .filter(|request| request["method"] == "session_client")
             .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_refused_first_call_identifies_nobody() {
+        use serde_json::json;
+        let meta = |name: &str| {
+            json!({
+                mcp_wire::PROTOCOL_VERSION_KEY: mcp_wire::MODERN_PROTOCOL_VERSION,
+                "io.modelcontextprotocol/clientInfo": {"name": name},
+                mcp_wire::CLIENT_CAPABILITIES_KEY: {}
+            })
+        };
+        let directory = tempfile::tempdir().expect("temporary socket directory");
+        let socket = directory.path().join("daemon.sock");
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind test daemon");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let daemon = {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (read, mut write) = stream.into_split();
+                    let mut line = String::new();
+                    BufReader::new(read).read_line(&mut line).await.unwrap();
+                    seen.lock()
+                        .unwrap()
+                        .push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                    let _ = write
+                        .write_all(b"{\"ok\":true,\"result\":{\"content\":[{\"type\":\"text\",\"text\":\"Found 0 window(s).\"}],\"structuredContent\":{\"windows\":[],\"current_space_id\":1}}}\n")
+                        .await;
+                }
+            })
+        };
+        let mut input = Vec::new();
+        for request in [
+            // Outside the core profile: refused before dispatch.
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"start_recording","arguments":{},"_meta":meta("codex-mcp-client")}}),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                   "params":{"name":"list_windows","arguments":{},"_meta":meta("claude-code")}}),
+        ] {
+            serde_json::to_writer(&mut input, &request).unwrap();
+            input.push(b'\n');
+        }
+        let inventory =
+            Arc::new(json!({"tools":[{"name":"list_windows"},{"name":"start_recording"}]}));
+        let mut output = Vec::new();
+        run_proxy_io_with_profile(
+            BufReader::new(input.as_slice()),
+            &mut output,
+            socket.to_str().unwrap(),
+            &inventory,
+            "refused-first-test",
+            false,
+            ToolProfile::Core,
+        )
+        .await
+        .unwrap();
+        daemon.abort();
+        let seen = seen.lock().unwrap().clone();
+        let names: Vec<&serde_json::Value> = seen
+            .iter()
+            .filter(|request| request["method"] == "session_client")
+            .map(|request| &request["args"]["client_name"])
+            .collect();
+        assert_eq!(names, [&json!("claude-code")], "{seen:?}");
+        let replies: Vec<serde_json::Value> = String::from_utf8(output)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(
+            replies[0]["result"]["structuredContent"]["code"],
+            "tool_not_in_profile"
+        );
+        // Rendered for Claude, not projected for Codex.
+        assert_ne!(
+            replies[1]["result"]["content"][0]["text"],
+            crate::mcp_surface::CODEX_TEXT_POINTER,
+            "{:?}",
+            replies[1]
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_stalled_daemon_costs_the_name_not_the_session() {
+        use serde_json::json;
+        let directory = tempfile::tempdir().expect("temporary socket directory");
+        let socket = directory.path().join("daemon.sock");
+        // Accepts and never answers.
+        let listener = tokio::net::UnixListener::bind(&socket).expect("bind test daemon");
+        let daemon = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+        let mut input = Vec::new();
+        serde_json::to_writer(
+            &mut input,
+            &json!({"jsonrpc":"2.0","id":1,"method":"initialize","params":{"clientInfo":{"name":"codex-mcp-client"}}}),
+        )
+        .unwrap();
+        input.push(b'\n');
+        let inventory = Arc::new(json!({"tools":[]}));
+        let mut output = Vec::new();
+        let started = std::time::Instant::now();
+        run_proxy_io(
+            BufReader::new(input.as_slice()),
+            &mut output,
+            socket.to_str().unwrap(),
+            &inventory,
+            "stalled-daemon-test",
+            false,
+        )
+        .await
+        .unwrap();
+        daemon.abort();
+        let elapsed = started.elapsed();
+        assert!(elapsed >= ANNOUNCE_TIMEOUT, "{elapsed:?}");
+        assert!(
+            elapsed < ANNOUNCE_TIMEOUT + std::time::Duration::from_secs(2),
+            "{elapsed:?}"
+        );
+        let reply: serde_json::Value =
+            serde_json::from_str(String::from_utf8(output).unwrap().lines().next().unwrap())
+                .unwrap();
+        assert!(reply["result"]["serverInfo"].is_object(), "{reply}");
     }
 
     #[cfg(unix)]
