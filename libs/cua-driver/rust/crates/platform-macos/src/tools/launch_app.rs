@@ -211,15 +211,8 @@ impl Tool for LaunchAppTool {
         // `activates = false` opens a background window there, where
         // `selectFile:inFileViewerRootedAtPath:` activated Finder before any
         // lease could see it.
-        let wildcard_lease = prior_frontmost
-            .filter(|_| reused_pid.is_none())
-            .map(|prior| {
-                crate::focus_steal::FocusStealPreventer::begin_suppression(
-                    None,
-                    prior,
-                    "LaunchAppTool.pre",
-                )
-            });
+        // The wildcard lease is armed in the launch worker below, after the
+        // foreground admission, from the front read there.
 
         // The slow path (`openURLs:withApplicationAtURL:`) triggers a SECOND
         // activation when the file-open delivers, after the bundle-only
@@ -228,13 +221,23 @@ impl Tool for LaunchAppTool {
 
         let launch_urls = urls_to_open.clone();
         let launch_result = match reused_pid {
-            Some(pid) => Ok(Ok(pid)),
+            Some(pid) => Ok(Ok((pid, prior_frontmost, None))),
             None => {
                 tokio::task::spawn_blocking(move || {
                     // A launched app can bring itself forward; while a click
                     // cua posted may still be held by an event tap, its late
                     // release would land there. Held for the launch call.
                     let _turn = crate::input::mouse::foreground_turn()?;
+                    // Read again after the admission: while it waited, another
+                    // worker's action may have changed the front.
+                    let prior_frontmost = crate::apps::frontmost_pid();
+                    let wildcard_lease = prior_frontmost.map(|prior| {
+                        crate::focus_steal::FocusStealPreventer::begin_suppression(
+                            None,
+                            prior,
+                            "LaunchAppTool.pre",
+                        )
+                    });
                     let pid = if let Some(ref bid) = bundle_id {
                         if launch_urls.is_empty() && plain_open {
                             crate::apps::launch_app(bid)?
@@ -261,15 +264,15 @@ impl Tool for LaunchAppTool {
                             )?
                         }
                     };
-                    Ok::<_, anyhow::Error>(pid)
+                    Ok::<_, anyhow::Error>((pid, prior_frontmost, wildcard_lease))
                 })
                 .await
             }
         };
         let launched_at = std::time::Instant::now();
 
-        let pid = match launch_result {
-            Ok(Ok(pid)) => pid,
+        let (pid, prior_frontmost, wildcard_lease) = match launch_result {
+            Ok(Ok(launched)) => launched,
             Ok(Err(e)) => return structured_launch_failure(&e),
             Err(e) => return ToolResult::error(format!("Task error: {e}")),
         };
