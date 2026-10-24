@@ -1566,6 +1566,25 @@ mod tests {
         preserves_exact_existing_focus,
     };
 
+    /// Item 21 (3): a foreground helper holds the foreground turn for its
+    /// whole action, so no other worker (one of a cancelled call included)
+    /// can activate or post anything in between.
+    #[test]
+    fn a_foreground_helper_holds_the_turn_while_its_action_runs() {
+        // No such process or window: the helper resolves no target, activates
+        // nothing and runs the body directly, still inside its turn.
+        let mut seen = None;
+        let _ = super::with_foreground_assist(999_999, 0, || {
+            seen = Some(
+                std::thread::spawn(|| crate::input::mouse::try_foreground_turn().is_some())
+                    .join()
+                    .unwrap(),
+            );
+            Ok(())
+        });
+        assert_eq!(seen, Some(false), "another thread took the turn inside the helper's action");
+    }
+
     /// The front app is not restored while a click may still be held by an
     /// event tap, however the error reached the guard.
     #[test]

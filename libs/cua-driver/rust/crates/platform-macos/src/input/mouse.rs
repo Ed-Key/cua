@@ -470,6 +470,131 @@ pub fn await_no_click_in_flight() {
     }
 }
 
+/// The foreground turn: one foreground action at a time (its activation,
+/// its input and the hand-back of the front), owned by the thread doing it.
+/// The MCP layer's desktop coordinator belongs to the async call and is
+/// released when the call is cancelled, while the blocking worker runs on;
+/// held by the worker, the turn ends only when the worker's action does.
+/// Re-entrant on the holding thread (a pointer gesture's activation wraps
+/// its click).
+pub struct TurnLock {
+    /// The holding thread and its hold count.
+    state: std::sync::Mutex<(Option<std::thread::ThreadId>, usize)>,
+    freed: std::sync::Condvar,
+}
+
+/// One hold of a [`TurnLock`]. The turn ends when the outermost hold drops.
+pub struct Turn<'a> {
+    lock: &'a TurnLock,
+    /// This thread already held the turn.
+    nested: bool,
+    _thread_bound: std::marker::PhantomData<*const ()>,
+}
+
+pub type ForegroundTurn = Turn<'static>;
+
+static FOREGROUND: TurnLock = TurnLock::new();
+
+impl TurnLock {
+    pub const fn new() -> Self {
+        Self { state: std::sync::Mutex::new((None, 0)), freed: std::sync::Condvar::new() }
+    }
+
+    /// Hold the turn, waiting up to `wait` while another thread holds it.
+    fn take(&self, _wait: std::time::Duration) -> Option<Turn<'_>> {
+        // Stub with the old behaviour (no turn at all); the fix follows.
+        Some(Turn { lock: self, nested: false, _thread_bound: std::marker::PhantomData })
+    }
+}
+
+impl Drop for Turn<'_> {
+    fn drop(&mut self) {
+        let _ = self.lock;
+    }
+}
+
+/// Why a foreground action was refused before it activated or sent anything.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ForegroundBusy {
+    /// Another worker's foreground action (perhaps of a cancelled call)
+    /// still held the turn when the wait ended.
+    EarlierAction { waited: std::time::Duration },
+    /// A HID click cua posted earlier was still held by an event tap.
+    ClickHeld { tap_owner: Option<i32>, waited: std::time::Duration },
+}
+
+impl std::fmt::Display for ForegroundBusy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match *self {
+            Self::EarlierAction { waited } => write!(
+                f,
+                "an earlier foreground action (possibly of a cancelled call) was still running after {} ms, \
+                 so nothing was activated or sent; retry once it has finished",
+                waited.as_millis()
+            ),
+            Self::ClickHeld { tap_owner, waited } => {
+                let owner = match tap_owner {
+                    Some(pid) => format!(
+                        "pid {pid} ({})",
+                        crate::apps::get_app_name_for_pid(pid).unwrap_or_else(|| "unknown app".into())
+                    ),
+                    None => "another process".into(),
+                };
+                write!(
+                    f,
+                    "a click cua posted earlier was still held by an active event tap of {owner} after {} ms; \
+                     bringing a window forward now would let its late release land there, so nothing was \
+                     activated or sent",
+                    waited.as_millis()
+                )
+            }
+        }
+    }
+}
+
+impl std::error::Error for ForegroundBusy {}
+
+/// How long a new foreground action waits for an earlier one's turn.
+const TURN_WAIT: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Admission for everything that activates or raises an app or window for a
+/// new action (the foreground input helpers, bring_to_front, launch_app, the
+/// invoke_menu foreground route): take the foreground turn, then wait while
+/// a HID click cua posted may still be held by an event tap, whose late
+/// release would land on what comes forward, until it passes or counts as
+/// dropped. Refused: nothing may be activated or sent.
+pub fn foreground_turn() -> Result<ForegroundTurn, ForegroundBusy> {
+    admit(&FOREGROUND, TURN_WAIT, click_in_flight, UNRESOLVED_FOR + HID_PASSAGE_TIMEOUT * 2)
+}
+
+fn admit(
+    lock: &TurnLock,
+    turn_wait: std::time::Duration,
+    in_flight: impl Fn() -> bool,
+    click_wait: std::time::Duration,
+) -> Result<Turn<'_>, ForegroundBusy> {
+    let turn = lock.take(turn_wait).ok_or(ForegroundBusy::EarlierAction { waited: turn_wait })?;
+    // Stub with the old behaviour (wait, then go ahead anyway); the fix follows.
+    let give_up = std::time::Instant::now() + click_wait;
+    while in_flight() && std::time::Instant::now() < give_up {
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    Ok(turn)
+}
+
+/// The turn alone, for a HID click with no activation of its own (desktop
+/// scope): it must not overlap another worker's foreground action.
+pub(crate) fn hold_foreground_turn() -> Result<ForegroundTurn, ForegroundBusy> {
+    FOREGROUND.take(TURN_WAIT).ok_or(ForegroundBusy::EarlierAction { waited: TURN_WAIT })
+}
+
+/// The turn if it is free now (or already this thread's), for handing the
+/// front back: a restore must not run under another worker's foreground
+/// action.
+pub fn try_foreground_turn() -> Option<ForegroundTurn> {
+    FOREGROUND.take(std::time::Duration::ZERO)
+}
+
 /// Pure passage decision for `own` pairs of the button `kinds` (indices into
 /// [`BUTTON_TYPES`]) posted since `baseline`, behind `backlog` earlier events.
 fn hid_passage(baseline: ButtonCounters, now: ButtonCounters, backlog: [u32; 6], kinds: [usize; 2], own: u32) -> HidPassage {
@@ -2147,6 +2272,97 @@ mod post_sink {
 mod tests {
     use super::post_sink::{Capture, Posted};
     use super::*;
+
+    fn own_lock() -> &'static TurnLock {
+        Box::leak(Box::new(TurnLock::new()))
+    }
+
+    /// Item 21 (3): the turn is the blocking worker's. Cancelling the async
+    /// call that awaits the worker (as a client timeout does) must not end
+    /// it: the next action may not start until the worker has finished.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_turn_held_by_a_blocking_worker_outlives_its_cancelled_call() {
+        let lock = own_lock();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let call = tokio::spawn(async move {
+            tokio::task::spawn_blocking(move || {
+                let _turn = lock.take(std::time::Duration::ZERO).expect("free turn");
+                held_tx.send(()).unwrap();
+                std::thread::sleep(std::time::Duration::from_millis(400));
+                drop(_turn);
+                done_tx.send(()).unwrap();
+            })
+            .await
+            .unwrap();
+        });
+        held_rx.recv().unwrap();
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        let other = std::thread::spawn(move || lock.take(std::time::Duration::ZERO).is_some());
+        assert!(!other.join().unwrap(), "the worker still runs, so its turn must still be held");
+        done_rx.recv().unwrap();
+        let other = std::thread::spawn(move || lock.take(std::time::Duration::ZERO).is_some());
+        assert!(other.join().unwrap(), "the turn ends with the worker");
+    }
+
+    /// A second action waits for the turn, and gives up with an honest
+    /// refusal when it does not come in time.
+    #[test]
+    fn a_second_foreground_action_waits_for_the_turn_or_is_refused() {
+        let lock = own_lock();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let first = std::thread::spawn(move || {
+            let _turn = lock.take(std::time::Duration::ZERO).expect("free turn");
+            held_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(300));
+        });
+        held_rx.recv().unwrap();
+        let refused = admit(lock, std::time::Duration::from_millis(50), || false, std::time::Duration::ZERO);
+        assert!(matches!(refused, Err(ForegroundBusy::EarlierAction { .. })));
+        let started = std::time::Instant::now();
+        let admitted = admit(lock, std::time::Duration::from_secs(5), || false, std::time::Duration::ZERO);
+        assert!(admitted.is_ok());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(150), "admitted before the first ended");
+        first.join().unwrap();
+    }
+
+    /// The turn is re-entrant on its thread and ends with the outermost hold.
+    #[test]
+    fn the_turn_is_reentrant_on_its_thread() {
+        let lock = own_lock();
+        let outer = lock.take(std::time::Duration::ZERO).expect("free turn");
+        let inner = lock.take(std::time::Duration::ZERO).expect("same thread");
+        assert!(inner.nested && !outer.nested);
+        drop(outer);
+        let other = std::thread::spawn(move || lock.take(std::time::Duration::ZERO).is_some());
+        assert!(!other.join().unwrap(), "the inner hold keeps the turn");
+        drop(inner);
+        let other = std::thread::spawn(move || lock.take(std::time::Duration::ZERO).is_some());
+        assert!(other.join().unwrap());
+    }
+
+    /// Item 21 (2): an activation waits while a click cua posted may still be
+    /// held, and when it still is at the end of the wait it is refused, with
+    /// nothing activated, instead of going ahead.
+    #[test]
+    fn admission_waits_for_a_held_click_and_refuses_when_it_stays_held() {
+        let lock = own_lock();
+        let refused = admit(lock, std::time::Duration::ZERO, || true, std::time::Duration::from_millis(60));
+        let Err(ForegroundBusy::ClickHeld { waited, .. }) = refused else {
+            panic!("admitted while a click was held: {:?}", refused.map(|_| ()))
+        };
+        assert!(waited >= std::time::Duration::from_millis(60));
+        // The refusal released the turn.
+        let other = std::thread::spawn(move || lock.take(std::time::Duration::ZERO).is_some());
+        assert!(other.join().unwrap());
+        let until = std::time::Instant::now() + std::time::Duration::from_millis(80);
+        let started = std::time::Instant::now();
+        assert!(admit(lock, std::time::Duration::ZERO, || std::time::Instant::now() < until, std::time::Duration::from_secs(2)).is_ok());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(70), "admitted while the click was held");
+        let message = ForegroundBusy::ClickHeld { tap_owner: None, waited: std::time::Duration::from_secs(7) }.to_string();
+        assert!(message.contains("nothing was activated or sent"), "{message}");
+    }
 
     #[test]
     fn capture_bound_background_route_preserves_nonzero_origin_hit() {

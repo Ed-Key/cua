@@ -101,27 +101,64 @@ pub(crate) fn find_row(
     None
 }
 
-/// Whether `element` sits inside an `AXWebArea` (bounded walk up its
-/// parents, stopping at the window or application).
-unsafe fn inside_web_area(element: AXUIElementRef) -> bool {
-    let mut current = element;
-    CFRetain(current as CFTypeRef);
-    let mut found = false;
-    for _ in 0..40 {
-        match copy_string_attr(current, "AXRole").as_deref() {
-            Some("AXWebArea") => {
-                found = true;
-                break;
-            }
-            Some("AXWindow") | Some("AXApplication") | None => break,
+/// Where an element sits relative to web content.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum WebAncestry {
+    /// An ancestor (or the element) is an `AXWebArea`.
+    Inside,
+    /// The walk reached the window or application without one.
+    Outside,
+    /// The walk ended before either: a read failed, or the bound ran out.
+    Unknown,
+}
+
+/// How many roles the web ancestry walk reads.
+const WEB_ANCESTRY_STEPS: usize = 40;
+
+/// [`WebAncestry`] from the roles of an element and its ancestors, nearest
+/// first (`None`: the role did not read); the sequence ends where a parent
+/// did not read.
+pub(crate) fn web_ancestry(roles: impl IntoIterator<Item = Option<String>>) -> WebAncestry {
+    for role in roles.into_iter().take(WEB_ANCESTRY_STEPS) {
+        match role.as_deref() {
+            Some("AXWebArea") => return WebAncestry::Inside,
+            Some("AXWindow") | Some("AXApplication") | None => return WebAncestry::Outside,
             _ => {}
         }
-        let Some(parent) = copy_element_attr(current, "AXParent") else { break };
-        CFRelease(current as CFTypeRef);
-        current = parent;
     }
-    CFRelease(current as CFTypeRef);
-    found
+    WebAncestry::Outside
+}
+
+/// Whether a row of `kind` may be handled as found. Web content is never a
+/// Catalyst row: its AXSelected follows aria-selected, not what the page does
+/// on a click, so the Catalyst read-back and retry ladder would misjudge it.
+fn catalyst_row_allowed(kind: RowKind, ancestry: impl FnOnce() -> WebAncestry) -> bool {
+    kind != RowKind::Catalyst || ancestry() != WebAncestry::Inside
+}
+
+/// [`web_ancestry`] of `element`, walking its AXParent chain lazily.
+unsafe fn web_ancestry_of(element: AXUIElementRef) -> WebAncestry {
+    let mut current: Option<AXUIElementRef> = None;
+    let mut started = false;
+    let walk = std::iter::from_fn(|| {
+        let node = if started {
+            let node = current.take()?;
+            let parent = copy_element_attr(node, "AXParent");
+            CFRelease(node as CFTypeRef);
+            parent?
+        } else {
+            started = true;
+            CFRetain(element as CFTypeRef);
+            element
+        };
+        current = Some(node);
+        Some(copy_string_attr(node, "AXRole"))
+    });
+    let verdict = web_ancestry(walk);
+    if let Some(node) = current {
+        CFRelease(node as CFTypeRef);
+    }
+    verdict
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -290,7 +327,7 @@ impl RowSelection {
             // sidebar switches chats and leaves the mark where it was), so
             // the read-back would call a working click a failure.
             .filter(|(_, kind)| {
-                *kind != RowKind::Catalyst || !inside_web_area(element_ptr as AXUIElementRef)
+                catalyst_row_allowed(*kind, || web_ancestry_of(element_ptr as AXUIElementRef))
             });
             let mut result = None;
             for (at, (element, parent)) in elements.into_iter().enumerate() {
@@ -652,6 +689,32 @@ pub fn ensure_ax_action_enabled(element_ptr: usize, action: &str) -> anyhow::Res
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 21 (4): only a walk that reached the window or application says
+    /// "outside web content". One that ran out of steps or reads (a deep web
+    /// item) is unknown, and an unknown element is not a Catalyst row, so its
+    /// click never enters the retry ladder that can act twice.
+    #[test]
+    fn an_ancestry_walk_that_does_not_finish_is_unknown() {
+        let groups = |n: usize| (0..n).map(|_| Some("AXGroup".to_string())).collect::<Vec<_>>();
+        let with = |mut roles: Vec<Option<String>>, last: Option<&str>| {
+            roles.push(last.map(str::to_string));
+            roles
+        };
+        assert_eq!(web_ancestry(with(groups(39), Some("AXWebArea"))), WebAncestry::Inside);
+        assert_eq!(web_ancestry(with(groups(5), Some("AXWindow"))), WebAncestry::Outside);
+        assert_eq!(web_ancestry(with(groups(5), Some("AXApplication"))), WebAncestry::Outside);
+        // A web area 41 steps up is past the bound.
+        assert_eq!(web_ancestry(with(groups(40), Some("AXWebArea"))), WebAncestry::Unknown);
+        assert_eq!(web_ancestry(groups(60)), WebAncestry::Unknown);
+        // A role that did not read, and a parent that did not.
+        assert_eq!(web_ancestry(with(groups(3), None)), WebAncestry::Unknown);
+        assert_eq!(web_ancestry(groups(3)), WebAncestry::Unknown);
+        assert!(!catalyst_row_allowed(RowKind::Catalyst, || WebAncestry::Unknown));
+        assert!(!catalyst_row_allowed(RowKind::Catalyst, || WebAncestry::Inside));
+        assert!(catalyst_row_allowed(RowKind::Catalyst, || WebAncestry::Outside));
+        assert!(catalyst_row_allowed(RowKind::Native, || WebAncestry::Unknown));
+    }
 
     #[test]
     fn disabled_elements_are_refused_before_dispatch() {
