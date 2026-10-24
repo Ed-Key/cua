@@ -7,6 +7,9 @@ use crate::protocol::{initialize_result, Request, Response, ResponseBody};
 pub const MODERN_PROTOCOL_VERSION: &str = "2026-07-28";
 pub const PROTOCOL_VERSION_KEY: &str = "io.modelcontextprotocol/protocolVersion";
 pub const CLIENT_CAPABILITIES_KEY: &str = "io.modelcontextprotocol/clientCapabilities";
+/// Per-request client identity (name, version), MCP 2026-07-28. Display and
+/// telemetry only; never used for policy.
+pub const CLIENT_INFO_KEY: &str = "io.modelcontextprotocol/clientInfo";
 
 /// The tools `cua-driver mcp --tools core` advertises, in the order the
 /// server instructions name them. Usage across every lab run picked the first

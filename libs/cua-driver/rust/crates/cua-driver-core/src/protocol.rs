@@ -60,7 +60,20 @@ impl Request {
     /// per-request `_meta` of a modern request that names its client. The
     /// same bounded subset as `initialize_metadata`.
     pub fn client_metadata(&self) -> Option<InitializeMetadata> {
-        self.initialize_metadata()
+        use crate::mcp_wire::{CLIENT_CAPABILITIES_KEY, CLIENT_INFO_KEY, PROTOCOL_VERSION_KEY};
+        if self.method == "initialize" {
+            return self.initialize_metadata();
+        }
+        let meta = self.params.as_ref().and_then(|p| p.get("_meta"))?;
+        let protocol_version = meta.get(PROTOCOL_VERSION_KEY)?;
+        let client_info = meta.get(CLIENT_INFO_KEY).filter(|v| v.is_object())?;
+        let metadata = declared_metadata(
+            Some(protocol_version),
+            Some(client_info),
+            meta.get(CLIENT_CAPABILITIES_KEY),
+            Some(meta),
+        );
+        metadata.client_name.is_some().then_some(metadata)
     }
 }
 
