@@ -551,8 +551,10 @@ async fn announce_client_name(socket_path: &str, session_id: &str, client_name: 
     }
     #[cfg(not(unix))]
     {
-        // ponytail: on timeout the blocking exchange runs on to send_request's
-        // own deadline on one worker thread; use an async named pipe if that matters.
+        // ponytail: on timeout the blocking exchange keeps one worker thread and
+        // the pipe until the daemon answers or closes (Windows send_request has no
+        // read deadline), as the fire-and-forget announcement did before; use async
+        // named-pipe I/O if a stalled Windows daemon ever matters (it draws no PiP).
         let socket = socket_path.to_owned();
         let exchange = tokio::task::spawn_blocking(move || send_request(&socket, &req));
         if tokio::time::timeout(ANNOUNCE_TIMEOUT, exchange)
