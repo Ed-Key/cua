@@ -307,6 +307,15 @@ impl NativeInputState {
     }
 
     fn dispatch_batch(&mut self, batch: &InteractiveInputBatch) -> Result<()> {
+        // Global-queue input holds the foreground turn for the batch, so no
+        // other worker's foreground action interleaves with it.
+        // ponytail: per batch; a gesture split across batches can still
+        // interleave between them. Hold it across the gesture if that matters.
+        let _turn = (self.config.region.is_some()
+            || self.config.delivery_mode == InteractiveDeliveryMode::PersistentForeground)
+            .then(crate::input::mouse::hold_foreground_turn)
+            .transpose()
+            .map_err(|busy| InteractiveInputError::Native(busy.to_string()))?;
         if self.config.region.is_none()
             && self.config.delivery_mode == InteractiveDeliveryMode::PersistentForeground
             && crate::apps::frontmost_pid() != Some(self.config.pid)

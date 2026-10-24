@@ -845,7 +845,12 @@ fn handle_activation(dispatcher: &Arc<Dispatcher>, note: &objc2_foundation::NSNo
 /// the thief). The admit callback rechecks the lease and the foreground
 /// immediately before the mutation.
 fn restore_focus(pid: i32, admit: &mut dyn FnMut() -> bool) {
-    let accepted = crate::input::skylight::restore_front_pid(pid, admit);
+    // A HID click cua posted that an event tap still holds would land on the
+    // app restored. (The turn is not required: this undoes a theft during an
+    // action, often one holding the turn.)
+    let accepted = crate::input::skylight::restore_front_pid(pid, &mut || {
+        !crate::input::mouse::click_in_flight() && admit()
+    });
     tracing::debug!(restore_to = pid, accepted, "WindowServer focus restoration returned");
 }
 
