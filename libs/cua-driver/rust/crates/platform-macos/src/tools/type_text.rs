@@ -1711,6 +1711,10 @@ fn await_typed_progress_with_selection(
     ),
 ) -> TypedProgress {
     let mut best_partial = None;
+    // An unchanged value read once with a moved caret: an edit whose value
+    // lags. A later reading without the caret must not undo that evidence
+    // (item 25: "unchanged" lets type_text type the text a second time).
+    let mut moved_caret_seen = false;
     loop {
         let (after, after_selection) = read_value();
         let progress =
@@ -1721,13 +1725,17 @@ fn await_typed_progress_with_selection(
                 best_partial =
                     Some(best_partial.map_or(delivered, |best: usize| best.max(delivered)));
             }
-            TypedProgress::Unverifiable if before.is_some() && after.as_deref() == before => {}
+            TypedProgress::Unverifiable if before.is_some() && after.as_deref() == before => {
+                moved_caret_seen = true;
+            }
             TypedProgress::Unverifiable => return TypedProgress::Unverifiable,
             TypedProgress::Unchanged => {}
         }
         if std::time::Instant::now() >= deadline {
-            return if progress == TypedProgress::Unverifiable {
-                progress
+            return if progress == TypedProgress::Unverifiable
+                || (progress == TypedProgress::Unchanged && moved_caret_seen)
+            {
+                TypedProgress::Unverifiable
             } else {
                 best_partial.map(TypedProgress::Partial).unwrap_or(progress)
             };
@@ -2119,6 +2127,20 @@ fn type_text_blocking(
         } else {
             None
         };
+        // An errored write whose read-back shows the value and the selection
+        // exactly as before did not land: keys may follow, as they did before
+        // errors were read back (a replacement of selected text otherwise
+        // reads as unverifiable).
+        let ax_progress = match ax_progress {
+            Some(TypedProgress::Unverifiable)
+                if err != kAXErrorSuccess
+                    && readback.before.is_some()
+                    && readback.sample() == (readback.before.clone(), readback.before_range) =>
+            {
+                None
+            }
+            other => other,
+        };
         // AXValue is not renderer evidence in web content. An unchanged echo
         // there cannot prove that zero characters landed, so blind retry is
         // unsafe even though no synthesis has run yet.
@@ -2313,6 +2335,33 @@ fn is_chromium_browser_pid(pid: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Item 25 (review): a moved caret seen once in the drain is kept, even
+    /// when the last reading has no caret.
+    #[test]
+    fn a_moved_caret_seen_during_the_drain_is_not_forgotten() {
+        use super::{await_typed_progress_with_selection, TextSelectionRange, TypedProgress};
+        let caret = |location| Some(TextSelectionRange { location, length: 0 });
+        let mut readings = vec![
+            (Some("ab".to_owned()), caret(5)),
+            (Some("ab".to_owned()), None),
+        ]
+        .into_iter();
+        let mut last = (Some("ab".to_owned()), None);
+        let progress = await_typed_progress_with_selection(
+            Some("ab"),
+            caret(2),
+            "xyz",
+            std::time::Instant::now() + std::time::Duration::from_millis(60),
+            || {
+                if let Some(next) = readings.next() {
+                    last = next;
+                }
+                last.clone()
+            },
+        );
+        assert_eq!(progress, TypedProgress::Unverifiable);
+    }
+
     /// Item 25: an AX text write that errored without proving a refusal is
     /// read back like an accepted one; only a proven refusal goes straight
     /// to keys.

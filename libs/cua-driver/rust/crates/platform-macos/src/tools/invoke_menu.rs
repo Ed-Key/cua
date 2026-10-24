@@ -43,16 +43,19 @@ const MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a menu command gets to open an inline editor (File > Rename)
 /// before the previous front app is brought back.
 const INLINE_EDIT_WAIT: Duration = Duration::from_millis(1200);
-/// Whether the menu item at the end of `path` is one Finder answers with an
-/// inline name editor (File > Rename, New Folder, New Folder with Selection).
-/// Matched by its English title, trailing ellipsis ignored.
+/// Whether `path` is a File menu item Finder answers with an inline name
+/// editor (File > Rename, New Folder, New Folder with Selection). Matched by
+/// its English titles, trailing ellipsis ignored.
 // ponytail: English titles only; another language falls back to the generic
 // 150 ms settle (the pre-item-26 behaviour), add localized titles if needed.
 fn opens_inline_editor(path: &[String]) -> bool {
-    path.last().is_some_and(|item| {
+    let [menu, item] = path else {
+        return false;
+    };
+    menu == "File" && {
         let title = item.trim().trim_end_matches(['…', '.']).trim_end();
-        title == "Rename" || title.starts_with("New Folder")
-    })
+        title == "Rename" || title == "New Folder" || title.starts_with("New Folder with Selection")
+    }
 }
 
 /// How long a press made from behind gets to show its effect. A press that
@@ -1416,6 +1419,9 @@ mod tests {
         assert!(!opens_inline_editor(&path(&["File", "New Finder Window"])));
         assert!(!opens_inline_editor(&path(&["View", "as List"])));
         assert!(!opens_inline_editor(&path(&["Rename", "Other"])));
+        assert!(!opens_inline_editor(&path(&["Edit", "Rename"])));
+        assert!(!opens_inline_editor(&path(&["File", "New Folder Template"])));
+        assert!(!opens_inline_editor(&path(&["File", "Sub", "Rename"])));
     }
 
     #[test]
