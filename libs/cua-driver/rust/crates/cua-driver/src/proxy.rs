@@ -453,6 +453,15 @@ where
                         )
                     })
                     .flatten();
+                // Announce before dispatching, so the daemon knows the client
+                // before this request's own action (a modern client may start
+                // with tools/call) and before any later one.
+                if let Some(name) = initialize_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.client_name.clone())
+                {
+                    announce_client_name(socket_path, session_id, name).await;
+                }
                 let id = req.id.clone().unwrap_or(serde_json::Value::Null);
                 let response = handle_proxy_request(
                     req,
@@ -464,9 +473,6 @@ where
                 )
                 .await;
                 if let Some(metadata) = initialize_metadata {
-                    if let Some(name) = metadata.client_name.clone() {
-                        announce_client_name(socket_path, session_id, name);
-                    }
                     observe_proxy_session_started(metadata);
                     session_observed = true;
                 }
@@ -505,9 +511,9 @@ where
 }
 
 /// Tell the daemon which MCP client this session belongs to, so the PiP
-/// preview can show the right app. Fire-and-forget: an older daemon answers
-/// "Unknown method" and nothing else depends on it.
-fn announce_client_name(socket_path: &str, session_id: &str, client_name: String) {
+/// preview can show the right app. Awaited but never fatal: an older daemon
+/// answers "Unknown method" and nothing else depends on it.
+async fn announce_client_name(socket_path: &str, session_id: &str, client_name: String) {
     let req = DaemonRequest {
         method: "session_client".into(),
         name: None,
@@ -517,9 +523,7 @@ fn announce_client_name(socket_path: &str, session_id: &str, client_name: String
         client_kind: None,
     };
     let socket = socket_path.to_owned();
-    tokio::task::spawn_blocking(move || {
-        let _ = send_request(&socket, &req);
-    });
+    let _ = tokio::task::spawn_blocking(move || send_request(&socket, &req)).await;
 }
 
 fn proxy_knows_tool(cached_tools_list: &serde_json::Value, name: &str) -> bool {
@@ -1201,13 +1205,30 @@ mod tests {
     }
 
     /// Run `requests` through the proxy against a test daemon socket and
-    /// return every `session_client` announcement the daemon received.
+    /// return every daemon request it received, in order.
     #[cfg(unix)]
-    async fn announced_client_names(requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
+    async fn daemon_requests(requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
         use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
         let directory = tempfile::tempdir().expect("temporary socket directory");
         let socket = directory.path().join("daemon.sock");
         let listener = tokio::net::UnixListener::bind(&socket).expect("bind test daemon");
+        let seen = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let daemon = {
+            let seen = seen.clone();
+            tokio::spawn(async move {
+                while let Ok((stream, _)) = listener.accept().await {
+                    let (read, mut write) = stream.into_split();
+                    let mut line = String::new();
+                    BufReader::new(read).read_line(&mut line).await.unwrap();
+                    seen.lock()
+                        .unwrap()
+                        .push(serde_json::from_str::<serde_json::Value>(&line).unwrap());
+                    let _ = write
+                        .write_all(b"{\"ok\":true,\"result\":{\"content\":[]}}\n")
+                        .await;
+                }
+            })
+        };
         let mut input = Vec::new();
         for request in requests {
             serde_json::to_writer(&mut input, request).unwrap();
@@ -1225,20 +1246,41 @@ mod tests {
         )
         .await
         .unwrap();
-        // The announcement is fire-and-forget: collect what arrives in 1.5 s.
-        let mut announced = Vec::new();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(1500);
-        while let Ok(Ok((stream, _))) = tokio::time::timeout_at(deadline, listener.accept()).await {
-            let (read, mut write) = stream.into_split();
-            let mut line = String::new();
-            BufReader::new(read).read_line(&mut line).await.unwrap();
-            let request: serde_json::Value = serde_json::from_str(&line).unwrap();
-            let _ = write.write_all(b"{\"ok\":true,\"result\":{}}\n").await;
-            if request["method"] == "session_client" {
-                announced.push(request);
-            }
-        }
-        announced
+        daemon.abort();
+        let seen = seen.lock().unwrap().clone();
+        seen
+    }
+
+    #[cfg(unix)]
+    async fn announced_client_names(requests: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        daemon_requests(requests)
+            .await
+            .into_iter()
+            .filter(|request| request["method"] == "session_client")
+            .collect()
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_modern_first_tool_call_reaches_the_daemon_after_its_client_name() {
+        use serde_json::json;
+        let meta = json!({
+            mcp_wire::PROTOCOL_VERSION_KEY: mcp_wire::MODERN_PROTOCOL_VERSION,
+            "io.modelcontextprotocol/clientInfo": {"name": "claude-code"},
+            mcp_wire::CLIENT_CAPABILITIES_KEY: {}
+        });
+        let seen = daemon_requests(&[json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+            "params":{"name":"get_config","arguments":{},"_meta":meta}})])
+        .await;
+        let methods: Vec<&str> = seen
+            .iter()
+            .map(|request| request["method"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(methods.first(), Some(&"session_client"), "{seen:?}");
+        assert!(
+            methods.len() >= 2,
+            "the tool call reached the daemon: {seen:?}"
+        );
     }
 
     #[cfg(unix)]
@@ -1327,6 +1369,47 @@ mod tests {
             .as_str()
             .unwrap()
             .contains("--tools full"));
+    }
+
+    #[test]
+    fn the_first_client_identity_keeps_the_rendering() {
+        use cua_driver_core::protocol::Request;
+        let modern = |name: &str| -> Request {
+            serde_json::from_value(serde_json::json!({
+                "jsonrpc":"2.0","id":2,"method":"tools/list",
+                "params":{"_meta":{
+                    mcp_wire::PROTOCOL_VERSION_KEY: mcp_wire::MODERN_PROTOCOL_VERSION,
+                    "io.modelcontextprotocol/clientInfo": {"name": name},
+                    mcp_wire::CLIENT_CAPABILITIES_KEY: {}}}
+            }))
+            .unwrap()
+        };
+        let initialize: Request = serde_json::from_value(serde_json::json!({
+            "jsonrpc":"2.0","id":1,"method":"initialize",
+            "params":{"clientInfo":{"name":"codex-mcp-client"}}
+        }))
+        .unwrap();
+        let rendered = |surface: &Surface| {
+            let result = serde_json::json!({
+                "content": [{"type":"text","text":"Found 0 window(s)."}],
+                "structuredContent": {"windows": [], "current_space_id": 1},
+            });
+            serde_json::to_value(
+                surface.render("tools/call", Response::ok(serde_json::json!(3), result)),
+            )
+            .unwrap()["result"]["content"][0]["text"]
+                .clone()
+        };
+        // Codex first, then a request naming another client: still Codex.
+        let mut surface = Surface::new(ToolProfile::Core);
+        surface.observe(&initialize);
+        surface.observe(&modern("claude-code"));
+        assert_eq!(rendered(&surface), crate::mcp_surface::CODEX_TEXT_POINTER);
+        // Claude first, then Codex: still not Codex.
+        let mut surface = Surface::new(ToolProfile::Core);
+        surface.observe(&modern("claude-code"));
+        surface.observe(&modern("codex-mcp-client"));
+        assert_eq!(rendered(&surface), "Found 0 window(s).");
     }
 
     #[test]
