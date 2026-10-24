@@ -63,9 +63,10 @@ impl Surface {
         }
     }
 
-    /// Note the client from its `initialize` request.
+    /// Note the client from its `initialize` request, or from a modern
+    /// request's per-request client metadata.
     pub fn observe(&mut self, request: &Request) {
-        if let Some(metadata) = request.initialize_metadata() {
+        if let Some(metadata) = request.client_metadata() {
             self.codex = metadata
                 .client_name
                 .is_some_and(|name| name.to_ascii_lowercase().starts_with("codex"));
