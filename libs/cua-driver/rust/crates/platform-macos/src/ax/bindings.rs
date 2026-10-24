@@ -1013,6 +1013,10 @@ mod inline_edit_wait_tests {
     /// Replays `timeline` (one focus reading per 25 ms poll, the last one
     /// repeated) on a fake clock; returns the decision and when it came.
     fn run(timeline: &[FocusState], editor_expected: bool) -> (bool, Duration) {
+        run_for(timeline, editor_expected, Duration::from_millis(1200))
+    }
+
+    fn run_for(timeline: &[FocusState], editor_expected: bool, max: Duration) -> (bool, Duration) {
         let now = Cell::new(Duration::ZERO);
         let polls = Cell::new(0usize);
         let kept = super::inline_edit_wait(
@@ -1023,7 +1027,7 @@ mod inline_edit_wait_tests {
             },
             || now.get(),
             || now.set(now.get() + Duration::from_millis(25)),
-            Duration::from_millis(1200),
+            max,
             editor_expected,
         );
         (kept, now.get())
@@ -1039,6 +1043,16 @@ mod inline_edit_wait_tests {
     fn an_expected_editor_after_old_focus_longer_than_150_ms_is_kept() {
         let t = timeline(&[(InMenu, 8), (Elsewhere, 12), (InlineEdit, 1)]);
         assert_eq!(run(&t, true), (true, Duration::from_millis(500)));
+    }
+
+    /// Item 26, VM B under load: New Folder's editor came more than 1.2 s
+    /// after the menu (the folder is created first); invoke_menu gives a
+    /// command known to open one up to 4 s.
+    #[test]
+    fn a_late_expected_editor_within_the_longer_budget_is_kept() {
+        let t = timeline(&[(InMenu, 60), (Elsewhere, 36), (InlineEdit, 1)]);
+        assert_eq!(run_for(&t, true, Duration::from_millis(4000)), (true, Duration::from_millis(2400)));
+        assert_eq!(run_for(&t, true, Duration::from_millis(1200)).0, false);
     }
 
     #[test]

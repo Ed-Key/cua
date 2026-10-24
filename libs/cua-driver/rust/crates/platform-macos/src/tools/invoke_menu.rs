@@ -43,6 +43,12 @@ const MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a menu command gets to open an inline editor (File > Rename)
 /// before the previous front app is brought back.
 const INLINE_EDIT_WAIT: Duration = Duration::from_millis(1200);
+/// The same for a command known to open one (File > Rename, New Folder).
+/// The wait ends when the editor shows (0.4 to 1.2 s after the menu in VM B);
+/// the rest is spent only when none comes. Under load Finder showed the
+/// new folder's name editor later than 1.2 s after its menu (item 26), and
+/// handing the front back first ended the edit.
+const EXPECTED_INLINE_EDIT_WAIT: Duration = Duration::from_millis(4000);
 /// Whether `path` is a File menu item Finder answers with an inline name
 /// editor (File > Rename, New Folder, New Folder with Selection). Matched by
 /// its English titles, trailing ellipsis ignored.
@@ -1337,12 +1343,11 @@ impl Tool for InvokeMenuTool {
             let kept = other_front.is_some()
                 && result.is_ok()
                 && crate::tools::edit_commit::app_saves_on_end_editing(pid)
-                && crate::ax::bindings::await_inline_edit_after_menu(
-                    pid,
-                    window_id,
-                    INLINE_EDIT_WAIT,
-                    opens_inline_editor(&path),
-                );
+                && {
+                    let expected = opens_inline_editor(&path);
+                    let wait = if expected { EXPECTED_INLINE_EDIT_WAIT } else { INLINE_EDIT_WAIT };
+                    crate::ax::bindings::await_inline_edit_after_menu(pid, window_id, wait, expected)
+                };
             if kept {
                 front_restored = Some(FrontAfter::KeptForInlineEdit);
                 crate::front_lease::begin(pid, before);
