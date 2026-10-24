@@ -74,7 +74,13 @@ pub fn classify_insertion(
     if inserted == text {
         Complete
     } else if inserted.is_empty() && selection.length == 0 {
-        Unchanged
+        // A caret that moved while the value reads the same is evidence of
+        // an edit whose value has not caught up yet (item 25), not of none.
+        if after_selection.is_some_and(|after| after != selection) {
+            Unverifiable
+        } else {
+            Unchanged
+        }
     } else {
         Partial(inserted.chars().count())
     }
@@ -191,6 +197,28 @@ mod tests {
             ),
             Complete
         );
+    }
+
+    /// Item 25: a value that reads unchanged while the caret moved is not
+    /// "nothing landed": an app whose AX value lags the edit (seen past
+    /// type_text's 2 s drain) still moves the caret. Typing the text again
+    /// after it would insert it twice.
+    #[test]
+    fn an_unchanged_value_with_a_moved_caret_is_not_unchanged() {
+        assert_eq!(
+            classify_insertion(Some("ab"), range(2, 0), Some("ab"), range(5, 0), "xyz"),
+            Unverifiable
+        );
+        assert_eq!(
+            classify_insertion(Some(""), None, Some(""), range(3, 0), "xyz"),
+            Unverifiable
+        );
+        // The caret where it was, or not read: unchanged as before.
+        assert_eq!(
+            classify_insertion(Some("ab"), range(2, 0), Some("ab"), range(2, 0), "xyz"),
+            Unchanged
+        );
+        assert_eq!(classify_insertion(Some("ab"), range(2, 0), Some("ab"), None, "xyz"), Unchanged);
     }
 
     #[test]

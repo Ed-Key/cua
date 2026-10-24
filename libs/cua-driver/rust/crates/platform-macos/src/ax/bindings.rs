@@ -904,6 +904,9 @@ enum FocusState {
     InlineEdit,
     /// The application itself, or nothing: a menu is tracking or closing.
     InMenu,
+    /// The focused element did not read (a busy app's bounded read timed
+    /// out, or it has no role or window): no evidence either way.
+    Unknown,
     /// Any other element.
     Elsewhere,
 }
@@ -915,7 +918,7 @@ fn focus_state(pid: i32, target: u32) -> FocusState {
     unsafe {
         let app = AXUIElementCreateApplication(pid);
         if app.is_null() {
-            return FocusState::Elsewhere;
+            return FocusState::Unknown;
         }
         AXUIElementSetMessagingTimeout(app, READ_TIMEOUT_SECONDS);
         let element = copy_element_attr(app, "AXFocusedUIElement");
@@ -933,7 +936,9 @@ fn focus_state(pid: i32, target: u32) -> FocusState {
         // editor is its own child window; no ancestor walk needed).
         let window = ax_get_window_id(element);
         CFRelease(element as CFTypeRef);
-        if is_inline_edit(role.as_deref(), window, target, window_belongs_to) {
+        if role.is_none() || window.is_none() {
+            FocusState::Unknown
+        } else if is_inline_edit(role.as_deref(), window, target, window_belongs_to) {
             FocusState::InlineEdit
         } else {
             FocusState::Elsewhere
@@ -946,24 +951,134 @@ fn focus_state(pid: i32, target: u32) -> FocusState {
 /// closed (Finder: about 0.4 s after the press, the app reporting itself as
 /// focused until then), so wait while the focus is in the menu, and stop
 /// once it has settled on anything else for a moment, or at `max`.
-pub fn await_inline_edit_after_menu(pid: i32, target: u32, max: std::time::Duration) -> bool {
-    let deadline = std::time::Instant::now() + max;
-    let mut elsewhere_since: Option<std::time::Instant> = None;
+///
+/// `editor_expected`: the command is one that opens an inline editor (the
+/// caller knows it by name). Finder first moves the focus back to its file
+/// view (creating the folder, selecting the item) and shows the editor
+/// later, under load well after 150 ms (item 26), so for such a command
+/// only the editor or `max` ends the wait.
+pub fn await_inline_edit_after_menu(
+    pid: i32,
+    target: u32,
+    max: std::time::Duration,
+    editor_expected: bool,
+) -> bool {
+    let start = std::time::Instant::now();
+    inline_edit_wait(
+        || focus_state(pid, target),
+        || start.elapsed(),
+        || std::thread::sleep(std::time::Duration::from_millis(25)),
+        max,
+        editor_expected,
+    )
+}
+
+/// [`await_inline_edit_after_menu`]'s loop over a focus reader and a clock.
+fn inline_edit_wait(
+    mut read: impl FnMut() -> FocusState,
+    elapsed: impl Fn() -> std::time::Duration,
+    mut pause: impl FnMut(),
+    max: std::time::Duration,
+    editor_expected: bool,
+) -> bool {
+    /// How long the focus may rest elsewhere before a command that need not
+    /// open an editor is taken to have opened none.
+    const SETTLED: std::time::Duration = std::time::Duration::from_millis(150);
+    let mut elsewhere_since: Option<std::time::Duration> = None;
     loop {
-        match focus_state(pid, target) {
+        match read() {
             FocusState::InlineEdit => return true,
-            FocusState::InMenu => elsewhere_since = None,
+            FocusState::InMenu | FocusState::Unknown => elsewhere_since = None,
+            FocusState::Elsewhere if editor_expected => {}
             FocusState::Elsewhere => {
-                let since = *elsewhere_since.get_or_insert_with(std::time::Instant::now);
-                if since.elapsed() >= std::time::Duration::from_millis(150) {
+                let since = *elsewhere_since.get_or_insert_with(&elapsed);
+                if elapsed().saturating_sub(since) >= SETTLED {
                     return false;
                 }
             }
         }
-        if std::time::Instant::now() >= deadline {
+        if elapsed() >= max {
             return false;
         }
-        std::thread::sleep(std::time::Duration::from_millis(25));
+        pause();
+    }
+}
+
+#[cfg(test)]
+mod inline_edit_wait_tests {
+    use super::FocusState::{self, *};
+    use std::cell::Cell;
+    use std::time::Duration;
+
+    /// Replays `timeline` (one focus reading per 25 ms poll, the last one
+    /// repeated) on a fake clock; returns the decision and when it came.
+    fn run(timeline: &[FocusState], editor_expected: bool) -> (bool, Duration) {
+        run_for(timeline, editor_expected, Duration::from_millis(1200))
+    }
+
+    fn run_for(timeline: &[FocusState], editor_expected: bool, max: Duration) -> (bool, Duration) {
+        let now = Cell::new(Duration::ZERO);
+        let polls = Cell::new(0usize);
+        let kept = super::inline_edit_wait(
+            || {
+                let i = polls.get();
+                polls.set(i + 1);
+                timeline[i.min(timeline.len() - 1)]
+            },
+            || now.get(),
+            || now.set(now.get() + Duration::from_millis(25)),
+            max,
+            editor_expected,
+        );
+        (kept, now.get())
+    }
+
+    fn timeline(parts: &[(FocusState, usize)]) -> Vec<FocusState> {
+        parts.iter().flat_map(|(state, n)| std::iter::repeat_n(*state, *n)).collect()
+    }
+
+    /// Item 26: menu, then the file view focused for 300 ms (Finder creating
+    /// the folder), then the editor, all before the 1200 ms deadline.
+    #[test]
+    fn an_expected_editor_after_old_focus_longer_than_150_ms_is_kept() {
+        let t = timeline(&[(InMenu, 8), (Elsewhere, 12), (InlineEdit, 1)]);
+        assert_eq!(run(&t, true), (true, Duration::from_millis(500)));
+    }
+
+    /// Item 26, VM B under load: New Folder's editor came more than 1.2 s
+    /// after the menu (the folder is created first); invoke_menu gives a
+    /// command known to open one up to 4 s.
+    #[test]
+    fn a_late_expected_editor_within_the_longer_budget_is_kept() {
+        let t = timeline(&[(InMenu, 60), (Elsewhere, 36), (InlineEdit, 1)]);
+        assert_eq!(run_for(&t, true, Duration::from_millis(4000)), (true, Duration::from_millis(2400)));
+        assert_eq!(run_for(&t, true, Duration::from_millis(1200)).0, false);
+    }
+
+    #[test]
+    fn a_command_not_known_to_open_an_editor_still_ends_after_150_ms_elsewhere() {
+        let t = timeline(&[(InMenu, 8), (Elsewhere, 12), (InlineEdit, 1)]);
+        assert_eq!(run(&t, false), (false, Duration::from_millis(350)));
+    }
+
+    #[test]
+    fn no_editor_by_the_deadline_hands_the_front_back_at_the_deadline() {
+        let t = timeline(&[(InMenu, 4), (Elsewhere, 1)]);
+        assert_eq!(run(&t, true), (false, Duration::from_millis(1200)));
+    }
+
+    #[test]
+    fn unreadable_focus_is_no_evidence_and_waits_on() {
+        // Unknown readings (timed-out reads) do not count as settled elsewhere.
+        let t = timeline(&[(Elsewhere, 4), (Unknown, 10), (Elsewhere, 4), (InlineEdit, 1)]);
+        assert_eq!(run(&t, false), (true, Duration::from_millis(450)));
+        let t = timeline(&[(Unknown, 1)]);
+        assert_eq!(run(&t, false), (false, Duration::from_millis(1200)));
+    }
+
+    #[test]
+    fn an_editor_already_open_keeps_at_once() {
+        assert_eq!(run(&[InlineEdit], true), (true, Duration::ZERO));
     }
 }
 

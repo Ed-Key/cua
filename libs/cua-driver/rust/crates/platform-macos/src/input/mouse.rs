@@ -19,11 +19,6 @@ use foreign_types::ForeignType;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum MousePostMode {
-    /// Post the same event through SkyLight and again through the public API.
-    /// An AppKit target receives both copies, so one logical event arrives
-    /// twice. Kept only until the remaining callers move to
-    /// [`MousePostMode::SkyLightPreferred`].
-    Both,
     /// Post each event exactly once: through SkyLight `SLEventPostToPid`, or
     /// through the public `CGEvent::post_to_pid` only when the SPI is absent.
     SkyLightPreferred,
@@ -39,13 +34,10 @@ enum PostRoute {
     SkyLight,
     PublicPid,
     Hid,
-    /// Legacy duplicate delivery: SkyLight, then the public API.
-    SkyLightAndPublic,
 }
 
 fn post_route(mode: MousePostMode, skylight_available: bool) -> PostRoute {
     match mode {
-        MousePostMode::Both => PostRoute::SkyLightAndPublic,
         MousePostMode::SkyLightPreferred if skylight_available => PostRoute::SkyLight,
         MousePostMode::SkyLightPreferred | MousePostMode::PublicOnly => PostRoute::PublicPid,
         MousePostMode::HidOnly => PostRoute::Hid,
@@ -78,10 +70,6 @@ fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
         // Through focus_steal so the theft detector counts the button events
         // cua posted itself.
         PostRoute::Hid => crate::focus_steal::post_hid_mouse_event(event),
-        PostRoute::SkyLightAndPublic => {
-            crate::input::skylight::post_to_pid(pid as libc::pid_t, event_ptr, false);
-            event.post_to_pid(pid as libc::pid_t);
-        }
     }
 }
 
@@ -120,7 +108,7 @@ pub fn click_at_xy(
         None,
         count,
         modifiers,
-        MousePostMode::Both,
+        MousePostMode::SkyLightPreferred,
     )
 }
 
@@ -1296,7 +1284,7 @@ where
     // Prime the routed target's cursor-tracking state immediately before the
     // press, matching the click path's stamped mouseMoved + settle interval.
     let from_pt = CGPoint::new(from_x, from_y);
-    post_mouse_moved_primer(pid, &source, from_pt, from_local, wid, MousePostMode::Both);
+    post_mouse_moved_primer(pid, &source, from_pt, from_local, wid, MousePostMode::SkyLightPreferred);
     std::thread::sleep(std::time::Duration::from_millis(12));
 
     // MouseDown at start.
@@ -1747,8 +1735,8 @@ pub enum DragButton {
 /// Middle-click at `(x, y)` with optional modifier keys.
 ///
 /// Posts an `OtherMouseDown` / `OtherMouseUp` pair with `CGMouseButton::Center`
-/// to the target pid through the same SkyLight + public-API postBoth path the
-/// left- and right-click primitives use. Window-local stamping mirrors
+/// to the target pid, each event once (SkyLight, or the public API when the
+/// SPI is absent), as the left- and right-click primitives post. Window-local stamping mirrors
 /// `right_click_at_xy_with_window_local`.
 pub fn middle_click_at_xy(pid: i32, x: f64, y: f64, modifiers: &[&str]) -> anyhow::Result<()> {
     middle_click_at_xy_inner(pid, x, y, None, modifiers)
@@ -1912,12 +1900,10 @@ fn right_click_at_xy_inner(
 
 /// Post a mouse event to `pid`.
 ///
-/// Matches Swift's `MouseInput.postBoth(_:toPid:)`:
-/// - Fires `SLEventPostToPid` (SkyLight path — reaches backgrounded Chromium/Catalyst).
-/// - Also fires `CGEvent::post_to_pid` (public path — lands on AppKit targets where
-///   SkyLight mouse delivery drops).
-///
-/// Both are always posted in sequence regardless of whether the other succeeded.
+/// Each event is posted once: through `SLEventPostToPid`, or through
+/// `CGEvent::post_to_pid` only when the SPI is absent (item 25). The Swift
+/// `MouseInput.postBoth` this was ported from posted through both, and an
+/// AppKit target received every event twice.
 ///
 /// Field stamps applied (always):
 /// - f40 = `pid`  (Chromium's synthetic-event filter)
@@ -1953,7 +1939,7 @@ pub(super) fn post_mouse_event(
         click_state,
         button_number,
         subtype,
-        MousePostMode::Both,
+        MousePostMode::SkyLightPreferred,
     );
 }
 
@@ -2080,7 +2066,7 @@ pub fn scroll_wheel_at_xy(
         CGPoint::new(screen_x, screen_y),
         window_local,
         wid,
-        MousePostMode::Both,
+        MousePostMode::SkyLightPreferred,
     );
     std::thread::sleep(std::time::Duration::from_millis(12));
 
@@ -2119,9 +2105,14 @@ pub fn scroll_wheel_at_xy(
         // f40 = target pid (Chromium synthetic-event filter).
         crate::input::skylight::set_integer_field(event_ptr, 40, pid as i64);
 
-        // Belt+suspenders post: SkyLight reaches backgrounded Chromium/Catalyst;
-        // the public path lands on AppKit/WKWebView. Mouse-class → no auth envelope.
-        dispatch_mouse_event(PostRoute::SkyLightAndPublic, pid, &event);
+        // Once, like every pid-routed pointer event (item 25): posting it
+        // through SkyLight and again through the public API made an AppKit
+        // target scroll twice. Mouse-class → no auth envelope.
+        dispatch_mouse_event(
+            post_route(MousePostMode::SkyLightPreferred, skylight_available()),
+            pid,
+            &event,
+        );
 
         std::thread::sleep(std::time::Duration::from_millis(30));
     }
@@ -2684,6 +2675,94 @@ mod tests {
                 ("RightMouseUp".to_owned(), PostRoute::SkyLight),
             ]
         );
+    }
+
+    /// Item 25: every pid-routed pointer primitive hands each event to one
+    /// transport, SkyLight, or the public API only when the SPI is absent. A
+    /// SkyLight-and-public post reaches an AppKit target twice: two downs and
+    /// two ups for one click, two wheel ticks for one.
+    #[test]
+    fn every_pid_routed_pointer_event_goes_through_exactly_one_transport() {
+        type Gesture = fn() -> anyhow::Result<()>;
+        let gestures: [(&str, Gesture, &[&str]); 7] = [
+            (
+                "click without a window",
+                || click_at_xy(1, 100.0, 100.0, 1, &[]),
+                &["MouseMoved", "LeftMouseDown", "LeftMouseUp"],
+            ),
+            (
+                "double click without a window",
+                || click_at_xy(1, 100.0, 100.0, 2, &[]),
+                &["MouseMoved", "LeftMouseDown", "LeftMouseUp", "LeftMouseDown", "LeftMouseUp"],
+            ),
+            (
+                "middle click",
+                || middle_click_at_xy_with_window_local(1, 100.0, 100.0, 10.0, 10.0, &[]),
+                &["OtherMouseDown", "OtherMouseUp"],
+            ),
+            (
+                "middle click without a window",
+                || middle_click_at_xy(1, 100.0, 100.0, &[]),
+                &["OtherMouseDown", "OtherMouseUp"],
+            ),
+            (
+                "background drag",
+                || {
+                    drag_at_xy(
+                        1,
+                        100.0,
+                        100.0,
+                        140.0,
+                        100.0,
+                        Some((10.0, 10.0)),
+                        Some((50.0, 10.0)),
+                        Some(7),
+                        0,
+                        2,
+                        &[],
+                        DragButton::Left,
+                        false,
+                    )
+                },
+                &["MouseMoved", "LeftMouseDown", "LeftMouseDragged", "LeftMouseDragged", "LeftMouseUp"],
+            ),
+            (
+                "background scroll",
+                || scroll_wheel_at_xy(1, 100.0, 100.0, Some((10.0, 10.0)), Some(7), -120, 0, 2),
+                &["MouseMoved", "ScrollWheel", "ScrollWheel"],
+            ),
+            (
+                // The interactive session's background pointer and scroll path.
+                "post_mouse_event",
+                || {
+                    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                        .map_err(|_| anyhow::anyhow!("no source"))?;
+                    let down = CGEvent::new_mouse_event(
+                        source,
+                        CGEventType::LeftMouseDown,
+                        CGPoint::new(100.0, 100.0),
+                        CGMouseButton::Left,
+                    )
+                    .map_err(|_| anyhow::anyhow!("no event"))?;
+                    post_mouse_event(1, &down, Some((10.0, 10.0)), Some(7), 1, 0, 3);
+                    Ok(())
+                },
+                &["LeftMouseDown"],
+            ),
+        ];
+        for available in [true, false] {
+            let want = if available { PostRoute::SkyLight } else { PostRoute::PublicPid };
+            for (name, gesture, expected) in &gestures {
+                let capture = Capture::start(available);
+                gesture().unwrap();
+                let posted = capture.posted();
+                let events: Vec<&str> = posted.iter().map(|p| p.event.as_str()).collect();
+                assert_eq!(events, *expected, "{name} (SPI {available}): event sequence");
+                for p in &posted {
+                    assert_eq!(p.route, want, "{name} (SPI {available}): {} transport", p.event);
+                }
+            }
+        }
     }
 
     #[test]

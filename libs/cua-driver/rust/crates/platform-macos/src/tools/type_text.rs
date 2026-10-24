@@ -1711,6 +1711,10 @@ fn await_typed_progress_with_selection(
     ),
 ) -> TypedProgress {
     let mut best_partial = None;
+    // An unchanged value read once with a moved caret: an edit whose value
+    // lags. A later reading without the caret must not undo that evidence
+    // (item 25: "unchanged" lets type_text type the text a second time).
+    let mut moved_caret_seen = false;
     loop {
         let (after, after_selection) = read_value();
         let progress =
@@ -1721,13 +1725,17 @@ fn await_typed_progress_with_selection(
                 best_partial =
                     Some(best_partial.map_or(delivered, |best: usize| best.max(delivered)));
             }
-            TypedProgress::Unverifiable if before.is_some() && after.as_deref() == before => {}
+            TypedProgress::Unverifiable if before.is_some() && after.as_deref() == before => {
+                moved_caret_seen = true;
+            }
             TypedProgress::Unverifiable => return TypedProgress::Unverifiable,
             TypedProgress::Unchanged => {}
         }
         if std::time::Instant::now() >= deadline {
-            return if progress == TypedProgress::Unverifiable {
-                progress
+            return if progress == TypedProgress::Unverifiable
+                || (progress == TypedProgress::Unchanged && moved_caret_seen)
+            {
+                TypedProgress::Unverifiable
             } else {
                 best_partial.map(TypedProgress::Partial).unwrap_or(progress)
             };
@@ -2107,7 +2115,7 @@ fn type_text_blocking(
         // The write is atomic, its effect on the field is not: the same drain
         // the keystroke rung uses settles the read-back here, so a value the
         // app is still rebuilding is never reported as a partial insertion.
-        let ax_progress = if err == kAXErrorSuccess {
+        let ax_progress = if read_back_ax_write(err) {
             let deadline = std::time::Instant::now() + DELIVERY_DRAIN_TIMEOUT;
             Some(await_typed_progress_with_selection(
                 readback.before.as_deref(),
@@ -2252,6 +2260,14 @@ fn type_text_blocking(
     }))
 }
 
+/// Whether an AX text write's result is read back before anything else is
+/// sent. Only an error that proves the app refused the write before acting
+/// skips the read-back; a timeout or a generic failure may hide a write that
+/// took effect, and typing the text after it would insert it twice (item 25).
+fn read_back_ax_write(err: crate::ax::bindings::AXError) -> bool {
+    err == kAXErrorSuccess || !crate::input::ax_actions::ax_write_rejected(err)
+}
+
 /// Whether `element` is the focused element of its window (`window_id`), or
 /// of the process when no window is given.
 fn addressed_element_has_focus(pid: i32, element: AXUIElementRef, window_id: Option<u32>) -> bool {
@@ -2305,6 +2321,50 @@ fn is_chromium_browser_pid(pid: i32) -> bool {
 
 #[cfg(test)]
 mod tests {
+    /// Item 25 (review): a moved caret seen once in the drain is kept, even
+    /// when the last reading has no caret.
+    #[test]
+    fn a_moved_caret_seen_during_the_drain_is_not_forgotten() {
+        use super::{await_typed_progress_with_selection, TextSelectionRange, TypedProgress};
+        let caret = |location| Some(TextSelectionRange { location, length: 0 });
+        let mut readings = vec![
+            (Some("ab".to_owned()), caret(5)),
+            (Some("ab".to_owned()), None),
+        ]
+        .into_iter();
+        let mut last = (Some("ab".to_owned()), None);
+        let progress = await_typed_progress_with_selection(
+            Some("ab"),
+            caret(2),
+            "xyz",
+            std::time::Instant::now() + std::time::Duration::from_millis(60),
+            || {
+                if let Some(next) = readings.next() {
+                    last = next;
+                }
+                last.clone()
+            },
+        );
+        assert_eq!(progress, TypedProgress::Unverifiable);
+    }
+
+    /// Item 25: an AX text write that errored without proving a refusal is
+    /// read back like an accepted one; only a proven refusal goes straight
+    /// to keys.
+    #[test]
+    fn an_indeterminate_ax_write_error_is_read_back_before_any_keys() {
+        use super::read_back_ax_write;
+        const CANNOT_COMPLETE: i32 = -25204;
+        const FAILURE: i32 = -25200;
+        const ATTRIBUTE_UNSUPPORTED: i32 = -25205;
+        const ILLEGAL_ARGUMENT: i32 = -25201;
+        assert!(read_back_ax_write(0));
+        assert!(read_back_ax_write(CANNOT_COMPLETE), "a timed-out write may have landed");
+        assert!(read_back_ax_write(FAILURE), "a generic failure may have landed");
+        assert!(!read_back_ax_write(ATTRIBUTE_UNSUPPORTED));
+        assert!(!read_back_ax_write(ILLEGAL_ARGUMENT));
+    }
+
     #[test]
     fn an_unchanged_web_value_is_unknown_not_zero() {
         use super::web_zero_is_unknown;
