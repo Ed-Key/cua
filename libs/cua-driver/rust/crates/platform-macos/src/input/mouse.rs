@@ -2686,6 +2686,94 @@ mod tests {
         );
     }
 
+    /// Item 25: every pid-routed pointer primitive hands each event to one
+    /// transport, SkyLight, or the public API only when the SPI is absent. A
+    /// SkyLight-and-public post reaches an AppKit target twice: two downs and
+    /// two ups for one click, two wheel ticks for one.
+    #[test]
+    fn every_pid_routed_pointer_event_goes_through_exactly_one_transport() {
+        type Gesture = fn() -> anyhow::Result<()>;
+        let gestures: [(&str, Gesture, &[&str]); 7] = [
+            (
+                "click without a window",
+                || click_at_xy(1, 100.0, 100.0, 1, &[]),
+                &["MouseMoved", "LeftMouseDown", "LeftMouseUp"],
+            ),
+            (
+                "double click without a window",
+                || click_at_xy(1, 100.0, 100.0, 2, &[]),
+                &["MouseMoved", "LeftMouseDown", "LeftMouseUp", "LeftMouseDown", "LeftMouseUp"],
+            ),
+            (
+                "middle click",
+                || middle_click_at_xy_with_window_local(1, 100.0, 100.0, 10.0, 10.0, &[]),
+                &["OtherMouseDown", "OtherMouseUp"],
+            ),
+            (
+                "middle click without a window",
+                || middle_click_at_xy(1, 100.0, 100.0, &[]),
+                &["OtherMouseDown", "OtherMouseUp"],
+            ),
+            (
+                "background drag",
+                || {
+                    drag_at_xy(
+                        1,
+                        100.0,
+                        100.0,
+                        140.0,
+                        100.0,
+                        Some((10.0, 10.0)),
+                        Some((50.0, 10.0)),
+                        Some(7),
+                        0,
+                        2,
+                        &[],
+                        DragButton::Left,
+                        false,
+                    )
+                },
+                &["MouseMoved", "LeftMouseDown", "LeftMouseDragged", "LeftMouseDragged", "LeftMouseUp"],
+            ),
+            (
+                "background scroll",
+                || scroll_wheel_at_xy(1, 100.0, 100.0, Some((10.0, 10.0)), Some(7), -120, 0, 2),
+                &["MouseMoved", "ScrollWheel", "ScrollWheel"],
+            ),
+            (
+                // The interactive session's background pointer and scroll path.
+                "post_mouse_event",
+                || {
+                    let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
+                        .map_err(|_| anyhow::anyhow!("no source"))?;
+                    let down = CGEvent::new_mouse_event(
+                        source,
+                        CGEventType::LeftMouseDown,
+                        CGPoint::new(100.0, 100.0),
+                        CGMouseButton::Left,
+                    )
+                    .map_err(|_| anyhow::anyhow!("no event"))?;
+                    post_mouse_event(1, &down, Some((10.0, 10.0)), Some(7), 1, 0, 3);
+                    Ok(())
+                },
+                &["LeftMouseDown"],
+            ),
+        ];
+        for available in [true, false] {
+            let want = if available { PostRoute::SkyLight } else { PostRoute::PublicPid };
+            for (name, gesture, expected) in &gestures {
+                let capture = Capture::start(available);
+                gesture().unwrap();
+                let posted = capture.posted();
+                let events: Vec<&str> = posted.iter().map(|p| p.event.as_str()).collect();
+                assert_eq!(events, *expected, "{name} (SPI {available}): event sequence");
+                for p in &posted {
+                    assert_eq!(p.route, want, "{name} (SPI {available}): {} transport", p.event);
+                }
+            }
+        }
+    }
+
     #[test]
     fn right_click_modifiers_ride_on_the_single_down_and_up() {
         let capture = Capture::start(true);

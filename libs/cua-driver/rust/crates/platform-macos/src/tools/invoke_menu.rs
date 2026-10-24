@@ -43,6 +43,18 @@ const MAIN_QUEUE_TIMEOUT: Duration = Duration::from_secs(5);
 /// How long a menu command gets to open an inline editor (File > Rename)
 /// before the previous front app is brought back.
 const INLINE_EDIT_WAIT: Duration = Duration::from_millis(1200);
+/// Whether the menu item at the end of `path` is one Finder answers with an
+/// inline name editor (File > Rename, New Folder, New Folder with Selection).
+/// Matched by its English title, trailing ellipsis ignored.
+// ponytail: English titles only; another language falls back to the generic
+// 150 ms settle (the pre-item-26 behaviour), add localized titles if needed.
+fn opens_inline_editor(path: &[String]) -> bool {
+    path.last().is_some_and(|item| {
+        let title = item.trim().trim_end_matches(['…', '.']).trim_end();
+        title == "Rename" || title.starts_with("New Folder")
+    })
+}
+
 /// How long a press made from behind gets to show its effect. A press that
 /// shows none is not made again: the command may finish later (Slack's
 /// Paste, TextEdit's New), and pressing it in front as well ran it twice.
@@ -1322,7 +1334,12 @@ impl Tool for InvokeMenuTool {
             let kept = other_front.is_some()
                 && result.is_ok()
                 && crate::tools::edit_commit::app_saves_on_end_editing(pid)
-                && crate::ax::bindings::await_inline_edit_after_menu(pid, window_id, INLINE_EDIT_WAIT);
+                && crate::ax::bindings::await_inline_edit_after_menu(
+                    pid,
+                    window_id,
+                    INLINE_EDIT_WAIT,
+                    opens_inline_editor(&path),
+                );
             if kept {
                 front_restored = Some(FrontAfter::KeptForInlineEdit);
                 crate::front_lease::begin(pid, before);
@@ -1388,6 +1405,18 @@ impl Tool for InvokeMenuTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn finders_rename_and_new_folder_items_are_known_to_open_an_editor() {
+        let path = |items: &[&str]| items.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        assert!(opens_inline_editor(&path(&["File", "Rename"])));
+        assert!(opens_inline_editor(&path(&["File", "Rename…"])));
+        assert!(opens_inline_editor(&path(&["File", "New Folder"])));
+        assert!(opens_inline_editor(&path(&["File", "New Folder with Selection (2 Items)"])));
+        assert!(!opens_inline_editor(&path(&["File", "New Finder Window"])));
+        assert!(!opens_inline_editor(&path(&["View", "as List"])));
+        assert!(!opens_inline_editor(&path(&["Rename", "Other"])));
+    }
 
     #[test]
     fn path_normalization_rejects_empty_segments() {
