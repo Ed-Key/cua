@@ -2130,12 +2130,15 @@ fn type_text_blocking(
         // An errored write whose read-back shows the value and the selection
         // exactly as before did not land: keys may follow, as they did before
         // errors were read back (a replacement of selected text otherwise
-        // reads as unverifiable).
+        // reads as unverifiable). Both must read: a selection that did not
+        // read before or now proves nothing.
         let ax_progress = match ax_progress {
             Some(TypedProgress::Unverifiable)
                 if err != kAXErrorSuccess
-                    && readback.before.is_some()
-                    && readback.sample() == (readback.before.clone(), readback.before_range) =>
+                    && unchanged_state(
+                        (readback.before.as_deref(), readback.before_range),
+                        &readback.sample(),
+                    ) =>
             {
                 None
             }
@@ -2282,6 +2285,16 @@ fn read_back_ax_write(err: crate::ax::bindings::AXError) -> bool {
     err == kAXErrorSuccess || !crate::input::ax_actions::ax_write_rejected(err)
 }
 
+/// Whether a field reads exactly as it did before an AX write: the same value
+/// and the same selection, both of them read both times.
+fn unchanged_state(
+    before: (Option<&str>, Option<TextSelectionRange>),
+    now: &(Option<String>, Option<TextSelectionRange>),
+) -> bool {
+    matches!((before, now), ((Some(value), Some(range)), (Some(now_value), Some(now_range)))
+        if value == now_value && range == *now_range)
+}
+
 /// Whether `element` is the focused element of its window (`window_id`), or
 /// of the process when no window is given.
 fn addressed_element_has_focus(pid: i32, element: AXUIElementRef, window_id: Option<u32>) -> bool {
@@ -2360,6 +2373,19 @@ mod tests {
             },
         );
         assert_eq!(progress, TypedProgress::Unverifiable);
+    }
+
+    /// Item 25 (review 2): only a value and a selection that both read, the
+    /// same as before, count as an errored write that changed nothing.
+    #[test]
+    fn an_errored_write_counts_as_unlanded_only_with_both_reads_unchanged() {
+        use super::{unchanged_state, TextSelectionRange};
+        let r = |location| Some(TextSelectionRange { location, length: 3 });
+        assert!(unchanged_state((Some("old"), r(0)), &(Some("old".into()), r(0))));
+        assert!(!unchanged_state((Some(""), None), &(Some("".into()), None)));
+        assert!(!unchanged_state((Some("old"), r(0)), &(Some("old".into()), None)));
+        assert!(!unchanged_state((Some("old"), r(0)), &(Some("old".into()), r(1))));
+        assert!(!unchanged_state((None, r(0)), &(None, r(0))));
     }
 
     /// Item 25: an AX text write that errored without proving a refusal is
