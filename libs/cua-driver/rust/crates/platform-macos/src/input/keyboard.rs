@@ -189,6 +189,8 @@ pub fn press_key_no_auth(pid: i32, key: &str, modifiers: &[&str]) -> anyhow::Res
 /// no process addressing.
 pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
     use core_graphics::event::CGEventTapLocation;
+    // Global HID input: not under another worker's foreground action.
+    let _turn = crate::input::mouse::hold_foreground_turn()?;
 
     let (key, shift) = resolve_key_name(key);
     let modifiers = with_shift(modifiers, shift);
@@ -410,6 +412,8 @@ pub fn type_text_global(
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<usize> {
     use core_graphics::event::CGEventTapLocation;
+    // Global HID input: not under another worker's foreground action.
+    let _turn = crate::input::mouse::hold_foreground_turn()?;
 
     let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState)
         .map_err(|_| anyhow::anyhow!("CGEventSource::new failed"))?;
@@ -446,6 +450,8 @@ pub fn type_text_physical_global(
     deadline: Option<std::time::Instant>,
 ) -> anyhow::Result<usize> {
     use core_graphics::event::CGEventTapLocation;
+    // Global HID input: not under another worker's foreground action.
+    let _turn = crate::input::mouse::hold_foreground_turn()?;
 
     // Validate the complete payload before posting its first event. A string
     // containing an unsupported character must fail without partially typing.
@@ -479,6 +485,8 @@ pub fn type_text_physical_global(
 /// (Cmd+V typed a plain "v" on every foreground attempt in the VM lab).
 pub fn press_key_bare_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
     use core_graphics::event::CGEventTapLocation;
+    // Global HID input: not under another worker's foreground action.
+    let _turn = crate::input::mouse::hold_foreground_turn()?;
 
     let (key, shift) = resolve_key_name(key);
     let modifiers = with_shift(modifiers, shift);

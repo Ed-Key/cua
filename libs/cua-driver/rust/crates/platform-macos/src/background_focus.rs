@@ -295,6 +295,10 @@ impl HostController {
         window_id: Option<u32>,
         prepare_element: impl FnOnce() -> Result<()>,
     ) -> Result<()> {
+        // The preparation brings the host forward and restores the original:
+        // an activation, so it passes the foreground admission and holds the
+        // turn through the restore.
+        let _turn = crate::input::mouse::foreground_turn()?;
         let started = Instant::now();
         let _operation = self
             .operation

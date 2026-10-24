@@ -1274,6 +1274,12 @@ impl Tool for InvokeMenuTool {
             // Owned by the worker: a cancelled call must not release it while
             // the worker is still sending and reading.
             let _mutation = mutation;
+            // The foreground admission, before the front is read: either
+            // route may change the front (the foreground route activates, the
+            // background one restores), and the turn is held through the
+            // hand-back.
+            let _turn = crate::input::mouse::foreground_turn()
+                .map_err(|busy| format!("invoke_menu: {busy}"))?;
             // apps::frontmost_pid reads WindowServer first, so it is live here.
             let prior_frontmost = crate::apps::frontmost_pid();
             // Read with it, in case the foreground route keeps the app in

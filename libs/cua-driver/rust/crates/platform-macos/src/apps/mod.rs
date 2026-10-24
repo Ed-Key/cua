@@ -699,7 +699,12 @@ pub fn frontmost_pid() -> Option<i32> {
 ///
 /// Not while a HID click cua posted may still be held by an event tap: it
 /// would land on the app brought back (checked again right before the call).
+/// Not under another worker's foreground action either: the restore holds
+/// the foreground turn, or does not run.
 pub fn restore_prior_app(pid: i32) -> bool {
+    let Some(_turn) = crate::input::mouse::try_foreground_turn() else {
+        return false;
+    };
     let clear = || !crate::input::mouse::click_in_flight();
     clear() && (crate::input::skylight::restore_front_pid(pid, &mut || clear()) || (clear() && activate_pid(pid)))
 }
