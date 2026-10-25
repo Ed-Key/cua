@@ -430,11 +430,18 @@ fn workflow_steps() -> (&'static str, &'static str) {
 /// text, which can hold the only copy of the message.
 /// The long form stays in the skill.
 pub fn codex_instructions() -> String {
-    "Code mode: show a result r with \
-     `for (const c of r.content) if (c.data) image(c); else if (r.isError) text(c.text); \
-     text(r.structuredContent ?? r.content)`; text(r) would print images as base64. \
-     Apps: get_window_state, then act_and_read. Chrome pages: get_browser_state, then browser_steps."
-        .to_owned()
+    // act_and_read is registered only on macOS (see `workflow_steps`).
+    let apps = if cfg!(target_os = "macos") {
+        "Apps: get_window_state, then act_and_read."
+    } else {
+        "Apps: get_window_state, then act on its element tokens."
+    };
+    format!(
+        "Code mode: show a result r with \
+         `for (const c of r.content) if (c.data) image(c); else if (r.isError) text(c.text); \
+         text(r.structuredContent ?? r.content)`; text(r) would print images as base64. \
+         {apps} Chrome pages: get_browser_state, then browser_steps."
+    )
 }
 
 /// MCP `instructions` (`InitializeResult.instructions`) sent to every
@@ -648,7 +655,16 @@ mod agent_instruction_tests {
             "{codex}"
         );
         assert!(
-            codex.contains("Apps: get_window_state, then act_and_read."),
+            codex.contains(if cfg!(target_os = "macos") {
+                "Apps: get_window_state, then act_and_read."
+            } else {
+                "Apps: get_window_state, then act on its element tokens."
+            }),
+            "{codex}"
+        );
+        assert_eq!(
+            codex.contains("act_and_read"),
+            cfg!(target_os = "macos"),
             "{codex}"
         );
         assert!(
