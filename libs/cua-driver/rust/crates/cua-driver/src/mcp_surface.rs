@@ -53,6 +53,9 @@ impl ToolProfile {
 pub struct Surface {
     profile: ToolProfile,
     codex: bool,
+    /// The client was identified: later requests do not change it (the proxy
+    /// announces the first identity only).
+    identified: bool,
 }
 
 impl Surface {
@@ -60,15 +63,21 @@ impl Surface {
         Self {
             profile,
             codex: false,
+            identified: false,
         }
     }
 
-    /// Note the client from its `initialize` request.
+    /// Note the client from its `initialize` request, or from a modern
+    /// request's per-request client metadata.
     pub fn observe(&mut self, request: &Request) {
-        if let Some(metadata) = request.initialize_metadata() {
+        if self.identified {
+            return;
+        }
+        if let Some(metadata) = request.client_metadata() {
             self.codex = metadata
                 .client_name
                 .is_some_and(|name| name.to_ascii_lowercase().starts_with("codex"));
+            self.identified = true;
         }
     }
 

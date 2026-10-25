@@ -1381,9 +1381,9 @@ fn normalize_model(value: Option<&str>) -> String {
 
 fn normalize_protocol(value: Option<&str>) -> String {
     match value {
-        Some(value @ ("2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25")) => {
-            value.to_owned()
-        }
+        Some(
+            value @ ("2024-11-05" | "2025-03-26" | "2025-06-18" | "2025-11-25" | "2026-07-28"),
+        ) => value.to_owned(),
         _ => "unknown".into(),
     }
 }
@@ -3323,6 +3323,12 @@ mod tests {
                 "payload contains {forbidden}: {serialized}"
             );
         }
+    }
+
+    #[test]
+    fn modern_protocol_version_is_reported() {
+        assert_eq!(normalize_protocol(Some("2026-07-28")), "2026-07-28");
+        assert_eq!(normalize_protocol(Some("2099-01-01")), "unknown");
     }
 
     #[test]

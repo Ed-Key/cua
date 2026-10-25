@@ -46,63 +46,93 @@ impl Request {
         if self.method != "initialize" {
             return None;
         }
-
         let params = self.params.as_ref();
-        let protocol_version = params
-            .and_then(|p| p.get("protocolVersion"))
-            .and_then(Value::as_str)
-            .and_then(bounded_metadata_value);
-        let client_info = params.and_then(|p| p.get("clientInfo"));
-        let client_name = client_info
-            .and_then(|v| v.get("name"))
-            .and_then(Value::as_str)
-            .and_then(bounded_metadata_value);
-        let client_version = client_info
-            .and_then(|v| v.get("version"))
-            .and_then(Value::as_str)
-            .and_then(bounded_metadata_value);
+        Some(declared_metadata(
+            params.and_then(|p| p.get("protocolVersion")),
+            params.and_then(|p| p.get("clientInfo")),
+            params.and_then(|p| p.get("capabilities")),
+            params.and_then(|p| p.get("_meta")),
+        ))
+    }
 
-        let capabilities = params.and_then(|p| p.get("capabilities"));
-        let capability_flags = ClientCapabilityFlags {
-            tools: capability_declared(capabilities, "tools"),
-            roots: capability_declared(capabilities, "roots"),
-            sampling: capability_declared(capabilities, "sampling"),
-            experimental: capability_declared(capabilities, "experimental"),
-            elicitation_form: nested_capability_declared(capabilities, "elicitation", "form"),
-            elicitation_url: nested_capability_declared(capabilities, "elicitation", "url"),
-        };
+    /// The client's declared metadata from whichever handshake it used: a
+    /// legacy `initialize`, or (MCP 2026-07-28, which has no initialize) the
+    /// per-request `_meta` of a modern request that names its client. The
+    /// same bounded subset as `initialize_metadata`.
+    pub fn client_metadata(&self) -> Option<InitializeMetadata> {
+        use crate::mcp_wire::{CLIENT_CAPABILITIES_KEY, CLIENT_INFO_KEY, PROTOCOL_VERSION_KEY};
+        if self.method == "initialize" {
+            return self.initialize_metadata();
+        }
+        let meta = self.params.as_ref().and_then(|p| p.get("_meta"))?;
+        let protocol_version = meta.get(PROTOCOL_VERSION_KEY)?;
+        let client_info = meta.get(CLIENT_INFO_KEY).filter(|v| v.is_object())?;
+        let metadata = declared_metadata(
+            Some(protocol_version),
+            Some(client_info),
+            meta.get(CLIENT_CAPABILITIES_KEY),
+            Some(meta),
+        );
+        metadata.client_name.is_some().then_some(metadata)
+    }
+}
 
-        let reported_agent_context = params
-            .and_then(|p| p.get("_meta"))
-            .and_then(|m| m.get("ai.cua/agent-context"))
-            .filter(|v| v.is_object())
-            .map(|ctx| ReportedAgentContext {
-                provider: ctx
-                    .get("provider")
-                    .and_then(Value::as_str)
-                    .and_then(bounded_metadata_value),
-                model: ctx
-                    .get("model")
-                    .and_then(Value::as_str)
-                    .and_then(bounded_metadata_value),
-                agent_name: ctx
-                    .get("agent_name")
-                    .and_then(Value::as_str)
-                    .and_then(bounded_metadata_value),
-                agent_version: ctx
-                    .get("agent_version")
-                    .and_then(Value::as_str)
-                    .and_then(bounded_metadata_value),
-            })
-            .filter(ReportedAgentContext::has_any_value);
+fn declared_metadata(
+    protocol_version: Option<&Value>,
+    client_info: Option<&Value>,
+    capabilities: Option<&Value>,
+    meta: Option<&Value>,
+) -> InitializeMetadata {
+    let protocol_version = protocol_version
+        .and_then(Value::as_str)
+        .and_then(bounded_metadata_value);
+    let client_name = client_info
+        .and_then(|v| v.get("name"))
+        .and_then(Value::as_str)
+        .and_then(bounded_metadata_value);
+    let client_version = client_info
+        .and_then(|v| v.get("version"))
+        .and_then(Value::as_str)
+        .and_then(bounded_metadata_value);
 
-        Some(InitializeMetadata {
-            protocol_version,
-            client_name,
-            client_version,
-            capability_flags,
-            reported_agent_context,
+    let capability_flags = ClientCapabilityFlags {
+        tools: capability_declared(capabilities, "tools"),
+        roots: capability_declared(capabilities, "roots"),
+        sampling: capability_declared(capabilities, "sampling"),
+        experimental: capability_declared(capabilities, "experimental"),
+        elicitation_form: nested_capability_declared(capabilities, "elicitation", "form"),
+        elicitation_url: nested_capability_declared(capabilities, "elicitation", "url"),
+    };
+
+    let reported_agent_context = meta
+        .and_then(|m| m.get("ai.cua/agent-context"))
+        .filter(|v| v.is_object())
+        .map(|ctx| ReportedAgentContext {
+            provider: ctx
+                .get("provider")
+                .and_then(Value::as_str)
+                .and_then(bounded_metadata_value),
+            model: ctx
+                .get("model")
+                .and_then(Value::as_str)
+                .and_then(bounded_metadata_value),
+            agent_name: ctx
+                .get("agent_name")
+                .and_then(Value::as_str)
+                .and_then(bounded_metadata_value),
+            agent_version: ctx
+                .get("agent_version")
+                .and_then(Value::as_str)
+                .and_then(bounded_metadata_value),
         })
+        .filter(ReportedAgentContext::has_any_value);
+
+    InitializeMetadata {
+        protocol_version,
+        client_name,
+        client_version,
+        capability_flags,
+        reported_agent_context,
     }
 }
 
@@ -747,6 +777,116 @@ mod initialize_metadata_tests {
                 .count(),
             MAX_METADATA_CHARS
         );
+    }
+
+    /// `_meta` as Claude Code 2.1.299 sends it on every request (captured
+    /// against an owned logging server, item 32): MCP 2026-07-28, no initialize.
+    fn claude_code_meta() -> Value {
+        serde_json::json!({
+            "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+            "io.modelcontextprotocol/clientInfo": {
+                "name": "claude-code", "title": "Claude Code", "version": "2.1.299",
+                "description": "Anthropic's agentic coding tool",
+                "websiteUrl": "https://claude.com/claude-code"
+            },
+            "io.modelcontextprotocol/clientCapabilities": {
+                "roots": { "listChanged": true }, "elicitation": { "form": {}, "url": {} }
+            }
+        })
+    }
+
+    fn modern(method: &str, params: Value) -> Request {
+        serde_json::from_value(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "method": method, "params": params,
+        }))
+        .unwrap()
+    }
+
+    #[test]
+    fn modern_requests_name_their_client_in_meta() {
+        for (method, mut params) in [
+            ("server/discover", serde_json::json!({})),
+            ("tools/list", serde_json::json!({})),
+            (
+                "tools/call",
+                serde_json::json!({"name": "click", "arguments": {"pid": 1}}),
+            ),
+        ] {
+            params["_meta"] = claude_code_meta();
+            let metadata = modern(method, params).client_metadata().expect(method);
+            assert_eq!(metadata.client_name.as_deref(), Some("claude-code"));
+            assert_eq!(metadata.client_version.as_deref(), Some("2.1.299"));
+            assert_eq!(metadata.protocol_version.as_deref(), Some("2026-07-28"));
+            assert!(metadata.capability_flags.roots);
+            assert!(metadata.capability_flags.elicitation_form);
+            assert!(metadata.capability_flags.elicitation_url);
+            assert!(!metadata.capability_flags.tools);
+            let debug = format!("{metadata:?}");
+            for forbidden in ["Anthropic", "websiteUrl", "claude.com", "Claude Code"] {
+                assert!(!debug.contains(forbidden), "{forbidden}: {debug}");
+            }
+        }
+    }
+
+    #[test]
+    fn client_metadata_still_reads_a_legacy_initialize() {
+        let req = request(serde_json::json!({
+            "clientInfo": { "name": "codex-mcp-client", "version": "0.163.0" }
+        }));
+        let metadata = req.client_metadata().unwrap();
+        assert_eq!(metadata.client_name.as_deref(), Some("codex-mcp-client"));
+        assert_eq!(metadata, req.initialize_metadata().unwrap());
+    }
+
+    #[test]
+    fn only_a_modern_request_that_names_its_client_has_client_metadata() {
+        // Modern, but no clientInfo: nothing to report.
+        let mut meta = claude_code_meta();
+        meta.as_object_mut()
+            .unwrap()
+            .remove("io.modelcontextprotocol/clientInfo");
+        assert!(modern("tools/list", serde_json::json!({"_meta": meta}))
+            .client_metadata()
+            .is_none());
+        // Legacy requests after initialize: a clientInfo-shaped `_meta` key
+        // without the modern protocol version is not a handshake.
+        let mut meta = claude_code_meta();
+        meta.as_object_mut()
+            .unwrap()
+            .remove("io.modelcontextprotocol/protocolVersion");
+        assert!(modern(
+            "tools/call",
+            serde_json::json!({"name": "click", "_meta": meta})
+        )
+        .client_metadata()
+        .is_none());
+        // Claude Code's legacy tools/call `_meta`.
+        let legacy = serde_json::json!({"name": "echo", "_meta": {"claudecode/toolUseId": "toolu_1", "progressToken": 2}});
+        assert!(modern("tools/call", legacy).client_metadata().is_none());
+        // A clientInfo that is not an object, or a name that is blank.
+        let mut meta = claude_code_meta();
+        meta["io.modelcontextprotocol/clientInfo"] = serde_json::json!("claude-code");
+        assert!(modern("tools/list", serde_json::json!({"_meta": meta}))
+            .client_metadata()
+            .is_none());
+        let mut meta = claude_code_meta();
+        meta["io.modelcontextprotocol/clientInfo"] = serde_json::json!({"name": "  "});
+        assert!(modern("tools/list", serde_json::json!({"_meta": meta}))
+            .client_metadata()
+            .is_none());
+    }
+
+    #[test]
+    fn modern_client_names_are_bounded_like_initialize() {
+        let mut meta = claude_code_meta();
+        meta["io.modelcontextprotocol/clientInfo"]["name"] =
+            serde_json::json!(format!("  a\nb{}", "c".repeat(MAX_METADATA_CHARS + 10)));
+        let metadata = modern("tools/list", serde_json::json!({"_meta": meta}))
+            .client_metadata()
+            .unwrap();
+        let name = metadata.client_name.unwrap();
+        assert!(name.starts_with("abc"));
+        assert_eq!(name.chars().count(), MAX_METADATA_CHARS);
     }
 
     #[test]
