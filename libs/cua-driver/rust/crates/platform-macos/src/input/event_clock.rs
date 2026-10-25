@@ -46,3 +46,9 @@ pub(crate) fn stamp_now(event: &CGEvent) -> Result<()> {
     unsafe { CGEventSetTimestamp(event.as_ptr(), now) };
     Ok(())
 }
+
+/// The current uptime in nanoseconds, the clock events are stamped with.
+#[cfg(test)]
+pub(crate) fn uptime_now() -> Result<u64> {
+    uptime_nanoseconds()
+}
