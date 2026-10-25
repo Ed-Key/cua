@@ -57,6 +57,9 @@ fn skylight_available() -> bool {
 fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
     // An event left at 0 still posts: receivers then see it from boot, as before.
     let _ = crate::input::event_clock::stamp_now(event);
+    if route != PostRoute::Hid && is_button_down(event) {
+        reassert_user_front(pid);
+    }
     #[cfg(test)]
     if post_sink::record(route, event) {
         return;
@@ -71,6 +74,42 @@ fn dispatch_mouse_event(route: PostRoute, pid: i32, event: &CGEvent) {
         // cua posted itself.
         PostRoute::Hid => crate::focus_steal::post_hid_mouse_event(event),
     }
+}
+
+fn is_button_down(event: &CGEvent) -> bool {
+    matches!(
+        event.get_type(),
+        CGEventType::LeftMouseDown | CGEventType::RightMouseDown | CGEventType::OtherMouseDown
+    )
+}
+
+/// Item 35: re-assert the user's front app right before a pid-routed button
+/// down reaches a background target, after the down got its timestamp.
+///
+/// A fresh down into a window the target treats as key makes AppKit order
+/// that window front, and WindowServer allows it above the user's app when
+/// the event is newer than that app's activation (measured in VM B: Safari,
+/// Chrome and an AppKit pad drew over TextEdit while TextEdit stayed
+/// frontmost; stamping the down a moment before the re-assertion stops it,
+/// and the click still lands). The re-assertion is WindowServer's no-windows
+/// front request for the app already in front, so nothing of the user's
+/// moves; the down keeps a current timestamp (incident 20).
+fn reassert_user_front(target_pid: i32) {
+    #[cfg(test)]
+    if let Some(front) = post_sink::front_override() {
+        if let Some(front) = front.filter(|front| *front != target_pid) {
+            let at = crate::input::event_clock::uptime_now().unwrap_or(0);
+            post_sink::record_reassert(front, at);
+        }
+        return;
+    }
+    let Some(front) = crate::input::skylight::front_pid().filter(|front| *front != target_pid) else {
+        return;
+    };
+    // ponytail: the front is read, then re-asserted; a user switch in the
+    // microseconds between the admit check and the request is not covered.
+    let still_front = || crate::input::skylight::front_pid_matches(front) == Some(true);
+    crate::input::skylight::restore_front_pid(front, &mut { still_front });
 }
 
 #[derive(Clone, Copy)]
