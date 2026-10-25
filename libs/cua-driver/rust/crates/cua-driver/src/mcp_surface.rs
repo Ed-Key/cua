@@ -10,16 +10,15 @@
 //!   Claude Code (`ToolDef::to_list_entry`), so both profiles carry it.
 //! - For Codex (`clientInfo.name` "codex-mcp-client"), whose code mode shows
 //!   MCP instructions only inside its ALL_TOOLS catalog, prefixed to every
-//!   tool entry, the instructions are one short line on forwarding results
-//!   (`codex_instructions`), and the listing has no `outputSchema`: code mode
-//!   renders each into a TypeScript return type, about two-thirds of the
-//!   catalog. Results reach every client unchanged: code mode hands the
-//!   script the whole result, and the script forwards `content` block by
-//!   block (text, then images as image items), so the outcome text has to
-//!   be there (item 33: a pointer to `structuredContent` in its place made
-//!   the model read every window twice). Results still carry
-//!   `structuredContent`, which MCP allows without an advertised schema;
-//!   servers still validate against it.
+//!   tool entry, the instructions are a short text on showing results and
+//!   starting a task (`codex_instructions`), and the listing has no
+//!   `outputSchema`: code mode renders each into a TypeScript return type,
+//!   about two-thirds of the catalog. Results reach every client unchanged:
+//!   code mode hands the script the whole result and the script prints what
+//!   the model sees, so every block must keep its content (item 33: a
+//!   pointer to `structuredContent` in place of the text made the model read
+//!   every window twice). Results still carry `structuredContent`, which MCP
+//!   allows without an advertised schema; servers still validate against it.
 
 use cua_driver_core::mcp_result::{conforming_tool_result, tool_error_result};
 use cua_driver_core::mcp_wire::{finish_response, is_core_tool, ProtocolEra};

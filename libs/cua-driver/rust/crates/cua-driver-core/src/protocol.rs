@@ -422,13 +422,16 @@ fn workflow_steps() -> (&'static str, &'static str) {
 /// Codex code mode shows MCP instructions only inside its ALL_TOOLS catalog,
 /// prefixed to every tool entry, and its model finds tools by filtering
 /// names and descriptions for words like click, type or screen. So this is
-/// one short line that names none of them (a filter then picks tools by
-/// their own descriptions) and says the one thing no tool description does:
-/// how a script forwards a result. The long form stays in the skill.
+/// short, names none of those words (a filter then picks tools by their own
+/// descriptions), and says what no tool description does: how a script
+/// shows a result (`structuredContent` is complete for every tool; some text
+/// blocks are one-line summaries) and which read starts which kind of task.
+/// The long form stays in the skill.
 pub fn codex_instructions() -> String {
-    "Code mode: begin with get_window_state. Forward a result r with \
-     `for (const c of r.content) c.data ? image(c) : text(c.text)`; \
-     text(r) would print images as base64."
+    "Code mode: show a result r with \
+     `for (const c of r.content) if (c.data) image(c); text(r.structuredContent ?? r.content)`; \
+     text(r) would print images as base64. Apps: get_window_state, then act_and_read. \
+     Chrome pages: get_browser_state, then browser_steps."
         .to_owned()
 }
 
@@ -619,32 +622,43 @@ mod agent_instruction_tests {
 
     /// Codex code mode prefixes these instructions to every ALL_TOOLS entry
     /// and the model finds tools by filtering name + description with words
-    /// such as click, type, screen or browser (all four bench trials of item
-    /// 33). The text names none of them, so a filter selects tools by their
-    /// own descriptions, and it is short, because every printed entry pays it.
-    /// What it carries is the one thing no tool description says: how to
-    /// forward a result so the model sees its text and images.
+    /// such as click, type or screen (all four bench trials of item 33). The
+    /// text names none of them, so a filter selects tools by their own
+    /// descriptions, and it is short, because every printed entry pays it.
+    /// It says how to show a result completely (structuredContent: the text
+    /// of the browser tools is a one-line summary) without printing images as
+    /// base64, and keeps the base instructions' routing: Chrome pages go to
+    /// get_browser_state (item 33 errands: without it Codex read Chrome's
+    /// accessibility tree instead).
     #[test]
     fn codex_gets_a_short_filter_neutral_text_with_the_forwarding_line() {
         let codex = super::codex_instructions();
         assert!(
-            codex.contains("for (const c of r.content) c.data ? image(c) : text(c.text)"),
+            codex.contains(
+                "for (const c of r.content) if (c.data) image(c); text(r.structuredContent ?? r.content)"
+            ),
             "{codex}"
         );
         assert!(
             codex.contains("text(r)") && codex.contains("base64"),
             "{codex}"
         );
-        assert!(codex.contains("get_window_state"), "{codex}");
+        assert!(
+            codex.contains("Apps: get_window_state, then act_and_read."),
+            "{codex}"
+        );
+        assert!(
+            codex.contains("Chrome pages: get_browser_state, then browser_steps."),
+            "{codex}"
+        );
         let lower = codex.to_ascii_lowercase();
         for word in [
-            "click", "type", "screen", "keyboard", "keypress", "mouse", "browser", "computer",
-            "display",
+            "click", "type", "screen", "keyboard", "keypress", "mouse", "computer", "display",
         ] {
             assert!(!lower.contains(word), "{word:?} in {codex}");
         }
         let chars = codex.chars().count();
-        assert!(chars <= 200, "codex instructions are {chars} characters");
+        assert!(chars <= 260, "codex instructions are {chars} characters");
     }
 
     #[test]
