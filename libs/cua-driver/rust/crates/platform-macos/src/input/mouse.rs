@@ -2197,6 +2197,11 @@ mod post_sink {
         /// `CGEventGetTimestamp` of each posted event as it reached the
         /// transport, parallel to `posted`.
         timestamps: Vec<u64>,
+        /// The process WindowServer reports in front while capturing.
+        front_pid: Option<i32>,
+        /// Each re-assertion of the user's front app: (the number of events
+        /// posted before it, the front pid, the uptime it happened at).
+        reasserts: Vec<(usize, i32, u64)>,
     }
 
     extern "C" {
@@ -2219,9 +2224,31 @@ mod post_sink {
                     posted: Vec::new(),
                     modifiers: Vec::new(),
                     timestamps: Vec::new(),
+                    front_pid: None,
+                    reasserts: Vec::new(),
                 });
             });
             Self
+        }
+
+        /// Report `pid` as WindowServer's front process while capturing.
+        pub(super) fn with_front(self, pid: i32) -> Self {
+            STATE.with(|state| {
+                if let Some(state) = state.borrow_mut().as_mut() {
+                    state.front_pid = Some(pid);
+                }
+            });
+            self
+        }
+
+        pub(super) fn reasserts(&self) -> Vec<(usize, i32, u64)> {
+            STATE.with(|state| {
+                state
+                    .borrow()
+                    .as_ref()
+                    .map(|state| state.reasserts.clone())
+                    .unwrap_or_default()
+            })
         }
 
         /// Shift/control/option/command flags of each posted event. The rest of
@@ -2262,6 +2289,24 @@ mod post_sink {
         fn drop(&mut self) {
             STATE.with(|state| *state.borrow_mut() = None);
         }
+    }
+
+    /// While capturing: `Some(front pid)` as configured (None = unknown).
+    pub(super) fn front_override() -> Option<Option<i32>> {
+        STATE.with(|state| state.borrow().as_ref().map(|state| state.front_pid))
+    }
+
+    /// Record a re-assertion of `front`; returns whether a capture is active.
+    pub(super) fn record_reassert(front: i32, uptime: u64) -> bool {
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let Some(state) = state.as_mut() else {
+                return false;
+            };
+            let index = state.posted.len();
+            state.reasserts.push((index, front, uptime));
+            true
+        })
     }
 
     pub(super) fn skylight_override() -> Option<bool> {
@@ -2980,5 +3025,67 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// Item 35: a background button-down stamped later than the user's last
+    /// app activation lets the target order its window above the user's app
+    /// (AppKit's click-to-front, allowed by WindowServer for a fresh event).
+    /// So every background down re-asserts the user's front app first, and
+    /// the down keeps the timestamp it was given before that re-assertion.
+    #[test]
+    fn a_background_button_down_reasserts_the_users_front_app_after_its_timestamp() {
+        const USER_APP: i32 = 999;
+        type Gesture = fn() -> anyhow::Result<()>;
+        let gestures: [(&str, Gesture, &[&str]); 3] = [
+            (
+                "background chromium click",
+                || click_at_xy_chromium(1, 100.0, 100.0, 10.0, 10.0, 7, 1, &[]),
+                &["LeftMouseDown", "LeftMouseDown"],
+            ),
+            (
+                "background double click",
+                || click_at_xy_chromium(1, 100.0, 100.0, 10.0, 10.0, 7, 2, &[]),
+                &["LeftMouseDown", "LeftMouseDown", "LeftMouseDown"],
+            ),
+            (
+                "background right click",
+                || right_click_at_xy_with_window_local(1, 100.0, 100.0, 10.0, 10.0, 7, &[]),
+                &["RightMouseDown"],
+            ),
+        ];
+        for (name, gesture, downs) in gestures {
+            let capture = Capture::start(true).with_front(USER_APP);
+            gesture().unwrap();
+            let posted = capture.posted();
+            let stamps = capture.timestamps();
+            let reasserts = capture.reasserts();
+            let down_indices: Vec<usize> = posted
+                .iter()
+                .enumerate()
+                .filter(|(_, p)| p.event.ends_with("MouseDown"))
+                .map(|(i, _)| i)
+                .collect();
+            let down_names: Vec<&str> = down_indices.iter().map(|i| posted[*i].event.as_str()).collect();
+            assert_eq!(down_names, *downs, "{name}: downs");
+            assert_eq!(reasserts.len(), down_indices.len(), "{name}: one re-assertion per down");
+            for (down, (index, front, at)) in down_indices.iter().zip(&reasserts) {
+                assert_eq!(index, down, "{name}: re-asserted right before the down");
+                assert_eq!(*front, USER_APP, "{name}: re-asserted the user's app");
+                assert!(stamps[*down] <= *at, "{name}: the down is stamped before the re-assertion");
+            }
+        }
+    }
+
+    /// The target is the front app (foreground delivery, or the user's own
+    /// app), or WindowServer's front is unknown: nothing is re-asserted.
+    #[test]
+    fn a_down_to_the_front_app_or_with_an_unknown_front_reasserts_nothing() {
+        let capture = Capture::start(true).with_front(1);
+        click_at_xy_chromium(1, 100.0, 100.0, 10.0, 10.0, 7, 1, &[]).unwrap();
+        assert!(capture.reasserts().is_empty(), "target in front");
+        drop(capture);
+        let capture = Capture::start(true);
+        click_at_xy_chromium(1, 100.0, 100.0, 10.0, 10.0, 7, 1, &[]).unwrap();
+        assert!(capture.reasserts().is_empty(), "front unknown");
     }
 }
