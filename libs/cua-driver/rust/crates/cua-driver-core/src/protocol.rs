@@ -616,17 +616,34 @@ mod agent_instruction_tests {
         assert!(!instructions.contains("pip_turn"));
     }
 
+    /// Codex code mode prefixes these instructions to every ALL_TOOLS entry
+    /// and the model finds tools by filtering name + description with words
+    /// such as click, type, screen or browser (all four bench trials of item
+    /// 33). The text names none of them, so a filter selects tools by their
+    /// own descriptions, and it is short, because every printed entry pays it.
+    /// What it carries is the one thing no tool description says: how to
+    /// forward a result so the model sees its text and images.
     #[test]
-    fn codex_gets_a_compact_text_with_the_core_list_and_workflow() {
+    fn codex_gets_a_short_filter_neutral_text_with_the_forwarding_line() {
         let codex = super::codex_instructions();
-        assert!(codex.contains(&super::instruction_core_tools()));
-        assert!(codex.contains("call them directly"));
-        assert!(codex.contains("`unknown` is not success"));
-        assert!(codex.contains("`session` label"));
-        assert!(codex.contains("browser_steps"));
+        assert!(
+            codex.contains("for (const c of r.content) c.data ? image(c) : text(c.text)"),
+            "{codex}"
+        );
+        assert!(
+            codex.contains("text(r)") && codex.contains("base64"),
+            "{codex}"
+        );
+        assert!(codex.contains("get_window_state"), "{codex}");
+        let lower = codex.to_ascii_lowercase();
+        for word in [
+            "click", "type", "screen", "keyboard", "keypress", "mouse", "browser", "computer",
+            "display",
+        ] {
+            assert!(!lower.contains(word), "{word:?} in {codex}");
+        }
         let chars = codex.chars().count();
-        assert!(chars <= 900, "codex instructions are {chars} characters");
-        assert!(chars * 2 < agent_instructions().chars().count());
+        assert!(chars <= 200, "codex instructions are {chars} characters");
     }
 
     #[test]

@@ -329,23 +329,46 @@ mod tests {
         }
     }
 
+    /// A get_window_state result as the daemon returns it (image first, then
+    /// the outcome text with the token prefix and the rows), item 33.
+    fn window_read() -> Value {
+        json!({
+            "content": [
+                {"type": "image", "data": "iVBORw0KGgo", "mimeType": "image/png"},
+                {"type": "text", "text": "window_id=38 pid=771 size=1568x985 elements=3\n\nelement_token = s00000002:<index>\n- [0] AXWindow \"Inbox\"\n  - [24] AXTextField \"Search mail\" [actions=[press]]\n  - [31] AXButton \"Archive\" [actions=[press]]"},
+            ],
+            "structuredContent": {"pid": 771, "window_id": 38, "snapshot_id": "s00000002",
+                                  "tree_markdown": "- [0] AXWindow \"Inbox\""},
+        })
+    }
+
     #[test]
-    fn codex_gets_one_copy_with_images_and_structured_content_intact() {
+    fn codex_gets_the_outcome_text_images_and_structured_content_in_the_first_result() {
         let mut surface = Surface::new(ToolProfile::Full);
         surface.observe(&initialize("codex-mcp-client"));
-        let projected =
-            result(&surface.render("tools/call", Response::ok(json!(1), sample_result())));
-        assert_eq!(
-            projected["content"],
-            json!([
-                {"type": "text", "text": CODEX_TEXT_POINTER},
-                {"type": "image", "data": "iVBO", "mimeType": "image/png"},
-            ])
-        );
-        assert_eq!(
-            projected["structuredContent"],
-            sample_result()["structuredContent"]
-        );
+        for daemon in [window_read(), sample_result()] {
+            let rendered =
+                result(&surface.render("tools/call", Response::ok(json!(1), daemon.clone())));
+            // Code mode forwards `content` block by block: every text block
+            // (usable element tokens included) and every image arrive as they are.
+            assert_eq!(rendered["content"], daemon["content"]);
+            assert_eq!(rendered["structuredContent"], daemon["structuredContent"]);
+        }
+        let rendered = result(&surface.render("tools/call", Response::ok(json!(1), window_read())));
+        let texts: Vec<&str> = rendered["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter(|part| part["type"] == "text")
+            .map(|part| part["text"].as_str().unwrap())
+            .collect();
+        assert!(texts
+            .iter()
+            .any(|text| text.contains("element_token = s00000002:<index>")
+                && text.contains("[31] AXButton \"Archive\"")));
+        // Images stay image blocks; no text block carries their base64.
+        assert!(texts.iter().all(|text| !text.contains("iVBORw0KGgo")));
+        assert_eq!(rendered["content"][0]["type"], "image");
     }
 
     #[test]
