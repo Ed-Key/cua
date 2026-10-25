@@ -424,14 +424,16 @@ fn workflow_steps() -> (&'static str, &'static str) {
 /// names and descriptions for words like click, type or screen. So this is
 /// short, names none of those words (a filter then picks tools by their own
 /// descriptions), and says what no tool description does: how a script
-/// shows a result (`structuredContent` is complete for every tool; some text
-/// blocks are one-line summaries) and which read starts which kind of task.
+/// shows a result and which read starts which kind of task. A success prints
+/// its images and `structuredContent` (what Claude Code shows its model; the
+/// browser tools' text is a one-line summary of it); an error also prints its
+/// text, which can hold the only copy of the message.
 /// The long form stays in the skill.
 pub fn codex_instructions() -> String {
     "Code mode: show a result r with \
-     `for (const c of r.content) if (c.data) image(c); text(r.structuredContent ?? r.content)`; \
-     text(r) would print images as base64. Apps: get_window_state, then act_and_read. \
-     Chrome pages: get_browser_state, then browser_steps."
+     `for (const c of r.content) if (c.data) image(c); else if (r.isError) text(c.text); \
+     text(r.structuredContent ?? r.content)`; text(r) would print images as base64. \
+     Apps: get_window_state, then act_and_read. Chrome pages: get_browser_state, then browser_steps."
         .to_owned()
 }
 
@@ -626,8 +628,9 @@ mod agent_instruction_tests {
     /// text names none of them, so a filter selects tools by their own
     /// descriptions, and it is short, because every printed entry pays it.
     /// It says how to show a result completely (structuredContent: the text
-    /// of the browser tools is a one-line summary) without printing images as
-    /// base64, and keeps the base instructions' routing: Chrome pages go to
+    /// of the browser tools is a one-line summary; an error's text, which can
+    /// hold the only copy of its message) without printing images as base64,
+    /// and keeps the base instructions' routing: Chrome pages go to
     /// get_browser_state (item 33 errands: without it Codex read Chrome's
     /// accessibility tree instead).
     #[test]
@@ -635,7 +638,8 @@ mod agent_instruction_tests {
         let codex = super::codex_instructions();
         assert!(
             codex.contains(
-                "for (const c of r.content) if (c.data) image(c); text(r.structuredContent ?? r.content)"
+                "for (const c of r.content) if (c.data) image(c); else if (r.isError) text(c.text); \
+                 text(r.structuredContent ?? r.content)"
             ),
             "{codex}"
         );
@@ -658,7 +662,7 @@ mod agent_instruction_tests {
             assert!(!lower.contains(word), "{word:?} in {codex}");
         }
         let chars = codex.chars().count();
-        assert!(chars <= 260, "codex instructions are {chars} characters");
+        assert!(chars <= 300, "codex instructions are {chars} characters");
     }
 
     #[test]
