@@ -148,12 +148,18 @@ impl Surface {
 }
 
 /// Codex prints a result's `structuredContent` (`codex_instructions`), as
-/// Claude Code shows its model. An error envelope can carry only a code
-/// (`internal_error_result`, normalized tool errors) while the text holds the
-/// message, so copy the text in. Envelopes with a message, and results that
-/// are not envelopes (act_and_read's output), are left alone.
+/// Claude Code shows its model. An error envelope (a refusal marker: code,
+/// status or refusal) can lack the message its text holds
+/// (`internal_error_result`, normalized tool errors, clipboard failures), so
+/// copy the text in. Envelopes with a message, and results that are not
+/// envelopes (act_and_read's output), are left alone.
 fn carry_error_message(result: &mut Value) {
-    if result.get("isError").and_then(Value::as_bool) != Some(true) {
+    let envelope = result.get("isError").and_then(Value::as_bool) == Some(true)
+        && result.get("structuredContent").is_some_and(|structured| {
+            cua_driver_contract::is_refusal_envelope(structured)
+                && structured.get("message").is_none()
+        });
+    if !envelope {
         return;
     }
     let message = result
@@ -164,14 +170,8 @@ fn carry_error_message(result: &mut Value) {
         .filter_map(|part| part.get("text").and_then(Value::as_str))
         .collect::<Vec<_>>()
         .join("\n");
-    let Some(envelope) = result
-        .get_mut("structuredContent")
-        .and_then(Value::as_object_mut)
-    else {
-        return;
-    };
-    if !message.is_empty() && envelope.contains_key("code") && !envelope.contains_key("message") {
-        envelope.insert("message".into(), json!(message));
+    if !message.is_empty() {
+        result["structuredContent"]["message"] = json!(message);
     }
 }
 
@@ -371,6 +371,16 @@ mod tests {
             rendered["structuredContent"],
             json!({"code": "tool_invocation_failed",
                    "message": "query_context requires a nonblank query\nVerify state before retrying."})
+        );
+        // A clipboard failure marks itself with status, not code.
+        let clipboard = json!({
+            "content": [{"type": "text", "text": "Clipboard write is unavailable: no such file"}],
+            "isError": true,
+            "structuredContent": {"status": "unavailable", "error_code": "clipboard_unavailable"}});
+        let rendered = result(&codex.render("tools/call", Response::ok(json!(1), clipboard)));
+        assert_eq!(
+            rendered["structuredContent"]["message"],
+            "Clipboard write is unavailable: no such file"
         );
         // Not an envelope (act_and_read's output), or a success: unchanged.
         let output = json!({"content": [{"type": "text", "text": "STEP 1 RESULT"}], "isError": true,
