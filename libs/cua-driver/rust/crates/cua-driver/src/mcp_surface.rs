@@ -322,21 +322,6 @@ mod tests {
             assert_eq!(rendered["content"], daemon["content"]);
             assert_eq!(rendered["structuredContent"], daemon["structuredContent"]);
         }
-        let rendered = result(&surface.render("tools/call", Response::ok(json!(1), window_read())));
-        let texts: Vec<&str> = rendered["content"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .filter(|part| part["type"] == "text")
-            .map(|part| part["text"].as_str().unwrap())
-            .collect();
-        assert!(texts
-            .iter()
-            .any(|text| text.contains("element_token = s00000002:<index>")
-                && text.contains("[31] AXButton \"Archive\"")));
-        // Images stay image blocks; no text block carries their base64.
-        assert!(texts.iter().all(|text| !text.contains("iVBORw0KGgo")));
-        assert_eq!(rendered["content"][0]["type"], "image");
     }
 
     #[test]

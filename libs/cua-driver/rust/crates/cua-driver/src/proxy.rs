@@ -1339,12 +1339,14 @@ mod tests {
                    "params":{"name":"start_recording","arguments":{},"_meta":meta("codex-mcp-client")}}),
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
                    "params":{"name":"list_windows","arguments":{},"_meta":meta("claude-code")}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list",
+                   "params":{"_meta":meta("claude-code")}}),
         ] {
             serde_json::to_writer(&mut input, &request).unwrap();
             input.push(b'\n');
         }
-        let inventory =
-            Arc::new(json!({"tools":[{"name":"list_windows"},{"name":"start_recording"}]}));
+        let inventory = Arc::new(json!({"tools":[
+            {"name":"list_windows","outputSchema":{"type":"object"}},{"name":"start_recording"}]}));
         let mut output = Vec::new();
         run_proxy_io_with_profile(
             BufReader::new(input.as_slice()),
@@ -1379,6 +1381,13 @@ mod tests {
             replies[1]["result"]["content"][0]["text"], "Found 0 window(s).",
             "{:?}",
             replies[1]
+        );
+        // Rendered for Claude, not Codex: the listing keeps its output schema.
+        assert_eq!(
+            replies[2]["result"]["tools"][0]["outputSchema"],
+            json!({"type": "object"}),
+            "{:?}",
+            replies[2]
         );
     }
 
