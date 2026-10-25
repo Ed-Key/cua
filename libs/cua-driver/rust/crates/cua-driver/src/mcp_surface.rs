@@ -13,12 +13,15 @@
 //!   tool entry, the instructions are a short text on showing results and
 //!   starting a task (`codex_instructions`), and the listing has no
 //!   `outputSchema`: code mode renders each into a TypeScript return type,
-//!   about two-thirds of the catalog. Results reach every client unchanged:
-//!   code mode hands the script the whole result and the script prints what
-//!   the model sees, so every block must keep its content (item 33: a
-//!   pointer to `structuredContent` in place of the text made the model read
-//!   every window twice). Results still carry `structuredContent`, which MCP
-//!   allows without an advertised schema; servers still validate against it.
+//!   about two-thirds of the catalog. Results reach Codex as they reach every
+//!   client: code mode hands the script the whole result and the script
+//!   prints what the model sees, so every block must keep its content (item
+//!   33: a pointer to `structuredContent` in place of the text made the model
+//!   read every window twice). The one addition: an error envelope that
+//!   carries only a code gets the message from its text, because the
+//!   instructions print `structuredContent`. Results still carry
+//!   `structuredContent`, which MCP allows without an advertised schema;
+//!   servers still validate against it.
 
 use cua_driver_core::mcp_result::{conforming_tool_result, tool_error_result};
 use cua_driver_core::mcp_wire::{finish_response, is_core_tool, ProtocolEra};
@@ -109,7 +112,8 @@ impl Surface {
     }
 
     /// Apply the profile to a `tools/list` result and give Codex its
-    /// instructions. `tools/call` results pass unchanged.
+    /// instructions. `tools/call` results pass unchanged, except that a
+    /// Codex error's envelope gets its message.
     pub fn render(&self, method: &str, mut response: Response) -> Response {
         if let ResponseBody::Result { result } = &mut response.body {
             match method {
@@ -119,6 +123,7 @@ impl Surface {
                         result.insert("instructions".into(), json!(codex_instructions()));
                     }
                 }
+                "tools/call" if self.codex => carry_error_message(result),
                 _ => {}
             }
         }
@@ -139,6 +144,34 @@ impl Surface {
                 tool.remove("outputSchema");
             }
         }
+    }
+}
+
+/// Codex prints a result's `structuredContent` (`codex_instructions`), as
+/// Claude Code shows its model. An error envelope can carry only a code
+/// (`internal_error_result`, normalized tool errors) while the text holds the
+/// message, so copy the text in. Envelopes with a message, and results that
+/// are not envelopes (act_and_read's output), are left alone.
+fn carry_error_message(result: &mut Value) {
+    if result.get("isError").and_then(Value::as_bool) != Some(true) {
+        return;
+    }
+    let message = result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    let Some(envelope) = result
+        .get_mut("structuredContent")
+        .and_then(Value::as_object_mut)
+    else {
+        return;
+    };
+    if !message.is_empty() && envelope.contains_key("code") && !envelope.contains_key("message") {
+        envelope.insert("message".into(), json!(message));
     }
 }
 
@@ -324,6 +357,41 @@ mod tests {
     }
 
     #[test]
+    fn a_codex_error_envelope_gets_the_message_its_text_carries() {
+        let code_only = json!({
+            "content": [{"type": "text", "text": "query_context requires a nonblank query"},
+                        {"type": "text", "text": "Verify state before retrying."}],
+            "isError": true, "structuredContent": {"code": "tool_invocation_failed"}});
+        let mut codex = Surface::new(ToolProfile::Full);
+        codex.observe(&initialize("codex-mcp-client"));
+        let rendered =
+            result(&codex.render("tools/call", Response::ok(json!(1), code_only.clone())));
+        assert_eq!(rendered["content"], code_only["content"]);
+        assert_eq!(
+            rendered["structuredContent"],
+            json!({"code": "tool_invocation_failed",
+                   "message": "query_context requires a nonblank query\nVerify state before retrying."})
+        );
+        // Not an envelope (act_and_read's output), or a success: unchanged.
+        let output = json!({"content": [{"type": "text", "text": "STEP 1 RESULT"}], "isError": true,
+                            "structuredContent": {"action": {"code": "stale"}, "observation": {}}});
+        let success = window_read();
+        for unchanged in [output, success] {
+            assert_eq!(
+                result(&codex.render("tools/call", Response::ok(json!(1), unchanged.clone()))),
+                unchanged
+            );
+        }
+        // Other clients get the envelope as it is.
+        let mut claude = Surface::new(ToolProfile::Full);
+        claude.observe(&initialize("claude-code"));
+        assert_eq!(
+            result(&claude.render("tools/call", Response::ok(json!(1), code_only.clone()))),
+            code_only
+        );
+    }
+
+    #[test]
     fn codex_gets_the_compact_instructions_and_others_the_full_ones() {
         let full = cua_driver_core::protocol::initialize_result();
         for (client, expected) in [
@@ -351,7 +419,7 @@ mod tests {
         let mut codex = Surface::new(ToolProfile::Core);
         codex.observe(&initialize("codex-mcp-client"));
         let error = json!({"content": [{"type": "text", "text": "refused: stale token"}],
-                           "isError": true, "structuredContent": {"code": "stale"}});
+                           "isError": true, "structuredContent": {"code": "stale", "message": "stale"}});
         assert_eq!(
             result(&codex.render("tools/call", Response::ok(json!(1), error.clone()))),
             error
