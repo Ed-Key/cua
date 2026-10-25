@@ -420,15 +420,16 @@ fn workflow_steps() -> (&'static str, &'static str) {
 
 /// The instructions a Codex client gets instead of [`agent_instructions`].
 /// Codex code mode shows MCP instructions only inside its ALL_TOOLS catalog,
-/// prefixed to every tool entry, so a long text is paid once per listed tool
-/// and truncation hides most declarations. This keeps the core list and the
-/// per-task workflow; the long form stays in the skill.
+/// prefixed to every tool entry, and its model finds tools by filtering
+/// names and descriptions for words like click, type or screen. So this is
+/// one short line that names none of them (a filter then picks tools by
+/// their own descriptions) and says the one thing no tool description does:
+/// how a script forwards a result. The long form stays in the skill.
 pub fn codex_instructions() -> String {
-    let (read_step, act_step) = workflow_steps();
-    format!(
-        "cua-driver core tools; call them directly, no need to list or describe them first: {}.\n{read_step} {act_step} `verify_state` checks postconditions; `unknown` is not success. Repeat one short `session` label on every call. This server has no shell.",
-        instruction_core_tools()
-    )
+    "Code mode: begin with get_window_state. Forward a result r with \
+     `for (const c of r.content) c.data ? image(c) : text(c.text)`; \
+     text(r) would print images as base64."
+        .to_owned()
 }
 
 /// MCP `instructions` (`InitializeResult.instructions`) sent to every

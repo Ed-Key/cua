@@ -8,24 +8,23 @@
 //!   advertises everything.
 //! - The registry itself marks the core tools `anthropic/alwaysLoad` for
 //!   Claude Code (`ToolDef::to_list_entry`), so both profiles carry it.
-//! - For Codex (`clientInfo.name` "codex-mcp-client"), whose code mode prints
-//!   the whole result object, a successful result's text blocks become one
-//!   line pointing at `structuredContent`, so the model reads one copy.
-//!   Claude Code already shows its model only `structuredContent`. Images and
-//!   error results are left as they are. Codex also gets the compact
-//!   `codex_instructions`, because it repeats the instructions in every
-//!   ALL_TOOLS entry, and a listing without `outputSchema`: code mode
+//! - For Codex (`clientInfo.name` "codex-mcp-client"), whose code mode shows
+//!   MCP instructions only inside its ALL_TOOLS catalog, prefixed to every
+//!   tool entry, the instructions are one short line on forwarding results
+//!   (`codex_instructions`), and the listing has no `outputSchema`: code mode
 //!   renders each into a TypeScript return type, about two-thirds of the
-//!   catalog. Results still carry `structuredContent`, which MCP allows
-//!   without an advertised schema; servers still validate against it.
+//!   catalog. Results reach every client unchanged: code mode hands the
+//!   script the whole result, and the script forwards `content` block by
+//!   block (text, then images as image items), so the outcome text has to
+//!   be there (item 33: a pointer to `structuredContent` in its place made
+//!   the model read every window twice). Results still carry
+//!   `structuredContent`, which MCP allows without an advertised schema;
+//!   servers still validate against it.
 
 use cua_driver_core::mcp_result::{conforming_tool_result, tool_error_result};
 use cua_driver_core::mcp_wire::{finish_response, is_core_tool, ProtocolEra};
 use cua_driver_core::protocol::{codex_instructions, Request, Response, ResponseBody};
 use serde_json::{json, Value};
-
-/// The text a Codex client gets in place of a result's text blocks.
-pub const CODEX_TEXT_POINTER: &str = "Full result in structuredContent.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolProfile {
@@ -110,8 +109,8 @@ impl Surface {
         ))
     }
 
-    /// Apply the profile to a `tools/list` result and, for Codex, project a
-    /// `tools/call` result to one copy.
+    /// Apply the profile to a `tools/list` result and give Codex its
+    /// instructions. `tools/call` results pass unchanged.
     pub fn render(&self, method: &str, mut response: Response) -> Response {
         if let ResponseBody::Result { result } = &mut response.body {
             match method {
@@ -121,7 +120,6 @@ impl Surface {
                         result.insert("instructions".into(), json!(codex_instructions()));
                     }
                 }
-                "tools/call" if self.codex => project_for_codex(result),
                 _ => {}
             }
         }
@@ -143,36 +141,6 @@ impl Surface {
             }
         }
     }
-}
-
-/// Replace a successful result's text blocks with one pointer line when its
-/// `structuredContent` carries the result. Images keep their place.
-fn project_for_codex(result: &mut Value) {
-    if result.get("isError").and_then(Value::as_bool) == Some(true) {
-        return;
-    }
-    let structured = result
-        .get("structuredContent")
-        .and_then(Value::as_object)
-        .is_some_and(|object| !object.is_empty());
-    if !structured {
-        return;
-    }
-    let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) else {
-        return;
-    };
-    let mut pointed = false;
-    content.retain_mut(|part| {
-        if part.get("type").and_then(Value::as_str) != Some("text") {
-            return true;
-        }
-        if pointed {
-            return false;
-        }
-        pointed = true;
-        *part = json!({"type": "text", "text": CODEX_TEXT_POINTER});
-        true
-    });
 }
 
 #[cfg(test)]
