@@ -1345,8 +1345,11 @@ mod tests {
             serde_json::to_writer(&mut input, &request).unwrap();
             input.push(b'\n');
         }
+        // The proxy validates results against the canonical schema, so the
+        // inventory carries that one.
+        let schema = cua_driver_contract::advertised_tool_output_schema("list_windows").unwrap();
         let inventory = Arc::new(json!({"tools":[
-            {"name":"list_windows","outputSchema":{"type":"object"}},{"name":"start_recording"}]}));
+            {"name":"list_windows","outputSchema":schema.clone()},{"name":"start_recording"}]}));
         let mut output = Vec::new();
         run_proxy_io_with_profile(
             BufReader::new(input.as_slice()),
@@ -1384,8 +1387,7 @@ mod tests {
         );
         // Rendered for Claude, not Codex: the listing keeps its output schema.
         assert_eq!(
-            replies[2]["result"]["tools"][0]["outputSchema"],
-            json!({"type": "object"}),
+            replies[2]["result"]["tools"][0]["outputSchema"], schema,
             "{:?}",
             replies[2]
         );
