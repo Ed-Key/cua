@@ -96,20 +96,51 @@ fn is_button_down(event: &CGEvent) -> bool {
 /// moves; the down keeps a current timestamp (incident 20).
 fn reassert_user_front(target_pid: i32) {
     #[cfg(test)]
+    if post_sink::capturing() {
+        // Tests run without the process-wide turn other tests may hold.
+        reassert_front_now(target_pid);
+        return;
+    }
+    // Not during another worker's foreground action: it is changing the
+    // front itself, and re-asserting the old front could take its input.
+    // ponytail: a background click overlapping such an action may still
+    // raise its window; queue on the turn if that overlap ever matters.
+    let Some(_turn) = try_foreground_turn() else {
+        return;
+    };
+    reassert_front_now(target_pid);
+}
+
+/// The decision, with WindowServer behind [`front_now`] and
+/// [`restore_front`] so tests drive it through the post sink.
+fn reassert_front_now(target_pid: i32) {
+    let Some(front) = front_now().filter(|front| *front != target_pid) else {
+        return;
+    };
+    // ponytail: a user switch in the microseconds between this admission
+    // read and WindowServer's handling of the request is not covered.
+    let mut still_front = || front_now() == Some(front);
+    restore_front(front, &mut still_front);
+}
+
+fn front_now() -> Option<i32> {
+    #[cfg(test)]
     if let Some(front) = post_sink::front_override() {
-        if let Some(front) = front.filter(|front| *front != target_pid) {
+        return front;
+    }
+    crate::input::skylight::front_pid()
+}
+
+fn restore_front(front: i32, admit: &mut dyn FnMut() -> bool) {
+    #[cfg(test)]
+    if post_sink::capturing() {
+        if admit() {
             let at = crate::input::event_clock::uptime_now().unwrap_or(0);
             post_sink::record_reassert(front, at);
         }
         return;
     }
-    let Some(front) = crate::input::skylight::front_pid().filter(|front| *front != target_pid) else {
-        return;
-    };
-    // ponytail: the front is read, then re-asserted; a user switch in the
-    // microseconds between the admit check and the request is not covered.
-    let still_front = || crate::input::skylight::front_pid_matches(front) == Some(true);
-    crate::input::skylight::restore_front_pid(front, &mut { still_front });
+    crate::input::skylight::restore_front_pid(front, admit);
 }
 
 #[derive(Clone, Copy)]
@@ -2236,8 +2267,9 @@ mod post_sink {
         /// `CGEventGetTimestamp` of each posted event as it reached the
         /// transport, parallel to `posted`.
         timestamps: Vec<u64>,
-        /// The process WindowServer reports in front while capturing.
-        front_pid: Option<i32>,
+        /// What WindowServer reports in front while capturing, one read at a
+        /// time; the last value repeats.
+        fronts: Vec<Option<i32>>,
         /// Each re-assertion of the user's front app: (the number of events
         /// posted before it, the front pid, the uptime it happened at).
         reasserts: Vec<(usize, i32, u64)>,
@@ -2263,7 +2295,7 @@ mod post_sink {
                     posted: Vec::new(),
                     modifiers: Vec::new(),
                     timestamps: Vec::new(),
-                    front_pid: None,
+                    fronts: Vec::new(),
                     reasserts: Vec::new(),
                 });
             });
@@ -2272,9 +2304,14 @@ mod post_sink {
 
         /// Report `pid` as WindowServer's front process while capturing.
         pub(super) fn with_front(self, pid: i32) -> Self {
+            self.with_fronts(&[Some(pid)])
+        }
+
+        /// Report these front processes, one per read (the last repeats).
+        pub(super) fn with_fronts(self, fronts: &[Option<i32>]) -> Self {
             STATE.with(|state| {
                 if let Some(state) = state.borrow_mut().as_mut() {
-                    state.front_pid = Some(pid);
+                    state.fronts = fronts.to_vec();
                 }
             });
             self
@@ -2330,9 +2367,23 @@ mod post_sink {
         }
     }
 
-    /// While capturing: `Some(front pid)` as configured (None = unknown).
+    /// Whether a capture is active: WindowServer is then never asked.
+    pub(super) fn capturing() -> bool {
+        STATE.with(|state| state.borrow().is_some())
+    }
+
+    /// While capturing: the next front read (None = unknown, also when no
+    /// fronts were configured). Outside a capture: None.
     pub(super) fn front_override() -> Option<Option<i32>> {
-        STATE.with(|state| state.borrow().as_ref().map(|state| state.front_pid))
+        STATE.with(|state| {
+            let mut state = state.borrow_mut();
+            let state = state.as_mut()?;
+            Some(match state.fronts.len() {
+                0 => None,
+                1 => state.fronts[0],
+                _ => state.fronts.remove(0),
+            })
+        })
     }
 
     /// Record a re-assertion of `front`; returns whether a capture is active.
@@ -3123,8 +3174,40 @@ mod tests {
         click_at_xy_chromium(1, 100.0, 100.0, 10.0, 10.0, 7, 1, &[]).unwrap();
         assert!(capture.reasserts().is_empty(), "target in front");
         drop(capture);
-        let capture = Capture::start(true);
+        let capture = Capture::start(true).with_fronts(&[None]);
         click_at_xy_chromium(1, 100.0, 100.0, 10.0, 10.0, 7, 1, &[]).unwrap();
         assert!(capture.reasserts().is_empty(), "front unknown");
+    }
+
+    /// The user switched apps between the front read and the re-assertion:
+    /// the old front is not brought back.
+    #[test]
+    fn a_front_that_changed_before_admission_is_not_reasserted() {
+        let capture = Capture::start(true).with_fronts(&[Some(999), Some(555)]);
+        right_click_at_xy_with_window_local(1, 100.0, 100.0, 10.0, 10.0, 7, &[]).unwrap();
+        assert!(capture.reasserts().is_empty());
+    }
+
+    /// Only pid-routed button-downs re-assert: a HID down (the user's own
+    /// stream, foreground) and non-down events do not; a public-route down
+    /// and a middle down do.
+    #[test]
+    fn only_pid_routed_downs_reassert() {
+        let source = CGEventSource::new(CGEventSourceStateID::HIDSystemState).unwrap();
+        let event = |ty: CGEventType| {
+            CGEvent::new_mouse_event(source.clone(), ty, CGPoint::new(10.0, 10.0), CGMouseButton::Left).unwrap()
+        };
+        let cases = [
+            (PostRoute::Hid, CGEventType::LeftMouseDown, 0),
+            (PostRoute::PublicPid, CGEventType::LeftMouseDown, 1),
+            (PostRoute::SkyLight, CGEventType::OtherMouseDown, 1),
+            (PostRoute::SkyLight, CGEventType::LeftMouseUp, 0),
+            (PostRoute::SkyLight, CGEventType::MouseMoved, 0),
+        ];
+        for (route, ty, want) in cases {
+            let capture = Capture::start(true).with_front(999);
+            dispatch_mouse_event(route, 1, &event(ty));
+            assert_eq!(capture.reasserts().len(), want, "{route:?} {:?}", ty as u32);
+        }
     }
 }
