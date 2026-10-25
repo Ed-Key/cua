@@ -434,7 +434,7 @@ pub fn codex_instructions() -> String {
     let apps = if cfg!(target_os = "macos") {
         "Apps: get_window_state, then act_and_read."
     } else {
-        "Apps: get_window_state, then act on its element tokens."
+        "Apps: get_window_state, then act by element_token."
     };
     format!(
         "Code mode: show a result r with \
@@ -658,7 +658,7 @@ mod agent_instruction_tests {
             codex.contains(if cfg!(target_os = "macos") {
                 "Apps: get_window_state, then act_and_read."
             } else {
-                "Apps: get_window_state, then act on its element tokens."
+                "Apps: get_window_state, then act by element_token."
             }),
             "{codex}"
         );
