@@ -3102,6 +3102,130 @@ mod tests {
         assert!(text.contains("Nothing was sent"), "{text}");
     }
 
+    /// Web batch 1: a web page field (an AXWebArea ancestor, outside Electron)
+    /// never gets the AX text write a background Safari page accepts and
+    /// ignores; the request goes to the key rung, addressed or focused, with
+    /// nothing written first (so nothing can land twice).
+    #[test]
+    fn web_page_fields_get_keys_not_the_ax_write() {
+        // The oversized payload stops the key rung at its synthesis budget, so
+        // reaching it posts no real key events from this unit test.
+        let text = "x".repeat(OVERSIZED_CHARS);
+        for addressed in [false, true] {
+            let fixture =
+                crate::ax::bindings::test_support::EditorScope::install("AXTextField", None, || {});
+            fixture.web();
+            let element = addressed.then(|| (fixture.element_ptr(), Some(3)));
+            let result = type_text_blocking(
+                -9876,
+                &text,
+                element,
+                0,
+                false,
+                KeyboardRoute {
+                    background_focus: None,
+                    delivery_mode: super::super::DeliveryMode::Background,
+                    window_id: Some(42),
+                    keyboard_policy: BackgroundKeyboardPolicy::Allowed,
+                    prepare_native_text: true,
+                    deadline: posting_deadline(),
+                },
+            )
+            .expect("the key rung's budget refusal");
+            assert_eq!(fixture.value(), "", "no AX text write (addressed {addressed})");
+            assert!(
+                matches!(
+                    result,
+                    TypeTextDelivery::SynthesisRefused {
+                        path: PATH_KEY_EVENTS,
+                        ax_attempt: AxAttempt::NotAttempted,
+                        ..
+                    }
+                ),
+                "addressed {addressed}: the key rung, with no AX attempt"
+            );
+        }
+    }
+
+    /// A focus write the page ignores is followed by one press of the field;
+    /// the press is skipped when focus already moved, and a field that takes
+    /// neither is reported unfocused (so no key is sent).
+    #[test]
+    fn an_addressed_web_field_is_pressed_only_when_the_focus_write_did_not_take() {
+        use crate::ax::bindings::test_support::EditorScope;
+        // (focused at start, press offered, press focuses) -> (focused, presses)
+        for (focused, offered, focuses, want, presses) in [
+            (true, true, true, true, 0),
+            (false, true, true, true, 1),
+            (false, true, false, false, 1),
+            (false, false, false, false, 0),
+        ] {
+            let fixture = EditorScope::install("AXTextField", None, || {});
+            fixture.web();
+            if !focused {
+                fixture.unfocus();
+            }
+            if offered {
+                fixture.press(focuses);
+            }
+            let got = focus_web_field(-9876, fixture.element_ptr() as AXUIElementRef, Some(42));
+            let case = format!("focused {focused} offered {offered} focuses {focuses}");
+            assert_eq!(got, want, "{case}");
+            assert_eq!(fixture.presses(), presses, "{case}");
+        }
+    }
+
+    #[test]
+    fn the_web_focus_refusal_names_the_foreground_call() {
+        let result = web_field_not_focused_result(Some("s00000003:9"), "dana@example.com");
+        assert_eq!(result.is_error, Some(true));
+        let data = result.structured_content.as_ref().unwrap();
+        assert_eq!(data["code"], "web_field_not_focused");
+        assert_eq!(data["effect"], "refused");
+        assert_eq!(data["delivered_chars"], 0);
+        assert_eq!(
+            data["next_call"],
+            serde_json::json!({
+                "tool": "type_text",
+                "arguments": {
+                    "element_token": "s00000003:9",
+                    "text": "dana@example.com",
+                    "delivery_mode": "foreground",
+                },
+            })
+        );
+        let text = summary_of(&result);
+        assert!(text.contains("no key was sent"), "{text}");
+    }
+
+    /// Safari keys that read back: no px or browser-tool advice (neither
+    /// route reaches a WebKit page differently), and the next step is to check
+    /// the page instead of typing again.
+    #[test]
+    fn webkit_typing_points_at_the_page_not_another_route() {
+        let result = completed_typing_result(
+            TypeTextOutcome {
+                detail: " via CGEvent (30ms delay)".into(),
+                path: PATH_KEY_EVENTS,
+                verified: true,
+                delivered_chars: Some(16),
+                unconfirmed: None,
+            },
+            16,
+            true,
+            WebSurface::Other,
+            false,
+            "",
+        );
+        let data = result.structured_content.as_ref().unwrap();
+        assert_eq!(data["effect"], "unverifiable");
+        assert_eq!(data["delivered_chars"], 16);
+        assert!(data.get("escalation").is_none(), "{data}");
+        let text = summary_of(&result);
+        assert!(text.contains("check the page's own response"), "{text}");
+        assert!(!text.contains("px form") && !text.contains("browser_type"), "{text}");
+    }
+
     /// Over the synthesis budget at any supported key gap (2 ms is the
     /// smallest: 4 ms per character at delay 0), so reaching the key rung
     /// refuses instead of posting real key events from a unit test.

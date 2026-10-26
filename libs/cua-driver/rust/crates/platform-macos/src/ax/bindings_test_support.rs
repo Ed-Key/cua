@@ -112,6 +112,12 @@ pub(super) fn copy_string_attr(element: AXUIElementRef, attr: &str) -> Option<Op
     }) {
         return Some(value);
     }
+    if let Some(value) = with_web_area(element, |_| match attr {
+        "AXRole" => Some("AXWebArea".into()),
+        _ => None,
+    }) {
+        return Some(value);
+    }
     if let Some(value) = with_editor(element, |fixture| match attr {
         "AXRole" => Some(fixture.role.clone()),
         "AXSubrole" => None,
@@ -149,6 +155,11 @@ pub(super) fn copy_bool_attr(element: AXUIElementRef, attr: &str) -> Option<Opti
 }
 
 pub(super) fn copy_action_names(element: AXUIElementRef) -> Option<Vec<String>> {
+    if let Some(names) = with_editor(element, |fixture| {
+        fixture.press.map(|_| vec!["AXPress".to_string()]).unwrap_or_default()
+    }) {
+        return Some(names);
+    }
     with_fixture(element, |fixture| {
         if fixture.advertised_press {
             vec!["AXPress".into()]
@@ -166,9 +177,13 @@ pub(super) fn copy_element_attr(
     if let Some(parent) = with_content_group(element, |_| None) {
         return Some(parent);
     }
+    // A web editor sits in its page's web area, which is the top here.
+    if let Some(parent) = with_web_area(element, |_| None) {
+        return Some(parent);
+    }
     if let Some(parent) = with_editor(element, |fixture| {
         assert_eq!(attr, "AXParent");
-        fixture.content_group.as_ref().map(|group| unsafe {
+        fixture.content_group.as_ref().or(fixture.web_area.as_ref()).map(|group| unsafe {
             core_foundation::base::CFRetain(group.as_concrete_TypeRef() as CFTypeRef)
                 as AXUIElementRef
         })
@@ -188,6 +203,16 @@ pub(super) fn copy_element_attr(
 }
 
 pub(super) fn perform_action(element: AXUIElementRef, action: &str) -> Option<AXError> {
+    if let Some(result) = with_editor(element, |fixture| {
+        assert_eq!(action, "AXPress");
+        fixture.presses += 1;
+        if fixture.press == Some(true) {
+            fixture.focused = true;
+        }
+        kAXErrorSuccess
+    }) {
+        return Some(result);
+    }
     with_fixture(element, |fixture| {
         assert_eq!(action, "AXPress");
         fixture.calls.push("failed press");
@@ -196,6 +221,14 @@ pub(super) fn perform_action(element: AXUIElementRef, action: &str) -> Option<AX
 }
 
 pub(super) fn set_bool_attr_true(element: AXUIElementRef, attr: &str) -> Option<AXError> {
+    // The focus write is accepted and, as a background Safari page does,
+    // changes nothing.
+    if let Some(result) = with_editor(element, |_| {
+        assert_eq!(attr, "AXFocused");
+        kAXErrorSuccess
+    }) {
+        return Some(result);
+    }
     with_fixture(element, |fixture| {
         assert_eq!(attr, "AXSelected");
         fixture.calls.push("write selected");
@@ -221,6 +254,12 @@ struct EditorFixture {
     content_group: Option<core_foundation::string::CFString>,
     /// Whether the exact window reports the editor as its focused element.
     focused: bool,
+    /// Set by `EditorScope::web`: the page's `AXWebArea`, the editor's parent.
+    web_area: Option<core_foundation::string::CFString>,
+    /// The editor's advertised AXPress: `Some(true)` focuses it, `Some(false)`
+    /// does nothing, `None` is not offered.
+    press: Option<bool>,
+    presses: usize,
 }
 pub(crate) struct EditorScope {
     _element: core_foundation::string::CFString,
@@ -244,6 +283,9 @@ impl EditorScope {
                 before_write: Some(Box::new(before_write)),
                 content_group: None,
                 focused: true,
+                web_area: None,
+                press: None,
+                presses: 0,
             });
         });
         Self { _element: element }
@@ -259,6 +301,23 @@ impl EditorScope {
             slot.borrow_mut().as_mut().unwrap().content_group =
                 Some(core_foundation::string::CFString::new("Scoped fake content group"));
         });
+    }
+
+    /// Place the editor in a web page (an `AXWebArea` parent).
+    pub fn web(&self) {
+        EDITOR.with(|slot| {
+            slot.borrow_mut().as_mut().unwrap().web_area =
+                Some(core_foundation::string::CFString::new("Scoped fake web area"));
+        });
+    }
+
+    /// Offer AXPress on the editor; `focuses` says whether a press gives it focus.
+    pub fn press(&self, focuses: bool) {
+        EDITOR.with(|slot| slot.borrow_mut().as_mut().unwrap().press = Some(focuses));
+    }
+
+    pub fn presses(&self) -> usize {
+        EDITOR.with(|slot| slot.borrow().as_ref().unwrap().presses)
     }
 
     /// Report no focused element in the exact window.
@@ -428,6 +487,17 @@ fn with_content_group<T>(
         let fixture = slot.as_mut()?;
         let group = fixture.content_group.as_ref()?.as_concrete_TypeRef() as usize;
         (group == element as usize).then(|| f(fixture))
+    })
+}
+fn with_web_area<T>(
+    element: AXUIElementRef,
+    f: impl FnOnce(&mut EditorFixture) -> T,
+) -> Option<T> {
+    EDITOR.with(|slot| {
+        let mut slot = slot.borrow_mut();
+        let fixture = slot.as_mut()?;
+        let area = fixture.web_area.as_ref()?.as_concrete_TypeRef() as usize;
+        (area == element as usize).then(|| f(fixture))
     })
 }
 fn with_editor<T>(element: AXUIElementRef, f: impl FnOnce(&mut EditorFixture) -> T) -> Option<T> {
