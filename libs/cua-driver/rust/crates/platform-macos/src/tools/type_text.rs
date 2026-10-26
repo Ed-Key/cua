@@ -1542,9 +1542,7 @@ fn classify_target_web_area(
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     window_id: Option<u32>,
 ) -> WebAreaClassification {
-    use crate::ax::bindings::AXUIElementCopyAttributeValue;
-    use core_foundation::base::{CFTypeRef, TCFType};
-    use core_foundation::string::CFString;
+    use core_foundation::base::CFTypeRef;
     unsafe {
         // Start element: the addressed one (borrowed — do NOT release) or the
         // focused element (owned — must release when done). A window-addressed
@@ -1566,7 +1564,6 @@ fn classify_target_web_area(
                 },
             },
         };
-        let parent_attr = CFString::new("AXParent");
         let mut cur = start;
         let mut cur_owned = start_owned;
         let mut classification = WebAreaClassification::Incomplete;
@@ -1584,18 +1581,16 @@ fn classify_target_web_area(
                 None => break,
                 _ => {}
             }
-            let mut parent: CFTypeRef = std::ptr::null_mut();
-            let err =
-                AXUIElementCopyAttributeValue(cur, parent_attr.as_concrete_TypeRef(), &mut parent);
+            let parent = crate::ax::bindings::copy_element_attr(cur, "AXParent");
             if cur_owned {
                 CFRelease(cur as CFTypeRef);
             }
-            if err != kAXErrorSuccess || parent.is_null() {
+            let Some(parent) = parent else {
                 cur = std::ptr::null_mut();
                 cur_owned = false;
                 break;
-            }
-            cur = parent as AXUIElementRef;
+            };
+            cur = parent;
             cur_owned = true;
         }
         if cur_owned && !cur.is_null() {
