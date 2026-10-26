@@ -13,11 +13,11 @@ model -> agent harness -> Cua Driver (MCP, CLI, or SDK) -> OS accessibility + in
 
 ## Observe: tree and pixels together
 
-`get_window_state(pid, window_id)` returns the window's accessibility tree and
-a screenshot in one call. The tree says what is actionable (roles, labels, an
-`element_token` per element); the screenshot says which
-one, and shows what the tree omits or gets wrong. Pass
-`include_screenshot: false` to skip the image when you only need to re-index.
+`get_window_state(pid, window_id)` returns the window's accessibility tree, and
+a screenshot in the same call when asked. The tree says what is actionable (roles,
+labels, an `element_token` per element); the screenshot says which one, and shows
+what the tree omits or gets wrong. On macOS pass `include_screenshot: true` for
+the image (Windows and Linux attach it by default; `false` skips it).
 `get_desktop_state` captures the whole primary display.
 
 When neither the tree nor typed browser state exposes the target, the optional

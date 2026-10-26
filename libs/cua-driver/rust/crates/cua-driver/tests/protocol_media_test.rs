@@ -87,13 +87,8 @@ fn zoom_tool_returns_jpeg() {
             continue;
         }
 
-        // Window-relative pixels need this connection's current screenshot.
-        d.send(&serde_json::json!({
-            "jsonrpc":"2.0","id": 100 + tried as u64,"method":"tools/call",
-            "params":{"name":"get_window_state","arguments":{"pid": win["pid"], "window_id": wid}}
-        }));
-        d.recv();
-
+        // The read above is this connection's current screenshot of the window;
+        // a tree-only read now would replace it (item 39).
         d.send(&serde_json::json!({
             "jsonrpc":"2.0","id": request_id + 1,"method":"tools/call",
             "params":{"name":"zoom","arguments":{
@@ -219,7 +214,7 @@ fn zoom_from_zoom_click_round_trip() {
     // Step 2: read the window, then zoom on it to store context.
     d.send(&serde_json::json!({
         "jsonrpc":"2.0","id":40,"method":"tools/call",
-        "params":{"name":"get_window_state","arguments":{"pid": pid, "window_id": window_id}}
+        "params":{"name":"get_window_state","arguments":{"pid": pid, "window_id": window_id, "include_screenshot": true}}
     }));
     d.recv();
     d.send(&serde_json::json!({

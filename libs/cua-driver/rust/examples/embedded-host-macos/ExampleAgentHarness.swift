@@ -158,7 +158,7 @@ let windows = launched["windows"] as? [[String: Any]] ?? []
 let windowId = windows.first?["window_id"] as? Int ?? 0
 log("launch_app(Finder): pid: \(pid), windows: \(windows.count)")
 
-let state = call("get_window_state", ["pid": pid, "window_id": windowId])
+let state = call("get_window_state", ["pid": pid, "window_id": windowId, "include_screenshot": true])
 let images = (state["content"] as? [[String: Any]] ?? [])
     .filter { $0["type"] as? String == "image" }
 let tree = (state["structuredContent"] as? [String: Any])?["tree_markdown"] as? String

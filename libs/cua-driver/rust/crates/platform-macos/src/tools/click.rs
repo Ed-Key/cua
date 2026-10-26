@@ -366,7 +366,8 @@ fn def() -> &'static ToolDef {
         description:
             "Click an element or point. Prefer element_token from get_window_state; it works \
              on background or hidden windows without moving the pointer. Use x,y in \
-             get_window_state screenshot pixels only for surfaces missing from the tree. To \
+             get_window_state screenshot pixels (include_screenshot:true) only for surfaces \
+             missing from the tree. To \
              choose a pop-up option use set_value. Background by default. \
              Details: skill://cua-driver/WORKFLOW.md"
             .into(),

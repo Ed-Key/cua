@@ -18,9 +18,11 @@ static DEF: std::sync::OnceLock<ToolDef> = std::sync::OnceLock::new();
 fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "zoom".into(),
-        description: "Capture a JPEG (at most 500 px wide) of window region x1,y1 to x2,y2 in screenshot \
-            pixels, padded 20% per side. Then pass from_zoom:true to click or drag to use zoom \
-            pixels. zoom_context_missing: call get_window_state, then zoom, again.".into(),
+        description: "Capture a JPEG (at most 500 px wide) of window region x1,y1 to x2,y2 in pixels \
+            of this session's get_window_state screenshot (include_screenshot:true), padded 20% \
+            per side. Then pass from_zoom:true to click or drag to use zoom pixels. \
+            zoom_context_missing: call get_window_state with include_screenshot:true, then zoom, \
+            again.".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "required": ["window_id", "x1", "y1", "x2", "y2"],
@@ -67,7 +69,9 @@ impl Tool for ZoomTool {
             session_id.as_deref(),
         ) {
             Ok(context) => context,
-            Err(refusal) => return refusal,
+            Err(refusal) => {
+                return cua_driver_core::snapshot_store::label_screenshot_refusal(refusal, &args)
+            }
         };
         let x1 = match args.require_f64("x1") {
             Ok(v) => v,

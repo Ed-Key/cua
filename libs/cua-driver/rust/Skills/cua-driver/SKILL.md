@@ -37,7 +37,7 @@ Operate one exact target, observe it narrowly, act by element, and verify the us
 
 The MCP server instructions carry the same rules, so they apply even when this file is not opened.
 
-1. Read the window: `get_window_state({app})` for a single-window app on macOS, else `({pid, window_id})`. Add `query:"Save"` when you know the target, and pass `include_screenshot:false` when the tree is enough. On macOS later reads of the same window return only changed rows.
+1. Read the window: `get_window_state({app})` for a single-window app on macOS, else `({pid, window_id})`. Add `query:"Save"` when you know the target. On macOS a read is the tree only; pass `include_screenshot:true` when you need pixels (an `x,y` action, `zoom`, or a visual check). On macOS later reads of the same window return only changed rows.
 2. Act by `element_token`. A narrowed read keeps the full snapshot actionable, so you can act on a match without re-reading. Use pixels only for surfaces missing from the tree.
 3. Verify at checkpoints (after a meaningful state change, before finishing), not after every action. One `verify_state` or one targeted `get_window_state` is usually enough.
 4. Batch known steps: on macOS, `act_and_read` with `steps` (one window, background, one read at the end); `run_actions` (full tool profile) for steps across windows, foreground delivery, or drag. Both stop at the first failure; see [Workflow](WORKFLOW.md#batch-known-actions).

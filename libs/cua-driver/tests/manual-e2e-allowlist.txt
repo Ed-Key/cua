@@ -35,7 +35,7 @@ protocol_tools_call_test::type_text_chars_tool | Sends real input to a live desk
 protocol_tools_call_test::get_accessibility_tree | Reads the real running apps and windows through a source-built daemon; manual disposable-desktop run only
 protocol_tools_call_test::list_windows_structured_content | Lists every real window through a source-built daemon; manual disposable-desktop run only
 protocol_tools_call_test::get_screen_size_and_cursor_position | Reads the real display and cursor through a source-built daemon; manual disposable-desktop run only
-protocol_tools_call_test::get_window_state_returns_both_with_opt_out | Walks and captures a real window, which needs Accessibility and Screen Recording for the ad-hoc source build; manual disposable-desktop run only
+protocol_tools_call_test::get_window_state_screenshot_default_and_opt_out | Walks and captures a real window, which needs Accessibility and Screen Recording for the ad-hoc source build; manual disposable-desktop run only
 protocol_media_test::zoom_tool_returns_jpeg | Captures real windows, which needs Screen Recording for the ad-hoc source build; manual disposable-desktop run only
 protocol_media_test::recording_session | Captures the whole display with screencapture, which needs Screen Recording for the ad-hoc source build; manual disposable-desktop run only
 protocol_session_test::concurrent_multi_driver_isolation | Draws the agent-cursor overlay window on the real display; manual disposable-desktop run only

@@ -384,10 +384,10 @@ fn get_screen_size_and_cursor_position() {
 #[test]
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[ignore = "host desktop: walks and captures a real window (Accessibility / Screen Recording); see libs/cua-driver/tests/manual-e2e-allowlist.txt"]
-fn get_window_state_returns_both_with_opt_out() {
-    //! Perception is mode-agnostic: get_window_state returns BOTH the tree AND a
-    //! screenshot by default (the deprecated `capture_mode` arg is ignored), and
-    //! `include_screenshot:false` is the opt-out that returns the tree only.
+fn get_window_state_screenshot_default_and_opt_out() {
+    //! The deprecated `capture_mode` arg is ignored. On macOS a read is the tree
+    //! only unless `include_screenshot:true` (item 39); Windows still attaches a
+    //! screenshot by default. `include_screenshot:false` always returns the tree only.
     let Some(mut d) = spawn_unrestricted() else {
         return;
     };
@@ -443,9 +443,57 @@ fn get_window_state_returns_both_with_opt_out() {
         sc["element_count"].is_number(),
         "expected element_count in structuredContent: {sc:?}"
     );
-    // The screenshot is delivered by default (skip the strict image assertion on
-    // Windows, whose capture can vary, and when screen-recording isn't granted).
-    if !cfg!(target_os = "windows") && !sc["screenshot_width"].is_null() {
+    if cfg!(target_os = "macos") {
+        // Item 39: find a window that captures when asked, then read it with
+        // the defaults: no image, no capture_id, no screenshot size.
+        let candidates: Vec<(i64, u64)> = windows
+            .into_iter()
+            .flatten()
+            .filter_map(|w| Some((w["pid"].as_i64()?, w["window_id"].as_u64()?)))
+            .take(12)
+            .collect();
+        let images = |resp: &serde_json::Value| {
+            resp["result"]["content"]
+                .as_array()
+                .map_or(0, |c| c.iter().filter(|c| c["type"] == "image").count())
+        };
+        let mut checked = false;
+        for (n, (pid, wid)) in candidates.into_iter().enumerate() {
+            d.send(&serde_json::json!({
+                "jsonrpc":"2.0","id":30 + 2 * n,"method":"tools/call",
+                "params":{"name":"get_window_state","arguments":{
+                    "pid": pid, "window_id": wid, "include_screenshot": true
+                }}
+            }));
+            let asked = d.recv();
+            let asked_sc = &asked["result"]["structuredContent"];
+            if images(&asked) != 1 || asked_sc["capture_id"].is_null() {
+                continue;
+            }
+            assert!(asked_sc["screenshot_width"].as_f64().unwrap_or(0.0) > 0.0);
+            d.send(&serde_json::json!({
+                "jsonrpc":"2.0","id":31 + 2 * n,"method":"tools/call",
+                "params":{"name":"get_window_state","arguments":{"pid": pid, "window_id": wid}}
+            }));
+            let default = d.recv();
+            let default_sc = &default["result"]["structuredContent"];
+            assert!(
+                images(&default) == 0
+                    && default_sc["screenshot_width"].is_null()
+                    && default_sc["capture_id"].is_null(),
+                "a default macOS read must not attach a screenshot (window {wid}): {default:?}"
+            );
+            eprintln!("window {wid}: asked read had 1 image, default read none");
+            checked = true;
+            break;
+        }
+        if !checked {
+            eprintln!("No capturable window (Screen Recording?) — default-read check skipped");
+        }
+    }
+    // Windows delivers the screenshot by default (its capture can vary, so the
+    // strict image assertion is skipped there).
+    if cfg!(target_os = "windows") && !sc["screenshot_width"].is_null() {
         let has_image = content.iter().any(|c| c["type"] == "image");
         assert!(
             has_image,

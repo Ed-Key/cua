@@ -185,11 +185,62 @@ pub(crate) fn background_refusal_result(
             "reason": refusal.reason,
         });
     }
+    // The pixel rung stays in the background but needs a screenshot, which a
+    // read attaches only when asked (item 39). Name that read, so the
+    // background route costs one call, like the foreground one.
+    let pixel_step = (refusal.advice == Some("px")).then(|| {
+        structured["next_call"] = serde_json::json!({
+            "tool": "get_window_state",
+            "arguments": {
+                "pid": pid, "window_id": window_id,
+                "include_screenshot": true, "element_fields": "compact"
+            }
+        });
+        format!(
+            " To stay in the background: get_window_state({{pid:{pid}, window_id:{window_id}, \
+             include_screenshot:true, element_fields:\"compact\"}}), then repeat this call with \
+             x,y at the target's screenshot_frame centre instead of its element_token."
+        )
+    });
     cua_driver_core::protocol::ToolResult::error(format!(
-        "Background input refused ({}): {}",
-        refusal.code, refusal.reason
+        "Background input refused ({}): {}{}",
+        refusal.code,
+        refusal.reason,
+        pixel_step.unwrap_or_default()
     ))
     .with_structured(structured)
+}
+
+#[cfg(test)]
+mod background_refusal_tests {
+    use cua_driver_core::background_input::BackgroundRefusal;
+
+    /// Item 39: a refusal that advises the pixel rung names the screenshot
+    /// read it needs; other refusals do not.
+    #[test]
+    fn a_pixel_advice_names_the_screenshot_read() {
+        let px = BackgroundRefusal {
+            code: "background_unavailable",
+            reason: "web content".into(),
+            advice: Some("px"),
+        };
+        let result = super::background_refusal_result(7, 9, &px);
+        let structured = result.structured_content.as_ref().unwrap();
+        assert_eq!(
+            structured["next_call"],
+            serde_json::json!({"tool": "get_window_state", "arguments": {
+                "pid": 7, "window_id": 9, "include_screenshot": true, "element_fields": "compact"}})
+        );
+        match &result.content[0] {
+            cua_driver_core::protocol::Content::Text { text, .. } => {
+                assert!(text.contains("To stay in the background: get_window_state({pid:7, window_id:9, include_screenshot:true"), "{text}")
+            }
+            other => panic!("text expected, got {other:?}"),
+        }
+        let foreground = BackgroundRefusal { advice: Some("foreground"), ..px };
+        let result = super::background_refusal_result(7, 9, &foreground);
+        assert!(result.structured_content.unwrap().get("next_call").is_none());
+    }
 }
 
 /// Exclusive per-process ownership of one background mutation. Callers must
@@ -393,12 +444,27 @@ pub(crate) async fn focus_by_pixel(
                 .await?;
         }
     }
+    // The caller's x,y in native capture pixels, mapped as ClickTool maps
+    // them. Without this session's screenshot (or zoom) of the window this
+    // refuses here, before the focused-field check below can skip the click
+    // that would refuse (item 39: reads attach a screenshot only when asked).
+    let (native_x, native_y) = if window_native {
+        (x, y)
+    } else {
+        let frame_args = serde_json::json!({ "_session_id": session_id, "session": session });
+        if from_zoom {
+            zoom_context(state, &frame_args, pid, window_id)?.zoom_to_window(x, y)
+        } else {
+            let ratio = screenshot_scale(state, &frame_args, pid, window_id)?;
+            (x * ratio, y * ratio)
+        }
+    };
     // The requested field may already hold keyboard focus, for example after
     // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
     // click fallback would be destructive: Chromium's omnibox hit-tests to an
     // enclosing AXGroup that rejects AXFocused, so the fallback click moved
     // the caret and dropped the selection (#4125).
-    if focused_element_holds_point(pid, window_id, x, y, true).await {
+    if focused_element_holds_point(pid, window_id, native_x, native_y, true).await {
         return Ok(());
     }
     if let Some(ref s) = session {
@@ -440,7 +506,7 @@ pub(crate) async fn focus_by_pixel(
         // whenever the click was a silent no-op — advancing on transport
         // success alone, which is exactly what the ladder forbids. Confirm the
         // focus actually moved before claiming this rung worked.
-        if !foreground || pixel_focus_landed(pid, window_id, x, y).await {
+        if !foreground || pixel_focus_landed(pid, window_id, native_x, native_y).await {
             return Ok(());
         }
     } else if !foreground {

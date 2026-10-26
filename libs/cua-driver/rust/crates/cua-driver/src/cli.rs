@@ -2512,6 +2512,18 @@ mod daemon_compatibility_tests {
     }
 }
 
+/// `--screenshot-out-file` asks for the image it saves: a macOS window read
+/// attaches one only when asked (item 39). An explicit include_screenshot wins.
+fn request_screenshot_for_out_file(tool: &str, args: &mut serde_json::Value, out_file: bool) {
+    if out_file && tool == "get_window_state" {
+        if let Some(fields) = args.as_object_mut() {
+            fields
+                .entry("include_screenshot")
+                .or_insert(serde_json::Value::Bool(true));
+        }
+    }
+}
+
 pub fn run_call(
     tool: &str,
     json_args: Option<serde_json::Value>,
@@ -2541,6 +2553,7 @@ pub fn run_call(
             .clone()
             .unwrap_or(serde_json::Value::Object(serde_json::Map::new()));
         cua_driver_core::tool_args::sanitize_reserved_args(&mut args_for_daemon);
+        request_screenshot_for_out_file(tool, &mut args_for_daemon, screenshot_out_file.is_some());
         let named_session = args_for_daemon
             .get("session")
             .and_then(serde_json::Value::as_str)
@@ -5341,6 +5354,21 @@ fn first_sentence(text: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    /// Item 39: --screenshot-out-file on get_window_state asks for the image.
+    #[test]
+    fn screenshot_out_file_asks_get_window_state_for_an_image() {
+        let mut args = serde_json::json!({"pid": 1, "window_id": 2});
+        super::request_screenshot_for_out_file("get_window_state", &mut args, true);
+        assert_eq!(args["include_screenshot"], true);
+        let mut opted_out = serde_json::json!({"include_screenshot": false});
+        super::request_screenshot_for_out_file("get_window_state", &mut opted_out, true);
+        assert_eq!(opted_out["include_screenshot"], false);
+        let mut other = serde_json::json!({});
+        super::request_screenshot_for_out_file("zoom", &mut other, true);
+        super::request_screenshot_for_out_file("get_window_state", &mut other, false);
+        assert!(other.get("include_screenshot").is_none());
+    }
+
 
     #[test]
     fn cli_docs_json_examples_cover_every_command() {

@@ -983,7 +983,7 @@ fn electron_background_ax_refusal(
     }
     Some(BackgroundRefusal {
         code: "background_unavailable",
-        reason: "The Electron AX target cannot establish a safe exact background text route on macOS because its ancestry is web content or could not be proven native; use the pixel-targeted type_text form (x,y) or delivery_mode:\"foreground\"."
+        reason: "The Electron AX target cannot establish a safe exact background text route on macOS because its ancestry is web content or could not be proven native; use the pixel-targeted type_text form (x,y), which stays in the background, or delivery_mode:\"foreground\", which brings the app to the front."
             .to_owned(),
         advice: Some("px"),
     })

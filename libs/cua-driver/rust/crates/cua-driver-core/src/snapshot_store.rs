@@ -68,15 +68,84 @@ impl ZoomContext {
     }
 }
 
-fn screenshot_context_refusal(pid: Option<i32>, window_id: Option<u64>) -> ToolResult {
-    ToolResult::error(
-        "No current snapshot for this window contains a screenshot owned by this session. Call get_window_state with a screenshot on the same connection before using pixels.",
-    )
-    .with_structured(serde_json::json!({
+/// Pixels need a screenshot of the window from this session; on macOS
+/// get_window_state attaches one only with include_screenshot:true (item 39).
+/// The refusal names the one call that gets it, with the target and the
+/// caller's public session label filled in; without both pid and window_id
+/// it names list_windows first, since get_window_state needs both.
+pub fn screenshot_context_refusal(
+    pid: Option<i32>,
+    window_id: Option<u64>,
+    session_label: Option<&str>,
+) -> ToolResult {
+    let mut read = serde_json::Map::new();
+    if let Some(pid) = pid {
+        read.insert("pid".into(), pid.into());
+    }
+    if let Some(window_id) = window_id {
+        read.insert("window_id".into(), window_id.into());
+    }
+    read.insert("include_screenshot".into(), true.into());
+    if let Some(label) = session_label {
+        read.insert("session".into(), label.into());
+    }
+    // Shown in a fixed order: the JSON map's key order is not guaranteed.
+    let pid_part = pid.map(|pid| format!("pid:{pid}"));
+    let label_part = session_label.map(|label| format!("session:{}", serde_json::json!(label)));
+    let (next_call, step) = if let (Some(_), Some(window_id)) = (pid, window_id) {
+        let shown = [pid_part, Some(format!("window_id:{window_id}")), Some("include_screenshot:true".into()), label_part]
+            .into_iter()
+            .flatten()
+            .collect::<Vec<_>>()
+            .join(", ");
+        (
+            serde_json::json!({ "tool": "get_window_state", "arguments": read }),
+            format!("Call get_window_state({{{shown}}})"),
+        )
+    } else {
+        let mut list = serde_json::Map::new();
+        if let Some(pid) = pid {
+            list.insert("pid".into(), pid.into());
+        }
+        let step = format!(
+            "Find the window with list_windows({{{}}}), then call get_window_state with its pid, \
+             window_id and include_screenshot:true",
+            pid_part.unwrap_or_default()
+        );
+        (serde_json::json!({ "tool": "list_windows", "arguments": list }), step)
+    };
+    let message = format!(
+        "No screenshot of this window from this session, so its pixels have no frame. {step} \
+         on the same connection, then use x,y from that image. element_token actions need no \
+         screenshot."
+    );
+    ToolResult::error(message.clone()).with_structured(serde_json::json!({
+        // Nothing was dispatched: the frame is resolved before any input.
+        "status": "refused",
+        "refusal": { "code": "screenshot_context_missing", "message": message },
         "code": "screenshot_context_missing",
         "pid": pid,
         "window_id": window_id,
+        "next_call": next_call,
     }))
+}
+
+/// The same refusal carrying the caller's public `session` label, for tools
+/// that resolve the frame through an API without their arguments (zoom).
+pub fn label_screenshot_refusal(refusal: ToolResult, args: &serde_json::Value) -> ToolResult {
+    let Some(label) = args.get("session").and_then(serde_json::Value::as_str) else {
+        return refusal;
+    };
+    match refusal.structured_content.as_ref() {
+        Some(structured) if structured["code"] == "screenshot_context_missing" => {
+            screenshot_context_refusal(
+                structured["pid"].as_i64().and_then(|pid| i32::try_from(pid).ok()),
+                structured["window_id"].as_u64(),
+                Some(label),
+            )
+        }
+        _ => refusal,
+    }
 }
 
 fn stale_token_refusal<S>(pid: i32, lane: &[Snapshot<S>]) -> ToolResult {
@@ -108,7 +177,7 @@ fn stale_token_refusal<S>(pid: i32, lane: &[Snapshot<S>]) -> ToolResult {
 }
 
 fn zoom_context_refusal(pid: i32, window_id: Option<u64>) -> ToolResult {
-    let message = "The zoom coordinate context is missing or was replaced by a newer snapshot. Call get_window_state and zoom again on the same connection before using from_zoom coordinates.";
+    let message = "The zoom coordinate context is missing or was replaced by a newer snapshot. Call get_window_state with include_screenshot:true and zoom again on the same connection before using from_zoom coordinates.";
     ToolResult::error(message).with_structured(serde_json::json!({
         // Explicit shared refusal envelope: the context is resolved before any
         // input is dispatched, so nothing was delivered. Top-level fields stay
@@ -235,7 +304,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
                 })
             }
         };
-        context.ok_or_else(|| screenshot_context_refusal(Some(pid), window_id))
+        context.ok_or_else(|| screenshot_context_refusal(Some(pid), window_id, None))
     }
 
     /// The native-image / delivered-image scale for a window-relative pixel
@@ -257,6 +326,7 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
             args.get("_session_id").and_then(serde_json::Value::as_str),
         )
         .map(|context| context.scale)
+        .map_err(|refusal| label_screenshot_refusal(refusal, args))
     }
 
     pub fn screenshot_context_for_zoom(
@@ -279,7 +349,16 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         });
         match (matches.next(), matches.next()) {
             (Some(found), None) => Ok(found),
-            _ => Err(screenshot_context_refusal(None, Some(window_id))),
+            _ => {
+                let mut owners = inner.iter().filter(|(_, lane)| {
+                    lane.iter().any(|snapshot| snapshot.window_id == window_id)
+                });
+                let pid = match (owners.next(), owners.next()) {
+                    (Some((pid, _)), None) => Some(*pid),
+                    _ => None,
+                };
+                Err(screenshot_context_refusal(pid, Some(window_id), None))
+            }
         }
     }
 
@@ -895,6 +974,86 @@ mod tests {
             )
             .expect_err("a non-boolean marker is not native pixels");
         assert_eq!(refusal_code(refusal), "screenshot_context_missing");
+    }
+
+    /// Item 39: reads are tree-only by default, so the pixel refusal says
+    /// exactly which one call gets a frame, and a tree-only snapshot still
+    /// resolves element tokens.
+    #[test]
+    fn a_tree_only_read_refuses_pixels_with_the_one_call_that_fixes_it() {
+        let cache = SnapshotStore::new();
+        let (snapshot_id, _) = cache
+            .publish_for_session(10, 20, Payload(vec![1, 2]), Some("client-a"), None)
+            .unwrap();
+        let refusal = cache
+            .screenshot_context(10, Some(20), Some("client-a"))
+            .expect_err("no frame was asked for");
+        let text = match &refusal.content[0] {
+            crate::protocol::Content::Text { text, .. } => text.clone(),
+            other => panic!("text expected, got {other:?}"),
+        };
+        assert!(
+            text.contains("get_window_state({pid:10, window_id:20, include_screenshot:true})"),
+            "{text}"
+        );
+        let structured = refusal.structured_content.expect("structured");
+        assert_eq!(structured["code"], "screenshot_context_missing");
+        assert_eq!(structured["refusal"]["code"], "screenshot_context_missing");
+        assert_eq!(
+            structured["next_call"],
+            serde_json::json!({"tool": "get_window_state",
+                "arguments": {"pid": 10, "window_id": 20, "include_screenshot": true}})
+        );
+        let token = format!("{}:1", crate::element_token::format_snapshot_id(snapshot_id));
+        assert!(
+            cache
+                .resolve(10, &serde_json::json!({ "element_token": token }))
+                .is_ok_and(|resolved| matches!(resolved, ResolvedElement::Element { .. })),
+            "element tokens do not depend on a screenshot"
+        );
+
+        // zoom names its window only; the refusal fills in the one pid that has it.
+        let refusal = cache
+            .screenshot_context_for_zoom(None, 20, Some("client-a"))
+            .expect_err("no frame was asked for");
+        assert_eq!(
+            refusal.structured_content.unwrap()["next_call"]["arguments"],
+            serde_json::json!({"pid": 10, "window_id": 20, "include_screenshot": true})
+        );
+
+        // The caller's public session label carries into the read, so the
+        // retried action finds the screenshot in the same session.
+        let refusal = cache
+            .screenshot_scale(10, Some(20), &serde_json::json!({"_session_id": "client-a", "session": "run"}))
+            .expect_err("no frame was asked for");
+        let structured = refusal.structured_content.expect("structured");
+        assert_eq!(structured["next_call"]["arguments"]["session"], "run");
+        assert!(structured["refusal"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("include_screenshot:true, session:\"run\"})"));
+
+        // get_window_state needs pid and window_id; without both, find the window first.
+        for (refusal, arguments) in [
+            (
+                cache.screenshot_context_for_zoom(None, 99, Some("client-a")).unwrap_err(),
+                serde_json::json!({}),
+            ),
+            (
+                cache.screenshot_context(10, None, Some("client-a")).unwrap_err(),
+                serde_json::json!({"pid": 10}),
+            ),
+        ] {
+            let structured = refusal.structured_content.expect("structured");
+            assert_eq!(
+                structured["next_call"],
+                serde_json::json!({"tool": "list_windows", "arguments": arguments})
+            );
+            assert!(structured["refusal"]["message"]
+                .as_str()
+                .unwrap()
+                .contains("include_screenshot:true"));
+        }
     }
 
     #[test]

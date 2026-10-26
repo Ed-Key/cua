@@ -434,7 +434,7 @@ fn workflow_steps() -> (&'static str, &'static str) {
 pub fn codex_instructions() -> String {
     // act_and_read is registered only on macOS (see `workflow_steps`).
     let apps = if cfg!(target_os = "macos") {
-        "Apps: get_window_state, then act_and_read."
+        "Apps: get_window_state (text; an image on request), then act_and_read."
     } else {
         "Apps: get_window_state, then act by element_token."
     };
@@ -469,6 +469,14 @@ fn agent_instructions() -> String {
 
     let core_tools = instruction_core_tools();
 
+    // macOS window reads attach an image only when asked (item 39); Windows
+    // and Linux still attach one by default.
+    let images = if cfg!(target_os = "macos") {
+        ". Images need `include_screenshot:true`: for pixels, or for the multimodal agent to judge."
+    } else {
+        "; `include_screenshot:true` lets the multimodal agent judge visual evidence."
+    };
+
     format!(
         r#"cua-driver core tools; call them directly, no need to list or describe them first: {core_tools}.
 
@@ -478,10 +486,10 @@ On continuation/recent-work, when available, call `history_status`; if ready, ma
 
 For app/window outcomes, use the narrowest semantic Cua route first: `set_window_frame` plus `list_windows` readback for geometry, typed browser tools for supported page content, clipboard tools for clipboard state. Then climb: background `element_token` ({tree_kind}), background pixels, foreground delivery, desktop fallback. Never advance on transport success alone.
 
-0. `start_session` is optional. For multi-call work, prefer a short `session` label and repeat it on every call that accepts it. Unnamed calls use the transport's implicit session. Idle names resume; `start_session` revives others; `end_session` cleans up.
+0. `start_session` is optional; prefer a short `session` label and repeat it on every call that accepts it. Unnamed calls use the transport's implicit session. Idle names resume; `start_session` revives others; `end_session` cleans up.
 1. {read_step}
 2. {act_step}
-3. `verify_state(pid, window_id, expect)` checks bounded postconditions. `unknown` is not success; `include_screenshot:true` lets the multimodal agent judge visual evidence.
+3. `verify_state(pid, window_id, expect)` checks bounded postconditions. `unknown` is not success{images}
 
 Guide: `skill://cua-driver/SKILL.md` (`skills/get` or `resources/read`); when the host activates it, follow it and {platform_skill_pointer}."#
     )
@@ -655,7 +663,7 @@ mod agent_instruction_tests {
         );
         assert!(
             codex.contains(if cfg!(target_os = "macos") {
-                "Apps: get_window_state, then act_and_read."
+                "Apps: get_window_state (text; an image on request), then act_and_read."
             } else {
                 "Apps: get_window_state, then act by element_token."
             }),
@@ -688,6 +696,20 @@ mod agent_instruction_tests {
         } else {
             "Chrome pages: `get_browser_state(pid, window_id)`, then `browser_steps`."
         }));
+        assert_within_budget(&instructions);
+    }
+
+    /// Item 39: window reads carry no image unless asked, so the
+    /// instructions say how to ask for one, for pixels and for visual checks.
+    #[test]
+    fn the_instructions_say_how_to_ask_for_a_screenshot() {
+        let instructions = agent_instructions();
+        assert_eq!(
+            instructions.contains("Images need `include_screenshot:true`: for pixels"),
+            cfg!(target_os = "macos"),
+            "{instructions}"
+        );
+        assert!(instructions.contains("`include_screenshot:true`"));
         assert_within_budget(&instructions);
     }
 

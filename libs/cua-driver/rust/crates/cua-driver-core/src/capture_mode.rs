@@ -13,7 +13,8 @@
 //!
 //! `capture_mode` is still *accepted* on `get_window_state` so older MCP/CLI
 //! callers don't hard-break under `additionalProperties:false`, but it has no
-//! effect — both tree and screenshot come back regardless of its value.
+//! effect: what comes back is set by `include_accessibility_tree` and
+//! `include_screenshot` (on macOS a screenshot only when asked, item 39).
 
 /// The `capture_mode` JSON-schema fragment, shared by every platform's
 /// `get_window_state` so the (deprecated) param advertises an identical shape
@@ -24,7 +25,7 @@ pub fn capture_mode_schema() -> serde_json::Value {
     serde_json::json!({
         "type": "string",
         "enum": ["ax", "vision"],
-        "description": "DEPRECATED and ignored; both tree and screenshot are returned."
+        "description": "DEPRECATED and ignored; include_screenshot chooses the image."
     })
 }
 
@@ -42,6 +43,6 @@ mod tests {
         // Description must signal it's a no-op so nobody relies on it.
         let desc = schema["description"].as_str().unwrap();
         assert!(desc.contains("DEPRECATED"), "must flag deprecation: {desc}");
-        assert!(desc.contains("both"), "must say both are returned: {desc}");
+        assert!(desc.contains("include_screenshot"), "must name what chooses the image: {desc}");
     }
 }

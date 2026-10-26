@@ -23,7 +23,7 @@ These parameters have the same shape on macOS, Windows and Linux (composed from 
 | `session` | every action and cursor tool | Optional public run label. Repeat it on every call of multi-call work; it is not sticky. Without it, the call uses the connection's private implicit session. A label is never caller identity or authorization. |
 | `target` | `move_cursor`, `click`, `drag`, `scroll`, `type_text`, `press_key`, `hotkey` | The preferred per-call target: `{kind:"window", pid, window_id}` or `{kind:"desktop", display_id:"primary"}`. Cannot be combined with the legacy `scope`, `pid` or `window_id`. |
 | `delivery_mode` | `click`, `double_click`, `right_click`, `drag`, `scroll`, `type_text`, `press_key`, `hotkey` | `"background"` (the default) acts without fronting or raising the target. `"foreground"` briefly fronts it, acts, and restores the previous front window: use it only after a background attempt reports it did not land. Omitted or unknown values fall back to `"background"`. |
-| `include_screenshot` | `get_window_state` | Default `true` (tree and screenshot). `false` returns the tree only, for re-indexing before an element action. |
+| `include_screenshot` | `get_window_state` | macOS: default `false` (tree only); `true` attaches a screenshot for pixel actions and zoom. Windows and Linux: default `true`; `false` returns the tree only. |
 | `capture_mode` | `get_window_state` | Deprecated and ignored; still accepted so older callers do not fail. |
 | `modifier`, `button`, `element_token` | pointer and element tools | Held modifier keys, the mouse button, and the element handle from the latest `get_window_state` row. Action tools refuse `element_index` and `snapshot_id`. |
 

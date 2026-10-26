@@ -106,7 +106,14 @@ impl MacCaptureBindings {
                 .map_err(|_| capture_error("invalid_target", "pid is negative"))?,
             window_id: u64::from(window_id),
         };
+        let mut read = serde_json::json!({
+            "pid": pid, "window_id": window_id, "include_screenshot": true
+        });
+        if let Some(label) = args.get("session").filter(|label| label.is_string()) {
+            read["session"] = label.clone();
+        }
         self.admit(capture_id, args, target, x, y)
+            .map_err(|refusal| with_fresh_capture(refusal, "get_window_state", read))
     }
 
     pub(super) fn admit_desktop_click(
@@ -116,7 +123,12 @@ impl MacCaptureBindings {
         x: f64,
         y: f64,
     ) -> Result<(f64, f64), ToolResult> {
+        let mut read = serde_json::json!({});
+        if let Some(label) = args.get("session").filter(|label| label.is_string()) {
+            read["session"] = label.clone();
+        }
         self.admit(capture_id, args, CaptureTarget::PrimaryDesktop, x, y)
+            .map_err(|refusal| with_fresh_capture(refusal, "get_desktop_state", read))
     }
 
     fn admit(
@@ -245,6 +257,21 @@ fn scale_transform(
     .map_err(|error| capture_error("capture_publication_failed", error))
 }
 
+/// A refused capture_id (expired, consumed, another session's, a changed
+/// window) says which one call takes a fresh capture of the same target.
+fn with_fresh_capture(mut refusal: ToolResult, tool: &str, arguments: serde_json::Value) -> ToolResult {
+    let step = format!(
+        " Take a fresh capture with {tool}({arguments}) and use its capture_id and x,y."
+    );
+    if let Some(cua_driver_core::protocol::Content::Text { text, .. }) = refusal.content.first_mut() {
+        text.push_str(&step);
+    }
+    if let Some(structured) = refusal.structured_content.as_mut() {
+        structured["next_call"] = serde_json::json!({ "tool": tool, "arguments": arguments });
+    }
+    refusal
+}
+
 fn capture_error(code: &str, error: impl std::fmt::Display) -> ToolResult {
     ToolResult::error(format!(
         "capture binding failed: {error}. Not dispatching click."
@@ -258,6 +285,26 @@ fn capture_error(code: &str, error: impl std::fmt::Display) -> ToolResult {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Item 39: a refused capture_id names the call that takes a new one.
+    #[test]
+    fn a_refused_capture_names_a_fresh_capture() {
+        let refused = with_fresh_capture(
+            capture_error("capture_expired", "expired"),
+            "get_window_state",
+            serde_json::json!({"pid": 8, "window_id": 13, "include_screenshot": true}),
+        );
+        let structured = refused.structured_content.as_ref().unwrap();
+        assert_eq!(structured["code"], "capture_expired");
+        assert_eq!(structured["next_call"]["tool"], "get_window_state");
+        assert_eq!(structured["next_call"]["arguments"]["include_screenshot"], true);
+        match &refused.content[0] {
+            cua_driver_core::protocol::Content::Text { text, .. } => {
+                assert!(text.contains("Take a fresh capture with get_window_state("), "{text}")
+            }
+            other => panic!("text expected, got {other:?}"),
+        }
+    }
 
     fn args(session: &str) -> serde_json::Value {
         serde_json::json!({ "_session_id": session })
