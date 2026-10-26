@@ -55,7 +55,8 @@ loop. A one-shot CLI tool call owns a disposable runtime, so a later process
 cannot resolve its `capture_id`. Keep the four stages separate within the same
 runtime:
 
-1. Capture the exact native window with `get_window_state`, or an explicitly
+1. Capture the exact native window with `get_window_state` and
+   `include_screenshot:true`, or an explicitly
    authorized desktop with `get_desktop_state`. Use a
    native-resolution capture when the extension requires it and retain the
    returned `capture_id`, target, dimensions, and action-coordinate mapping.

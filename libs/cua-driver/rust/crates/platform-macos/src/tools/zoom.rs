@@ -69,7 +69,9 @@ impl Tool for ZoomTool {
             session_id.as_deref(),
         ) {
             Ok(context) => context,
-            Err(refusal) => return refusal,
+            Err(refusal) => {
+                return cua_driver_core::snapshot_store::label_screenshot_refusal(refusal, &args)
+            }
         };
         let x1 = match args.require_f64("x1") {
             Ok(v) => v,

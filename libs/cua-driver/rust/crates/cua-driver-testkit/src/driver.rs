@@ -23,7 +23,9 @@ pub trait BehaviorRecording {
 /// `get_window_state`. The tool's model-facing default is now one compact
 /// markdown tree, so request the full response unless the scenario chose a
 /// shape itself (`tree_format`, `full_output`, `since`, `element_fields`, or
-/// `diff`).
+/// `diff`). Scenarios also read the screenshot (pixels, capture_id, zoom),
+/// which macOS attaches only when asked (item 39), so ask unless the scenario
+/// set `include_screenshot` itself.
 pub fn with_full_window_state(tool: &str, mut args: Value) -> Value {
     if tool == "get_window_state" {
         if let Some(map) = args.as_object_mut() {
@@ -39,6 +41,8 @@ pub fn with_full_window_state(tool: &str, mut args: Value) -> Value {
             if !chose_shape {
                 map.insert("full_output".into(), Value::Bool(true));
             }
+            map.entry("include_screenshot")
+                .or_insert(Value::Bool(true));
         }
     }
     args
@@ -70,5 +74,12 @@ mod tests {
         }
         let other = with_full_window_state("click", json!({"pid": 1}));
         assert!(other.get("full_output").is_none());
+        assert!(other.get("include_screenshot").is_none());
+        assert_eq!(plain["include_screenshot"], json!(true));
+        let tree_only = with_full_window_state(
+            "get_window_state",
+            json!({"pid": 1, "window_id": 2, "include_screenshot": false}),
+        );
+        assert_eq!(tree_only["include_screenshot"], json!(false));
     }
 }

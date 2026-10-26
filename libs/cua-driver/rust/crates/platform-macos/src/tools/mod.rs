@@ -393,12 +393,27 @@ pub(crate) async fn focus_by_pixel(
                 .await?;
         }
     }
+    // The caller's x,y in native capture pixels, mapped as ClickTool maps
+    // them. Without this session's screenshot (or zoom) of the window this
+    // refuses here, before the focused-field check below can skip the click
+    // that would refuse (item 39: reads attach a screenshot only when asked).
+    let (native_x, native_y) = if window_native {
+        (x, y)
+    } else {
+        let frame_args = serde_json::json!({ "_session_id": session_id, "session": session });
+        if from_zoom {
+            zoom_context(state, &frame_args, pid, window_id)?.zoom_to_window(x, y)
+        } else {
+            let ratio = screenshot_scale(state, &frame_args, pid, window_id)?;
+            (x * ratio, y * ratio)
+        }
+    };
     // The requested field may already hold keyboard focus, for example after
     // a pixel hotkey Cmd+A. Any focus action is then redundant, and the real
     // click fallback would be destructive: Chromium's omnibox hit-tests to an
     // enclosing AXGroup that rejects AXFocused, so the fallback click moved
     // the caret and dropped the selection (#4125).
-    if focused_element_holds_point(pid, window_id, x, y, true).await {
+    if focused_element_holds_point(pid, window_id, native_x, native_y, true).await {
         return Ok(());
     }
     if let Some(ref s) = session {
@@ -440,7 +455,7 @@ pub(crate) async fn focus_by_pixel(
         // whenever the click was a silent no-op — advancing on transport
         // success alone, which is exactly what the ladder forbids. Confirm the
         // focus actually moved before claiming this rung worked.
-        if !foreground || pixel_focus_landed(pid, window_id, x, y).await {
+        if !foreground || pixel_focus_landed(pid, window_id, native_x, native_y).await {
             return Ok(());
         }
     } else if !foreground {

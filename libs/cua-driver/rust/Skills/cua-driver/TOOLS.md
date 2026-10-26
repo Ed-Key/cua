@@ -55,7 +55,7 @@ check `describe <tool>` there.
 ## zoom
 
 - After a zoom, `from_zoom:true` on `click` or `drag` maps zoom-image pixels back to full-window space.
-- `zoom` and coordinate actions return `screenshot_context_missing` when the latest snapshot has no screenshot owned by this session (on macOS a read has one only with `include_screenshot:true`). The refusal's `next_call` is that read, with the target filled in. `from_zoom` actions return `zoom_context_missing` when the zoom was never created or was replaced; call `get_window_state` with `include_screenshot:true`, then `zoom`, again on the same connection.
+- `zoom` and coordinate actions return `screenshot_context_missing` when the latest snapshot has no screenshot owned by this session (on macOS a read has one only with `include_screenshot:true`). The refusal's `next_call` is that read, with the target and your `session` label filled in (or `list_windows` first when the call named no `pid` or no `window_id`). A refused `capture_id` (expired, consumed, another session's) also carries a `next_call` for a fresh capture. `from_zoom` actions return `zoom_context_missing` when the zoom was never created or was replaced; call `get_window_state` with `include_screenshot:true`, then `zoom`, again on the same connection.
 
 ## click
 

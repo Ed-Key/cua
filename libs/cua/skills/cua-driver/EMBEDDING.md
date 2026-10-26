@@ -552,8 +552,9 @@ log("check_permissions: attribution: \(attribution) (want: host), " +
 
 // 5. Background AX read + window screenshot: proves both grants
 //    inherited without focusing anything. launch_app resolves pid +
-//    windows without foregrounding; get_window_state returns the AX
-//    element tree AND a screenshot of the (background) window.
+//    windows without foregrounding; get_window_state with
+//    include_screenshot:true returns the AX element tree AND a screenshot
+//    of the (background) window.
 let launch = call("launch_app", ["bundle_id": "com.apple.finder"])
 let launched = launch["structuredContent"] as? [String: Any] ?? [:]
 let pid = launched["pid"] as? Int ?? 0
@@ -561,7 +562,7 @@ let windows = launched["windows"] as? [[String: Any]] ?? []
 let windowId = windows.first?["window_id"] as? Int ?? 0
 log("launch_app(Finder): pid: \(pid), windows: \(windows.count)")
 
-let state = call("get_window_state", ["pid": pid, "window_id": windowId])
+let state = call("get_window_state", ["pid": pid, "window_id": windowId, "include_screenshot": true])
 let images = (state["content"] as? [[String: Any]] ?? [])
     .filter { $0["type"] as? String == "image" }
 let hasTree = (state["structuredContent"] as? [String: Any])?["elements"] != nil
