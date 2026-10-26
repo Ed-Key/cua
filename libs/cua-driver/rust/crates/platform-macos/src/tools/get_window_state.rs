@@ -33,10 +33,10 @@ fn def() -> &'static ToolDef {
     DEF.get_or_init(|| ToolDef {
         name: "get_window_state".into(),
         description: "Read one window (pid, window_id, or app for its only window): \
-            accessibility rows tagged [index], plus a screenshot whose pixels are the x,y space for \
-            pixel actions. Act on row [N] with element_token <snapshot_id>:N from the latest read. \
-            On macOS later looks return only changed rows (diff). Details: \
-            skill://cua-driver/WORKFLOW.md".into(),
+            accessibility rows tagged [index]. Act on row [N] with element_token <snapshot_id>:N \
+            from the latest read. No screenshot unless include_screenshot:true; its pixels are \
+            the x,y space for pixel actions and zoom. On macOS later looks return only changed \
+            rows (diff). Details: skill://cua-driver/WORKFLOW.md".into(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -60,12 +60,12 @@ fn def() -> &'static ToolDef {
                 "include_accessibility_tree": {
                     "type": "boolean",
                     "default": true,
-                    "description": "false skips the tree walk and returns only the screenshot and window metadata; not with include_screenshot:false."
+                    "description": "false skips the tree walk and returns only the screenshot (taken unless include_screenshot:false) and window metadata; not with include_screenshot:false."
                 },
                 "include_screenshot": {
                     "type": "boolean",
-                    "default": true,
-                    "description": "false returns the tree only, which cannot ground a pixel action."
+                    "default": false,
+                    "description": "true attaches a screenshot, needed before x,y pixel actions and zoom. element_token actions need none."
                 },
                 "screenshot_out_file": {
                     "type": "string",
@@ -230,20 +230,13 @@ impl Tool for GetWindowStateTool {
                 .session_config
                 .effective_max_image_dimension(session_id.as_deref(), &cfg)
         };
-        // `capture_mode` is DEPRECATED and ignored — get_window_state always
-        // returns BOTH the tree and a screenshot now, so the agent grounds on
-        // both and cross-checks (the AX tree lies often enough that a grounding
-        // screenshot should always be present). The modality is chosen at action
-        // time: an element ax action (element_token) or element px action (x,y).
-        // We don't even read the arg; it stays in the schema only so old callers
-        // don't trip additionalProperties:false.
+        // `capture_mode` is DEPRECATED and ignored; it stays in the schema only
+        // so old callers don't trip additionalProperties:false.
         //
-        // `include_screenshot` (default true) is the perf opt-out: set false to
-        // skip the grab and return the tree only — the cheap path when you're
-        // just re-indexing before an element ax action. `screenshot_out_file`
-        // still forces a capture (an explicit "write the frame to disk").
+        // A screenshot is attached only when asked (item 39): every image is
+        // re-read by the model on every later turn, and element_token actions
+        // need none. See `capture_requested`.
         let include_screenshot = args.get("include_screenshot").and_then(|v| v.as_bool());
-        let should_capture = include_screenshot != Some(false) || screenshot_out_file.is_some();
         // `include_accessibility_tree` (default true) is the mirror image of
         // `include_screenshot`: set false to SKIP the AX walk (the expensive
         // part) and return just the screenshot + window metadata — the
@@ -254,6 +247,8 @@ impl Tool for GetWindowStateTool {
             .get("include_accessibility_tree")
             .and_then(|v| v.as_bool())
             != Some(false);
+        let should_capture =
+            capture_requested(include_screenshot, want_tree, screenshot_out_file.is_some());
         if !want_tree && !should_capture {
             return ToolResult::error(
                 "Nothing to return: both include_accessibility_tree:false and \
@@ -412,10 +407,8 @@ impl Tool for GetWindowStateTool {
             .then(|| self.state.snapshots.remove(pid, u64::from(window_id)))
             .flatten();
 
-        // Capture the screenshot and deliver it alongside the tree — the
-        // grounding frame the agent cross-checks the (sometimes-lying) tree
-        // against. Skipped only when `include_screenshot:false` (and no
-        // screenshot_out_file). With `screenshot_out_file` set, write to disk and
+        // Capture the screenshot when it was asked for (`capture_requested`).
+        // With `screenshot_out_file` set, write to disk and
         // surface the path instead of embedding base64; otherwise embed base64.
         // The portable `max_image_dimension` is an explicit per-call override,
         // including 0 for native resolution. Without it, preserve the existing
@@ -914,8 +907,13 @@ impl Tool for GetWindowStateTool {
                 );
                 structured["escalation"] = serde_json::json!({
                     "recommended": "px",
-                    "reason": "non-AX surface — act by pixel (x,y) off the screenshot \
-                               in this response (an element px action)."
+                    "reason": if screenshot.is_some() {
+                        "non-AX surface — act by pixel (x,y) off the screenshot \
+                         in this response (an element px action)."
+                    } else {
+                        "non-AX surface — read again with include_screenshot:true, \
+                         then act by pixel (x,y) off that screenshot."
+                    }
                 });
             }
             Degradation::AxWindowUnresolved { .. } if child_parent.is_some() => {
@@ -960,8 +958,8 @@ impl Tool for GetWindowStateTool {
                 ));
                 structured["escalation"] = serde_json::json!({
                     "recommended": "foreground",
-                    "reason": "observation-only: the screenshot in this response IS the \
-                               requested window, but background input (including px) is \
+                    "reason": "observation-only: the window is live (include_screenshot:true \
+                               shows it), but background input (including px) is \
                                refused while its AX surface is unresolved — events could \
                                reach a same-process sibling window. Re-snapshot after the \
                                app settles, or act with delivery_mode:\"foreground\"."
@@ -974,13 +972,14 @@ impl Tool for GetWindowStateTool {
         // before acting. Every action still revalidates — this is advisory,
         // not a promise. Old consumers ignore the extra field.
         {
-            let capture_available = screenshot_dims.is_some();
+            // Unknown, not unavailable, when no capture was asked for.
+            let capture_available = should_capture.then_some(screenshot_dims.is_some());
             let report = tokio::task::spawn_blocking(move || {
                 let facts = crate::ax::exact_target::gather_background_facts(pid, window_id, None);
                 cua_driver_core::background_input::background_input_capability_report(
                     cua_driver_core::background_input::ExactWindowTarget { pid, window_id },
                     &facts,
-                    Some(capture_available),
+                    capture_available,
                 )
             })
             .await;
@@ -1057,6 +1056,16 @@ impl Tool for GetWindowStateTool {
             structured_content: Some(structured),
             action_record: None,
         }
+    }
+}
+
+/// Whether this read takes a screenshot: only when asked (item 39), by
+/// `include_screenshot:true`, by `screenshot_out_file`, or by a capture-only
+/// read (`include_accessibility_tree:false`, which has nothing else to return).
+fn capture_requested(include_screenshot: Option<bool>, want_tree: bool, out_file: bool) -> bool {
+    match include_screenshot {
+        Some(asked) => asked || out_file,
+        None => out_file || !want_tree,
     }
 }
 
@@ -2021,6 +2030,47 @@ mod window_scope_contract_tests {
                 .contains("include_screenshot:false"),
             "include_accessibility_tree must document the both-false error"
         );
+    }
+
+    /// Item 39: a read is the tree only unless the agent asks for an image,
+    /// and the declaration says how to ask (the field and what needs it).
+    #[test]
+    fn schema_says_reads_are_tree_only_unless_a_screenshot_is_asked_for() {
+        let d = def();
+        let shot = &d.input_schema["properties"]["include_screenshot"];
+        assert_eq!(shot["default"], false);
+        let text = shot["description"].as_str().unwrap();
+        for needle in ["pixel actions", "zoom", "element_token"] {
+            assert!(text.contains(needle), "{needle:?} missing from {text:?}");
+        }
+        assert!(
+            d.description.contains("No screenshot unless include_screenshot:true"),
+            "{}",
+            d.description
+        );
+    }
+
+    /// Item 39: who asks for a capture. A capture-only read
+    /// (include_accessibility_tree:false) still gets its screenshot.
+    #[test]
+    fn a_screenshot_is_taken_only_when_asked() {
+        // (include_screenshot, want_tree, screenshot_out_file) -> capture
+        for (shot, tree, file, want) in [
+            (None, true, false, false),
+            (Some(false), true, false, false),
+            (Some(true), true, false, true),
+            (None, true, true, true),
+            (Some(false), true, true, true),
+            (None, false, false, true),
+            (Some(false), false, false, false),
+            (Some(true), false, false, true),
+        ] {
+            assert_eq!(
+                super::capture_requested(shot, tree, file),
+                want,
+                "include_screenshot={shot:?} tree={tree} out_file={file}"
+            );
+        }
     }
 
     #[test]

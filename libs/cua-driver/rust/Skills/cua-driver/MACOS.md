@@ -133,14 +133,13 @@ When a cua-driver call surprises you, diagnose cua-driver first:
   `full_output:true`) for the full outline and `element_fields:"compact"` for
   records. Upstream's `tree_format`, `since` and `verbose` are aliases here;
   see TOOLS.md.
-- **Empty `tree_markdown`?** `get_window_state` returns **both** the
-  AX tree and a screenshot by default: there's nothing to configure and
-  no capture mode to pick. An empty tree means the surface isn't AX (a
-  non-AX surface: Electron/Chromium/canvas), and the response carries
-  `degraded: true`, so act by **`px`** off the screenshot that's
-  already in the same response. `capture_mode` is **deprecated and
-  ignored** (still accepted so old callers don't error, but it has no
-  effect; tree + screenshot come back regardless); don't reach for
+- **Empty `tree_markdown`?** `get_window_state` returns the AX tree,
+  and a screenshot only with `include_screenshot:true`. An empty tree
+  means the surface isn't AX (a non-AX surface: Electron/Chromium/canvas),
+  and the response carries `degraded: true`: read again with
+  `include_screenshot:true` and act by **`px`** off that screenshot.
+  `capture_mode` is **deprecated and ignored** (still accepted so old
+  callers don't error, but it has no effect); don't reach for
   `get_config` to "switch modes," there is no mode to switch.
 - **`has_screenshot: false`?** The window capture failed (transient
   race against a close, or the window has no backing store yet).
@@ -158,20 +157,17 @@ genuinely needs frontmost state, fall through to the activate
 fallback. Always name the focus steal in your response ("I'll
 briefly bring Chrome to the front because …").
 
-### Verifying actions: cross-check the tree against the pixels you already have
+### Verifying actions: the tree first, a screenshot when the tree lies
 
-There is no `ax`/`vision` capture toggle. **Every `get_window_state`
-returns both the AX tree and a screenshot** (default), so verifying that
-an action **landed** never means "go grab a screenshot": it means
-cross-check the tree diff against the pixels you already have in the same
-response, and only switch _dispatch rung_ on a real signal:
+There is no `ax`/`vision` capture toggle. **`get_window_state` returns
+the AX tree; pass `include_screenshot:true` for a screenshot** of the same
+window in the same response. Every image stays in your context for the
+rest of the task, so ask for one only on a real signal:
 
 1. **Re-snapshot and read the tree diff**: a changed `AXValue`, a new
    element, a collapsed menu, a disabled button. If the tree shows the
-   change, you're done. When you only need the tree diff and don't need
-   fresh pixels, pass `include_screenshot:false` to skip the grab: a
-   **perf** knob, not a mode flip.
-2. **Trust the screenshot and do an element px action** when the tree
+   change, you're done.
+2. **Read with `include_screenshot:true` and do an element px action** when the tree
    **lies**: the action response carried `effect:"suspected_noop"`, the
    re-snapshot came back `degraded` (empty tree), or the tree looks
    unchanged/unreadable / disagrees with the pixels on a surface where
@@ -184,11 +180,11 @@ response, and only switch _dispatch rung_ on a real signal:
      limits" above. `AXValue` can lag the rendered pixels or report the
      placeholder while the field is actually populated.
 
-On these surfaces you read the result off the screenshot already in the
-response, then address the target by `x,y`: an **element px action**.
-`px` is your **conscious switch to the pixel addressing path**, not a
-different capture: the screenshot was always there, you just change _how
-you address_ the target. The point is to catch the "type → AX-check
+On these surfaces you read the result off that screenshot, then address
+the target by `x,y` (with its `capture_id`): an **element px action**.
+`px` is your **conscious switch to the pixel addressing path**. A pixel
+action without a screenshot from this session is refused with
+`screenshot_context_missing`; its `next_call` is the one read to make. The point is to catch the "type → AX-check
 succeeds → believe the lie → find out three calls later" trap on exactly
 the surfaces that warrant it.
 
@@ -200,7 +196,7 @@ Rule of thumb:
 - **element px action**: when the tree is unreadable / `suspected_noop`
   / `degraded` / disagrees with the pixels, or for pure visual
   inspection (reading a chart). You address by `x,y` off the screenshot
-  that's already in the snapshot response.
+  of a `get_window_state` with `include_screenshot:true`.
 
 ### Self-check pattern
 

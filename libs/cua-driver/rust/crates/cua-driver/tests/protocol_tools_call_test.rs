@@ -384,10 +384,10 @@ fn get_screen_size_and_cursor_position() {
 #[test]
 #[cfg(any(target_os = "macos", target_os = "windows"))]
 #[ignore = "host desktop: walks and captures a real window (Accessibility / Screen Recording); see libs/cua-driver/tests/manual-e2e-allowlist.txt"]
-fn get_window_state_returns_both_with_opt_out() {
-    //! Perception is mode-agnostic: get_window_state returns BOTH the tree AND a
-    //! screenshot by default (the deprecated `capture_mode` arg is ignored), and
-    //! `include_screenshot:false` is the opt-out that returns the tree only.
+fn get_window_state_screenshot_default_and_opt_out() {
+    //! The deprecated `capture_mode` arg is ignored. On macOS a read is the tree
+    //! only unless `include_screenshot:true` (item 39); Windows still attaches a
+    //! screenshot by default. `include_screenshot:false` always returns the tree only.
     let Some(mut d) = spawn_unrestricted() else {
         return;
     };
@@ -443,9 +443,37 @@ fn get_window_state_returns_both_with_opt_out() {
         sc["element_count"].is_number(),
         "expected element_count in structuredContent: {sc:?}"
     );
-    // The screenshot is delivered by default (skip the strict image assertion on
-    // Windows, whose capture can vary, and when screen-recording isn't granted).
-    if !cfg!(target_os = "windows") && !sc["screenshot_width"].is_null() {
+    if cfg!(target_os = "macos") {
+        assert!(
+            !content.iter().any(|c| c["type"] == "image")
+                && sc["screenshot_width"].is_null()
+                && sc["capture_id"].is_null(),
+            "a default macOS read must not attach a screenshot: {resp:?}"
+        );
+        // Asked for, it comes back (when Screen Recording is granted).
+        d.send(&serde_json::json!({
+            "jsonrpc":"2.0","id":30,"method":"tools/call",
+            "params":{"name":"get_window_state","arguments":{
+                "pid": pid, "window_id": wid, "include_screenshot": true
+            }}
+        }));
+        let asked = d.recv();
+        let asked_sc = &asked["result"]["structuredContent"];
+        if asked_sc["screenshot_error"].is_null() {
+            let images = asked["result"]["content"]
+                .as_array()
+                .expect("content array")
+                .iter()
+                .filter(|c| c["type"] == "image")
+                .count();
+            assert_eq!(images, 1, "include_screenshot:true attaches one image: {asked:?}");
+            assert!(asked_sc["screenshot_width"].as_f64().unwrap_or(0.0) > 0.0);
+            assert!(asked_sc["capture_id"].is_string(), "{asked_sc:?}");
+        }
+    }
+    // Windows delivers the screenshot by default (its capture can vary, so the
+    // strict image assertion is skipped there).
+    if cfg!(target_os = "windows") && !sc["screenshot_width"].is_null() {
         let has_image = content.iter().any(|c| c["type"] == "image");
         assert!(
             has_image,

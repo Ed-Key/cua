@@ -68,14 +68,36 @@ impl ZoomContext {
     }
 }
 
+/// Pixels need a screenshot this session asked for: get_window_state
+/// attaches one only with include_screenshot:true (item 39). The refusal
+/// names that one call, with the target filled in where it is known.
 fn screenshot_context_refusal(pid: Option<i32>, window_id: Option<u64>) -> ToolResult {
-    ToolResult::error(
-        "No current snapshot for this window contains a screenshot owned by this session. Call get_window_state with a screenshot on the same connection before using pixels.",
-    )
-    .with_structured(serde_json::json!({
+    let target = match (pid, window_id) {
+        (Some(pid), Some(window_id)) => format!("pid:{pid}, window_id:{window_id}"),
+        (Some(pid), None) => format!("pid:{pid}, window_id"),
+        (None, Some(window_id)) => format!("pid, window_id:{window_id}"),
+        (None, None) => "pid, window_id".to_owned(),
+    };
+    let message = format!(
+        "No screenshot of this window from this session: get_window_state attaches one only \
+         when asked. Call get_window_state({{{target}, include_screenshot:true}}) on the same \
+         connection, then use x,y from that image. element_token actions need no screenshot."
+    );
+    let mut arguments = serde_json::json!({ "include_screenshot": true });
+    if let Some(pid) = pid {
+        arguments["pid"] = pid.into();
+    }
+    if let Some(window_id) = window_id {
+        arguments["window_id"] = window_id.into();
+    }
+    ToolResult::error(message.clone()).with_structured(serde_json::json!({
+        // Nothing was dispatched: the frame is resolved before any input.
+        "status": "refused",
+        "refusal": { "code": "screenshot_context_missing", "message": message },
         "code": "screenshot_context_missing",
         "pid": pid,
         "window_id": window_id,
+        "next_call": { "tool": "get_window_state", "arguments": arguments },
     }))
 }
 
@@ -108,7 +130,7 @@ fn stale_token_refusal<S>(pid: i32, lane: &[Snapshot<S>]) -> ToolResult {
 }
 
 fn zoom_context_refusal(pid: i32, window_id: Option<u64>) -> ToolResult {
-    let message = "The zoom coordinate context is missing or was replaced by a newer snapshot. Call get_window_state and zoom again on the same connection before using from_zoom coordinates.";
+    let message = "The zoom coordinate context is missing or was replaced by a newer snapshot. Call get_window_state with include_screenshot:true and zoom again on the same connection before using from_zoom coordinates.";
     ToolResult::error(message).with_structured(serde_json::json!({
         // Explicit shared refusal envelope: the context is resolved before any
         // input is dispatched, so nothing was delivered. Top-level fields stay
@@ -279,7 +301,16 @@ impl<S: SnapshotPayload> SnapshotStore<S> {
         });
         match (matches.next(), matches.next()) {
             (Some(found), None) => Ok(found),
-            _ => Err(screenshot_context_refusal(None, Some(window_id))),
+            _ => {
+                let mut owners = inner.iter().filter(|(_, lane)| {
+                    lane.iter().any(|snapshot| snapshot.window_id == window_id)
+                });
+                let pid = match (owners.next(), owners.next()) {
+                    (Some((pid, _)), None) => Some(*pid),
+                    _ => None,
+                };
+                Err(screenshot_context_refusal(pid, Some(window_id)))
+            }
         }
     }
 
@@ -895,6 +926,52 @@ mod tests {
             )
             .expect_err("a non-boolean marker is not native pixels");
         assert_eq!(refusal_code(refusal), "screenshot_context_missing");
+    }
+
+    /// Item 39: reads are tree-only by default, so the pixel refusal says
+    /// exactly which one call gets a frame, and a tree-only snapshot still
+    /// resolves element tokens.
+    #[test]
+    fn a_tree_only_read_refuses_pixels_with_the_one_call_that_fixes_it() {
+        let cache = SnapshotStore::new();
+        let (snapshot_id, _) = cache
+            .publish_for_session(10, 20, Payload(vec![1, 2]), Some("client-a"), None)
+            .unwrap();
+        let refusal = cache
+            .screenshot_context(10, Some(20), Some("client-a"))
+            .expect_err("no frame was asked for");
+        let text = match &refusal.content[0] {
+            crate::protocol::Content::Text { text, .. } => text.clone(),
+            other => panic!("text expected, got {other:?}"),
+        };
+        assert!(
+            text.contains("get_window_state({pid:10, window_id:20, include_screenshot:true})"),
+            "{text}"
+        );
+        let structured = refusal.structured_content.expect("structured");
+        assert_eq!(structured["code"], "screenshot_context_missing");
+        assert_eq!(structured["refusal"]["code"], "screenshot_context_missing");
+        assert_eq!(
+            structured["next_call"],
+            serde_json::json!({"tool": "get_window_state",
+                "arguments": {"pid": 10, "window_id": 20, "include_screenshot": true}})
+        );
+        let token = format!("{}:1", crate::element_token::format_snapshot_id(snapshot_id));
+        assert!(
+            cache
+                .resolve(10, &serde_json::json!({ "element_token": token }))
+                .is_ok_and(|resolved| matches!(resolved, ResolvedElement::Element { .. })),
+            "element tokens do not depend on a screenshot"
+        );
+
+        // zoom names its window only; the refusal fills in the one pid that has it.
+        let refusal = cache
+            .screenshot_context_for_zoom(None, 20, Some("client-a"))
+            .expect_err("no frame was asked for");
+        assert_eq!(
+            refusal.structured_content.unwrap()["next_call"]["arguments"],
+            serde_json::json!({"pid": 10, "window_id": 20, "include_screenshot": true})
+        );
     }
 
     #[test]

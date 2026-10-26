@@ -1235,6 +1235,25 @@ mod tests {
             .join(" ")
     }
 
+    /// Item 39: macOS reads attach no screenshot unless asked, and the
+    /// shipped guides say how to ask instead of promising one by default.
+    #[test]
+    fn skill_guides_say_how_to_ask_for_a_screenshot() {
+        let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let read = |file: &str| {
+            std::fs::read_to_string(crate_dir.join("../../Skills/cua-driver").join(file))
+                .unwrap_or_else(|error| panic!("failed to read {file}: {error}"))
+        };
+        for file in ["SKILL.md", "WORKFLOW.md", "MACOS.md", "TOOLS.md"] {
+            let text = read(file);
+            assert!(text.contains("include_screenshot:true"), "{file}");
+            for stale in ["a screenshot by default", "returns **both**", "already in the same response"] {
+                assert!(!text.contains(stale), "{file} still says {stale:?}");
+            }
+        }
+        assert!(read("TOOLS.md").contains("`next_call`"));
+    }
+
     #[test]
     fn macos_skill_keeps_ax_only_and_non_prompting_permission_guidance() {
         let crate_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
