@@ -1379,6 +1379,9 @@ enum Unconfirmed {
     Unchanged,
     /// Readable, but the change is not exactly the typed text.
     Mismatch,
+    /// Web content showing only part of the typed text when the read-back
+    /// ended, every key having been posted.
+    Lagging,
 }
 
 impl Unconfirmed {
@@ -1405,6 +1408,10 @@ impl Unconfirmed {
             Self::Mismatch => {
                 "the field's text changed, but not by exactly the typed text \
                  (autocorrect, autocapitalization, or another edit)"
+            }
+            Self::Lagging => {
+                "the page showed only part of the text when the read-back ended and \
+                 may still be taking the rest"
             }
         }
     }
@@ -2058,9 +2065,10 @@ fn type_text_blocking(
                 });
             }
         };
-        let (delivered_chars, unconfirmed) = web_zero_is_unknown(
+        let (delivered_chars, unconfirmed) = web_shortfall_is_unknown(
             delivered_chars,
             unconfirmed,
+            text.chars().count(),
             target_in_web_area(pid, element_ptr_and_idx, window_id),
         );
         // Only claim the `_fg` path when a front actually happened; when no
@@ -2376,9 +2384,10 @@ fn type_text_blocking(
             });
         }
     };
-    let (delivered_chars, unconfirmed) = web_zero_is_unknown(
+    let (delivered_chars, unconfirmed) = web_shortfall_is_unknown(
         delivered_chars,
         unconfirmed,
+        text.chars().count(),
         target_in_web_area(pid, element_ptr_and_idx, window_id),
     );
     Ok(TypeTextDelivery::Typed(TypeTextOutcome {
@@ -2456,7 +2465,8 @@ fn await_addressed_focus(pid: i32, element: AXUIElementRef, window_id: Option<u3
     }
 }
 
-const WEB_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(500);
+// Short: the background wait runs inside the focus preparation's 2 s bound.
+const WEB_FOCUS_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(250);
 
 /// Whether `element` is the focused element of its window (`window_id`), or
 /// of the process when no window is given.
@@ -2474,19 +2484,23 @@ fn addressed_element_has_focus(pid: i32, element: AXUIElementRef, window_id: Opt
     }
 }
 
-/// Key events into web content whose AXValue did not change: the page may
-/// have taken every key (a combobox moves accessibility focus to a
-/// suggestion, AX lags the renderer), so "0 delivered" would be a false
-/// count. Report it as unknown instead.
-fn web_zero_is_unknown(
+/// Key events into web content (every key posted) whose AXValue shows none
+/// or only part of the text: the page may have taken every key (a combobox
+/// moves accessibility focus to a suggestion, AX lags the renderer: a
+/// background Safari page under load showed 4 of 24 characters at the end of
+/// the drain and all 24 a moment later), so "0 delivered" or "delivered 4,
+/// retry the rest" would be a false count, and the retry would type the
+/// suffix twice. Report it as unknown instead.
+fn web_shortfall_is_unknown(
     delivered_chars: Option<usize>,
     unconfirmed: Option<Unconfirmed>,
+    requested_chars: usize,
     web_content: bool,
 ) -> (Option<usize>, Option<Unconfirmed>) {
-    if web_content && delivered_chars == Some(0) {
-        (None, Some(Unconfirmed::Unchanged))
-    } else {
-        (delivered_chars, unconfirmed)
+    match delivered_chars {
+        Some(0) if web_content => (None, Some(Unconfirmed::Unchanged)),
+        Some(n) if web_content && n < requested_chars => (None, Some(Unconfirmed::Lagging)),
+        _ => (delivered_chars, unconfirmed),
     }
 }
 
@@ -2558,13 +2572,16 @@ mod tests {
 
     #[test]
     fn an_unchanged_web_value_is_unknown_not_zero() {
-        use super::web_zero_is_unknown;
-        use super::Unconfirmed::{Unchanged, Unreadable};
-        assert_eq!(web_zero_is_unknown(Some(0), None, true), (None, Some(Unchanged)));
-        assert_eq!(web_zero_is_unknown(Some(0), None, false), (Some(0), None));
-        assert_eq!(web_zero_is_unknown(Some(3), None, true), (Some(3), None));
+        use super::web_shortfall_is_unknown;
+        use super::Unconfirmed::{Lagging, Unchanged, Unreadable};
+        assert_eq!(web_shortfall_is_unknown(Some(0), None, 5, true), (None, Some(Unchanged)));
+        assert_eq!(web_shortfall_is_unknown(Some(0), None, 5, false), (Some(0), None));
+        // A web prefix is not a count to retry from: the page may still be taking keys.
+        assert_eq!(web_shortfall_is_unknown(Some(3), None, 5, true), (None, Some(Lagging)));
+        assert_eq!(web_shortfall_is_unknown(Some(3), None, 5, false), (Some(3), None));
+        assert_eq!(web_shortfall_is_unknown(Some(5), None, 5, true), (Some(5), None));
         assert_eq!(
-            web_zero_is_unknown(None, Some(Unreadable), true),
+            web_shortfall_is_unknown(None, Some(Unreadable), 5, true),
             (None, Some(Unreadable))
         );
     }
