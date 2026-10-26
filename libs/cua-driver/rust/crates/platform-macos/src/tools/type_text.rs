@@ -2420,7 +2420,7 @@ fn read_back_ax_write(err: crate::ax::bindings::AXError) -> bool {
 /// action focuses the field the way `click {element_token}` does. The press
 /// is sent only when the write left focus elsewhere, and focus is proven
 /// either way before any key.
-fn focus_web_field(pid: i32, element: AXUIElementRef, window_id: Option<u32>) -> bool {
+pub(super) fn focus_web_field(pid: i32, element: AXUIElementRef, window_id: Option<u32>) -> bool {
     if await_addressed_focus(pid, element, window_id) {
         return true;
     }
@@ -2433,6 +2433,38 @@ fn focus_web_field(pid: i32, element: AXUIElementRef, window_id: Option<u32>) ->
     presses
         && unsafe { crate::ax::bindings::perform_action(element, "AXPress") } == kAXErrorSuccess
         && await_addressed_focus(pid, element, window_id)
+}
+
+/// The web page text field at a pixel hit: the hit element or one of its
+/// three nearest ancestors with a text-entry role (a hit usually lands on the
+/// field's placeholder text), in web content outside Electron. Retained; the
+/// caller releases it.
+pub(super) fn web_text_field_at(
+    pid: i32,
+    hit: AXUIElementRef,
+    window_id: u32,
+) -> Option<AXUIElementRef> {
+    if crate::browser::electron_js::ElectronJs::is_electron(pid) {
+        return None;
+    }
+    unsafe {
+        CFRetain(hit as CFTypeRef);
+        let mut current = hit;
+        for _ in 0..4 {
+            let role = copy_string_attr(current, "AXRole").unwrap_or_default();
+            if is_text_entry_role(&role) {
+                if target_in_web_area(pid, Some((current as usize, None)), Some(window_id)) {
+                    return Some(current);
+                }
+                break;
+            }
+            let parent = crate::ax::bindings::copy_element_attr(current, "AXParent");
+            CFRelease(current as CFTypeRef);
+            current = parent?;
+        }
+        CFRelease(current as CFTypeRef);
+        None
+    }
 }
 
 /// A page that was just clicked (`click {element_token}` before an untargeted
