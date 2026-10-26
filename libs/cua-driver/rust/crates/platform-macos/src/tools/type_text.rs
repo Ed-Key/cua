@@ -2,13 +2,13 @@
 //!
 //! Inserts text via `AXSelectedText` attribute write — an atomic single-call
 //! insertion at the current cursor position. This is the preferred path for
-//! all standard Cocoa text views (NSTextField, NSTextView, WKWebView text
-//! inputs in Safari, etc.) and is significantly faster than per-keystroke
-//! CGEvent synthesis.
+//! standard Cocoa text views (NSTextField, NSTextView) and is significantly
+//! faster than per-keystroke CGEvent synthesis.
 //!
-//! For Chromium / Electron inputs that don't implement `kAXSelectedText`,
-//! the tool falls back to character-by-character CGEvent keystrokes so the
-//! caller doesn't need to detect the app type themselves.
+//! Web page fields (Safari, Chrome and other WebKit or Chromium pages, not
+//! Electron) get character-by-character CGEvent keystrokes instead: a page
+//! ignores the AX write. So do Electron inputs that don't implement
+//! `kAXSelectedText`, so the caller doesn't need to detect the app type.
 //!
 //! When the target pid belongs to a terminal emulator (Ghostty,
 //! Terminal.app, iTerm2, Alacritty, kitty, WezTerm, Hyper, Warp — see
@@ -492,8 +492,13 @@ impl Tool for TypeTextTool {
             Ok(Ok(TypeTextDelivery::CatalystNeedsFocus)) => {
                 return catalyst_text_needs_focus_result(pid, window_id);
             }
-            Ok(Ok(TypeTextDelivery::WebFieldNotFocused)) => {
-                return web_field_not_focused_result(args.opt_str("element_token").as_deref(), &text);
+            Ok(Err(error)) if error.downcast_ref::<WebFieldNotFocused>().is_some() => {
+                return web_field_not_focused_result(
+                    args.opt_str("element_token").as_deref(),
+                    &text,
+                    args.opt_str("session").as_deref(),
+                    delivery_mode.is_foreground(),
+                );
             }
             Ok(Ok(TypeTextDelivery::SynthesisRefused {
                 path,
@@ -1146,12 +1151,24 @@ fn catalyst_text_needs_focus_result(pid: i32, window_id: Option<u32>) -> ToolRes
 /// An addressed web page field that did not take focus, refused before any key.
 const WEB_FIELD_NOT_FOCUSED: &str = "web_field_not_focused";
 
-fn web_field_not_focused_result(element_token: Option<&str>, text: &str) -> ToolResult {
-    let reason = "The page did not move keyboard focus to this field (after a focus request \
-                  and a press of the field), and typed keys go to whatever the page has \
-                  focused, so no key was sent. Next: the same type_text with \
-                  delivery_mode:\"foreground\", which brings the window to the front for the \
-                  typing and then gives the front back.";
+fn web_field_not_focused_result(
+    element_token: Option<&str>,
+    text: &str,
+    session: Option<&str>,
+    foreground: bool,
+) -> ToolResult {
+    let reason = if foreground {
+        "The page did not move keyboard focus to this field, even in front (after a focus \
+         request and a press of the field), and typed keys go to whatever the page has \
+         focused, so no key was sent. Next: get_window_state with include_screenshot:true, \
+         then type_text with x,y on the field and delivery_mode:\"foreground\"."
+    } else {
+        "The page did not move keyboard focus to this field (after a focus request and a \
+         press of the field), and typed keys go to whatever the page has focused, so no key \
+         was sent. Next: the same type_text with delivery_mode:\"foreground\", which brings \
+         the window to the front for the typing and then gives the front back (if a read \
+         followed this call, as in act_and_read, use the field's element_token from it)."
+    };
     let mut structured = serde_json::json!({
         "code": WEB_FIELD_NOT_FOCUSED,
         "effect": "refused",
@@ -1159,15 +1176,30 @@ fn web_field_not_focused_result(element_token: Option<&str>, text: &str) -> Tool
         "delivered_chars": 0,
         "reason": reason,
     });
-    if let Some(token) = element_token {
-        structured["next_call"] = serde_json::json!({
-            "tool": "type_text",
-            "arguments": { "element_token": token, "text": text, "delivery_mode": "foreground" },
-        });
+    if let (Some(token), false) = (element_token, foreground) {
+        let mut arguments =
+            serde_json::json!({ "element_token": token, "text": text, "delivery_mode": "foreground" });
+        if let Some(session) = session {
+            arguments["session"] = serde_json::json!(session);
+        }
+        structured["next_call"] = serde_json::json!({ "tool": "type_text", "arguments": arguments });
     }
     ToolResult::error(format!("type_text refused ({WEB_FIELD_NOT_FOCUSED}): {reason}"))
         .with_structured(structured)
 }
+
+/// Raised inside the key rung when an addressed web field does not hold
+/// keyboard focus right before the first key: nothing was posted.
+#[derive(Debug)]
+struct WebFieldNotFocused;
+
+impl std::fmt::Display for WebFieldNotFocused {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("the page did not move keyboard focus to the addressed field")
+    }
+}
+
+impl std::error::Error for WebFieldNotFocused {}
 
 const CATALYST_BACKGROUND_KEYS_NOT_LANDED: &str = "catalyst_background_keys_not_landed";
 
@@ -1253,9 +1285,6 @@ enum TypeTextDelivery {
     Refused(BackgroundRefusal),
     /// An addressed Catalyst text view without keyboard focus; nothing sent.
     CatalystNeedsFocus,
-    /// An addressed web page field that did not take keyboard focus from the
-    /// focus write; no key was sent.
-    WebFieldNotFocused,
     SynthesisRefused {
         path: &'static str,
         refusal: SynthesisRefusal,
@@ -1637,6 +1666,7 @@ fn cgevent_type_verified(
     element_ptr_and_idx: Option<(usize, Option<usize>)>,
     settle_ms: u64,
     deadline: std::time::Instant,
+    web_field: bool,
 ) -> anyhow::Result<Keyed> {
     // Background field focus ran inside protected preparation before recipient resolution.
     if settle_ms > 0 {
@@ -1650,6 +1680,21 @@ fn cgevent_type_verified(
     // sites pass 0 — they have no front transition and must not pay this latency.
     if settle_ms > 0 {
         std::thread::sleep(std::time::Duration::from_millis(settle_ms));
+    }
+    // Keys go to whatever a page has focused, so an addressed web field must
+    // hold keyboard focus when the first key is posted. In front, focus it
+    // here as the background preparation does; from behind that preparation
+    // already ran, and focus is checked again because it may have moved.
+    if let (true, Some((ptr, _))) = (web_field, element_ptr_and_idx) {
+        let element = ptr as AXUIElementRef;
+        let focused = if settle_ms > 0 {
+            focus_web_field(pid, element, readback.window_id)
+        } else {
+            addressed_element_has_focus(pid, element, readback.window_id)
+        };
+        if !focused {
+            return Err(WebFieldNotFocused.into());
+        }
     }
     // Focus preparation can change the caret or selection. Sample immediately
     // before posting input, while retaining the original target identity.
@@ -1881,6 +1926,11 @@ fn type_text_blocking(
     if let (None, Some(wid), false) = (element_ptr_and_idx, window_id, delivery_mode.is_foreground()) {
         settle_web_area_focus(pid, wid);
     }
+    // An addressed field in a web page (outside Electron, which keeps its own
+    // rules): its keys are guarded by a focus proof on either route.
+    let is_electron = crate::browser::electron_js::ElectronJs::is_electron(pid);
+    let addressed_web_field =
+        element_ptr_and_idx.is_some() && !is_electron && target_in_web_area(pid, element_ptr_and_idx, window_id);
     let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
@@ -1933,6 +1983,7 @@ fn type_text_blocking(
                 element_ptr_and_idx,
                 foreground_settle_ms,
                 deadline,
+                addressed_web_field,
             )
         };
         let (keyed, fronted) = match window_id {
@@ -2054,6 +2105,7 @@ fn type_text_blocking(
                     element_ptr_and_idx,
                     /*settle_ms=*/ 0,
                     deadline,
+                    false,
                 )
             },
         )?;
@@ -2102,13 +2154,10 @@ fn type_text_blocking(
     // (a web area, a button) cannot take text at all. Both go straight to key
     // events, which reach whatever holds keyboard focus the way a user's
     // typing does. Electron keeps its own AX rules (see above).
-    let is_electron = crate::browser::electron_js::ElectronJs::is_electron(pid);
-    let mut web_page_field = false;
     let ax_target = ax_target.filter(|&(element, owns, idx_opt)| {
         let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
         let web_page = !is_electron
             && target_in_web_area(pid, Some((element as usize, idx_opt)), window_id);
-        web_page_field = web_page;
         let keep = ax_text_write_first(&role, owns, web_page);
         if !keep && owns {
             unsafe { CFRelease(element as CFTypeRef) };
@@ -2285,19 +2334,17 @@ fn type_text_blocking(
     //
     // Keys go to whatever the page has focused, so an addressed web field
     // must hold keyboard focus before the first key: a focus write the page
-    // ignored would otherwise type into another field. Nothing is sent then.
-    let web_focus_missed = std::cell::Cell::new(false);
+    // ignored would otherwise type into another field. No key is sent then.
     let prepare_element = || {
         focus_typing_element(pid, element_ptr_and_idx, false)?;
-        if let (true, Some((ptr, _))) = (web_page_field, element_ptr_and_idx) {
+        if let (true, Some((ptr, _))) = (addressed_web_field, element_ptr_and_idx) {
             if !focus_web_field(pid, ptr as AXUIElementRef, window_id) {
-                web_focus_missed.set(true);
-                anyhow::bail!("the page did not move keyboard focus to the addressed field");
+                return Err(WebFieldNotFocused.into());
             }
         }
         Ok(())
     };
-    let keyed = match super::with_background_key_recipient(
+    let keyed = super::with_background_key_recipient(
         background_focus.as_ref(),
         pid,
         window_id,
@@ -2314,13 +2361,10 @@ fn type_text_blocking(
                 element_ptr_and_idx,
                 /*settle_ms=*/ 0,
                 deadline,
+                addressed_web_field,
             )
         },
-    ) {
-        Ok(keyed) => keyed,
-        Err(_) if web_focus_missed.get() => return Ok(TypeTextDelivery::WebFieldNotFocused),
-        Err(error) => return Err(error),
-    };
+    )?;
     let (verified, delivered_chars, unconfirmed) = match keyed {
         Keyed::ReadBack(verified, delivered_chars, unconfirmed) => {
             (verified, delivered_chars, unconfirmed)
@@ -2363,9 +2407,12 @@ fn focus_web_field(pid: i32, element: AXUIElementRef, window_id: Option<u32>) ->
     if await_addressed_focus(pid, element, window_id) {
         return true;
     }
-    let presses = unsafe { crate::ax::bindings::copy_action_names(element) }
-        .iter()
-        .any(|action| action == "AXPress");
+    // A press of anything but a text field could submit, navigate or delete.
+    let role = unsafe { copy_string_attr(element, "AXRole") }.unwrap_or_default();
+    let presses = is_text_entry_role(&role)
+        && unsafe { crate::ax::bindings::copy_action_names(element) }
+            .iter()
+            .any(|action| action == "AXPress");
     presses
         && unsafe { crate::ax::bindings::perform_action(element, "AXPress") } == kAXErrorSuccess
         && await_addressed_focus(pid, element, window_id)
@@ -2443,14 +2490,15 @@ fn web_zero_is_unknown(
     }
 }
 
+fn is_text_entry_role(role: &str) -> bool {
+    matches!(role, "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox")
+}
+
 /// Whether an AX text write is the first rung for a target with AX `role`.
 /// `implicit`: the window's focused element rather than an addressed one.
-fn ax_text_write_first(role: &str, implicit: bool, chromium_page: bool) -> bool {
-    let text_control = matches!(
-        role,
-        "AXTextField" | "AXTextArea" | "AXSearchField" | "AXComboBox"
-    );
-    !chromium_page && (text_control || !implicit)
+/// `web_page`: the target is in a web page outside Electron.
+fn ax_text_write_first(role: &str, implicit: bool, web_page: bool) -> bool {
+    !web_page && (is_text_entry_role(role) || !implicit)
 }
 
 /// A Chromium-family browser, not an Electron app (Electron keeps its own
@@ -3172,7 +3220,8 @@ mod tests {
 
     #[test]
     fn the_web_focus_refusal_names_the_foreground_call() {
-        let result = web_field_not_focused_result(Some("s00000003:9"), "dana@example.com");
+        let result =
+            web_field_not_focused_result(Some("s00000003:9"), "dana@example.com", Some("w1"), false);
         assert_eq!(result.is_error, Some(true));
         let data = result.structured_content.as_ref().unwrap();
         assert_eq!(data["code"], "web_field_not_focused");
@@ -3186,11 +3235,63 @@ mod tests {
                     "element_token": "s00000003:9",
                     "text": "dana@example.com",
                     "delivery_mode": "foreground",
+                    "session": "w1",
                 },
             })
         );
         let text = summary_of(&result);
         assert!(text.contains("no key was sent"), "{text}");
+        // Refused in front too: no foreground call to offer, the pixel route instead.
+        let result = web_field_not_focused_result(Some("s00000003:9"), "x", None, true);
+        let data = result.structured_content.as_ref().unwrap();
+        assert!(data.get("next_call").is_none(), "{data}");
+        assert!(summary_of(&result).contains("include_screenshot:true"));
+    }
+
+    /// The key rung itself refuses an addressed web field without focus,
+    /// before any key: from behind (focus moved after the preparation) and in
+    /// front (where the rung focuses the field itself). A non-text control is
+    /// never pressed.
+    #[test]
+    fn the_key_rung_sends_nothing_to_an_unfocused_web_field() {
+        use crate::ax::bindings::test_support::EditorScope;
+        for (role, settle_ms, press_offered, presses) in [
+            ("AXTextField", 0, true, 0),
+            ("AXTextField", 20, true, 1),
+            ("AXButton", 20, true, 0),
+        ] {
+            let fixture = EditorScope::install(role, None, || {});
+            fixture.web();
+            fixture.unfocus();
+            if press_offered {
+                fixture.press(false);
+            }
+            let element = Some((fixture.element_ptr(), Some(3)));
+            let readback = TypingReadback {
+                pid: -9876,
+                element,
+                window_id: Some(42),
+                focused: None,
+                before: Some(String::new()),
+                before_range: None,
+            };
+            let result = cgevent_type_verified(
+                -9876,
+                -9876,
+                "hello",
+                0,
+                &readback,
+                element,
+                settle_ms,
+                std::time::Instant::now(),
+                true,
+            );
+            let case = format!("{role} settle {settle_ms}");
+            let error = result.err().unwrap_or_else(|| panic!("{case}: must refuse"));
+            assert!(error.downcast_ref::<WebFieldNotFocused>().is_some(), "{case}: {error:#}");
+            assert_eq!(fixture.presses(), presses, "{case}");
+            assert_eq!(fixture.value(), "", "{case}");
+        }
     }
 
     /// Safari keys that read back: no px or browser-tool advice (neither
