@@ -1166,8 +1166,9 @@ fn web_field_not_focused_result(
         "The page did not move keyboard focus to this field (after a focus request and a \
          press of the field), and typed keys go to whatever the page has focused, so no key \
          was sent. Next: the same type_text with delivery_mode:\"foreground\", which brings \
-         the window to the front for the typing and then gives the front back (if a read \
-         followed this call, as in act_and_read, use the field's element_token from it)."
+         the window to the front for the typing and then gives the front back (after \
+         act_and_read, whose read replaces the token, use the field's element_token from \
+         that read)."
     };
     let mut structured = serde_json::json!({
         "code": WEB_FIELD_NOT_FOCUSED,
@@ -1718,6 +1719,13 @@ fn cgevent_type_verified(
             }),
             recipient_pid,
         )?;
+    }
+    // The sample and the recipient check are AX calls a page's own focus
+    // change can race: prove the addressed web field again, last.
+    if let (true, Some((ptr, _))) = (web_field, element_ptr_and_idx) {
+        if !addressed_element_has_focus(pid, ptr as AXUIElementRef, readback.window_id) {
+            return Err(WebFieldNotFocused.into());
+        }
     }
     let posted = crate::input::keyboard::type_text_with_delay(
         recipient_pid,
