@@ -1299,11 +1299,7 @@ impl ToolRegistry {
     ) -> ToolResult {
         let runtime_scope = context.runtime_scope_key();
         let received_at = current_dispatch_received_at().unwrap_or_else(std::time::Instant::now);
-        let session_label = args
-            .get("session")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let result = DISPATCH_RECEIVED_AT
+        DISPATCH_RECEIVED_AT
             .scope(
                 received_at,
                 DISPATCH_RUNTIME_SCOPE.scope(runtime_scope, async {
@@ -1319,11 +1315,29 @@ impl ToolRegistry {
                         .await
                 }),
             )
-            .await;
+            .await
+    }
+
+    /// Every dispatch, nested steps of composites included, routes here, so a
+    /// refusal's next_call read gets the caller's session label before any
+    /// composite wraps the result.
+    async fn invoke_authorized(
+        &self,
+        name: &str,
+        args: Value,
+        context: &crate::session_authorization::EffectiveAuthorizationContext,
+        evidence: &TrustedInvocationEvidence,
+    ) -> ToolResult {
+        let session_label = args
+            .get("session")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let result =
+            Box::pin(self.invoke_authorized_unlabelled(name, args, context, evidence)).await;
         with_session_in_next_call(result, session_label.as_deref())
     }
 
-    async fn invoke_authorized(
+    async fn invoke_authorized_unlabelled(
         &self,
         name: &str,
         mut args: Value,
