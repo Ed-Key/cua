@@ -420,14 +420,28 @@ fn workflow_steps() -> (&'static str, &'static str) {
 
 /// The instructions a Codex client gets instead of [`agent_instructions`].
 /// Codex code mode shows MCP instructions only inside its ALL_TOOLS catalog,
-/// prefixed to every tool entry, so a long text is paid once per listed tool
-/// and truncation hides most declarations. This keeps the core list and the
-/// per-task workflow; the long form stays in the skill.
+/// prefixed to every tool entry, and its model finds tools by filtering
+/// names and descriptions for words like click, type or screen. So this is
+/// short, names none of those words (a filter then picks tools by their own
+/// descriptions), and says what no tool description does: how a script
+/// shows a result and which read starts which kind of task. It prints the
+/// images and `structuredContent`, what Claude Code shows its model (the
+/// browser tools' text is a one-line summary of it). The Codex surface copies
+/// an error's message into its envelope (`mcp_surface`), so this one line
+/// serves errors too: item 33's runs showed a two-branch line rewritten into
+/// text-only forwarding.
+/// The long form stays in the skill.
 pub fn codex_instructions() -> String {
-    let (read_step, act_step) = workflow_steps();
+    // act_and_read is registered only on macOS (see `workflow_steps`).
+    let apps = if cfg!(target_os = "macos") {
+        "Apps: get_window_state, then act_and_read."
+    } else {
+        "Apps: get_window_state, then act by element_token."
+    };
     format!(
-        "cua-driver core tools; call them directly, no need to list or describe them first: {}.\n{read_step} {act_step} `verify_state` checks postconditions; `unknown` is not success. Repeat one short `session` label on every call. This server has no shell.",
-        instruction_core_tools()
+        "Code mode: show a result r with \
+         `for (const c of r.content) if (c.data) image(c); text(r.structuredContent ?? r.content)`; \
+         text(r) would print images as base64. {apps} Chrome pages: get_browser_state, then browser_steps."
     )
 }
 
@@ -616,17 +630,54 @@ mod agent_instruction_tests {
         assert!(!instructions.contains("pip_turn"));
     }
 
+    /// Codex code mode prefixes these instructions to every ALL_TOOLS entry
+    /// and the model finds tools by filtering name + description with words
+    /// such as click, type or screen (all four bench trials of item 33). The
+    /// text names none of them, so a filter selects tools by their own
+    /// descriptions, and it is short, because every printed entry pays it.
+    /// It says how to show a result completely (structuredContent: the text
+    /// of the browser tools is a one-line summary) without printing images as
+    /// base64, and keeps the base instructions' routing: Chrome pages go to
+    /// get_browser_state (item 33 errands: without it Codex read Chrome's
+    /// accessibility tree instead).
     #[test]
-    fn codex_gets_a_compact_text_with_the_core_list_and_workflow() {
+    fn codex_gets_a_short_filter_neutral_text_with_the_forwarding_line() {
         let codex = super::codex_instructions();
-        assert!(codex.contains(&super::instruction_core_tools()));
-        assert!(codex.contains("call them directly"));
-        assert!(codex.contains("`unknown` is not success"));
-        assert!(codex.contains("`session` label"));
-        assert!(codex.contains("browser_steps"));
+        assert!(
+            codex.contains(
+                "for (const c of r.content) if (c.data) image(c); text(r.structuredContent ?? r.content)"
+            ),
+            "{codex}"
+        );
+        assert!(
+            codex.contains("text(r)") && codex.contains("base64"),
+            "{codex}"
+        );
+        assert!(
+            codex.contains(if cfg!(target_os = "macos") {
+                "Apps: get_window_state, then act_and_read."
+            } else {
+                "Apps: get_window_state, then act by element_token."
+            }),
+            "{codex}"
+        );
+        assert_eq!(
+            codex.contains("act_and_read"),
+            cfg!(target_os = "macos"),
+            "{codex}"
+        );
+        assert!(
+            codex.contains("Chrome pages: get_browser_state, then browser_steps."),
+            "{codex}"
+        );
+        let lower = codex.to_ascii_lowercase();
+        for word in [
+            "click", "type", "screen", "keyboard", "keypress", "mouse", "computer", "display",
+        ] {
+            assert!(!lower.contains(word), "{word:?} in {codex}");
+        }
         let chars = codex.chars().count();
-        assert!(chars <= 900, "codex instructions are {chars} characters");
-        assert!(chars * 2 < agent_instructions().chars().count());
+        assert!(chars <= 300, "codex instructions are {chars} characters");
     }
 
     #[test]

@@ -8,24 +8,25 @@
 //!   advertises everything.
 //! - The registry itself marks the core tools `anthropic/alwaysLoad` for
 //!   Claude Code (`ToolDef::to_list_entry`), so both profiles carry it.
-//! - For Codex (`clientInfo.name` "codex-mcp-client"), whose code mode prints
-//!   the whole result object, a successful result's text blocks become one
-//!   line pointing at `structuredContent`, so the model reads one copy.
-//!   Claude Code already shows its model only `structuredContent`. Images and
-//!   error results are left as they are. Codex also gets the compact
-//!   `codex_instructions`, because it repeats the instructions in every
-//!   ALL_TOOLS entry, and a listing without `outputSchema`: code mode
-//!   renders each into a TypeScript return type, about two-thirds of the
-//!   catalog. Results still carry `structuredContent`, which MCP allows
-//!   without an advertised schema; servers still validate against it.
+//! - For Codex (`clientInfo.name` "codex-mcp-client"), whose code mode shows
+//!   MCP instructions only inside its ALL_TOOLS catalog, prefixed to every
+//!   tool entry, the instructions are a short text on showing results and
+//!   starting a task (`codex_instructions`), and the listing has no
+//!   `outputSchema`: code mode renders each into a TypeScript return type,
+//!   about two-thirds of the catalog. Results reach Codex as they reach every
+//!   client: code mode hands the script the whole result and the script
+//!   prints what the model sees, so every block must keep its content (item
+//!   33: a pointer to `structuredContent` in place of the text made the model
+//!   read every window twice). The one addition: an error envelope that
+//!   carries only a code gets the message from its text, because the
+//!   instructions print `structuredContent`. Results still carry
+//!   `structuredContent`, which MCP allows without an advertised schema;
+//!   servers still validate against it.
 
 use cua_driver_core::mcp_result::{conforming_tool_result, tool_error_result};
 use cua_driver_core::mcp_wire::{finish_response, is_core_tool, ProtocolEra};
 use cua_driver_core::protocol::{codex_instructions, Request, Response, ResponseBody};
 use serde_json::{json, Value};
-
-/// The text a Codex client gets in place of a result's text blocks.
-pub const CODEX_TEXT_POINTER: &str = "Full result in structuredContent.";
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub enum ToolProfile {
@@ -110,8 +111,9 @@ impl Surface {
         ))
     }
 
-    /// Apply the profile to a `tools/list` result and, for Codex, project a
-    /// `tools/call` result to one copy.
+    /// Apply the profile to a `tools/list` result and give Codex its
+    /// instructions. `tools/call` results pass unchanged, except that a
+    /// Codex error's envelope gets its message.
     pub fn render(&self, method: &str, mut response: Response) -> Response {
         if let ResponseBody::Result { result } = &mut response.body {
             match method {
@@ -121,7 +123,7 @@ impl Surface {
                         result.insert("instructions".into(), json!(codex_instructions()));
                     }
                 }
-                "tools/call" if self.codex => project_for_codex(result),
+                "tools/call" if self.codex => carry_error_message(result),
                 _ => {}
             }
         }
@@ -145,34 +147,32 @@ impl Surface {
     }
 }
 
-/// Replace a successful result's text blocks with one pointer line when its
-/// `structuredContent` carries the result. Images keep their place.
-fn project_for_codex(result: &mut Value) {
-    if result.get("isError").and_then(Value::as_bool) == Some(true) {
+/// Codex prints a result's `structuredContent` (`codex_instructions`), as
+/// Claude Code shows its model. An error envelope (a refusal marker: code,
+/// status or refusal) can lack the message its text holds
+/// (`internal_error_result`, normalized tool errors, clipboard failures), so
+/// copy the text in. Envelopes with a message, and results that are not
+/// envelopes (act_and_read's output), are left alone.
+fn carry_error_message(result: &mut Value) {
+    let envelope = result.get("isError").and_then(Value::as_bool) == Some(true)
+        && result.get("structuredContent").is_some_and(|structured| {
+            cua_driver_contract::is_refusal_envelope(structured)
+                && structured.get("message").is_none()
+        });
+    if !envelope {
         return;
     }
-    let structured = result
-        .get("structuredContent")
-        .and_then(Value::as_object)
-        .is_some_and(|object| !object.is_empty());
-    if !structured {
-        return;
+    let message = result
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    if !message.is_empty() {
+        result["structuredContent"]["message"] = json!(message);
     }
-    let Some(content) = result.get_mut("content").and_then(Value::as_array_mut) else {
-        return;
-    };
-    let mut pointed = false;
-    content.retain_mut(|part| {
-        if part.get("type").and_then(Value::as_str) != Some("text") {
-            return true;
-        }
-        if pointed {
-            return false;
-        }
-        pointed = true;
-        *part = json!({"type": "text", "text": CODEX_TEXT_POINTER});
-        true
-    });
 }
 
 #[cfg(test)]
@@ -329,22 +329,75 @@ mod tests {
         }
     }
 
+    /// A get_window_state result as the daemon returns it (image first, then
+    /// the outcome text with the token prefix and the rows), item 33.
+    fn window_read() -> Value {
+        json!({
+            "content": [
+                {"type": "image", "data": "iVBORw0KGgo", "mimeType": "image/png"},
+                {"type": "text", "text": "window_id=38 pid=771 size=1568x985 elements=3\n\nelement_token = s00000002:<index>\n- [0] AXWindow \"Inbox\"\n  - [24] AXTextField \"Search mail\" [actions=[press]]\n  - [31] AXButton \"Archive\" [actions=[press]]"},
+            ],
+            "structuredContent": {"pid": 771, "window_id": 38, "snapshot_id": "s00000002",
+                                  "tree_markdown": "- [0] AXWindow \"Inbox\""},
+        })
+    }
+
     #[test]
-    fn codex_gets_one_copy_with_images_and_structured_content_intact() {
+    fn codex_gets_the_outcome_text_images_and_structured_content_in_the_first_result() {
         let mut surface = Surface::new(ToolProfile::Full);
         surface.observe(&initialize("codex-mcp-client"));
-        let projected =
-            result(&surface.render("tools/call", Response::ok(json!(1), sample_result())));
+        for daemon in [window_read(), sample_result()] {
+            let rendered =
+                result(&surface.render("tools/call", Response::ok(json!(1), daemon.clone())));
+            // Code mode forwards `content` block by block: every text block
+            // (usable element tokens included) and every image arrive as they are.
+            assert_eq!(rendered["content"], daemon["content"]);
+            assert_eq!(rendered["structuredContent"], daemon["structuredContent"]);
+        }
+    }
+
+    #[test]
+    fn a_codex_error_envelope_gets_the_message_its_text_carries() {
+        let code_only = json!({
+            "content": [{"type": "text", "text": "query_context requires a nonblank query"},
+                        {"type": "text", "text": "Verify state before retrying."}],
+            "isError": true, "structuredContent": {"code": "tool_invocation_failed"}});
+        let mut codex = Surface::new(ToolProfile::Full);
+        codex.observe(&initialize("codex-mcp-client"));
+        let rendered =
+            result(&codex.render("tools/call", Response::ok(json!(1), code_only.clone())));
+        assert_eq!(rendered["content"], code_only["content"]);
         assert_eq!(
-            projected["content"],
-            json!([
-                {"type": "text", "text": CODEX_TEXT_POINTER},
-                {"type": "image", "data": "iVBO", "mimeType": "image/png"},
-            ])
+            rendered["structuredContent"],
+            json!({"code": "tool_invocation_failed",
+                   "message": "query_context requires a nonblank query\nVerify state before retrying."})
         );
+        // A clipboard failure marks itself with status, not code.
+        let clipboard = json!({
+            "content": [{"type": "text", "text": "Clipboard write is unavailable: no such file"}],
+            "isError": true,
+            "structuredContent": {"status": "unavailable", "error_code": "clipboard_unavailable"}});
+        let rendered = result(&codex.render("tools/call", Response::ok(json!(1), clipboard)));
         assert_eq!(
-            projected["structuredContent"],
-            sample_result()["structuredContent"]
+            rendered["structuredContent"]["message"],
+            "Clipboard write is unavailable: no such file"
+        );
+        // Not an envelope (act_and_read's output), or a success: unchanged.
+        let output = json!({"content": [{"type": "text", "text": "STEP 1 RESULT"}], "isError": true,
+                            "structuredContent": {"action": {"code": "stale"}, "observation": {}}});
+        let success = window_read();
+        for unchanged in [output, success] {
+            assert_eq!(
+                result(&codex.render("tools/call", Response::ok(json!(1), unchanged.clone()))),
+                unchanged
+            );
+        }
+        // Other clients get the envelope as it is.
+        let mut claude = Surface::new(ToolProfile::Full);
+        claude.observe(&initialize("claude-code"));
+        assert_eq!(
+            result(&claude.render("tools/call", Response::ok(json!(1), code_only.clone()))),
+            code_only
         );
     }
 
@@ -376,7 +429,7 @@ mod tests {
         let mut codex = Surface::new(ToolProfile::Core);
         codex.observe(&initialize("codex-mcp-client"));
         let error = json!({"content": [{"type": "text", "text": "refused: stale token"}],
-                           "isError": true, "structuredContent": {"code": "stale"}});
+                           "isError": true, "structuredContent": {"code": "stale", "message": "stale"}});
         assert_eq!(
             result(&codex.render("tools/call", Response::ok(json!(1), error.clone()))),
             error

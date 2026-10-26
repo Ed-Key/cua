@@ -1339,12 +1339,17 @@ mod tests {
                    "params":{"name":"start_recording","arguments":{},"_meta":meta("codex-mcp-client")}}),
             json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
                    "params":{"name":"list_windows","arguments":{},"_meta":meta("claude-code")}}),
+            json!({"jsonrpc":"2.0","id":3,"method":"tools/list",
+                   "params":{"_meta":meta("claude-code")}}),
         ] {
             serde_json::to_writer(&mut input, &request).unwrap();
             input.push(b'\n');
         }
-        let inventory =
-            Arc::new(json!({"tools":[{"name":"list_windows"},{"name":"start_recording"}]}));
+        // The proxy validates results against the canonical schema, so the
+        // inventory carries that one.
+        let schema = cua_driver_contract::advertised_tool_output_schema("list_windows").unwrap();
+        let inventory = Arc::new(json!({"tools":[
+            {"name":"list_windows","outputSchema":schema.clone()},{"name":"start_recording"}]}));
         let mut output = Vec::new();
         run_proxy_io_with_profile(
             BufReader::new(input.as_slice()),
@@ -1374,12 +1379,17 @@ mod tests {
             replies[0]["result"]["structuredContent"]["code"],
             "tool_not_in_profile"
         );
-        // Rendered for Claude, not projected for Codex.
-        assert_ne!(
-            replies[1]["result"]["content"][0]["text"],
-            crate::mcp_surface::CODEX_TEXT_POINTER,
+        // Results reach every client unchanged.
+        assert_eq!(
+            replies[1]["result"]["content"][0]["text"], "Found 0 window(s).",
             "{:?}",
             replies[1]
+        );
+        // Rendered for Claude, not Codex: the listing keeps its output schema.
+        assert_eq!(
+            replies[2]["result"]["tools"][0]["outputSchema"], schema,
+            "{:?}",
+            replies[2]
         );
     }
 
@@ -1559,31 +1569,32 @@ mod tests {
             "params":{"clientInfo":{"name":"codex-mcp-client"}}
         }))
         .unwrap();
-        let rendered = |surface: &Surface| {
-            let result = serde_json::json!({
-                "content": [{"type":"text","text":"Found 0 window(s)."}],
-                "structuredContent": {"windows": [], "current_space_id": 1},
-            });
+        // Codex's listing has no output schemas; every other client's keeps them.
+        let keeps_output_schema = |surface: &Surface| {
+            let list = serde_json::json!({"tools": [
+                {"name": "list_windows", "outputSchema": {"type": "object"}},
+            ]});
             serde_json::to_value(
-                surface.render("tools/call", Response::ok(serde_json::json!(3), result)),
+                surface.render("tools/list", Response::ok(serde_json::json!(3), list)),
             )
-            .unwrap()["result"]["content"][0]["text"]
-                .clone()
+            .unwrap()["result"]["tools"][0]
+                .get("outputSchema")
+                .is_some()
         };
         // Codex first, then a request naming another client: still Codex.
         let mut surface = Surface::new(ToolProfile::Core);
         surface.observe(&initialize);
         surface.observe(&modern("claude-code"));
-        assert_eq!(rendered(&surface), crate::mcp_surface::CODEX_TEXT_POINTER);
+        assert!(!keeps_output_schema(&surface));
         // Claude first, then Codex: still not Codex.
         let mut surface = Surface::new(ToolProfile::Core);
         surface.observe(&modern("claude-code"));
         surface.observe(&modern("codex-mcp-client"));
-        assert_eq!(rendered(&surface), "Found 0 window(s).");
+        assert!(keeps_output_schema(&surface));
     }
 
     #[test]
-    fn daemon_results_reach_codex_as_one_copy_and_others_unchanged() {
+    fn daemon_results_reach_codex_and_others_unchanged() {
         use cua_driver_core::protocol::Request;
         let daemon_result = serde_json::json!({
             "content": [{"type":"text","text":"Found 0 window(s)."}],
@@ -1591,18 +1602,10 @@ mod tests {
         });
         let schema = cua_driver_contract::advertised_tool_output_schema("list_windows");
         for (client, expected_text, modern) in [
-            (
-                "codex-mcp-client",
-                crate::mcp_surface::CODEX_TEXT_POINTER,
-                false,
-            ),
+            ("codex-mcp-client", "Found 0 window(s).", false),
             ("claude-code", "Found 0 window(s).", false),
             // MCP 2026-07-28 clients name themselves per request, not in initialize.
-            (
-                "codex-mcp-client",
-                crate::mcp_surface::CODEX_TEXT_POINTER,
-                true,
-            ),
+            ("codex-mcp-client", "Found 0 window(s).", true),
             ("claude-code", "Found 0 window(s).", true),
         ] {
             let mut surface = Surface::new(ToolProfile::Core);
