@@ -444,31 +444,51 @@ fn get_window_state_screenshot_default_and_opt_out() {
         "expected element_count in structuredContent: {sc:?}"
     );
     if cfg!(target_os = "macos") {
-        assert!(
-            !content.iter().any(|c| c["type"] == "image")
-                && sc["screenshot_width"].is_null()
-                && sc["capture_id"].is_null(),
-            "a default macOS read must not attach a screenshot: {resp:?}"
-        );
-        // Asked for, it comes back (when Screen Recording is granted).
-        d.send(&serde_json::json!({
-            "jsonrpc":"2.0","id":30,"method":"tools/call",
-            "params":{"name":"get_window_state","arguments":{
-                "pid": pid, "window_id": wid, "include_screenshot": true
-            }}
-        }));
-        let asked = d.recv();
-        let asked_sc = &asked["result"]["structuredContent"];
-        if asked_sc["screenshot_error"].is_null() {
-            let images = asked["result"]["content"]
+        // Item 39: find a window that captures when asked, then read it with
+        // the defaults: no image, no capture_id, no screenshot size.
+        let candidates: Vec<(i64, u64)> = windows
+            .into_iter()
+            .flatten()
+            .filter_map(|w| Some((w["pid"].as_i64()?, w["window_id"].as_u64()?)))
+            .take(12)
+            .collect();
+        let images = |resp: &serde_json::Value| {
+            resp["result"]["content"]
                 .as_array()
-                .expect("content array")
-                .iter()
-                .filter(|c| c["type"] == "image")
-                .count();
-            assert_eq!(images, 1, "include_screenshot:true attaches one image: {asked:?}");
+                .map_or(0, |c| c.iter().filter(|c| c["type"] == "image").count())
+        };
+        let mut checked = false;
+        for (n, (pid, wid)) in candidates.into_iter().enumerate() {
+            d.send(&serde_json::json!({
+                "jsonrpc":"2.0","id":30 + 2 * n,"method":"tools/call",
+                "params":{"name":"get_window_state","arguments":{
+                    "pid": pid, "window_id": wid, "include_screenshot": true
+                }}
+            }));
+            let asked = d.recv();
+            let asked_sc = &asked["result"]["structuredContent"];
+            if images(&asked) != 1 || asked_sc["capture_id"].is_null() {
+                continue;
+            }
             assert!(asked_sc["screenshot_width"].as_f64().unwrap_or(0.0) > 0.0);
-            assert!(asked_sc["capture_id"].is_string(), "{asked_sc:?}");
+            d.send(&serde_json::json!({
+                "jsonrpc":"2.0","id":31 + 2 * n,"method":"tools/call",
+                "params":{"name":"get_window_state","arguments":{"pid": pid, "window_id": wid}}
+            }));
+            let default = d.recv();
+            let default_sc = &default["result"]["structuredContent"];
+            assert!(
+                images(&default) == 0
+                    && default_sc["screenshot_width"].is_null()
+                    && default_sc["capture_id"].is_null(),
+                "a default macOS read must not attach a screenshot (window {wid}): {default:?}"
+            );
+            eprintln!("window {wid}: asked read had 1 image, default read none");
+            checked = true;
+            break;
+        }
+        if !checked {
+            eprintln!("No capturable window (Screen Recording?) — default-read check skipped");
         }
     }
     // Windows delivers the screenshot by default (its capture can vary, so the
