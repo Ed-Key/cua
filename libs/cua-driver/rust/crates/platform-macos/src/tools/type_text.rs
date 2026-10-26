@@ -60,9 +60,10 @@ fn def() -> &'static ToolDef {
         name: "type_text".into(),
         description:
             "Insert text at an element (element_token) or the \
-             focused element. For web or Electron fields pass x,y screenshot pixels: it clicks \
-             there for real focus, then types. No special keys (use press_key). If unverifiable, \
-             re-read before retrying to avoid duplicate text. \
+             focused element. A web page field's element_token works in the background: the \
+             field is focused and gets key events. For Electron fields pass x,y screenshot \
+             pixels: it clicks there for real focus, then types. No special keys (use \
+             press_key). If unverifiable, re-read before retrying to avoid duplicate text. \
              Details: skill://cua-driver/MACOS.md"
             .into(),
         input_schema: serde_json::json!({
@@ -492,7 +493,7 @@ impl Tool for TypeTextTool {
                 return catalyst_text_needs_focus_result(pid, window_id);
             }
             Ok(Ok(TypeTextDelivery::WebFieldNotFocused)) => {
-                return web_field_not_focused_result(args.opt_str("element_token").as_deref());
+                return web_field_not_focused_result(args.opt_str("element_token").as_deref(), &text);
             }
             Ok(Ok(TypeTextDelivery::SynthesisRefused {
                 path,
@@ -1145,10 +1146,12 @@ fn catalyst_text_needs_focus_result(pid: i32, window_id: Option<u32>) -> ToolRes
 /// An addressed web page field that did not take focus, refused before any key.
 const WEB_FIELD_NOT_FOCUSED: &str = "web_field_not_focused";
 
-fn web_field_not_focused_result(element_token: Option<&str>) -> ToolResult {
-    let reason = "The page did not move keyboard focus to this field, and typed keys go to \
-                  whatever the page has focused. Nothing was sent. Next: click the field (its \
-                  element_token; a background click is enough), then call type_text again.";
+fn web_field_not_focused_result(element_token: Option<&str>, text: &str) -> ToolResult {
+    let reason = "The page did not move keyboard focus to this field (after a focus request \
+                  and a press of the field), and typed keys go to whatever the page has \
+                  focused, so no key was sent. Next: the same type_text with \
+                  delivery_mode:\"foreground\", which brings the window to the front for the \
+                  typing and then gives the front back.";
     let mut structured = serde_json::json!({
         "code": WEB_FIELD_NOT_FOCUSED,
         "effect": "refused",
@@ -1157,8 +1160,10 @@ fn web_field_not_focused_result(element_token: Option<&str>) -> ToolResult {
         "reason": reason,
     });
     if let Some(token) = element_token {
-        structured["next_call"] =
-            serde_json::json!({ "tool": "click", "arguments": { "element_token": token } });
+        structured["next_call"] = serde_json::json!({
+            "tool": "type_text",
+            "arguments": { "element_token": token, "text": text, "delivery_mode": "foreground" },
+        });
     }
     ToolResult::error(format!("type_text refused ({WEB_FIELD_NOT_FOCUSED}): {reason}"))
         .with_structured(structured)
@@ -1878,6 +1883,9 @@ fn type_text_blocking(
     // An unreadable value is not evidence that the field is empty — and for a
     // window-addressed request it must come from the exact target window,
     // never a same-process sibling.
+    if let (None, Some(wid), false) = (element_ptr_and_idx, window_id, delivery_mode.is_foreground()) {
+        settle_web_area_focus(pid, wid);
+    }
     let mut readback = TypingReadback::capture(pid, element_ptr_and_idx, window_id);
 
     // --- Foreground rung: explicit agent request (skip AX/background ladder). ---
@@ -2287,7 +2295,7 @@ fn type_text_blocking(
     let prepare_element = || {
         focus_typing_element(pid, element_ptr_and_idx, false)?;
         if let (true, Some((ptr, _))) = (web_page_field, element_ptr_and_idx) {
-            if !await_addressed_focus(pid, ptr as AXUIElementRef, window_id) {
+            if !focus_web_field(pid, ptr as AXUIElementRef, window_id) {
                 web_focus_missed.set(true);
                 anyhow::bail!("the page did not move keyboard focus to the addressed field");
             }
@@ -2349,6 +2357,45 @@ fn type_text_blocking(
 /// took effect, and typing the text after it would insert it twice (item 25).
 fn read_back_ax_write(err: crate::ax::bindings::AXError) -> bool {
     err == kAXErrorSuccess || !crate::input::ax_actions::ax_write_rejected(err)
+}
+
+/// Give an addressed web page field keyboard focus after the AXFocused write
+/// (already sent). A background Safari page can ignore that write; its press
+/// action focuses the field the way `click {element_token}` does. The press
+/// is sent only when the write left focus elsewhere, and focus is proven
+/// either way before any key.
+fn focus_web_field(pid: i32, element: AXUIElementRef, window_id: Option<u32>) -> bool {
+    if await_addressed_focus(pid, element, window_id) {
+        return true;
+    }
+    let presses = unsafe { crate::ax::bindings::copy_action_names(element) }
+        .iter()
+        .any(|action| action == "AXPress");
+    presses
+        && unsafe { crate::ax::bindings::perform_action(element, "AXPress") } == kAXErrorSuccess
+        && await_addressed_focus(pid, element, window_id)
+}
+
+/// A page that was just clicked (`click {element_token}` before an untargeted
+/// type_text) reports the field's focus a moment after the press returns;
+/// until then the window's focused element is the web area itself. Wait
+/// briefly for it to move, so the read-back watches the field the keys reach
+/// rather than reporting it unreadable.
+fn settle_web_area_focus(pid: i32, window_id: u32) {
+    let deadline = std::time::Instant::now() + WEB_FOCUS_TIMEOUT;
+    loop {
+        let role = unsafe {
+            crate::ax::exact_target::focused_element_in_window(pid, window_id).map(|element| {
+                let role = copy_string_attr(element, "AXRole");
+                CFRelease(element as CFTypeRef);
+                role
+            })
+        };
+        if role.flatten().as_deref() != Some("AXWebArea") || std::time::Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(DELIVERY_DRAIN_POLL_INTERVAL);
+    }
 }
 
 /// Wait briefly for `element` to become its window's focused element after a
