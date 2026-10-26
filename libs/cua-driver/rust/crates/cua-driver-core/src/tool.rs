@@ -719,6 +719,37 @@ impl TrustedInvocationEvidence {
     }
 }
 
+/// A refusal's `next_call` read (a screenshot for pixels, item 39) must land
+/// in the caller's session, or the retried action still finds no screenshot.
+/// Tools that do not see the call's public `session` label leave it out; the
+/// dispatch boundary adds it here, to the arguments and to the text.
+fn with_session_in_next_call(mut result: ToolResult, session_label: Option<&str>) -> ToolResult {
+    let Some(label) = session_label else {
+        return result;
+    };
+    let Some(arguments) = result
+        .structured_content
+        .as_mut()
+        .and_then(|structured| structured.get_mut("next_call"))
+        .filter(|next| next["tool"] == "get_window_state")
+        .and_then(|next| next.get_mut("arguments"))
+        .and_then(Value::as_object_mut)
+    else {
+        return result;
+    };
+    if arguments.contains_key("session") {
+        return result;
+    }
+    arguments.insert("session".into(), label.into());
+    if let Some(crate::protocol::Content::Text { text, .. }) = result.content.first_mut() {
+        text.push_str(&format!(
+            " Pass session:{} in that get_window_state call.",
+            serde_json::json!(label)
+        ));
+    }
+    result
+}
+
 /// Thread-safe collection of all registered tools.
 pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
@@ -1268,7 +1299,11 @@ impl ToolRegistry {
     ) -> ToolResult {
         let runtime_scope = context.runtime_scope_key();
         let received_at = current_dispatch_received_at().unwrap_or_else(std::time::Instant::now);
-        DISPATCH_RECEIVED_AT
+        let session_label = args
+            .get("session")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let result = DISPATCH_RECEIVED_AT
             .scope(
                 received_at,
                 DISPATCH_RUNTIME_SCOPE.scope(runtime_scope, async {
@@ -1284,7 +1319,8 @@ impl ToolRegistry {
                         .await
                 }),
             )
-            .await
+            .await;
+        with_session_in_next_call(result, session_label.as_deref())
     }
 
     async fn invoke_authorized(
@@ -2782,6 +2818,41 @@ fn history_observation_resource(tool_name: &str) -> Option<(Value, &'static str)
             "Allow Cua to read encrypted Computer History metadata",
         )),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod next_call_session_tests {
+    use super::with_session_in_next_call;
+    use crate::protocol::{Content, ToolResult};
+
+    fn refusal() -> ToolResult {
+        ToolResult::error("Background input refused.").with_structured(serde_json::json!({
+            "next_call": {"tool": "get_window_state",
+                "arguments": {"pid": 7, "window_id": 9, "include_screenshot": true}}
+        }))
+    }
+
+    /// Item 39: the recovery read lands in the caller's named session.
+    #[test]
+    fn the_callers_session_label_joins_the_next_call() {
+        let labelled = with_session_in_next_call(refusal(), Some("run"));
+        assert_eq!(
+            labelled.structured_content.as_ref().unwrap()["next_call"]["arguments"]["session"],
+            "run"
+        );
+        match &labelled.content[0] {
+            Content::Text { text, .. } => assert!(text.ends_with(" Pass session:\"run\" in that get_window_state call."), "{text}"),
+            other => panic!("text expected, got {other:?}"),
+        }
+        // Unnamed calls, and calls whose next_call already names it, stay as they are.
+        let plain = with_session_in_next_call(refusal(), None);
+        assert!(plain.structured_content.unwrap()["next_call"]["arguments"].get("session").is_none());
+        let twice = with_session_in_next_call(labelled, Some("run"));
+        match &twice.content[0] {
+            Content::Text { text, .. } => assert_eq!(text.matches("Pass session").count(), 1),
+            other => panic!("text expected, got {other:?}"),
+        }
     }
 }
 
