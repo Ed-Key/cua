@@ -614,6 +614,17 @@ Chrome's own UI, `chrome://` pages, and windows the extension cannot see
 value write, which page frameworks such as React ignore, and an unchanged page
 value is reported as unverifiable rather than as zero characters delivered.
 
+Safari (and any other WebKit page) works the same way from behind: a background
+page accepts an accessibility text write and leaves the field as it was, so
+`type_text` sends key events. Pass the field's `element_token`: the tool gives
+that field keyboard focus first (a focus request, then one press of the field
+when the page ignored it) and proves it before the first key. A field that does
+not take focus is refused with `code:"web_field_not_focused"` before any key;
+its `next_call` is the same call with `delivery_mode:"foreground"`. A result
+that reads the text back is still `⚠️ Not confirmed:` (web content) with no
+escalation: check the page's own response (search results, a draft) instead of
+typing again, and prefer the `element_token` over the `x,y` form there.
+
 ## macOS common error patterns
 
 | Error text                                                    | Meaning                                                                                                           | Fix                                                                                                                                                                                                                                 |
