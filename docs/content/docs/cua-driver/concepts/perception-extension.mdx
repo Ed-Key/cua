@@ -22,8 +22,9 @@ structure, so an agent has nothing to address by role or label. The extension
 gives those surfaces a structure without sending screenshots to a remote model.
 
 Every [`get_window_state`](/cua-driver/concepts/how-cua-driver-works#observe-tree-and-pixels-together) call
-already returns the accessibility tree and a screenshot together. The extension
-adds one step on top of that observation: it parses the screenshot into
+returns the accessibility tree, and a screenshot with it when asked (on macOS
+pass `include_screenshot:true`; Windows and Linux attach one by default). The
+extension adds one step on top of that observation: it parses the screenshot into
 regions. It does not replace the tree, and it never captures on its own.
 
 ## The loop
