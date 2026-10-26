@@ -46,7 +46,7 @@ one-shot `cua-driver call` process cannot resolve another process's
 `capture_id`.
 
 ```text output
-state   = get_window_state({"pid":844,"window_id":10725})
+state   = get_window_state({"pid":844,"window_id":10725,"include_screenshot":true})
 regions = parse_visual_regions({
   "capture_id": state.capture_id,
   "options": {"kinds":["text","icon"], "min_confidence":0.5, "max_regions":100}
