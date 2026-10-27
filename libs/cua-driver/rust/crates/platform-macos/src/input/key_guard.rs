@@ -1,11 +1,13 @@
 //! Foreground keys reach only the process the call targeted.
 //!
 //! A key posted on the global HID queue has no process address: WindowServer
-//! hands it to whichever app is in front when it routes it, which can be a
-//! moment after the post. A foreground action fronts its target, posts, then
-//! gives the user's app the front back; if anything brings the user's app
-//! back before every key has been routed, the keys land there (item 38: a
-//! Cmd+A meant for Safari selected all in the user's TextEdit document).
+//! hands it to whichever app is in front when it routes the key, which can be
+//! well after the post. A foreground action fronts its target, posts, then
+//! gives the user's app the front back. It used to hand back 40 ms after its
+//! last post; in VM B the keys of a freshly activated target were routed up
+//! to about 80 ms after they were posted, so the hand-back overtook them and
+//! they landed in the user's app (item 38: a Cmd+A meant for Safari selected
+//! all in the user's TextEdit document, 12 of 60 probe cases on 605b7dd8b).
 //!
 //! A [`KeyScope`] covers one foreground action (from the target's activation
 //! through the hand-back). Every HID key event cua posts on the scope's
@@ -14,20 +16,23 @@
 //! - before the first key, installs one active tap at the session's
 //!   annotated point (where each event already names the process it will be
 //!   delivered to), and refuses, sending nothing, when that tap cannot run;
-//! - before every key down, requires the exact target window's process to
-//!   be WindowServer's front process (a bounded wait for the first one), and
-//!   stops once any key went astray, so no partial chord follows;
-//! - tags the event with this scope's nonce.
+//! - before every press, requires WindowServer's front process to be the
+//!   target (or the owner of its window), with a bounded wait for the first
+//!   one, and stops once any press went astray, so no partial chord follows;
+//! - tags the event with this scope's nonce and whether it presses or
+//!   releases.
 //!
-//! The tap passes a tagged event bound for the target (or its window's
-//! owner) and counts it delivered. A tagged event bound for any other
-//! process is withheld from it; a release (key up, modifier change) is then
-//! given to the target by pid, so a modifier it saw pressed is released
-//! there. [`KeyScope::settle`] waits until every posted event was routed one
-//! way or the other, and the hand-back of the front runs only after it.
-//! While a scope is open, cua's reactive focus guard does not restore the
-//! user's app (`foreground_input_open`); the foreground turn already keeps
-//! every other cua front change out.
+//! The tap passes a tagged press bound for the target and remembers which
+//! process got it; a press bound anywhere else is withheld. A release goes to
+//! the process that got its press: passed when routed there, otherwise
+//! withheld and given to that process by pid; a release whose press was never
+//! delivered is withheld unless it is bound for the target.
+//! [`KeyScope::settle`] waits until every posted event was routed; the
+//! hand-back of the front runs only after that, and not at all while any key
+//! is still on its way (the tap then stays until it is routed). While a scope
+//! is open, cua's reactive focus guard does not restore the user's app
+//! ([`foreground_input_open`]); the foreground turn already keeps every other
+//! cua front change out.
 
 use std::cell::RefCell;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, AtomicUsize, Ordering};
@@ -35,6 +40,8 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use core_graphics::event::{CGEvent, CGEventTapLocation};
+use foreign_types::ForeignType;
+
 use crate::focus_event_tap::{EventTap, TapDecision};
 
 const KEY_DOWN: u32 = 10;
@@ -42,18 +49,21 @@ const KEY_UP: u32 = 11;
 const FLAGS_CHANGED: u32 = 12;
 /// kCGKeyboardEventKeycode, kCGEventTargetUnixProcessID,
 /// kCGEventSourceUnixProcessID, kCGEventSourceUserData.
+const FIELD_KEYCODE: u32 = 9;
 const FIELD_TARGET_PID: u32 = 40;
 const FIELD_SOURCE_PID: u32 = 41;
 const FIELD_USER_DATA: u32 = 42;
+/// The low bit of the tag marks a release.
+const RELEASE_BIT: i64 = 1;
 
 /// How long the first key waits for the target to become the front process
-/// (activation is asynchronous), the bound [`with_foreground_assist`] uses.
-///
-/// [`with_foreground_assist`]: crate::input::skylight::with_foreground_assist
+/// (activation is asynchronous), the bound `with_foreground_assist` uses.
 const FRONT_WAIT: Duration = Duration::from_millis(400);
 const FRONT_POLL: Duration = Duration::from_millis(10);
 /// How long the hand-back waits for posted keys to be routed.
-pub(crate) const SETTLE_TIMEOUT: Duration = Duration::from_millis(1000);
+const SETTLE_TIMEOUT: Duration = Duration::from_millis(1000);
+/// How long the tap outlives its scope for keys still on their way.
+const LATE_KEY_GUARD: Duration = Duration::from_secs(5);
 
 #[link(name = "CoreGraphics", kind = "framework")]
 extern "C" {
@@ -82,37 +92,73 @@ struct Ledger {
     /// The target pid and its window's owner (the same process unless the
     /// window belongs to a helper process, read before the first key).
     accept: [AtomicI32; 2],
+    /// Keys whose press was delivered, and the process that got it.
+    held: Mutex<Vec<(i64, i32)>>,
     posted: AtomicUsize,
-    delivered: AtomicUsize,
+    routed: AtomicUsize,
     astray: AtomicUsize,
     astray_to: AtomicI32,
     lost: AtomicBool,
 }
 
 impl Ledger {
-    fn routed(&self) -> usize {
-        self.delivered.load(Ordering::SeqCst) + self.astray.load(Ordering::SeqCst)
+    fn new(nonce: i64, own_pid: i64, target: i32) -> Self {
+        Ledger {
+            nonce,
+            own_pid,
+            accept: [AtomicI32::new(target), AtomicI32::new(0)],
+            held: Mutex::new(Vec::new()),
+            posted: AtomicUsize::new(0),
+            routed: AtomicUsize::new(0),
+            astray: AtomicUsize::new(0),
+            astray_to: AtomicI32::new(0),
+            lost: AtomicBool::new(false),
+        }
     }
 
     fn accepts(&self, pid: i32) -> bool {
         pid > 0 && self.accept.iter().any(|a| a.load(Ordering::SeqCst) == pid)
     }
 
-    /// The tap's decision for one event.
-    fn decide(&self, kind: u32, source: i64, user_data: i64, target: i32) -> Decision {
-        if source != self.own_pid || user_data != self.nonce {
-            return Decision::Pass;
-        }
-        if self.accepts(target) {
-            self.delivered.fetch_add(1, Ordering::SeqCst);
-            return Decision::Pass;
-        }
-        self.astray_to.store(target, Ordering::SeqCst);
+    fn held(&self) -> std::sync::MutexGuard<'_, Vec<(i64, i32)>> {
+        self.held.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// The process that got the press of `keycode`, if one did.
+    fn holder(&self, keycode: i64) -> Option<i32> {
+        self.held().iter().rev().find(|(code, _)| *code == keycode).map(|(_, pid)| *pid)
+    }
+
+    fn went_astray(&self, to: i32) {
+        self.astray_to.store(to, Ordering::SeqCst);
         self.astray.fetch_add(1, Ordering::SeqCst);
-        if kind == KEY_DOWN {
-            Decision::Withhold
-        } else {
-            Decision::WithholdAndGiveToTarget
+    }
+
+    /// The tap's decision for one event.
+    fn decide(&self, source: i64, user_data: i64, keycode: i64, target: i32) -> Decision {
+        if source != self.own_pid || user_data & !RELEASE_BIT != self.nonce {
+            return Decision::Pass;
+        }
+        self.routed.fetch_add(1, Ordering::SeqCst);
+        if user_data & RELEASE_BIT == 0 {
+            if self.accepts(target) {
+                self.held().push((keycode, target));
+                return Decision::Pass;
+            }
+            self.went_astray(target);
+            return Decision::Withhold;
+        }
+        let holder = {
+            let mut held = self.held();
+            let at = held.iter().rposition(|(code, _)| *code == keycode);
+            at.map(|at| held.remove(at).1)
+        };
+        match holder {
+            Some(pid) if pid == target => Decision::Pass,
+            Some(pid) => Decision::GiveTo(pid),
+            // Its press never arrived: a release for the target is harmless.
+            None if self.accepts(target) => Decision::Pass,
+            None => Decision::Withhold,
         }
     }
 }
@@ -121,7 +167,8 @@ impl Ledger {
 enum Decision {
     Pass,
     Withhold,
-    WithholdAndGiveToTarget,
+    /// Withhold, and post the event to this process instead.
+    GiveTo(i32),
 }
 
 struct Recipient {
@@ -135,13 +182,14 @@ struct Recipient {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum KeyRefusal {
     /// The guard tap could not be installed or stopped running: nothing
-    /// further was sent.
+    /// further was pressed.
     GuardUnavailable(String),
-    /// The target was not the front process when a key was due.
+    /// The target was not the front process when a press was due.
     NotFront { target: i32, front: Option<i32> },
-    /// A key was routed to another process and withheld from it.
+    /// A press was routed to another process and withheld from it.
     Astray { target: i32, to: i32 },
-    /// Posted keys were not all routed within the bound.
+    /// Posted keys were not all routed within the bound; the front stays
+    /// with the target.
     Unsettled { target: i32, posted: usize, routed: usize },
 }
 
@@ -154,7 +202,7 @@ impl std::fmt::Display for KeyRefusal {
         match self {
             Self::GuardUnavailable(why) => write!(
                 f,
-                "cua could not guard the foreground keys ({why}), so it sent no further key; \
+                "cua could not guard the foreground keys ({why}), so it pressed no further key; \
                  nothing reached another app"
             ),
             Self::NotFront { target, front } => {
@@ -165,25 +213,27 @@ impl std::fmt::Display for KeyRefusal {
                 write!(
                     f,
                     "{} (pid {target}) was not the frontmost app when its key was due (the front \
-                     was {front}), so cua sent no further key; nothing reached another app. Read \
-                     the window before retrying",
+                     was {front}), so cua pressed no further key; nothing reached another app. \
+                     Read the window before retrying",
                     app_name(*target)
                 )
             }
             Self::Astray { target, to } => write!(
                 f,
                 "the front moved to {} (pid {to}) while the keys for pid {target} were on their \
-                 way; cua withheld every key bound for it, released any pressed modifier to pid \
-                 {target} and sent nothing more, so the keys did not all arrive. Read the window \
-                 before retrying",
+                 way; cua withheld every key bound for it, released each pressed key to the app \
+                 that got it and pressed nothing more, so the keys did not all arrive. Read the \
+                 window before retrying",
                 app_name(*to)
             ),
             Self::Unsettled { target, posted, routed } => write!(
                 f,
-                "{routed} of {posted} keys for pid {target} were routed within {} ms; any key \
-                 still on its way after that is withheld from every other app. Read the window \
-                 before retrying",
-                SETTLE_TIMEOUT.as_millis()
+                "only {routed} of {posted} key events for pid {target} were routed within {} ms, \
+                 so cua left {} in front for the rest instead of handing the front back; any \
+                 still on its way is withheld from every other app. Read the window before \
+                 retrying",
+                SETTLE_TIMEOUT.as_millis(),
+                app_name(*target)
             ),
         }
     }
@@ -201,21 +251,13 @@ pub struct KeyScope {
 impl KeyScope {
     pub fn open(pid: i32, window_id: u32) -> Self {
         static NONCES: AtomicI64 = AtomicI64::new(0);
-        // A value no other software is likely to put in the source user data.
-        let nonce = 0x0C0A_3800_0000_0000 | NONCES.fetch_add(1, Ordering::SeqCst);
+        // A value no other software is likely to put in the source user data;
+        // its low bit is the release flag.
+        let nonce = 0x0C0A_3800_0000_0000 | (NONCES.fetch_add(1, Ordering::SeqCst) << 1);
         let recipient = Arc::new(Recipient {
             pid,
             window_id,
-            ledger: Arc::new(Ledger {
-                nonce,
-                own_pid: std::process::id() as i64,
-                accept: [AtomicI32::new(pid), AtomicI32::new(0)],
-                posted: AtomicUsize::new(0),
-                delivered: AtomicUsize::new(0),
-                astray: AtomicUsize::new(0),
-                astray_to: AtomicI32::new(0),
-                lost: AtomicBool::new(false),
-            }),
+            ledger: Arc::new(Ledger::new(nonce, std::process::id() as i64, pid)),
             tap: Mutex::new(None),
         });
         OPEN.fetch_add(1, Ordering::SeqCst);
@@ -224,7 +266,7 @@ impl KeyScope {
     }
 
     /// Wait until every key posted in this scope was routed. `Ok` when none
-    /// were posted or all reached the target.
+    /// were posted or every press reached the target.
     pub fn settle(&self) -> Result<(), KeyRefusal> {
         let ledger = &self.recipient.ledger;
         let posted = ledger.posted.load(Ordering::SeqCst);
@@ -232,19 +274,18 @@ impl KeyScope {
             return Ok(());
         }
         let deadline = Instant::now() + SETTLE_TIMEOUT;
-        while ledger.routed() < posted && Instant::now() < deadline {
+        while ledger.routed.load(Ordering::SeqCst) < posted && Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(2));
         }
-        let astray = ledger.astray.load(Ordering::SeqCst);
-        if astray > 0 {
+        let routed = ledger.routed.load(Ordering::SeqCst);
+        if routed < posted {
+            return Err(KeyRefusal::Unsettled { target: self.recipient.pid, posted, routed });
+        }
+        if ledger.astray.load(Ordering::SeqCst) > 0 {
             return Err(KeyRefusal::Astray {
                 target: self.recipient.pid,
                 to: ledger.astray_to.load(Ordering::SeqCst),
             });
-        }
-        let routed = ledger.routed();
-        if routed < posted {
-            return Err(KeyRefusal::Unsettled { target: self.recipient.pid, posted, routed });
         }
         Ok(())
     }
@@ -253,17 +294,24 @@ impl KeyScope {
 impl Drop for KeyScope {
     fn drop(&mut self) {
         CURRENT.with(|c| *c.borrow_mut() = self.outer.take());
-        // A key still on its way past the hand-back stays guarded briefly.
-        let ledger = &self.recipient.ledger;
-        let posted = ledger.posted.load(Ordering::SeqCst);
-        let deadline = Instant::now() + Duration::from_millis(200);
-        while ledger.routed() < posted && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        if let Some(tap) = self.recipient.tap.lock().unwrap_or_else(|p| p.into_inner()).take() {
-            tap.close();
-        }
         OPEN.fetch_sub(1, Ordering::SeqCst);
+        let Some(tap) = self.recipient.tap.lock().unwrap_or_else(|p| p.into_inner()).take() else {
+            return;
+        };
+        let ledger = self.recipient.ledger.clone();
+        let posted = ledger.posted.load(Ordering::SeqCst);
+        if ledger.routed.load(Ordering::SeqCst) >= posted {
+            tap.close();
+            return;
+        }
+        // A key still on its way stays guarded until it is routed.
+        std::thread::spawn(move || {
+            let deadline = Instant::now() + LATE_KEY_GUARD;
+            while ledger.routed.load(Ordering::SeqCst) < posted && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            tap.close();
+        });
     }
 }
 
@@ -290,36 +338,56 @@ impl Recipient {
     fn post(&self, event: &CGEvent, role: KeyRole) -> anyhow::Result<()> {
         let ledger = &self.ledger;
         let mut tap = self.tap.lock().unwrap_or_else(|p| p.into_inner());
-        if role == KeyRole::Press {
-            if ledger.astray.load(Ordering::SeqCst) > 0 {
-                return Err(KeyRefusal::Astray {
-                    target: self.pid,
-                    to: ledger.astray_to.load(Ordering::SeqCst),
+        match role {
+            KeyRole::Press => {
+                if ledger.astray.load(Ordering::SeqCst) > 0 {
+                    return Err(KeyRefusal::Astray {
+                        target: self.pid,
+                        to: ledger.astray_to.load(Ordering::SeqCst),
+                    }
+                    .into());
                 }
-                .into());
+                if tap.is_none() {
+                    *tap = Some(self.install_tap().map_err(KeyRefusal::GuardUnavailable)?);
+                }
+                if !self.guarded(tap.as_ref()) {
+                    return Err(KeyRefusal::GuardUnavailable("its event tap stopped".into()).into());
+                }
+                if ledger.posted.load(Ordering::SeqCst) == 0 {
+                    if let Some(window) = crate::windows::window_info_by_id(self.window_id) {
+                        ledger.accept[1].store(window.pid, Ordering::SeqCst);
+                    }
+                    self.await_front(FRONT_WAIT)?;
+                } else {
+                    self.await_front(Duration::ZERO)?;
+                }
+                event.set_integer_value_field(FIELD_USER_DATA, ledger.nonce);
             }
-            if tap.is_none() {
-                *tap = Some(self.install_tap().map_err(KeyRefusal::GuardUnavailable)?);
-            }
-            if ledger.lost.load(Ordering::SeqCst) || !tap.as_ref().is_some_and(EventTap::is_active) {
-                return Err(KeyRefusal::GuardUnavailable("its event tap stopped".into()).into());
-            }
-            let first = ledger.posted.load(Ordering::SeqCst) == 0;
-            if first {
-                if let Some(window) = crate::windows::window_info_by_id(self.window_id) {
-                    ledger.accept[1].store(window.pid, Ordering::SeqCst);
+            KeyRole::Release => {
+                if tap.is_none() {
+                    // Nothing was pressed under this guard.
+                    event.post(CGEventTapLocation::HID);
+                    return Ok(());
+                }
+                event.set_integer_value_field(FIELD_USER_DATA, ledger.nonce | RELEASE_BIT);
+                if !self.guarded(tap.as_ref()) {
+                    // Without the tap a HID release could reach whichever app
+                    // is in front: give it to the process that got the press.
+                    let keycode = event.get_integer_value_field(FIELD_KEYCODE);
+                    let to = ledger.holder(keycode).unwrap_or(self.pid);
+                    // SAFETY: a valid event; posting copies it.
+                    unsafe { CGEventPostToPid(to, event.as_ptr().cast()) };
+                    return Ok(());
                 }
             }
-            self.await_front(if first { FRONT_WAIT } else { Duration::ZERO })?;
-        } else if tap.is_none() {
-            // Nothing was pressed under this guard.
-            event.post(CGEventTapLocation::HID);
-            return Ok(());
         }
-        event.set_integer_value_field(FIELD_USER_DATA, ledger.nonce);
         ledger.posted.fetch_add(1, Ordering::SeqCst);
         event.post(CGEventTapLocation::HID);
         Ok(())
+    }
+
+    fn guarded(&self, tap: Option<&EventTap>) -> bool {
+        !self.ledger.lost.load(Ordering::SeqCst) && tap.is_some_and(EventTap::is_active)
     }
 
     fn await_front(&self, wait: Duration) -> Result<(), KeyRefusal> {
@@ -338,25 +406,24 @@ impl Recipient {
 
     fn install_tap(&self) -> Result<EventTap, String> {
         let ledger = self.ledger.clone();
-        let target = self.pid;
         let lost = self.ledger.clone();
         EventTap::start_annotated_session(
             &[KEY_DOWN, KEY_UP, FLAGS_CHANGED],
-            move |kind, event| {
+            move |_, event| {
                 // SAFETY: the tap borrows `event` for this callback only.
-                let (source, user_data, to) = unsafe {
-                    (
-                        CGEventGetIntegerValueField(event, FIELD_SOURCE_PID),
-                        CGEventGetIntegerValueField(event, FIELD_USER_DATA),
-                        CGEventGetIntegerValueField(event, FIELD_TARGET_PID) as i32,
-                    )
-                };
-                match ledger.decide(kind, source, user_data, to) {
+                let read = |field| unsafe { CGEventGetIntegerValueField(event, field) };
+                let decision = ledger.decide(
+                    read(FIELD_SOURCE_PID),
+                    read(FIELD_USER_DATA),
+                    read(FIELD_KEYCODE),
+                    read(FIELD_TARGET_PID) as i32,
+                );
+                match decision {
                     Decision::Pass => TapDecision::Pass,
                     Decision::Withhold => TapDecision::Drop,
-                    Decision::WithholdAndGiveToTarget => {
+                    Decision::GiveTo(pid) => {
                         // SAFETY: as above; posting copies the event.
-                        unsafe { CGEventPostToPid(target, event) };
+                        unsafe { CGEventPostToPid(pid, event) };
                         TapDecision::Drop
                     }
                 }
@@ -372,32 +439,49 @@ impl Recipient {
 mod tests {
     use super::*;
 
+    const PRESS: i64 = 76;
+    const RELEASE: i64 = 77;
+
     fn ledger(target: i32, owner: i32) -> Ledger {
-        Ledger {
-            nonce: 77,
-            own_pid: 500,
-            accept: [AtomicI32::new(target), AtomicI32::new(owner)],
-            posted: AtomicUsize::new(0),
-            delivered: AtomicUsize::new(0),
-            astray: AtomicUsize::new(0),
-            astray_to: AtomicI32::new(0),
-            lost: AtomicBool::new(false),
-        }
+        let l = Ledger::new(PRESS, 500, target);
+        l.accept[1].store(owner, Ordering::SeqCst);
+        l
     }
 
     /// Item 38: Cmd down reached Safari, then the user's TextEdit came back
     /// in front and A down, A up and the Cmd release were routed there.
-    /// Under the guard TextEdit gets none of them; the releases go to Safari.
+    /// Under the guard TextEdit gets none of them: A was never pressed, so
+    /// its release is withheld too, and Cmd's release goes to Safari.
     #[test]
-    fn keys_routed_to_another_app_are_withheld_and_releases_go_to_the_target() {
+    fn keys_routed_to_another_app_are_withheld_and_releases_go_to_their_press() {
         let l = ledger(716, 716);
-        assert_eq!(l.decide(FLAGS_CHANGED, 500, 77, 716), Decision::Pass);
-        assert_eq!(l.decide(KEY_DOWN, 500, 77, 918), Decision::Withhold);
-        assert_eq!(l.decide(KEY_UP, 500, 77, 918), Decision::WithholdAndGiveToTarget);
-        assert_eq!(l.decide(FLAGS_CHANGED, 500, 77, 918), Decision::WithholdAndGiveToTarget);
-        assert_eq!(l.delivered.load(Ordering::SeqCst), 1);
-        assert_eq!(l.astray.load(Ordering::SeqCst), 3);
+        assert_eq!(l.decide(500, PRESS, 55, 716), Decision::Pass, "Cmd down");
+        assert_eq!(l.decide(500, PRESS, 0, 918), Decision::Withhold, "A down");
+        assert_eq!(l.decide(500, RELEASE, 0, 918), Decision::Withhold, "A up, never pressed");
+        assert_eq!(l.decide(500, RELEASE, 55, 918), Decision::GiveTo(716), "Cmd up");
+        assert_eq!(l.routed.load(Ordering::SeqCst), 4);
+        assert_eq!(l.astray.load(Ordering::SeqCst), 1);
         assert_eq!(l.astray_to.load(Ordering::SeqCst), 918);
+        assert!(l.held().is_empty());
+    }
+
+    /// A modifier press routed elsewhere is withheld, not given to the
+    /// target: both arrive as flags-changed events, so the tag says which.
+    #[test]
+    fn a_modifier_press_routed_elsewhere_is_withheld() {
+        let l = ledger(716, 716);
+        assert_eq!(l.decide(500, PRESS, 55, 918), Decision::Withhold);
+        assert_eq!(l.decide(500, RELEASE, 55, 918), Decision::Withhold);
+    }
+
+    /// The press went to the window's helper process and the release to the
+    /// target: the release belongs to the helper.
+    #[test]
+    fn a_release_goes_to_the_process_that_got_its_press() {
+        let l = ledger(716, 4242);
+        assert_eq!(l.decide(500, PRESS, 55, 4242), Decision::Pass);
+        assert_eq!(l.decide(500, RELEASE, 55, 716), Decision::GiveTo(4242));
+        assert_eq!(l.decide(500, PRESS, 0, 0), Decision::Withhold, "unrouted is not the target");
     }
 
     /// The tap sees every key in the session: the user's own keys, other
@@ -405,21 +489,11 @@ mod tests {
     #[test]
     fn only_this_scopes_own_events_are_judged() {
         let l = ledger(716, 716);
-        assert_eq!(l.decide(KEY_DOWN, 0, 0, 918), Decision::Pass, "the user's key");
-        assert_eq!(l.decide(KEY_DOWN, 500, 0, 918), Decision::Pass, "an untagged cua key");
-        assert_eq!(l.decide(KEY_DOWN, 500, 78, 918), Decision::Pass, "another scope's key");
-        assert_eq!(l.decide(KEY_DOWN, 501, 77, 918), Decision::Pass, "another process");
-        assert_eq!(l.routed(), 0);
-    }
-
-    /// A window owned by a helper process (a panel's view service) counts
-    /// as the target.
-    #[test]
-    fn the_target_windows_owner_counts_as_the_target() {
-        let l = ledger(716, 4242);
-        assert_eq!(l.decide(KEY_DOWN, 500, 77, 4242), Decision::Pass);
-        assert_eq!(l.decide(KEY_DOWN, 500, 77, 0), Decision::Withhold, "unrouted is not the target");
-        assert_eq!(l.delivered.load(Ordering::SeqCst), 1);
+        assert_eq!(l.decide(0, 0, 0, 918), Decision::Pass, "the user's key");
+        assert_eq!(l.decide(500, 0, 0, 918), Decision::Pass, "an untagged cua key");
+        assert_eq!(l.decide(500, PRESS + 2, 0, 918), Decision::Pass, "another scope's key");
+        assert_eq!(l.decide(501, PRESS, 0, 918), Decision::Pass, "another process");
+        assert_eq!(l.routed.load(Ordering::SeqCst), 0);
     }
 
     #[test]

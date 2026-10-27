@@ -214,12 +214,12 @@ pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
         {
             continue;
         }
-        active_flags |= modifier_flag;
+        // The flags of a refused press are never carried by the releases.
         if let Err(error) = post_global_key(
             &source,
             modifier_code,
             true,
-            active_flags,
+            active_flags | modifier_flag,
             CGEventTapLocation::HID,
         ) {
             release_global_modifiers(
@@ -230,6 +230,7 @@ pub fn press_key_global(key: &str, modifiers: &[&str]) -> anyhow::Result<()> {
             );
             return Err(error);
         }
+        active_flags |= modifier_flag;
         pressed_modifiers.push((modifier_code, modifier_flag));
         key_gap_sleep();
     }
@@ -288,17 +289,18 @@ pub(super) fn with_global_modifier_keys<T>(
         {
             continue;
         }
-        active_flags |= flag;
+        // The flags of a refused press are never carried by the releases.
         if let Err(error) = post_global_key(
             &source,
             key_code,
             true,
-            active_flags,
+            active_flags | flag,
             CGEventTapLocation::HID,
         ) {
             release_global_modifiers(&source, &pressed, active_flags, CGEventTapLocation::HID);
             return Err(error);
         }
+        active_flags |= flag;
         pressed.push((key_code, flag));
         key_gap_sleep();
     }

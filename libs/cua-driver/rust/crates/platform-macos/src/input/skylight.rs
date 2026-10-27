@@ -1107,6 +1107,7 @@ pub fn with_foreground_assist(
 
     if prev_ok
         && !click_may_be_in_flight(&result)
+        && !keys_on_their_way(&result)
         && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before)
     {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
@@ -1318,6 +1319,7 @@ pub fn with_foreground_hid_activation<T>(
 
     if prev_ok
         && !click_may_be_in_flight(&result)
+        && !keys_on_their_way(&result)
         && !keeps_front_for_inline_edit(result.is_ok(), target_pid, target_wid, before)
     {
         unsafe { set_front(prev_psn.as_ptr() as *const c_void, 0, 0x400) };
@@ -1326,17 +1328,31 @@ pub fn with_foreground_hid_activation<T>(
     result
 }
 
-/// The action's result once every HID key it posted was routed: a key that
-/// went astray (withheld from the other app) or was not routed in time makes
-/// a successful action an error.
+/// The action's result once every HID key it posted was routed: a press that
+/// went astray (withheld from the other app) makes a successful action an
+/// error, and keys still on their way win over any other error, because the
+/// hand-back must not run then ([`keys_on_their_way`]).
 fn settled<T>(
     keys: &crate::input::key_guard::KeyScope,
     result: anyhow::Result<T>,
 ) -> anyhow::Result<T> {
-    let routed = keys.settle();
-    let value = result?;
-    routed?;
-    Ok(value)
+    use crate::input::key_guard::KeyRefusal;
+    match keys.settle() {
+        Err(unsettled @ KeyRefusal::Unsettled { .. }) => Err(unsettled.into()),
+        routed => {
+            let value = result?;
+            routed?;
+            Ok(value)
+        }
+    }
+}
+
+/// Keys of this action are still unrouted: handing the front back now would
+/// route them into the user's app, so the target stays in front.
+fn keys_on_their_way<T>(result: &anyhow::Result<T>) -> bool {
+    result.as_ref().err().and_then(|e| e.downcast_ref::<crate::input::key_guard::KeyRefusal>()).is_some_and(
+        |refusal| matches!(refusal, crate::input::key_guard::KeyRefusal::Unsettled { .. }),
+    )
 }
 
 /// A foreground pointer event was not sent because another window stays
